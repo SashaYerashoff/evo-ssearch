@@ -1,4 +1,5 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import pickle
 import numpy as np
 from flask import Flask, request, jsonify, send_file, render_template_string
@@ -127,6 +128,7 @@ def home():
         
         .container {
             max-width: 1200px;
+            min-width: 900px;                     
             margin: 0 auto;
             padding: 2rem;
             flex: 1;
@@ -237,7 +239,7 @@ def home():
         }
         
         .result-item.expanded {
-            grid-column: span 2;
+            grid-column: span 3;
         }
         
         .thumbnail {

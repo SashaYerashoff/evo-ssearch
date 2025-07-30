@@ -1,15 +1,7 @@
-"""
-Refactored CLIP‑powered image search server — v3 UI tweaks
-———————————————————————————————————————————————————————————————————
-• Container given higher z‑index so heading & results always sit above overlay.
-• Full‑view background now fills screen (background‑size:cover already, z‑fix).
-• Overlay blur dialled back (4 px) and given a top‑to‑bottom gradient so top
-  half stays sharper, improving legibility.
-"""
-
 from __future__ import annotations
 
 import base64, os, pickle, threading
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from io import BytesIO
 from pathlib import Path
 
