@@ -2,7 +2,7 @@
 
 A CLIP-powered image search server with two UIs:
 - **app.py**: Modern glassmorphic interface, uses the last enlarged image as the background.
-- **clip_search_backend.py**: Clean, dark UI with minimal design.
+- **oldapp.py**: Clean, dark UI with minimal design.
 
 ## Prerequisites
 - Windows 10/11 or Ubuntu 20.04+
@@ -52,9 +52,9 @@ python app.py
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
 - Features: Modern glassmorphic UI, last enlarged image becomes the background.
 
-### For the Minimal Backend (`clip_search_backend.py`)
+### For the Minimal Backend (`oldapp.py`)
 ```sh
-python clip_search_backend.py
+python oldapp.py
 ```
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
 - Features: Clean, dark UI with no extra effects.
