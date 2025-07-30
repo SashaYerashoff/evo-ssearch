@@ -50,7 +50,7 @@ pip install -r requirements.txt
 python app.py
 ```
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
-- Features: Modern glassmorphic UI, last enlarged image becomes the background.
+- Features: glassmorphic UI, last enlarged image becomes the background. not the best option, for minimalist :)
 
 ### For the Minimal Backend (`oldapp.py`)
 ```sh
