@@ -54,6 +54,7 @@ def create_index(folder_path):
     folder_path = Path(folder_path)
     image_paths = []
     embeddings = []
+    image_metadata = []
     
     # Supported image formats
     extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
@@ -64,20 +65,29 @@ def create_index(folder_path):
                 embedding = get_image_embedding(img_path)
                 embeddings.append(embedding)
                 image_paths.append(str(img_path))
+                
+                # Get file metadata
+                stat = img_path.stat()
+                metadata = {
+                    'path': str(img_path),
+                    'mtime': stat.st_mtime,
+                    'size': stat.st_size
+                }
+                image_metadata.append(metadata)
             except Exception as e:
                 print(f"Error processing {img_path}: {e}")
     
     if not embeddings:
-        return None, None
+        return None, None, None
     
     # Create FAISS index
     embeddings_array = np.array(embeddings).astype('float32')
     index = faiss.IndexFlatIP(embeddings_array.shape[1])  # Inner product for cosine similarity
     index.add(embeddings_array)
     
-    return index, image_paths
+    return index, image_paths, image_metadata
 
-def save_index(index, image_paths, folder_path):
+def save_index(index, image_paths, image_metadata, folder_path):
     """Save FAISS index and metadata"""
     index_path = Path(folder_path) / '.clip_index'
     index_path.mkdir(exist_ok=True)
@@ -88,13 +98,17 @@ def save_index(index, image_paths, folder_path):
     # Save image paths
     with open(index_path / 'paths.pkl', 'wb') as f:
         pickle.dump(image_paths, f)
+    
+    # Save image metadata
+    with open(index_path / 'metadata.pkl', 'wb') as f:
+        pickle.dump(image_metadata, f)
 
 def load_index(folder_path):
     """Load FAISS index and metadata"""
     index_path = Path(folder_path) / '.clip_index'
     
     if not index_path.exists():
-        return None, None
+        return None, None, None
     
     try:
         # Load FAISS index
@@ -104,9 +118,19 @@ def load_index(folder_path):
         with open(index_path / 'paths.pkl', 'rb') as f:
             image_paths = pickle.load(f)
         
-        return index, image_paths
+        # Load image metadata (backwards compatible)
+        image_metadata = None
+        metadata_file = index_path / 'metadata.pkl'
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'rb') as f:
+                    image_metadata = pickle.load(f)
+            except:
+                image_metadata = None
+        
+        return index, image_paths, image_metadata
     except:
-        return None, None
+        return None, None, None
 
 def load_comments(folder_path):
     """Load comments from JSON file"""
@@ -306,7 +330,42 @@ def home():
         .search-controls {
             margin-bottom: 1rem;
             display: flex;
-            justify-content: flex-end;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        .feature-btn {
+            background: #2a4a3a;
+            border: 1px solid #3a5a4a;
+            color: #e0e0e0;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        
+        .feature-btn:hover {
+            background: #345a44;
+            border-color: #4a6a54;
+        }
+        
+        .feature-btn:active {
+            transform: translateY(1px);
+        }
+        
+        .sort-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
         
         .limit-control {
@@ -315,6 +374,7 @@ def home():
             gap: 0.5rem;
         }
         
+        .sort-control label,
         .limit-control label {
             color: #888;
             font-size: 0.9rem;
@@ -607,17 +667,29 @@ def home():
                 <button id="imageModeBtn" class="mode-tab">Image Search</button>
             </div>
             <div class="search-controls">
-                <div class="limit-control">
-                    <label for="resultLimit">Results:</label>
-                    <select id="resultLimit">
-                        <option value="6">6</option>
-                        <option value="12" selected>12</option>
-                        <option value="18">18</option>
-                        <option value="24">24</option>
-                        <option value="30">30</option>
-                        <option value="48">48</option>
-                        <option value="60">60</option>
-                    </select>
+                <div class="control-group">
+                    <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
+                </div>
+                <div class="control-group">
+                    <div class="sort-control">
+                        <label for="sortBy">Sort by:</label>
+                        <select id="sortBy">
+                            <option value="similarity" selected>Similarity</option>
+                            <option value="time">Time (Newest First)</option>
+                        </select>
+                    </div>
+                    <div class="limit-control">
+                        <label for="resultLimit">Results:</label>
+                        <select id="resultLimit">
+                            <option value="6">6</option>
+                            <option value="12" selected>12</option>
+                            <option value="18">18</option>
+                            <option value="24">24</option>
+                            <option value="30">30</option>
+                            <option value="48">48</option>
+                            <option value="60">60</option>
+                        </select>
+                    </div>
                 </div>
             </div>
             <div id="textSearchBox" class="search-box">
@@ -646,6 +718,8 @@ def home():
         const textSearchBox = document.getElementById('textSearchBox');
         const imageSearchBox = document.getElementById('imageSearchBox');
         const resultLimitSelect = document.getElementById('resultLimit');
+        const sortBySelect = document.getElementById('sortBy');
+        const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
         
         let currentFolder = '';
@@ -722,6 +796,7 @@ def home():
             const query = searchInput.value.trim();
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
+            const sortBy = sortBySelect.value;
             
             if (!query || !folder) return;
             
@@ -731,7 +806,7 @@ def home():
                 const response = await fetch('/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder, query, limit })
+                    body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
                 });
                 
                 const data = await response.json();
@@ -751,6 +826,7 @@ def home():
             const folder = folderInput.value.trim();
             const file = imageUpload.files[0];
             const limit = resultLimitSelect.value;
+            const sortBy = sortBySelect.value;
             
             if (!file || !folder) return;
             
@@ -761,6 +837,7 @@ def home():
                 formData.append('folder', folder);
                 formData.append('image', file);
                 formData.append('limit', limit);
+                formData.append('sort_by', sortBy);
                 
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
@@ -779,6 +856,36 @@ def home():
             }
         });
         
+        // Show commented images
+        showCommentedBtn.addEventListener('click', async () => {
+            const folder = folderInput.value.trim();
+            
+            if (!folder) {
+                alert('Please enter a folder path first');
+                return;
+            }
+            
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
+            
+            try {
+                const response = await fetch('/commented_images', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folder })
+                });
+                
+                const data = await response.json();
+                
+                if (data.results && data.results.length > 0) {
+                    displayCommentedResults(data.results);
+                } else {
+                    resultsContainer.innerHTML = '<div class="loading">No commented images found</div>';
+                }
+            } catch (error) {
+                resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            }
+        });
+        
         // Display results
         function displayResults(results) {
             resultsContainer.innerHTML = '';
@@ -791,6 +898,76 @@ def home():
                     <div class="result-info">
                         <div class="filename">${result.filename}</div>
                         <div class="similarity">Similarity: ${(result.similarity * 100).toFixed(1)}%</div>
+                    </div>
+                    <div class="image-controls">
+                        <button class="copy-path-btn" id="copy-btn-${index}">
+                            <span class="copy-icon">📋</span>
+                            Copy Path
+                        </button>
+                    </div>
+                    <div class="comment-section">
+                        <div class="comments-list" id="comments-${index}">
+                            <div class="comment-loading">Loading comments...</div>
+                        </div>
+                        <div class="comment-form">
+                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                        </div>
+                    </div>
+                `;
+                
+                item.addEventListener('click', (e) => {
+                    // Don't toggle if clicking on comment section or image controls
+                    if (e.target.closest('.comment-section') || e.target.closest('.image-controls')) {
+                        return;
+                    }
+                    
+                    const img = item.querySelector('.thumbnail');
+                    const isExpanded = item.classList.contains('expanded');
+                    
+                    if (isExpanded) {
+                        // Collapse: switch back to thumbnail
+                        img.src = `data:image/jpeg;base64,${result.thumbnail}`;
+                        item.classList.remove('expanded');
+                    } else {
+                        // Expand: show original image and load comments
+                        const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
+                        img.src = originalImageUrl;
+                        item.classList.add('expanded');
+                        loadComments(index, result.path, folderInput.value.trim());
+                    }
+                });
+                
+                // Add save comment functionality
+                const saveBtn = item.querySelector(`#save-btn-${index}`);
+                const commentInput = item.querySelector(`#comment-input-${index}`);
+                
+                saveBtn.addEventListener('click', () => {
+                    saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+                });
+                
+                // Add copy path functionality
+                const copyBtn = item.querySelector(`#copy-btn-${index}`);
+                copyBtn.addEventListener('click', () => {
+                    copyImagePath(result.path, result.filename, copyBtn);
+                });
+                
+                resultsContainer.appendChild(item);
+            });
+        }
+        
+        // Display commented results (similar to displayResults but with comment info)
+        function displayCommentedResults(results) {
+            resultsContainer.innerHTML = '';
+            
+            results.forEach((result, index) => {
+                const item = document.createElement('div');
+                item.className = 'result-item';
+                item.innerHTML = `
+                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                    <div class="result-info">
+                        <div class="filename">${result.filename}</div>
+                        <div class="similarity">Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}</div>
                     </div>
                     <div class="image-controls">
                         <button class="copy-path-btn" id="copy-btn-${index}">
@@ -1070,6 +1247,68 @@ def save_comment():
         print(f"Error saving comment: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/commented_images', methods=['POST'])
+def get_commented_images():
+    """Get all images that have comments in the indexed folder"""
+    folder = request.json.get('folder')
+    if not folder:
+        return jsonify({'error': 'No folder specified'}), 400
+    
+    try:
+        # Load index to get image paths
+        index, image_paths, image_metadata = load_index(folder)
+        if index is None:
+            return jsonify({'error': 'Folder not indexed'}), 400
+        
+        # Load comments
+        comments_data = load_comments(folder)
+        
+        # Build results for images with comments
+        results = []
+        for image_path in comments_data.keys():
+            if image_path in image_paths:
+                try:
+                    # Get index position for metadata lookup
+                    idx = image_paths.index(image_path)
+                    
+                    # Create thumbnail
+                    img = Image.open(image_path)
+                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    
+                    # Convert to base64
+                    buffer = BytesIO()
+                    img.save(buffer, format='JPEG', quality=85)
+                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+                    
+                    # Get metadata if available
+                    metadata_info = {}
+                    if image_metadata and idx < len(image_metadata):
+                        meta = image_metadata[idx]
+                        metadata_info = {
+                            'mtime': meta.get('mtime', 0),
+                            'size': meta.get('size', 0)
+                        }
+                    
+                    results.append({
+                        'path': image_path,
+                        'filename': os.path.basename(image_path),
+                        'thumbnail': img_base64,
+                        'comment_count': len(comments_data[image_path]),
+                        'latest_comment': comments_data[image_path][-1] if comments_data[image_path] else '',
+                        'metadata': metadata_info
+                    })
+                except Exception as img_error:
+                    print(f"Error processing commented image {image_path}: {img_error}")
+                    continue
+        
+        # Sort by most recent comment first
+        results.sort(key=lambda x: x['latest_comment'], reverse=True)
+        
+        return jsonify({'results': results})
+    except Exception as e:
+        print(f"Error getting commented images: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/check_index', methods=['POST'])
 def check_index():
     """Check if folder is indexed"""
@@ -1077,7 +1316,7 @@ def check_index():
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
     
-    index, _ = load_index(folder)
+    index, _, _ = load_index(folder)
     return jsonify({'indexed': index is not None})
 
 @app.route('/index', methods=['POST'])
@@ -1088,11 +1327,11 @@ def index_folder():
         return jsonify({'error': 'Invalid folder path'}), 400
     
     try:
-        index, image_paths = create_index(folder)
+        index, image_paths, image_metadata = create_index(folder)
         if index is None:
             return jsonify({'error': 'No images found in folder'}), 400
         
-        save_index(index, image_paths, folder)
+        save_index(index, image_paths, image_metadata, folder)
         return jsonify({'success': True, 'count': len(image_paths)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1103,7 +1342,8 @@ def search():
     folder = request.json.get('folder')
     query = request.json.get('query')
     limit = request.json.get('limit', 10)
-    print(f"Search request: folder={folder}, query={query}, limit={limit}")
+    sort_by = request.json.get('sort_by', 'similarity')  # 'similarity' or 'time'
+    print(f"Search request: folder={folder}, query={query}, limit={limit}, sort_by={sort_by}")
     
     if not folder or not query:
         return jsonify({'error': 'Missing folder or query'}), 400
@@ -1117,7 +1357,7 @@ def search():
         limit = 12
     
     # Load index
-    index, image_paths = load_index(folder)
+    index, image_paths, image_metadata = load_index(folder)
     if index is None:
         return jsonify({'error': 'Folder not indexed'}), 400
     
@@ -1146,15 +1386,31 @@ def search():
                     img.save(buffer, format='JPEG', quality=85)
                     img_base64 = base64.b64encode(buffer.getvalue()).decode()
                     
+                    # Get metadata if available
+                    metadata_info = {}
+                    if image_metadata and idx < len(image_metadata):
+                        meta = image_metadata[idx]
+                        metadata_info = {
+                            'mtime': meta.get('mtime', 0),
+                            'size': meta.get('size', 0)
+                        }
+                    
                     results.append({
                         'path': img_path,
                         'filename': os.path.basename(img_path),
                         'similarity': float(sim),
-                        'thumbnail': img_base64
+                        'thumbnail': img_base64,
+                        'metadata': metadata_info
                     })
                 except Exception as img_error:
                     print(f"Error processing image {img_path}: {img_error}")
                     continue
+        
+        # Sort results based on sort_by parameter
+        if sort_by == 'time' and image_metadata:
+            # Sort by modification time (newest first)
+            results.sort(key=lambda x: x['metadata'].get('mtime', 0), reverse=True)
+        # Otherwise keep similarity sort (default FAISS order)
         
         return jsonify({'results': results})
     except Exception as e:
@@ -1168,6 +1424,7 @@ def search_by_image():
     """Search for images using an uploaded image"""
     folder = request.form.get('folder')
     limit = request.form.get('limit', 12)
+    sort_by = request.form.get('sort_by', 'similarity')  # 'similarity' or 'time'
     
     if not folder:
         return jsonify({'error': 'Missing folder'}), 400
@@ -1188,7 +1445,7 @@ def search_by_image():
         return jsonify({'error': 'No image selected'}), 400
     
     # Load index
-    index, image_paths = load_index(folder)
+    index, image_paths, image_metadata = load_index(folder)
     if index is None:
         return jsonify({'error': 'Folder not indexed'}), 400
     
@@ -1222,15 +1479,31 @@ def search_by_image():
                     img.save(buffer, format='JPEG', quality=85)
                     img_base64 = base64.b64encode(buffer.getvalue()).decode()
                     
+                    # Get metadata if available
+                    metadata_info = {}
+                    if image_metadata and idx < len(image_metadata):
+                        meta = image_metadata[idx]
+                        metadata_info = {
+                            'mtime': meta.get('mtime', 0),
+                            'size': meta.get('size', 0)
+                        }
+                    
                     results.append({
                         'path': img_path,
                         'filename': os.path.basename(img_path),
                         'similarity': float(sim),
-                        'thumbnail': img_base64
+                        'thumbnail': img_base64,
+                        'metadata': metadata_info
                     })
                 except Exception as img_error:
                     print(f"Error processing image {img_path}: {img_error}")
                     continue
+        
+        # Sort results based on sort_by parameter
+        if sort_by == 'time' and image_metadata:
+            # Sort by modification time (newest first)
+            results.sort(key=lambda x: x['metadata'].get('mtime', 0), reverse=True)
+        # Otherwise keep similarity sort (default FAISS order)
         
         return jsonify({'results': results})
     except Exception as e:
