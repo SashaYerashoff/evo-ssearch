@@ -33,6 +33,14 @@ def get_image_embedding(image_path):
         image_features /= image_features.norm(dim=-1, keepdim=True)
     return image_features.cpu().numpy().flatten()
 
+def get_image_embedding_from_pil(pil_image):
+    """Extract CLIP embedding from PIL Image"""
+    image = preprocess(pil_image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        image_features = model.encode_image(image)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+    return image_features.cpu().numpy().flatten()
+
 def get_text_embedding(text):
     """Extract CLIP embedding from text"""
     text_tokens = clip.tokenize([text]).to(device)
@@ -213,9 +221,56 @@ def home():
             border: 1px solid #262626;
         }
         
+        .search-mode-tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 1rem;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .mode-tab {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            color: #888;
+            padding: 0.75rem 1rem;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            border-radius: 0;
+        }
+        
+        .mode-tab.active {
+            background: #1a1a1a;
+            color: #e0e0e0;
+            border-color: #555;
+        }
+        
+        .mode-tab:hover {
+            background: #222;
+            color: #e0e0e0;
+        }
+        
         .search-box {
             display: flex;
             gap: 1rem;
+        }
+        
+        input[type="file"] {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 0.95rem;
+            transition: border-color 0.2s;
+        }
+        
+        input[type="file"]:focus {
+            outline: none;
+            border-color: #555;
         }
         
         .results-grid {
@@ -304,9 +359,17 @@ def home():
         </div>
         
         <div class="search-panel">
-            <div class="search-box">
+            <div class="search-mode-tabs">
+                <button id="textModeBtn" class="mode-tab active">Text Search</button>
+                <button id="imageModeBtn" class="mode-tab">Image Search</button>
+            </div>
+            <div id="textSearchBox" class="search-box">
                 <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
                 <button id="searchBtn">Search</button>
+            </div>
+            <div id="imageSearchBox" class="search-box" style="display: none;">
+                <input type="file" id="imageUpload" accept="image/*" />
+                <button id="imageSearchBtn">Search by Image</button>
             </div>
         </div>
         
@@ -319,9 +382,33 @@ def home():
         const indexStatus = document.getElementById('indexStatus');
         const searchInput = document.getElementById('searchQuery');
         const searchBtn = document.getElementById('searchBtn');
+        const imageUpload = document.getElementById('imageUpload');
+        const imageSearchBtn = document.getElementById('imageSearchBtn');
+        const textModeBtn = document.getElementById('textModeBtn');
+        const imageModeBtn = document.getElementById('imageModeBtn');
+        const textSearchBox = document.getElementById('textSearchBox');
+        const imageSearchBox = document.getElementById('imageSearchBox');
         const resultsContainer = document.getElementById('results');
         
         let currentFolder = '';
+        let currentMode = 'text';
+        
+        // Mode switching
+        textModeBtn.addEventListener('click', () => {
+            currentMode = 'text';
+            textModeBtn.classList.add('active');
+            imageModeBtn.classList.remove('active');
+            textSearchBox.style.display = 'flex';
+            imageSearchBox.style.display = 'none';
+        });
+        
+        imageModeBtn.addEventListener('click', () => {
+            currentMode = 'image';
+            imageModeBtn.classList.add('active');
+            textModeBtn.classList.remove('active');
+            imageSearchBox.style.display = 'flex';
+            textSearchBox.style.display = 'none';
+        });
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -372,7 +459,7 @@ def home():
             }
         });
         
-        // Search
+        // Text search
         searchBtn.addEventListener('click', async () => {
             const query = searchInput.value.trim();
             const folder = folderInput.value.trim();
@@ -386,6 +473,37 @@ def home():
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folder, query })
+                });
+                
+                const data = await response.json();
+                
+                if (data.results) {
+                    displayResults(data.results);
+                } else {
+                    resultsContainer.innerHTML = '<div class="loading">No results found</div>';
+                }
+            } catch (error) {
+                resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            }
+        });
+        
+        // Image search
+        imageSearchBtn.addEventListener('click', async () => {
+            const folder = folderInput.value.trim();
+            const file = imageUpload.files[0];
+            
+            if (!file || !folder) return;
+            
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
+            
+            try {
+                const formData = new FormData();
+                formData.append('folder', folder);
+                formData.append('image', file);
+                
+                const response = await fetch('/search_by_image', {
+                    method: 'POST',
+                    body: formData
                 });
                 
                 const data = await response.json();
@@ -499,6 +617,64 @@ def search():
         # Search
         k = min(10, len(image_paths))
         similarities, indices = index.search(text_embedding.reshape(1, -1), k)
+        
+        results = []
+        for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):
+            if idx < len(image_paths):
+                img_path = image_paths[idx]
+                
+                # Create thumbnail
+                img = Image.open(img_path)
+                img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                
+                # Convert to base64
+                buffer = BytesIO()
+                img.save(buffer, format='JPEG', quality=85)
+                img_base64 = base64.b64encode(buffer.getvalue()).decode()
+                
+                results.append({
+                    'path': img_path,
+                    'filename': os.path.basename(img_path),
+                    'similarity': float(sim),
+                    'thumbnail': img_base64
+                })
+        
+        return jsonify({'results': results})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/search_by_image', methods=['POST'])
+def search_by_image():
+    """Search for images using an uploaded image"""
+    folder = request.form.get('folder')
+    
+    if not folder:
+        return jsonify({'error': 'Missing folder'}), 400
+    
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image uploaded'}), 400
+    
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No image selected'}), 400
+    
+    # Load index
+    index, image_paths = load_index(folder)
+    if index is None:
+        return jsonify({'error': 'Folder not indexed'}), 400
+    
+    try:
+        # Process uploaded image
+        uploaded_image = Image.open(file.stream)
+        if uploaded_image.mode != 'RGB':
+            uploaded_image = uploaded_image.convert('RGB')
+        
+        # Get image embedding
+        image_embedding = get_image_embedding_from_pil(uploaded_image)
+        
+        # Search
+        k = min(10, len(image_paths))
+        similarities, indices = index.search(image_embedding.reshape(1, -1), k)
         
         results = []
         for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):

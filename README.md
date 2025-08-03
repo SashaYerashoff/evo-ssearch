@@ -2,7 +2,7 @@
 
 A CLIP-powered image search server with two UIs:
 - **app.py**: Modern glassmorphic interface, uses the last enlarged image as the background.
-- **oldapp.py**: Clean, dark UI with minimal design.
+- **oldapp.py**: Clean, dark UI with minimal design and search-by-image functionality.
 
 ## Prerequisites
 - Windows 10/11 or Ubuntu 20.04+
@@ -57,7 +57,18 @@ python app.py
 python oldapp.py
 ```
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
-- Features: Clean, dark UI with no extra effects.
+- Features: Clean, dark UI with search-by-image functionality.
+
+## Search Modes
+
+### Text Search
+- Enter a natural language description of what you're looking for
+- Example: "a red car", "sunset over mountains", "people playing basketball"
+
+### Image Search (oldapp.py only)
+- Upload an image to find visually similar images in your indexed folder
+- Supports common image formats (jpg, png, webp, etc.)
+- Uses CLIP embeddings for semantic similarity matching
 
 ## Notes
 - On Windows, the scripts automatically handle OpenMP runtime issues for FAISS/CLIP.
