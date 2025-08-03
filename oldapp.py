@@ -252,6 +252,44 @@ def home():
             color: #e0e0e0;
         }
         
+        .search-controls {
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: flex-end;
+        }
+        
+        .limit-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .limit-control label {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        
+        select {
+            background: #0a0a0a;
+            border: 1px solid #333;
+            color: #e0e0e0;
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        
+        select:focus {
+            outline: none;
+            border-color: #555;
+        }
+        
+        select option {
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        
         .search-box {
             display: flex;
             gap: 1rem;
@@ -363,6 +401,20 @@ def home():
                 <button id="textModeBtn" class="mode-tab active">Text Search</button>
                 <button id="imageModeBtn" class="mode-tab">Image Search</button>
             </div>
+            <div class="search-controls">
+                <div class="limit-control">
+                    <label for="resultLimit">Results:</label>
+                    <select id="resultLimit">
+                        <option value="6">6</option>
+                        <option value="12" selected>12</option>
+                        <option value="18">18</option>
+                        <option value="24">24</option>
+                        <option value="30">30</option>
+                        <option value="48">48</option>
+                        <option value="60">60</option>
+                    </select>
+                </div>
+            </div>
             <div id="textSearchBox" class="search-box">
                 <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
                 <button id="searchBtn">Search</button>
@@ -388,6 +440,7 @@ def home():
         const imageModeBtn = document.getElementById('imageModeBtn');
         const textSearchBox = document.getElementById('textSearchBox');
         const imageSearchBox = document.getElementById('imageSearchBox');
+        const resultLimitSelect = document.getElementById('resultLimit');
         const resultsContainer = document.getElementById('results');
         
         let currentFolder = '';
@@ -463,6 +516,7 @@ def home():
         searchBtn.addEventListener('click', async () => {
             const query = searchInput.value.trim();
             const folder = folderInput.value.trim();
+            const limit = resultLimitSelect.value;
             
             if (!query || !folder) return;
             
@@ -472,12 +526,12 @@ def home():
                 const response = await fetch('/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder, query })
+                    body: JSON.stringify({ folder, query, limit })
                 });
                 
                 const data = await response.json();
                 
-                if (data.results) {
+                if (data.results && data.results.length > 0) {
                     displayResults(data.results);
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
@@ -491,6 +545,7 @@ def home():
         imageSearchBtn.addEventListener('click', async () => {
             const folder = folderInput.value.trim();
             const file = imageUpload.files[0];
+            const limit = resultLimitSelect.value;
             
             if (!file || !folder) return;
             
@@ -500,6 +555,7 @@ def home():
                 const formData = new FormData();
                 formData.append('folder', folder);
                 formData.append('image', file);
+                formData.append('limit', limit);
                 
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
@@ -508,7 +564,7 @@ def home():
                 
                 const data = await response.json();
                 
-                if (data.results) {
+                if (data.results && data.results.length > 0) {
                     displayResults(data.results);
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
@@ -534,7 +590,19 @@ def home():
                 `;
                 
                 item.addEventListener('click', () => {
-                    item.classList.toggle('expanded');
+                    const img = item.querySelector('.thumbnail');
+                    const isExpanded = item.classList.contains('expanded');
+                    
+                    if (isExpanded) {
+                        // Collapse: switch back to thumbnail
+                        img.src = `data:image/jpeg;base64,${result.thumbnail}`;
+                        item.classList.remove('expanded');
+                    } else {
+                        // Expand: show original image
+                        const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
+                        img.src = originalImageUrl;
+                        item.classList.add('expanded');
+                    }
                 });
                 
                 resultsContainer.appendChild(item);
@@ -569,6 +637,23 @@ def home():
 </html>
     ''')
 
+@app.route('/image/<path:filepath>')
+def serve_image(filepath):
+    """Serve original images"""
+    try:
+        # Security check - prevent directory traversal
+        if '..' in filepath or filepath.startswith('/'):
+            return "Access denied", 403
+        
+        # Convert to absolute path and check if file exists
+        abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+            return "Image not found", 404
+            
+        return send_file(abs_path)
+    except Exception as e:
+        return f"Error serving image: {str(e)}", 500
+
 @app.route('/check_index', methods=['POST'])
 def check_index():
     """Check if folder is indexed"""
@@ -601,9 +686,19 @@ def search():
     """Search for images"""
     folder = request.json.get('folder')
     query = request.json.get('query')
+    limit = request.json.get('limit', 10)
+    print(f"Search request: folder={folder}, query={query}, limit={limit}")
     
     if not folder or not query:
         return jsonify({'error': 'Missing folder or query'}), 400
+    
+    # Validate limit
+    try:
+        limit = int(limit)
+        if limit < 6 or limit > 60:
+            limit = 12
+    except (ValueError, TypeError):
+        limit = 12
     
     # Load index
     index, image_paths = load_index(folder)
@@ -615,41 +710,59 @@ def search():
         text_embedding = get_text_embedding(query)
         
         # Search
-        k = min(10, len(image_paths))
+        k = min(limit, len(image_paths))
+        if k == 0:
+            return jsonify({'results': []})
         similarities, indices = index.search(text_embedding.reshape(1, -1), k)
         
         results = []
         for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):
-            if idx < len(image_paths):
-                img_path = image_paths[idx]
-                
-                # Create thumbnail
-                img = Image.open(img_path)
-                img.thumbnail((400, 400), Image.Resampling.LANCZOS)
-                
-                # Convert to base64
-                buffer = BytesIO()
-                img.save(buffer, format='JPEG', quality=85)
-                img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                
-                results.append({
-                    'path': img_path,
-                    'filename': os.path.basename(img_path),
-                    'similarity': float(sim),
-                    'thumbnail': img_base64
-                })
+            if idx >= 0 and idx < len(image_paths):
+                try:
+                    img_path = image_paths[idx]
+                    
+                    # Create thumbnail
+                    img = Image.open(img_path)
+                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    
+                    # Convert to base64
+                    buffer = BytesIO()
+                    img.save(buffer, format='JPEG', quality=85)
+                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+                    
+                    results.append({
+                        'path': img_path,
+                        'filename': os.path.basename(img_path),
+                        'similarity': float(sim),
+                        'thumbnail': img_base64
+                    })
+                except Exception as img_error:
+                    print(f"Error processing image {img_path}: {img_error}")
+                    continue
         
         return jsonify({'results': results})
     except Exception as e:
+        print(f"Text search error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/search_by_image', methods=['POST'])
 def search_by_image():
     """Search for images using an uploaded image"""
     folder = request.form.get('folder')
+    limit = request.form.get('limit', 12)
     
     if not folder:
         return jsonify({'error': 'Missing folder'}), 400
+    
+    # Validate limit
+    try:
+        limit = int(limit)
+        if limit < 6 or limit > 60:
+            limit = 12
+    except (ValueError, TypeError):
+        limit = 12
     
     if 'image' not in request.files:
         return jsonify({'error': 'No image uploaded'}), 400
@@ -673,29 +786,35 @@ def search_by_image():
         image_embedding = get_image_embedding_from_pil(uploaded_image)
         
         # Search
-        k = min(10, len(image_paths))
+        k = min(limit, len(image_paths))
+        if k == 0:
+            return jsonify({'results': []})
         similarities, indices = index.search(image_embedding.reshape(1, -1), k)
         
         results = []
         for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):
-            if idx < len(image_paths):
-                img_path = image_paths[idx]
-                
-                # Create thumbnail
-                img = Image.open(img_path)
-                img.thumbnail((400, 400), Image.Resampling.LANCZOS)
-                
-                # Convert to base64
-                buffer = BytesIO()
-                img.save(buffer, format='JPEG', quality=85)
-                img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                
-                results.append({
-                    'path': img_path,
-                    'filename': os.path.basename(img_path),
-                    'similarity': float(sim),
-                    'thumbnail': img_base64
-                })
+            if idx >= 0 and idx < len(image_paths):
+                try:
+                    img_path = image_paths[idx]
+                    
+                    # Create thumbnail
+                    img = Image.open(img_path)
+                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    
+                    # Convert to base64
+                    buffer = BytesIO()
+                    img.save(buffer, format='JPEG', quality=85)
+                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+                    
+                    results.append({
+                        'path': img_path,
+                        'filename': os.path.basename(img_path),
+                        'similarity': float(sim),
+                        'thumbnail': img_base64
+                    })
+                except Exception as img_error:
+                    print(f"Error processing image {img_path}: {img_error}")
+                    continue
         
         return jsonify({'results': results})
     except Exception as e:
