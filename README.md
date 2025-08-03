@@ -2,7 +2,7 @@
 
 A CLIP-powered image search server with two UIs:
 - **app.py**: Modern glassmorphic interface, uses the last enlarged image as the background.
-- **oldapp.py**: Clean, dark UI with minimal design and search-by-image functionality.
+- **oldapp.py**: Advanced dark UI with comprehensive search and management features.
 
 ## Prerequisites
 - Windows 10/11 or Ubuntu 20.04+
@@ -50,35 +50,78 @@ pip install -r requirements.txt
 python app.py
 ```
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
-- Features: glassmorphic UI, last enlarged image becomes the background. not the best option, for minimalist :)
+- Features: Modern glassmorphic UI, last enlarged image becomes the background.
 
-### For the Minimal Backend (`oldapp.py`)
+### For the Advanced Interface (`oldapp.py`)
 ```sh
 python oldapp.py
 ```
 - Open your browser and go to: [http://localhost:5000](http://localhost:5000)
-- Features: Clean, dark UI with search-by-image functionality.
+- Features: Comprehensive search and management interface with advanced functionality.
 
-## Search Modes
+## Features
 
-### Text Search
-- Enter a natural language description of what you're looking for
-- Example: "a red car", "sunset over mountains", "people playing basketball"
+### Search Capabilities
+- **Text Search**: Natural language descriptions (e.g., "red car", "sunset over mountains")
+- **Image Search**: Upload an image to find visually similar images
+- **Configurable Results**: Choose result limits from 6 to 60 images
+- **Smart Limit Handling**: Returns available results even when limit exceeds total matches
 
-### Image Search (oldapp.py only)
-- Upload an image to find visually similar images in your indexed folder
-- Supports common image formats (jpg, png, webp, etc.)
-- Uses CLIP embeddings for semantic similarity matching
+### Image Management
+- **Original Image Viewing**: Click thumbnails to view full-resolution images
+- **Comment System**: Add timestamped comments to any image
+- **Comment History**: View all previous comments with timestamps
+- **Persistent Storage**: Comments saved locally with search index
+
+### User Interface (oldapp.py)
+- **Dual Search Modes**: Toggle between text and image search
+- **Dark Theme**: Clean, modern dark interface
+- **Responsive Grid**: Auto-adjusting image grid layout
+- **Expandable Results**: Click to expand images and access features
+- **Real-time Feedback**: Loading states and error handling
+
+### Technical Features
+- **CLIP Embeddings**: Semantic similarity matching using OpenAI's CLIP
+- **FAISS Indexing**: Fast similarity search with persistent indexes
+- **Robust Error Handling**: Graceful handling of corrupted or missing images
+- **Security**: Input validation and XSS protection
+- **Cross-platform**: Works on Windows and Linux
+
+## How to Use
+
+1. **Index a Folder**: Enter the path to your image folder and click "Index Folder"
+2. **Search Images**: 
+   - Type a natural language description, or
+   - Upload an image for similarity search
+3. **View Results**: Browse thumbnail results with similarity scores
+4. **Expand Images**: Click any result to view the full-resolution image
+5. **Add Comments**: In expanded view, add comments that persist across searches
+6. **Manage Results**: Use the dropdown to adjust the number of results shown
+
+## File Structure
+
+- `app.py` - Glassmorphic interface version
+- `oldapp.py` - Advanced interface with full feature set
+- `requirements.txt` - Python dependencies
+- `CLAUDE.md` - Development documentation
+- `.clip_index/` - Created in indexed folders containing:
+  - `index.faiss` - FAISS vector index
+  - `paths.pkl` - Image file paths
+  - `comments.json` - User comments and timestamps
 
 ## Notes
 - On Windows, the scripts automatically handle OpenMP runtime issues for FAISS/CLIP.
 - Indexing and searching work with folders containing images (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`).
 - For best performance, use a CUDA-capable GPU and the appropriate PyTorch version.
+- Comments are stored locally in the indexed folder and persist across sessions.
 
 ## Troubleshooting
 - If you see errors about OpenMP or `libiomp5md.dll`, ensure you are using the provided scripts (they set the required environment variable).
 - If you have issues with dependencies, try upgrading pip and reinstalling requirements.
+- If search returns fewer results than expected, check that images are in supported formats.
+- Comments not saving? Ensure the application has write permissions to the indexed folder.
 
 ---
 
-Enjoy fast, natural language image search with CLIP!
+Enjoy fast, natural language image search with CLIP and comprehensive image management\!
+EOF < /dev/null

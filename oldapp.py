@@ -108,6 +108,57 @@ def load_index(folder_path):
     except:
         return None, None
 
+def load_comments(folder_path):
+    """Load comments from JSON file"""
+    index_path = Path(folder_path) / '.clip_index'
+    comments_file = index_path / 'comments.json'
+    
+    if not comments_file.exists():
+        return {}
+    
+    try:
+        import json
+        with open(comments_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_comments(folder_path, comments_data):
+    """Save comments to JSON file"""
+    index_path = Path(folder_path) / '.clip_index'
+    index_path.mkdir(exist_ok=True)
+    comments_file = index_path / 'comments.json'
+    
+    try:
+        import json
+        with open(comments_file, 'w', encoding='utf-8') as f:
+            json.dump(comments_data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving comments: {e}")
+        return False
+
+def get_image_comments(folder_path, image_path):
+    """Get comments for specific image"""
+    comments_data = load_comments(folder_path)
+    return comments_data.get(image_path, [])
+
+def add_image_comment(folder_path, image_path, comment):
+    """Add new comment to image"""
+    comments_data = load_comments(folder_path)
+    
+    if image_path not in comments_data:
+        comments_data[image_path] = []
+    
+    # Add timestamp to comment
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    comment_with_timestamp = f"[{timestamp}] {comment}"
+    
+    comments_data[image_path].append(comment_with_timestamp)
+    
+    return save_comments(folder_path, comments_data)
+
 @app.route('/')
 def home():
     """Serve the frontend"""
@@ -382,6 +433,160 @@ def home():
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+        
+        /* Comment System Styles */
+        .comment-section {
+            display: none;
+            padding: 1rem;
+            border-top: 1px solid #333;
+            background: #0f0f0f;
+        }
+        
+        .result-item.expanded .comment-section {
+            display: block;
+        }
+        
+        .comments-list {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 1rem;
+            padding: 0.5rem;
+            background: #1a1a1a;
+            border-radius: 6px;
+            border: 1px solid #333;
+        }
+        
+        .comment-item {
+            padding: 0.5rem;
+            margin-bottom: 0.5rem;
+            background: #222;
+            border-radius: 4px;
+            border-left: 3px solid #555;
+            font-size: 0.85rem;
+            line-height: 1.4;
+            color: #e0e0e0;
+        }
+        
+        .comment-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .comment-timestamp {
+            color: #888;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        
+        .comment-text {
+            margin-top: 0.25rem;
+            color: #ccc;
+        }
+        
+        .comment-form {
+            display: flex;
+            gap: 0.5rem;
+            align-items: flex-start;
+        }
+        
+        .comment-input {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 0.85rem;
+            resize: vertical;
+            min-height: 60px;
+            font-family: inherit;
+        }
+        
+        .comment-input:focus {
+            outline: none;
+            border-color: #555;
+        }
+        
+        .comment-input::placeholder {
+            color: #666;
+        }
+        
+        .save-comment-btn {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #e0e0e0;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        
+        .save-comment-btn:hover {
+            background: #333;
+            border-color: #555;
+        }
+        
+        .save-comment-btn:disabled {
+            background: #1a1a1a;
+            border-color: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        
+        .no-comments {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+            padding: 1rem;
+            font-size: 0.85rem;
+        }
+        
+        .comment-loading {
+            text-align: center;
+            color: #888;
+            font-size: 0.85rem;
+            padding: 0.5rem;
+        }
+        
+        /* Copy Path Button */
+        .image-controls {
+            padding: 0.75rem;
+            border-bottom: 1px solid #333;
+            background: #0f0f0f;
+            display: none;
+        }
+        
+        .result-item.expanded .image-controls {
+            display: block;
+        }
+        
+        .copy-path-btn {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #e0e0e0;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .copy-path-btn:hover {
+            background: #333;
+            border-color: #555;
+        }
+        
+        .copy-path-btn:active {
+            transform: translateY(1px);
+        }
+        
+        .copy-icon {
+            font-size: 0.8rem;
+        }
     </style>
 </head>
 <body>
@@ -587,9 +792,29 @@ def home():
                         <div class="filename">${result.filename}</div>
                         <div class="similarity">Similarity: ${(result.similarity * 100).toFixed(1)}%</div>
                     </div>
+                    <div class="image-controls">
+                        <button class="copy-path-btn" id="copy-btn-${index}">
+                            <span class="copy-icon">📋</span>
+                            Copy Path
+                        </button>
+                    </div>
+                    <div class="comment-section">
+                        <div class="comments-list" id="comments-${index}">
+                            <div class="comment-loading">Loading comments...</div>
+                        </div>
+                        <div class="comment-form">
+                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                        </div>
+                    </div>
                 `;
                 
-                item.addEventListener('click', () => {
+                item.addEventListener('click', (e) => {
+                    // Don't toggle if clicking on comment section or image controls
+                    if (e.target.closest('.comment-section') || e.target.closest('.image-controls')) {
+                        return;
+                    }
+                    
                     const img = item.querySelector('.thumbnail');
                     const isExpanded = item.classList.contains('expanded');
                     
@@ -598,15 +823,164 @@ def home():
                         img.src = `data:image/jpeg;base64,${result.thumbnail}`;
                         item.classList.remove('expanded');
                     } else {
-                        // Expand: show original image
+                        // Expand: show original image and load comments
                         const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
                         img.src = originalImageUrl;
                         item.classList.add('expanded');
+                        loadComments(index, result.path, folderInput.value.trim());
                     }
+                });
+                
+                // Add save comment functionality
+                const saveBtn = item.querySelector(`#save-btn-${index}`);
+                const commentInput = item.querySelector(`#comment-input-${index}`);
+                
+                saveBtn.addEventListener('click', () => {
+                    saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+                });
+                
+                // Add copy path functionality
+                const copyBtn = item.querySelector(`#copy-btn-${index}`);
+                copyBtn.addEventListener('click', () => {
+                    copyImagePath(result.path, result.filename, copyBtn);
                 });
                 
                 resultsContainer.appendChild(item);
             });
+        }
+        
+        // Comment functionality
+        async function loadComments(index, imagePath, folder) {
+            const commentsContainer = document.getElementById(`comments-${index}`);
+            
+            try {
+                const response = await fetch(`/comments?folder=${encodeURIComponent(folder)}&image_path=${encodeURIComponent(imagePath)}`);
+                const data = await response.json();
+                
+                if (data.comments && data.comments.length > 0) {
+                    displayComments(commentsContainer, data.comments);
+                } else {
+                    commentsContainer.innerHTML = '<div class="no-comments">No comments yet. Be the first to add one!</div>';
+                }
+            } catch (error) {
+                console.error('Error loading comments:', error);
+                commentsContainer.innerHTML = '<div class="no-comments">Error loading comments</div>';
+            }
+        }
+        
+        function displayComments(container, comments) {
+            container.innerHTML = '';
+            comments.forEach(comment => {
+                const commentDiv = document.createElement('div');
+                commentDiv.className = 'comment-item';
+                
+                // Parse timestamp and comment text
+                const timestampMatch = comment.match(/^\\[(.*?)\\] (.*)$/);
+                if (timestampMatch) {
+                    const [, timestamp, text] = timestampMatch;
+                    commentDiv.innerHTML = `
+                        <div class="comment-timestamp">${timestamp}</div>
+                        <div class="comment-text">${escapeHtml(text)}</div>
+                    `;
+                } else {
+                    commentDiv.innerHTML = `<div class="comment-text">${escapeHtml(comment)}</div>`;
+                }
+                
+                container.appendChild(commentDiv);
+            });
+        }
+        
+        async function saveComment(index, imagePath, folder, comment) {
+            if (!comment) return;
+            
+            const saveBtn = document.getElementById(`save-btn-${index}`);
+            const commentInput = document.getElementById(`comment-input-${index}`);
+            
+            // Disable button during save
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            
+            try {
+                const response = await fetch('/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder: folder,
+                        image_path: imagePath,
+                        comment: comment
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Clear input and reload comments
+                    commentInput.value = '';
+                    const commentsContainer = document.getElementById(`comments-${index}`);
+                    displayComments(commentsContainer, data.comments);
+                } else {
+                    alert('Error saving comment: ' + (data.error || 'Unknown error'));
+                }
+            } catch (error) {
+                console.error('Error saving comment:', error);
+                alert('Error saving comment: ' + error.message);
+            } finally {
+                // Re-enable button
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save';
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        async function copyImagePath(imagePath, filename, button) {
+            try {
+                const textToCopy = `Path: ${imagePath}\nFilename: ${filename}`;
+                
+                if (navigator.clipboard && window.isSecureContext) {
+                    // Use modern clipboard API
+                    await navigator.clipboard.writeText(textToCopy);
+                } else {
+                    // Fallback for older browsers
+                    const textArea = document.createElement('textarea');
+                    textArea.value = textToCopy;
+                    textArea.style.position = 'fixed';
+                    textArea.style.left = '-999999px';
+                    textArea.style.top = '-999999px';
+                    document.body.appendChild(textArea);
+                    textArea.focus();
+                    textArea.select();
+                    document.execCommand('copy');
+                    textArea.remove();
+                }
+                
+                // Visual feedback
+                const originalText = button.innerHTML;
+                button.innerHTML = '<span class="copy-icon">✅</span>Copied!';
+                button.style.backgroundColor = '#2d4a2d';
+                
+                setTimeout(() => {
+                    button.innerHTML = originalText;
+                    button.style.backgroundColor = '';
+                }, 2000);
+                
+            } catch (error) {
+                console.error('Failed to copy:', error);
+                
+                // Error feedback
+                const originalText = button.innerHTML;
+                button.innerHTML = '<span class="copy-icon">❌</span>Failed';
+                button.style.backgroundColor = '#4a2d2d';
+                
+                setTimeout(() => {
+                    button.innerHTML = originalText;
+                    button.style.backgroundColor = '';
+                }, 2000);
+            }
         }
         
         // Enter key support
@@ -653,6 +1027,48 @@ def serve_image(filepath):
         return send_file(abs_path)
     except Exception as e:
         return f"Error serving image: {str(e)}", 500
+
+@app.route('/comments', methods=['GET'])
+def get_comments():
+    """Get comments for a specific image"""
+    folder = request.args.get('folder')
+    image_path = request.args.get('image_path')
+    
+    if not folder or not image_path:
+        return jsonify({'error': 'Missing folder or image_path parameter'}), 400
+    
+    try:
+        comments = get_image_comments(folder, image_path)
+        return jsonify({'comments': comments})
+    except Exception as e:
+        print(f"Error getting comments: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/comments', methods=['POST'])
+def save_comment():
+    """Save a new comment for an image"""
+    data = request.json
+    folder = data.get('folder')
+    image_path = data.get('image_path')
+    comment = data.get('comment', '').strip()
+    
+    if not folder or not image_path or not comment:
+        return jsonify({'error': 'Missing folder, image_path, or comment'}), 400
+    
+    # Basic input sanitization
+    if len(comment) > 1000:
+        return jsonify({'error': 'Comment too long (max 1000 characters)'}), 400
+    
+    try:
+        success = add_image_comment(folder, image_path, comment)
+        if success:
+            comments = get_image_comments(folder, image_path)
+            return jsonify({'success': True, 'comments': comments})
+        else:
+            return jsonify({'error': 'Failed to save comment'}), 500
+    except Exception as e:
+        print(f"Error saving comment: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/check_index', methods=['POST'])
 def check_index():
