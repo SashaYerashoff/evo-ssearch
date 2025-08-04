@@ -11,6 +11,7 @@ from PIL import Image
 from pathlib import Path
 import base64
 from io import BytesIO
+from config import config
 
 app = Flask(__name__)
 CORS(app)
@@ -23,7 +24,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def init_clip():
     """Initialize CLIP model"""
     global model, preprocess
-    model, preprocess = clip.load("ViT-B/32", device=device)
+    model, preprocess = clip.load(config.CLIP_MODEL, device=device)
     
 def get_image_embedding(image_path):
     """Extract CLIP embedding from image"""
@@ -57,7 +58,7 @@ def create_index(folder_path):
     image_metadata = []
     
     # Supported image formats
-    extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    extensions = config.SUPPORTED_EXTENSIONS
     
     for ext in extensions:
         for img_path in folder_path.glob(f'*{ext}'):
@@ -89,7 +90,7 @@ def create_index(folder_path):
 
 def save_index(index, image_paths, image_metadata, folder_path):
     """Save FAISS index and metadata"""
-    index_path = Path(folder_path) / '.clip_index'
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
     index_path.mkdir(exist_ok=True)
     
     # Save FAISS index
@@ -105,7 +106,7 @@ def save_index(index, image_paths, image_metadata, folder_path):
 
 def load_index(folder_path):
     """Load FAISS index and metadata"""
-    index_path = Path(folder_path) / '.clip_index'
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
     
     if not index_path.exists():
         return None, None, None
@@ -134,7 +135,7 @@ def load_index(folder_path):
 
 def load_comments(folder_path):
     """Load comments from JSON file"""
-    index_path = Path(folder_path) / '.clip_index'
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
     comments_file = index_path / 'comments.json'
     
     if not comments_file.exists():
@@ -149,7 +150,7 @@ def load_comments(folder_path):
 
 def save_comments(folder_path, comments_data):
     """Save comments to JSON file"""
-    index_path = Path(folder_path) / '.clip_index'
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
     index_path.mkdir(exist_ok=True)
     comments_file = index_path / 'comments.json'
     
@@ -186,7 +187,43 @@ def add_image_comment(folder_path, image_path, comment):
 @app.route('/')
 def home():
     """Serve the frontend"""
-    return render_template_string('''
+    # Generate result limit options dynamically based on config
+    result_options = []
+    
+    # Create a reasonable set of options between min and max
+    min_val = config.MIN_RESULTS
+    max_val = config.MAX_RESULTS
+    default_val = config.DEFAULT_RESULTS
+    
+    # Generate options with reasonable intervals
+    options = set()
+    
+    # Always include min, default, and max
+    options.add(min_val)
+    options.add(default_val)
+    options.add(max_val)
+    
+    # Add some intermediate values
+    if max_val <= 20:
+        # Small range: add every 2-3 values
+        for i in range(min_val, max_val + 1):
+            if i % 2 == 0 or i % 3 == 0:
+                options.add(i)
+    else:
+        # Larger range: add multiples of 6, 12, etc.
+        for i in [6, 12, 18, 24, 30]:
+            if min_val <= i <= max_val:
+                options.add(i)
+    
+    # Sort and create HTML options
+    for i in sorted(options):
+        selected = "selected" if i == default_val else ""
+        result_options.append(f'<option value="{i}" {selected}>{i}</option>')
+    
+    result_options_html = '\n                            '.join(result_options)
+    
+    # Use string formatting for the result options
+    html_template = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -453,10 +490,6 @@ def home():
             display: block;
         }
         
-        .result-item.expanded .thumbnail {
-            height: auto;
-            max-height: 400px;
-        }
         
         .result-info {
             padding: 0.75rem;
@@ -609,44 +642,97 @@ def home():
             padding: 0.5rem;
         }
         
-        /* Copy Path Button */
-        .image-controls {
-            padding: 0.75rem;
-            border-bottom: 1px solid #333;
-            background: #0f0f0f;
-            display: none;
-        }
         
-        .result-item.expanded .image-controls {
+        /* Image Container and Overlay */
+        .image-container {
+            position: relative;
             display: block;
         }
         
-        .copy-path-btn {
-            background: #2a2a2a;
-            border: 1px solid #444;
-            color: #e0e0e0;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
+        .image-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* Allow clicks to pass through to image */
+        }
+        
+        .expand-collapse-icon {
+            position: absolute;
+            bottom: 8px;
+            right: 8px;
+            background: rgba(0, 0, 0, 0.7);
+            border-radius: 4px;
+            padding: 4px;
             cursor: pointer;
-            font-size: 0.85rem;
-            transition: all 0.2s;
+            pointer-events: auto; /* Re-enable clicks for the icon */
+            transition: all 0.2s ease;
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            justify-content: center;
         }
         
-        .copy-path-btn:hover {
-            background: #333;
-            border-color: #555;
+        .expand-collapse-icon:hover {
+            background: rgba(0, 0, 0, 0.9);
+            transform: scale(1.1);
         }
         
-        .copy-path-btn:active {
-            transform: translateY(1px);
+        .fit-fill-icon {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0, 0, 0, 0.7);
+            border-radius: 4px;
+            padding: 4px;
+            cursor: pointer;
+            pointer-events: auto; /* Re-enable clicks for the icon */
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         
+        .fit-fill-icon:hover {
+            background: rgba(0, 0, 0, 0.9);
+            transform: scale(1.1);
+        }
+        
+        /* Show fit/fill icon only when expanded */
+        .result-item.expanded .fit-fill-icon {
+            display: flex !important;
+        }
+        
+        /* Copy icon styling */
         .copy-icon {
-            font-size: 0.8rem;
+            margin-left: 8px;
+            cursor: pointer;
+            transition: fill 0.2s ease;
+            vertical-align: middle;
         }
+        
+        .copy-icon:hover {
+            fill: #e0e0e0;
+        }
+        
+        .filename {
+            display: flex;
+            align-items: center;
+        }
+        
+        /* Image display modes */
+        .result-item.expanded .thumbnail {
+            height: auto;
+            max-height: 400px;
+            object-fit: cover; /* Default: fill mode */
+            transition: object-fit 0.3s ease;
+        }
+        
+        .result-item.expanded .thumbnail.fit-mode {
+            object-fit: contain; /* Fit mode: show full image */
+            max-height: 600px;
+        }
+        
     </style>
 </head>
 <body>
@@ -681,13 +767,7 @@ def home():
                     <div class="limit-control">
                         <label for="resultLimit">Results:</label>
                         <select id="resultLimit">
-                            <option value="6">6</option>
-                            <option value="12" selected>12</option>
-                            <option value="18">18</option>
-                            <option value="24">24</option>
-                            <option value="30">30</option>
-                            <option value="48">48</option>
-                            <option value="60">60</option>
+                            {result_options_html}
                         </select>
                     </div>
                 </div>
@@ -894,16 +974,29 @@ def home():
                 const item = document.createElement('div');
                 item.className = 'result-item';
                 item.innerHTML = `
-                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
-                    <div class="result-info">
-                        <div class="filename">${result.filename}</div>
-                        <div class="similarity">Similarity: ${(result.similarity * 100).toFixed(1)}%</div>
+                    <div class="image-container">
+                        <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                        <div class="image-overlay">
+                            <div class="expand-collapse-icon" data-index="${index}">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                            <div class="fit-fill-icon" data-index="${index}" data-mode="fill" style="display: none;">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                        </div>
                     </div>
-                    <div class="image-controls">
-                        <button class="copy-path-btn" id="copy-btn-${index}">
-                            <span class="copy-icon">📋</span>
-                            Copy Path
-                        </button>
+                    <div class="result-info">
+                        <div class="filename">
+                            ${result.filename}
+                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                            </svg>
+                        </div>
+                        <div class="similarity">Similarity: ${(result.similarity * 100).toFixed(1)}%</div>
                     </div>
                     <div class="comment-section">
                         <div class="comments-list" id="comments-${index}">
@@ -916,26 +1009,25 @@ def home():
                     </div>
                 `;
                 
-                item.addEventListener('click', (e) => {
-                    // Don't toggle if clicking on comment section or image controls
-                    if (e.target.closest('.comment-section') || e.target.closest('.image-controls')) {
-                        return;
-                    }
-                    
-                    const img = item.querySelector('.thumbnail');
-                    const isExpanded = item.classList.contains('expanded');
-                    
-                    if (isExpanded) {
-                        // Collapse: switch back to thumbnail
-                        img.src = `data:image/jpeg;base64,${result.thumbnail}`;
-                        item.classList.remove('expanded');
-                    } else {
-                        // Expand: show original image and load comments
-                        const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
-                        img.src = originalImageUrl;
-                        item.classList.add('expanded');
-                        loadComments(index, result.path, folderInput.value.trim());
-                    }
+                // Handle expand/collapse via overlay icon
+                const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
+                expandCollapseIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageExpansion(item, result, index);
+                });
+                
+                // Handle copy icon click
+                const copyIcon = item.querySelector('.copy-icon');
+                copyIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    copyImagePath(result.path);
+                });
+                
+                // Handle fit/fill toggle
+                const fitFillIcon = item.querySelector('.fit-fill-icon');
+                fitFillIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageFit(item.querySelector('.thumbnail'), fitFillIcon);
                 });
                 
                 // Add save comment functionality
@@ -946,11 +1038,6 @@ def home():
                     saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
                 });
                 
-                // Add copy path functionality
-                const copyBtn = item.querySelector(`#copy-btn-${index}`);
-                copyBtn.addEventListener('click', () => {
-                    copyImagePath(result.path, result.filename, copyBtn);
-                });
                 
                 resultsContainer.appendChild(item);
             });
@@ -964,16 +1051,29 @@ def home():
                 const item = document.createElement('div');
                 item.className = 'result-item';
                 item.innerHTML = `
-                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
-                    <div class="result-info">
-                        <div class="filename">${result.filename}</div>
-                        <div class="similarity">Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}</div>
+                    <div class="image-container">
+                        <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                        <div class="image-overlay">
+                            <div class="expand-collapse-icon" data-index="${index}">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                            <div class="fit-fill-icon" data-index="${index}" data-mode="fill" style="display: none;">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                        </div>
                     </div>
-                    <div class="image-controls">
-                        <button class="copy-path-btn" id="copy-btn-${index}">
-                            <span class="copy-icon">📋</span>
-                            Copy Path
-                        </button>
+                    <div class="result-info">
+                        <div class="filename">
+                            ${result.filename}
+                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                            </svg>
+                        </div>
+                        <div class="similarity">Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}</div>
                     </div>
                     <div class="comment-section">
                         <div class="comments-list" id="comments-${index}">
@@ -986,26 +1086,25 @@ def home():
                     </div>
                 `;
                 
-                item.addEventListener('click', (e) => {
-                    // Don't toggle if clicking on comment section or image controls
-                    if (e.target.closest('.comment-section') || e.target.closest('.image-controls')) {
-                        return;
-                    }
-                    
-                    const img = item.querySelector('.thumbnail');
-                    const isExpanded = item.classList.contains('expanded');
-                    
-                    if (isExpanded) {
-                        // Collapse: switch back to thumbnail
-                        img.src = `data:image/jpeg;base64,${result.thumbnail}`;
-                        item.classList.remove('expanded');
-                    } else {
-                        // Expand: show original image and load comments
-                        const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
-                        img.src = originalImageUrl;
-                        item.classList.add('expanded');
-                        loadComments(index, result.path, folderInput.value.trim());
-                    }
+                // Handle expand/collapse via overlay icon
+                const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
+                expandCollapseIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageExpansion(item, result, index);
+                });
+                
+                // Handle copy icon click
+                const copyIcon = item.querySelector('.copy-icon');
+                copyIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    copyImagePath(result.path);
+                });
+                
+                // Handle fit/fill toggle
+                const fitFillIcon = item.querySelector('.fit-fill-icon');
+                fitFillIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageFit(item.querySelector('.thumbnail'), fitFillIcon);
                 });
                 
                 // Add save comment functionality
@@ -1016,11 +1115,6 @@ def home():
                     saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
                 });
                 
-                // Add copy path functionality
-                const copyBtn = item.querySelector(`#copy-btn-${index}`);
-                copyBtn.addEventListener('click', () => {
-                    copyImagePath(result.path, result.filename, copyBtn);
-                });
                 
                 resultsContainer.appendChild(item);
             });
@@ -1114,9 +1208,54 @@ def home():
             return div.innerHTML;
         }
         
-        async function copyImagePath(imagePath, filename, button) {
+        function toggleImageExpansion(item, result, index) {
+            const img = item.querySelector('.thumbnail');
+            const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
+            const isExpanded = item.classList.contains('expanded');
+            
+            if (isExpanded) {
+                // Collapse: switch back to thumbnail
+                img.src = `data:image/jpeg;base64,${result.thumbnail}`;
+                item.classList.remove('expanded');
+                // Update icon to expand
+                expandCollapseIcon.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                    </svg>
+                `;
+            } else {
+                // Expand: show original image and load comments
+                const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
+                img.src = originalImageUrl;
+                item.classList.add('expanded');
+                loadComments(index, result.path, folderInput.value.trim());
+                // Update icon to collapse
+                expandCollapseIcon.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="M432-432v240h-72v-168H192v-72h240Zm168-336v168h168v72H528v-240h72Z"/>
+                    </svg>
+                `;
+            }
+        }
+        
+        function toggleImageFit(img, fitFillIcon) {
+            const currentMode = fitFillIcon.getAttribute('data-mode');
+            
+            if (currentMode === 'fill') {
+                // Switch to fit mode
+                img.classList.add('fit-mode');
+                fitFillIcon.setAttribute('data-mode', 'fit');
+                // You can update the icon here if you want different icons for fit/fill
+            } else {
+                // Switch to fill mode
+                img.classList.remove('fit-mode');
+                fitFillIcon.setAttribute('data-mode', 'fill');
+            }
+        }
+        
+        async function copyImagePath(imagePath) {
             try {
-                const textToCopy = `Path: ${imagePath}\nFilename: ${filename}`;
+                const textToCopy = imagePath;
                 
                 if (navigator.clipboard && window.isSecureContext) {
                     // Use modern clipboard API
@@ -1135,28 +1274,11 @@ def home():
                     textArea.remove();
                 }
                 
-                // Visual feedback
-                const originalText = button.innerHTML;
-                button.innerHTML = '<span class="copy-icon">✅</span>Copied!';
-                button.style.backgroundColor = '#2d4a2d';
-                
-                setTimeout(() => {
-                    button.innerHTML = originalText;
-                    button.style.backgroundColor = '';
-                }, 2000);
+                // Simple console feedback for now (could add toast notification)
+                console.log('Copied to clipboard:', imagePath);
                 
             } catch (error) {
                 console.error('Failed to copy:', error);
-                
-                // Error feedback
-                const originalText = button.innerHTML;
-                button.innerHTML = '<span class="copy-icon">❌</span>Failed';
-                button.style.backgroundColor = '#4a2d2d';
-                
-                setTimeout(() => {
-                    button.innerHTML = originalText;
-                    button.style.backgroundColor = '';
-                }, 2000);
             }
         }
         
@@ -1186,7 +1308,10 @@ def home():
     </script>
 </body>
 </html>
-    ''')
+    '''
+    
+    # Replace the placeholder with actual options
+    return html_template.replace('{result_options_html}', result_options_html)
 
 @app.route('/image/<path:filepath>')
 def serve_image(filepath):
@@ -1233,8 +1358,8 @@ def save_comment():
         return jsonify({'error': 'Missing folder, image_path, or comment'}), 400
     
     # Basic input sanitization
-    if len(comment) > 1000:
-        return jsonify({'error': 'Comment too long (max 1000 characters)'}), 400
+    if len(comment) > config.MAX_COMMENT_LENGTH:
+        return jsonify({'error': f'Comment too long (max {config.MAX_COMMENT_LENGTH} characters)'}), 400
     
     try:
         success = add_image_comment(folder, image_path, comment)
@@ -1273,11 +1398,11 @@ def get_commented_images():
                     
                     # Create thumbnail
                     img = Image.open(image_path)
-                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
                     
                     # Convert to base64
                     buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=85)
+                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
                     img_base64 = base64.b64encode(buffer.getvalue()).decode()
                     
                     # Get metadata if available
@@ -1351,10 +1476,10 @@ def search():
     # Validate limit
     try:
         limit = int(limit)
-        if limit < 6 or limit > 60:
-            limit = 12
+        if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+            limit = config.DEFAULT_RESULTS
     except (ValueError, TypeError):
-        limit = 12
+        limit = config.DEFAULT_RESULTS
     
     # Load index
     index, image_paths, image_metadata = load_index(folder)
@@ -1379,11 +1504,11 @@ def search():
                     
                     # Create thumbnail
                     img = Image.open(img_path)
-                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
                     
                     # Convert to base64
                     buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=85)
+                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
                     img_base64 = base64.b64encode(buffer.getvalue()).decode()
                     
                     # Get metadata if available
@@ -1432,10 +1557,10 @@ def search_by_image():
     # Validate limit
     try:
         limit = int(limit)
-        if limit < 6 or limit > 60:
-            limit = 12
+        if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+            limit = config.DEFAULT_RESULTS
     except (ValueError, TypeError):
-        limit = 12
+        limit = config.DEFAULT_RESULTS
     
     if 'image' not in request.files:
         return jsonify({'error': 'No image uploaded'}), 400
@@ -1472,11 +1597,11 @@ def search_by_image():
                     
                     # Create thumbnail
                     img = Image.open(img_path)
-                    img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
                     
                     # Convert to base64
                     buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=85)
+                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
                     img_base64 = base64.b64encode(buffer.getvalue()).decode()
                     
                     # Get metadata if available
@@ -1511,4 +1636,5 @@ def search_by_image():
 
 if __name__ == '__main__':
     init_clip()
-    app.run(debug=True, port=5000)
+    config.print_startup_info()
+    app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)
