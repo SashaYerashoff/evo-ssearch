@@ -8,3 +8,4 @@ git+https://github.com/openai/CLIP.git
 ftfy>=6.1.1
 regex>=2024.4.24
 tqdm>=4.66.0
+python-dotenv>=1.0.0

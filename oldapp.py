@@ -254,11 +254,223 @@ def home():
             flex: 1;
         }
         
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+        
         h1 {
             font-size: 2rem;
             font-weight: 300;
-            margin-bottom: 2rem;
             letter-spacing: -0.02em;
+            margin: 0;
+        }
+        
+        .settings-icon {
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 6px;
+            transition: all 0.2s ease;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .settings-icon:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: scale(1.05);
+        }
+        
+        /* Settings Modal */
+        .settings-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            backdrop-filter: blur(4px);
+        }
+        
+        .settings-modal-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #161616;
+            border-radius: 12px;
+            border: 1px solid #262626;
+            width: 90%;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow-y: auto;
+            padding: 2rem;
+        }
+        
+        .settings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #333;
+        }
+        
+        .settings-header h2 {
+            font-size: 1.5rem;
+            font-weight: 300;
+            color: #e0e0e0;
+            margin: 0;
+        }
+        
+        .close-btn {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+        
+        .close-btn:hover {
+            color: #e0e0e0;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .settings-section {
+            margin-bottom: 2rem;
+        }
+        
+        .settings-section h3 {
+            font-size: 1.1rem;
+            font-weight: 400;
+            color: #e0e0e0;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #333;
+        }
+        
+        .settings-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            gap: 1rem;
+        }
+        
+        .settings-label {
+            flex: 1;
+            color: #ccc;
+            font-size: 0.9rem;
+            min-width: 120px;
+        }
+        
+        .settings-input {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            transition: border-color 0.2s;
+            max-width: 200px;
+        }
+        
+        .settings-input:focus {
+            outline: none;
+            border-color: #555;
+        }
+        
+        .settings-checkbox {
+            width: 18px;
+            height: 18px;
+            accent-color: #4a4a4a;
+        }
+        
+        .settings-select {
+            background: #0a0a0a;
+            border: 1px solid #333;
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            cursor: pointer;
+            max-width: 200px;
+        }
+        
+        .settings-range {
+            flex: 1;
+            max-width: 150px;
+            accent-color: #555;
+        }
+        
+        .range-value {
+            min-width: 30px;
+            text-align: center;
+            color: #888;
+            font-size: 0.85rem;
+        }
+        
+        .settings-actions {
+            display: flex;
+            gap: 1rem;
+            justify-content: flex-end;
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #333;
+        }
+        
+        .settings-btn {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #e0e0e0;
+            padding: 0.75rem 1.5rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+        
+        .settings-btn:hover {
+            background: #333;
+            border-color: #555;
+        }
+        
+        .settings-btn.primary {
+            background: #4a4a4a;
+            border-color: #666;
+        }
+        
+        .settings-btn.primary:hover {
+            background: #555;
+            border-color: #777;
+        }
+        
+        .settings-status {
+            margin-top: 1rem;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            display: none;
+        }
+        
+        .settings-status.success {
+            background: rgba(74, 222, 128, 0.1);
+            border: 1px solid rgba(74, 222, 128, 0.3);
+            color: #4ade80;
+        }
+        
+        .settings-status.error {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            color: #f87171;
         }
         
         .control-panel {
@@ -737,7 +949,14 @@ def home():
 </head>
 <body>
     <div class="container">
-        <h1>Natural Language Image Search</h1>
+        <div class="header">
+            <h1>Natural Language Image Search</h1>
+            <div class="settings-icon" id="settingsBtn">
+                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                    <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
+                </svg>
+            </div>
+        </div>
         
         <div class="control-panel">
             <div class="folder-select">
@@ -785,6 +1004,92 @@ def home():
         <div id="results" class="results-grid"></div>
     </div>
     
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="settings-modal">
+        <div class="settings-modal-content">
+            <div class="settings-header">
+                <h2>Settings</h2>
+                <button class="close-btn" id="closeSettings">&times;</button>
+            </div>
+            
+            <div class="settings-section">
+                <h3>Server Configuration</h3>
+                <div class="settings-row">
+                    <label class="settings-label">Host:</label>
+                    <input type="text" id="host" class="settings-input" placeholder="0.0.0.0">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Port:</label>
+                    <input type="number" id="port" class="settings-input" min="1000" max="65535" placeholder="5000">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Debug Mode:</label>
+                    <input type="checkbox" id="debug" class="settings-checkbox">
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>Search Configuration</h3>
+                <div class="settings-row">
+                    <label class="settings-label">Min Results:</label>
+                    <input type="number" id="minResults" class="settings-input" min="1" max="100" placeholder="3">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Max Results:</label>
+                    <input type="number" id="maxResults" class="settings-input" min="1" max="200" placeholder="48">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Default Results:</label>
+                    <input type="number" id="defaultResults" class="settings-input" min="1" max="100" placeholder="12">
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>Model & Processing</h3>
+                <div class="settings-row">
+                    <label class="settings-label">CLIP Model:</label>
+                    <select id="clipModel" class="settings-select">
+                        <option value="ViT-B/32">ViT-B/32</option>
+                        <option value="ViT-B/16">ViT-B/16</option>
+                        <option value="ViT-L/14">ViT-L/14</option>
+                    </select>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Batch Size:</label>
+                    <input type="number" id="batchSize" class="settings-input" min="1" max="128" placeholder="32">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Thumbnail Quality:</label>
+                    <input type="range" id="thumbnailQuality" class="settings-range" min="50" max="100" value="85">
+                    <span class="range-value" id="qualityValue">85</span>
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>Advanced Settings</h3>
+                <div class="settings-row">
+                    <label class="settings-label">Max Comment Length:</label>
+                    <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Max File Size (MB):</label>
+                    <input type="number" id="maxFileSize" class="settings-input" min="1" max="500" placeholder="50">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Index Folder Name:</label>
+                    <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
+                </div>
+            </div>
+            
+            <div class="settings-actions">
+                <button class="settings-btn" id="resetSettings">Reset to Defaults</button>
+                <button class="settings-btn primary" id="saveSettings">Save Settings</button>
+            </div>
+            
+            <div id="settingsStatus" class="settings-status"></div>
+        </div>
+    </div>
+    
     <script>
         const folderInput = document.getElementById('folderPath');
         const indexBtn = document.getElementById('indexBtn');
@@ -804,6 +1109,156 @@ def home():
         
         let currentFolder = '';
         let currentMode = 'text';
+        
+        // Settings modal elements
+        const settingsBtn = document.getElementById('settingsBtn');
+        const settingsModal = document.getElementById('settingsModal');
+        const closeSettingsBtn = document.getElementById('closeSettings');
+        const saveSettingsBtn = document.getElementById('saveSettings');
+        const resetSettingsBtn = document.getElementById('resetSettings');
+        const settingsStatus = document.getElementById('settingsStatus');
+        const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
+        const qualityValue = document.getElementById('qualityValue');
+        
+        // Settings modal functionality
+        settingsBtn.addEventListener('click', () => {
+            settingsModal.style.display = 'block';
+            loadSettings();
+        });
+        
+        closeSettingsBtn.addEventListener('click', () => {
+            settingsModal.style.display = 'none';
+        });
+        
+        // Close modal when clicking outside
+        settingsModal.addEventListener('click', (e) => {
+            if (e.target === settingsModal) {
+                settingsModal.style.display = 'none';
+            }
+        });
+        
+        // Thumbnail quality slider update
+        thumbnailQualitySlider.addEventListener('input', (e) => {
+            qualityValue.textContent = e.target.value;
+        });
+        
+        // Load current settings
+        async function loadSettings() {
+            try {
+                const response = await fetch('/settings');
+                const data = await response.json();
+                
+                if (data.success) {
+                    const settings = data.settings;
+                    document.getElementById('host').value = settings.host;
+                    document.getElementById('port').value = settings.port;
+                    document.getElementById('debug').checked = settings.debug;
+                    document.getElementById('clipModel').value = settings.clipModel;
+                    document.getElementById('minResults').value = settings.minResults;
+                    document.getElementById('maxResults').value = settings.maxResults;
+                    document.getElementById('defaultResults').value = settings.defaultResults;
+                    document.getElementById('batchSize').value = settings.batchSize;
+                    document.getElementById('thumbnailQuality').value = settings.thumbnailQuality;
+                    document.getElementById('qualityValue').textContent = settings.thumbnailQuality;
+                    document.getElementById('maxCommentLength').value = settings.maxCommentLength;
+                    document.getElementById('maxFileSize').value = settings.maxFileSize;
+                    document.getElementById('indexFolderName').value = settings.indexFolderName;
+                } else {
+                    showSettingsStatus('Error loading settings: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showSettingsStatus('Error loading settings: ' + error.message, 'error');
+            }
+        }
+        
+        // Save settings
+        saveSettingsBtn.addEventListener('click', async () => {
+            try {
+                const settings = {
+                    host: document.getElementById('host').value.trim(),
+                    port: parseInt(document.getElementById('port').value),
+                    debug: document.getElementById('debug').checked,
+                    clipModel: document.getElementById('clipModel').value,
+                    minResults: parseInt(document.getElementById('minResults').value),
+                    maxResults: parseInt(document.getElementById('maxResults').value),
+                    defaultResults: parseInt(document.getElementById('defaultResults').value),
+                    batchSize: parseInt(document.getElementById('batchSize').value),
+                    thumbnailQuality: parseInt(document.getElementById('thumbnailQuality').value),
+                    maxCommentLength: parseInt(document.getElementById('maxCommentLength').value),
+                    maxFileSize: parseInt(document.getElementById('maxFileSize').value),
+                    indexFolderName: document.getElementById('indexFolderName').value.trim()
+                };
+                
+                // Basic validation
+                if (!settings.host) {
+                    showSettingsStatus('Host cannot be empty', 'error');
+                    return;
+                }
+                
+                if (settings.minResults >= settings.maxResults) {
+                    showSettingsStatus('Min results must be less than max results', 'error');
+                    return;
+                }
+                
+                if (settings.defaultResults < settings.minResults || settings.defaultResults > settings.maxResults) {
+                    showSettingsStatus('Default results must be between min and max results', 'error');
+                    return;
+                }
+                
+                saveSettingsBtn.disabled = true;
+                saveSettingsBtn.textContent = 'Saving...';
+                
+                const response = await fetch('/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(settings)
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showSettingsStatus(data.message, 'success');
+                } else {
+                    showSettingsStatus('Error saving settings: ' + data.error, 'error');
+                }
+                
+            } catch (error) {
+                showSettingsStatus('Error saving settings: ' + error.message, 'error');
+            } finally {
+                saveSettingsBtn.disabled = false;
+                saveSettingsBtn.textContent = 'Save Settings';
+            }
+        });
+        
+        // Reset settings to defaults
+        resetSettingsBtn.addEventListener('click', () => {
+            if (confirm('Reset all settings to default values?')) {
+                document.getElementById('host').value = '0.0.0.0';
+                document.getElementById('port').value = '5000';
+                document.getElementById('debug').checked = false;
+                document.getElementById('clipModel').value = 'ViT-B/32';
+                document.getElementById('minResults').value = '3';
+                document.getElementById('maxResults').value = '48';
+                document.getElementById('defaultResults').value = '12';
+                document.getElementById('batchSize').value = '32';
+                document.getElementById('thumbnailQuality').value = '85';
+                document.getElementById('qualityValue').textContent = '85';
+                document.getElementById('maxCommentLength').value = '100';
+                document.getElementById('maxFileSize').value = '50';
+                document.getElementById('indexFolderName').value = '.clip_index';
+            }
+        });
+        
+        // Show settings status message
+        function showSettingsStatus(message, type) {
+            settingsStatus.textContent = message;
+            settingsStatus.className = `settings-status ${type}`;
+            settingsStatus.style.display = 'block';
+            
+            setTimeout(() => {
+                settingsStatus.style.display = 'none';
+            }, 5000);
+        }
         
         // Mode switching
         textModeBtn.addEventListener('click', () => {
@@ -1633,6 +2088,101 @@ def search_by_image():
         return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/settings', methods=['GET'])
+def get_settings():
+    """Get current configuration settings"""
+    try:
+        settings = {
+            'host': config.HOST,
+            'port': config.PORT,
+            'debug': config.DEBUG,
+            'clipModel': config.CLIP_MODEL,
+            'minResults': config.MIN_RESULTS,
+            'maxResults': config.MAX_RESULTS,
+            'defaultResults': config.DEFAULT_RESULTS,
+            'batchSize': config.BATCH_SIZE,
+            'thumbnailQuality': config.THUMBNAIL_QUALITY,
+            'maxCommentLength': config.MAX_COMMENT_LENGTH,
+            'maxFileSize': config.MAX_FILE_SIZE_MB,
+            'indexFolderName': config.INDEX_FOLDER_NAME
+        }
+        return jsonify({'success': True, 'settings': settings})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/settings', methods=['POST'])
+def save_settings():
+    """Save configuration settings to .env file"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        # Validate required fields
+        required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+        
+        # Validate data types and ranges
+        try:
+            port = int(data['port'])
+            if not (1000 <= port <= 65535):
+                return jsonify({'success': False, 'error': 'Port must be between 1000 and 65535'}), 400
+            
+            min_results = int(data['minResults'])
+            max_results = int(data['maxResults'])
+            default_results = int(data['defaultResults'])
+            
+            if not (1 <= min_results <= max_results):
+                return jsonify({'success': False, 'error': 'Min results must be less than or equal to max results'}), 400
+                
+            if not (min_results <= default_results <= max_results):
+                return jsonify({'success': False, 'error': 'Default results must be between min and max results'}), 400
+                
+        except ValueError as e:
+            return jsonify({'success': False, 'error': f'Invalid number format: {str(e)}'}), 400
+        
+        # Create .env file content
+        env_content = f"""# evo-ssearch Configuration
+# Generated by settings panel
+
+# Server Configuration
+EVOSSEARCH_HOST={data['host']}
+EVOSSEARCH_PORT={data['port']}
+EVOSSEARCH_DEBUG={str(data['debug']).lower()}
+
+# CLIP model configuration
+EVOSSEARCH_CLIP_MODEL={data['clipModel']}
+
+# Search result limits
+EVOSSEARCH_MIN_RESULTS={data['minResults']}
+EVOSSEARCH_MAX_RESULTS={data['maxResults']}
+EVOSSEARCH_DEFAULT_RESULTS={data['defaultResults']}
+
+# Processing configuration
+EVOSSEARCH_BATCH_SIZE={data.get('batchSize', 32)}
+EVOSSEARCH_THUMBNAIL_QUALITY={data.get('thumbnailQuality', 85)}
+
+# File system configuration
+EVOSSEARCH_INDEX_FOLDER={data.get('indexFolderName', '.clip_index')}
+
+# Comment system configuration
+EVOSSEARCH_MAX_COMMENT_LENGTH={data.get('maxCommentLength', 100)}
+
+# Security configuration
+EVOSSEARCH_MAX_FILE_SIZE_MB={data.get('maxFileSize', 50)}
+"""
+        
+        # Write to .env file
+        with open('.env', 'w', encoding='utf-8') as f:
+            f.write(env_content)
+        
+        return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server to apply changes.'})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     init_clip()

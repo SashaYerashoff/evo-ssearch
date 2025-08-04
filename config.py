@@ -3,6 +3,17 @@ Configuration file for evo-ssearch oldapp.py
 Contains all configurable settings with environment variable support
 """
 import os
+from pathlib import Path
+
+# Load .env file if it exists
+try:
+    from dotenv import load_dotenv
+    env_path = Path('.') / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+except ImportError:
+    # python-dotenv not installed, fall back to environment variables only
+    pass
 
 class Config:
     # Server configuration

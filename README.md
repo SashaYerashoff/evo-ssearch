@@ -76,9 +76,26 @@ The server will display available URLs on startup:
 
 ## Configuration
 
-Environment variables for customization:
+### Frontend Settings Panel (Recommended)
 
-### Server Configuration
+**Easy Configuration via Web UI:**
+- Click the settings gear icon (⚙️) in the top-right corner of the application
+- Modify settings in the organized modal panel
+- Click "Save Settings" to persist changes to `.env` file
+- Restart the server to apply new configuration
+
+**Available Settings:**
+- **Server**: Host, Port, Debug Mode
+- **Search**: Min/Max/Default result limits  
+- **Model**: CLIP model variant, batch size, thumbnail quality
+- **Advanced**: Comment length limits, file size limits, index folder name
+
+Settings are automatically saved to `.env` file and persist across restarts.
+
+### Environment Variables (Advanced)
+
+For command-line configuration or CI/CD environments:
+
 ```bash
 # Server settings
 EVOSSEARCH_HOST=0.0.0.0          # Server host (0.0.0.0 for network access)
@@ -92,6 +109,13 @@ EVOSSEARCH_DEFAULT_RESULTS=12    # Default search results
 
 # Model configuration
 EVOSSEARCH_CLIP_MODEL=ViT-B/32   # CLIP model variant
+EVOSSEARCH_BATCH_SIZE=32         # Processing batch size
+EVOSSEARCH_THUMBNAIL_QUALITY=85  # JPEG quality (50-100)
+
+# Advanced settings
+EVOSSEARCH_MAX_COMMENT_LENGTH=500 # Max comment characters
+EVOSSEARCH_MAX_FILE_SIZE_MB=50   # Max upload file size
+EVOSSEARCH_INDEX_FOLDER=.clip_index # Index folder name
 ```
 
 ### Example Usage
@@ -126,6 +150,7 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 
 | Icon | Location | Function |
 |------|----------|----------|
+| ⚙️ (settings) | Top-right of header | Open settings panel for configuration |
 | ⤢ (expand) | Bottom-right of thumbnail | Expand to full view |
 | ⤡ (collapse) | Bottom-right of expanded image | Collapse to thumbnail |
 | ⤢ (fit/fill) | Bottom-left of expanded image | Toggle between fit (show full) and fill (crop) modes |
@@ -155,11 +180,13 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 evo-ssearch/
 ├── oldapp.py              # Main application
 ├── config.py              # Configuration with environment variable support
+├── .env                   # Settings file (created by settings panel)
 ├── requirements.txt       # Python dependencies
 ├── images/                # SVG icons for UI controls
 │   ├── expand_content_*.svg
 │   ├── collapse_content_*.svg
-│   └── content_copy_*.svg
+│   ├── content_copy_*.svg
+│   └── settings_*.svg
 └── [indexed-folder]/
     └── .clip_index/       # Created automatically
         ├── index.faiss    # FAISS vector index
