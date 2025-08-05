@@ -70,9 +70,10 @@ EVOSSEARCH_DEBUG=False python oldapp.py
 ### Core Components
 
 **CLIP Integration**: Uses OpenAI's CLIP model (configurable, default ViT-B/32) for:
-- Text-to-image semantic search
-- Image-to-image similarity search
+- Text-to-image semantic search using natural language descriptions
+- Image-to-image similarity search via file upload or image path input
 - Feature extraction and embedding generation
+- "Find Similar" functionality from any displayed image
 
 **FAISS Indexing**: 
 - Vector similarity search using Facebook's FAISS library
@@ -89,16 +90,17 @@ EVOSSEARCH_DEBUG=False python oldapp.py
 
 **Modern Dark Interface**:
 - Clean, minimal design with dark theme
-- Dual search modes (text and image-based)
+- Dual search modes (text and image-based with file upload or path input)
 - Dynamic result limits (configurable 3-48 images)
 - SVG overlay controls for better UX
 
 **Image Management**:
 - Thumbnail view with expand/collapse functionality
-- Fit/fill toggle for expanded images (crop vs. contain)
+- Expanded images take full row with 900px minimum width and no cropping
 - Inline copy functionality for file paths
 - Image commenting system with timestamps
 - Sort by similarity or modification time
+- "Find Similar" functionality from expanded images
 
 ### API Endpoints
 
@@ -106,7 +108,7 @@ EVOSSEARCH_DEBUG=False python oldapp.py
 - `GET /` - Serve frontend interface
 - `POST /index` - Index folder for search  
 - `POST /search` - Text-based image search
-- `POST /search_by_image` - Image-based similarity search
+- `POST /search_by_image` - Image-based similarity search (supports both file upload and image paths)
 - `POST /check_index` - Verify if folder is indexed
 
 **Image & Comment Management**:

@@ -2,7 +2,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import pickle
 import numpy as np
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, send_file, render_template_string, make_response
 from flask_cors import CORS
 import torch
 import clip
@@ -12,6 +12,7 @@ from pathlib import Path
 import base64
 from io import BytesIO
 from config import config
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -230,6 +231,7 @@ def home():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Natural Language Image Search</title>
+    <!-- Cache buster: {timestamp} -->
     <style>
         * {
             margin: 0;
@@ -656,7 +658,6 @@ def home():
         }
         
         input[type="file"] {
-            flex: 1;
             background: #0a0a0a;
             border: 1px solid #333;
             padding: 0.75rem 1rem;
@@ -664,11 +665,41 @@ def home():
             color: #e0e0e0;
             font-size: 0.95rem;
             transition: border-color 0.2s;
+            width: 100%;
         }
         
         input[type="file"]:focus {
             outline: none;
             border-color: #555;
+        }
+        
+        /* Image search layout */
+        .image-search-inputs {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            flex: 1;
+            margin-right: 1rem;
+        }
+        
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        
+        .input-label {
+            color: #888;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        
+        .input-separator {
+            text-align: center;
+            color: #666;
+            font-size: 0.8rem;
+            font-weight: bold;
+            padding: 0.25rem 0;
         }
         
         .results-grid {
@@ -692,7 +723,7 @@ def home():
         }
         
         .result-item.expanded {
-            grid-column: span 3;
+            grid-column: 1 / -1;
         }
         
         .thumbnail {
@@ -890,10 +921,11 @@ def home():
             transform: scale(1.1);
         }
         
-        .fit-fill-icon {
+        
+        .find-similar-icon {
             position: absolute;
-            bottom: 8px;
-            left: 8px;
+            top: 8px;
+            right: 8px;
             background: rgba(0, 0, 0, 0.7);
             border-radius: 4px;
             padding: 4px;
@@ -905,13 +937,13 @@ def home():
             justify-content: center;
         }
         
-        .fit-fill-icon:hover {
+        .find-similar-icon:hover {
             background: rgba(0, 0, 0, 0.9);
             transform: scale(1.1);
         }
         
-        /* Show fit/fill icon only when expanded */
-        .result-item.expanded .fit-fill-icon {
+        /* Show find similar icon only when expanded */
+        .result-item.expanded .find-similar-icon {
             display: flex !important;
         }
         
@@ -932,17 +964,12 @@ def home():
             align-items: center;
         }
         
-        /* Image display modes */
+        /* Expanded image display */
         .result-item.expanded .thumbnail {
+            width: 100%;
+            min-width: 900px;
             height: auto;
-            max-height: 400px;
-            object-fit: cover; /* Default: fill mode */
-            transition: object-fit 0.3s ease;
-        }
-        
-        .result-item.expanded .thumbnail.fit-mode {
-            object-fit: contain; /* Fit mode: show full image */
-            max-height: 600px;
+            object-fit: contain;
         }
         
     </style>
@@ -996,7 +1023,17 @@ def home():
                 <button id="searchBtn">Search</button>
             </div>
             <div id="imageSearchBox" class="search-box" style="display: none;">
-                <input type="file" id="imageUpload" accept="image/*" />
+                <div class="image-search-inputs">
+                    <div class="input-group">
+                        <label for="imageUpload" class="input-label">Upload File:</label>
+                        <input type="file" id="imageUpload" accept="image/*" />
+                    </div>
+                    <div class="input-separator">OR</div>
+                    <div class="input-group">
+                        <label for="imagePath" class="input-label">Enter Image Path:</label>
+                        <input type="text" id="imagePath" placeholder="C:\\path\\to\\image.jpg" />
+                    </div>
+                </div>
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
         </div>
@@ -1097,6 +1134,7 @@ def home():
         const searchInput = document.getElementById('searchQuery');
         const searchBtn = document.getElementById('searchBtn');
         const imageUpload = document.getElementById('imageUpload');
+        const imagePath = document.getElementById('imagePath');
         const imageSearchBtn = document.getElementById('imageSearchBtn');
         const textModeBtn = document.getElementById('textModeBtn');
         const imageModeBtn = document.getElementById('imageModeBtn');
@@ -1360,19 +1398,30 @@ def home():
         imageSearchBtn.addEventListener('click', async () => {
             const folder = folderInput.value.trim();
             const file = imageUpload.files[0];
+            const imagePathValue = imagePath.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
             
-            if (!file || !folder) return;
+            // Check if we have either a file or a path
+            if (!folder || (!file && !imagePathValue)) {
+                alert('Please select a folder and either upload an image file or enter an image path.');
+                return;
+            }
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
             
             try {
                 const formData = new FormData();
                 formData.append('folder', folder);
-                formData.append('image', file);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
+                
+                // Prioritize file upload over path
+                if (file) {
+                    formData.append('image', file);
+                } else if (imagePathValue) {
+                    formData.append('image_path', imagePathValue);
+                }
                 
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
@@ -1421,6 +1470,82 @@ def home():
             }
         });
         
+        // Generate common HTML structure for result items
+        function generateResultItemHTML(result, index, isCommented = false) {
+            const similarityText = isCommented 
+                ? `Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}`
+                : `Similarity: ${(result.similarity * 100).toFixed(1)}%`;
+                
+            return `
+                <div class="image-container">
+                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                    <div class="image-overlay">
+                        <div class="expand-collapse-icon" data-index="${index}">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                            </svg>
+                        </div>
+                        <div class="find-similar-icon" data-index="${index}" data-path="${result.path}" style="display: none;">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="result-info">
+                    <div class="filename">
+                        ${result.filename}
+                        <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                            <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                        </svg>
+                    </div>
+                    <div class="similarity">${similarityText}</div>
+                </div>
+                <div class="comment-section">
+                    <div class="comments-list" id="comments-${index}">
+                        <div class="comment-loading">Loading comments...</div>
+                    </div>
+                    <div class="comment-form">
+                        <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                        <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Setup event handlers for result item
+        function setupResultItemEventHandlers(item, result, index) {
+            // Handle expand/collapse via overlay icon
+            const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
+            expandCollapseIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                toggleImageExpansion(item, result, index);
+            });
+            
+            // Handle copy icon click
+            const copyIcon = item.querySelector('.copy-icon');
+            copyIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                copyImagePath(result.path);
+            });
+            
+            
+            // Handle find similar button
+            const findSimilarIcon = item.querySelector('.find-similar-icon');
+            findSimilarIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                findSimilarImages(result.path);
+            });
+            
+            // Add save comment functionality
+            const saveBtn = item.querySelector(`#save-btn-${index}`);
+            const commentInput = item.querySelector(`#comment-input-${index}`);
+            
+            saveBtn.addEventListener('click', () => {
+                saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+            });
+        }
+
         // Display results
         function displayResults(results) {
             resultsContainer.innerHTML = '';
@@ -1428,72 +1553,9 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
-                item.innerHTML = `
-                    <div class="image-container">
-                        <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
-                        <div class="image-overlay">
-                            <div class="expand-collapse-icon" data-index="${index}">
-                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                                </svg>
-                            </div>
-                            <div class="fit-fill-icon" data-index="${index}" data-mode="fill" style="display: none;">
-                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                                </svg>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="result-info">
-                        <div class="filename">
-                            ${result.filename}
-                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
-                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
-                            </svg>
-                        </div>
-                        <div class="similarity">Similarity: ${(result.similarity * 100).toFixed(1)}%</div>
-                    </div>
-                    <div class="comment-section">
-                        <div class="comments-list" id="comments-${index}">
-                            <div class="comment-loading">Loading comments...</div>
-                        </div>
-                        <div class="comment-form">
-                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
-                        </div>
-                    </div>
-                `;
+                item.innerHTML = generateResultItemHTML(result, index, false);
                 
-                // Handle expand/collapse via overlay icon
-                const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-                expandCollapseIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    toggleImageExpansion(item, result, index);
-                });
-                
-                // Handle copy icon click
-                const copyIcon = item.querySelector('.copy-icon');
-                copyIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    copyImagePath(result.path);
-                });
-                
-                // Handle fit/fill toggle
-                const fitFillIcon = item.querySelector('.fit-fill-icon');
-                fitFillIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    toggleImageFit(item.querySelector('.thumbnail'), fitFillIcon);
-                });
-                
-                // Add save comment functionality
-                const saveBtn = item.querySelector(`#save-btn-${index}`);
-                const commentInput = item.querySelector(`#comment-input-${index}`);
-                
-                saveBtn.addEventListener('click', () => {
-                    saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
-                });
-                
-                
+                setupResultItemEventHandlers(item, result, index);
                 resultsContainer.appendChild(item);
             });
         }
@@ -1505,72 +1567,9 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
-                item.innerHTML = `
-                    <div class="image-container">
-                        <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
-                        <div class="image-overlay">
-                            <div class="expand-collapse-icon" data-index="${index}">
-                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                                </svg>
-                            </div>
-                            <div class="fit-fill-icon" data-index="${index}" data-mode="fill" style="display: none;">
-                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                                </svg>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="result-info">
-                        <div class="filename">
-                            ${result.filename}
-                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
-                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
-                            </svg>
-                        </div>
-                        <div class="similarity">Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}</div>
-                    </div>
-                    <div class="comment-section">
-                        <div class="comments-list" id="comments-${index}">
-                            <div class="comment-loading">Loading comments...</div>
-                        </div>
-                        <div class="comment-form">
-                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
-                        </div>
-                    </div>
-                `;
+                item.innerHTML = generateResultItemHTML(result, index, true);
                 
-                // Handle expand/collapse via overlay icon
-                const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-                expandCollapseIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    toggleImageExpansion(item, result, index);
-                });
-                
-                // Handle copy icon click
-                const copyIcon = item.querySelector('.copy-icon');
-                copyIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    copyImagePath(result.path);
-                });
-                
-                // Handle fit/fill toggle
-                const fitFillIcon = item.querySelector('.fit-fill-icon');
-                fitFillIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    toggleImageFit(item.querySelector('.thumbnail'), fitFillIcon);
-                });
-                
-                // Add save comment functionality
-                const saveBtn = item.querySelector(`#save-btn-${index}`);
-                const commentInput = item.querySelector(`#comment-input-${index}`);
-                
-                saveBtn.addEventListener('click', () => {
-                    saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
-                });
-                
-                
+                setupResultItemEventHandlers(item, result, index);
                 resultsContainer.appendChild(item);
             });
         }
@@ -1693,20 +1692,6 @@ def home():
             }
         }
         
-        function toggleImageFit(img, fitFillIcon) {
-            const currentMode = fitFillIcon.getAttribute('data-mode');
-            
-            if (currentMode === 'fill') {
-                // Switch to fit mode
-                img.classList.add('fit-mode');
-                fitFillIcon.setAttribute('data-mode', 'fit');
-                // You can update the icon here if you want different icons for fit/fill
-            } else {
-                // Switch to fill mode
-                img.classList.remove('fit-mode');
-                fitFillIcon.setAttribute('data-mode', 'fill');
-            }
-        }
         
         async function copyImagePath(imagePath) {
             try {
@@ -1734,6 +1719,64 @@ def home():
                 
             } catch (error) {
                 console.error('Failed to copy:', error);
+            }
+        }
+        
+        async function findSimilarImages(imagePath) {
+            const folder = folderInput.value.trim();
+            const limit = resultLimitSelect.value;
+            const sortBy = sortBySelect.value;
+            
+            if (!folder) {
+                alert('Please enter a folder path first');
+                return;
+            }
+            
+            // Show loading state
+            indexStatus.textContent = 'Finding similar images...';
+            indexStatus.className = 'status';
+            
+            try {
+                // Fetch the image file from the server using existing image route
+                const imageResponse = await fetch(`/image/${encodeURIComponent(imagePath)}`);
+                if (!imageResponse.ok) {
+                    throw new Error('Failed to load image file');
+                }
+                
+                // Convert response to blob
+                const imageBlob = await imageResponse.blob();
+                
+                // Create FormData to match existing search_by_image endpoint
+                const formData = new FormData();
+                formData.append('image', imageBlob, 'reference_image.jpg');
+                formData.append('folder', folder);
+                formData.append('limit', limit);
+                formData.append('sort_by', sortBy);
+                
+                // Call existing search_by_image endpoint
+                const response = await fetch('/search_by_image', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.results) {
+                    if (data.results.length === 0) {
+                        indexStatus.textContent = 'No similar images found';
+                        indexStatus.className = 'status warning';
+                    } else {
+                        indexStatus.textContent = `Found ${data.results.length} similar images`;
+                        indexStatus.className = 'status success';
+                        displayResults(data.results);
+                    }
+                } else {
+                    throw new Error(data.error || 'Unknown error');
+                }
+            } catch (error) {
+                console.error('Find similar error:', error);
+                indexStatus.textContent = 'Error finding similar images: ' + error.message;
+                indexStatus.className = 'status error';
             }
         }
         
@@ -1765,8 +1808,18 @@ def home():
 </html>
     '''
     
-    # Replace the placeholder with actual options
-    return html_template.replace('{result_options_html}', result_options_html)
+    # Replace the placeholder with actual options and timestamp
+    current_timestamp = str(int(time.time()))
+    response_html = html_template.replace('{result_options_html}', result_options_html)
+    response_html = response_html.replace('{timestamp}', current_timestamp)
+    
+    # Create response with cache-busting headers
+    response = make_response(response_html)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache' 
+    response.headers['Expires'] = '0'
+    
+    return response
 
 @app.route('/image/<path:filepath>')
 def serve_image(filepath):
@@ -2017,12 +2070,15 @@ def search_by_image():
     except (ValueError, TypeError):
         limit = config.DEFAULT_RESULTS
     
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image uploaded'}), 400
+    # Check for either uploaded file or image path
+    file = request.files.get('image')
+    image_path = request.form.get('image_path')
     
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No image selected'}), 400
+    if not file and not image_path:
+        return jsonify({'error': 'No image uploaded or path provided'}), 400
+    
+    if file and file.filename == '':
+        file = None
     
     # Load index
     index, image_paths, image_metadata = load_index(folder)
@@ -2030,13 +2086,24 @@ def search_by_image():
         return jsonify({'error': 'Folder not indexed'}), 400
     
     try:
-        # Process uploaded image
-        uploaded_image = Image.open(file.stream)
-        if uploaded_image.mode != 'RGB':
-            uploaded_image = uploaded_image.convert('RGB')
-        
-        # Get image embedding
-        image_embedding = get_image_embedding_from_pil(uploaded_image)
+        # Process image from either file upload or path
+        if file:
+            # Process uploaded image
+            uploaded_image = Image.open(file.stream)
+            if uploaded_image.mode != 'RGB':
+                uploaded_image = uploaded_image.convert('RGB')
+            # Get image embedding
+            image_embedding = get_image_embedding_from_pil(uploaded_image)
+        else:
+            # Process image from path
+            if not os.path.exists(image_path):
+                return jsonify({'error': f'Image file not found: {image_path}'}), 400
+            
+            try:
+                # Get image embedding directly from path
+                image_embedding = get_image_embedding(image_path)
+            except Exception as path_error:
+                return jsonify({'error': f'Error processing image from path: {str(path_error)}'}), 400
         
         # Search
         k = min(limit, len(image_paths))
@@ -2088,6 +2155,7 @@ def search_by_image():
         return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/settings', methods=['GET'])
 def get_settings():

@@ -11,11 +11,12 @@ A CLIP-powered natural language image search application with semantic similarit
 
 **Dual Search Modes:**
 - **Text Search**: Natural language descriptions (e.g., "red car", "sunset over mountains")
-- **Image Search**: Upload an image to find visually similar images
+- **Image Search**: Upload an image file OR enter an image path to find visually similar images
 
 **Advanced Image Management:**
 - **Expand/Collapse**: Click overlay icon (bottom-right) to toggle between thumbnail and full view
-- **Fit/Fill Toggle**: When expanded, click overlay icon (bottom-left) to switch between fit (show full image) and fill (crop to container) modes  
+- **Full-Width Expanded View**: Expanded images take the complete row with 900px minimum width and no cropping
+- **Find Similar**: Click search icon on expanded images to find visually similar images
 - **Quick Copy**: Click copy icon next to filename to copy full file path to clipboard
 - **Comment System**: Add timestamped comments to any image with persistent storage
 
@@ -135,14 +136,14 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 1. **Index a Folder**: Enter the path to your image folder and click "Index Folder"
 2. **Search Images**: 
    - **Text Mode**: Type a natural language description
-   - **Image Mode**: Upload an image for similarity search
+   - **Image Mode**: Upload an image file OR enter an image path for similarity search
 3. **Configure Search**: 
    - Choose sorting by similarity or time (newest first)
    - Adjust the number of results using the dropdown
 4. **Interact with Results**: 
    - **Expand**: Click the expand icon (⤢) in bottom-right corner of any image
-   - **Copy Path**: Click the copy icon (📋) next to the filename  
-   - **Fit/Fill**: When expanded, click the toggle icon (⤢) in bottom-left to switch display modes
+   - **Find Similar**: Click the search icon (🔍) on expanded images to find similar images
+   - **Copy Path**: Click the copy icon (📋) next to the filename
    - **Add Comments**: In expanded view, add comments that persist across searches
 5. **View Commented Images**: Click "Show Commented Images" to see only images with comments
 
@@ -151,9 +152,9 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 | Icon | Location | Function |
 |------|----------|----------|
 | ⚙️ (settings) | Top-right of header | Open settings panel for configuration |
-| ⤢ (expand) | Bottom-right of thumbnail | Expand to full view |
+| ⤢ (expand) | Bottom-right of thumbnail | Expand to full view (takes full row, 900px min-width) |
 | ⤡ (collapse) | Bottom-right of expanded image | Collapse to thumbnail |
-| ⤢ (fit/fill) | Bottom-left of expanded image | Toggle between fit (show full) and fill (crop) modes |
+| 🔍 (find similar) | Top-right of expanded image | Find visually similar images |
 | 📋 (copy) | Next to filename | Copy full file path to clipboard |
 
 ## Technical Features
