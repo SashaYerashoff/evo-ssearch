@@ -1,189 +1,215 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import base64
+import json
 import pickle
+import time
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import unquote
+
 import numpy as np
-from flask import Flask, request, jsonify, send_file, render_template_string, make_response
-from flask_cors import CORS
 import torch
 import clip
 import faiss
 from PIL import Image
-from pathlib import Path
-import base64
-from io import BytesIO
+from flask import Flask, request, jsonify, send_file, render_template_string, make_response
+from flask_cors import CORS
+
 from config import config
-import time
+from embedders.dino_encoder import DINOEncoder
 
 app = Flask(__name__)
 CORS(app)
 
-# Global variables
-model = None
-preprocess = None
+# Global embedder state
 device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model: Optional[torch.nn.Module] = None
+clip_preprocess = None
+dino_encoder: Optional[DINOEncoder] = None
+SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
+EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
+active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
+if active_embedder == "fusion" and not config.FUSION_ENABLED:
+    active_embedder = "clip"
 
-def init_clip():
-    """Initialize CLIP model"""
-    global model, preprocess
-    model, preprocess = clip.load(config.CLIP_MODEL, device=device)
-    
-def get_image_embedding(image_path):
-    """Extract CLIP embedding from image"""
-    image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
-    with torch.no_grad():
-        image_features = model.encode_image(image)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-    return image_features.cpu().numpy().flatten()
 
-def get_image_embedding_from_pil(pil_image):
-    """Extract CLIP embedding from PIL Image"""
-    image = preprocess(pil_image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        image_features = model.encode_image(image)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-    return image_features.cpu().numpy().flatten()
+def init_clip() -> None:
+    """Load the CLIP model lazily for embedding extraction."""
+    global clip_model, clip_preprocess
+    if clip_model is not None and clip_preprocess is not None:
+        return
+    clip_model, clip_preprocess = clip.load(config.CLIP_MODEL, device=device)
+    clip_model.eval()
 
-def get_text_embedding(text):
-    """Extract CLIP embedding from text"""
+
+def init_dino() -> None:
+    """Load the DINO encoder lazily."""
+    global dino_encoder
+    if dino_encoder is not None:
+        return
+    dino_encoder = DINOEncoder(
+        model_name=config.DINO_MODEL,
+        batch_size=config.BATCH_SIZE,
+        weights_path=config.DINO_WEIGHTS_PATH or None,
+        device=config.DINO_DEVICE or None,
+    )
+
+
+def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
+    target = embedder or active_embedder
+    if target == "clip":
+        init_clip()
+    elif target == "dino":
+        init_dino()
+    elif target == "fusion":
+        init_clip()
+        init_dino()
+    else:
+        raise ValueError(f"Unsupported embedder: {target}")
+
+
+def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
+    """Extract an embedding for an image path using the selected backend."""
+    target = embedder or active_embedder
+    if target == "fusion":
+        target = "clip"
+    ensure_embedder_loaded(target)
+    if target == "clip":
+        image = clip_preprocess(Image.open(image_path)).unsqueeze(0).to(device)  # type: ignore[attr-defined]
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+        return image_features.cpu().numpy().flatten()
+    else:
+        assert dino_encoder is not None
+        features = dino_encoder.encode_images(image_path)
+        return features[0]
+
+
+def get_image_embedding_from_pil(pil_image: Image.Image, embedder: Optional[str] = None) -> np.ndarray:
+    """Extract an embedding from a PIL image using the selected backend."""
+    target = embedder or active_embedder
+    if target == "fusion":
+        target = "clip"
+    ensure_embedder_loaded(target)
+    if target == "clip":
+        image = clip_preprocess(pil_image).unsqueeze(0).to(device)  # type: ignore[attr-defined]
+        with torch.no_grad():
+            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+        return image_features.cpu().numpy().flatten()
+    else:
+        assert dino_encoder is not None
+        features = dino_encoder.encode_images(pil_image)
+        return features[0]
+
+
+def get_text_embedding(text: str) -> np.ndarray:
+    """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
+    if active_embedder not in {"clip", "fusion"}:
+        raise RuntimeError("Text search is only supported when the CLIP backend is active.")
+    ensure_embedder_loaded("clip")
     text_tokens = clip.tokenize([text]).to(device)
     with torch.no_grad():
-        text_features = model.encode_text(text_tokens)
+        text_features = clip_model.encode_text(text_tokens)  # type: ignore[union-attr]
         text_features /= text_features.norm(dim=-1, keepdim=True)
     return text_features.cpu().numpy().flatten()
 
-def create_index(folder_path):
-    """Create FAISS index for folder"""
-    folder_path = Path(folder_path)
-    image_paths = []
-    embeddings = []
-    image_metadata = []
-    
-    # Supported image formats
-    extensions = config.SUPPORTED_EXTENSIONS
-    
-    for ext in extensions:
-        for img_path in folder_path.glob(f'*{ext}'):
+
+def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ensure_embedder_loaded(embedder)
+    base: Dict[str, Any]
+    if embedder == "clip":
+        embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+        base = {
+            "embedder": "clip",
+            "model": config.CLIP_MODEL,
+            "embedding_dim": embed_dim,
+            "library": "openai/CLIP",
+            "device": device,
+        }
+    else:
+        assert dino_encoder is not None
+        base = {
+            "embedder": "dino",
+            "model": dino_encoder.metadata.name,
+            "embedding_dim": dino_encoder.metadata.embed_dim,
+            "config_model": config.DINO_MODEL,
+            "library": "facebookresearch/dinov3",
+            "device": str(dino_encoder.device),
+        }
+    if additional:
+        base.update(additional)
+    base.setdefault("created_at", time.time())
+    return base
+
+
+def _index_targets() -> List[str]:
+    if config.INDEX_MODE == 'dual':
+        return list(EMBEDDER_SUBDIRS.keys())
+    return [config.INDEX_MODE]
+
+
+def _collect_image_entries(folder_path: Path) -> List[Tuple[Path, Dict[str, Any]]]:
+    entries: List[Tuple[Path, Dict[str, Any]]] = []
+    for ext in config.SUPPORTED_EXTENSIONS:
+        for img_path in sorted(folder_path.glob(f'*{ext}')):
             try:
-                embedding = get_image_embedding(img_path)
-                embeddings.append(embedding)
-                image_paths.append(str(img_path))
-                
-                # Get file metadata
                 stat = img_path.stat()
-                metadata = {
-                    'path': str(img_path),
-                    'mtime': stat.st_mtime,
-                    'size': stat.st_size
-                }
-                image_metadata.append(metadata)
-            except Exception as e:
-                print(f"Error processing {img_path}: {e}")
-    
+            except FileNotFoundError:
+                continue
+            metadata = {
+                'path': str(img_path),
+                'mtime': stat.st_mtime,
+                'size': stat.st_size,
+            }
+            entries.append((img_path, metadata))
+    return entries
+
+
+def _create_index_for_embedder(entries: List[Tuple[Path, Dict[str, Any]]], embedder: str) -> Optional[Tuple[faiss.Index, List[str], List[Dict[str, Any]], Dict[str, Any]]]:
+    image_paths: List[str] = []
+    image_metadata: List[Dict[str, Any]] = []
+    embeddings: List[np.ndarray] = []
+
+    for img_path, metadata in entries:
+        try:
+            embedding = get_image_embedding(img_path, embedder=embedder)
+        except Exception as exc:
+            print(f"Error processing {img_path} for {embedder}: {exc}")
+            continue
+        embeddings.append(embedding)
+        image_paths.append(str(img_path))
+        image_metadata.append(metadata)
+
     if not embeddings:
-        return None, None, None
-    
-    # Create FAISS index
-    embeddings_array = np.array(embeddings).astype('float32')
-    index = faiss.IndexFlatIP(embeddings_array.shape[1])  # Inner product for cosine similarity
+        return None
+
+    embeddings_array = np.array(embeddings, dtype='float32')
+    index = faiss.IndexFlatIP(embeddings_array.shape[1])
     index.add(embeddings_array)
-    
-    return index, image_paths, image_metadata
+    index_meta = _build_index_metadata(embedder, {'image_count': len(image_paths)})
+    return index, image_paths, image_metadata, index_meta
 
-def save_index(index, image_paths, image_metadata, folder_path):
-    """Save FAISS index and metadata"""
-    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
-    index_path.mkdir(exist_ok=True)
-    
-    # Save FAISS index
-    faiss.write_index(index, str(index_path / 'index.faiss'))
-    
-    # Save image paths
-    with open(index_path / 'paths.pkl', 'wb') as f:
-        pickle.dump(image_paths, f)
-    
-    # Save image metadata
-    with open(index_path / 'metadata.pkl', 'wb') as f:
-        pickle.dump(image_metadata, f)
 
-def load_index(folder_path):
-    """Load FAISS index and metadata"""
-    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
-    
-    if not index_path.exists():
-        return None, None, None
-    
-    try:
-        # Load FAISS index
-        index = faiss.read_index(str(index_path / 'index.faiss'))
-        
-        # Load image paths
-        with open(index_path / 'paths.pkl', 'rb') as f:
-            image_paths = pickle.load(f)
-        
-        # Load image metadata (backwards compatible)
-        image_metadata = None
-        metadata_file = index_path / 'metadata.pkl'
-        if metadata_file.exists():
-            try:
-                with open(metadata_file, 'rb') as f:
-                    image_metadata = pickle.load(f)
-            except:
-                image_metadata = None
-        
-        return index, image_paths, image_metadata
-    except:
-        return None, None, None
-
-def load_comments(folder_path):
-    """Load comments from JSON file"""
-    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
-    comments_file = index_path / 'comments.json'
-    
-    if not comments_file.exists():
-        return {}
-    
-    try:
-        import json
-        with open(comments_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
+def create_index(folder_path):
+    """Create FAISS indexes for the configured embedder targets."""
+    folder_path = Path(folder_path)
+    entries = _collect_image_entries(folder_path)
+    if not entries:
         return {}
 
-def save_comments(folder_path, comments_data):
-    """Save comments to JSON file"""
-    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
-    index_path.mkdir(exist_ok=True)
-    comments_file = index_path / 'comments.json'
-    
-    try:
-        import json
-        with open(comments_file, 'w', encoding='utf-8') as f:
-            json.dump(comments_data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        print(f"Error saving comments: {e}")
-        return False
+    results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[str, Any]], Dict[str, Any]]] = {}
+    for embedder in _index_targets():
+        if embedder not in EMBEDDER_SUBDIRS:
+            continue
+        data = _create_index_for_embedder(entries, embedder)
+        if data is not None:
+            results[embedder] = data
+    return results
 
-def get_image_comments(folder_path, image_path):
-    """Get comments for specific image"""
-    comments_data = load_comments(folder_path)
-    return comments_data.get(image_path, [])
-
-def add_image_comment(folder_path, image_path, comment):
-    """Add new comment to image"""
-    comments_data = load_comments(folder_path)
-    
-    if image_path not in comments_data:
-        comments_data[image_path] = []
-    
-    # Add timestamp to comment
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    comment_with_timestamp = f"[{timestamp}] {comment}"
-    
-    comments_data[image_path].append(comment_with_timestamp)
-    
-    return save_comments(folder_path, comments_data)
 
 @app.route('/')
 def home():
@@ -365,7 +391,16 @@ def home():
             margin-bottom: 1rem;
             gap: 1rem;
         }
-        
+
+        .backend-dino {
+            display: none;
+        }
+
+        .mode-tab[disabled] {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
         .settings-label {
             flex: 1;
             color: #ccc;
@@ -388,6 +423,10 @@ def home():
         .settings-input:focus {
             outline: none;
             border-color: #555;
+        }
+
+        .settings-input.disabled {
+            opacity: 0.5;
         }
         
         .settings-checkbox {
@@ -418,6 +457,10 @@ def home():
             text-align: center;
             color: #888;
             font-size: 0.85rem;
+        }
+
+        .range-value.disabled {
+            opacity: 0.5;
         }
         
         .settings-actions {
@@ -746,8 +789,35 @@ def home():
         }
         
         .similarity {
-            color: #888;
-            font-size: 0.8rem;
+            color: #bbb;
+            font-size: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        .similarity .metric-line {
+            display: flex;
+            gap: 0.3rem;
+            align-items: baseline;
+            color: #999;
+        }
+
+        .metric-label {
+            color: #e0e0e0;
+            font-weight: 500;
+        }
+
+        .metric-note {
+            color: #777;
+            font-size: 0.75rem;
+            margin-left: 0.35rem;
+        }
+
+        .settings-input.disabled,
+        .settings-input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         
         .loading {
@@ -1084,6 +1154,35 @@ def home():
             <div class="settings-section">
                 <h3>Model & Processing</h3>
                 <div class="settings-row">
+                    <label class="settings-label">Backend:</label>
+                    <select id="embedder" class="settings-select">
+                        <option value="clip">CLIP</option>
+                        <option value="dino">DINO</option>
+                        <option value="fusion">Fusion</option>
+                    </select>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Fusion Enabled:</label>
+                    <input type="checkbox" id="fusionEnabled" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Fusion Alpha:</label>
+                    <input type="range" id="fusionAlpha" class="settings-range" min="0" max="1" step="0.05" value="0.7">
+                    <span class="range-value" id="fusionAlphaValue">0.70</span>
+                </div>
+                <div class="settings-row backend-dino">
+                    <label class="settings-label">DINO Model:</label>
+                    <input type="text" id="dinoModel" class="settings-input" placeholder="dinov3_vitb16">
+                </div>
+                <div class="settings-row backend-dino">
+                    <label class="settings-label">DINO Embedding Dim:</label>
+                    <input type="number" id="dinoEmbedDim" class="settings-input" min="128" max="4096" placeholder="1280">
+                </div>
+                <div class="settings-row backend-dino">
+                    <label class="settings-label">DINO Weights Path:</label>
+                    <input type="text" id="dinoWeightsPath" class="settings-input" placeholder="/path/to/dinov3">
+                </div>
+                <div class="settings-row backend-clip">
                     <label class="settings-label">CLIP Model:</label>
                     <select id="clipModel" class="settings-select">
                         <option value="ViT-B/32">ViT-B/32</option>
@@ -1115,6 +1214,30 @@ def home():
                 <div class="settings-row">
                     <label class="settings-label">Index Folder Name:</label>
                     <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Index Mode:</label>
+                    <select id="indexMode" class="settings-select">
+                        <option value="clip">CLIP only</option>
+                        <option value="dino">DINO only</option>
+                        <option value="dual">Dual (CLIP & DINO)</option>
+                    </select>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Rerank Enabled:</label>
+                    <input type="checkbox" id="rerankEnabled" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Rerank Top-K:</label>
+                    <input type="number" id="rerankTopK" class="settings-input" min="1" max="500" placeholder="50">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Segment Embeddings:</label>
+                    <input type="checkbox" id="segmentsEnabled" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Min Segment Patches:</label>
+                    <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3">
                 </div>
             </div>
             
@@ -1157,6 +1280,68 @@ def home():
         const settingsStatus = document.getElementById('settingsStatus');
         const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
         const qualityValue = document.getElementById('qualityValue');
+        const embedderSelect = document.getElementById('embedder');
+        const fusionEnabledInput = document.getElementById('fusionEnabled');
+        const fusionAlphaInput = document.getElementById('fusionAlpha');
+        const fusionAlphaValue = document.getElementById('fusionAlphaValue');
+        const dinoModelInput = document.getElementById('dinoModel');
+        const dinoEmbedDimInput = document.getElementById('dinoEmbedDim');
+        const dinoWeightsInput = document.getElementById('dinoWeightsPath');
+        const indexModeSelect = document.getElementById('indexMode');
+        const rerankEnabledInput = document.getElementById('rerankEnabled');
+        const rerankTopKInput = document.getElementById('rerankTopK');
+        const segmentsEnabledInput = document.getElementById('segmentsEnabled');
+        const segmentMinPatchesInput = document.getElementById('segmentMinPatches');
+
+        function formatPercent(value) {
+            if (!Number.isFinite(value)) {
+                return 'n/a';
+            }
+            return `${(value * 100).toFixed(1)}%`;
+        }
+
+        function buildSimilarityMetrics(result, isCommented = false) {
+            if (isCommented) {
+                const count = result.comment_count || 0;
+                const latest = (result.latest_comment || '').toString();
+                const trimmed = latest.length > 50 ? `${latest.substring(0, 50)}...` : latest;
+                return `<div class="metric-line"><span class="metric-label">Comments:</span> ${count}${trimmed ? ` <span class="metric-note">Latest: ${trimmed}</span>` : ''}</div>`;
+            }
+
+            const lines = [];
+            lines.push(`<div class="metric-line"><span class="metric-label">Final:</span> ${formatPercent(result.similarity)}</div>`);
+
+            if (result.rerank) {
+                const originalScore = formatPercent(result.rerank.original_score);
+                if (Number.isFinite(result.rerank.original_score)) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">Original:</span> ${originalScore}</div>`);
+                }
+
+                if (Number.isFinite(result.rerank.score)) {
+                    const rerankScore = formatPercent(result.rerank.score);
+                    const note = result.rerank.applied ? '' : '<span class="metric-note">fallback</span>';
+                    lines.push(`<div class="metric-line"><span class="metric-label">Rerank:</span> ${rerankScore}${note}</div>`);
+                }
+            }
+
+            if (result.fusion) {
+                if (Number.isFinite(result.fusion.clip_similarity)) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">CLIP:</span> ${formatPercent(result.fusion.clip_similarity)}</div>`);
+                }
+                if (Number.isFinite(result.fusion.dino_similarity)) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">DINO:</span> ${formatPercent(result.fusion.dino_similarity)}</div>`);
+                }
+                if (Number.isFinite(result.fusion.alpha)) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">Fusion α:</span> ${result.fusion.alpha.toFixed(2)}</div>`);
+                }
+            }
+
+            if (!lines.length) {
+                lines.push(`<div class="metric-line"><span class="metric-label">Similarity:</span> ${formatPercent(result.similarity)}</div>`);
+            }
+
+            return lines.join('');
+        }
         
         // Settings modal functionality
         settingsBtn.addEventListener('click', () => {
@@ -1179,18 +1364,48 @@ def home():
         thumbnailQualitySlider.addEventListener('input', (e) => {
             qualityValue.textContent = e.target.value;
         });
-        
+
+        fusionAlphaInput.addEventListener('input', () => {
+            fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
+        });
+
+        fusionEnabledInput.addEventListener('change', () => {
+            updateFusionUI(fusionEnabledInput.checked);
+        });
+
+        rerankEnabledInput.addEventListener('change', () => {
+            updateRerankUI(rerankEnabledInput.checked);
+        });
+
+        segmentsEnabledInput.addEventListener('change', () => {
+            updateSegmentsUI(segmentsEnabledInput.checked);
+        });
+
         // Load current settings
         async function loadSettings() {
             try {
                 const response = await fetch('/settings');
                 const data = await response.json();
-                
+
                 if (data.success) {
                     const settings = data.settings;
                     document.getElementById('host').value = settings.host;
                     document.getElementById('port').value = settings.port;
                     document.getElementById('debug').checked = settings.debug;
+                    embedderSelect.value = settings.embedder || 'clip';
+                    fusionEnabledInput.checked = Boolean(settings.fusionEnabled);
+                    const parsedFusionAlpha = parseFloat(settings.fusionAlpha);
+                    const fusionAlpha = Number.isFinite(parsedFusionAlpha) ? parsedFusionAlpha : 0.7;
+                    fusionAlphaInput.value = fusionAlpha.toFixed(2);
+                    dinoModelInput.value = settings.dinoModel || 'dinov3_vitb16';
+                    dinoEmbedDimInput.value = settings.dinoEmbedDim || 1280;
+                    dinoWeightsInput.value = settings.dinoWeightsPath || '';
+                    indexModeSelect.value = settings.indexMode || 'clip';
+                    updateFusionUI(fusionEnabledInput.checked);
+                    rerankEnabledInput.checked = Boolean(settings.rerankEnabled);
+                    const parsedRerankTopK = parseInt(settings.rerankTopK, 10);
+                    rerankTopKInput.value = Number.isFinite(parsedRerankTopK) ? parsedRerankTopK : 50;
+                    updateRerankUI(rerankEnabledInput.checked);
                     document.getElementById('clipModel').value = settings.clipModel;
                     document.getElementById('minResults').value = settings.minResults;
                     document.getElementById('maxResults').value = settings.maxResults;
@@ -1201,6 +1416,10 @@ def home():
                     document.getElementById('maxCommentLength').value = settings.maxCommentLength;
                     document.getElementById('maxFileSize').value = settings.maxFileSize;
                     document.getElementById('indexFolderName').value = settings.indexFolderName;
+                    applyEmbedderUI(embedderSelect.value);
+                    segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
+                    segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
+                    updateSegmentsUI(segmentsEnabledInput.checked);
                 } else {
                     showSettingsStatus('Error loading settings: ' + data.error, 'error');
                 }
@@ -1216,7 +1435,18 @@ def home():
                     host: document.getElementById('host').value.trim(),
                     port: parseInt(document.getElementById('port').value),
                     debug: document.getElementById('debug').checked,
+                    embedder: embedderSelect.value,
+                    fusionEnabled: fusionEnabledInput.checked,
+                    fusionAlpha: parseFloat(fusionAlphaInput.value),
+                    rerankEnabled: rerankEnabledInput.checked,
+                    rerankTopK: parseInt(rerankTopKInput.value),
+                    segmentsEnabled: segmentsEnabledInput.checked,
+                    segmentMinPatches: parseInt(segmentMinPatchesInput.value),
                     clipModel: document.getElementById('clipModel').value,
+                    dinoModel: dinoModelInput.value.trim(),
+                    dinoEmbedDim: parseInt(dinoEmbedDimInput.value),
+                    dinoWeightsPath: dinoWeightsInput.value.trim(),
+                    indexMode: indexModeSelect.value,
                     minResults: parseInt(document.getElementById('minResults').value),
                     maxResults: parseInt(document.getElementById('maxResults').value),
                     defaultResults: parseInt(document.getElementById('defaultResults').value),
@@ -1240,6 +1470,34 @@ def home():
                 
                 if (settings.defaultResults < settings.minResults || settings.defaultResults > settings.maxResults) {
                     showSettingsStatus('Default results must be between min and max results', 'error');
+                    return;
+                }
+
+                if (!Number.isFinite(settings.dinoEmbedDim) || settings.dinoEmbedDim <= 0) {
+                    settings.dinoEmbedDim = parseInt(dinoEmbedDimInput.placeholder) || 1280;
+                }
+
+                if (!Number.isFinite(settings.fusionAlpha) || settings.fusionAlpha < 0 || settings.fusionAlpha > 1) {
+                    const defaultAlpha = parseFloat(fusionAlphaInput.defaultValue || '0.7');
+                    settings.fusionAlpha = Number.isFinite(defaultAlpha) ? defaultAlpha : 0.7;
+                }
+
+                if (!settings.fusionEnabled && settings.embedder === 'fusion') {
+                    settings.embedder = 'clip';
+                }
+
+                if (!Number.isFinite(settings.rerankTopK) || settings.rerankTopK < 1) {
+                    const defaultTopK = parseInt(rerankTopKInput.placeholder) || 50;
+                    settings.rerankTopK = Number.isFinite(defaultTopK) && defaultTopK > 0 ? defaultTopK : 50;
+                }
+
+                if (!Number.isFinite(settings.segmentMinPatches) || settings.segmentMinPatches < 1) {
+                    const defaultSegments = parseInt(segmentMinPatchesInput.placeholder) || 3;
+                    settings.segmentMinPatches = Number.isFinite(defaultSegments) && defaultSegments > 0 ? defaultSegments : 3;
+                }
+
+                if (settings.embedder === 'dino' && !settings.dinoModel) {
+                    showSettingsStatus('DINO model name is required when DINO backend is selected', 'error');
                     return;
                 }
                 
@@ -1274,6 +1532,18 @@ def home():
                 document.getElementById('host').value = '0.0.0.0';
                 document.getElementById('port').value = '5000';
                 document.getElementById('debug').checked = false;
+                embedderSelect.value = 'clip';
+                fusionEnabledInput.checked = false;
+                fusionAlphaInput.value = '0.70';
+                fusionAlphaValue.textContent = '0.70';
+                rerankEnabledInput.checked = false;
+                rerankTopKInput.value = '50';
+                segmentsEnabledInput.checked = false;
+                segmentMinPatchesInput.value = '3';
+                dinoModelInput.value = 'dinov3_vitb16';
+                dinoEmbedDimInput.value = '1280';
+                dinoWeightsInput.value = '';
+                indexModeSelect.value = 'clip';
                 document.getElementById('clipModel').value = 'ViT-B/32';
                 document.getElementById('minResults').value = '3';
                 document.getElementById('maxResults').value = '48';
@@ -1284,9 +1554,13 @@ def home():
                 document.getElementById('maxCommentLength').value = '100';
                 document.getElementById('maxFileSize').value = '50';
                 document.getElementById('indexFolderName').value = '.clip_index';
+                updateFusionUI(false);
+                updateRerankUI(false);
+                updateSegmentsUI(false);
+                applyEmbedderUI(embedderSelect.value);
             }
         });
-        
+
         // Show settings status message
         function showSettingsStatus(message, type) {
             settingsStatus.textContent = message;
@@ -1297,6 +1571,70 @@ def home():
                 settingsStatus.style.display = 'none';
             }, 5000);
         }
+
+        function updateFusionUI(enabled) {
+            fusionAlphaInput.disabled = !enabled;
+            fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
+            fusionAlphaValue.classList.toggle('disabled', !enabled);
+            const fusionOption = embedderSelect.querySelector('option[value="fusion"]');
+            if (fusionOption) {
+                fusionOption.disabled = !enabled;
+            }
+            if (!enabled && embedderSelect.value === 'fusion') {
+                embedderSelect.value = 'clip';
+                applyEmbedderUI('clip');
+            }
+        }
+
+        function updateRerankUI(enabled) {
+            rerankTopKInput.disabled = !enabled;
+            rerankTopKInput.classList.toggle('disabled', !enabled);
+        }
+
+        updateFusionUI(fusionEnabledInput.checked);
+        updateRerankUI(rerankEnabledInput.checked);
+        
+        function updateSegmentsUI(enabled) {
+            segmentMinPatchesInput.disabled = !enabled;
+            segmentMinPatchesInput.classList.toggle('disabled', !enabled);
+        }
+
+        updateSegmentsUI(segmentsEnabledInput.checked);
+
+        function applyEmbedderUI(embedder) {
+            const showDino = embedder === 'dino' || embedder === 'fusion';
+            const dinoRows = document.querySelectorAll('.backend-dino');
+            dinoRows.forEach(row => {
+                row.style.display = showDino ? 'flex' : 'none';
+            });
+
+            const clipRows = document.querySelectorAll('.backend-clip');
+            clipRows.forEach(row => {
+                row.style.display = embedder === 'dino' ? 'none' : 'flex';
+            });
+
+            if (embedder === 'dino') {
+                textModeBtn.disabled = true;
+                textModeBtn.title = 'Text search is only available with the CLIP backend.';
+                textModeBtn.classList.remove('active');
+                imageModeBtn.classList.add('active');
+                currentMode = 'image';
+                textSearchBox.style.display = 'none';
+                imageSearchBox.style.display = 'flex';
+            } else {
+                textModeBtn.disabled = false;
+                textModeBtn.title = '';
+                if (currentMode === 'text') {
+                    textSearchBox.style.display = 'flex';
+                    imageSearchBox.style.display = 'none';
+                }
+            }
+        }
+
+        embedderSelect.addEventListener('change', (event) => {
+            applyEmbedderUI(event.target.value);
+        });
+        applyEmbedderUI(embedderSelect.value);
         
         // Mode switching
         textModeBtn.addEventListener('click', () => {
@@ -1323,10 +1661,9 @@ def home():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folder })
                 });
-                const data = await response.json();
-                return data.indexed;
+                return await response.json();
             } catch (error) {
-                return false;
+                return { indexed: false, available_modes: [] };
             }
         }
         
@@ -1349,9 +1686,17 @@ def home():
                 const data = await response.json();
                 
                 if (data.success) {
-                    indexStatus.textContent = `Indexed ${data.count} images successfully`;
+                    const counts = data.counts || {};
+                    const summary = Object.keys(counts).length > 0
+                        ? Object.entries(counts).map(([mode, count]) => `${mode}: ${count}`).join(' | ')
+                        : `Active: ${data.count || 0}`;
+                    indexStatus.textContent = `Indexed successfully (${summary})`;
                     indexStatus.className = 'status success';
                     currentFolder = folder;
+                    const modes = data.modes || [];
+                    if (modes.includes(embedderSelect.value)) {
+                        applyEmbedderUI(embedderSelect.value);
+                    }
                 } else {
                     indexStatus.textContent = data.error || 'Indexing failed';
                     indexStatus.className = 'status error';
@@ -1472,9 +1817,7 @@ def home():
         
         // Generate common HTML structure for result items
         function generateResultItemHTML(result, index, isCommented = false) {
-            const similarityText = isCommented 
-                ? `Comments: ${result.comment_count} | Latest: ${result.latest_comment.substring(0, 50)}${result.latest_comment.length > 50 ? '...' : ''}`
-                : `Similarity: ${(result.similarity * 100).toFixed(1)}%`;
+            const similarityMarkup = buildSimilarityMetrics(result, isCommented);
                 
             return `
                 <div class="image-container">
@@ -1499,7 +1842,7 @@ def home():
                             <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
                         </svg>
                     </div>
-                    <div class="similarity">${similarityText}</div>
+                    <div class="similarity">${similarityMarkup}</div>
                 </div>
                 <div class="comment-section">
                     <div class="comments-list" id="comments-${index}">
@@ -1793,13 +2136,14 @@ def home():
         folderInput.addEventListener('blur', async () => {
             const folder = folderInput.value.trim();
             if (folder) {
-                const indexed = await checkIndexStatus(folder);
-                if (indexed) {
-                    indexStatus.textContent = 'Folder is indexed';
+                const status = await checkIndexStatus(folder);
+                if (status.indexed) {
+                    indexStatus.textContent = `Folder is indexed (${(status.available_modes || []).join(', ') || embedderSelect.value})`;
                     indexStatus.className = 'status success';
                 } else {
-                    indexStatus.textContent = 'Folder not indexed';
-                    indexStatus.className = 'status';
+                    const available = (status.available_modes || []).join(', ');
+                    indexStatus.textContent = available ? `Folder indexed for: ${available}` : 'Folder not indexed';
+                    indexStatus.className = available ? 'status warning' : 'status';
                 }
             }
         });
@@ -1816,27 +2160,628 @@ def home():
     # Create response with cache-busting headers
     response = make_response(response_html)
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache' 
+    response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     
     return response
 
+
 @app.route('/image/<path:filepath>')
 def serve_image(filepath):
-    """Serve original images"""
+    """Serve original images from absolute paths."""
     try:
-        # Security check - prevent directory traversal
-        if '..' in filepath or filepath.startswith('/'):
+        decoded = unquote(filepath)
+        path_obj = Path(decoded)
+        if '..' in path_obj.parts:
             return "Access denied", 403
-        
-        # Convert to absolute path and check if file exists
-        abs_path = os.path.abspath(filepath)
-        if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        if not path_obj.is_absolute():
+            path_obj = Path('/') / path_obj
+        abs_path = path_obj.resolve()
+        if not abs_path.exists() or not abs_path.is_file():
             return "Image not found", 404
-            
-        return send_file(abs_path)
-    except Exception as e:
-        return f"Error serving image: {str(e)}", 500
+        return send_file(str(abs_path))
+    except Exception as exc:
+        return f"Error serving image: {exc}", 500
+
+
+def _index_directory(folder_path: Union[str, Path], embedder: str) -> Path:
+    root = Path(folder_path) / config.INDEX_FOLDER_NAME
+    return root / EMBEDDER_SUBDIRS[embedder]
+
+
+def _segment_index_directory(folder_path: Union[str, Path]) -> Path:
+    return _index_directory(folder_path, 'dino') / 'segments'
+
+
+def _image_to_base64(img: Image.Image) -> str:
+    buffer = BytesIO()
+    img.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _available_indexes(folder_path: Union[str, Path]) -> List[str]:
+    available: List[str] = []
+    root = Path(folder_path) / config.INDEX_FOLDER_NAME
+    has_clip = False
+    has_dino = False
+    for embedder in EMBEDDER_SUBDIRS:
+        embed_dir = _index_directory(folder_path, embedder)
+        if (embed_dir / 'index.faiss').exists():
+            available.append(embedder)
+            if embedder == 'clip':
+                has_clip = True
+            elif embedder == 'dino':
+                has_dino = True
+            continue
+        if embedder == 'clip' and (root / 'index.faiss').exists():
+            available.append(embedder)
+            has_clip = True
+    if config.FUSION_ENABLED and has_clip and has_dino:
+        available.append('fusion')
+    return available
+
+
+def save_index(index_results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[str, Any]], Dict[str, Any]]], folder_path) -> None:
+    """Persist FAISS indexes for one or more embedders."""
+    for embedder, (index, image_paths, image_metadata, index_meta) in index_results.items():
+        embed_dir = _index_directory(folder_path, embedder)
+        embed_dir.mkdir(parents=True, exist_ok=True)
+
+        faiss.write_index(index, str(embed_dir / 'index.faiss'))
+
+        with open(embed_dir / 'paths.pkl', 'wb') as f:
+            pickle.dump(image_paths, f)
+
+        with open(embed_dir / 'metadata.pkl', 'wb') as f:
+            pickle.dump(image_metadata, f)
+
+        meta_path = embed_dir / 'meta.json'
+        meta_path.write_text(json.dumps(index_meta, indent=2), encoding='utf-8')
+
+
+def load_index(folder_path, embedder: Optional[str] = None):
+    """Load FAISS index, metadata, and embedder info for the requested backend."""
+    target = embedder or active_embedder
+    if target not in EMBEDDER_SUBDIRS:
+        return None, None, None, {}
+
+    root = Path(folder_path) / config.INDEX_FOLDER_NAME
+    embed_dir = _index_directory(folder_path, target)
+    legacy_dir = root if target == 'clip' else None
+    if not embed_dir.exists():
+        if legacy_dir is None or not (legacy_dir / 'index.faiss').exists():
+            return None, None, None, {}
+        embed_dir = legacy_dir
+
+    meta: Dict[str, Any] = {}
+    meta_path = embed_dir / 'meta.json'
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            meta = {}
+
+    try:
+        index = faiss.read_index(str(embed_dir / 'index.faiss'))
+
+        with open(embed_dir / 'paths.pkl', 'rb') as f:
+            image_paths = pickle.load(f)
+
+        image_metadata = None
+        metadata_file = embed_dir / 'metadata.pkl'
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'rb') as f:
+                    image_metadata = pickle.load(f)
+            except Exception:
+                image_metadata = None
+
+        return index, image_paths, image_metadata, meta
+    except Exception as exc:
+        print(f"Error loading index for {target}: {exc}")
+        return None, None, None, meta
+
+
+def save_segment_index(
+    folder_path: Union[str, Path],
+    embeddings: np.ndarray,
+    segment_metadata: List[Dict[str, Any]],
+) -> None:
+    segment_dir = _segment_index_directory(folder_path)
+    segment_dir.mkdir(parents=True, exist_ok=True)
+
+    index_path = segment_dir / 'segment_index.faiss'
+    metadata_path = segment_dir / 'segments.pkl'
+    info_path = segment_dir / 'meta.json'
+
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    if embeddings.ndim != 2:
+        raise ValueError("Segment embeddings must be a 2D array")
+
+    if index_path.exists():
+        index = faiss.read_index(str(index_path))
+        if index.d != embeddings.shape[1]:
+            raise ValueError(
+                f"Segment embedding dimension mismatch: existing index expects {index.d}, got {embeddings.shape[1]}"
+            )
+        with open(metadata_path, 'rb') as fh:
+            existing_meta: List[Dict[str, Any]] = pickle.load(fh)
+    else:
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        existing_meta = []
+
+    index.add(embeddings)
+    existing_meta.extend(segment_metadata)
+
+    faiss.write_index(index, str(index_path))
+    with open(metadata_path, 'wb') as fh:
+        pickle.dump(existing_meta, fh)
+
+    info = {
+        'embedder': 'dino',
+        'type': 'segments',
+        'embedding_dim': embeddings.shape[1],
+        'segment_count': len(existing_meta),
+        'updated_at': time.time(),
+    }
+    info_path.write_text(json.dumps(info, indent=2), encoding='utf-8')
+
+
+def load_segment_index(folder_path: Union[str, Path]):
+    segment_dir = _segment_index_directory(folder_path)
+    index_path = segment_dir / 'segment_index.faiss'
+    metadata_path = segment_dir / 'segments.pkl'
+    info_path = segment_dir / 'meta.json'
+
+    if not index_path.exists() or not metadata_path.exists():
+        return None, [], {}
+
+    try:
+        index = faiss.read_index(str(index_path))
+        with open(metadata_path, 'rb') as fh:
+            segment_meta: List[Dict[str, Any]] = pickle.load(fh)
+        meta_info = {}
+        if info_path.exists():
+            try:
+                meta_info = json.loads(info_path.read_text(encoding='utf-8'))
+            except json.JSONDecodeError:
+                meta_info = {}
+        return index, segment_meta, meta_info
+    except Exception as exc:
+        print(f"Error loading segment index: {exc}")
+        return None, [], {}
+
+
+def load_comments(folder_path):
+    """Load comments from JSON file."""
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
+    comments_file = index_path / 'comments.json'
+
+    if not comments_file.exists():
+        return {}
+
+    try:
+        return json.loads(comments_file.read_text(encoding='utf-8'))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_comments(folder_path, comments_data):
+    """Persist comments to JSON."""
+    index_path = Path(folder_path) / config.INDEX_FOLDER_NAME
+    index_path.mkdir(exist_ok=True)
+    comments_file = index_path / 'comments.json'
+
+    try:
+        comments_file.write_text(json.dumps(comments_data, ensure_ascii=False, indent=2), encoding='utf-8')
+        return True
+    except Exception as exc:
+        print(f"Error saving comments: {exc}")
+        return False
+
+
+def get_image_comments(folder_path, image_path):
+    """Fetch list of comments for a particular image."""
+    comments_data = load_comments(folder_path)
+    return comments_data.get(image_path, [])
+
+
+def add_image_comment(folder_path, image_path, comment):
+    """Append a comment to the image's history."""
+    comments_data = load_comments(folder_path)
+
+    if image_path not in comments_data:
+        comments_data[image_path] = []
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    comments_data[image_path].append(f"[{timestamp}] {comment}")
+
+    return save_comments(folder_path, comments_data)
+
+
+def _prepare_metadata_map(image_paths: Optional[List[str]], image_metadata: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    meta_map: Dict[str, Dict[str, Any]] = {}
+    if not image_paths:
+        return meta_map
+    for idx, path in enumerate(image_paths):
+        info: Dict[str, Any] = {}
+        if image_metadata and idx < len(image_metadata):
+            meta = image_metadata[idx] or {}
+            if isinstance(meta, dict):
+                info = meta
+        meta_map[path] = info
+    return meta_map
+
+
+def _build_result_entry(img_path: str, similarity: float, metadata: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    try:
+        img = Image.open(img_path)
+        img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        buffer = BytesIO()
+        img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
+        img_base64 = base64.b64encode(buffer.getvalue()).decode()
+        result = {
+            'path': img_path,
+            'filename': os.path.basename(img_path),
+            'similarity': float(similarity),
+            'thumbnail': img_base64,
+            'metadata': metadata or {},
+        }
+        if extra:
+            result.update(extra)
+        return result
+    except Exception as img_error:
+        print(f"Error processing image {img_path}: {img_error}")
+        return None
+
+
+def _should_rerank(sort_by: str) -> bool:
+    return config.RERANK_ENABLED and config.RERANK_TOP_K > 0 and sort_by != 'time'
+
+
+def _candidate_pool_size(limit: int, total: int, sort_by: str) -> int:
+    if total <= 0:
+        return 0
+    limit = max(0, min(limit, total))
+    if limit == 0:
+        return 0
+    if _should_rerank(sort_by):
+        return min(total, max(limit, config.RERANK_TOP_K))
+    return limit
+
+
+def _collect_candidates(indices: np.ndarray, similarities: np.ndarray, max_index: int) -> List[Tuple[int, float]]:
+    seen: Set[int] = set()
+    candidates: List[Tuple[int, float]] = []
+    flat_indices = indices[0] if indices.ndim > 1 else indices
+    flat_sims = similarities[0] if similarities.ndim > 1 else similarities
+    for idx, sim in zip(flat_indices, flat_sims):
+        idx_int = int(idx)
+        if 0 <= idx_int < max_index and idx_int not in seen:
+            seen.add(idx_int)
+            candidates.append((idx_int, float(sim)))
+    return candidates
+
+
+def _reconstruct_vectors(index: faiss.Index, ids: Sequence[int]) -> Optional[np.ndarray]:
+    vectors: List[np.ndarray] = []
+    for idx in ids:
+        try:
+            vec = index.reconstruct(int(idx))
+        except (AttributeError, RuntimeError, IndexError, TypeError):
+            return None
+        vectors.append(np.asarray(vec, dtype=np.float32))
+    if not vectors:
+        return None
+    try:
+        return np.stack(vectors, axis=0)
+    except ValueError:
+        return None
+
+
+def _rerank_candidates(index: faiss.Index, query_vec: np.ndarray, candidates: List[Tuple[int, float]], sort_by: str) -> List[Tuple[int, float, float, bool]]:
+    if not candidates:
+        return []
+
+    if not _should_rerank(sort_by):
+        return [(idx, score, score, False) for idx, score in candidates]
+
+    rerank_count = min(len(candidates), config.RERANK_TOP_K)
+    pool_ids = [idx for idx, _ in candidates[:rerank_count]]
+    reconstructed = _reconstruct_vectors(index, pool_ids)
+    if reconstructed is None:
+        return [(idx, score, score, False) for idx, score in candidates]
+
+    pool_vectors = reconstructed.astype(np.float32, copy=False)
+    pool_norms = np.linalg.norm(pool_vectors, axis=1, keepdims=True)
+    pool_norms[pool_norms == 0] = 1.0
+    pool_vectors = pool_vectors / pool_norms
+
+    query = np.asarray(query_vec, dtype=np.float32)
+    if query.ndim > 1:
+        query = query.reshape(-1)
+    q_norm = np.linalg.norm(query)
+    if q_norm == 0.0:
+        q_norm = 1.0
+    query = query / q_norm
+
+    rerank_scores = pool_vectors @ query
+    reranked = [
+        (pool_ids[i], float(rerank_scores[i]), candidates[i][1], True)
+        for i in range(len(pool_ids))
+    ]
+    reranked.sort(key=lambda item: item[1], reverse=True)
+
+    remaining = [
+        (idx, score, score, False) for idx, score in candidates[len(pool_ids):]
+    ]
+    return reranked + remaining
+
+
+def _build_ranked_results(
+    index: faiss.Index,
+    query_vec: np.ndarray,
+    indices: np.ndarray,
+    similarities: np.ndarray,
+    image_paths: Sequence[str],
+    metadata_map: Dict[str, Dict[str, Any]],
+    limit: int,
+    sort_by: str,
+) -> List[Dict[str, Any]]:
+    candidates = _collect_candidates(indices, similarities, len(image_paths))
+    baseline = [(idx, score, score, False) for idx, score in candidates]
+    ranked = _rerank_candidates(index, query_vec, candidates, sort_by)
+
+    if not ranked and baseline:
+        ranked = baseline
+
+    if ranked and len(ranked) != len(baseline) and baseline:
+        ranked = baseline
+
+    if not ranked:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    max_results = min(limit, len(ranked)) if limit > 0 else len(ranked)
+
+    for idx, score, original_score, applied in ranked[:max_results]:
+        path = image_paths[idx]
+        extra = None
+        if config.RERANK_ENABLED:
+            extra = {
+                'rerank': {
+                    'applied': applied,
+                    'score': float(score),
+                    'original_score': float(original_score),
+                }
+            }
+        entry = _build_result_entry(path, float(score), metadata_map.get(path, {}), extra=extra)
+        if entry:
+            results.append(entry)
+
+    return results
+
+
+def _load_fusion_indexes(folder_path: Union[str, Path]):
+    clip_data = load_index(folder_path, embedder='clip')
+    dino_data = load_index(folder_path, embedder='dino')
+    return clip_data, dino_data
+
+
+def _merge_metadata_maps(primary: Dict[str, Dict[str, Any]], secondary: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    merged = {path: dict(meta) for path, meta in primary.items()}
+    for path, meta in secondary.items():
+        if path not in merged:
+            merged[path] = dict(meta)
+        else:
+            for key, value in meta.items():
+                merged[path].setdefault(key, value)
+    return merged
+
+
+def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarray, limit: int, sort_by: str) -> List[Dict[str, Any]]:
+    clip_index, clip_paths, clip_metadata, _ = clip_data
+    dino_index, dino_paths, dino_metadata, _ = dino_data
+    if clip_index is None or dino_index is None:
+        return []
+
+    clip_map = _prepare_metadata_map(clip_paths, clip_metadata)
+    dino_map = _prepare_metadata_map(dino_paths, dino_metadata)
+    metadata_map = _merge_metadata_maps(clip_map, dino_map)
+
+    limit = max(1, limit)
+    alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
+
+    def _search(index, vec, paths):
+        if index is None or not paths:
+            return {}
+        k = min(limit * 2, len(paths))
+        sims, inds = index.search(vec.reshape(1, -1), k)
+        scores = {}
+        for idx, sim in zip(inds[0], sims[0]):
+            if 0 <= idx < len(paths):
+                scores[paths[idx]] = float(sim)
+        return scores
+
+    clip_scores = _search(clip_index, clip_vec, clip_paths)
+    dino_scores = _search(dino_index, dino_vec, dino_paths)
+
+    combined: List[Tuple[str, float, float, float]] = []
+    for path in set(list(clip_scores.keys()) + list(dino_scores.keys())):
+        clip_sim = clip_scores.get(path, 0.0)
+        dino_sim = dino_scores.get(path, 0.0)
+        combined_score = (1.0 - alpha) * clip_sim + alpha * dino_sim
+        combined.append((path, combined_score, clip_sim, dino_sim))
+
+    if sort_by == 'time':
+        combined.sort(key=lambda item: metadata_map.get(item[0], {}).get('mtime', 0), reverse=True)
+    else:
+        combined.sort(key=lambda item: item[1], reverse=True)
+
+    results: List[Dict[str, Any]] = []
+    for path, score, clip_sim, dino_sim in combined:
+        entry = _build_result_entry(
+            path,
+            score,
+            metadata_map.get(path, {}),
+            extra={
+                'fusion': {
+                    'clip_similarity': clip_sim,
+                    'dino_similarity': dino_sim,
+                    'alpha': alpha,
+                }
+            },
+        )
+        if entry:
+            results.append(entry)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _build_segment_search_results(
+    segment_index: Optional[faiss.Index],
+    segment_metadata: Sequence[Dict[str, Any]],
+    query_vec: np.ndarray,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    if segment_index is None or not segment_metadata:
+        return []
+
+    if limit <= 0:
+        return []
+
+    k = min(limit, len(segment_metadata))
+    if k == 0:
+        return []
+
+    similarities, indices = segment_index.search(query_vec.reshape(1, -1), k)
+
+    results: List[Dict[str, Any]] = []
+    for idx, sim in zip(indices[0], similarities[0]):
+        if not (0 <= idx < len(segment_metadata)):
+            continue
+        seg_meta = segment_metadata[idx] or {}
+        image_path = seg_meta.get('image_path')
+        if not image_path:
+            continue
+        metadata = {
+            'segment_id': seg_meta.get('segment_id'),
+            'segment_label': seg_meta.get('label'),
+            'segment_area': seg_meta.get('area'),
+            'segment_fraction': seg_meta.get('patch_fraction'),
+        }
+        entry = _build_result_entry(image_path, float(sim), metadata)
+        if entry is None:
+            continue
+        entry['segment'] = {
+            'id': seg_meta.get('segment_id'),
+            'label': seg_meta.get('label'),
+            'source': seg_meta.get('source'),
+            'area': seg_meta.get('area'),
+            'patch_fraction': seg_meta.get('patch_fraction'),
+        }
+        results.append(entry)
+    return results
+
+
+def _parse_targets(raw_value: Optional[Union[str, Sequence[str]]]) -> Set[str]:
+    acceptable = {'images', 'segments'}
+    if raw_value is None:
+        return {'images'}
+    if isinstance(raw_value, (list, tuple, set)):
+        tokens = {str(item).lower() for item in raw_value}
+    else:
+        tokens = {str(raw_value).lower()}
+    targets = {token for token in tokens if token in acceptable}
+    return targets or {'images'}
+
+
+def _mask_search_pipeline(
+    image_input: Union[str, Path, Image.Image],
+    mask_image: Image.Image,
+    folder: Union[str, Path],
+    limit: int,
+    sort_by: str,
+    target_modes: Set[str],
+    segment_ids: Optional[List[str]] = None,
+    label_map: Optional[Dict[str, Any]] = None,
+):
+    ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        raise RuntimeError('DINO encoder is not available')
+
+    segments = dino_encoder.encode_masked(
+        image_input,
+        mask_image,
+        segment_ids=segment_ids,
+        min_patches=config.DINO_SEGMENT_MIN_PATCHES,
+    )
+
+    if not segments:
+        return [], segments
+
+    image_index, image_paths, image_metadata, _ = load_index(folder, embedder='dino')
+    if image_index is None or not image_paths:
+        raise RuntimeError('DINO index not available for the requested folder')
+
+    metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+    segment_index, segment_metadata, _ = load_segment_index(folder)
+
+    label_map = label_map or {}
+
+    segments_response: List[Dict[str, Any]] = []
+    for seg_id, info in segments.items():
+        if seg_id == 'full':
+            if segment_ids is not None and 'full' not in segment_ids:
+                continue
+            if segment_ids is None and any(key != 'full' for key in segments.keys()):
+                continue
+
+        embedding = np.asarray(info.get('embedding'))
+        if embedding.size == 0:
+            continue
+
+        embedding = embedding.astype(np.float32)
+        norm = np.linalg.norm(embedding)
+        if norm == 0.0:
+            continue
+        embedding = embedding / norm
+
+        entry: Dict[str, Any] = {
+            'segment_id': seg_id,
+            'label': label_map.get(str(seg_id)) or label_map.get(seg_id),
+            'patch_count': int(info.get('patch_count', 0)),
+            'patch_fraction': float(info.get('patch_fraction', 0.0)),
+        }
+
+        if 'images' in target_modes:
+            k = _candidate_pool_size(limit, len(image_paths), sort_by)
+            similarities, indices = image_index.search(embedding.reshape(1, -1), k)
+            entry['image_results'] = _build_ranked_results(
+                image_index,
+                embedding,
+                indices,
+                similarities,
+                image_paths,
+                metadata_map,
+                limit,
+                sort_by,
+            )
+
+        if 'segments' in target_modes:
+            entry['segment_results'] = _build_segment_search_results(
+                segment_index,
+                segment_metadata,
+                embedding,
+                limit,
+            )
+
+        segments_response.append(entry)
+
+    return segments_response, segments
+
 
 @app.route('/comments', methods=['GET'])
 def get_comments():
@@ -1889,9 +2834,13 @@ def get_commented_images():
     
     try:
         # Load index to get image paths
-        index, image_paths, image_metadata = load_index(folder)
+        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
         if index is None:
-            return jsonify({'error': 'Folder not indexed'}), 400
+            message = 'Folder not indexed for the current backend'
+            available = _available_indexes(folder)
+            if available:
+                message += f" (available: {', '.join(available)})"
+            return jsonify({'error': message}), 400
         
         # Load comments
         comments_data = load_comments(folder)
@@ -1949,8 +2898,18 @@ def check_index():
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
     
-    index, _, _ = load_index(folder)
-    return jsonify({'indexed': index is not None})
+    available = _available_indexes(folder)
+    if active_embedder == 'fusion':
+        indexed = 'fusion' in available or ({'clip', 'dino'}.issubset(set(available)))
+    else:
+        indexed = active_embedder in available
+    response = {
+        'indexed': indexed,
+        'available_modes': available,
+    }
+    if not response['indexed'] and available:
+        response['existing_embedder'] = available
+    return jsonify(response)
 
 @app.route('/index', methods=['POST'])
 def index_folder():
@@ -1960,91 +2919,216 @@ def index_folder():
         return jsonify({'error': 'Invalid folder path'}), 400
     
     try:
-        index, image_paths, image_metadata = create_index(folder)
-        if index is None:
+        index_results = create_index(folder)
+        if not index_results:
             return jsonify({'error': 'No images found in folder'}), 400
-        
-        save_index(index, image_paths, image_metadata, folder)
-        return jsonify({'success': True, 'count': len(image_paths)})
+
+        save_index(index_results, folder)
+
+        counts = {embedder: len(data[1]) for embedder, data in index_results.items()}
+        metadata = {embedder: data[3] for embedder, data in index_results.items()}
+        modes = list(index_results.keys())
+        if config.FUSION_ENABLED and 'clip' in counts and 'dino' in counts:
+            fusion_count = min(counts['clip'], counts['dino'])
+            counts['fusion'] = fusion_count
+            metadata['fusion'] = {'alpha': config.FUSION_ALPHA}
+            modes.append('fusion')
+
+        active_count = counts.get(active_embedder)
+        if active_count is None and counts:
+            active_count = next(iter(counts.values()))
+        response = {
+            'success': True,
+            'counts': counts,
+            'meta': metadata,
+            'count': active_count or 0,
+            'active_meta': metadata.get(active_embedder),
+            'modes': modes,
+        }
+        return jsonify(response)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+def _parse_segment_ids(raw_value: Optional[Union[str, List[str], List[int]]]) -> Optional[List[str]]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, list):
+        return [str(item) for item in raw_value]
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except json.JSONDecodeError:
+        pass
+    return [part.strip() for part in text.split(',') if part.strip()]
+
+
+def _parse_segment_labels(raw_value: Optional[Union[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    if raw_value is None:
+        return {}
+    if isinstance(raw_value, dict):
+        return {str(k): v for k, v in raw_value.items()}
+    try:
+        parsed = json.loads(raw_value)
+        if isinstance(parsed, dict):
+            return {str(k): v for k, v in parsed.items()}
+    except json.JSONDecodeError:
+        pass
+    return {}
+
+
+def _load_mask_from_request() -> Optional[Image.Image]:
+    mask_file = request.files.get('mask')
+    if mask_file:
+        return Image.open(mask_file.stream).convert('L')
+    mask_base64 = request.form.get('mask') or (request.json or {}).get('mask') if request.is_json else None
+    if mask_base64:
+        try:
+            mask_bytes = base64.b64decode(mask_base64)
+            return Image.open(BytesIO(mask_bytes)).convert('L')
+        except Exception as exc:
+            raise ValueError(f"Invalid mask payload: {exc}")
+    return None
+
+
+@app.route('/index_segments', methods=['POST'])
+def index_segments():
+    """Index DINO segment embeddings derived from a mask."""
+    if not config.DINO_SEGMENTS_ENABLED:
+        return jsonify({'error': 'Segment indexing is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
+
+    data = request.form if request.form else (request.json or {})
+
+    folder = data.get('folder')
+    image_path = data.get('image_path')
+    if not folder or not image_path:
+        return jsonify({'error': 'Both folder and image_path are required'}), 400
+
+    if not Path(image_path).exists():
+        return jsonify({'error': f'Image file not found: {image_path}'}), 400
+
+    mask_image = _load_mask_from_request()
+    if mask_image is None:
+        return jsonify({'error': 'Mask is required for segment indexing'}), 400
+
+    segment_ids = _parse_segment_ids(data.get('segment_ids'))
+    label_map = _parse_segment_labels(data.get('segment_labels'))
+
+    ensure_embedder_loaded('dino')
+    segments = dino_encoder.encode_masked(
+        image_path,
+        mask_image,
+        segment_ids=segment_ids,
+        min_patches=config.DINO_SEGMENT_MIN_PATCHES,
+    )
+
+    if not segments:
+        return jsonify({'error': 'No valid segments were produced from the provided mask'}), 400
+
+    entries: List[Dict[str, Any]] = []
+    embeddings: List[np.ndarray] = []
+    for seg_id, info in segments.items():
+        if seg_id == 'full':
+            continue
+        embedding = info.get('embedding')
+        if embedding is None:
+            continue
+        embeddings.append(np.asarray(embedding, dtype=np.float32))
+        entries.append(
+            {
+                'image_path': image_path,
+                'segment_id': seg_id,
+                'label': label_map.get(seg_id),
+                'area': int(info.get('patch_count', 0)),
+                'patch_fraction': float(info.get('patch_fraction', 0.0)),
+                'source': 'index_segments',
+                'created_at': time.time(),
+            }
+        )
+
+    if not embeddings:
+        return jsonify({'error': 'Mask did not yield any segments beyond the full image aggregate'}), 400
+
+    embedding_matrix = np.stack(embeddings, axis=0)
+    save_segment_index(folder, embedding_matrix, entries)
+
+    return jsonify(
+        {
+            'success': True,
+            'segments_indexed': [
+                {
+                    'segment_id': entry['segment_id'],
+                    'label': entry.get('label'),
+                    'patch_count': entry.get('area'),
+                    'patch_fraction': entry.get('patch_fraction'),
+                }
+                for entry in entries
+            ],
+        }
+    )
 @app.route('/search', methods=['POST'])
 def search():
-    """Search for images"""
+    """Search for images using text queries."""
     folder = request.json.get('folder')
     query = request.json.get('query')
     limit = request.json.get('limit', 10)
     sort_by = request.json.get('sort_by', 'similarity')  # 'similarity' or 'time'
     print(f"Search request: folder={folder}, query={query}, limit={limit}, sort_by={sort_by}")
-    
+
     if not folder or not query:
         return jsonify({'error': 'Missing folder or query'}), 400
-    
-    # Validate limit
+
+    fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
+    search_mode = 'clip' if fusion_active else active_embedder
+
+    if search_mode != 'clip':
+        return jsonify({'error': 'Text search is only available when using the CLIP backend.'}), 400
+
     try:
         limit = int(limit)
         if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
             limit = config.DEFAULT_RESULTS
     except (ValueError, TypeError):
         limit = config.DEFAULT_RESULTS
-    
-    # Load index
-    index, image_paths, image_metadata = load_index(folder)
+
+    index, image_paths, image_metadata, index_meta = load_index(folder, embedder=search_mode)
     if index is None:
-        return jsonify({'error': 'Folder not indexed'}), 400
-    
+        message = 'Folder not indexed for the current backend'
+        available = _available_indexes(folder)
+        if available:
+            message += f" (available: {', '.join(available)})"
+        return jsonify({'error': message}), 400
+
     try:
-        # Get text embedding
         text_embedding = get_text_embedding(query)
-        
-        # Search
-        k = min(limit, len(image_paths))
+    except RuntimeError as err:
+        return jsonify({'error': str(err)}), 400
+
+    try:
+        k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
             return jsonify({'results': []})
         similarities, indices = index.search(text_embedding.reshape(1, -1), k)
-        
-        results = []
-        for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):
-            if idx >= 0 and idx < len(image_paths):
-                try:
-                    img_path = image_paths[idx]
-                    
-                    # Create thumbnail
-                    img = Image.open(img_path)
-                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                    
-                    # Convert to base64
-                    buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                    
-                    # Get metadata if available
-                    metadata_info = {}
-                    if image_metadata and idx < len(image_metadata):
-                        meta = image_metadata[idx]
-                        metadata_info = {
-                            'mtime': meta.get('mtime', 0),
-                            'size': meta.get('size', 0)
-                        }
-                    
-                    results.append({
-                        'path': img_path,
-                        'filename': os.path.basename(img_path),
-                        'similarity': float(sim),
-                        'thumbnail': img_base64,
-                        'metadata': metadata_info
-                    })
-                except Exception as img_error:
-                    print(f"Error processing image {img_path}: {img_error}")
-                    continue
-        
-        # Sort results based on sort_by parameter
-        if sort_by == 'time' and image_metadata:
-            # Sort by modification time (newest first)
-            results.sort(key=lambda x: x['metadata'].get('mtime', 0), reverse=True)
-        # Otherwise keep similarity sort (default FAISS order)
-        
+
+        metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        results = _build_ranked_results(
+            index,
+            text_embedding,
+            indices,
+            similarities,
+            image_paths,
+            metadata_map,
+            limit,
+            sort_by,
+        )
+
+        if sort_by == 'time':
+            results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
+
         return jsonify({'results': results})
     except Exception as e:
         print(f"Text search error: {e}")
@@ -2058,114 +3142,327 @@ def search_by_image():
     folder = request.form.get('folder')
     limit = request.form.get('limit', 12)
     sort_by = request.form.get('sort_by', 'similarity')  # 'similarity' or 'time'
-    
+
     if not folder:
         return jsonify({'error': 'Missing folder'}), 400
-    
-    # Validate limit
+
     try:
         limit = int(limit)
         if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
             limit = config.DEFAULT_RESULTS
     except (ValueError, TypeError):
         limit = config.DEFAULT_RESULTS
-    
-    # Check for either uploaded file or image path
+
     file = request.files.get('image')
     image_path = request.form.get('image_path')
-    
+
     if not file and not image_path:
         return jsonify({'error': 'No image uploaded or path provided'}), 400
-    
+
     if file and file.filename == '':
         file = None
-    
-    # Load index
-    index, image_paths, image_metadata = load_index(folder)
-    if index is None:
-        return jsonify({'error': 'Folder not indexed'}), 400
-    
+
+    fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
+
+    if fusion_active:
+        clip_data, dino_data = _load_fusion_indexes(folder)
+        clip_index, clip_paths, clip_metadata, _ = clip_data
+        dino_index, dino_paths, dino_metadata, _ = dino_data
+        if clip_index is None or dino_index is None:
+            message = 'Fusion requires both CLIP and DINO indexes'
+            available = _available_indexes(folder)
+            if available:
+                message += f" (available: {', '.join(available)})"
+            return jsonify({'error': message}), 400
+    else:
+        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
+        if index is None:
+            message = 'Folder not indexed for the current backend'
+            available = _available_indexes(folder)
+            if available:
+                message += f" (available: {', '.join(available)})"
+            return jsonify({'error': message}), 400
+
     try:
-        # Process image from either file upload or path
         if file:
-            # Process uploaded image
             uploaded_image = Image.open(file.stream)
             if uploaded_image.mode != 'RGB':
                 uploaded_image = uploaded_image.convert('RGB')
-            # Get image embedding
-            image_embedding = get_image_embedding_from_pil(uploaded_image)
+            clip_vec = get_image_embedding_from_pil(uploaded_image, embedder='clip') if fusion_active else get_image_embedding_from_pil(uploaded_image, embedder=active_embedder)
+            if fusion_active:
+                dino_vec = get_image_embedding_from_pil(uploaded_image, embedder='dino')
         else:
-            # Process image from path
             if not os.path.exists(image_path):
                 return jsonify({'error': f'Image file not found: {image_path}'}), 400
-            
-            try:
-                # Get image embedding directly from path
-                image_embedding = get_image_embedding(image_path)
-            except Exception as path_error:
-                return jsonify({'error': f'Error processing image from path: {str(path_error)}'}), 400
-        
-        # Search
-        k = min(limit, len(image_paths))
+            clip_vec = get_image_embedding(image_path, embedder='clip') if fusion_active else get_image_embedding(image_path, embedder=active_embedder)
+            if fusion_active:
+                dino_vec = get_image_embedding(image_path, embedder='dino')
+
+        if fusion_active:
+            results = _fuse_results(clip_data, dino_data, clip_vec, dino_vec, limit, sort_by)
+            return jsonify({'results': results})
+
+        k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
             return jsonify({'results': []})
-        similarities, indices = index.search(image_embedding.reshape(1, -1), k)
-        
-        results = []
-        for i, (idx, sim) in enumerate(zip(indices[0], similarities[0])):
-            if idx >= 0 and idx < len(image_paths):
-                try:
-                    img_path = image_paths[idx]
-                    
-                    # Create thumbnail
-                    img = Image.open(img_path)
-                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                    
-                    # Convert to base64
-                    buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                    
-                    # Get metadata if available
-                    metadata_info = {}
-                    if image_metadata and idx < len(image_metadata):
-                        meta = image_metadata[idx]
-                        metadata_info = {
-                            'mtime': meta.get('mtime', 0),
-                            'size': meta.get('size', 0)
-                        }
-                    
-                    results.append({
-                        'path': img_path,
-                        'filename': os.path.basename(img_path),
-                        'similarity': float(sim),
-                        'thumbnail': img_base64,
-                        'metadata': metadata_info
-                    })
-                except Exception as img_error:
-                    print(f"Error processing image {img_path}: {img_error}")
-                    continue
-        
-        # Sort results based on sort_by parameter
-        if sort_by == 'time' and image_metadata:
-            # Sort by modification time (newest first)
-            results.sort(key=lambda x: x['metadata'].get('mtime', 0), reverse=True)
-        # Otherwise keep similarity sort (default FAISS order)
-        
+        similarities, indices = index.search(clip_vec.reshape(1, -1), k)
+
+        metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        results = _build_ranked_results(
+            index,
+            clip_vec,
+            indices,
+            similarities,
+            image_paths,
+            metadata_map,
+            limit,
+            sort_by,
+        )
+
+        if sort_by == 'time':
+            results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
+
         return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/search_by_mask', methods=['POST'])
+def search_by_mask():
+    """Search using a masked region of an image leveraging DINO segment embeddings."""
+    data = request.form if request.form else (request.json or {})
+
+    if not config.DINO_SEGMENTS_ENABLED:
+        return jsonify({'error': 'Segment search is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
+
+    folder = data.get('folder')
+    if not folder:
+        return jsonify({'error': 'Missing folder'}), 400
+
+    limit = data.get('limit', config.DEFAULT_RESULTS)
+    sort_by = data.get('sort_by', 'similarity')
+    target_modes_raw = data.get('targets') or data.get('target')
+    segment_ids = _parse_segment_ids(data.get('segment_ids'))
+    label_map = _parse_segment_labels(data.get('segment_labels'))
+
+    try:
+        limit = int(limit)
+    except (ValueError, TypeError):
+        limit = config.DEFAULT_RESULTS
+
+    try:
+        limit = max(config.MIN_RESULTS, min(limit, config.MAX_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+
+    target_modes = _parse_targets(target_modes_raw)
+
+    image_source = data.get('image_path')
+    uploaded_image = request.files.get('image')
+
+    if not image_source and uploaded_image is None:
+        return jsonify({'error': 'Provide image_path or upload an image file'}), 400
+
+    mask_image = _load_mask_from_request()
+    if mask_image is None:
+        return jsonify({'error': 'Mask is required for masked search'}), 400
+
+    ensure_embedder_loaded('dino')
+
+    if uploaded_image:
+        query_image = Image.open(uploaded_image.stream)
+        if query_image.mode != 'RGB':
+            query_image = query_image.convert('RGB')
+        image_input: Union[Image.Image, str] = query_image
+    else:
+        if not Path(image_source).exists():
+            return jsonify({'error': f'Image file not found: {image_source}'}), 400
+        image_input = image_source
+
+    try:
+        segment_map = dino_encoder.encode_masked(
+            image_input,
+            mask_image,
+            segment_ids=segment_ids,
+            min_patches=config.DINO_SEGMENT_MIN_PATCHES,
+        )
+    except Exception as exc:
+        return jsonify({'error': f'Failed to compute masked embeddings: {exc}'}), 500
+
+    if not segment_map:
+        return jsonify({'error': 'Mask did not produce any valid segments'}), 400
+
+    try:
+        segments_response, _ = _mask_search_pipeline(
+            image_input,
+            mask_image,
+            folder,
+            limit,
+            sort_by,
+            target_modes,
+            segment_ids,
+            label_map,
+        )
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    if not segments_response:
+        return jsonify({'error': 'No segment results produced'}), 400
+
+    return jsonify(
+        {
+            'segments': segments_response,
+            'targets': list(target_modes),
+            'segment_count': len(segments_response),
+        }
+    )
+
+
+@app.route('/segment_from_point', methods=['POST'])
+def segment_from_point():
+    """Derive a mask from a clicked point and run masked search."""
+    data = request.json if request.is_json else request.form
+    if data is None:
+        return jsonify({'error': 'No data provided'}), 400
+
+    folder = data.get('folder')
+    if not folder:
+        return jsonify({'error': 'Missing folder'}), 400
+
+    image_path = data.get('image_path')
+    uploaded_image = request.files.get('image')
+    if not image_path and uploaded_image is None:
+        return jsonify({'error': 'Provide image_path or upload an image file'}), 400
+
+    try:
+        x_norm = float(data.get('x'))
+        y_norm = float(data.get('y'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid or missing x/y coordinates'}), 400
+
+    try:
+        threshold = float(data.get('threshold', config.DINO_HEATMAP_THRESHOLD))
+    except (TypeError, ValueError):
+        threshold = config.DINO_HEATMAP_THRESHOLD
+    threshold = min(max(threshold, 0.0), 0.99)
+
+    limit = data.get('limit', config.DEFAULT_RESULTS)
+    sort_by = data.get('sort_by', 'similarity')
+    target_modes = _parse_targets(data.get('targets') or data.get('target'))
+    segment_ids = _parse_segment_ids(data.get('segment_ids'))
+    label_map = _parse_segment_labels(data.get('segment_labels'))
+
+    try:
+        limit = int(limit)
+    except (ValueError, TypeError):
+        limit = config.DEFAULT_RESULTS
+    try:
+        limit = max(config.MIN_RESULTS, min(limit, config.MAX_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+
+    ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        return jsonify({'error': 'DINO encoder is not available'}), 500
+
+    if uploaded_image:
+        image_obj = Image.open(uploaded_image.stream)
+        if image_obj.mode != 'RGB':
+            image_obj = image_obj.convert('RGB')
+        image_input: Union[str, Path, Image.Image] = image_obj
+    else:
+        if not os.path.exists(image_path):
+            return jsonify({'error': f'Image file not found: {image_path}'}), 400
+        image_input = image_path
+
+    try:
+        heatmap, _, grid, patch_coords = dino_encoder.patch_similarity_map(
+            image_input,
+            x_norm,
+            y_norm,
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+    flat = heatmap.reshape(-1)
+    quantile = np.quantile(flat, threshold) if flat.size else 0.0
+    mask_bool = heatmap >= quantile
+    if not mask_bool.any() and flat.size:
+        mask_bool.flat[int(np.argmax(flat))] = True
+
+    mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+    heatmap_norm = heatmap - heatmap.min()
+    if heatmap_norm.max() > 0:
+        heatmap_norm = heatmap_norm / heatmap_norm.max()
+
+    crop_size = getattr(dino_encoder, 'crop_size', 224)
+    heatmap_img = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(
+        (crop_size, crop_size),
+        resample=Image.BILINEAR,
+    )
+    mask_img = Image.fromarray(mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+
+    try:
+        segments_response, segment_map = _mask_search_pipeline(
+            image_input,
+            mask_img,
+            folder,
+            limit,
+            sort_by,
+            target_modes,
+            segment_ids,
+            label_map,
+        )
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    if not segments_response:
+        return jsonify({'error': 'No segment results produced'}), 400
+
+    selected_key = next((key for key in segment_map.keys() if key != 'full'), 'full')
+    selected_meta = segment_map.get(selected_key, {})
+
+    overlay = {
+        'grid_size': grid,
+        'patch_coords': {'x': patch_coords[0], 'y': patch_coords[1]},
+        'threshold': threshold,
+        'heatmap_png': _image_to_base64(heatmap_img),
+        'mask_png': _image_to_base64(mask_img),
+        'patch_count': int(selected_meta.get('patch_count', 0)),
+        'patch_fraction': float(selected_meta.get('patch_fraction', 0.0)),
+    }
+
+    return jsonify(
+        {
+            'segments': segments_response,
+            'targets': list(target_modes),
+            'segment_count': len(segments_response),
+            'overlay': overlay,
+        }
+    )
+
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""
     try:
+        requested_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder
         settings = {
             'host': config.HOST,
             'port': config.PORT,
             'debug': config.DEBUG,
+            'embedder': requested_embedder,
             'clipModel': config.CLIP_MODEL,
+            'dinoModel': config.DINO_MODEL,
+            'dinoEmbedDim': config.EMB_DIM_DINO,
+            'dinoWeightsPath': config.DINO_WEIGHTS_PATH,
+            'indexMode': config.INDEX_MODE,
+            'fusionEnabled': config.FUSION_ENABLED,
+            'fusionAlpha': config.FUSION_ALPHA,
+            'rerankEnabled': config.RERANK_ENABLED,
+            'rerankTopK': config.RERANK_TOP_K,
+            'segmentsEnabled': config.DINO_SEGMENTS_ENABLED,
+            'segmentMinPatches': config.DINO_SEGMENT_MIN_PATCHES,
+            'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
             'defaultResults': config.DEFAULT_RESULTS,
@@ -2186,73 +3483,186 @@ def save_settings():
         data = request.json
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
-        
-        # Validate required fields
+
+        global active_embedder, clip_model, clip_preprocess, dino_encoder
+
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
             if field not in data:
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
-        
-        # Validate data types and ranges
+
         try:
             port = int(data['port'])
             if not (1000 <= port <= 65535):
                 return jsonify({'success': False, 'error': 'Port must be between 1000 and 65535'}), 400
-            
+
             min_results = int(data['minResults'])
             max_results = int(data['maxResults'])
             default_results = int(data['defaultResults'])
-            
+
             if not (1 <= min_results <= max_results):
                 return jsonify({'success': False, 'error': 'Min results must be less than or equal to max results'}), 400
-                
+
             if not (min_results <= default_results <= max_results):
                 return jsonify({'success': False, 'error': 'Default results must be between min and max results'}), 400
-                
         except ValueError as e:
             return jsonify({'success': False, 'error': f'Invalid number format: {str(e)}'}), 400
-        
-        # Create .env file content
+
+        fusion_enabled_raw = data.get('fusionEnabled', config.FUSION_ENABLED)
+        if isinstance(fusion_enabled_raw, str):
+            fusion_enabled = fusion_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+            fusion_enabled = bool(fusion_enabled_raw)
+
+        try:
+            fusion_alpha = float(data.get('fusionAlpha', config.FUSION_ALPHA))
+        except (TypeError, ValueError):
+            fusion_alpha = config.FUSION_ALPHA
+        fusion_alpha = min(1.0, max(0.0, fusion_alpha))
+
+        rerank_enabled_raw = data.get('rerankEnabled', config.RERANK_ENABLED)
+        if isinstance(rerank_enabled_raw, str):
+            rerank_enabled = rerank_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+            rerank_enabled = bool(rerank_enabled_raw)
+
+        try:
+            rerank_top_k = int(data.get('rerankTopK', config.RERANK_TOP_K))
+        except (TypeError, ValueError):
+            rerank_top_k = config.RERANK_TOP_K
+        if rerank_top_k < 1:
+            rerank_top_k = 1
+
+        segments_enabled_raw = data.get('segmentsEnabled', config.DINO_SEGMENTS_ENABLED)
+        if isinstance(segments_enabled_raw, str):
+            segments_enabled = segments_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+            segments_enabled = bool(segments_enabled_raw)
+
+        try:
+            segment_min_patches = int(data.get('segmentMinPatches', config.DINO_SEGMENT_MIN_PATCHES))
+        except (TypeError, ValueError):
+            segment_min_patches = config.DINO_SEGMENT_MIN_PATCHES
+        if segment_min_patches < 1:
+            segment_min_patches = 1
+
+        try:
+            segment_threshold = float(data.get('segmentThreshold', config.DINO_HEATMAP_THRESHOLD))
+        except (TypeError, ValueError):
+            segment_threshold = config.DINO_HEATMAP_THRESHOLD
+        segment_threshold = min(0.99, max(0.0, segment_threshold))
+
+        embedder = str(data.get('embedder', active_embedder)).strip().lower()
+        if embedder == 'fusion' and not fusion_enabled:
+            embedder = 'clip'
+        if embedder not in SUPPORTED_EMBEDDERS:
+            embedder = 'clip'
+        dino_model = str(data.get('dinoModel', config.DINO_MODEL)).strip() or config.DINO_MODEL
+        try:
+            dino_dim = int(data.get('dinoEmbedDim', config.EMB_DIM_DINO))
+        except (TypeError, ValueError):
+            dino_dim = config.EMB_DIM_DINO
+
+        dino_weights_path = data.get('dinoWeightsPath', config.DINO_WEIGHTS_PATH) or ''
+        dino_device = str(data.get('dinoDevice', config.DINO_DEVICE)).strip()
+
+        index_mode = str(data.get('indexMode', config.INDEX_MODE)).strip().lower()
+        if index_mode not in {'clip', 'dino', 'dual'}:
+            index_mode = 'clip'
+
+        batch_size = int(data.get('batchSize', config.BATCH_SIZE))
+        thumbnail_quality = int(data.get('thumbnailQuality', config.THUMBNAIL_QUALITY))
+        max_comment_length = int(data.get('maxCommentLength', config.MAX_COMMENT_LENGTH))
+        max_file_size = int(data.get('maxFileSize', config.MAX_FILE_SIZE_MB))
+        index_folder = data.get('indexFolderName', config.INDEX_FOLDER_NAME)
+
         env_content = f"""# evo-ssearch Configuration
 # Generated by settings panel
 
 # Server Configuration
 EVOSSEARCH_HOST={data['host']}
-EVOSSEARCH_PORT={data['port']}
+EVOSSEARCH_PORT={port}
 EVOSSEARCH_DEBUG={str(data['debug']).lower()}
 
-# CLIP model configuration
+# Embedder configuration
+EVOSSEARCH_EMBEDDER={embedder}
 EVOSSEARCH_CLIP_MODEL={data['clipModel']}
+EVOSSEARCH_DINO_MODEL={dino_model}
+EVOSSEARCH_EMB_DIM_DINO={dino_dim}
+EVOSSEARCH_DINO_WEIGHTS_PATH={dino_weights_path}
+EVOSSEARCH_DINO_DEVICE={dino_device}
+EVOSSEARCH_INDEX_MODE={index_mode}
+EVOSSEARCH_FUSION_ENABLED={str(fusion_enabled).lower()}
+EVOSSEARCH_FUSION_ALPHA={fusion_alpha:.4f}
+EVOSSEARCH_RERANK_ENABLED={str(rerank_enabled).lower()}
+EVOSSEARCH_RERANK_TOP_K={rerank_top_k}
+EVOSSEARCH_DINO_SEGMENTS_ENABLED={str(segments_enabled).lower()}
+EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES={segment_min_patches}
+EVOSSEARCH_DINO_HEATMAP_THRESHOLD={segment_threshold:.4f}
 
 # Search result limits
-EVOSSEARCH_MIN_RESULTS={data['minResults']}
-EVOSSEARCH_MAX_RESULTS={data['maxResults']}
-EVOSSEARCH_DEFAULT_RESULTS={data['defaultResults']}
+EVOSSEARCH_MIN_RESULTS={min_results}
+EVOSSEARCH_MAX_RESULTS={max_results}
+EVOSSEARCH_DEFAULT_RESULTS={default_results}
 
 # Processing configuration
-EVOSSEARCH_BATCH_SIZE={data.get('batchSize', 32)}
-EVOSSEARCH_THUMBNAIL_QUALITY={data.get('thumbnailQuality', 85)}
+EVOSSEARCH_BATCH_SIZE={batch_size}
+EVOSSEARCH_THUMBNAIL_QUALITY={thumbnail_quality}
 
 # File system configuration
-EVOSSEARCH_INDEX_FOLDER={data.get('indexFolderName', '.clip_index')}
+EVOSSEARCH_INDEX_FOLDER={index_folder}
 
 # Comment system configuration
-EVOSSEARCH_MAX_COMMENT_LENGTH={data.get('maxCommentLength', 100)}
+EVOSSEARCH_MAX_COMMENT_LENGTH={max_comment_length}
 
 # Security configuration
-EVOSSEARCH_MAX_FILE_SIZE_MB={data.get('maxFileSize', 50)}
+EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 """
-        
-        # Write to .env file
+
         with open('.env', 'w', encoding='utf-8') as f:
             f.write(env_content)
-        
-        return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server to apply changes.'})
-        
+
+        config.HOST = data['host']
+        config.PORT = port
+        config.DEBUG = bool(data['debug'])
+        config.EMBEDDER = embedder
+        config.CLIP_MODEL = data['clipModel']
+        config.DINO_MODEL = dino_model
+        config.EMB_DIM_DINO = dino_dim
+        config.DINO_WEIGHTS_PATH = dino_weights_path
+        config.DINO_DEVICE = dino_device
+        config.INDEX_MODE = index_mode
+        config.MIN_RESULTS = min_results
+        config.MAX_RESULTS = max_results
+        config.DEFAULT_RESULTS = default_results
+        config.BATCH_SIZE = batch_size
+        config.THUMBNAIL_QUALITY = thumbnail_quality
+        config.MAX_COMMENT_LENGTH = max_comment_length
+        config.MAX_FILE_SIZE_MB = max_file_size
+        config.INDEX_FOLDER_NAME = index_folder
+        config.FUSION_ENABLED = fusion_enabled
+        config.FUSION_ALPHA = fusion_alpha
+        config.RERANK_ENABLED = rerank_enabled
+        config.RERANK_TOP_K = rerank_top_k
+        config.DINO_SEGMENTS_ENABLED = segments_enabled
+        config.DINO_SEGMENT_MIN_PATCHES = segment_min_patches
+        config.DINO_HEATMAP_THRESHOLD = segment_threshold
+
+        active_embedder = embedder
+        if active_embedder == 'fusion' and not config.FUSION_ENABLED:
+            active_embedder = 'clip'
+        clip_model = None
+        clip_preprocess = None
+        dino_encoder = None
+        ensure_embedder_loaded()
+
+        return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server if issues persist.'})
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
 if __name__ == '__main__':
-    init_clip()
+    ensure_embedder_loaded()
     config.print_startup_info()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

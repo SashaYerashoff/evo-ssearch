@@ -1,10 +1,16 @@
 flask==3.0.3
 flask-cors==4.0.0
 torch>=2.1.0
+torchvision>=0.16.0
+torchmetrics>=1.2.0
+termcolor>=2.4.0
 numpy>=1.26.0
 pillow>=10.0.0
 faiss-cpu>=1.7.4
 git+https://github.com/openai/CLIP.git
+timm>=0.9.10
+einops>=0.7.0
+transformers>=4.40.0
 ftfy>=6.1.1
 regex>=2024.4.24
 tqdm>=4.66.0
