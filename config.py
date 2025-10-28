@@ -29,13 +29,26 @@ class Config:
     # Embedder configuration
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', 'ViT-B/32')
-    DINO_MODEL = os.getenv('EVOSSEARCH_DINO_MODEL', 'dinov3_vitb16')
+    DINO_MODEL = os.getenv('EVOSSEARCH_DINO_MODEL', 'dinov3_vith16plus')
     try:
-        EMB_DIM_DINO = int(os.getenv('EVOSSEARCH_EMB_DIM_DINO', '768'))
+        EMB_DIM_DINO = int(os.getenv('EVOSSEARCH_EMB_DIM_DINO', '1280'))
     except ValueError:
-        EMB_DIM_DINO = 768
-    DINO_WEIGHTS_PATH = os.getenv('EVOSSEARCH_DINO_WEIGHTS_PATH', '')
-    DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', '').strip()
+        EMB_DIM_DINO = 1280
+    DINO_WEIGHTS_PATH = os.getenv(
+        'EVOSSEARCH_DINO_WEIGHTS_PATH',
+        '/home/sasha/Downloads/dinoweigths/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth',
+    )
+    DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', 'cuda:0').strip()
+
+    MASK2FORMER_ENABLED = _get_bool_env('EVOSSEARCH_M2F_ENABLED', 'True')
+    MASK2FORMER_MODEL = os.getenv('EVOSSEARCH_M2F_MODEL', 'facebook/mask2former-swin-base-ade-semantic')
+    MASK2FORMER_DEVICE = os.getenv('EVOSSEARCH_M2F_DEVICE', DINO_DEVICE or 'cuda:0').strip()
+    try:
+        MASK2FORMER_MAX_SIZE = int(os.getenv('EVOSSEARCH_M2F_MAX_SIZE', '1024'))
+    except (TypeError, ValueError):
+        MASK2FORMER_MAX_SIZE = 1024
+    if MASK2FORMER_MAX_SIZE < 256:
+        MASK2FORMER_MAX_SIZE = 256
 
     INDEX_MODE = os.getenv('EVOSSEARCH_INDEX_MODE', 'clip').strip().lower()
     if INDEX_MODE not in {'clip', 'dino', 'dual'}:
@@ -153,6 +166,12 @@ class Config:
                 'enabled' if cls.DINO_SEGMENTS_ENABLED else 'disabled', cls.DINO_SEGMENT_MIN_PATCHES
             )
         )
+        if cls.MASK2FORMER_ENABLED:
+            print(
+                f"Mask2Former: enabled ({cls.MASK2FORMER_MODEL}, device={cls.MASK2FORMER_DEVICE}, max_edge={cls.MASK2FORMER_MAX_SIZE})"
+            )
+        else:
+            print("Mask2Former: disabled")
         print(f"Result Limits: {cls.MIN_RESULTS}-{cls.MAX_RESULTS} (default: {cls.DEFAULT_RESULTS})")
         print()
         print("Server available at:")

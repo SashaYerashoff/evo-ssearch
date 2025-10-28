@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import unquote
+from threading import Lock
 
 import numpy as np
 import torch
@@ -19,6 +20,10 @@ from flask_cors import CORS
 
 from config import config
 from embedders.dino_encoder import DINOEncoder
+try:
+    from heads.mask2former_head import Mask2FormerHead
+except Exception:  # pragma: no cover - optional dependency
+    Mask2FormerHead = None  # type: ignore[misc]
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +33,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model: Optional[torch.nn.Module] = None
 clip_preprocess = None
 dino_encoder: Optional[DINOEncoder] = None
+mask2former_head: Optional["Mask2FormerHead"] = None
+_mask2former_lock = Lock()
+_mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
@@ -49,11 +57,31 @@ def init_dino() -> None:
     global dino_encoder
     if dino_encoder is not None:
         return
+    weights_path = (config.DINO_WEIGHTS_PATH or "").strip()
+    if not weights_path:
+        raise RuntimeError(
+            "EVOSSEARCH_DINO_WEIGHTS_PATH is not set. Provide a local DINO checkpoint to keep inference on GPU."
+        )
+    weights_file = Path(weights_path).expanduser()
+    if not weights_file.exists():
+        raise FileNotFoundError(f"DINO weights file not found: {weights_file}")
+    config.DINO_WEIGHTS_PATH = str(weights_file.resolve())
+
+    device_hint = (config.DINO_DEVICE or "").strip()
+    if not device_hint:
+        if torch.cuda.is_available():
+            device_hint = "cuda:0"
+        else:
+            raise RuntimeError("CUDA device required for DINO encoder; none detected.")
+    if not device_hint.startswith("cuda"):
+        raise RuntimeError("DINO encoder must run on CUDA. Set EVOSSEARCH_DINO_DEVICE accordingly.")
+    config.DINO_DEVICE = device_hint
+
     dino_encoder = DINOEncoder(
         model_name=config.DINO_MODEL,
         batch_size=config.BATCH_SIZE,
-        weights_path=config.DINO_WEIGHTS_PATH or None,
-        device=config.DINO_DEVICE or None,
+        weights_path=config.DINO_WEIGHTS_PATH,
+        device=config.DINO_DEVICE,
     )
 
 
@@ -68,6 +96,35 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         init_dino()
     else:
         raise ValueError(f"Unsupported embedder: {target}")
+
+
+def ensure_mask_head() -> Optional["Mask2FormerHead"]:
+    global mask2former_head, _mask2former_failed
+    if not config.MASK2FORMER_ENABLED:
+        return None
+    if Mask2FormerHead is None:
+        if not _mask2former_failed:
+            print("Mask2Former head unavailable: transformers vision deps missing; disabling head.")
+            _mask2former_failed = True
+        return None
+    if mask2former_head is not None:
+        return mask2former_head
+    with _mask2former_lock:
+        if mask2former_head is not None:
+            return mask2former_head
+        try:
+            target_device = config.MASK2FORMER_DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
+            mask2former_head = Mask2FormerHead(
+                model_name=config.MASK2FORMER_MODEL,
+                device=target_device,
+                max_size=config.MASK2FORMER_MAX_SIZE,
+            )
+        except Exception as exc:
+            _mask2former_failed = True
+            print(f"Mask2Former head initialization failed: {exc}")
+            config.MASK2FORMER_ENABLED = False
+            return None
+    return mask2former_head
 
 
 def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
@@ -668,6 +725,40 @@ def home():
             gap: 0.5rem;
         }
         
+        .segment-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .segment-controls label {
+            font-size: 0.85rem;
+            color: #bbb;
+        }
+        
+        .segment-threshold-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .segment-threshold-control input[type="range"] {
+            width: 160px;
+            accent-color: #ff9d1a;
+        }
+        
+        .segment-threshold-value {
+            font-variant-numeric: tabular-nums;
+            min-width: 3.5ch;
+            text-align: right;
+            color: #e0e0e0;
+        }
+        
+        .segment-threshold-control.disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+        
         .sort-control label,
         .limit-control label {
             color: #888;
@@ -776,6 +867,10 @@ def home():
             display: block;
         }
         
+        .thumbnail.segment-enabled {
+            cursor: crosshair;
+        }
+        
         
         .result-info {
             padding: 0.75rem;
@@ -846,6 +941,216 @@ def home():
             padding: 1rem;
             border-top: 1px solid #333;
             background: #0f0f0f;
+        }
+        
+        .segments-panel {
+            display: none;
+            padding: 1rem;
+            border-top: 1px solid #2a2a2a;
+            background: #111;
+        }
+        
+        .result-item.expanded .segments-panel {
+            display: block;
+        }
+        
+        .segments-status {
+            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
+            color: #bcbcbc;
+        }
+        
+        .segments-status.success {
+            color: #7dd97b;
+        }
+        
+        .segments-status.error {
+            color: #ff6b6b;
+        }
+        
+        .segments-status.warning {
+            color: #f4c066;
+        }
+        
+        .segment-overlay-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            align-items: flex-start;
+            margin-bottom: 0.75rem;
+        }
+        
+        .segment-overlay-figure,
+        .segment-segmap-figure {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            max-width: 280px;
+        }
+        
+        .segment-overlay-figure figcaption,
+        .segment-segmap-figure figcaption {
+            color: #aaa;
+            font-size: 0.78rem;
+            letter-spacing: 0.01em;
+        }
+        
+        .segment-overlay-stack {
+            position: relative;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid #1f1f1f;
+        }
+        
+        .segment-overlay-stack img {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+        
+        .segment-overlay-stack .overlay-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .segment-overlay-stack .overlay-heatmap {
+            mix-blend-mode: screen;
+            opacity: 0.85;
+        }
+        
+        .segment-overlay-stack .overlay-mask {
+            mix-blend-mode: multiply;
+            opacity: 0.45;
+        }
+        
+        .segment-overlay-stack .overlay-crosshair {
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            margin-left: -7px;
+            margin-top: -7px;
+            border-radius: 50%;
+            border: 2px solid #ffdf6b;
+            box-shadow: 0 0 6px rgba(255, 223, 107, 0.7);
+            pointer-events: none;
+        }
+
+        .segment-segmap {
+            width: 100%;
+            border-radius: 10px;
+            border: 1px solid #1f1f1f;
+            display: block;
+        }
+        
+        .segment-legend {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+            margin-bottom: 0.75rem;
+        }
+        
+        .segment-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.78rem;
+            color: #cfcfcf;
+        }
+        
+        .segment-legend-item.highlight {
+            color: #ffffff;
+            font-weight: 600;
+        }
+        
+        .segment-legend-swatch {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            border: 1px solid rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+        }
+        
+        .segment-legend-item.highlight .segment-legend-swatch {
+            box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
+        }
+        
+        .segment-overlay-images img {
+            max-width: 160px;
+            border: 1px solid #222;
+            border-radius: 4px;
+            background: #000;
+        }
+        
+        .segment-results-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        
+        .segment-results-list li {
+            background: #181818;
+            border: 1px solid #242424;
+            border-radius: 6px;
+            padding: 0.6rem 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            font-size: 0.82rem;
+        }
+        
+        .segment-title {
+            color: #e0e0e0;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+        
+        .segment-meta {
+            color: #888;
+            font-size: 0.78rem;
+        }
+        
+        .segment-match-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+        
+        .segment-match-row {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 5px;
+            padding: 0.35rem 0.5rem;
+        }
+        
+        .segment-match-thumb {
+            width: 44px;
+            height: 44px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid #1f1f1f;
+        }
+        
+        .segment-match-thumb.placeholder {
+            background: repeating-linear-gradient(45deg, #222, #222 6px, #1a1a1a 6px, #1a1a1a 12px);
+        }
+        
+        .segment-match-meta {
+            display: flex;
+            flex-direction: column;
+            font-size: 0.75rem;
+            color: #cfcfcf;
+            line-height: 1.35;
         }
         
         .result-item.expanded .comment-section {
@@ -1086,6 +1391,13 @@ def home():
                             {result_options_html}
                         </select>
                     </div>
+                    <div class="segment-controls">
+                        <label for="segmentThresholdSlider">Region threshold:</label>
+                        <div class="segment-threshold-control" id="segmentThresholdControl">
+                            <input type="range" id="segmentThresholdSlider" min="40" max="99" value="70" step="1">
+                            <span class="segment-threshold-value" id="segmentThresholdValue">70%</span>
+                        </div>
+                    </div>
                 </div>
             </div>
             <div id="textSearchBox" class="search-box">
@@ -1292,6 +1604,31 @@ def home():
         const rerankTopKInput = document.getElementById('rerankTopK');
         const segmentsEnabledInput = document.getElementById('segmentsEnabled');
         const segmentMinPatchesInput = document.getElementById('segmentMinPatches');
+        const segmentThresholdSlider = document.getElementById('segmentThresholdSlider');
+        const segmentThresholdValueEl = document.getElementById('segmentThresholdValue');
+        const segmentThresholdControl = document.getElementById('segmentThresholdControl');
+        
+        let segmentThreshold = 0.7;
+
+        function clampSegmentThreshold(value) {
+            const numeric = Number.parseFloat(value);
+            if (!Number.isFinite(numeric)) {
+                return segmentThreshold;
+            }
+            return Math.min(0.99, Math.max(0.0, numeric));
+        }
+
+        function setSegmentThresholdFromPercent(percentValue) {
+            const pct = Number.parseInt(percentValue, 10);
+            const clamped = Math.min(99, Math.max(0, Number.isFinite(pct) ? pct : Math.round(segmentThreshold * 100)));
+            segmentThreshold = clamped / 100;
+            if (segmentThresholdSlider) {
+                segmentThresholdSlider.value = String(clamped);
+            }
+            if (segmentThresholdValueEl) {
+                segmentThresholdValueEl.textContent = `${clamped}%`;
+            }
+        }
 
         function formatPercent(value) {
             if (!Number.isFinite(value)) {
@@ -1369,6 +1706,13 @@ def home():
             fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
         });
 
+        if (segmentThresholdSlider) {
+            segmentThresholdSlider.addEventListener('input', (e) => {
+                setSegmentThresholdFromPercent(e.target.value);
+            });
+            setSegmentThresholdFromPercent(segmentThresholdSlider.value);
+        }
+
         fusionEnabledInput.addEventListener('change', () => {
             updateFusionUI(fusionEnabledInput.checked);
         });
@@ -1379,6 +1723,7 @@ def home():
 
         segmentsEnabledInput.addEventListener('change', () => {
             updateSegmentsUI(segmentsEnabledInput.checked);
+            refreshSegmentsPanels();
         });
 
         // Load current settings
@@ -1419,7 +1764,11 @@ def home():
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
+                    const thresholdRaw = clampSegmentThreshold(settings.segmentThreshold);
+                    const pctValue = Math.round(thresholdRaw * 100);
+                    setSegmentThresholdFromPercent(pctValue);
                     updateSegmentsUI(segmentsEnabledInput.checked);
+                    refreshSegmentsPanels();
                 } else {
                     showSettingsStatus('Error loading settings: ' + data.error, 'error');
                 }
@@ -1442,6 +1791,7 @@ def home():
                     rerankTopK: parseInt(rerankTopKInput.value),
                     segmentsEnabled: segmentsEnabledInput.checked,
                     segmentMinPatches: parseInt(segmentMinPatchesInput.value),
+                    segmentThreshold: segmentThreshold,
                     clipModel: document.getElementById('clipModel').value,
                     dinoModel: dinoModelInput.value.trim(),
                     dinoEmbedDim: parseInt(dinoEmbedDimInput.value),
@@ -1496,6 +1846,8 @@ def home():
                     settings.segmentMinPatches = Number.isFinite(defaultSegments) && defaultSegments > 0 ? defaultSegments : 3;
                 }
 
+                settings.segmentThreshold = clampSegmentThreshold(settings.segmentThreshold);
+
                 if (settings.embedder === 'dino' && !settings.dinoModel) {
                     showSettingsStatus('DINO model name is required when DINO backend is selected', 'error');
                     return;
@@ -1540,6 +1892,7 @@ def home():
                 rerankTopKInput.value = '50';
                 segmentsEnabledInput.checked = false;
                 segmentMinPatchesInput.value = '3';
+                setSegmentThresholdFromPercent(70);
                 dinoModelInput.value = 'dinov3_vitb16';
                 dinoEmbedDimInput.value = '1280';
                 dinoWeightsInput.value = '';
@@ -1557,6 +1910,7 @@ def home():
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
+                refreshSegmentsPanels();
                 applyEmbedderUI(embedderSelect.value);
             }
         });
@@ -1597,9 +1951,17 @@ def home():
         function updateSegmentsUI(enabled) {
             segmentMinPatchesInput.disabled = !enabled;
             segmentMinPatchesInput.classList.toggle('disabled', !enabled);
+            updateSegmentControlsUI(enabled);
+        }
+
+        function updateSegmentControlsUI(enabled) {
+            if (!segmentThresholdSlider || !segmentThresholdControl) return;
+            segmentThresholdSlider.disabled = !enabled;
+            segmentThresholdControl.classList.toggle('disabled', !enabled);
         }
 
         updateSegmentsUI(segmentsEnabledInput.checked);
+        refreshSegmentsPanels();
 
         function applyEmbedderUI(embedder) {
             const showDino = embedder === 'dino' || embedder === 'fusion';
@@ -1844,6 +2206,9 @@ def home():
                     </div>
                     <div class="similarity">${similarityMarkup}</div>
                 </div>
+                <div class="segments-panel" id="segments-${index}">
+                    <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
+                </div>
                 <div class="comment-section">
                     <div class="comments-list" id="comments-${index}">
                         <div class="comment-loading">Loading comments...</div>
@@ -1887,6 +2252,13 @@ def home():
             saveBtn.addEventListener('click', () => {
                 saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
             });
+
+            const img = item.querySelector('.thumbnail');
+            if (img) {
+                img.addEventListener('click', (e) => {
+                    handleSegmentClick(e, result, index, item);
+                });
+            }
         }
 
         // Display results
@@ -1896,11 +2268,15 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
+                item.dataset.resultIndex = index;
                 item.innerHTML = generateResultItemHTML(result, index, false);
                 
                 setupResultItemEventHandlers(item, result, index);
+                resetSegmentsPanel(item, index);
                 resultsContainer.appendChild(item);
             });
+
+            refreshSegmentsPanels();
         }
         
         // Display commented results (similar to displayResults but with comment info)
@@ -1910,11 +2286,15 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
+                item.dataset.resultIndex = index;
                 item.innerHTML = generateResultItemHTML(result, index, true);
                 
                 setupResultItemEventHandlers(item, result, index);
+                resetSegmentsPanel(item, index);
                 resultsContainer.appendChild(item);
             });
+
+            refreshSegmentsPanels();
         }
         
         // Comment functionality
@@ -2014,6 +2394,8 @@ def home():
                 // Collapse: switch back to thumbnail
                 img.src = `data:image/jpeg;base64,${result.thumbnail}`;
                 item.classList.remove('expanded');
+                resetSegmentsPanel(item, index);
+                img.classList.remove('segment-enabled');
                 // Update icon to expand
                 expandCollapseIcon.innerHTML = `
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
@@ -2026,6 +2408,10 @@ def home():
                 img.src = originalImageUrl;
                 item.classList.add('expanded');
                 loadComments(index, result.path, folderInput.value.trim());
+                prepareSegmentsPanel(item, result, index);
+                if (segmentsEnabledInput.checked) {
+                    img.classList.add('segment-enabled');
+                }
                 // Update icon to collapse
                 expandCollapseIcon.innerHTML = `
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
@@ -2034,7 +2420,219 @@ def home():
                 `;
             }
         }
-        
+
+        function resetSegmentsPanel(item, index) {
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+            if (!segmentsEnabledInput.checked) {
+                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
+            } else {
+                panel.innerHTML = '<div class="segments-status">Expand the image and click on an area to propose regions.</div>';
+            }
+        }
+
+        function prepareSegmentsPanel(item, result, index) {
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+            if (!segmentsEnabledInput.checked) {
+                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
+                return;
+            }
+            panel.innerHTML = '<div class="segments-status">Click inside the image to propose a region near the selected point.</div>';
+        }
+
+        function refreshSegmentsPanels() {
+            document.querySelectorAll('.result-item').forEach((item) => {
+                const indexAttr = item.dataset.resultIndex;
+                if (typeof indexAttr === 'undefined') return;
+                const index = parseInt(indexAttr, 10);
+                if (Number.isNaN(index)) return;
+                if (item.classList.contains('expanded')) {
+                    prepareSegmentsPanel(item, null, index);
+                    const img = item.querySelector('.thumbnail');
+                    if (img) {
+                        if (segmentsEnabledInput.checked) {
+                            img.classList.add('segment-enabled');
+                        } else {
+                            img.classList.remove('segment-enabled');
+                        }
+                    }
+                } else {
+                    resetSegmentsPanel(item, index);
+                    const img = item.querySelector('.thumbnail');
+                    if (img) {
+                        img.classList.remove('segment-enabled');
+                    }
+                }
+            });
+        }
+
+        function clamp01(value) {
+            if (!Number.isFinite(value)) return 0;
+            return Math.min(1, Math.max(0, value));
+        }
+
+        async function handleSegmentClick(event, result, index, item) {
+            if (!segmentsEnabledInput.checked) return;
+            if (!item.classList.contains('expanded')) return;
+
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                const panel = item.querySelector(`#segments-${index}`);
+                if (panel) {
+                    panel.innerHTML = '<div class="segments-status error">Provide a folder path before running region proposals.</div>';
+                }
+                return;
+            }
+
+            if (item.dataset.segmentLoading === '1') {
+                return;
+            }
+
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+
+            const img = event.currentTarget;
+            const rect = img.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return;
+
+            const xNorm = clamp01((event.clientX - rect.left) / rect.width);
+            const yNorm = clamp01((event.clientY - rect.top) / rect.height);
+
+            const limitValue = parseInt(resultLimitSelect.value, 10);
+            const payload = {
+                folder,
+                image_path: result.path,
+                x: xNorm,
+                y: yNorm,
+                limit: Number.isFinite(limitValue) ? limitValue : 12,
+                sort_by: sortBySelect.value || 'similarity',
+                targets: ['images', 'segments'],
+                threshold: segmentThreshold,
+            };
+
+            item.dataset.segmentLoading = '1';
+            panel.innerHTML = '<div class="segments-status">Proposing region around the selected point...</div>';
+
+            try {
+                const response = await fetch('/segment_from_point', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || 'Region proposal failed');
+                }
+                renderSegmentResponse(panel, data, xNorm, yNorm, img.currentSrc || img.src);
+            } catch (error) {
+                panel.innerHTML = `<div class="segments-status error">Segment error: ${escapeHtml(error.message || String(error))}</div>`;
+            } finally {
+                delete item.dataset.segmentLoading;
+            }
+        }
+
+        function renderSegmentResponse(panel, data, xNorm, yNorm, baseImageSrc) {
+            const segments = Array.isArray(data && data.segments) ? data.segments : [];
+            const overlay = data && data.overlay ? data.overlay : {};
+            const pctX = (xNorm * 100).toFixed(1);
+            const pctY = (yNorm * 100).toFixed(1);
+            const safeBaseSrc = baseImageSrc ? escapeHtml(baseImageSrc) : '';
+
+            const baseOverlayFigure = safeBaseSrc ? `
+                <figure class="segment-overlay-figure">
+                    <div class="segment-overlay-stack">
+                        <img src="${safeBaseSrc}" alt="Expanded image region" />
+                        ${overlay.heatmap_png ? `<img class="overlay-layer overlay-heatmap" src="data:image/png;base64,${overlay.heatmap_png}" alt="Heatmap overlay" />` : ''}
+                        ${overlay.mask_png ? `<img class="overlay-layer overlay-mask" src="data:image/png;base64,${overlay.mask_png}" alt="Refined mask overlay" />` : ''}
+                        <div class="overlay-crosshair" style="left: ${pctX}%; top: ${pctY}%"></div>
+                    </div>
+                    <figcaption>Region overlay</figcaption>
+                </figure>
+            ` : '';
+
+            const segmentationFigure = overlay.segmentation_png ? `
+                <figure class="segment-segmap-figure">
+                    <img class="segment-segmap" src="data:image/png;base64,${overlay.segmentation_png}" alt="Semantic segmentation" />
+                    <figcaption>Mask2Former segmentation</figcaption>
+                </figure>
+            ` : '';
+
+            const legendItems = Array.isArray(overlay.legend)
+                ? overlay.legend.map((entry) => {
+                    const color = escapeHtml(String(entry.color || '#888'));
+                    const labelText = entry.label ? escapeHtml(String(entry.label)) : escapeHtml(String(entry.id || 'class'));
+                    const highlightClass = entry.highlight ? ' highlight' : '';
+                    return `<div class="segment-legend-item${highlightClass}"><span class="segment-legend-swatch" style="background:${color};"></span><span>${labelText}</span></div>`;
+                }).join('')
+                : '';
+
+            const legendHtml = legendItems ? `<div class="segment-legend">${legendItems}</div>` : '';
+
+            const overlayHtml = (baseOverlayFigure || segmentationFigure)
+                ? `<div class="segment-overlay-grid">${baseOverlayFigure}${segmentationFigure}</div>${legendHtml}`
+                : legendHtml;
+
+            const listItems = segments.slice(0, 3).map((segment, idx) => {
+                const segId = escapeHtml(String(segment.segment_id || `region-${idx + 1}`));
+                const fraction = typeof segment.patch_fraction === 'number'
+                    ? `${(segment.patch_fraction * 100).toFixed(1)}% area`
+                    : 'Area n/a';
+                const patchCount = typeof segment.patch_count === 'number'
+                    ? `${segment.patch_count} patch${segment.patch_count === 1 ? '' : 'es'}`
+                    : '';
+                const humanLabel = segment.label ? ` · ${escapeHtml(String(segment.label))}` : '';
+
+                const matches = Array.isArray(segment.image_results) ? segment.image_results.slice(0, 3) : [];
+                const matchRows = matches.map((match, matchIdx) => {
+                    const label = escapeHtml(String(match.filename || match.path || `Match ${matchIdx + 1}`));
+                    const score = typeof match.similarity === 'number' ? `${(match.similarity * 100).toFixed(1)}%` : 'n/a';
+                    const thumb = match.thumbnail
+                        ? `<img class="segment-match-thumb" src="data:image/jpeg;base64,${match.thumbnail}" alt="${label}" />`
+                        : '<div class="segment-match-thumb placeholder"></div>';
+                    return `
+                        <div class="segment-match-row">
+                            ${thumb}
+                            <div class="segment-match-meta">
+                                <span>${label}</span>
+                                <span>Similarity: ${score}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+                const matchList = matchRows || '<div class="segments-status warning">No close matches for this region.</div>';
+
+                return `
+                    <li>
+                        <span class="segment-title">#${idx + 1} · ${segId}${humanLabel}</span>
+                        <span class="segment-meta">${fraction}${patchCount ? ` · ${patchCount}` : ''}</span>
+                        <div class="segment-match-list">
+                            ${matchList}
+                        </div>
+                    </li>
+                `;
+            }).join('');
+
+            const refinementNote = overlay.refinement
+                ? `<div class="segment-meta">Mask source: ${escapeHtml(String(overlay.refinement))}${overlay.refined_label ? ` · ${escapeHtml(String(overlay.refined_label))}` : ''}</div>`
+                : '';
+            const areaNote = typeof overlay.mask_fraction === 'number'
+                ? `<div class="segment-meta">Refined mask coverage: ${(overlay.mask_fraction * 100).toFixed(1)}%</div>`
+                : '';
+            const resultsHtml = listItems
+                ? `<ul class="segment-results-list">${listItems}</ul>`
+                : '<div class="segments-status warning">Region proposals returned no matches.</div>';
+
+            panel.innerHTML = `
+                <div class="segments-status success">Regions proposed near (${pctX}%, ${pctY}%) · ${segments.length} candidate(s)</div>
+                ${overlayHtml}
+                ${refinementNote}
+                ${typeof overlay.threshold === 'number' ? `<div class="segment-meta">Heatmap threshold: ${(overlay.threshold * 100).toFixed(1)}%</div>` : ''}
+                ${areaNote}
+                ${resultsHtml}
+            `;
+        }
         
         async function copyImagePath(imagePath) {
             try {
@@ -2197,6 +2795,88 @@ def _image_to_base64(img: Image.Image) -> str:
     buffer = BytesIO()
     img.save(buffer, format='PNG')
     return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
+    alpha = alpha_image.convert('L')
+    scale = float(opacity_scale)
+    if scale <= 0:
+        alpha = alpha.point(lambda _: 0)
+    elif scale < 0.999:
+        alpha = alpha.point(lambda v: int(max(0, min(255, v * scale))))
+    overlay = Image.new('RGBA', alpha.size, color + (0,))
+    overlay.putalpha(alpha)
+    return overlay
+
+
+_SEGMENT_COLOR_TABLE: Tuple[Tuple[int, int, int], ...] = (
+    (244, 67, 54),
+    (30, 136, 229),
+    (102, 187, 106),
+    (255, 202, 40),
+    (171, 71, 188),
+    (255, 112, 67),
+    (66, 165, 245),
+    (38, 166, 154),
+    (156, 204, 101),
+    (255, 238, 88),
+    (239, 83, 80),
+    (126, 87, 194),
+    (0, 188, 212),
+    (255, 171, 145),
+    (156, 39, 176),
+    (124, 179, 66),
+)
+
+
+def _class_color(class_id: int) -> Tuple[int, int, int]:
+    table = _SEGMENT_COLOR_TABLE
+    return table[class_id % len(table)]
+
+
+def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*color)
+
+
+def _render_segmentation_overlay(
+    seg_map: np.ndarray,
+    label_lookup: Optional[Dict[int, str]],
+    highlight_id: Optional[int],
+) -> Tuple[Optional[Image.Image], List[Dict[str, Any]]]:
+    if seg_map is None or not isinstance(seg_map, np.ndarray):
+        return None, []
+    seg_int = np.asarray(seg_map, dtype=np.int32)
+    if seg_int.ndim != 2:
+        return None, []
+    height, width = seg_int.shape
+    if height == 0 or width == 0:
+        return None, []
+
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    legend: List[Dict[str, Any]] = []
+
+    labels = label_lookup or {}
+    unique_ids = np.unique(seg_int)
+    for class_id in unique_ids:
+        class_int = int(class_id)
+        color = _class_color(class_int)
+        mask = seg_int == class_int
+        alpha = 220 if highlight_id is not None and class_int == highlight_id else 150
+        rgba[..., :3][mask] = color
+        rgba[..., 3][mask] = alpha
+        legend.append(
+            {
+                'id': class_int,
+                'label': labels.get(class_int, f'class_{class_int}'),
+                'color': _rgb_to_hex(color),
+                'highlight': bool(highlight_id is not None and class_int == highlight_id),
+            }
+        )
+
+    legend.sort(key=lambda entry: (0 if entry['highlight'] else 1, entry['label']))
+
+    overlay_img = Image.fromarray(rgba, mode='RGBA')
+    return overlay_img, legend
 
 
 def _available_indexes(folder_path: Union[str, Path]) -> List[str]:
@@ -3351,6 +4031,8 @@ def segment_from_point():
     target_modes = _parse_targets(data.get('targets') or data.get('target'))
     segment_ids = _parse_segment_ids(data.get('segment_ids'))
     label_map = _parse_segment_labels(data.get('segment_labels'))
+    if not isinstance(label_map, dict):
+        label_map = {}
 
     try:
         limit = int(limit)
@@ -3365,15 +4047,19 @@ def segment_from_point():
     if dino_encoder is None:
         return jsonify({'error': 'DINO encoder is not available'}), 500
 
+    pil_image: Optional[Image.Image] = None
     if uploaded_image:
-        image_obj = Image.open(uploaded_image.stream)
-        if image_obj.mode != 'RGB':
-            image_obj = image_obj.convert('RGB')
-        image_input: Union[str, Path, Image.Image] = image_obj
+        pil_image = Image.open(uploaded_image.stream)
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
     else:
         if not os.path.exists(image_path):
             return jsonify({'error': f'Image file not found: {image_path}'}), 400
-        image_input = image_path
+        with Image.open(image_path) as src:
+            pil_image = src.convert('RGB')
+
+    assert pil_image is not None
+    image_input: Union[str, Path, Image.Image] = pil_image
 
     try:
         heatmap, _, grid, patch_coords = dino_encoder.patch_similarity_map(
@@ -3390,17 +4076,65 @@ def segment_from_point():
     if not mask_bool.any() and flat.size:
         mask_bool.flat[int(np.argmax(flat))] = True
 
-    mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+    coarse_mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+    mask_fraction = float(np.count_nonzero(coarse_mask_uint8)) / float(coarse_mask_uint8.size) if coarse_mask_uint8.size else 0.0
+
     heatmap_norm = heatmap - heatmap.min()
     if heatmap_norm.max() > 0:
         heatmap_norm = heatmap_norm / heatmap_norm.max()
 
     crop_size = getattr(dino_encoder, 'crop_size', 224)
-    heatmap_img = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(
-        (crop_size, crop_size),
-        resample=Image.BILINEAR,
-    )
-    mask_img = Image.fromarray(mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+
+    base_size = pil_image.size
+    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=Image.NEAREST)
+    refinement_source = 'dino_heatmap'
+    refined_label: Optional[str] = None
+    segment_value = 255
+    refine_result: Optional[Dict[str, Any]] = None
+
+    head = ensure_mask_head()
+    if head is not None:
+        try:
+            refine_result = head.refine(pil_image, coarse_mask_uint8, (x_norm, y_norm))
+            if refine_result and isinstance(refine_result, dict):
+                refined_mask_arr = refine_result.get('mask')
+                if isinstance(refined_mask_arr, np.ndarray) and refined_mask_arr.any():
+                    refinement_source = 'mask2former'
+                    refined_label = refine_result.get('label')
+                    mask_fraction = float(refine_result.get('mask_fraction', mask_fraction))
+                    segment_value = int(refine_result.get('segment_value', 255))
+                    overlay_mask_source = Image.fromarray(refined_mask_arr.astype(np.uint8), mode='L')
+                    if overlay_mask_source.size != base_size:
+                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=Image.NEAREST)
+                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=Image.NEAREST)
+                    if refined_label:
+                        label_map[str(segment_value)] = refined_label
+        except Exception as exc:
+            print(f"Mask2Former refinement error: {exc}")
+
+    # Update mask coverage fraction based on overlay image size
+    overlay_mask_np = np.asarray(overlay_mask_source)
+    if overlay_mask_np.size:
+        mask_fraction = float(np.count_nonzero(overlay_mask_np)) / float(overlay_mask_np.size)
+
+    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=Image.BILINEAR)
+    heatmap_overlay = _create_overlay_rgba(heatmap_alpha, (255, 155, 40), 0.9)
+    mask_overlay = _create_overlay_rgba(overlay_mask_source, (94, 196, 255), 0.6)
+    segmentation_overlay_img: Optional[Image.Image] = None
+    legend_entries: List[Dict[str, Any]] = []
+
+    if refine_result:
+        seg_map = refine_result.get('segmentation')
+        class_labels_raw = refine_result.get('class_labels')
+        class_labels = {}
+        if isinstance(class_labels_raw, dict):
+            class_labels = {int(k): str(v) for k, v in class_labels_raw.items()}
+        seg_overlay, legend_entries = _render_segmentation_overlay(seg_map, class_labels, int(refine_result.get('class_id', segment_value)))
+        if seg_overlay is not None:
+            if seg_overlay.size != base_size:
+                seg_overlay = seg_overlay.resize(base_size, resample=Image.NEAREST)
+            segmentation_overlay_img = seg_overlay
 
     try:
         segments_response, segment_map = _mask_search_pipeline(
@@ -3426,11 +4160,19 @@ def segment_from_point():
         'grid_size': grid,
         'patch_coords': {'x': patch_coords[0], 'y': patch_coords[1]},
         'threshold': threshold,
-        'heatmap_png': _image_to_base64(heatmap_img),
-        'mask_png': _image_to_base64(mask_img),
+        'heatmap_png': _image_to_base64(heatmap_overlay),
+        'mask_png': _image_to_base64(mask_overlay),
+        'mask_fraction': mask_fraction,
+        'refinement': refinement_source,
+        'refined_label': refined_label,
+        'segment_value': segment_value,
         'patch_count': int(selected_meta.get('patch_count', 0)),
         'patch_fraction': float(selected_meta.get('patch_fraction', 0.0)),
     }
+    if segmentation_overlay_img is not None:
+        overlay['segmentation_png'] = _image_to_base64(segmentation_overlay_img)
+    if legend_entries:
+        overlay['legend'] = legend_entries
 
     return jsonify(
         {
@@ -3599,6 +4341,10 @@ EVOSSEARCH_RERANK_TOP_K={rerank_top_k}
 EVOSSEARCH_DINO_SEGMENTS_ENABLED={str(segments_enabled).lower()}
 EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES={segment_min_patches}
 EVOSSEARCH_DINO_HEATMAP_THRESHOLD={segment_threshold:.4f}
+EVOSSEARCH_M2F_ENABLED={str(config.MASK2FORMER_ENABLED).lower()}
+EVOSSEARCH_M2F_MODEL={config.MASK2FORMER_MODEL}
+EVOSSEARCH_M2F_DEVICE={config.MASK2FORMER_DEVICE}
+EVOSSEARCH_M2F_MAX_SIZE={config.MASK2FORMER_MAX_SIZE}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
