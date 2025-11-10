@@ -50,6 +50,34 @@ class Config:
     if MASK2FORMER_MAX_SIZE < 256:
         MASK2FORMER_MAX_SIZE = 256
 
+    OCR_ENABLED = _get_bool_env('EVOSSEARCH_OCR_ENABLED', 'True')
+    PADDLE_OCR_ENABLED = _get_bool_env('EVOSSEARCH_PADDLE_OCR_ENABLED', 'True')
+    PADDLE_OCR_LANG = os.getenv('EVOSSEARCH_PADDLE_OCR_LANG', 'en').strip() or 'en'
+
+    try:
+        CLIP_TAG_TOP_K = int(os.getenv('EVOSSEARCH_CLIP_TAG_TOP_K', '6'))
+    except (TypeError, ValueError):
+        CLIP_TAG_TOP_K = 6
+    if CLIP_TAG_TOP_K < 1:
+        CLIP_TAG_TOP_K = 1
+    try:
+        CLIP_TAG_THRESHOLD = float(os.getenv('EVOSSEARCH_CLIP_TAG_THRESHOLD', '0.23'))
+    except (TypeError, ValueError):
+        CLIP_TAG_THRESHOLD = 0.23
+    CLIP_TAG_THRESHOLD = min(0.99, max(0.0, CLIP_TAG_THRESHOLD))
+    raw_prompts = os.getenv('EVOSSEARCH_CLIP_TAG_PROMPTS', '')
+    if raw_prompts:
+        if os.path.isfile(raw_prompts):
+            try:
+                _prompt_list = [line.strip() for line in Path(raw_prompts).read_text(encoding='utf-8').splitlines() if line.strip()]
+            except Exception:
+                _prompt_list = []
+        else:
+            _prompt_list = [part.strip() for part in raw_prompts.split(',') if part.strip()]
+        CLIP_TAG_PROMPTS = tuple(_prompt_list)
+    else:
+        CLIP_TAG_PROMPTS = tuple()
+
     INDEX_MODE = os.getenv('EVOSSEARCH_INDEX_MODE', 'clip').strip().lower()
     if INDEX_MODE not in {'clip', 'dino', 'dual'}:
         INDEX_MODE = 'clip'
@@ -172,6 +200,11 @@ class Config:
             )
         else:
             print("Mask2Former: disabled")
+        print(f"OCR: {'enabled' if cls.OCR_ENABLED else 'disabled'}")
+        print(f"PaddleOCR: {'enabled' if cls.PADDLE_OCR_ENABLED else 'disabled'} (lang={cls.PADDLE_OCR_LANG})")
+        print(
+            f"CLIP tags: top_k={cls.CLIP_TAG_TOP_K}, threshold={cls.CLIP_TAG_THRESHOLD:.2f}"
+        )
         print(f"Result Limits: {cls.MIN_RESULTS}-{cls.MAX_RESULTS} (default: {cls.DEFAULT_RESULTS})")
         print()
         print("Server available at:")
