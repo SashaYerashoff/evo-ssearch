@@ -1324,7 +1324,6 @@ def home():
             background: rgba(0, 0, 0, 0.9);
             transform: scale(1.1);
         }
-
         /* Video understanding */
         .video-box {
             display: none;
@@ -1396,28 +1395,13 @@ def home():
         }
         
         
-        .find-similar-icon {
-            position: absolute;
-            top: 8px;
-            right: 8px;
-            background: rgba(0, 0, 0, 0.7);
-            border-radius: 4px;
-            padding: 4px;
-            cursor: pointer;
-            pointer-events: auto; /* Re-enable clicks for the icon */
-            transition: all 0.2s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+        /* Show action icons only when expanded */
+        .result-item .find-similar-icon,
+        .result-item .describe-icon {
+            display: none;
         }
-        
-        .find-similar-icon:hover {
-            background: rgba(0, 0, 0, 0.9);
-            transform: scale(1.1);
-        }
-        
-        /* Show find similar icon only when expanded */
-        .result-item.expanded .find-similar-icon {
+        .result-item.expanded .find-similar-icon,
+        .result-item.expanded .describe-icon {
             display: flex !important;
         }
         
@@ -4068,7 +4052,8 @@ def save_comment():
 @app.route('/commented_images', methods=['POST'])
 def get_commented_images():
     """Get all images that have comments in the indexed folder"""
-    folder = request.json.get('folder')
+    payload = request.json if request.is_json else None
+    folder = (payload or {}).get('folder')
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
     
