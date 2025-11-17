@@ -16,6 +16,4 @@ regex>=2024.4.24
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 psutil>=5.9.0
-pytesseract>=0.3.10
-paddleocr>=2.7.0
-paddlepaddle>=2.6.2
+requests>=2.31.0

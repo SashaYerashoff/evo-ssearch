@@ -50,34 +50,6 @@ class Config:
     if MASK2FORMER_MAX_SIZE < 256:
         MASK2FORMER_MAX_SIZE = 256
 
-    OCR_ENABLED = _get_bool_env('EVOSSEARCH_OCR_ENABLED', 'True')
-    PADDLE_OCR_ENABLED = _get_bool_env('EVOSSEARCH_PADDLE_OCR_ENABLED', 'True')
-    PADDLE_OCR_LANG = os.getenv('EVOSSEARCH_PADDLE_OCR_LANG', 'en').strip() or 'en'
-
-    try:
-        CLIP_TAG_TOP_K = int(os.getenv('EVOSSEARCH_CLIP_TAG_TOP_K', '6'))
-    except (TypeError, ValueError):
-        CLIP_TAG_TOP_K = 6
-    if CLIP_TAG_TOP_K < 1:
-        CLIP_TAG_TOP_K = 1
-    try:
-        CLIP_TAG_THRESHOLD = float(os.getenv('EVOSSEARCH_CLIP_TAG_THRESHOLD', '0.23'))
-    except (TypeError, ValueError):
-        CLIP_TAG_THRESHOLD = 0.23
-    CLIP_TAG_THRESHOLD = min(0.99, max(0.0, CLIP_TAG_THRESHOLD))
-    raw_prompts = os.getenv('EVOSSEARCH_CLIP_TAG_PROMPTS', '')
-    if raw_prompts:
-        if os.path.isfile(raw_prompts):
-            try:
-                _prompt_list = [line.strip() for line in Path(raw_prompts).read_text(encoding='utf-8').splitlines() if line.strip()]
-            except Exception:
-                _prompt_list = []
-        else:
-            _prompt_list = [part.strip() for part in raw_prompts.split(',') if part.strip()]
-        CLIP_TAG_PROMPTS = tuple(_prompt_list)
-    else:
-        CLIP_TAG_PROMPTS = tuple()
-
     INDEX_MODE = os.getenv('EVOSSEARCH_INDEX_MODE', 'clip').strip().lower()
     if INDEX_MODE not in {'clip', 'dino', 'dual'}:
         INDEX_MODE = 'clip'
@@ -129,6 +101,41 @@ class Config:
 
     # Security configuration
     MAX_FILE_SIZE_MB = int(os.getenv('EVOSSEARCH_MAX_FILE_SIZE_MB', '50'))
+
+    # LM Studio / Qwen video understanding
+    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://192.168.1.104:1234/v1').strip().rstrip('/')
+    LM_MODEL = os.getenv('EVOSSEARCH_LM_MODEL', 'qwen/qwen3-vl-4b').strip()
+    LM_API_KEY = os.getenv('EVOSSEARCH_LM_API_KEY', '').strip()
+    try:
+        LM_TIMEOUT = int(os.getenv('EVOSSEARCH_LM_TIMEOUT', '120'))
+    except (TypeError, ValueError):
+        LM_TIMEOUT = 120
+    try:
+        LM_VIDEO_DEFAULT_FRAMES = int(os.getenv('EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES', '16'))
+    except (TypeError, ValueError):
+        LM_VIDEO_DEFAULT_FRAMES = 16
+    if LM_VIDEO_DEFAULT_FRAMES < 1:
+        LM_VIDEO_DEFAULT_FRAMES = 1
+    try:
+        LM_VIDEO_MAX_FRAMES = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_FRAMES', '64'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_FRAMES = 64
+    if LM_VIDEO_MAX_FRAMES < 1:
+        LM_VIDEO_MAX_FRAMES = 1
+    LM_VIDEO_FRAME_OPTIONS = (16, 32, 64)
+    try:
+        LM_VIDEO_MAX_EDGE = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_EDGE', '960'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_EDGE = 960
+    try:
+        LM_VIDEO_MAX_TOKENS = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_TOKENS', '768'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_TOKENS = 768
+    try:
+        LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
+    except (TypeError, ValueError):
+        LM_VIDEO_TEMPERATURE = 0.2
+    LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
 
     @classmethod
     def get_server_urls(cls):
@@ -194,17 +201,16 @@ class Config:
                 'enabled' if cls.DINO_SEGMENTS_ENABLED else 'disabled', cls.DINO_SEGMENT_MIN_PATCHES
             )
         )
+        print(
+            f"Video LM: {cls.LM_MODEL} @ {cls.LM_BASE_URL or 'unset'} "
+            f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, max_edge={cls.LM_VIDEO_MAX_EDGE})"
+        )
         if cls.MASK2FORMER_ENABLED:
             print(
                 f"Mask2Former: enabled ({cls.MASK2FORMER_MODEL}, device={cls.MASK2FORMER_DEVICE}, max_edge={cls.MASK2FORMER_MAX_SIZE})"
             )
         else:
             print("Mask2Former: disabled")
-        print(f"OCR: {'enabled' if cls.OCR_ENABLED else 'disabled'}")
-        print(f"PaddleOCR: {'enabled' if cls.PADDLE_OCR_ENABLED else 'disabled'} (lang={cls.PADDLE_OCR_LANG})")
-        print(
-            f"CLIP tags: top_k={cls.CLIP_TAG_TOP_K}, threshold={cls.CLIP_TAG_THRESHOLD:.2f}"
-        )
         print(f"Result Limits: {cls.MIN_RESULTS}-{cls.MAX_RESULTS} (default: {cls.DEFAULT_RESULTS})")
         print()
         print("Server available at:")

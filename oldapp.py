@@ -4,6 +4,8 @@ import base64
 import json
 import pickle
 import time
+import math
+import requests
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -12,9 +14,10 @@ from threading import Lock
 
 import numpy as np
 import torch
+import cv2
 import clip
 import faiss
-from PIL import Image, ImageOps
+from PIL import Image
 from flask import Flask, request, jsonify, send_file, render_template_string, make_response
 from flask_cors import CORS
 
@@ -24,20 +27,6 @@ try:
     from heads.mask2former_head import Mask2FormerHead
 except Exception:  # pragma: no cover - optional dependency
     Mask2FormerHead = None  # type: ignore[misc]
-try:
-    from heads.clip_tagger import CLIPAutoTagger, DEFAULT_PROMPTS as CLIP_DEFAULT_PROMPTS
-except Exception:  # pragma: no cover - optional dependency
-    CLIPAutoTagger = None  # type: ignore[misc]
-    CLIP_DEFAULT_PROMPTS = tuple()
-try:
-    from heads.paddle_ocr_head import PaddleOCRHead
-except Exception:  # pragma: no cover - optional dependency
-    PaddleOCRHead = None  # type: ignore[misc]
-
-try:
-    import pytesseract  # type: ignore
-except Exception:  # pragma: no cover
-    pytesseract = None  # type: ignore
 
 app = Flask(__name__)
 CORS(app)
@@ -50,12 +39,6 @@ dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
 _mask2former_failed = False
-clip_auto_tagger: Optional["CLIPAutoTagger"] = None
-_clip_tagger_lock = Lock()
-_clip_tagger_failed = False
-paddle_ocr_head: Optional["PaddleOCRHead"] = None
-_paddle_ocr_lock = Lock()
-_paddle_ocr_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
@@ -145,55 +128,6 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
             config.MASK2FORMER_ENABLED = False
             return None
     return mask2former_head
-
-
-def ensure_clip_tagger() -> Optional["CLIPAutoTagger"]:
-    global clip_auto_tagger, _clip_tagger_failed
-    if CLIPAutoTagger is None or _clip_tagger_failed:
-        if CLIPAutoTagger is None and not _clip_tagger_failed:
-            print("CLIP tagger unavailable: clip package not ready; disabling auto-tags.")
-        return None
-    if clip_auto_tagger is not None:
-        return clip_auto_tagger
-    with _clip_tagger_lock:
-        if clip_auto_tagger is not None:
-            return clip_auto_tagger
-        try:
-            ensure_embedder_loaded("clip")
-            if clip_model is None or clip_preprocess is None:
-                raise RuntimeError("CLIP model not loaded")
-            prompts = CLIP_DEFAULT_PROMPTS if CLIP_DEFAULT_PROMPTS else ()
-            clip_auto_tagger = CLIPAutoTagger(
-                clip_model,
-                clip_preprocess,
-                device=torch.device(device),
-                prompts=prompts if prompts else ("person", "object"),
-            )
-        except Exception as exc:
-            _clip_tagger_failed = True
-            print(f"CLIP tagger initialization failed: {exc}")
-            return None
-    return clip_auto_tagger
-
-
-def ensure_paddle_ocr() -> Optional["PaddleOCRHead"]:
-    global paddle_ocr_head, _paddle_ocr_failed
-    if not config.PADDLE_OCR_ENABLED:
-        return None
-    if PaddleOCRHead is None or _paddle_ocr_failed:
-        return None
-    if paddle_ocr_head is not None:
-        return paddle_ocr_head
-    with _paddle_ocr_lock:
-        if paddle_ocr_head is not None:
-            return paddle_ocr_head
-        try:
-            paddle_ocr_head = PaddleOCRHead(lang=config.PADDLE_OCR_LANG)
-        except Exception as exc:
-            _paddle_ocr_failed = True
-            print(f"PaddleOCR initialization failed: {exc}")
-            return None
-    return paddle_ocr_head
 
 
 def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
@@ -1147,52 +1081,6 @@ def home():
         .segment-legend-item.highlight .segment-legend-swatch {
             box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
         }
-
-        .segment-zoom-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-            gap: 0.75rem;
-            margin-bottom: 0.8rem;
-        }
-        
-        .segment-zoom-card {
-            background: #131313;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.55rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
-        }
-        
-        .segment-zoom-card img {
-            width: 100%;
-            border-radius: 6px;
-            display: block;
-        }
-        
-        .segment-zoom-title {
-            font-size: 0.72rem;
-            color: #ddd;
-            letter-spacing: 0.01em;
-        }
-        
-        .segment-ocr {
-            font-size: 0.74rem;
-            color: #c9c9c9;
-            background: #151515;
-            border: 1px solid #222;
-            padding: 0.45rem 0.55rem;
-            border-radius: 8px;
-            margin-bottom: 0.7rem;
-            white-space: pre-wrap;
-            line-height: 1.35;
-        }
-        
-        .segment-ocr strong {
-            color: #f0f0f0;
-            margin-right: 0.35rem;
-        }
         
         .segment-overlay-images img {
             max-width: 160px;
@@ -1266,49 +1154,6 @@ def home():
             font-size: 0.75rem;
             color: #cfcfcf;
             line-height: 1.35;
-        }
-
-        .lpr-box {
-            display: none;
-            flex-direction: column;
-            gap: 1rem;
-            background: #111;
-            border: 1px dashed #333;
-            border-radius: 10px;
-            padding: 1rem;
-            color: #d0d0d0;
-        }
-
-        .lpr-hint {
-            font-size: 0.85rem;
-            color: #999;
-            margin: 0;
-            line-height: 1.4;
-        }
-        
-        .segment-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.35rem;
-            margin-bottom: 0.6rem;
-        }
-        
-        .segment-tag {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.25rem;
-            padding: 0.25rem 0.55rem;
-            background: #1d1d1d;
-            border-radius: 999px;
-            font-size: 0.74rem;
-            color: #f0f0f0;
-            border: 1px solid #2c2c2c;
-            letter-spacing: 0.01em;
-        }
-        
-        .segment-tag-score {
-            color: #a8a8a8;
-            font-size: 0.68rem;
         }
         
         .result-item.expanded .comment-section {
@@ -1453,6 +1298,76 @@ def home():
             background: rgba(0, 0, 0, 0.9);
             transform: scale(1.1);
         }
+
+        /* Video understanding */
+        .video-box {
+            display: none;
+            flex-direction: column;
+            gap: 0.8rem;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .video-row {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .video-row .input-group {
+            flex: 1;
+            min-width: 220px;
+        }
+
+        .video-prompt {
+            width: 100%;
+            min-height: 110px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.75rem;
+            resize: vertical;
+        }
+
+        .video-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .video-status {
+            font-size: 0.9rem;
+            color: #ccc;
+            min-height: 20px;
+        }
+
+        .video-output {
+            background: #0f0f0f;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 0.9rem;
+            color: #eaeaea;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .video-frame-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .video-frame-grid img {
+            width: 140px;
+            height: auto;
+            border-radius: 5px;
+            border: 1px solid #222;
+            background: #111;
+        }
         
         
         .find-similar-icon {
@@ -1526,12 +1441,12 @@ def home():
             <div class="status" id="indexStatus"></div>
         </div>
         
-        <div class="search-panel">
-            <div class="search-mode-tabs">
-                <button id="textModeBtn" class="mode-tab active">Text Search</button>
-                <button id="imageModeBtn" class="mode-tab">Image Search</button>
-                <button id="lprModeBtn" class="mode-tab">LPR</button>
-            </div>
+            <div class="search-panel">
+                <div class="search-mode-tabs">
+                    <button id="textModeBtn" class="mode-tab active">Text Search</button>
+                    <button id="imageModeBtn" class="mode-tab">Image Search</button>
+                    <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
+                </div>
             <div class="search-controls">
                 <div class="control-group">
                     <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
@@ -1577,16 +1492,40 @@ def home():
                 </div>
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
-            <div id="lprBox" class="lpr-box" style="display: none;">
-                <div class="input-group">
-                    <label class="input-label" for="lprVideoPath">Video Path:</label>
-                    <input type="text" id="lprVideoPath" placeholder="/home/user/video.mp4" value="/home/sasha/Projects/webtool/video/video_20250710_005830_33670051.mp4" />
+            <div id="videoBox" class="video-box" style="display: none;">
+                <div class="video-row">
+                    <div class="input-group">
+                        <label for="videoPath" class="input-label">Video Path:</label>
+                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+                    </div>
                 </div>
-                <p class="lpr-hint">
-                    LPR (License Plate Recognition) will scan the video for incoming vehicles, capture their plates, colors, and best frames,
-                    and automatically index them. Provide the absolute path to a video file and press “Run LPR”.
-                </p>
-                <button id="lprRunBtn" class="feature-btn">Run LPR (beta)</button>
+                <div class="video-row">
+                    <div class="input-group">
+                        <label class="input-label" for="videoFrameCount">Frames to sample:</label>
+                        <select id="videoFrameCount">
+                            <option value="16">16</option>
+                            <option value="32">32</option>
+                            <option value="64">64</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label class="input-label" for="videoSampleFps">Target sample FPS (optional):</label>
+                        <input type="number" id="videoSampleFps" min="0" step="0.1" placeholder="auto" />
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label class="input-label" for="videoPrompt">Prompt:</label>
+                    <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
+                    <label style="color: #aaa; font-size: 0.85rem;">
+                        <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
+                    </label>
+                </div>
+                <div class="video-controls">
+                    <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
+                    <div id="videoStatus" class="video-status"></div>
+                </div>
+                <div id="videoOutput" class="video-output" style="display: none;"></div>
+                <div id="videoFrames" class="video-frame-grid"></div>
             </div>
         </div>
         
@@ -1743,20 +1682,60 @@ def home():
         const imageSearchBtn = document.getElementById('imageSearchBtn');
         const textModeBtn = document.getElementById('textModeBtn');
         const imageModeBtn = document.getElementById('imageModeBtn');
-        const lprModeBtn = document.getElementById('lprModeBtn');
+        const videoModeBtn = document.getElementById('videoModeBtn');
         const textSearchBox = document.getElementById('textSearchBox');
         const imageSearchBox = document.getElementById('imageSearchBox');
-        const lprBox = document.getElementById('lprBox');
+        const videoBox = document.getElementById('videoBox');
+        const videoPathInput = document.getElementById('videoPath');
+        const videoFrameCount = document.getElementById('videoFrameCount');
+        const videoSampleFpsInput = document.getElementById('videoSampleFps');
+        const videoPromptInput = document.getElementById('videoPrompt');
+        const saveVideoPromptInput = document.getElementById('saveVideoPrompt');
+        const videoRunBtn = document.getElementById('videoRunBtn');
+        const videoStatus = document.getElementById('videoStatus');
+        const videoOutput = document.getElementById('videoOutput');
+        const videoFrames = document.getElementById('videoFrames');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
-        const lprVideoInput = document.getElementById('lprVideoPath');
-        const lprRunBtn = document.getElementById('lprRunBtn');
         
         let currentFolder = '';
         let currentMode = 'text';
-        let lastQueryText = '';
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+            const safe = escapeHtml(text || '');
+            return safe
+                .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/\\n/g, '<br>');
+        }
+
+        function setMode(mode) {
+            currentMode = mode;
+            textModeBtn.classList.toggle('active', mode === 'text');
+            imageModeBtn.classList.toggle('active', mode === 'image');
+            videoModeBtn.classList.toggle('active', mode === 'video');
+            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
+            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
+            videoBox.style.display = mode === 'video' ? 'flex' : 'none';
+        }
+
+        const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
+        if (savedVideoPrompt && videoPromptInput) {
+            videoPromptInput.value = savedVideoPrompt;
+            if (saveVideoPromptInput) {
+                saveVideoPromptInput.checked = true;
+            }
+        }
+
+        setMode(currentMode);
         
         // Settings modal elements
         const settingsBtn = document.getElementById('settingsBtn');
@@ -2154,16 +2133,12 @@ def home():
                 textModeBtn.disabled = true;
                 textModeBtn.title = 'Text search is only available with the CLIP backend.';
                 textModeBtn.classList.remove('active');
-                imageModeBtn.classList.add('active');
-                currentMode = 'image';
-                textSearchBox.style.display = 'none';
-                imageSearchBox.style.display = 'flex';
+                setMode('image');
             } else {
                 textModeBtn.disabled = false;
                 textModeBtn.title = '';
                 if (currentMode === 'text') {
-                    textSearchBox.style.display = 'flex';
-                    imageSearchBox.style.display = 'none';
+                    setMode('text');
                 }
             }
         }
@@ -2174,35 +2149,9 @@ def home():
         applyEmbedderUI(embedderSelect.value);
         
         // Mode switching
-        textModeBtn.addEventListener('click', () => {
-            currentMode = 'text';
-            textModeBtn.classList.add('active');
-            imageModeBtn.classList.remove('active');
-            lprModeBtn.classList.remove('active');
-            textSearchBox.style.display = 'flex';
-            imageSearchBox.style.display = 'none';
-            lprBox.style.display = 'none';
-        });
-        
-        imageModeBtn.addEventListener('click', () => {
-            currentMode = 'image';
-            imageModeBtn.classList.add('active');
-            textModeBtn.classList.remove('active');
-            lprModeBtn.classList.remove('active');
-            imageSearchBox.style.display = 'flex';
-            textSearchBox.style.display = 'none';
-            lprBox.style.display = 'none';
-        });
-
-        lprModeBtn.addEventListener('click', () => {
-            currentMode = 'lpr';
-            lprModeBtn.classList.add('active');
-            textModeBtn.classList.remove('active');
-            imageModeBtn.classList.remove('active');
-            textSearchBox.style.display = 'none';
-            imageSearchBox.style.display = 'none';
-            lprBox.style.display = 'flex';
-        });
+        textModeBtn.addEventListener('click', () => setMode('text'));
+        imageModeBtn.addEventListener('click', () => setMode('image'));
+        videoModeBtn.addEventListener('click', () => setMode('video'));
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -2268,7 +2217,6 @@ def home():
             const sortBy = sortBySelect.value;
             
             if (!query || !folder) return;
-            lastQueryText = query;
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
             
@@ -2304,7 +2252,6 @@ def home():
                 alert('Please select a folder and either upload an image file or enter an image path.');
                 return;
             }
-            lastQueryText = imagePathValue ? imagePathValue.split(/[/\\\\]/).pop() || imagePathValue : (file ? file.name : 'image search');
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
             
@@ -2337,6 +2284,85 @@ def home():
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
             }
         });
+
+        function renderVideoFrames(frames) {
+            if (!videoFrames) return;
+            if (!frames || !frames.length) {
+                videoFrames.innerHTML = '';
+                return;
+            }
+            const html = frames.map((frame, idx) => {
+                const ts = typeof frame.time_sec === 'number' ? `${frame.time_sec.toFixed(2)}s` : 'n/a';
+                return `<div title="Frame ${idx + 1} (${ts})"><img src="data:image/jpeg;base64,${frame.thumbnail}" alt="Frame ${idx + 1}" /></div>`;
+            }).join('');
+            videoFrames.innerHTML = html;
+        }
+
+        async function runVideoUnderstanding() {
+            const videoPath = videoPathInput.value.trim();
+            const frameCount = parseInt(videoFrameCount.value, 10) || 16;
+            const sampleFpsValue = Number.parseFloat(videoSampleFpsInput.value);
+            const prompt = videoPromptInput.value.trim();
+
+            if (!videoPath) {
+                videoStatus.textContent = 'Provide a video path.';
+                videoStatus.className = 'video-status error';
+                return;
+            }
+
+            if (saveVideoPromptInput && saveVideoPromptInput.checked) {
+                localStorage.setItem('evs_video_prompt', prompt);
+            } else {
+                localStorage.removeItem('evs_video_prompt');
+            }
+
+            videoRunBtn.disabled = true;
+            videoStatus.textContent = 'Sampling frames and querying the model...';
+            videoStatus.className = 'video-status';
+            videoOutput.style.display = 'none';
+            videoOutput.innerHTML = '';
+            renderVideoFrames([]);
+
+            try {
+                const payload = {
+                    video: videoPath,
+                    frame_count: frameCount,
+                    prompt,
+                };
+                if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
+                    payload.sample_fps = sampleFpsValue;
+                }
+                const response = await fetch('/video_understanding', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    videoStatus.textContent = data.error || 'Video understanding request failed.';
+                    videoStatus.className = 'video-status error';
+                    return;
+                }
+                videoStatus.textContent = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}`;
+                if (data.summary) {
+                    videoOutput.style.display = 'block';
+                    videoOutput.innerHTML = renderMarkdown(data.summary);
+                } else {
+                    videoOutput.style.display = 'block';
+                    videoOutput.textContent = '(No summary returned)';
+                }
+                renderVideoFrames(data.frames || []);
+            } catch (error) {
+                videoStatus.textContent = 'Error: ' + error.message;
+                videoStatus.className = 'video-status error';
+            } finally {
+                videoRunBtn.disabled = false;
+            }
+        }
+
+        if (videoRunBtn) {
+            videoRunBtn.addEventListener('click', runVideoUnderstanding);
+        }
         
         // Show commented images
         showCommentedBtn.addEventListener('click', async () => {
@@ -2570,12 +2596,6 @@ def home():
             }
         }
         
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        
         function toggleImageExpansion(item, result, index) {
             const img = item.querySelector('.thumbnail');
             const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
@@ -2700,7 +2720,6 @@ def home():
                 sort_by: sortBySelect.value || 'similarity',
                 targets: ['images', 'segments'],
                 threshold: segmentThreshold,
-                query_hint: lastQueryText,
             };
 
             item.dataset.segmentLoading = '1';
@@ -2759,56 +2778,11 @@ def home():
                 }).join('')
                 : '';
 
-        const legendHtml = legendItems ? `<div class="segment-legend">${legendItems}</div>` : '';
+            const legendHtml = legendItems ? `<div class="segment-legend">${legendItems}</div>` : '';
 
-        const overlayTags = Array.isArray(overlay.clip_tags)
-                ? overlay.clip_tags.map((tag) => {
-                    const label = escapeHtml(String(tag.label || 'tag'));
-                    const scoreNum = Number.parseFloat(tag.score);
-                    const scoreText = Number.isFinite(scoreNum) ? `${Math.round(scoreNum * 100)}%` : '';
-                    return `<span class="segment-tag">${label}${scoreText ? `<span class="segment-tag-score">${scoreText}</span>` : ''}</span>`;
-                })
-                : [];
-
-        const overlayTagsHtml = overlayTags.length ? `<div class="segment-tags">${overlayTags.join('')}</div>` : '';
-        const overlayOcrHtml = overlay.ocr ? `<div class="segment-ocr"><strong>OCR:</strong>${escapeHtml(String(overlay.ocr))}</div>` : '';
-
-        const overlayZoomCards = Array.isArray(overlay.zoom_regions)
-                ? overlay.zoom_regions.map((region, idx) => {
-                    const thumb = region.thumbnail ? `<img src="data:image/jpeg;base64,${escapeHtml(String(region.thumbnail))}" alt="Detail ${idx + 1}" />` : '';
-                    const score = Number.isFinite(region.score) ? `Score ${(region.score * 100).toFixed(1)}%` : '';
-                    const tags = Array.isArray(region.tags)
-                        ? region.tags.map((tag) => {
-                            const label = escapeHtml(String(tag.label || 'tag'));
-                            const scoreNum = Number.parseFloat(tag.score);
-                            const scoreText = Number.isFinite(scoreNum) ? `${Math.round(scoreNum * 100)}%` : '';
-                            return `<span class="segment-tag">${label}${scoreText ? `<span class="segment-tag-score">${scoreText}</span>` : ''}</span>`;
-                        }).join('')
-                        : '';
-                    const tagsHtml = tags ? `<div class="segment-tags">${tags}</div>` : '';
-                    const ocrHtml = region.ocr ? `<div class="segment-ocr"><strong>OCR:</strong>${escapeHtml(String(region.ocr))}</div>` : '';
-                    return `
-                        <div class="segment-zoom-card">
-                            ${thumb}
-                            <span class="segment-zoom-title">Detail ${idx + 1}${score ? ` · ${score}` : ''}</span>
-                            ${tagsHtml}
-                            ${ocrHtml}
-                        </div>
-                    `;
-                })
-                : [];
-        const overlayZoomHtml = overlayZoomCards.length ? `<div class="segment-zoom-grid">${overlayZoomCards.join('')}</div>` : '';
-
-        const overlayPlateItems = Array.isArray(overlay.plates)
-                ? overlay.plates.map((plate) => `Plate: ${escapeHtml(String(plate.text || ''))}`).filter(Boolean)
-                : [];
-        const overlayPlateHtml = overlayPlateItems.length
-                ? `<div class="segment-ocr"><strong>Plate:</strong> ${overlayPlateItems.join(', ')}</div>`
-                : '';
-
-        const overlayHtml = (baseOverlayFigure || segmentationFigure)
-                ? `<div class="segment-overlay-grid">${baseOverlayFigure}${segmentationFigure}</div>${overlayTagsHtml}${overlayOcrHtml}${overlayPlateHtml}${overlayZoomHtml}${legendHtml}`
-                : `${overlayTagsHtml}${overlayOcrHtml}${overlayPlateHtml}${overlayZoomHtml}${legendHtml}`;
+            const overlayHtml = (baseOverlayFigure || segmentationFigure)
+                ? `<div class="segment-overlay-grid">${baseOverlayFigure}${segmentationFigure}</div>${legendHtml}`
+                : legendHtml;
 
             const listItems = segments.slice(0, 3).map((segment, idx) => {
                 const segId = escapeHtml(String(segment.segment_id || `region-${idx + 1}`));
@@ -2840,55 +2814,10 @@ def home():
 
                 const matchList = matchRows || '<div class="segments-status warning">No close matches for this region.</div>';
 
-                const segmentTags = Array.isArray(segment.tags)
-                    ? segment.tags.map((tag) => {
-                        const label = escapeHtml(String(tag.label || 'tag'));
-                        const scoreNum = Number.parseFloat(tag.score);
-                        const scoreText = Number.isFinite(scoreNum) ? `${Math.round(scoreNum * 100)}%` : '';
-                        return `<span class="segment-tag">${label}${scoreText ? `<span class="segment-tag-score">${scoreText}</span>` : ''}</span>`;
-                    })
-                    : [];
-
-                const segmentTagsHtml = segmentTags.length ? `<div class="segment-tags">${segmentTags.join('')}</div>` : '';
-                const segmentOcrHtml = segment.ocr ? `<div class="segment-ocr"><strong>OCR:</strong>${escapeHtml(String(segment.ocr))}</div>` : '';
-                const segmentPlateHtml = Array.isArray(segment.plates) && segment.plates.length
-                    ? `<div class="segment-ocr"><strong>Plate:</strong>${escapeHtml(String(segment.plates.map((item) => item.text).filter(Boolean).join(', ')))}</div>`
-                    : '';
-
-                const detailZoomCards = Array.isArray(segment.subregions)
-                    ? segment.subregions.map((region, sIdx) => {
-                        const thumb = region.thumbnail ? `<img src="data:image/jpeg;base64,${escapeHtml(String(region.thumbnail))}" alt="Detail ${sIdx + 1}" />` : '';
-                        const score = Number.isFinite(region.score) ? `Score ${(region.score * 100).toFixed(1)}%` : '';
-                        const tags = Array.isArray(region.tags)
-                            ? region.tags.map((tag) => {
-                                const label = escapeHtml(String(tag.label || 'tag'));
-                                const scoreNum = Number.parseFloat(tag.score);
-                                const scoreText = Number.isFinite(scoreNum) ? `${Math.round(scoreNum * 100)}%` : '';
-                                return `<span class="segment-tag">${label}${scoreText ? `<span class="segment-tag-score">${scoreText}</span>` : ''}</span>`;
-                            }).join('')
-                            : '';
-                        const tagsHtml = tags ? `<div class="segment-tags">${tags}</div>` : '';
-                        const ocrHtml = region.ocr ? `<div class="segment-ocr"><strong>OCR:</strong>${escapeHtml(String(region.ocr))}</div>` : '';
-                        return `
-                            <div class="segment-zoom-card">
-                                ${thumb}
-                                <span class="segment-zoom-title">Detail ${sIdx + 1}${score ? ` · ${score}` : ''}</span>
-                                ${tagsHtml}
-                                ${ocrHtml}
-                            </div>
-                        `;
-                    })
-                    : [];
-                const detailZoomHtml = detailZoomCards.length ? `<div class="segment-zoom-grid">${detailZoomCards.join('')}</div>` : '';
-
                 return `
                     <li>
                         <span class="segment-title">#${idx + 1} · ${segId}${humanLabel}</span>
                         <span class="segment-meta">${fraction}${patchCount ? ` · ${patchCount}` : ''}</span>
-                        ${segmentTagsHtml}
-                        ${segmentOcrHtml}
-                        ${segmentPlateHtml}
-                        ${detailZoomHtml}
                         <div class="segment-match-list">
                             ${matchList}
                         </div>
@@ -2954,8 +2883,6 @@ def home():
                 alert('Please enter a folder path first');
                 return;
             }
-            const fileName = imagePath.split(/[/\\\\]/).pop() || imagePath;
-            lastQueryText = fileName ? `similar image ${fileName}` : 'similar image';
             
             // Show loading state
             indexStatus.textContent = 'Finding similar images...';
@@ -3013,23 +2940,6 @@ def home():
         folderInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') indexBtn.click();
         });
-        
-        if (lprRunBtn) {
-            lprRunBtn.addEventListener('click', () => {
-                const folder = folderInput.value.trim();
-                const videoPath = (lprVideoInput.value || '').trim();
-                if (!folder) {
-                    alert('Please enter a folder path first');
-                    return;
-                }
-                if (!videoPath) {
-                    alert('Provide a video path to run LPR.');
-                    return;
-                }
-                indexStatus.textContent = `LPR job pending for ${videoPath}. Full pipeline coming soon.`;
-                indexStatus.className = 'status warning';
-            });
-        }
         
         // Check index on folder change
         folderInput.addEventListener('blur', async () => {
@@ -3098,208 +3008,13 @@ def _image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-def _extract_crop_from_mask(image: Image.Image, mask: Image.Image, padding: int = 8) -> Optional[Image.Image]:
-    try:
-        mask_array = np.asarray(mask)
-    except Exception:
-        return None
-    if mask_array.ndim == 3:
-        mask_array = mask_array[..., 0]
-    coords = np.argwhere(mask_array > 0)
-    if coords.size == 0:
-        return None
-    y_coords = coords[:, 0]
-    x_coords = coords[:, 1]
-    top = max(int(y_coords.min()) - padding, 0)
-    left = max(int(x_coords.min()) - padding, 0)
-    bottom = min(int(y_coords.max()) + padding + 1, image.height)
-    right = min(int(x_coords.max()) + padding + 1, image.width)
-    if left >= right or top >= bottom:
-        return None
-    return image.crop((left, top, right, bottom))
-
-
-def _crop_to_base64(img: Image.Image, max_edge: int = 192) -> str:
+def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int = 85) -> str:
     if max_edge and max(img.size) > max_edge:
         scale = max_edge / float(max(img.size))
-        new_size = (max(1, int(img.size[0] * scale)), max(1, int(img.size[1] * scale)))
-        img = img.resize(new_size, Image.LANCZOS)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
     buffer = BytesIO()
-    img.save(buffer, format='JPEG', quality=85)
+    img.save(buffer, format='JPEG', quality=quality)
     return base64.b64encode(buffer.getvalue()).decode()
-
-
-def _run_ocr_if_enabled(image: Image.Image) -> Optional[str]:
-    if pytesseract is None or not config.OCR_ENABLED:
-        return None
-    if min(image.size) < 24:
-        return None
-    try:
-        gray = image.convert('L')
-        max_dim = max(gray.size)
-        if max_dim < 260:
-            scale = 260 / float(max_dim)
-            new_size = (int(gray.width * scale), int(gray.height * scale))
-            gray = gray.resize(new_size, Image.LANCZOS)
-        gray = ImageOps.autocontrast(gray)
-        text = pytesseract.image_to_string(gray, config='--psm 7')
-    except Exception:
-        return None
-    text = (text or '').strip()
-    text = text.replace('\n', ' ').replace('\x0c', ' ').strip()
-    return text or None
-
-def _propose_plate_rois(mask_bool: np.ndarray, bbox: Tuple[int, int, int, int], max_candidates: int = 2) -> List[Tuple[int, int, int, int]]:
-    y_min, x_min, y_max, x_max = bbox
-    car_w = x_max - x_min
-    car_h = y_max - y_min
-    if car_w < 40 or car_h < 30:
-        return []
-    y0 = max(y_max - int(car_h * 0.35), y_min)
-    y1 = y_max
-    x0 = x_min
-    x1 = x_max
-    region_height = y1 - y0
-    if region_height < 10:
-        return []
-    target_width = max(24, int(car_w * 0.35))
-    step = max(4, target_width // 4)
-    candidates: List[Tuple[float, int, int]] = []
-    for start in range(x0, x1 - target_width + 1, step):
-        end = start + target_width
-        stripe = mask_bool[y0:y1, start:end]
-        if stripe.mean() < 0.15:
-            continue
-        score = float(stripe.sum()) / stripe.size
-        candidates.append((score, start, end))
-    candidates.sort(reverse=True, key=lambda item: item[0])
-    boxes = []
-    for score, start, end in candidates[:max_candidates]:
-        boxes.append((start, y0, end, min(y1, y0 + int(region_height * 0.6))))
-    return boxes
-
-
-def _detect_plate_text(image: Image.Image, mask_image: Image.Image, max_candidates: int = 2) -> List[Dict[str, Any]]:
-    mask_arr = np.asarray(mask_image)
-    if mask_arr.ndim == 3:
-        mask_arr = mask_arr[..., 0]
-    mask_bool = mask_arr > 0
-    coords = np.argwhere(mask_bool)
-    if coords.size == 0:
-        return []
-    y_min = int(coords[:, 0].min())
-    y_max = int(coords[:, 0].max()) + 1
-    x_min = int(coords[:, 1].min())
-    x_max = int(coords[:, 1].max()) + 1
-    rois = _propose_plate_rois(mask_bool, (y_min, x_min, y_max, x_max), max_candidates=max_candidates)
-    results: List[Dict[str, Any]] = []
-    for left, top, right, bottom in rois:
-        if right - left < 10 or bottom - top < 10:
-            continue
-        crop = image.crop((left, top, right, bottom))
-        text = ''
-        paddle_head = ensure_paddle_ocr()
-        if paddle_head is not None:
-            try:
-                text = paddle_head.recognize(crop)
-            except Exception as exc:
-                print(f"PaddleOCR plate read error: {exc}")
-                text = ''
-        if not text:
-            text = _run_ocr_if_enabled(crop)
-        if text:
-            results.append(
-                {
-                    'bbox': {'left': left, 'top': top, 'right': right, 'bottom': bottom},
-                    'text': text,
-                }
-            )
-    return results
-
-
-def _generate_zoom_regions(
-    image: Image.Image,
-    heatmap: np.ndarray,
-    mask_image: Image.Image,
-    tagger: Optional["CLIPAutoTagger"],
-    top_k: int,
-    threshold: float,
-    query_hint: str,
-) -> List[Dict[str, Any]]:
-    if heatmap.ndim != 2:
-        return []
-    grid = heatmap.shape[0]
-    width, height = image.size
-    heat_flat = heatmap.reshape(-1)
-    order = np.argsort(-heat_flat)
-    used: List[Tuple[int, int]] = []
-    mask_arr = None
-    try:
-        mask_arr = np.asarray(mask_image) > 0
-    except Exception:
-        mask_arr = None
-
-    patch_w = width / grid
-    patch_h = height / grid
-    regions: List[Dict[str, Any]] = []
-    query_hint = (query_hint or '').strip()
-
-    for idx in order:
-        if len(regions) >= max(1, top_k):
-            break
-        py = idx // grid
-        px = idx % grid
-        if any(abs(px - ux) <= 1 and abs(py - uy) <= 1 for ux, uy in used):
-            continue
-        if mask_arr is not None:
-            y0 = int(py * patch_h)
-            y1 = int(min((py + 1) * patch_h, height))
-            x0 = int(px * patch_w)
-            x1 = int(min((px + 1) * patch_w, width))
-            if y1 <= y0 or x1 <= x0:
-                continue
-            cell = mask_arr[y0:y1, x0:x1]
-            if cell.size == 0 or not cell.any():
-                continue
-
-        used.append((px, py))
-        cx = (px + 0.5) * patch_w
-        cy = (py + 0.5) * patch_h
-        span_w = patch_w * 2.2
-        span_h = patch_h * 2.2
-        left = int(max(0, cx - span_w / 2))
-        right = int(min(width, cx + span_w / 2))
-        top = int(max(0, cy - span_h / 2))
-        bottom = int(min(height, cy + span_h / 2))
-        if right - left < 12 or bottom - top < 12:
-            continue
-
-        crop = image.crop((left, top, right, bottom))
-        tags: List[Dict[str, Any]] = []
-        if tagger is not None:
-            try:
-                extra = _build_query_prompts(query_hint)
-                tags = tagger.tag_image(crop, top_k=3, threshold=threshold, extra_prompts=extra)
-            except Exception:
-                tags = []
-
-        area_fraction = ((right - left) * (bottom - top)) / float(width * height)
-        ocr_text = None
-        if _should_run_ocr(tags, area_fraction=area_fraction, query_hint=query_hint):
-            ocr_text = _run_ocr_if_enabled(crop)
-
-        regions.append(
-            {
-                'bbox': {'left': left, 'top': top, 'right': right, 'bottom': bottom},
-                'thumbnail': _crop_to_base64(crop, max_edge=196),
-                'tags': tags,
-                'score': float(heat_flat[idx]),
-                'area_fraction': area_fraction,
-                'ocr': ocr_text,
-            }
-        )
-
-    return regions
 
 
 def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
@@ -3339,99 +3054,121 @@ def _class_color(class_id: int) -> Tuple[int, int, int]:
     return table[class_id % len(table)]
 
 
-def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
-    return "#{:02x}{:02x}{:02x}".format(*color)
+def _sample_video_frames(
+    video_path: Union[str, Path],
+    max_frames: int,
+    sample_fps: Optional[float],
+    max_edge: int,
+) -> Tuple[List[Dict[str, Any]], float, Optional[float]]:
+    path_obj = Path(video_path)
+    cap = cv2.VideoCapture(str(path_obj))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = (total_frames / fps) if fps > 0 else None
+    target_frames = max(1, min(int(max_frames), config.LM_VIDEO_MAX_FRAMES))
+
+    if total_frames > 0:
+        if sample_fps and sample_fps > 0 and fps > 0:
+            step = max(1, int(round(fps / sample_fps)))
+            frame_indices = list(range(0, total_frames, step))
+        else:
+            frame_indices = list(np.linspace(0, total_frames - 1, num=target_frames, dtype=int))
+        frame_indices = sorted(set(frame_indices))[:target_frames]
+    else:
+        frame_indices = list(range(target_frames))
+
+    frames: List[Dict[str, Any]] = []
+    try:
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            frames.append(
+                {
+                    'index': int(idx),
+                    'time_sec': round(idx / fps, 2) if fps > 0 else None,
+                    'thumbnail': _encode_jpeg(pil_img, max_edge=max_edge, quality=85),
+                    'width': pil_img.width,
+                    'height': pil_img.height,
+                }
+            )
+            if len(frames) >= target_frames:
+                break
+    finally:
+        cap.release()
+    return frames, fps, duration
 
 
-_TEXT_TAG_KEYWORDS = {
-    'text',
-    'label',
-    'sign',
-    'signboard',
-    'document',
-    'paper',
-    'book',
-    'screen',
-    'monitor',
-    'display',
-    'keyboard',
-    'menu',
-    'poster',
-    'billboard',
-    'handwriting',
-    'subtitle',
-    'caption',
-    'license plate',
-    'receipt',
-    'invoice',
-    'interface',
-    'ui',
-    'dashboard',
-}
-
-_TEXT_LABEL_KEYWORDS = {
-    'signboard',
-    'book',
-    'keyboard',
-    'laptop',
-    'screen',
-    'tv',
-    'monitor',
-    'traffic sign',
-    'banner',
-    'scoreboard',
-    'document',
-    'license plate',
-    'car',
-    'bus',
-    'vehicle',
-}
-
-_TEXT_QUERY_KEYWORDS = {
-    'text',
-    'ocr',
-    'sign',
-    'caption',
-    'subtitle',
-    'license plate',
-    'document',
-    'pdf',
-    'transcribe',
-    'read',
-}
-
-_VEHICLE_KEYWORDS = {
-    'car',
-    'vehicle',
-    'truck',
-    'bus',
-    'bmw',
-    'audi',
-    'mercedes',
-    'license plate',
-    'plate',
-}
-
-
-def _filter_display_tags(tags: Optional[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    filtered: List[Dict[str, Any]] = []
-    if not tags:
-        return filtered
-    for tag in tags:
-        label = str(tag.get('label', '')).strip()
-        if not label:
-            continue
-        if tag.get('source') == 'extra':
-            continue
-        if len(label) > 28:
-            label = label[:25] + '…'
-        filtered.append(
+def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
+    prompt = (user_prompt or '').strip() or "Summarize the key events, people, and objects in this video."
+    intro = f"Video file: {Path(video_path).name}. {len(frames)} sampled frames are provided."
+    user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
+    for idx, frame in enumerate(frames):
+        ts = frame.get('time_sec')
+        ts_label = f"{ts:.2f}s" if isinstance(ts, (int, float)) else "n/a"
+        user_content.append({'type': 'text', 'text': f"Frame {idx + 1} (t={ts_label})"})
+        user_content.append(
             {
-                'label': label,
-                'score': tag.get('score'),
+                'type': 'image_url',
+                'image_url': {
+                    'url': f"data:image/jpeg;base64,{frame['thumbnail']}",
+                    'detail': 'high',
+                },
             }
         )
-    return filtered
+    system_msg = (
+        "You analyze short videos using sampled frames. Provide a concise, factual summary, key events, "
+        "notable objects, people, and any scene changes. Avoid repeating the same detail for each frame."
+    )
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
+        {'role': 'user', 'content': user_content},
+    ]
+
+
+def _call_video_understanding(messages: List[Dict[str, Any]]) -> str:
+    base_url = (config.LM_BASE_URL or '').rstrip('/')
+    if not base_url:
+        raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
+    endpoint = f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if config.LM_API_KEY:
+        headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
+
+    payload = {
+        "model": config.LM_MODEL,
+        "messages": messages,
+        "temperature": float(config.LM_VIDEO_TEMPERATURE),
+        "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
+    }
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=config.LM_TIMEOUT)
+        response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"LM Studio request failed: {exc}") from exc
+
+    data = response.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message", {}) or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        content_text = "\n".join(parts).strip()
+    else:
+        content_text = str(content).strip()
+    return content_text or "(empty response from model)"
+
+
+def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*color)
 
 
 def _render_segmentation_overlay(
@@ -3473,64 +3210,6 @@ def _render_segmentation_overlay(
 
     overlay_img = Image.fromarray(rgba, mode='RGBA')
     return overlay_img, legend
-
-
-def _should_run_ocr(
-    tags: Optional[Sequence[Dict[str, Any]]],
-    refined_label: Optional[str] = None,
-    mask_fraction: Optional[float] = None,
-    area_fraction: Optional[float] = None,
-    query_hint: Optional[str] = None,
-    force_vehicle: bool = False,
-) -> bool:
-    if not force_vehicle:
-        if mask_fraction is not None and mask_fraction < 0.015:
-            return False
-        if area_fraction is not None and area_fraction < 0.015:
-            return False
-
-    def _contains_keyword(text: str, keywords: Set[str]) -> bool:
-        lower = text.lower()
-        return any(keyword in lower for keyword in keywords)
-
-    if tags:
-        for tag in tags:
-            label = str(tag.get('label', ''))
-            if _contains_keyword(label, _TEXT_TAG_KEYWORDS):
-                return True
-
-    if refined_label and _contains_keyword(refined_label, _TEXT_LABEL_KEYWORDS):
-        return True
-
-    if query_hint and _contains_keyword(query_hint, _TEXT_QUERY_KEYWORDS):
-        return True
-
-    return False
-
-
-def _build_query_prompts(query_hint: str, refined_label: Optional[str] = None) -> List[str]:
-    prompts: List[str] = []
-    hint = (query_hint or '').strip()
-    if hint:
-        prompts.extend([
-            hint,
-            f"{hint} detail",
-            f"close-up of {hint}",
-            f"{hint} texture",
-        ])
-    if refined_label:
-        label_text = refined_label.strip()
-        if label_text and (not hint or label_text.lower() not in hint.lower()):
-            prompts.extend([label_text, f"{label_text} detail"])
-    seen: Set[str] = set()
-    deduped: List[str] = []
-    for prompt in prompts:
-        key = prompt.lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        deduped.append(prompt)
-    return deduped
 
 
 def _available_indexes(folder_path: Union[str, Path]) -> List[str]:
@@ -4162,8 +3841,7 @@ def save_comment():
 @app.route('/commented_images', methods=['POST'])
 def get_commented_images():
     """Get all images that have comments in the indexed folder"""
-    payload = request.json if request.is_json else None
-    folder = (payload or {}).get('folder')
+    folder = request.json.get('folder')
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
     
@@ -4171,14 +3849,10 @@ def get_commented_images():
         # Load index to get image paths
         index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
         if index is None:
+            message = 'Folder not indexed for the current backend'
             available = _available_indexes(folder)
-            for candidate in ['fusion', 'clip', 'dino']:
-                if candidate in available:
-                    index, image_paths, image_metadata, index_meta = load_index(folder, embedder=candidate)
-                    if index is not None:
-                        break
-        if index is None:
-            message = 'Folder not indexed. Run indexing first.'
+            if available:
+                message += f" (available: {', '.join(available)})"
             return jsonify({'error': message}), 400
         
         # Load comments
@@ -4409,6 +4083,62 @@ def index_segments():
             ],
         }
     )
+
+
+@app.route('/video_understanding', methods=['POST'])
+def video_understanding():
+    data = request.json or {}
+    video_path = (data.get('video') or '').strip()
+    if not video_path:
+        return jsonify({'error': 'Provide a video path.'}), 400
+    max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
+    try:
+        max_frames_int = int(max_frames)
+    except (TypeError, ValueError):
+        max_frames_int = config.LM_VIDEO_DEFAULT_FRAMES
+    if max_frames_int < 1:
+        max_frames_int = 1
+    max_frames_int = min(max_frames_int, config.LM_VIDEO_MAX_FRAMES)
+
+    sample_fps_raw = data.get('sample_fps')
+    try:
+        sample_fps_val = float(sample_fps_raw) if sample_fps_raw is not None else None
+        if sample_fps_val is not None and sample_fps_val <= 0:
+            sample_fps_val = None
+    except (TypeError, ValueError):
+        sample_fps_val = None
+
+    user_prompt = data.get('prompt') or ''
+
+    try:
+        frames, fps, duration = _sample_video_frames(
+            video_path,
+            max_frames=max_frames_int,
+            sample_fps=sample_fps_val,
+            max_edge=config.LM_VIDEO_MAX_EDGE,
+        )
+        if not frames:
+            return jsonify({'error': 'No frames could be extracted from the video.'}), 400
+        messages = _build_video_messages(video_path, frames, user_prompt)
+        summary = _call_video_understanding(messages)
+        return jsonify(
+            {
+                'summary': summary,
+                'frames': [
+                    {
+                        'index': f['index'],
+                        'time_sec': f['time_sec'],
+                        'thumbnail': f['thumbnail'],
+                    }
+                    for f in frames
+                ],
+                'fps': fps,
+                'duration_sec': duration,
+                'model': config.LM_MODEL,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
@@ -4690,7 +4420,6 @@ def segment_from_point():
     target_modes = _parse_targets(data.get('targets') or data.get('target'))
     segment_ids = _parse_segment_ids(data.get('segment_ids'))
     label_map = _parse_segment_labels(data.get('segment_labels'))
-    query_hint = str(data.get('query_hint') or '').strip()
     if not isinstance(label_map, dict):
         label_map = {}
 
@@ -4783,7 +4512,6 @@ def segment_from_point():
     mask_overlay = _create_overlay_rgba(overlay_mask_source, (94, 196, 255), 0.6)
     segmentation_overlay_img: Optional[Image.Image] = None
     legend_entries: List[Dict[str, Any]] = []
-    clip_tags: List[Dict[str, Any]] = []
 
     if refine_result:
         seg_map = refine_result.get('segmentation')
@@ -4796,57 +4524,6 @@ def segment_from_point():
             if seg_overlay.size != base_size:
                 seg_overlay = seg_overlay.resize(base_size, resample=Image.NEAREST)
             segmentation_overlay_img = seg_overlay
-
-    tagger = ensure_clip_tagger()
-    clip_tags: List[Dict[str, Any]] = []
-    ocr_text_main: Optional[str] = None
-    crop = _extract_crop_from_mask(pil_image, overlay_mask_source)
-    vehicle_hint = refined_label and any(keyword in refined_label.lower() for keyword in _VEHICLE_KEYWORDS)
-    if crop is not None and tagger is not None:
-        try:
-            extra_prompts = _build_query_prompts(query_hint, refined_label)
-            clip_tags = tagger.tag_image(
-                crop,
-                top_k=config.CLIP_TAG_TOP_K,
-                threshold=float(config.CLIP_TAG_THRESHOLD),
-                extra_prompts=extra_prompts,
-            )
-        except Exception as exc:
-            print(f"CLIP tagger error: {exc}")
-            clip_tags = []
-        force_vehicle = vehicle_hint or any(
-            (tag.get('label') or '').lower() in _VEHICLE_KEYWORDS for tag in clip_tags
-        )
-        if _should_run_ocr(
-            clip_tags,
-            refined_label,
-            mask_fraction=mask_fraction,
-            query_hint=query_hint,
-            force_vehicle=force_vehicle,
-        ):
-            ocr_text_main = _run_ocr_if_enabled(crop)
-    elif crop is not None and config.OCR_ENABLED:
-        if _should_run_ocr(None, refined_label, mask_fraction=mask_fraction, query_hint=query_hint, force_vehicle=bool(vehicle_hint)):
-            ocr_text_main = _run_ocr_if_enabled(crop)
-    zoom_regions: List[Dict[str, Any]] = []
-    plate_results: List[Dict[str, Any]] = []
-    if tagger is not None:
-        try:
-            zoom_regions = _generate_zoom_regions(
-                pil_image,
-                heatmap,
-                overlay_mask_source,
-                tagger,
-                top_k=3,
-                threshold=float(config.CLIP_TAG_THRESHOLD),
-                query_hint=query_hint or (refined_label or ''),
-            )
-        except Exception as exc:
-            print(f"Zoom region generation error: {exc}")
-    if force_vehicle:
-        plate_results = _detect_plate_text(pil_image, overlay_mask_source)
-        if plate_results and not ocr_text_main:
-            ocr_text_main = plate_results[0].get('text')
 
     try:
         segments_response, segment_map = _mask_search_pipeline(
@@ -4868,33 +4545,6 @@ def segment_from_point():
     selected_key = next((key for key in segment_map.keys() if key != 'full'), 'full')
     selected_meta = segment_map.get(selected_key, {})
 
-    display_tags = _filter_display_tags(clip_tags)
-    if display_tags and segments_response:
-        try:
-            segments_response[0]['tags'] = display_tags
-        except Exception:
-            pass
-    if zoom_regions and segments_response:
-        try:
-            enriched = []
-            for region in zoom_regions:
-                region_copy = dict(region)
-                region_copy['tags'] = _filter_display_tags(region.get('tags'))
-                enriched.append(region_copy)
-            segments_response[0]['subregions'] = enriched
-        except Exception:
-            pass
-    if ocr_text_main and segments_response:
-        try:
-            segments_response[0]['ocr'] = ocr_text_main
-        except Exception:
-            pass
-    if plate_results and segments_response:
-        try:
-            segments_response[0]['plates'] = plate_results
-        except Exception:
-            pass
-
     overlay = {
         'grid_size': grid,
         'patch_coords': {'x': patch_coords[0], 'y': patch_coords[1]},
@@ -4912,17 +4562,6 @@ def segment_from_point():
         overlay['segmentation_png'] = _image_to_base64(segmentation_overlay_img)
     if legend_entries:
         overlay['legend'] = legend_entries
-    if display_tags:
-        overlay['clip_tags'] = display_tags
-    if zoom_regions:
-        overlay['zoom_regions'] = [
-            {**region, 'tags': _filter_display_tags(region.get('tags'))}
-            for region in zoom_regions
-        ]
-    if ocr_text_main:
-        overlay['ocr'] = ocr_text_main
-    if plate_results:
-        overlay['plates'] = plate_results
 
     return jsonify(
         {

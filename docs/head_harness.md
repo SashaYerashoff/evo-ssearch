@@ -38,6 +38,3 @@ Runs exceeding these thresholds should be flagged before integration.
 - `EVOSSEARCH_M2F_ENABLED=true` enables the Mask2Former refinement head exposed by this harness.
 - The UI now offers a "Region threshold" slider (40–99%) to interactively tune the DINO heatmap quantile before refinement.
 - When refinement is active, the results panel overlays Mask2Former masks in cyan alongside the heatmap (amber) so you can compare coarse vs. refined coverage.
-- Auto-tagging is powered by CLIP; adjust `EVOSSEARCH_CLIP_TAG_TOP_K` and `EVOSSEARCH_CLIP_TAG_THRESHOLD` to tune how many semantic tags ("wearing sunglasses", "holding a drink", etc.) decorate each refined region.
-- Heatmap attention spawns up to three "detail zooms" per region; each zoom inherits CLIP tags and shows the hottest patches for quick drill-down.
-- OCR is now optional (`EVOSSEARCH_OCR_ENABLED`), using pytesseract (and, when enabled, PaddleOCR) to extract snippets from the primary mask and zoom crops; results show up inline beneath the tags.
