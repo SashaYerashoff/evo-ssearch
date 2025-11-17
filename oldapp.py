@@ -1299,6 +1299,32 @@ def home():
             transform: scale(1.1);
         }
 
+        .find-similar-icon,
+        .describe-icon {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0, 0, 0, 0.7);
+            border-radius: 4px;
+            padding: 4px;
+            cursor: pointer;
+            pointer-events: auto;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .find-similar-icon {
+            left: 40px;
+        }
+
+        .find-similar-icon:hover,
+        .describe-icon:hover {
+            background: rgba(0, 0, 0, 0.9);
+            transform: scale(1.1);
+        }
+
         /* Video understanding */
         .video-box {
             display: none;
@@ -1522,6 +1548,7 @@ def home():
                 </div>
                 <div class="video-controls">
                     <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
+                    <button id="saveSummaryBtn" class="feature-btn" style="display:none;">Save summary as comment</button>
                     <div id="videoStatus" class="video-status"></div>
                 </div>
                 <div id="videoOutput" class="video-output" style="display: none;"></div>
@@ -1695,6 +1722,7 @@ def home():
         const videoStatus = document.getElementById('videoStatus');
         const videoOutput = document.getElementById('videoOutput');
         const videoFrames = document.getElementById('videoFrames');
+        const saveSummaryBtn = document.getElementById('saveSummaryBtn');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -1702,6 +1730,10 @@ def home():
         
         let currentFolder = '';
         let currentMode = 'text';
+        let videoTimerHandle = null;
+        let videoRequestStarted = 0;
+        let lastSummaryText = '';
+        let lastSummaryTarget = null;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -1715,6 +1747,24 @@ def home():
                 .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/`([^`]+)`/g, '<code>$1</code>')
                 .replace(/\\n/g, '<br>');
+        }
+
+        function startVideoTimer() {
+            videoRequestStarted = performance.now();
+            if (videoTimerHandle) clearInterval(videoTimerHandle);
+            videoTimerHandle = setInterval(() => {
+                const elapsed = (performance.now() - videoRequestStarted) / 1000;
+                const base = videoStatus.dataset.base || '';
+                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
+            }, 200);
+        }
+
+        function stopVideoTimer() {
+            if (videoTimerHandle) {
+                clearInterval(videoTimerHandle);
+                videoTimerHandle = null;
+            }
+            videoRequestStarted = 0;
         }
 
         function setMode(mode) {
@@ -2317,11 +2367,16 @@ def home():
             }
 
             videoRunBtn.disabled = true;
-            videoStatus.textContent = 'Sampling frames and querying the model...';
+            saveSummaryBtn.style.display = 'none';
+            lastSummaryText = '';
+            lastSummaryTarget = null;
+            videoStatus.dataset.base = 'Sampling frames and querying the model...';
+            videoStatus.textContent = videoStatus.dataset.base;
             videoStatus.className = 'video-status';
             videoOutput.style.display = 'none';
             videoOutput.innerHTML = '';
             renderVideoFrames([]);
+            startVideoTimer();
 
             try {
                 const payload = {
@@ -2339,22 +2394,34 @@ def home():
                 });
                 const data = await response.json();
                 if (!response.ok || data.error) {
-                    videoStatus.textContent = data.error || 'Video understanding request failed.';
+                    videoStatus.dataset.base = data.error || 'Video understanding request failed.';
+                    videoStatus.textContent = videoStatus.dataset.base;
                     videoStatus.className = 'video-status error';
+                    stopVideoTimer();
                     return;
                 }
-                videoStatus.textContent = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}`;
+                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}`;
+                videoStatus.textContent = videoStatus.dataset.base;
                 if (data.summary) {
                     videoOutput.style.display = 'block';
                     videoOutput.innerHTML = renderMarkdown(data.summary);
+                    lastSummaryText = data.summary;
+                    lastSummaryTarget = null;
+                    saveSummaryBtn.style.display = 'inline-flex';
                 } else {
                     videoOutput.style.display = 'block';
                     videoOutput.textContent = '(No summary returned)';
+                    lastSummaryText = '';
+                    lastSummaryTarget = null;
+                    saveSummaryBtn.style.display = 'none';
                 }
                 renderVideoFrames(data.frames || []);
+                stopVideoTimer();
             } catch (error) {
-                videoStatus.textContent = 'Error: ' + error.message;
+                videoStatus.dataset.base = 'Error: ' + error.message;
+                videoStatus.textContent = videoStatus.dataset.base;
                 videoStatus.className = 'video-status error';
+                stopVideoTimer();
             } finally {
                 videoRunBtn.disabled = false;
             }
@@ -2362,6 +2429,41 @@ def home():
 
         if (videoRunBtn) {
             videoRunBtn.addEventListener('click', runVideoUnderstanding);
+        }
+
+        async function saveSummaryAsComment() {
+            if (!lastSummaryText || !lastSummaryTarget || !lastSummaryTarget.path) {
+                alert('No summary or target image available to save.');
+                return;
+            }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+            try {
+                const response = await fetch('/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder,
+                        image_path: lastSummaryTarget.path,
+                        comment: lastSummaryText,
+                    }),
+                });
+                const data = await response.json();
+                if (data.success) {
+                    alert('Summary saved as comment.');
+                } else {
+                    alert('Failed to save comment: ' + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Failed to save comment: ' + err.message);
+            }
+        }
+
+        if (saveSummaryBtn) {
+            saveSummaryBtn.addEventListener('click', saveSummaryAsComment);
         }
         
         // Show commented images
@@ -2372,6 +2474,7 @@ def home():
                 alert('Please enter a folder path first');
                 return;
             }
+            setMode('text');
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
             
@@ -2405,6 +2508,11 @@ def home():
                         <div class="expand-collapse-icon" data-index="${index}">
                             <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                                 <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                            </svg>
+                        </div>
+                        <div class="describe-icon" data-index="${index}" data-path="${result.path || ''}">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
                             </svg>
                         </div>
                         <div class="find-similar-icon" data-index="${index}" data-path="${result.path}" style="display: none;">
@@ -2449,26 +2557,56 @@ def home():
             
             // Handle copy icon click
             const copyIcon = item.querySelector('.copy-icon');
-            copyIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                copyImagePath(result.path);
-            });
+            if (copyIcon) {
+                if (result.path) {
+                    copyIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        copyImagePath(result.path);
+                    });
+                } else {
+                    copyIcon.style.display = 'none';
+                }
+            }
             
             
             // Handle find similar button
             const findSimilarIcon = item.querySelector('.find-similar-icon');
-            findSimilarIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                findSimilarImages(result.path);
-            });
+            if (findSimilarIcon) {
+                if (result.path) {
+                    findSimilarIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        findSimilarImages(result.path);
+                    });
+                } else {
+                    findSimilarIcon.style.display = 'none';
+                }
+            }
+
+            const describeIcon = item.querySelector('.describe-icon');
+            if (describeIcon) {
+                if (result.path) {
+                    describeIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        describeImageWithLM(result.path);
+                    });
+                } else {
+                    describeIcon.style.display = 'none';
+                }
+            }
             
             // Add save comment functionality
             const saveBtn = item.querySelector(`#save-btn-${index}`);
             const commentInput = item.querySelector(`#comment-input-${index}`);
             
-            saveBtn.addEventListener('click', () => {
-                saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
-            });
+            if (saveBtn) {
+                if (result.path) {
+                    saveBtn.addEventListener('click', () => {
+                        saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+                    });
+                } else {
+                    saveBtn.disabled = true;
+                }
+            }
 
             const img = item.querySelector('.thumbnail');
             if (img) {
@@ -2931,6 +3069,60 @@ def home():
                 indexStatus.className = 'status error';
             }
         }
+
+        async function describeImageWithLM(imagePath) {
+            if (!imagePath) {
+                alert('No filesystem path is available for this image.');
+                return;
+            }
+            const prompt = videoPromptInput.value.trim();
+            setMode('video');
+            videoStatus.dataset.base = 'Querying model...';
+            videoStatus.textContent = videoStatus.dataset.base;
+            videoStatus.className = 'video-status';
+            videoRunBtn.disabled = true;
+            saveSummaryBtn.style.display = 'none';
+            videoOutput.style.display = 'none';
+            videoOutput.innerHTML = '';
+            renderVideoFrames([]);
+            startVideoTimer();
+
+            try {
+                const response = await fetch('/describe_image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_path: imagePath, prompt }),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    videoStatus.dataset.base = data.error || 'Describe request failed.';
+                    videoStatus.textContent = videoStatus.dataset.base;
+                    videoStatus.className = 'video-status error';
+                    stopVideoTimer();
+                    return;
+                }
+                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Image described`;
+                videoStatus.textContent = videoStatus.dataset.base;
+                if (data.summary) {
+                    videoOutput.style.display = 'block';
+                    videoOutput.innerHTML = renderMarkdown(data.summary);
+                    lastSummaryText = data.summary;
+                    lastSummaryTarget = { path: imagePath };
+                    saveSummaryBtn.style.display = 'inline-flex';
+                }
+                if (data.thumbnail) {
+                    videoFrames.innerHTML = `<div title="Image"><img src="data:image/jpeg;base64,${data.thumbnail}" alt="Image" /></div>`;
+                }
+                stopVideoTimer();
+            } catch (err) {
+                videoStatus.dataset.base = 'Error: ' + err.message;
+                videoStatus.textContent = videoStatus.dataset.base;
+                videoStatus.className = 'video-status error';
+                stopVideoTimer();
+            } finally {
+                videoRunBtn.disabled = false;
+            }
+        }
         
         // Enter key support
         searchInput.addEventListener('keypress', (e) => {
@@ -3131,7 +3323,7 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
     ]
 
 
-def _call_video_understanding(messages: List[Dict[str, Any]]) -> str:
+def _call_lm_chat(messages: List[Dict[str, Any]]) -> str:
     base_url = (config.LM_BASE_URL or '').rstrip('/')
     if not base_url:
         raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
@@ -3165,6 +3357,28 @@ def _call_video_understanding(messages: List[Dict[str, Any]]) -> str:
     else:
         content_text = str(content).strip()
     return content_text or "(empty response from model)"
+
+
+def _call_video_understanding(messages: List[Dict[str, Any]]) -> str:
+    return _call_lm_chat(messages)
+
+
+def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
+    user_prompt = (prompt or '').strip() or "Describe the main content of this image clearly and concisely."
+    user_content = [
+        {'type': 'text', 'text': f"Image: {Path(image_path).name}\n\nTask: {user_prompt}"},
+        {
+            'type': 'image_url',
+            'image_url': {
+                'url': f"data:image/jpeg;base64,{_encode_jpeg(Image.open(image_path), max_edge=config.THUMBNAIL_SIZE[0])}",
+                'detail': 'high',
+            },
+        },
+    ]
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': 'You are an expert visual analyst. Be concise and factual.'}]},
+        {'role': 'user', 'content': user_content},
+    ]
 
 
 def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
@@ -4135,6 +4349,32 @@ def video_understanding():
                 'fps': fps,
                 'duration_sec': duration,
                 'model': config.LM_MODEL,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/describe_image', methods=['POST'])
+def describe_image():
+    data = request.json or {}
+    image_path = (data.get('image_path') or '').strip()
+    prompt = data.get('prompt') or ''
+    if not image_path:
+        return jsonify({'error': 'image_path is required'}), 400
+    path_obj = Path(image_path)
+    if not path_obj.exists():
+        return jsonify({'error': f'Image not found: {image_path}'}), 400
+    try:
+        messages = _build_image_messages(image_path, prompt)
+        summary = _call_lm_chat(messages)
+        thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
+        return jsonify(
+            {
+                'summary': summary,
+                'thumbnail': thumb,
+                'model': config.LM_MODEL,
+                'image_path': image_path,
             }
         )
     except Exception as exc:
