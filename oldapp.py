@@ -1299,30 +1299,28 @@ def home():
             transform: scale(1.1);
         }
 
-        .find-similar-icon,
-        .describe-icon {
-            position: absolute;
-            bottom: 8px;
-            left: 8px;
-            background: rgba(0, 0, 0, 0.7);
+        .result-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin-top: 0.35rem;
+        }
+
+        .action-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: #1a1a1a;
+            border: 1px solid #2d2d2d;
             border-radius: 4px;
             padding: 4px;
             cursor: pointer;
-            pointer-events: auto;
             transition: all 0.2s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
 
-        .find-similar-icon {
-            left: 40px;
-        }
-
-        .find-similar-icon:hover,
-        .describe-icon:hover {
-            background: rgba(0, 0, 0, 0.9);
-            transform: scale(1.1);
+        .action-icon:hover {
+            background: #202020;
+            border-color: #3a3a3a;
         }
         /* Video understanding */
         .video-box {
@@ -1394,16 +1392,6 @@ def home():
             background: #111;
         }
         
-        
-        /* Show action icons only when expanded */
-        .result-item .find-similar-icon,
-        .result-item .describe-icon {
-            display: none;
-        }
-        .result-item.expanded .find-similar-icon,
-        .result-item.expanded .describe-icon {
-            display: flex !important;
-        }
         
         /* Copy icon styling */
         .copy-icon {
@@ -2507,16 +2495,6 @@ def home():
                                 <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
                             </svg>
                         </div>
-                        <div class="describe-icon" data-index="${index}" data-path="${result.path || ''}">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
-                            </svg>
-                        </div>
-                        <div class="find-similar-icon" data-index="${index}" data-path="${result.path}" style="display: none;">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
-                            </svg>
-                        </div>
                     </div>
                 </div>
                 <div class="result-info">
@@ -2527,6 +2505,18 @@ def home():
                         </svg>
                     </div>
                     <div class="similarity">${similarityMarkup}</div>
+                    <div class="result-actions">
+                        <button class="action-icon describe-icon" data-index="${index}" data-path="${result.path || ''}" title="Describe with LM">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
+                            </svg>
+                        </button>
+                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${result.path || ''}" title="Find similar">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
+                            </svg>
+                        </button>
+                    </div>
                 </div>
                 <div class="segments-panel" id="segments-${index}">
                     <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
@@ -4056,64 +4046,46 @@ def get_commented_images():
     folder = (payload or {}).get('folder')
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
-    
+
     try:
-        # Load index to get image paths
-        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
-        if index is None:
-            message = 'Folder not indexed for the current backend'
-            available = _available_indexes(folder)
-            if available:
-                message += f" (available: {', '.join(available)})"
-            return jsonify({'error': message}), 400
-        
-        # Load comments
+        available = _available_indexes(folder)
+        image_paths: List[str] = []
+        image_metadata: List[Dict[str, Any]] = []
+        metadata_map: Dict[str, Dict[str, Any]] = {}
+
+        if available:
+            targets = [active_embedder] + [m for m in available if m != active_embedder]
+            for emb in targets:
+                idx_obj, paths, metas, meta_info = load_index(folder, embedder=emb)
+                if idx_obj is not None:
+                    image_paths = paths or []
+                    image_metadata = metas or []
+                    metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+                    break
+
         comments_data = load_comments(folder)
-        
-        # Build results for images with comments
-        results = []
-        for image_path in comments_data.keys():
-            if image_path in image_paths:
-                try:
-                    # Get index position for metadata lookup
-                    idx = image_paths.index(image_path)
-                    
-                    # Create thumbnail
-                    img = Image.open(image_path)
-                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                    
-                    # Convert to base64
-                    buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                    
-                    # Get metadata if available
-                    metadata_info = {}
-                    if image_metadata and idx < len(image_metadata):
-                        meta = image_metadata[idx]
-                        metadata_info = {
-                            'mtime': meta.get('mtime', 0),
-                            'size': meta.get('size', 0)
-                        }
-                    
-                    results.append({
-                        'path': image_path,
-                        'filename': os.path.basename(image_path),
-                        'thumbnail': img_base64,
-                        'comment_count': len(comments_data[image_path]),
-                        'latest_comment': comments_data[image_path][-1] if comments_data[image_path] else '',
-                        'metadata': metadata_info
-                    })
-                except Exception as img_error:
-                    print(f"Error processing commented image {image_path}: {img_error}")
-                    continue
-        
-        # Sort by most recent comment first
-        results.sort(key=lambda x: x['latest_comment'], reverse=True)
-        
+        if not comments_data:
+            return jsonify({'results': []})
+
+        results: List[Dict[str, Any]] = []
+        for image_path, comment_list in comments_data.items():
+            if not Path(image_path).exists():
+                continue
+            entry = _build_result_entry(
+                image_path,
+                similarity=1.0,
+                metadata=metadata_map.get(image_path, {}),
+                extra={
+                    'comment_count': len(comment_list),
+                    'latest_comment': comment_list[-1] if comment_list else '',
+                },
+            )
+            if entry:
+                results.append(entry)
+
+        results.sort(key=lambda x: (x.get('metadata', {}).get('mtime', 0), x.get('comment_count', 0)), reverse=True)
         return jsonify({'results': results})
     except Exception as e:
-        print(f"Error getting commented images: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/check_index', methods=['POST'])
