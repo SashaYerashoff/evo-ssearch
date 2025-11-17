@@ -1749,6 +1749,13 @@ def home():
                 .replace(/\\n/g, '<br>');
         }
 
+        function formatDuration(seconds) {
+            if (!Number.isFinite(seconds)) return 'n/a';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}m ${secs}s`;
+        }
+
         function startVideoTimer() {
             videoRequestStarted = performance.now();
             if (videoTimerHandle) clearInterval(videoTimerHandle);
@@ -1759,10 +1766,15 @@ def home():
             }, 200);
         }
 
-        function stopVideoTimer() {
+        function stopVideoTimer(finalize = false) {
+            const elapsed = videoRequestStarted ? (performance.now() - videoRequestStarted) / 1000 : 0;
             if (videoTimerHandle) {
                 clearInterval(videoTimerHandle);
                 videoTimerHandle = null;
+            }
+            if (finalize) {
+                const base = videoStatus.dataset.base || '';
+                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
             }
             videoRequestStarted = 0;
         }
@@ -2400,7 +2412,8 @@ def home():
                     stopVideoTimer();
                     return;
                 }
-                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}`;
+                const durationLabel = typeof data.duration_sec === 'number' ? ` · Duration: ${formatDuration(data.duration_sec)}` : '';
+                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
                 videoStatus.textContent = videoStatus.dataset.base;
                 if (data.summary) {
                     videoOutput.style.display = 'block';
@@ -2416,12 +2429,12 @@ def home():
                     saveSummaryBtn.style.display = 'none';
                 }
                 renderVideoFrames(data.frames || []);
-                stopVideoTimer();
+                stopVideoTimer(true);
             } catch (error) {
                 videoStatus.dataset.base = 'Error: ' + error.message;
                 videoStatus.textContent = videoStatus.dataset.base;
                 videoStatus.className = 'video-status error';
-                stopVideoTimer();
+                stopVideoTimer(true);
             } finally {
                 videoRunBtn.disabled = false;
             }
@@ -3113,12 +3126,12 @@ def home():
                 if (data.thumbnail) {
                     videoFrames.innerHTML = `<div title="Image"><img src="data:image/jpeg;base64,${data.thumbnail}" alt="Image" /></div>`;
                 }
-                stopVideoTimer();
+                stopVideoTimer(true);
             } catch (err) {
                 videoStatus.dataset.base = 'Error: ' + err.message;
                 videoStatus.textContent = videoStatus.dataset.base;
                 videoStatus.className = 'video-status error';
-                stopVideoTimer();
+                stopVideoTimer(true);
             } finally {
                 videoRunBtn.disabled = false;
             }
