@@ -119,7 +119,7 @@ EVOSSEARCH_LM_MODEL=qwen/qwen3-vl-4b
 EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES=16   # default frames to sample per video
 EVOSSEARCH_LM_VIDEO_MAX_FRAMES=64       # hard cap on frames sent to the model
 EVOSSEARCH_LM_VIDEO_MAX_EDGE=960        # resize frames before sending
-EVOSSEARCH_LM_VIDEO_MAX_TOKENS=768      # cap model output tokens
+EVOSSEARCH_LM_VIDEO_MAX_TOKENS=1536     # cap model output tokens (increase if responses are cut)
 EVOSSEARCH_LM_VIDEO_TEMPERATURE=0.2     # decoding temperature
 EVOSSEARCH_LM_TIMEOUT=120               # request timeout (seconds)
 

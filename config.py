@@ -128,9 +128,9 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_MAX_EDGE = 960
     try:
-        LM_VIDEO_MAX_TOKENS = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_TOKENS', '768'))
+        LM_VIDEO_MAX_TOKENS = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_TOKENS', '1536'))
     except (TypeError, ValueError):
-        LM_VIDEO_MAX_TOKENS = 768
+        LM_VIDEO_MAX_TOKENS = 1536
     try:
         LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
     except (TypeError, ValueError):
