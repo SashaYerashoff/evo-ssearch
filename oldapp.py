@@ -1496,6 +1496,10 @@ def home():
                         <label for="videoPath" class="input-label">Video Path:</label>
                         <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
                     </div>
+                    <div class="input-group">
+                        <label class="input-label" for="videoModel">Model ID:</label>
+                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
+                    </div>
                 </div>
                 <div class="video-row">
                     <div class="input-group">
@@ -1686,6 +1690,7 @@ def home():
         const imageSearchBox = document.getElementById('imageSearchBox');
         const videoBox = document.getElementById('videoBox');
         const videoPathInput = document.getElementById('videoPath');
+        const videoModelInput = document.getElementById('videoModel');
         const videoFrameCount = document.getElementById('videoFrameCount');
         const videoSampleFpsInput = document.getElementById('videoSampleFps');
         const videoPromptInput = document.getElementById('videoPrompt');
@@ -2337,6 +2342,7 @@ def home():
             const frameCount = parseInt(videoFrameCount.value, 10) || 16;
             const sampleFpsValue = Number.parseFloat(videoSampleFpsInput.value);
             const prompt = videoPromptInput.value.trim();
+            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
 
             if (!videoPath) {
                 videoStatus.textContent = 'Provide a video path.';
@@ -2368,6 +2374,9 @@ def home():
                     frame_count: frameCount,
                     prompt,
                 };
+                if (modelId) {
+                    payload.model = modelId;
+                }
                 if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
                     payload.sample_fps = sampleFpsValue;
                 }
@@ -2385,7 +2394,7 @@ def home():
                     return;
                 }
                 const durationLabel = typeof data.duration_sec === 'number' ? ` · Duration: ${formatDuration(data.duration_sec)}` : '';
-                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
+                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
                 videoStatus.textContent = videoStatus.dataset.base;
                 if (data.summary) {
                     videoOutput.style.display = 'block';
@@ -3063,6 +3072,7 @@ def home():
                 return;
             }
             const prompt = videoPromptInput.value.trim();
+            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
             setMode('video');
             videoStatus.dataset.base = 'Querying model...';
             videoStatus.textContent = videoStatus.dataset.base;
@@ -3078,7 +3088,7 @@ def home():
                 const response = await fetch('/describe_image', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image_path: imagePath, prompt }),
+                    body: JSON.stringify({ image_path: imagePath, prompt, model: modelId }),
                 });
                 const data = await response.json();
                 if (!response.ok || data.error) {
@@ -3088,7 +3098,7 @@ def home():
                     stopVideoTimer();
                     return;
                 }
-                videoStatus.dataset.base = `Model: ${data.model || 'LM Studio'} · Image described`;
+                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Image described`;
                 videoStatus.textContent = videoStatus.dataset.base;
                 if (data.summary) {
                     videoOutput.style.display = 'block';
@@ -3144,6 +3154,7 @@ def home():
     current_timestamp = str(int(time.time()))
     response_html = html_template.replace('{result_options_html}', result_options_html)
     response_html = response_html.replace('{timestamp}', current_timestamp)
+    response_html = response_html.replace('{lm_model}', config.LM_MODEL)
     
     # Create response with cache-busting headers
     response = make_response(response_html)
@@ -3310,7 +3321,7 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
     ]
 
 
-def _call_lm_chat(messages: List[Dict[str, Any]]) -> str:
+def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
     base_url = (config.LM_BASE_URL or '').rstrip('/')
     if not base_url:
         raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
@@ -3319,8 +3330,9 @@ def _call_lm_chat(messages: List[Dict[str, Any]]) -> str:
     if config.LM_API_KEY:
         headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
 
+    target_model = (model_override or config.LM_MODEL).strip()
     payload = {
-        "model": config.LM_MODEL,
+        "model": target_model,
         "messages": messages,
         "temperature": float(config.LM_VIDEO_TEMPERATURE),
         "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
@@ -3346,8 +3358,8 @@ def _call_lm_chat(messages: List[Dict[str, Any]]) -> str:
     return content_text or "(empty response from model)"
 
 
-def _call_video_understanding(messages: List[Dict[str, Any]]) -> str:
-    return _call_lm_chat(messages)
+def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
+    return _call_lm_chat(messages, model_override=model_override)
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -4293,6 +4305,7 @@ def video_understanding():
         sample_fps_val = None
 
     user_prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip()
 
     try:
         frames, fps, duration = _sample_video_frames(
@@ -4304,7 +4317,7 @@ def video_understanding():
         if not frames:
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
         messages = _build_video_messages(video_path, frames, user_prompt)
-        summary = _call_video_understanding(messages)
+        summary = _call_video_understanding(messages, model_override=model_hint or None)
         return jsonify(
             {
                 'summary': summary,
@@ -4318,7 +4331,7 @@ def video_understanding():
                 ],
                 'fps': fps,
                 'duration_sec': duration,
-                'model': config.LM_MODEL,
+                'model': model_hint or config.LM_MODEL,
             }
         )
     except Exception as exc:
@@ -4330,6 +4343,7 @@ def describe_image():
     data = request.json or {}
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip()
     if not image_path:
         return jsonify({'error': 'image_path is required'}), 400
     path_obj = Path(image_path)
@@ -4337,13 +4351,13 @@ def describe_image():
         return jsonify({'error': f'Image not found: {image_path}'}), 400
     try:
         messages = _build_image_messages(image_path, prompt)
-        summary = _call_lm_chat(messages)
+        summary = _call_lm_chat(messages, model_override=model_hint or None)
         thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
         return jsonify(
             {
                 'summary': summary,
                 'thumbnail': thumb,
-                'model': config.LM_MODEL,
+                'model': model_hint or config.LM_MODEL,
                 'image_path': image_path,
             }
         )
