@@ -3902,7 +3902,23 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
             )
     system_msg = (
         "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
-        "Keep it concise and avoid repetition across frames."
+        "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
+        "If and only if inappropriate or high-risk activity is present, append a JSON block exactly in this form:\n"
+        "```json\n"
+        "{\n"
+        '  \"alerts\": [\n'
+        '    {\n'
+        '      \"title\": \"short alert title\",\n'
+        '      \"description\": \"1-2 sentence description with any time/frame hints\",\n'
+        '      \"severity\": \"info|low|normal|high|critical\",\n'
+        '      \"state\": \"new|inprogress|closed|hidden|none\",\n'
+        '      \"channel_id\": <channel id>,\n'
+        '      \"timestamp_ms\": <milliseconds since epoch>\n'
+        '    }\n'
+        '  ]\n'
+        "}\n"
+        "```\n"
+        "If nothing inappropriate: do not include alerts or emit an empty alerts array."
     )
     return [
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
@@ -3951,11 +3967,81 @@ def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Op
     return _call_lm_chat(messages, model_override=model_override)
 
 
+def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]:
+    """Extract alert objects from LM output; expects optional JSON with an alerts array."""
+    import json
+    import re
+    now_ms = int(time.time() * 1000)
+
+    def _validate_alert(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        title = (raw.get('title') or '').strip() or 'External event'
+        description = (raw.get('description') or '').strip()
+        severity = str(raw.get('severity') or 'critical').lower()
+        allowed_sev = {'info', 'low', 'normal', 'high', 'critical'}
+        if severity not in allowed_sev:
+            severity = 'critical'
+        state = str(raw.get('state') or 'new').lower()
+        allowed_state = {'none', 'new', 'inprogress', 'closed', 'hidden'}
+        if state not in allowed_state:
+            state = 'new'
+        channel_id = raw.get('channel_id') or default_channel_id
+        try:
+            channel_id = int(channel_id)
+        except Exception:
+            channel_id = default_channel_id
+        timestamp_ms = raw.get('timestamp_ms') or now_ms
+        try:
+            timestamp_ms = int(timestamp_ms)
+        except Exception:
+            timestamp_ms = now_ms
+        return {
+            'title': title,
+            'description': description,
+            'severity': severity,
+            'state': state,
+            'channel_id': channel_id,
+            'timestamp_ms': timestamp_ms,
+        }
+
+    def _extract_candidates(blob: str) -> List[Any]:
+        candidates: List[Any] = []
+        try:
+            parsed = json.loads(blob)
+            candidates.append(parsed)
+        except Exception:
+            pass
+        for match in re.finditer(r"```json(.*?)```", blob, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                candidates.append(json.loads(match.group(1)))
+            except Exception:
+                continue
+        for match in re.finditer(r"ALERTS_JSON:(\{.*?\})", blob, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                candidates.append(json.loads(match.group(1)))
+            except Exception:
+                continue
+        return candidates
+
+    alerts: List[Dict[str, Any]] = []
+    for candidate in _extract_candidates(text or ''):
+        if isinstance(candidate, dict) and isinstance(candidate.get('alerts'), list):
+            for raw_alert in candidate['alerts']:
+                validated = _validate_alert(raw_alert)
+                if validated:
+                    alerts.append(validated)
+            if alerts:
+                break
+    return alerts
+
+
 luxriot_manager = LuxriotManager(
     config=config,
     lm_callback=_call_video_understanding,
     message_builder=_build_luxriot_messages,
     jpeg_encoder=_encode_jpeg,
+    alert_parser=_parse_lm_alerts,
 )
 
 

@@ -232,6 +232,25 @@ class LuxriotCaptureSession:
                 "duration_sec": duration,
                 "prompt": self.prompt,
             }
+            # Attempt to parse alerts from summary and send bookmarks
+            if self.manager.alert_parser:
+                try:
+                    alerts = self.manager.alert_parser(summary, self.channel_id) or []
+                    for alert in alerts:
+                        try:
+                            self.manager.send_bookmark_event(
+                                channel_id=alert.get("channel_id", self.channel_id),
+                                title=alert.get("title", "External event"),
+                                description=alert.get("description", ""),
+                                severity=alert.get("severity", "critical"),
+                                state=alert.get("state", "new"),
+                                timestamp_ms=alert.get("timestamp_ms"),
+                            )
+                        except Exception as bookmark_exc:
+                            # Keep running; attach error to log entry for visibility
+                            entry.setdefault("bookmark_errors", []).append(str(bookmark_exc))
+                except Exception as parse_exc:
+                    entry.setdefault("bookmark_errors", []).append(f"parse: {parse_exc}")
             with self.lock:
                 self.logs.append(entry)
                 self.total_flushes += 1
@@ -284,11 +303,13 @@ class LuxriotManager:
         lm_callback: Callable[[List[Dict[str, Any]], Optional[str]], str],
         message_builder: Callable[[str, List[Dict[str, Any]], str], List[Dict[str, Any]]],
         jpeg_encoder: Callable[..., str],
+        alert_parser: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
         self.message_builder = message_builder
         self.jpeg_encoder = jpeg_encoder
+        self.alert_parser = alert_parser
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.cache_lock = threading.Lock()
