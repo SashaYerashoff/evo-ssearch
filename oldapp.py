@@ -1848,6 +1848,20 @@ def home():
                     <label class="settings-label">Max Buffer Frames:</label>
                     <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
                 </div>
+                <div class="settings-row">
+                    <label class="settings-label">Auto Bookmark Alerts:</label>
+                    <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Severity Mapping:</label>
+                    <div style="display:flex; gap:0.4rem; flex-wrap: wrap;">
+                        <input type="text" id="luxriotSevInfo" class="settings-input" style="width:110px;" placeholder="info">
+                        <input type="text" id="luxriotSevLow" class="settings-input" style="width:110px;" placeholder="low">
+                        <input type="text" id="luxriotSevNormal" class="settings-input" style="width:110px;" placeholder="normal">
+                        <input type="text" id="luxriotSevHigh" class="settings-input" style="width:110px;" placeholder="high">
+                        <input type="text" id="luxriotSevCritical" class="settings-input" style="width:110px;" placeholder="critical">
+                    </div>
+                </div>
             </div>
             
             <div class="settings-section">
@@ -2301,6 +2315,12 @@ def home():
         const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
         const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
         const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
+        const luxriotAutoBookmarksInput = document.getElementById('luxriotAutoBookmarks');
+        const luxriotSevInfoInput = document.getElementById('luxriotSevInfo');
+        const luxriotSevLowInput = document.getElementById('luxriotSevLow');
+        const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
+        const luxriotSevHighInput = document.getElementById('luxriotSevHigh');
+        const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
         
         let segmentThreshold = 0.7;
 
@@ -2462,6 +2482,14 @@ def home():
                     luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
                     luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
                     luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
+                    luxriotAutoBookmarksInput.checked = Boolean(settings.luxriotAutoBookmarks);
+                    if (settings.luxriotSeverityMap) {
+                        luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
+                        luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
+                        luxriotSevNormalInput.value = settings.luxriotSeverityMap.normal || 'normal';
+                        luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
+                        luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
+                    }
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
@@ -2512,7 +2540,15 @@ def home():
                     luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput.value),
                     luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput.value),
                     luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput.value),
-                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput.value)
+                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput.value),
+                    luxriotAutoBookmarks: luxriotAutoBookmarksInput.checked,
+                    luxriotSeverityMap: {
+                        info: luxriotSevInfoInput.value.trim() || 'info',
+                        low: luxriotSevLowInput.value.trim() || 'low',
+                        normal: luxriotSevNormalInput.value.trim() || 'normal',
+                        high: luxriotSevHighInput.value.trim() || 'high',
+                        critical: luxriotSevCriticalInput.value.trim() || 'critical'
+                    }
                 };
                 
                 // Basic validation
@@ -2622,6 +2658,12 @@ def home():
                 luxriotSnapshotIntervalInput.value = '5';
                 luxriotSnapshotMaxEdgeInput.value = '800';
                 luxriotMaxBufferFramesInput.value = '180';
+                luxriotAutoBookmarksInput.checked = false;
+                luxriotSevInfoInput.value = 'info';
+                luxriotSevLowInput.value = 'low';
+                luxriotSevNormalInput.value = 'normal';
+                luxriotSevHighInput.value = 'high';
+                luxriotSevCriticalInput.value = 'critical';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
@@ -5624,6 +5666,8 @@ def get_settings():
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
             'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
+            'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
+            'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
             'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
@@ -5739,6 +5783,16 @@ def save_settings():
             luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
         if luxriot_max_buffer_frames < 12:
             luxriot_max_buffer_frames = 12
+        luxriot_auto_bookmarks_raw = data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS)
+        if isinstance(luxriot_auto_bookmarks_raw, str):
+            luxriot_auto_bookmarks = luxriot_auto_bookmarks_raw.strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+            luxriot_auto_bookmarks = bool(luxriot_auto_bookmarks_raw)
+        severity_map = data.get('luxriotSeverityMap', {}) or {}
+        merged_sev = dict(config.LUXRIOT_SEVERITY_MAP)
+        for key in ['info', 'low', 'normal', 'high', 'critical']:
+            if key in severity_map:
+                merged_sev[key] = str(severity_map[key] or merged_sev.get(key, key)).lower()
 
         embedder = str(data.get('embedder', active_embedder)).strip().lower()
         if embedder == 'fusion' and not fusion_enabled:
@@ -5800,6 +5854,12 @@ EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
+EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
+EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
+EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
+EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
+EVOSSEARCH_LUXRIOT_SEV_HIGH={merged_sev['high']}
+EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -5855,6 +5915,8 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
         config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
+        config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
+        config.LUXRIOT_SEVERITY_MAP = merged_sev
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:

@@ -161,6 +161,14 @@ class Config:
         LUXRIOT_MAX_BUFFER_FRAMES = 180
     if LUXRIOT_MAX_BUFFER_FRAMES < 12:
         LUXRIOT_MAX_BUFFER_FRAMES = 12
+    LUXRIOT_AUTO_BOOKMARKS = _get_bool_env('EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS', 'False')
+    LUXRIOT_SEVERITY_MAP = {
+        'info': os.getenv('EVOSSEARCH_LUXRIOT_SEV_INFO', 'info').lower(),
+        'low': os.getenv('EVOSSEARCH_LUXRIOT_SEV_LOW', 'low').lower(),
+        'normal': os.getenv('EVOSSEARCH_LUXRIOT_SEV_NORMAL', 'normal').lower(),
+        'high': os.getenv('EVOSSEARCH_LUXRIOT_SEV_HIGH', 'high').lower(),
+        'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
+    }
 
     @classmethod
     def get_server_urls(cls):
@@ -241,7 +249,8 @@ class Config:
             f"Luxriot Evo: {cls.LUXRIOT_BASE_URL or 'unset'} "
             f"(default channel: {cls.LUXRIOT_DEFAULT_CHANNEL_ID}, "
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
-            f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames)"
+            f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
+            f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
         )
         print()
         print("Server available at:")

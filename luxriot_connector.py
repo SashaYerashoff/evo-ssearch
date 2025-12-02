@@ -233,7 +233,7 @@ class LuxriotCaptureSession:
                 "prompt": self.prompt,
             }
             # Attempt to parse alerts from summary and send bookmarks
-            if self.manager.alert_parser:
+            if self.manager.alert_parser and self.manager.auto_bookmarks:
                 try:
                     alerts = self.manager.alert_parser(summary, self.channel_id) or []
                     for alert in alerts:
@@ -310,6 +310,7 @@ class LuxriotManager:
         self.message_builder = message_builder
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
+        self.auto_bookmarks = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.cache_lock = threading.Lock()
@@ -349,6 +350,9 @@ class LuxriotManager:
         timestamp_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         client = self.build_client()
+        sev_map = getattr(self.config, "LUXRIOT_SEVERITY_MAP", {}) or {}
+        severity = str(severity).lower()
+        severity = sev_map.get(severity, severity)
         client.create_bookmark(
             channel_id=channel_id,
             title=title,
