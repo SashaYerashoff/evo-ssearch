@@ -5478,6 +5478,37 @@ def luxriot_session_status():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/bookmark', methods=['POST'])
+def luxriot_bookmark():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    title = (data.get('title') or '').strip() or 'External event'
+    description = data.get('description') or ''
+    severity = (data.get('severity') or 'critical').strip().lower()
+    state = (data.get('state') or 'new').strip().lower()
+    timestamp_ms = data.get('timestamp_ms')
+    try:
+        if timestamp_ms is not None:
+            timestamp_ms = int(timestamp_ms)
+    except Exception:
+        timestamp_ms = None
+    try:
+        result = luxriot_manager.send_bookmark_event(
+            channel_id=channel_id,
+            title=title,
+            description=description,
+            severity=severity,
+            state=state,
+            timestamp_ms=timestamp_ms,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""

@@ -124,6 +124,31 @@ class LuxriotClient:
             image = image.convert("RGB")
         return image
 
+    def create_bookmark(
+        self,
+        channel_id: int,
+        title: str,
+        description: str = "",
+        timestamp_ms: Optional[int] = None,
+        severity: str = "critical",
+        state: str = "new",
+    ) -> None:
+        params = {
+            "title": title,
+            "channel": channel_id,
+            "time": timestamp_ms or int(time.time() * 1000),
+            "severity": severity,
+            "state": state,
+        }
+        # Description must be plain text in POST body per docs
+        self._request(
+            "POST",
+            "/createBookmark",
+            params=params,
+            headers={"Content-Type": "text/plain"},
+            data=description or "",
+        )
+
 
 class LuxriotCaptureSession:
     """Background snapshot-to-summary loop for a single channel."""
@@ -292,6 +317,26 @@ class LuxriotManager:
         snapshot = client.get_snapshot(channel_id, stream=stream_type)
         encoded = self.jpeg_encoder(snapshot, max_edge=self.config.LUXRIOT_SNAPSHOT_MAX_EDGE, quality=85)
         return encoded, {"width": snapshot.width, "height": snapshot.height}
+
+    def send_bookmark_event(
+        self,
+        channel_id: int,
+        title: str,
+        description: str,
+        severity: str = "critical",
+        state: str = "new",
+        timestamp_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        client = self.build_client()
+        client.create_bookmark(
+            channel_id=channel_id,
+            title=title,
+            description=description or "",
+            timestamp_ms=timestamp_ms,
+            severity=severity,
+            state=state,
+        )
+        return {"success": True, "channel_id": channel_id, "severity": severity, "state": state}
 
     def start_session(
         self,
