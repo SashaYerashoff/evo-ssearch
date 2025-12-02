@@ -3945,7 +3945,7 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
     system_msg = (
         "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
         "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
-        "If and only if inappropriate or high-risk activity is present, append a JSON block exactly in this form:\n"
+        "If any aggression, weapon, fight, or high-risk activity is present, you MUST append a JSON block exactly in this form:\n"
         "```json\n"
         "{\n"
         '  \"alerts\": [\n'
@@ -4075,6 +4075,28 @@ def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]
                     alerts.append(validated)
             if alerts:
                 break
+
+    if not alerts:
+        # Heuristic: weapon/violence keywords → create a critical alert
+        threat_keywords = [
+            'weapon', 'gun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
+            'оружие', 'пистолет', 'револьвер', 'винтовк', 'нож', 'стрел', 'выстрел', 'агресс', 'драк', 'насили'
+        ]
+        lowered = (text or '').lower()
+        if any(k in lowered for k in threat_keywords):
+            alerts.append(
+                _validate_alert(
+                    {
+                        'title': 'Possible weapon or aggression detected',
+                        'description': text.strip()[:300],
+                        'severity': 'critical',
+                        'state': 'new',
+                        'channel_id': default_channel_id,
+                        'timestamp_ms': now_ms,
+                    }
+                )
+            )
+
     return alerts
 
 
