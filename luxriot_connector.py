@@ -143,10 +143,13 @@ class LuxriotCaptureSession:
         self.model_hint = model_hint
         self.interval = max(1, int(getattr(manager.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         self.max_edge = int(getattr(manager.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800))
+        self.max_buffer = int(getattr(manager.config, "LUXRIOT_MAX_BUFFER_FRAMES", 180))
         self.client = manager.build_client()
 
         self.frames: List[Dict[str, Any]] = []
         self.logs: List[Dict[str, Any]] = []
+        self.total_flushes = 0
+        self.dropped_frames = 0
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -175,6 +178,7 @@ class LuxriotCaptureSession:
                 }
                 with self.lock:
                     self.frames.append(frame)
+                    self._enforce_buffer_locked()
                 if len(self.frames) >= self.batch_size:
                     self._summarize_batch()
                     with self.lock:
@@ -205,10 +209,25 @@ class LuxriotCaptureSession:
             }
             with self.lock:
                 self.logs.append(entry)
+                self.total_flushes += 1
                 if len(self.logs) > 50:
                     self.logs = self.logs[-50:]
         except Exception as exc:
             self.last_error = str(exc)
+
+    def _enforce_buffer_locked(self) -> None:
+        """Ensure frame buffer does not grow unbounded."""
+        if self.max_buffer and len(self.frames) > self.max_buffer:
+            overflow = len(self.frames) - self.max_buffer
+            # Drop oldest frames to cap size; keep last max_buffer frames
+            self.frames = self.frames[-self.max_buffer :]
+            self.dropped_frames += overflow
+
+    def flush_now(self) -> None:
+        """Force a summary of current buffer."""
+        self._summarize_batch()
+        with self.lock:
+            self.frames.clear()
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
@@ -221,6 +240,9 @@ class LuxriotCaptureSession:
             "pending_frames": pending_frames,
             "interval_sec": self.interval,
             "max_edge": self.max_edge,
+            "max_buffer_frames": self.max_buffer,
+            "dropped_frames": self.dropped_frames,
+            "flush_count": self.total_flushes,
             "last_error": self.last_error,
             "logs": logs_copy,
             "prompt": self.prompt,
@@ -305,6 +327,14 @@ class LuxriotManager:
             session.stop()
             return {"channel_id": channel_id, "running": False}
         return {"channel_id": channel_id, "running": False, "message": "No active session"}
+
+    def flush_session(self, channel_id: int) -> Dict[str, Any]:
+        with self.cache_lock:
+            session = self.sessions.get(channel_id)
+        if not session:
+            return {"success": False, "message": "No active session"}
+        session.flush_now()
+        return {"success": True, "message": "Flushed buffered frames", "status": session.status()}
 
     def session_status(self, channel_id: int) -> Dict[str, Any]:
         with self.cache_lock:

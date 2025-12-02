@@ -155,6 +155,12 @@ class Config:
         LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '103'))
     except (TypeError, ValueError):
         LUXRIOT_DEFAULT_CHANNEL_ID = 103
+    try:
+        LUXRIOT_MAX_BUFFER_FRAMES = int(os.getenv('EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES', '180'))
+    except (TypeError, ValueError):
+        LUXRIOT_MAX_BUFFER_FRAMES = 180
+    if LUXRIOT_MAX_BUFFER_FRAMES < 12:
+        LUXRIOT_MAX_BUFFER_FRAMES = 12
 
     @classmethod
     def get_server_urls(cls):
@@ -234,7 +240,8 @@ class Config:
         print(
             f"Luxriot Evo: {cls.LUXRIOT_BASE_URL or 'unset'} "
             f"(default channel: {cls.LUXRIOT_DEFAULT_CHANNEL_ID}, "
-            f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px)"
+            f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
+            f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames)"
         )
         print()
         print("Server available at:")

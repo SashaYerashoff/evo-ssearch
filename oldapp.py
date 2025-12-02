@@ -1661,6 +1661,7 @@ def home():
                             <button id="luxriotPreviewBtn" class="feature-btn">Preview</button>
                             <button id="luxriotStartCapture" class="feature-btn primary">Start summaries</button>
                             <button id="luxriotStopCapture" class="feature-btn">Stop</button>
+                            <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
                         </div>
                         <div class="luxriot-row">
                             <label for="luxriotPrompt">Prompt:</label>
@@ -1843,6 +1844,10 @@ def home():
                     <label class="settings-label">Snapshot Max Edge (px):</label>
                     <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
                 </div>
+                <div class="settings-row">
+                    <label class="settings-label">Max Buffer Frames:</label>
+                    <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
+                </div>
             </div>
             
             <div class="settings-section">
@@ -1929,6 +1934,7 @@ def home():
         const luxriotPreviewBtn = document.getElementById('luxriotPreviewBtn');
         const luxriotStartCaptureBtn = document.getElementById('luxriotStartCapture');
         const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
+        const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaries = document.getElementById('luxriotSummaries');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
@@ -2221,6 +2227,28 @@ def home():
             }
         }
 
+        async function flushLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            setLuxriotStatus('Flushing...');
+            try {
+                const resp = await fetch('/luxriot/flush_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || data.message || 'Flush failed');
+                }
+                setLuxriotStatus('Buffer flushed');
+                if (data.status) {
+                    renderLuxriotSummaries(data.status.logs || []);
+                }
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            }
+        }
+
         async function ensureLuxriotInit() {
             if (luxriotInitialized) return;
             luxriotInitialized = true;
@@ -2272,6 +2300,7 @@ def home():
         const luxriotDefaultChannelIdInput = document.getElementById('luxriotDefaultChannelId');
         const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
         const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
+        const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
         
         let segmentThreshold = 0.7;
 
@@ -2432,6 +2461,7 @@ def home():
                     luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
                     luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
                     luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
+                    luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
@@ -2481,7 +2511,8 @@ def home():
                     luxriotPassword: luxriotPasswordInput.value,
                     luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput.value),
                     luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput.value),
-                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput.value)
+                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput.value),
+                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput.value)
                 };
                 
                 // Basic validation
@@ -2590,6 +2621,7 @@ def home():
                 luxriotDefaultChannelIdInput.value = '103';
                 luxriotSnapshotIntervalInput.value = '5';
                 luxriotSnapshotMaxEdgeInput.value = '800';
+                luxriotMaxBufferFramesInput.value = '180';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
@@ -2691,6 +2723,9 @@ def home():
         }
         if (luxriotStopCaptureBtn) {
             luxriotStopCaptureBtn.addEventListener('click', stopLuxriotCapture);
+        }
+        if (luxriotFlushCaptureBtn) {
+            luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
         }
         if (luxriotRefreshSummariesBtn) {
             luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries());
@@ -5417,6 +5452,22 @@ def luxriot_stop_capture():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/flush_capture', methods=['POST'])
+def luxriot_flush_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        result = luxriot_manager.flush_session(channel_id)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/luxriot/session', methods=['GET'])
 def luxriot_session_status():
     channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
@@ -5455,6 +5506,7 @@ def get_settings():
             'luxriotSnapshotInterval': config.LUXRIOT_SNAPSHOT_INTERVAL,
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
+            'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
             'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
@@ -5564,6 +5616,12 @@ def save_settings():
             luxriot_default_channel_id = int(data.get('luxriotDefaultChannelId', config.LUXRIOT_DEFAULT_CHANNEL_ID))
         except (TypeError, ValueError):
             luxriot_default_channel_id = config.LUXRIOT_DEFAULT_CHANNEL_ID
+        try:
+            luxriot_max_buffer_frames = int(data.get('luxriotMaxBufferFrames', config.LUXRIOT_MAX_BUFFER_FRAMES))
+        except (TypeError, ValueError):
+            luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
+        if luxriot_max_buffer_frames < 12:
+            luxriot_max_buffer_frames = 12
 
         embedder = str(data.get('embedder', active_embedder)).strip().lower()
         if embedder == 'fusion' and not fusion_enabled:
@@ -5624,6 +5682,7 @@ EVOSSEARCH_LUXRIOT_PASSWORD={luxriot_password}
 EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
+EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -5678,6 +5737,7 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.LUXRIOT_DEFAULT_CHANNEL_ID = luxriot_default_channel_id
         config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
         config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
+        config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
