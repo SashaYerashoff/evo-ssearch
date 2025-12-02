@@ -235,7 +235,12 @@ class LuxriotCaptureSession:
             # Attempt to parse alerts from summary and send bookmarks
             if self.manager.alert_parser and self.manager.auto_bookmarks:
                 try:
-                    alerts = self.manager.alert_parser(summary, self.channel_id) or []
+                    latest_ts_ms = None
+                    if frames_copy:
+                        latest_ts = frames_copy[-1].get('captured_at') or frames_copy[-1].get('time_sec')
+                        if isinstance(latest_ts, (int, float)):
+                            latest_ts_ms = int(latest_ts * 1000)
+                    alerts = self.manager.alert_parser(summary, self.channel_id, default_ts_ms=latest_ts_ms) or []
                     for alert in alerts:
                         try:
                             self.manager.send_bookmark_event(

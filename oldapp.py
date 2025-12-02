@@ -4010,11 +4010,12 @@ def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Op
     return _call_lm_chat(messages, model_override=model_override)
 
 
-def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]:
+def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
     """Extract alert objects from LM output; expects optional JSON with an alerts array."""
     import json
     import re
     now_ms = int(time.time() * 1000)
+    base_ts_ms = default_ts_ms or now_ms
 
     def _validate_alert(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
@@ -4034,11 +4035,11 @@ def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]
             channel_id = int(channel_id)
         except Exception:
             channel_id = default_channel_id
-        timestamp_ms = raw.get('timestamp_ms') or now_ms
+        timestamp_ms = raw.get('timestamp_ms') or base_ts_ms
         try:
             timestamp_ms = int(timestamp_ms)
         except Exception:
-            timestamp_ms = now_ms
+            timestamp_ms = base_ts_ms
         return {
             'title': title,
             'description': description,
@@ -4087,11 +4088,11 @@ def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]
         phone_keywords = ['phone', 'call', 'talking on phone', 'звон', 'телефон', 'разговаривает по телефону']
         pet_keywords = ['orl', 'orland', 'maz', 'cat', 'кот', 'кошка', 'питом']
 
-        def add_fallback(title: str, severity: str) -> None:
+        def add_fallback(title: str, severity: str, reason: str) -> None:
             val = _validate_alert(
                 {
                     'title': title,
-                    'description': text.strip()[:300],
+                    'description': f"Heuristic trigger: {reason}. Summary snippet: {text.strip()[:200]}",
                     'severity': severity,
                     'state': 'new',
                     'channel_id': default_channel_id,
@@ -4102,11 +4103,11 @@ def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]
                 alerts.append(val)
 
         if any(k in lowered for k in threat_keywords):
-            add_fallback('Possible weapon or aggression detected', 'critical')
+            add_fallback('Possible weapon or aggression detected', 'critical', 'weapon/aggression keywords')
         elif any(k in lowered for k in phone_keywords):
-            add_fallback('Phone call detected', 'info')
+            add_fallback('Phone call detected', 'info', 'phone keywords')
         elif any(k in lowered for k in pet_keywords):
-            add_fallback('Pet interaction detected', 'low')
+            add_fallback('Pet interaction detected', 'low', 'pet keywords')
 
     return alerts
 
