@@ -3945,7 +3945,7 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
     system_msg = (
         "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
         "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
-        "If any aggression, weapon, fight, or high-risk activity is present, you MUST append a JSON block exactly in this form:\n"
+        "Always append a JSON block in this form (alerts may be empty, but must be present):\n"
         "```json\n"
         "{\n"
         '  \"alerts\": [\n'
@@ -3960,7 +3960,8 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
         '  ]\n'
         "}\n"
         "```\n"
-        "If nothing inappropriate: do not include alerts or emit an empty alerts array."
+        "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
+        "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
     )
     return [
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
@@ -4077,25 +4078,35 @@ def _parse_lm_alerts(text: str, default_channel_id: int) -> List[Dict[str, Any]]
                 break
 
     if not alerts:
-        # Heuristic: weapon/violence keywords → create a critical alert
+        # Heuristic fallbacks
+        lowered = (text or '').lower()
         threat_keywords = [
-            'weapon', 'gun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
+            'weapon', 'gun', 'handgun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
             'оружие', 'пистолет', 'револьвер', 'винтовк', 'нож', 'стрел', 'выстрел', 'агресс', 'драк', 'насили'
         ]
-        lowered = (text or '').lower()
-        if any(k in lowered for k in threat_keywords):
-            alerts.append(
-                _validate_alert(
-                    {
-                        'title': 'Possible weapon or aggression detected',
-                        'description': text.strip()[:300],
-                        'severity': 'critical',
-                        'state': 'new',
-                        'channel_id': default_channel_id,
-                        'timestamp_ms': now_ms,
-                    }
-                )
+        phone_keywords = ['phone', 'call', 'talking on phone', 'звон', 'телефон', 'разговаривает по телефону']
+        pet_keywords = ['orl', 'orland', 'maz', 'cat', 'кот', 'кошка', 'питом']
+
+        def add_fallback(title: str, severity: str) -> None:
+            val = _validate_alert(
+                {
+                    'title': title,
+                    'description': text.strip()[:300],
+                    'severity': severity,
+                    'state': 'new',
+                    'channel_id': default_channel_id,
+                    'timestamp_ms': now_ms,
+                }
             )
+            if val:
+                alerts.append(val)
+
+        if any(k in lowered for k in threat_keywords):
+            add_fallback('Possible weapon or aggression detected', 'critical')
+        elif any(k in lowered for k in phone_keywords):
+            add_fallback('Phone call detected', 'info')
+        elif any(k in lowered for k in pet_keywords):
+            add_fallback('Pet interaction detected', 'low')
 
     return alerts
 
