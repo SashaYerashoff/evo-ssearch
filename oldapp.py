@@ -23,6 +23,7 @@ from flask_cors import CORS
 
 from config import config
 from embedders.dino_encoder import DINOEncoder
+from luxriot_connector import LuxriotManager
 try:
     from heads.mask2former_head import Mask2FormerHead
 except Exception:  # pragma: no cover - optional dependency
@@ -308,6 +309,12 @@ def home():
         result_options.append(f'<option value="{i}" {selected}>{i}</option>')
     
     result_options_html = '\n                            '.join(result_options)
+    luxriot_batch_options = []
+    for size in config.LUXRIOT_BATCH_SIZES:
+        selected = "selected" if size == config.LUXRIOT_BATCH_SIZES[0] else ""
+        luxriot_batch_options.append(f'<option value="{size}" {selected}>{size}</option>')
+    luxriot_batch_options_html = '\n                            '.join(luxriot_batch_options)
+    luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
     
     # Use string formatting for the result options
     html_template = '''
@@ -1391,6 +1398,148 @@ def home():
             border: 1px solid #222;
             background: #111;
         }
+
+        /* Luxriot live view */
+        .luxriot-grid {
+            display: grid;
+            grid-template-columns: 1.3fr 1fr;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        @media (max-width: 1180px) {
+            .luxriot-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .luxriot-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+
+        .luxriot-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+        }
+
+        .luxriot-header h4 {
+            font-size: 1rem;
+        }
+
+        .luxriot-status {
+            font-size: 0.9rem;
+            color: #a6ffb0;
+        }
+
+        .luxriot-status.error {
+            color: #ff9080;
+        }
+
+        .luxriot-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-row label {
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        .luxriot-viewport {
+            position: relative;
+            background: #050505;
+            border: 1px solid #222;
+            border-radius: 8px;
+            min-height: 260px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .luxriot-viewport img {
+            width: 100%;
+            max-height: 500px;
+            object-fit: contain;
+            display: block;
+        }
+
+        .luxriot-viewport .luxriot-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #777;
+            font-size: 0.9rem;
+            pointer-events: none;
+            background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+        }
+
+        .luxriot-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-prompt {
+            width: 100%;
+            min-height: 80px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.65rem;
+            resize: vertical;
+        }
+
+        .luxriot-summaries {
+            max-height: 340px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .luxriot-summary {
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 6px;
+            padding: 0.65rem;
+        }
+
+        .luxriot-summary .timestamp {
+            color: #aaa;
+            font-size: 0.82rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .luxriot-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.55rem;
+            background: #161616;
+            border: 1px solid #2b2b2b;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            color: #cfcfcf;
+        }
+
+        .luxriot-mini-input {
+            min-width: 120px;
+        }
         
         
         /* Copy icon styling */
@@ -1491,6 +1640,49 @@ def home():
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
             <div id="videoBox" class="video-box" style="display: none;">
+                <div class="luxriot-grid">
+                    <div class="luxriot-card">
+                        <div class="luxriot-header">
+                            <h4>Luxriot Live Preview</h4>
+                            <div id="luxriotStatus" class="luxriot-status">Not connected</div>
+                        </div>
+                        <div class="luxriot-row">
+                            <label for="luxriotChannelSelect">Channel:</label>
+                            <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
+                            <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
+                            <span class="luxriot-pill">Batch:
+                                <select id="luxriotBatchSize" class="luxriot-mini-input">
+                                    {luxriot_batch_options}
+                                </select>
+                            </span>
+                            <span class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
+                        </div>
+                        <div class="luxriot-actions">
+                            <button id="luxriotPreviewBtn" class="feature-btn">Preview</button>
+                            <button id="luxriotStartCapture" class="feature-btn primary">Start summaries</button>
+                            <button id="luxriotStopCapture" class="feature-btn">Stop</button>
+                        </div>
+                        <div class="luxriot-row">
+                            <label for="luxriotPrompt">Prompt:</label>
+                        </div>
+                        <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                        <div class="luxriot-viewport" id="luxriotViewport">
+                            <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                            <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                        </div>
+                    </div>
+                    <div class="luxriot-card">
+                        <div class="luxriot-header">
+                            <h4>Live Summaries</h4>
+                            <div class="luxriot-actions">
+                                <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
+                            </div>
+                        </div>
+                        <div id="luxriotSummaries" class="luxriot-summaries">
+                            <div class="loading">No summaries yet.</div>
+                        </div>
+                    </div>
+                </div>
                 <div class="video-row">
                     <div class="input-group">
                         <label for="videoPath" class="input-label">Video Path:</label>
@@ -1624,6 +1816,34 @@ def home():
                     <span class="range-value" id="qualityValue">85</span>
                 </div>
             </div>
+
+            <div class="settings-section">
+                <h3>Luxriot Evo</h3>
+                <div class="settings-row">
+                    <label class="settings-label">Base URL:</label>
+                    <input type="text" id="luxriotBaseUrl" class="settings-input" placeholder="http://192.168.1.102:8080">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Username:</label>
+                    <input type="text" id="luxriotUsername" class="settings-input" placeholder="admin">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Password:</label>
+                    <input type="password" id="luxriotPassword" class="settings-input" placeholder="••••••">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Default Channel ID:</label>
+                    <input type="number" id="luxriotDefaultChannelId" class="settings-input" min="1" placeholder="103">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Snapshot Interval (s):</label>
+                    <input type="number" id="luxriotSnapshotInterval" class="settings-input" min="1" max="300" placeholder="5">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Snapshot Max Edge (px):</label>
+                    <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
+                </div>
+            </div>
             
             <div class="settings-section">
                 <h3>Advanced Settings</h3>
@@ -1700,6 +1920,18 @@ def home():
         const videoOutput = document.getElementById('videoOutput');
         const videoFrames = document.getElementById('videoFrames');
         const saveSummaryBtn = document.getElementById('saveSummaryBtn');
+        const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
+        const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
+        const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
+        const luxriotStatusLabel = document.getElementById('luxriotStatus');
+        const luxriotPreviewImg = document.getElementById('luxriotPreview');
+        const luxriotOverlay = document.getElementById('luxriotOverlay');
+        const luxriotPreviewBtn = document.getElementById('luxriotPreviewBtn');
+        const luxriotStartCaptureBtn = document.getElementById('luxriotStartCapture');
+        const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
+        const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
+        const luxriotSummaries = document.getElementById('luxriotSummaries');
+        const luxriotPromptInput = document.getElementById('luxriotPrompt');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -1711,6 +1943,17 @@ def home():
         let videoRequestStarted = 0;
         let lastSummaryText = '';
         let lastSummaryTarget = null;
+        const luxriotDefaults = {
+            channelId: {luxriot_default_channel},
+            snapshotInterval: {luxriot_snapshot_interval},
+            snapshotMaxEdge: {luxriot_snapshot_max_edge},
+            baseUrl: '{luxriot_base_url}',
+            batchSize: {luxriot_batch_default}
+        };
+        let luxriotActiveChannel = luxriotDefaults.channelId;
+        let luxriotPreviewTimer = null;
+        let luxriotSummaryTimer = null;
+        let luxriotInitialized = false;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -1764,6 +2007,226 @@ def home():
             textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
             imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
             videoBox.style.display = mode === 'video' ? 'flex' : 'none';
+            if (mode === 'video') {
+                ensureLuxriotInit();
+                startLuxriotPreview();
+                refreshLuxriotSummaries();
+            } else {
+                stopLuxriotPreview();
+                stopLuxriotSummaryPoll();
+            }
+        }
+
+        function setLuxriotStatus(text, isError = false) {
+            if (!luxriotStatusLabel) return;
+            luxriotStatusLabel.textContent = text;
+            luxriotStatusLabel.classList.toggle('error', Boolean(isError));
+            if (isError) {
+                luxriotStatusLabel.title = text;
+            } else {
+                luxriotStatusLabel.removeAttribute('title');
+            }
+        }
+
+        function stopLuxriotPreview() {
+            if (luxriotPreviewTimer) {
+                clearInterval(luxriotPreviewTimer);
+                luxriotPreviewTimer = null;
+            }
+        }
+
+        function stopLuxriotSummaryPoll() {
+            if (luxriotSummaryTimer) {
+                clearInterval(luxriotSummaryTimer);
+                luxriotSummaryTimer = null;
+            }
+        }
+
+        function getSelectedLuxriotChannel() {
+            const raw = luxriotChannelSelect ? luxriotChannelSelect.value : '';
+            const parsed = parseInt(raw || luxriotActiveChannel, 10);
+            if (Number.isFinite(parsed)) {
+                luxriotActiveChannel = parsed;
+                return parsed;
+            }
+            return luxriotDefaults.channelId;
+        }
+
+        async function fetchLuxriotChannels(force = false) {
+            if (!luxriotChannelSelect) return;
+            luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
+            try {
+                const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`);
+                const data = await response.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                const channels = data.channels || [];
+                if (!channels.length) {
+                    luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    setLuxriotStatus('No channels available', true);
+                    return;
+                }
+                const options = channels.map((ch) => {
+                    const id = ch.id;
+                    const label = ch.title || `Channel ${id}`;
+                    const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
+                    return `<option value="${id}" ${selected}>${label} (#${id})</option>`;
+                });
+                luxriotChannelSelect.innerHTML = options.join('');
+                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
+                    luxriotActiveChannel = channels[0].id;
+                    luxriotChannelSelect.value = luxriotActiveChannel;
+                }
+                setLuxriotStatus(`Loaded ${channels.length} channels`);
+            } catch (err) {
+                luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                setLuxriotStatus('Channel load failed: ' + err.message, true);
+            }
+        }
+
+        function startLuxriotPreview() {
+            if (!luxriotPreviewImg) return;
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel to preview', true);
+                return;
+            }
+            const refresh = () => {
+                if (luxriotOverlay) {
+                    luxriotOverlay.textContent = 'Loading...';
+                }
+                luxriotPreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
+            };
+            luxriotPreviewImg.onload = () => {
+                if (luxriotOverlay) luxriotOverlay.textContent = '';
+                setLuxriotStatus(`Previewing channel ${channelId}`);
+            };
+            luxriotPreviewImg.onerror = () => {
+                if (luxriotOverlay) luxriotOverlay.textContent = 'Preview failed';
+                setLuxriotStatus('Preview failed', true);
+            };
+            stopLuxriotPreview();
+            refresh();
+            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
+            luxriotPreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function renderLuxriotSummaries(logs) {
+            if (!luxriotSummaries) return;
+            if (!logs || !logs.length) {
+                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet.</div>';
+                return;
+            }
+            const html = logs
+                .slice()
+                .reverse()
+                .map((log) => {
+                    const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
+                    const tsLabel = ts ? ts.toLocaleString() : 'n/a';
+                    const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
+                    return `
+                        <div class="luxriot-summary">
+                            <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}</div>
+                            <div class="summary-body">${renderMarkdown(log.summary || '')}</div>
+                        </div>
+                    `;
+                })
+                .join('');
+            luxriotSummaries.innerHTML = html;
+        }
+
+        async function refreshLuxriotSummaries(channelId = getSelectedLuxriotChannel()) {
+            if (!channelId) return;
+            try {
+                const resp = await fetch(`/luxriot/session?channel_id=${channelId}`);
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                renderLuxriotSummaries(data.logs || []);
+                let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
+                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
+                    baseStatus += ` · ${data.pending_frames} frames queued`;
+                }
+                setLuxriotStatus(baseStatus, Boolean(data.last_error));
+                if (data.last_error) {
+                    luxriotStatusLabel.title = data.last_error;
+                }
+            } catch (err) {
+                setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
+            }
+        }
+
+        function startLuxriotSummaryPoll(channelId = getSelectedLuxriotChannel()) {
+            stopLuxriotSummaryPoll();
+            luxriotSummaryTimer = setInterval(() => refreshLuxriotSummaries(channelId), 8000);
+        }
+
+        async function startLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel first', true);
+                return;
+            }
+            const batchSize = luxriotBatchSizeSelect
+                ? parseInt(luxriotBatchSizeSelect.value, 10)
+                : luxriotDefaults.batchSize || 12;
+            const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
+            const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
+            luxriotStartCaptureBtn.disabled = true;
+            setLuxriotStatus('Starting summaries...');
+            try {
+                const resp = await fetch('/luxriot/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        batch_size: batchSize,
+                        prompt: prompt || fallbackPrompt,
+                        model: videoModelInput ? videoModelInput.value.trim() : ''
+                    })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Luxriot start failed');
+                }
+                setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
+                refreshLuxriotSummaries(channelId);
+                startLuxriotSummaryPoll(channelId);
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            } finally {
+                luxriotStartCaptureBtn.disabled = false;
+            }
+        }
+
+        async function stopLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            setLuxriotStatus('Stopping...');
+            try {
+                const resp = await fetch('/luxriot/stop_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                stopLuxriotSummaryPoll();
+                setLuxriotStatus('Summaries stopped');
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            }
+        }
+
+        async function ensureLuxriotInit() {
+            if (luxriotInitialized) return;
+            luxriotInitialized = true;
+            await fetchLuxriotChannels();
+            startLuxriotPreview();
+            refreshLuxriotSummaries();
         }
 
         const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
@@ -1772,6 +2235,9 @@ def home():
             if (saveVideoPromptInput) {
                 saveVideoPromptInput.checked = true;
             }
+        }
+        if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
+            luxriotPromptInput.value = videoPromptInput.value;
         }
 
         setMode(currentMode);
@@ -1800,6 +2266,12 @@ def home():
         const segmentThresholdSlider = document.getElementById('segmentThresholdSlider');
         const segmentThresholdValueEl = document.getElementById('segmentThresholdValue');
         const segmentThresholdControl = document.getElementById('segmentThresholdControl');
+        const luxriotBaseUrlInput = document.getElementById('luxriotBaseUrl');
+        const luxriotUsernameInput = document.getElementById('luxriotUsername');
+        const luxriotPasswordInput = document.getElementById('luxriotPassword');
+        const luxriotDefaultChannelIdInput = document.getElementById('luxriotDefaultChannelId');
+        const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
+        const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
         
         let segmentThreshold = 0.7;
 
@@ -1954,6 +2426,12 @@ def home():
                     document.getElementById('maxCommentLength').value = settings.maxCommentLength;
                     document.getElementById('maxFileSize').value = settings.maxFileSize;
                     document.getElementById('indexFolderName').value = settings.indexFolderName;
+                    luxriotBaseUrlInput.value = settings.luxriotBaseUrl || '';
+                    luxriotUsernameInput.value = settings.luxriotUsername || '';
+                    luxriotPasswordInput.value = settings.luxriotPassword || '';
+                    luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
+                    luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
+                    luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
@@ -1997,7 +2475,13 @@ def home():
                     thumbnailQuality: parseInt(document.getElementById('thumbnailQuality').value),
                     maxCommentLength: parseInt(document.getElementById('maxCommentLength').value),
                     maxFileSize: parseInt(document.getElementById('maxFileSize').value),
-                    indexFolderName: document.getElementById('indexFolderName').value.trim()
+                    indexFolderName: document.getElementById('indexFolderName').value.trim(),
+                    luxriotBaseUrl: luxriotBaseUrlInput.value.trim(),
+                    luxriotUsername: luxriotUsernameInput.value.trim(),
+                    luxriotPassword: luxriotPasswordInput.value,
+                    luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput.value),
+                    luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput.value),
+                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput.value)
                 };
                 
                 // Basic validation
@@ -2100,6 +2584,12 @@ def home():
                 document.getElementById('maxCommentLength').value = '100';
                 document.getElementById('maxFileSize').value = '50';
                 document.getElementById('indexFolderName').value = '.clip_index';
+                luxriotBaseUrlInput.value = 'http://192.168.1.102:8080';
+                luxriotUsernameInput.value = 'admin';
+                luxriotPasswordInput.value = '123';
+                luxriotDefaultChannelIdInput.value = '103';
+                luxriotSnapshotIntervalInput.value = '5';
+                luxriotSnapshotMaxEdgeInput.value = '800';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
@@ -2186,6 +2676,32 @@ def home():
             applyEmbedderUI(event.target.value);
         });
         applyEmbedderUI(embedderSelect.value);
+
+        if (luxriotRefreshChannelsBtn) {
+            luxriotRefreshChannelsBtn.addEventListener('click', () => fetchLuxriotChannels(true));
+        }
+        if (luxriotPreviewBtn) {
+            luxriotPreviewBtn.addEventListener('click', () => {
+                fetchLuxriotChannels();
+                startLuxriotPreview();
+            });
+        }
+        if (luxriotStartCaptureBtn) {
+            luxriotStartCaptureBtn.addEventListener('click', startLuxriotCapture);
+        }
+        if (luxriotStopCaptureBtn) {
+            luxriotStopCaptureBtn.addEventListener('click', stopLuxriotCapture);
+        }
+        if (luxriotRefreshSummariesBtn) {
+            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries());
+        }
+        if (luxriotChannelSelect) {
+            luxriotChannelSelect.addEventListener('change', () => {
+                luxriotActiveChannel = getSelectedLuxriotChannel();
+                startLuxriotPreview();
+                refreshLuxriotSummaries();
+            });
+        }
         
         // Mode switching
         textModeBtn.addEventListener('click', () => setMode('text'));
@@ -3153,8 +3669,14 @@ def home():
     # Replace the placeholder with actual options and timestamp
     current_timestamp = str(int(time.time()))
     response_html = html_template.replace('{result_options_html}', result_options_html)
+    response_html = response_html.replace('{luxriot_batch_options}', luxriot_batch_options_html)
     response_html = response_html.replace('{timestamp}', current_timestamp)
     response_html = response_html.replace('{lm_model}', config.LM_MODEL)
+    response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
+    response_html = response_html.replace('{luxriot_base_url}', config.LUXRIOT_BASE_URL)
+    response_html = response_html.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
+    response_html = response_html.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
+    response_html = response_html.replace('{luxriot_batch_default}', str(luxriot_default_batch))
     
     # Create response with cache-busting headers
     response = make_response(response_html)
@@ -3321,6 +3843,38 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
     ]
 
 
+def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
+    prompt = (user_prompt or '').strip() or "Describe notable activity, people, vehicles, and anomalies."
+    intro = (
+        f"Live snapshots from Luxriot channel {channel_label}. "
+        f"{len(frames)} snapshots captured roughly every {config.LUXRIOT_SNAPSHOT_INTERVAL}s."
+    )
+    user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
+    for idx, frame in enumerate(frames):
+        ts_raw = frame.get('captured_at') or frame.get('time_sec')
+        ts_label = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_raw)) if isinstance(ts_raw, (int, float)) else 'n/a'
+        user_content.append({'type': 'text', 'text': f"Snapshot {idx + 1} (captured at {ts_label})"})
+        thumbnail = frame.get('thumbnail')
+        if thumbnail:
+            user_content.append(
+                {
+                    'type': 'image_url',
+                    'image_url': {
+                        'url': f"data:image/jpeg;base64,{thumbnail}",
+                        'detail': 'high',
+                    },
+                }
+            )
+    system_msg = (
+        "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
+        "Keep it concise and avoid repetition across frames."
+    )
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
+        {'role': 'user', 'content': user_content},
+    ]
+
+
 def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
     base_url = (config.LM_BASE_URL or '').rstrip('/')
     if not base_url:
@@ -3360,6 +3914,14 @@ def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] 
 
 def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
     return _call_lm_chat(messages, model_override=model_override)
+
+
+luxriot_manager = LuxriotManager(
+    config=config,
+    lm_callback=_call_video_understanding,
+    message_builder=_build_luxriot_messages,
+    jpeg_encoder=_encode_jpeg,
+)
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -4796,6 +5358,75 @@ def segment_from_point():
         }
     )
 
+
+@app.route('/luxriot/channels', methods=['GET'])
+def luxriot_channels():
+    """Fetch available Luxriot channels (cached briefly)."""
+    force = str(request.args.get('force', '')).lower() in {'1', 'true', 'yes'}
+    try:
+        channels = luxriot_manager.get_channels(force=force)
+        return jsonify({'channels': channels})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/snapshot/<int:channel_id>', methods=['GET'])
+def luxriot_snapshot(channel_id: int):
+    stream_type = request.args.get('stream', 'mainStream')
+    try:
+        encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
+        img_bytes = base64.b64decode(encoded)
+        response = make_response(img_bytes)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['X-Image-Width'] = str(meta.get('width'))
+        response.headers['X-Image-Height'] = str(meta.get('height'))
+        return response
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/start_capture', methods=['POST'])
+def luxriot_start_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    batch_size = data.get('batch_size')
+    prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip() or None
+    try:
+        status = luxriot_manager.start_session(channel_id, batch_size=batch_size, prompt=prompt, model_hint=model_hint)
+        return jsonify({'success': True, 'session': status})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/stop_capture', methods=['POST'])
+def luxriot_stop_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        state = luxriot_manager.stop_session(channel_id)
+        return jsonify({'success': True, 'session': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/session', methods=['GET'])
+def luxriot_session_status():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    try:
+        status = luxriot_manager.session_status(channel_id)
+        return jsonify(status)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""
@@ -4818,6 +5449,13 @@ def get_settings():
             'segmentsEnabled': config.DINO_SEGMENTS_ENABLED,
             'segmentMinPatches': config.DINO_SEGMENT_MIN_PATCHES,
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
+            'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
+            'luxriotUsername': config.LUXRIOT_USERNAME,
+            'luxriotPassword': config.LUXRIOT_PASSWORD,
+            'luxriotSnapshotInterval': config.LUXRIOT_SNAPSHOT_INTERVAL,
+            'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
+            'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
+            'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
             'defaultResults': config.DEFAULT_RESULTS,
@@ -4907,6 +5545,26 @@ def save_settings():
             segment_threshold = config.DINO_HEATMAP_THRESHOLD
         segment_threshold = min(0.99, max(0.0, segment_threshold))
 
+        luxriot_base_url = str(data.get('luxriotBaseUrl', config.LUXRIOT_BASE_URL)).strip().rstrip('/')
+        luxriot_username = str(data.get('luxriotUsername', config.LUXRIOT_USERNAME)).strip()
+        luxriot_password = str(data.get('luxriotPassword', config.LUXRIOT_PASSWORD)).strip()
+        try:
+            luxriot_snapshot_interval = int(data.get('luxriotSnapshotInterval', config.LUXRIOT_SNAPSHOT_INTERVAL))
+        except (TypeError, ValueError):
+            luxriot_snapshot_interval = config.LUXRIOT_SNAPSHOT_INTERVAL
+        if luxriot_snapshot_interval < 1:
+            luxriot_snapshot_interval = 5
+        try:
+            luxriot_snapshot_max_edge = int(data.get('luxriotSnapshotMaxEdge', config.LUXRIOT_SNAPSHOT_MAX_EDGE))
+        except (TypeError, ValueError):
+            luxriot_snapshot_max_edge = config.LUXRIOT_SNAPSHOT_MAX_EDGE
+        if luxriot_snapshot_max_edge < 640:
+            luxriot_snapshot_max_edge = 640
+        try:
+            luxriot_default_channel_id = int(data.get('luxriotDefaultChannelId', config.LUXRIOT_DEFAULT_CHANNEL_ID))
+        except (TypeError, ValueError):
+            luxriot_default_channel_id = config.LUXRIOT_DEFAULT_CHANNEL_ID
+
         embedder = str(data.get('embedder', active_embedder)).strip().lower()
         if embedder == 'fusion' and not fusion_enabled:
             embedder = 'clip'
@@ -4959,6 +5617,14 @@ EVOSSEARCH_M2F_MODEL={config.MASK2FORMER_MODEL}
 EVOSSEARCH_M2F_DEVICE={config.MASK2FORMER_DEVICE}
 EVOSSEARCH_M2F_MAX_SIZE={config.MASK2FORMER_MAX_SIZE}
 
+# Luxriot Evo integration
+EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
+EVOSSEARCH_LUXRIOT_USERNAME={luxriot_username}
+EVOSSEARCH_LUXRIOT_PASSWORD={luxriot_password}
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
+EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
+EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
+
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
 EVOSSEARCH_MAX_RESULTS={max_results}
@@ -5006,6 +5672,12 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.DINO_SEGMENTS_ENABLED = segments_enabled
         config.DINO_SEGMENT_MIN_PATCHES = segment_min_patches
         config.DINO_HEATMAP_THRESHOLD = segment_threshold
+        config.LUXRIOT_BASE_URL = luxriot_base_url
+        config.LUXRIOT_USERNAME = luxriot_username
+        config.LUXRIOT_PASSWORD = luxriot_password
+        config.LUXRIOT_DEFAULT_CHANNEL_ID = luxriot_default_channel_id
+        config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
+        config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:

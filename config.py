@@ -136,6 +136,25 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_TEMPERATURE = 0.2
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
+    # Luxriot Evo integration
+    LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://192.168.1.102:8080').strip().rstrip('/')
+    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', 'admin').strip()
+    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '123').strip()
+    try:
+        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
+    except (TypeError, ValueError):
+        LUXRIOT_SNAPSHOT_INTERVAL = 5
+    try:
+        LUXRIOT_SNAPSHOT_MAX_EDGE = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE', '800'))
+    except (TypeError, ValueError):
+        LUXRIOT_SNAPSHOT_MAX_EDGE = 800
+    if LUXRIOT_SNAPSHOT_MAX_EDGE < 640:
+        LUXRIOT_SNAPSHOT_MAX_EDGE = 640
+    LUXRIOT_BATCH_SIZES = (12, 24, 36)
+    try:
+        LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '103'))
+    except (TypeError, ValueError):
+        LUXRIOT_DEFAULT_CHANNEL_ID = 103
 
     @classmethod
     def get_server_urls(cls):
@@ -212,6 +231,11 @@ class Config:
         else:
             print("Mask2Former: disabled")
         print(f"Result Limits: {cls.MIN_RESULTS}-{cls.MAX_RESULTS} (default: {cls.DEFAULT_RESULTS})")
+        print(
+            f"Luxriot Evo: {cls.LUXRIOT_BASE_URL or 'unset'} "
+            f"(default channel: {cls.LUXRIOT_DEFAULT_CHANNEL_ID}, "
+            f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px)"
+        )
         print()
         print("Server available at:")
         for url in cls.get_server_urls():
