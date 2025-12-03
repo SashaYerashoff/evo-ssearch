@@ -1730,45 +1730,14 @@ def home():
                     <div class="luxriot-card">
                         <div class="luxriot-header">
                             <h4>Live Summaries</h4>
-                            <div class="luxriot-actions">
-                                <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
-                            </div>
-                        </div>
-                        <div id="luxriotSummaries" class="luxriot-summaries">
-                            <div class="loading">No summaries yet.</div>
-                        </div>
+                    <div class="luxriot-actions">
+                        <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
                     </div>
-        </div>
-        <div class="probe-card">
-            <div class="luxriot-header">
-                <h4>Probes (CLIP/DINO beta)</h4>
-                <div id="probeStatus" class="luxriot-status">Idle</div>
-            </div>
-            <div class="probe-row">
-                <label for="probeChannelSelect">Channel:</label>
-                <select id="probeChannelSelect" class="luxriot-mini-input"></select>
-                <label>Top K:</label>
-                <input type="number" id="probeTopK" class="settings-input luxriot-mini-input" min="1" max="50" value="6" />
-                <label>Pos floor:</label>
-                <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input" step="0.01" value="0.2" />
-                <label>Margin:</label>
-                <input type="number" id="probeMargin" class="settings-input luxriot-mini-input" step="0.01" value="0.05" />
-            </div>
-            <div class="probe-row">
-                <div style="flex:1;">
-                    <label class="input-label">Positives (required):</label>
-                    <textarea id="probePositives" class="probe-textarea" placeholder="fire on stove&#10;person with handgun"></textarea>
                 </div>
-                <div style="flex:1;">
-                    <label class="input-label">Negatives (required):</label>
-                    <textarea id="probeNegatives" class="probe-textarea" placeholder="fire on phone screen&#10;toy gun"></textarea>
+                <div id="luxriotSummaries" class="luxriot-summaries">
+                    <div class="loading">No summaries yet.</div>
                 </div>
             </div>
-            <div class="luxriot-actions">
-                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                <button id="probeRefreshStatus" class="feature-btn">Status</button>
-            </div>
-            <div id="probeResults" class="probe-results"></div>
         </div>
         <div class="video-row">
             <div class="input-group">
@@ -2431,9 +2400,13 @@ def home():
         if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
             luxriotPromptInput.value = videoPromptInput.value;
         }
-        if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
-            probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
+        function syncProbeChannelSelect() {
+            if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
+                probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
+                probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
+            }
         }
+        syncProbeChannelSelect();
 
         setMode(currentMode);
         
@@ -2903,13 +2876,6 @@ def home():
             applyEmbedderUI(event.target.value);
         });
         applyEmbedderUI(embedderSelect.value);
-
-        function syncProbeChannelSelect() {
-            if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
-                probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
-                probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
-            }
-        }
         if (luxriotRefreshChannelsBtn) {
             luxriotRefreshChannelsBtn.addEventListener('click', () => {
                 fetchLuxriotChannels(true).then(syncProbeChannelSelect);
