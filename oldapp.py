@@ -3061,6 +3061,7 @@ def home():
         textModeBtn.addEventListener('click', () => setMode('text'));
         imageModeBtn.addEventListener('click', () => setMode('image'));
         videoModeBtn.addEventListener('click', () => setMode('video'));
+        monitorModeBtn.addEventListener('click', () => setMode('monitor'));
         
         // Check index status
         async function checkIndexStatus(folder) {
