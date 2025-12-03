@@ -24,6 +24,7 @@ from flask_cors import CORS
 from config import config
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
+from probe_manager import ProbeManager
 try:
     from heads.mask2former_head import Mask2FormerHead
 except Exception:  # pragma: no cover - optional dependency
@@ -1540,6 +1541,59 @@ def home():
         .luxriot-mini-input {
             min-width: 120px;
         }
+
+        /* Probes */
+        .probe-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+            margin-top: 0.5rem;
+        }
+
+        .probe-row {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .probe-row label {
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        .probe-textarea {
+            width: 100%;
+            min-height: 60px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.65rem;
+            resize: vertical;
+        }
+
+        .probe-results {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 0.5rem;
+        }
+
+        .probe-result {
+            background: #0a0a0a;
+            border: 1px solid #1d1d1d;
+            border-radius: 8px;
+            padding: 0.6rem;
+        }
+
+        .probe-result img {
+            width: 100%;
+            border-radius: 6px;
+            margin-bottom: 0.4rem;
+        }
         
         
         /* Copy icon styling */
@@ -1683,12 +1737,43 @@ def home():
                             <div class="loading">No summaries yet.</div>
                         </div>
                     </div>
+        </div>
+        <div class="probe-card">
+            <div class="luxriot-header">
+                <h4>Probes (CLIP/DINO beta)</h4>
+                <div id="probeStatus" class="luxriot-status">Idle</div>
+            </div>
+            <div class="probe-row">
+                <label for="probeChannelSelect">Channel:</label>
+                <select id="probeChannelSelect" class="luxriot-mini-input"></select>
+                <label>Top K:</label>
+                <input type="number" id="probeTopK" class="settings-input luxriot-mini-input" min="1" max="50" value="6" />
+                <label>Pos floor:</label>
+                <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input" step="0.01" value="0.2" />
+                <label>Margin:</label>
+                <input type="number" id="probeMargin" class="settings-input luxriot-mini-input" step="0.01" value="0.05" />
+            </div>
+            <div class="probe-row">
+                <div style="flex:1;">
+                    <label class="input-label">Positives (required):</label>
+                    <textarea id="probePositives" class="probe-textarea" placeholder="fire on stove&#10;person with handgun"></textarea>
                 </div>
-                <div class="video-row">
-                    <div class="input-group">
-                        <label for="videoPath" class="input-label">Video Path:</label>
-                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
-                    </div>
+                <div style="flex:1;">
+                    <label class="input-label">Negatives (required):</label>
+                    <textarea id="probeNegatives" class="probe-textarea" placeholder="fire on phone screen&#10;toy gun"></textarea>
+                </div>
+            </div>
+            <div class="luxriot-actions">
+                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                <button id="probeRefreshStatus" class="feature-btn">Status</button>
+            </div>
+            <div id="probeResults" class="probe-results"></div>
+        </div>
+        <div class="video-row">
+            <div class="input-group">
+                <label for="videoPath" class="input-label">Video Path:</label>
+                <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+            </div>
                     <div class="input-group">
                         <label class="input-label" for="videoModel">Model ID:</label>
                         <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
@@ -1952,6 +2037,16 @@ def home():
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaries = document.getElementById('luxriotSummaries');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
+        const probeChannelSelect = document.getElementById('probeChannelSelect');
+        const probeTopKInput = document.getElementById('probeTopK');
+        const probePosFloorInput = document.getElementById('probePosFloor');
+        const probeMarginInput = document.getElementById('probeMargin');
+        const probePositivesInput = document.getElementById('probePositives');
+        const probeNegativesInput = document.getElementById('probeNegatives');
+        const probeRunBtn = document.getElementById('probeRunBtn');
+        const probeResults = document.getElementById('probeResults');
+        const probeStatus = document.getElementById('probeStatus');
+        const probeRefreshStatusBtn = document.getElementById('probeRefreshStatus');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -2280,6 +2375,9 @@ def home():
         }
         if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
             luxriotPromptInput.value = videoPromptInput.value;
+        }
+        if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
+            probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
         }
 
         setMode(currentMode);
@@ -2754,9 +2852,16 @@ def home():
         if (luxriotRefreshChannelsBtn) {
             luxriotRefreshChannelsBtn.addEventListener('click', () => fetchLuxriotChannels(true));
         }
+        function syncProbeChannelSelect() {
+            if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
+                probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
+                probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
+            }
+        }
         if (luxriotPreviewBtn) {
             luxriotPreviewBtn.addEventListener('click', () => {
                 fetchLuxriotChannels();
+                syncProbeChannelSelect();
                 startLuxriotPreview();
             });
         }
@@ -2775,9 +2880,89 @@ def home():
         if (luxriotChannelSelect) {
             luxriotChannelSelect.addEventListener('change', () => {
                 luxriotActiveChannel = getSelectedLuxriotChannel();
+                syncProbeChannelSelect();
                 startLuxriotPreview();
                 refreshLuxriotSummaries();
             });
+        }
+        async function runProbe() {
+            const positives = (probePositivesInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+            const negatives = (probeNegativesInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+            const channelId = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+            if (!positives.length || !negatives.length) {
+                probeStatus.textContent = 'Add at least one positive and one negative probe.';
+                probeStatus.classList.add('error');
+                return;
+            }
+            probeStatus.textContent = 'Running...';
+            probeStatus.classList.remove('error');
+            try {
+                const resp = await fetch('/probes/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        positives,
+                        negatives,
+                        pos_floor: parseFloat(probePosFloorInput.value) || 0.2,
+                        margin: parseFloat(probeMarginInput.value) || 0.05,
+                        top_k: parseInt(probeTopKInput.value, 10) || 6,
+                    }),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    probeStatus.textContent = data.error || 'Probe failed';
+                    probeStatus.classList.add('error');
+                    probeResults.innerHTML = '';
+                    return;
+                }
+                probeStatus.textContent = `Hits: ${(data.results || []).length} · Frames: ${data.frames_indexed || 0}`;
+                probeStatus.classList.remove('error');
+                const hits = data.results || [];
+                if (!hits.length) {
+                    probeResults.innerHTML = '<div class="loading">No matches</div>';
+                    return;
+                }
+                probeResults.innerHTML = hits.map((hit) => {
+                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                    return `
+                        <div class="probe-result">
+                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" alt="hit" />` : ''}
+                            <div><strong>${ts}</strong></div>
+                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                probeStatus.textContent = 'Probe error: ' + err.message;
+                probeStatus.classList.add('error');
+            }
+        }
+        async function refreshProbeStatus() {
+            const channelId = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+            try {
+                const resp = await fetch(`/probes/status?channel_id=${channelId}`);
+                const data = await resp.json();
+                if (data.error) {
+                    probeStatus.textContent = data.error;
+                    probeStatus.classList.add('error');
+                    return;
+                }
+                const range = data.time_range_ms && data.time_range_ms.length === 2
+                    ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
+                    : 'n/a';
+                probeStatus.textContent = `Frames: ${data.frames || 0} · Range: ${range}`;
+                probeStatus.classList.remove('error');
+            } catch (err) {
+                probeStatus.textContent = 'Status error: ' + err.message;
+                probeStatus.classList.add('error');
+            }
+        }
+        if (probeRunBtn) {
+            probeRunBtn.addEventListener('click', runProbe);
+        }
+        if (probeRefreshStatusBtn) {
+            probeRefreshStatusBtn.addEventListener('click', refreshProbeStatus);
         }
         
         // Mode switching
@@ -4118,7 +4303,11 @@ luxriot_manager = LuxriotManager(
     message_builder=_build_luxriot_messages,
     jpeg_encoder=_encode_jpeg,
     alert_parser=_parse_lm_alerts,
+    probe_manager=None,  # will be assigned after probe_manager init
 )
+
+probe_manager = ProbeManager()
+luxriot_manager.probe_manager = probe_manager
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -5667,6 +5856,41 @@ def luxriot_bookmark():
             timestamp_ms=timestamp_ms,
         )
         return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/query', methods=['POST'])
+def probes_query():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    positives = data.get('positives') or []
+    negatives = data.get('negatives') or []
+    try:
+        pos_floor = float(data.get('pos_floor', 0.2))
+    except Exception:
+        pos_floor = 0.2
+    try:
+        margin_thr = float(data.get('margin', 0.05))
+    except Exception:
+        margin_thr = 0.05
+    try:
+        top_k = int(data.get('top_k', 5))
+    except Exception:
+        top_k = 5
+    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k)
+    status_code = 200 if 'error' not in result else 400
+    return jsonify(result), status_code
+
+
+@app.route('/probes/status', methods=['GET'])
+def probes_status():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    try:
+        return jsonify(probe_manager.status(channel_id))
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 

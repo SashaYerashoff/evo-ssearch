@@ -170,6 +170,20 @@ class Config:
         'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
     }
 
+    # Probe / CLIP monitoring
+    try:
+        PROBE_MAX_FRAMES = int(os.getenv('EVOSSEARCH_PROBE_MAX_FRAMES', '2000'))
+    except (TypeError, ValueError):
+        PROBE_MAX_FRAMES = 2000
+    if PROBE_MAX_FRAMES < 100:
+        PROBE_MAX_FRAMES = 100
+    try:
+        PROBE_THUMB_MAX_EDGE = int(os.getenv('EVOSSEARCH_PROBE_THUMB_MAX_EDGE', '256'))
+    except (TypeError, ValueError):
+        PROBE_THUMB_MAX_EDGE = 256
+    if PROBE_THUMB_MAX_EDGE < 64:
+        PROBE_THUMB_MAX_EDGE = 64
+
     @classmethod
     def get_server_urls(cls):
         """Get list of server URLs for display"""

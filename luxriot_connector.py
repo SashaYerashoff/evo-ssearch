@@ -204,6 +204,12 @@ class LuxriotCaptureSession:
                 with self.lock:
                     self.frames.append(frame)
                     self._enforce_buffer_locked()
+                try:
+                    if getattr(self.manager, "probe_manager", None):
+                        ts_ms = int(captured_at * 1000)
+                        self.manager.probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
+                except Exception as pm_exc:
+                    self.last_error = str(pm_exc)
                 if len(self.frames) >= self.batch_size:
                     self._summarize_batch()
                     with self.lock:
@@ -309,6 +315,7 @@ class LuxriotManager:
         message_builder: Callable[[str, List[Dict[str, Any]], str], List[Dict[str, Any]]],
         jpeg_encoder: Callable[..., str],
         alert_parser: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        probe_manager: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
@@ -316,6 +323,7 @@ class LuxriotManager:
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
         self.auto_bookmarks = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
+        self.probe_manager = probe_manager
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.cache_lock = threading.Lock()
