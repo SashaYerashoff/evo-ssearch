@@ -1812,13 +1812,17 @@ def home():
                             <textarea id="probeNegatives" class="probe-textarea" placeholder="fire on phone screen&#10;toy gun"></textarea>
                         </div>
                     </div>
-                    <div class="luxriot-actions">
-                        <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                        <button id="probeRefreshStatus" class="feature-btn">Status</button>
-                        <button id="probeBookmarkTop" class="feature-btn">Bookmark top hit</button>
-                    </div>
-                    <div id="probeResults" class="probe-results"></div>
-                </div>
+            <div class="luxriot-actions">
+                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                <button id="probeRefreshStatus" class="feature-btn">Status</button>
+                <button id="probeBookmarkTop" class="feature-btn">Bookmark top hit</button>
+                <input type="text" id="probePresetName" class="settings-input luxriot-mini-input" placeholder="Preset name">
+                <select id="probePresetSelect" class="luxriot-mini-input"></select>
+                <button id="probeSavePreset" class="feature-btn">Save preset</button>
+                <button id="probeLoadPreset" class="feature-btn">Load preset</button>
+            </div>
+            <div id="probeResults" class="probe-results"></div>
+        </div>
             </div>
         </div>
         
@@ -2063,6 +2067,10 @@ def home():
         const probeRefreshStatusBtn = document.getElementById('probeRefreshStatus');
         const probeBookmarkTopBtn = document.getElementById('probeBookmarkTop');
         const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
+        const probePresetNameInput = document.getElementById('probePresetName');
+        const probePresetSelect = document.getElementById('probePresetSelect');
+        const probeSavePresetBtn = document.getElementById('probeSavePreset');
+        const probeLoadPresetBtn = document.getElementById('probeLoadPreset');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -2086,6 +2094,8 @@ def home():
         let luxriotSummaryTimer = null;
         let luxriotInitialized = false;
         let probeHitsCache = [];
+        let probePresets = [];
+        let probePresets = [];
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2908,6 +2918,21 @@ def home():
                 refreshLuxriotSummaries();
             });
         }
+        function loadProbePresets() {
+            try {
+                const stored = localStorage.getItem('probe_presets');
+                if (stored) {
+                    probePresets = JSON.parse(stored) || [];
+                }
+            } catch (e) {
+                probePresets = [];
+            }
+            if (probePresetSelect) {
+                probePresetSelect.innerHTML = probePresets.map((p, idx) => `<option value="${idx}">${p.name}</option>`).join('');
+            }
+        }
+        loadProbePresets();
+
         async function runProbe() {
             const positives = (probePositivesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
             const negatives = (probeNegativesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
@@ -2942,6 +2967,7 @@ def home():
                 probeStatus.textContent = `Hits: ${(data.results || []).length} · Frames: ${data.frames_indexed || 0}`;
                 probeStatus.classList.remove('error');
                 const hits = data.results || [];
+                probeHitsCache = hits;
                 if (!hits.length) {
                     probeResults.innerHTML = '<div class="loading">No matches</div>';
                     return;
@@ -3021,6 +3047,63 @@ def home():
         }
         if (probeBookmarkTopBtn) {
             probeBookmarkTopBtn.addEventListener('click', bookmarkTopProbeHit);
+        }
+        function loadProbePresets() {
+            try {
+                const stored = localStorage.getItem('probe_presets');
+                if (stored) {
+                    probePresets = JSON.parse(stored) || [];
+                }
+            } catch (e) {
+                probePresets = [];
+            }
+            if (probePresetSelect) {
+                probePresetSelect.innerHTML = probePresets.map((p, idx) => `<option value="${idx}">${p.name}</option>`).join('');
+            }
+        }
+        loadProbePresets();
+
+        function saveProbePreset() {
+            const name = (probePresetNameInput && probePresetNameInput.value.trim()) || `preset-${Date.now()}`;
+            const preset = {
+                name,
+                channel_id: parseInt(probeChannelSelect.value || luxriotActiveChannel, 10),
+                positives: (probePositivesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean),
+                negatives: (probeNegativesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean),
+                pos_floor: parseFloat(probePosFloorInput.value) || 0.2,
+                margin: parseFloat(probeMarginInput.value) || 0.05,
+                top_k: parseInt(probeTopKInput.value, 10) || 6,
+                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
+            };
+            probePresets.push(preset);
+            localStorage.setItem('probe_presets', JSON.stringify(probePresets));
+            loadProbePresets();
+            if (probePresetNameInput) probePresetNameInput.value = '';
+            probeStatus.textContent = 'Preset saved';
+            probeStatus.classList.remove('error');
+        }
+
+        function loadSelectedPreset() {
+            if (!probePresetSelect || !probePresets.length) return;
+            const idx = parseInt(probePresetSelect.value, 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= probePresets.length) return;
+            const p = probePresets[idx];
+            if (probeChannelSelect) probeChannelSelect.value = p.channel_id;
+            if (probePositivesInput) probePositivesInput.value = (p.positives || []).join('\\n');
+            if (probeNegativesInput) probeNegativesInput.value = (p.negatives || []).join('\\n');
+            if (probePosFloorInput) probePosFloorInput.value = p.pos_floor;
+            if (probeMarginInput) probeMarginInput.value = p.margin;
+            if (probeTopKInput) probeTopKInput.value = p.top_k;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = p.severity || 'critical';
+            probeStatus.textContent = `Loaded preset: ${p.name}`;
+            probeStatus.classList.remove('error');
+        }
+
+        if (probeSavePresetBtn) {
+            probeSavePresetBtn.addEventListener('click', saveProbePreset);
+        }
+        if (probeLoadPresetBtn) {
+            probeLoadPresetBtn.addEventListener('click', loadSelectedPreset);
         }
         
         // Mode switching
