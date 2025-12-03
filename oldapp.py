@@ -2573,20 +2573,20 @@ def home():
                     document.getElementById('maxCommentLength').value = settings.maxCommentLength;
                     document.getElementById('maxFileSize').value = settings.maxFileSize;
                     document.getElementById('indexFolderName').value = settings.indexFolderName;
-                    luxriotBaseUrlInput.value = settings.luxriotBaseUrl || '';
-                    luxriotUsernameInput.value = settings.luxriotUsername || '';
-                    luxriotPasswordInput.value = settings.luxriotPassword || '';
-                    luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
-                    luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
-                    luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
-                    luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
-                    luxriotAutoBookmarksInput.checked = Boolean(settings.luxriotAutoBookmarks);
+                    if (luxriotBaseUrlInput) luxriotBaseUrlInput.value = settings.luxriotBaseUrl || '';
+                    if (luxriotUsernameInput) luxriotUsernameInput.value = settings.luxriotUsername || '';
+                    if (luxriotPasswordInput) luxriotPasswordInput.value = settings.luxriotPassword || '';
+                    if (luxriotDefaultChannelIdInput) luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
+                    if (luxriotSnapshotIntervalInput) luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
+                    if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
+                    if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
+                    if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = Boolean(settings.luxriotAutoBookmarks);
                     if (settings.luxriotSeverityMap) {
-                        luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
-                        luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
-                        luxriotSevNormalInput.value = settings.luxriotSeverityMap.normal || 'normal';
-                        luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
-                        luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
+                        if (luxriotSevInfoInput) luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
+                        if (luxriotSevLowInput) luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
+                        if (luxriotSevNormalInput) luxriotSevNormalInput.value = settings.luxriotSeverityMap.normal || 'normal';
+                        if (luxriotSevHighInput) luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
+                        if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
                     }
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
@@ -2634,18 +2634,18 @@ def home():
                     indexFolderName: document.getElementById('indexFolderName').value.trim(),
                     luxriotBaseUrl: luxriotBaseUrlInput.value.trim(),
                     luxriotUsername: luxriotUsernameInput.value.trim(),
-                    luxriotPassword: luxriotPasswordInput.value,
-                    luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput.value),
-                    luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput.value),
-                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput.value),
-                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput.value),
-                    luxriotAutoBookmarks: luxriotAutoBookmarksInput.checked,
+                    luxriotPassword: luxriotPasswordInput ? luxriotPasswordInput.value : '',
+                    luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput ? luxriotDefaultChannelIdInput.value : config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                    luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput ? luxriotSnapshotIntervalInput.value : config.LUXRIOT_SNAPSHOT_INTERVAL),
+                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput ? luxriotSnapshotMaxEdgeInput.value : config.LUXRIOT_SNAPSHOT_MAX_EDGE),
+                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput ? luxriotMaxBufferFramesInput.value : config.LUXRIOT_MAX_BUFFER_FRAMES),
+                    luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
                     luxriotSeverityMap: {
-                        info: luxriotSevInfoInput.value.trim() || 'info',
-                        low: luxriotSevLowInput.value.trim() || 'low',
-                        normal: luxriotSevNormalInput.value.trim() || 'normal',
-                        high: luxriotSevHighInput.value.trim() || 'high',
-                        critical: luxriotSevCriticalInput.value.trim() || 'critical'
+                        info: luxriotSevInfoInput ? (luxriotSevInfoInput.value.trim() || 'info') : 'info',
+                        low: luxriotSevLowInput ? (luxriotSevLowInput.value.trim() || 'low') : 'low',
+                        normal: luxriotSevNormalInput ? (luxriotSevNormalInput.value.trim() || 'normal') : 'normal',
+                        high: luxriotSevHighInput ? (luxriotSevHighInput.value.trim() || 'high') : 'high',
+                        critical: luxriotSevCriticalInput ? (luxriotSevCriticalInput.value.trim() || 'critical') : 'critical'
                     }
                 };
                 
@@ -2756,12 +2756,12 @@ def home():
                 luxriotSnapshotIntervalInput.value = '5';
                 luxriotSnapshotMaxEdgeInput.value = '800';
                 luxriotMaxBufferFramesInput.value = '180';
-                luxriotAutoBookmarksInput.checked = false;
-                luxriotSevInfoInput.value = 'info';
-                luxriotSevLowInput.value = 'low';
-                luxriotSevNormalInput.value = 'normal';
-                luxriotSevHighInput.value = 'high';
-                luxriotSevCriticalInput.value = 'critical';
+                if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
+                if (luxriotSevInfoInput) luxriotSevInfoInput.value = 'info';
+                if (luxriotSevLowInput) luxriotSevLowInput.value = 'low';
+                if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
+                if (luxriotSevHighInput) luxriotSevHighInput.value = 'high';
+                if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = 'critical';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
