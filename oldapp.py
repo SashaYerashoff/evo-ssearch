@@ -1647,6 +1647,7 @@ def home():
                     <button id="textModeBtn" class="mode-tab active">Text Search</button>
                     <button id="imageModeBtn" class="mode-tab">Image Search</button>
                     <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
+                    <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
                 </div>
             <div class="search-controls">
                 <div class="control-group">
@@ -1807,6 +1808,48 @@ def home():
                 </div>
                 <div id="videoOutput" class="video-output" style="display: none;"></div>
                 <div id="videoFrames" class="video-frame-grid"></div>
+            </div>
+            <div id="monitorBox" class="video-box" style="display: none;">
+                <div class="probe-card">
+                    <div class="luxriot-header">
+                        <h4>Probes (CLIP/DINO beta)</h4>
+                        <div id="probeStatus" class="luxriot-status">Idle</div>
+                    </div>
+                    <div class="probe-row">
+                        <label for="probeChannelSelect">Channel:</label>
+                        <select id="probeChannelSelect" class="luxriot-mini-input"></select>
+                        <label>Top K:</label>
+                        <input type="number" id="probeTopK" class="settings-input luxriot-mini-input" min="1" max="50" value="6" />
+                        <label>Pos floor:</label>
+                        <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input" step="0.01" value="0.2" />
+                        <label>Margin:</label>
+                        <input type="number" id="probeMargin" class="settings-input luxriot-mini-input" step="0.01" value="0.05" />
+                        <label>Bookmark severity:</label>
+                        <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                            <option value="info">info</option>
+                            <option value="low">low</option>
+                            <option value="normal">normal</option>
+                            <option value="high">high</option>
+                            <option value="critical" selected>critical</option>
+                        </select>
+                    </div>
+                    <div class="probe-row">
+                        <div style="flex:1;">
+                            <label class="input-label">Positives (required):</label>
+                            <textarea id="probePositives" class="probe-textarea" placeholder="fire on stove&#10;person with handgun"></textarea>
+                        </div>
+                        <div style="flex:1;">
+                            <label class="input-label">Negatives (required):</label>
+                            <textarea id="probeNegatives" class="probe-textarea" placeholder="fire on phone screen&#10;toy gun"></textarea>
+                        </div>
+                    </div>
+                    <div class="luxriot-actions">
+                        <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                        <button id="probeRefreshStatus" class="feature-btn">Status</button>
+                        <button id="probeBookmarkTop" class="feature-btn">Bookmark top hit</button>
+                    </div>
+                    <div id="probeResults" class="probe-results"></div>
+                </div>
             </div>
         </div>
         
@@ -2024,6 +2067,8 @@ def home():
         const videoOutput = document.getElementById('videoOutput');
         const videoFrames = document.getElementById('videoFrames');
         const saveSummaryBtn = document.getElementById('saveSummaryBtn');
+        const monitorModeBtn = document.getElementById('monitorModeBtn');
+        const monitorBox = document.getElementById('monitorBox');
         const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
         const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
         const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
@@ -2047,6 +2092,8 @@ def home():
         const probeResults = document.getElementById('probeResults');
         const probeStatus = document.getElementById('probeStatus');
         const probeRefreshStatusBtn = document.getElementById('probeRefreshStatus');
+        const probeBookmarkTopBtn = document.getElementById('probeBookmarkTop');
+        const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -2069,6 +2116,7 @@ def home():
         let luxriotPreviewTimer = null;
         let luxriotSummaryTimer = null;
         let luxriotInitialized = false;
+        let probeHitsCache = [];
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2119,13 +2167,20 @@ def home():
             textModeBtn.classList.toggle('active', mode === 'text');
             imageModeBtn.classList.toggle('active', mode === 'image');
             videoModeBtn.classList.toggle('active', mode === 'video');
+            monitorModeBtn.classList.toggle('active', mode === 'monitor');
             textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
             imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
             videoBox.style.display = mode === 'video' ? 'flex' : 'none';
+            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
                 refreshLuxriotSummaries();
+                syncProbeChannelSelect();
+            } else if (mode === 'monitor') {
+                ensureLuxriotInit();
+                syncProbeChannelSelect();
+                refreshProbeStatus();
             } else {
                 stopLuxriotPreview();
                 stopLuxriotSummaryPoll();
@@ -2849,14 +2904,16 @@ def home():
         });
         applyEmbedderUI(embedderSelect.value);
 
-        if (luxriotRefreshChannelsBtn) {
-            luxriotRefreshChannelsBtn.addEventListener('click', () => fetchLuxriotChannels(true));
-        }
         function syncProbeChannelSelect() {
             if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
                 probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
                 probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
             }
+        }
+        if (luxriotRefreshChannelsBtn) {
+            luxriotRefreshChannelsBtn.addEventListener('click', () => {
+                fetchLuxriotChannels(true).then(syncProbeChannelSelect);
+            });
         }
         if (luxriotPreviewBtn) {
             luxriotPreviewBtn.addEventListener('click', () => {
@@ -2963,6 +3020,41 @@ def home():
         }
         if (probeRefreshStatusBtn) {
             probeRefreshStatusBtn.addEventListener('click', refreshProbeStatus);
+        }
+        function bookmarkTopProbeHit() {
+            if (!probeHitsCache.length) {
+                probeStatus.textContent = 'No hits to bookmark';
+                probeStatus.classList.add('error');
+                return;
+            }
+            const top = probeHitsCache[0];
+            const severity = probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical';
+            fetch('/luxriot/bookmark', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    channel_id: top.channel_id || luxriotActiveChannel,
+                    title: `Probe hit (margin ${(top.margin || 0).toFixed(2)})`,
+                    description: `pos ${top.pos_score?.toFixed(3)} / neg ${top.neg_score?.toFixed(3)} at ${new Date(top.timestamp_ms || Date.now()).toLocaleString()}`,
+                    severity: severity,
+                    state: 'new',
+                    timestamp_ms: top.timestamp_ms,
+                }),
+            }).then(resp => resp.json()).then(data => {
+                if (data.error) {
+                    probeStatus.textContent = 'Bookmark failed: ' + data.error;
+                    probeStatus.classList.add('error');
+                } else {
+                    probeStatus.textContent = 'Bookmarked top hit';
+                    probeStatus.classList.remove('error');
+                }
+            }).catch(err => {
+                probeStatus.textContent = 'Bookmark error: ' + err.message;
+                probeStatus.classList.add('error');
+            });
+        }
+        if (probeBookmarkTopBtn) {
+            probeBookmarkTopBtn.addEventListener('click', bookmarkTopProbeHit);
         }
         
         // Mode switching
