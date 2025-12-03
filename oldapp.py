@@ -2095,7 +2095,6 @@ def home():
         let luxriotInitialized = false;
         let probeHitsCache = [];
         let probePresets = [];
-        let probePresets = [];
 
         function escapeHtml(text) {
             const div = document.createElement('div');
