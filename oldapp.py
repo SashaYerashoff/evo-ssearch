@@ -2886,8 +2886,8 @@ def home():
             });
         }
         async function runProbe() {
-            const positives = (probePositivesInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
-            const negatives = (probeNegativesInput.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+            const positives = (probePositivesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
+            const negatives = (probeNegativesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
             const channelId = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
             if (!positives.length || !negatives.length) {
                 probeStatus.textContent = 'Add at least one positive and one negative probe.';
