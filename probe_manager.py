@@ -1,13 +1,12 @@
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import faiss  # type: ignore
 import numpy as np
 from PIL import Image
 
 from config import config
-from oldapp import ensure_embedder_loaded, get_text_embedding, get_image_embedding_from_pil, _encode_jpeg  # type: ignore
 
 
 class ProbeBuffer:
@@ -97,11 +96,19 @@ class ProbeBuffer:
 
 
 class ProbeManager:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        embed_image_fn: Callable[[Image.Image], np.ndarray],
+        embed_text_fn: Callable[[str], np.ndarray],
+        jpeg_encoder: Callable[..., str],
+    ) -> None:
         self.buffers: Dict[int, ProbeBuffer] = {}
         self.lock = threading.Lock()
         self.max_frames = config.PROBE_MAX_FRAMES
         self.thumb_edge = config.PROBE_THUMB_MAX_EDGE
+        self.embed_image_fn = embed_image_fn
+        self.embed_text_fn = embed_text_fn
+        self.jpeg_encoder = jpeg_encoder
 
     def _buffer(self, channel_id: int) -> ProbeBuffer:
         if channel_id not in self.buffers:
@@ -110,20 +117,18 @@ class ProbeManager:
 
     def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> None:
         ts_ms = timestamp_ms or int(time.time() * 1000)
-        ensure_embedder_loaded("clip")
-        emb = get_image_embedding_from_pil(pil_image, embedder="clip")
-        thumb = _encode_jpeg(pil_image, max_edge=self.thumb_edge, quality=70)
+        emb = self.embed_image_fn(pil_image)
+        thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
         with self.lock:
             buf = self._buffer(channel_id)
             buf.add(emb, ts_ms, channel_id, thumb)
 
     def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
-        ensure_embedder_loaded("clip")
         embs = []
         for t in texts:
             if not t or not str(t).strip():
                 continue
-            embs.append(get_text_embedding(str(t)))
+            embs.append(self.embed_text_fn(str(t)))
         if not embs:
             return np.zeros((0, 512), dtype=np.float32)
         mat = np.stack(embs, axis=0).astype(np.float32)
