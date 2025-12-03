@@ -4306,7 +4306,11 @@ luxriot_manager = LuxriotManager(
     probe_manager=None,  # will be assigned after probe_manager init
 )
 
-probe_manager = ProbeManager()
+probe_manager = ProbeManager(
+    embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
+    embed_text_fn=lambda text: get_text_embedding(text),
+    jpeg_encoder=_encode_jpeg,
+)
 luxriot_manager.probe_manager = probe_manager
 
 
