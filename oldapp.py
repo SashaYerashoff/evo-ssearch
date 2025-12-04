@@ -1594,6 +1594,224 @@ def home():
             border-radius: 6px;
             margin-bottom: 0.4rem;
         }
+
+        /* Monitoring mock-inspired layout */
+        .monitor-grid {
+            display: grid;
+            grid-template-columns: 35% 65%;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .monitor-panel {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 10px;
+            padding: 0.75rem;
+        }
+
+        .monitor-panel h4 {
+            margin: 0 0 0.6rem 0;
+        }
+
+        .monitor-stream-preview {
+            width: 100%;
+            aspect-ratio: 16/9;
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 6px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .monitor-stream-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .monitor-stream-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, rgba(0,0,0,0.35), rgba(0,0,0,0.2));
+            color: #c8c8c8;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            pointer-events: none;
+        }
+
+        .monitor-inline {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .monitor-btn-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .monitor-actions-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .monitor-probe-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .monitor-probe-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.8rem;
+        }
+
+        .monitor-probe-box {
+            background: #0c0c0c;
+            border: 1px solid #1f1f1f;
+            border-radius: 8px;
+            padding: 0.6rem;
+        }
+
+        .probe-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .probe-pairs {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .probe-pairs-header {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr 60px;
+            gap: 0.35rem;
+            align-items: center;
+            color: #bdbdbd;
+            font-weight: 600;
+        }
+
+        .probe-pair-row {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr 60px;
+            gap: 0.35rem;
+            align-items: center;
+        }
+
+        .probe-pair-idx {
+            color: #a5a5a5;
+            text-align: center;
+        }
+
+        .probe-add-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin-top: 0.25rem;
+        }
+
+        .probe-meta {
+            color: #9a9a9a;
+            font-size: 0.9rem;
+        }
+
+        .image-probe-panel {
+            background: #101010;
+            border: 1px solid #203527;
+            border-radius: 10px;
+            padding: 0.75rem;
+            display: grid;
+            grid-template-columns: 65% 35%;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        .image-probe-left {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .image-probe-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .image-probe-pos {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .image-probe-actions {
+            display: flex;
+            gap: 0.6rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .probe-preview {
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 8px;
+            min-height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .probe-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .probe-preview-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, rgba(0,0,0,0.4), rgba(0,0,0,0.25));
+            color: #cfcfcf;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            text-align: center;
+            padding: 0.5rem;
+        }
+
+        .monitor-actions-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
         
         
         /* Copy icon styling */
@@ -1779,50 +1997,119 @@ def home():
                 <div id="videoFrames" class="video-frame-grid"></div>
             </div>
             <div id="monitorBox" class="video-box" style="display: none;">
-                <div class="probe-card">
-                    <div class="luxriot-header">
-                        <h4>Probes (CLIP/DINO beta)</h4>
-                        <div id="probeStatus" class="luxriot-status">Idle</div>
-                    </div>
-                    <div class="probe-row">
-                        <label for="probeChannelSelect">Channel:</label>
-                        <select id="probeChannelSelect" class="luxriot-mini-input"></select>
-                        <label>Top K:</label>
-                        <input type="number" id="probeTopK" class="settings-input luxriot-mini-input" min="1" max="50" value="6" />
-                        <label>Pos floor:</label>
-                        <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input" step="0.01" value="0.2" />
-                        <label>Margin:</label>
-                        <input type="number" id="probeMargin" class="settings-input luxriot-mini-input" step="0.01" value="0.05" />
-                        <label>Bookmark severity:</label>
-                        <select id="probeBookmarkSeverity" class="luxriot-mini-input">
-                            <option value="info">info</option>
-                            <option value="low">low</option>
-                            <option value="normal">normal</option>
-                            <option value="high">high</option>
-                            <option value="critical" selected>critical</option>
-                        </select>
-                    </div>
-                    <div class="probe-row">
-                        <div style="flex:1;">
-                            <label class="input-label">Positives (required):</label>
-                            <textarea id="probePositives" class="probe-textarea" placeholder="fire on stove&#10;person with handgun"></textarea>
+                <div class="probe-shell">
+                    <div class="monitor-grid">
+                        <div class="monitor-panel">
+                            <div class="probe-header" style="justify-content: space-between;">
+                                <h4>Live stream</h4>
+                                <span id="probeStatus" class="luxriot-status">Idle</span>
+                            </div>
+                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                                <label>Channel:</label>
+                                <select id="probeChannelSelect" class="luxriot-mini-input" style="flex:1;"></select>
+                            </div>
+                            <div class="monitor-stream-preview">
+                                <img id="probePreviewImg" src="" alt="" />
+                                <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                            </div>
+                            <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                                <label>FPS:</label>
+                                <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
+                                <label>Buffer (sec):</label>
+                                <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
+                            </div>
+                            <div class="probe-row spread">
+                                <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
+                                <div style="margin-left:auto; display:flex; align-items:center; gap:0.35rem;">
+                                    <label>Severity:</label>
+                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                                        <option value="info">info</option>
+                                        <option value="low">low</option>
+                                        <option value="normal">normal</option>
+                                        <option value="high">high</option>
+                                        <option value="critical" selected>critical</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="monitor-btn-row">
+                                <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
+                                <button id="probeStopCapture" class="feature-btn">Pause</button>
+                                <button id="probeStopAll" class="feature-btn">Stop</button>
+                            </div>
                         </div>
-                        <div style="flex:1;">
-                            <label class="input-label">Negatives (required):</label>
-                            <textarea id="probeNegatives" class="probe-textarea" placeholder="fire on phone screen&#10;toy gun"></textarea>
+                        <div class="monitor-panel">
+                            <div class="monitor-probe-header">
+                                <label>Probe name:</label>
+                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
+                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+                            </div>
+                            <div class="probe-pairs" id="probePairs">
+                                <div class="probe-pairs-header">
+                                    <div></div>
+                                    <div>Positive Examples:</div>
+                                    <div>Negative Examples:</div>
+                                    <div style="text-align:center;">&nbsp;</div>
+                                </div>
+                            </div>
+                            <div class="probe-add-row">
+                                <span class="probe-pair-idx">+</span>
+                                <button id="probeAddPair" class="feature-btn">Add pair</button>
+                            </div>
+                            <div class="image-probe-panel">
+                                <div class="image-probe-left">
+                                    <div class="image-probe-row">
+                                        <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
+                                    </div>
+                                    <div class="image-probe-pos">
+                                        <label>Image Pos:</label>
+                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                    </div>
+                                    <div class="image-probe-actions">
+                                        <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
+                                        <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
+                                    </div>
+                                </div>
+                                <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
+                                    <img id="probeImageThumb" src="" alt="" />
+                                    <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
+                                </div>
+                            </div>
                         </div>
                     </div>
-            <div class="luxriot-actions">
-                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                <button id="probeRefreshStatus" class="feature-btn">Status</button>
-                <button id="probeBookmarkTop" class="feature-btn">Bookmark top hit</button>
-                <input type="text" id="probePresetName" class="settings-input luxriot-mini-input" placeholder="Preset name">
-                <select id="probePresetSelect" class="luxriot-mini-input"></select>
-                <button id="probeSavePreset" class="feature-btn">Save preset</button>
-                <button id="probeLoadPreset" class="feature-btn">Load preset</button>
-            </div>
-            <div id="probeResults" class="probe-results"></div>
-        </div>
+                    <div class="monitor-actions-bar">
+                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                            <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                            <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
+                        </div>
+                        <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
+                    </div>
+                    <div class="probe-panel">
+                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
+                            <h4 style="margin:0;">Latest Detections</h4>
+                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+                        </div>
+                        <div class="probe-nav">
+                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+                            <div id="probeResults" class="probe-results"></div>
+                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+                        </div>
+                    </div>
+                    <div class="probe-panel">
+                        <div class="probe-header">
+                            <div>
+                                <h4 style="margin:0;">Saved probes</h4>
+                                <div class="probe-meta">Click to expand, run, or delete.</div>
+                            </div>
+                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
+                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                            </div>
+                        </div>
+                        <div id="probeCards" class="probe-grid"></div>
+                    </div>
+                </div>
             </div>
         </div>
         
@@ -2059,18 +2346,34 @@ def home():
         const probeTopKInput = document.getElementById('probeTopK');
         const probePosFloorInput = document.getElementById('probePosFloor');
         const probeMarginInput = document.getElementById('probeMargin');
-        const probePositivesInput = document.getElementById('probePositives');
-        const probeNegativesInput = document.getElementById('probeNegatives');
+        const probeNameInput = document.getElementById('probeName');
         const probeRunBtn = document.getElementById('probeRunBtn');
+        const probeSaveBtn = document.getElementById('probeSaveBtn');
+        const probeDeleteBtn = document.getElementById('probeDeleteBtn');
         const probeResults = document.getElementById('probeResults');
         const probeStatus = document.getElementById('probeStatus');
-        const probeRefreshStatusBtn = document.getElementById('probeRefreshStatus');
-        const probeBookmarkTopBtn = document.getElementById('probeBookmarkTop');
         const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
-        const probePresetNameInput = document.getElementById('probePresetName');
-        const probePresetSelect = document.getElementById('probePresetSelect');
-        const probeSavePresetBtn = document.getElementById('probeSavePreset');
-        const probeLoadPresetBtn = document.getElementById('probeLoadPreset');
+        const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
+        const probeStartCaptureBtn = document.getElementById('probeStartCapture');
+        const probeStopCaptureBtn = document.getElementById('probeStopCapture');
+        const probeStopAllBtn = document.getElementById('probeStopAll');
+        const probeCaptureStatus = document.getElementById('probeCaptureStatus');
+        const probeHitsMeta = document.getElementById('probeHitsMeta');
+        const probeCards = document.getElementById('probeCards');
+        const probeNewBtn = document.getElementById('probeNewBtn');
+        const probeReloadBtn = document.getElementById('probeReloadBtn');
+        const probePreviewImg = document.getElementById('probePreviewImg');
+        const probePreviewOverlay = document.getElementById('probePreviewOverlay');
+        const probePairsContainer = document.getElementById('probePairs');
+        const probeAddPairBtn = document.getElementById('probeAddPair');
+        const probeImageFile = document.getElementById('probeImageFile');
+        const probeImageEnableBtn = document.getElementById('probeImageEnable');
+        const probeImageStatus = document.getElementById('probeImageStatus');
+        const probeImageThumb = document.getElementById('probeImageThumb');
+        const probeImageOverlay = document.getElementById('probeImageOverlay');
+        const probeImagePosInput = document.getElementById('probeImagePos');
+        const probeDetLeftBtn = document.getElementById('probeDetLeft');
+        const probeDetRightBtn = document.getElementById('probeDetRight');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
@@ -2094,7 +2397,14 @@ def home():
         let luxriotSummaryTimer = null;
         let luxriotInitialized = false;
         let probeHitsCache = [];
-        let probePresets = [];
+        let probePairsState = [];
+        let probeImageState = null;
+        let probeList = [];
+        let activeProbeId = null;
+        const probeCaptureState = {};
+        let probeRunTimer = null;
+        let probeRunInFlight = false;
+        let probePreviewTimer = null;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2158,10 +2468,14 @@ def home():
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
                 syncProbeChannelSelect();
+                startProbePreview(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10));
                 refreshProbeStatus();
+                loadProbeList();
             } else {
                 stopLuxriotPreview();
                 stopLuxriotSummaryPoll();
+                stopProbePreview();
+                stopProbeRunLoop();
             }
         }
 
@@ -2917,199 +3231,551 @@ def home():
                 refreshLuxriotSummaries();
             });
         }
-        function loadProbePresets() {
-            try {
-                const stored = localStorage.getItem('probe_presets');
-                if (stored) {
-                    probePresets = JSON.parse(stored) || [];
-                }
-            } catch (e) {
-                probePresets = [];
+        
+        // -------- Monitoring / Probes --------
+        function setProbeStatus(message, isError = false) {
+            if (!probeStatus) return;
+            probeStatus.textContent = message;
+            probeStatus.classList.toggle('error', Boolean(isError));
+        }
+
+        function setPreviewState(text, clearImage = false) {
+            if (probePreviewOverlay) {
+                probePreviewOverlay.style.display = text ? 'flex' : 'none';
+                if (text) probePreviewOverlay.textContent = text;
             }
-            if (probePresetSelect) {
-                probePresetSelect.innerHTML = probePresets.map((p, idx) => `<option value="${idx}">${p.name}</option>`).join('');
+            if (clearImage && probePreviewImg) {
+                probePreviewImg.src = '';
             }
         }
-        loadProbePresets();
 
-        async function runProbe() {
-            const positives = (probePositivesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
-            const negatives = (probeNegativesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean);
-            const channelId = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
-            if (!positives.length || !negatives.length) {
-                probeStatus.textContent = 'Add at least one positive and one negative probe.';
-                probeStatus.classList.add('error');
+        function stopProbePreview() {
+            if (probePreviewTimer) {
+                clearInterval(probePreviewTimer);
+                probePreviewTimer = null;
+            }
+        }
+
+        function startProbePreview(channelId) {
+            if (!probePreviewImg) return;
+            stopProbePreview();
+            if (!channelId && channelId !== 0) {
+                setPreviewState('No channel', true);
                 return;
             }
-            probeStatus.textContent = 'Running...';
-            probeStatus.classList.remove('error');
-            try {
-                const resp = await fetch('/probes/query', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: channelId,
-                        positives,
-                        negatives,
-                        pos_floor: parseFloat(probePosFloorInput.value) || 0.2,
-                        margin: parseFloat(probeMarginInput.value) || 0.05,
-                        top_k: parseInt(probeTopKInput.value, 10) || 6,
-                    }),
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    probeStatus.textContent = data.error || 'Probe failed';
-                    probeStatus.classList.add('error');
-                    probeResults.innerHTML = '';
-                    return;
-                }
-                probeStatus.textContent = `Hits: ${(data.results || []).length} · Frames: ${data.frames_indexed || 0}`;
-                probeStatus.classList.remove('error');
-                const hits = data.results || [];
-                probeHitsCache = hits;
-                if (!hits.length) {
-                    probeResults.innerHTML = '<div class="loading">No matches</div>';
-                    return;
-                }
-                probeResults.innerHTML = hits.map((hit) => {
-                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
-                    return `
-                        <div class="probe-result">
-                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" alt="hit" />` : ''}
-                            <div><strong>${ts}</strong></div>
-                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
-                        </div>
-                    `;
-                }).join('');
-            } catch (err) {
-                probeStatus.textContent = 'Probe error: ' + err.message;
-                probeStatus.classList.add('error');
+            const refresh = () => {
+                if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
+                probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
+            };
+            probePreviewImg.onload = () => setPreviewState('');
+            probePreviewImg.onerror = () => setPreviewState('Preview failed');
+            refresh();
+            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
+            probePreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function ensurePairsSeed() {
+            if (!probePairsState || !probePairsState.length) {
+                probePairsState = [
+                    { pos: '', neg: '' },
+                    { pos: '', neg: '' },
+                    { pos: '', neg: '' },
+                ];
             }
         }
-        async function refreshProbeStatus() {
-            const channelId = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+
+        function renderPairs() {
+            if (!probePairsContainer) return;
+            ensurePairsSeed();
+            const rows = probePairsState.map((row, idx) => {
+                const canRemove = probePairsState.length > 1;
+                const removeBtn = canRemove ? `<button class="feature-btn" data-remove="${idx}" style="width:54px;">×</button>` : '<div class="probe-pair-idx">–</div>';
+                return `
+                    <div class="probe-pair-row" data-idx="${idx}">
+                        <div class="probe-pair-idx">${idx + 1}.</div>
+                        <input type="text" class="settings-input probe-pos" data-idx="${idx}" value="${escapeHtml(row.pos || '')}" placeholder="Positive probe ${idx + 1}">
+                        <input type="text" class="settings-input probe-neg" data-idx="${idx}" value="${escapeHtml(row.neg || '')}" placeholder="Negative probe ${idx + 1}">
+                        ${removeBtn}
+                    </div>
+                `;
+            }).join('');
+            probePairsContainer.innerHTML = `
+                <div class="probe-pairs-header">
+                    <div></div>
+                    <div>Positive Examples:</div>
+                    <div>Negative Examples:</div>
+                    <div style="text-align:center;">&nbsp;</div>
+                </div>
+                ${rows}
+            `;
+        }
+
+        function applyImageThumb(base64) {
+            if (!probeImageThumb || !probeImageOverlay) return;
+            if (base64) {
+                probeImageThumb.src = `data:image/jpeg;base64,${base64}`;
+                probeImageOverlay.style.display = 'none';
+            } else {
+                probeImageThumb.src = '';
+                probeImageOverlay.style.display = 'flex';
+            }
+        }
+
+        function collectProbeForm() {
+            const positives = [];
+            const negatives = [];
+            ensurePairsSeed();
+            probePairsState.forEach((row) => {
+                if (row.pos?.trim()) positives.push(row.pos.trim());
+                if (row.neg?.trim()) negatives.push(row.neg.trim());
+            });
+            const channelId = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            return {
+                id: activeProbeId,
+                name: (probeNameInput?.value || '').trim(),
+                channel_id: Number.isFinite(channelId) ? channelId : luxriotActiveChannel,
+                pairs: probePairsState.slice(),
+                positives,
+                negatives,
+                pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
+                margin: parseFloat(probeMarginInput?.value) || 0.05,
+                top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
+                window_sec: parseFloat(probeWindowSec?.value) || 300,
+                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
+                bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
+                enabled: true,
+                image_probe: {
+                    data: probeImageState?.data,
+                    name: probeImageState?.name,
+                    pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
+                },
+            };
+        }
+
+        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null) {
+            const now = Date.now();
+            const minTs = windowSec && windowSec > 0 ? now - windowSec * 1000 : null;
+            const merged = new Map();
+            const addHit = (hit) => {
+                if (!hit) return;
+                if (minTs && hit.timestamp_ms && hit.timestamp_ms < minTs) return;
+                const key = `${hit.timestamp_ms || 0}-${(hit.pos_score || 0).toFixed(3)}-${(hit.neg_score || 0).toFixed(3)}`;
+                merged.set(key, hit);
+            };
+            (probeHitsCache || []).forEach(addHit);
+            hits.forEach(addHit);
+            const combined = Array.from(merged.values()).sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0)).slice(0, 40);
+            probeHitsCache = combined;
+            if (probeHitsMeta) {
+                probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length}`;
+            }
+            if (!probeResults) return;
+            if (!combined.length) {
+                probeResults.innerHTML = '<div class="loading">No matches</div>';
+                return;
+            }
+            probeResults.innerHTML = combined.map((hit) => {
+                const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                return `
+                    <div class="probe-result">
+                        ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                        <div><strong>${ts}</strong></div>
+                        <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderProbeCards() {
+            if (!probeCards) return;
+            if (!probeList.length) {
+                probeCards.innerHTML = '<div class="loading">No saved probes</div>';
+                return;
+            }
+            probeCards.innerHTML = probeList.map((p) => {
+                const last = p.last_hit;
+                const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
+                return `
+                    <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
+                        <div class="probe-mini-head">
+                            <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
+                            <div class="probe-mini-status">${p.enabled === false ? 'DISABLED' : 'ready'}</div>
+                        </div>
+                        <div class="probe-mini-meta">
+                            Channel: ${p.channel_id || luxriotActiveChannel}<br>
+                            Last: ${last ? ts : 'n/a'}<br>
+                            P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
+                        </div>
+                        <div class="probe-mini-actions">
+                            <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
+                            <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
+                            <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function setActiveProbe(probe) {
+            activeProbeId = probe && probe.id ? probe.id : null;
+            if (probeNameInput) probeNameInput.value = (probe && probe.name) || '';
+            if (probeChannelSelect && probe && probe.channel_id) {
+                probeChannelSelect.value = probe.channel_id;
+                startProbePreview(probe.channel_id);
+            }
+            if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
+            if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
+            if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
+            probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
+            if (probe?.image_probe?.data) {
+                probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
+                applyImageThumb(probe.image_probe.data);
+                if (probeImagePosInput) probeImagePosInput.value = probe.image_probe.pos_floor || 0.7;
+            } else {
+                probeImageState = null;
+                applyImageThumb('');
+            }
+            renderPairs();
+            renderProbeHits(probe?.last_hit ? [probe.last_hit] : [], probe?.last_hit ? 1 : 0);
+            renderProbeCards();
+            setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
+        }
+
+        function updateRunButton(running) {
+            if (!probeRunBtn) return;
+            probeRunBtn.textContent = running ? 'Stop probe' : 'Run probe';
+            probeRunBtn.classList.toggle('primary', running);
+        }
+
+        function stopProbeRunLoop(message) {
+            if (probeRunTimer) {
+                clearInterval(probeRunTimer);
+                probeRunTimer = null;
+            }
+            updateRunButton(false);
+            if (message) setProbeStatus(message);
+        }
+
+        async function loadProbeList(showStatus = false) {
+            try {
+                const resp = await fetch('/probes/list');
+                const data = await resp.json();
+                probeList = data.probes || [];
+                if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
+                const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
+                if (match) {
+                    setActiveProbe(match);
+                } else if (!activeProbeId && probeList.length) {
+                    setActiveProbe(probeList[0]);
+                } else {
+                    renderProbeCards();
+                }
+            } catch (err) {
+                setProbeStatus('Failed to load probes: ' + err.message, true);
+            }
+        }
+
+        async function ensureProbeCapture(channelId, quiet = false) {
+            if (!channelId && channelId !== 0) return;
+            if (probeCaptureState[channelId]) {
+                if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                setPreviewState('');
+                startProbePreview(channelId);
+                return;
+            }
+            try {
+                const resp = await fetch('/probes/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
+                probeCaptureState[channelId] = true;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                setPreviewState('');
+                startProbePreview(channelId);
+            } catch (err) {
+                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (!quiet) setProbeStatus(err.message, true);
+            }
+        }
+
+        async function stopProbeCapture(channelId, reason = 'stopped') {
+            if (!channelId && channelId !== 0) return;
+            try {
+                const resp = await fetch('/probes/stop_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
+                delete probeCaptureState[channelId];
+                if (reason === 'paused') {
+                    setPreviewState('Paused');
+                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
+                } else {
+                    setPreviewState('Stopped', true);
+                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
+                }
+                if (reason !== 'paused') stopProbePreview();
+            } catch (err) {
+                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        async function refreshProbeStatus(channelIdOverride) {
+            const channelId = channelIdOverride || parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
             try {
                 const resp = await fetch(`/probes/status?channel_id=${channelId}`);
                 const data = await resp.json();
                 if (data.error) {
-                    probeStatus.textContent = data.error;
-                    probeStatus.classList.add('error');
+                    setProbeStatus(data.error, true);
                     return;
                 }
                 const range = data.time_range_ms && data.time_range_ms.length === 2
                     ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
                     : 'n/a';
-                probeStatus.textContent = `Frames: ${data.frames || 0} · Range: ${range}`;
-                probeStatus.classList.remove('error');
+                setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
+                if (probeCaptureStatus) {
+                    probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
+                }
             } catch (err) {
-                probeStatus.textContent = 'Status error: ' + err.message;
-                probeStatus.classList.add('error');
+                setProbeStatus('Status error: ' + err.message, true);
             }
         }
-        if (probeRunBtn) {
-            probeRunBtn.addEventListener('click', runProbe);
-        }
-        if (probeRefreshStatusBtn) {
-            probeRefreshStatusBtn.addEventListener('click', refreshProbeStatus);
-        }
-        function bookmarkTopProbeHit() {
-            if (!probeHitsCache.length) {
-                probeStatus.textContent = 'No hits to bookmark';
-                probeStatus.classList.add('error');
+
+        async function saveActiveProbe() {
+            const payload = collectProbeForm();
+            if (!payload.positives.length || !payload.negatives.length) {
+                setProbeStatus('Add at least one positive and one negative probe.', true);
                 return;
             }
-            const top = probeHitsCache[0];
-            const severity = probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical';
-            fetch('/luxriot/bookmark', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    channel_id: top.channel_id || luxriotActiveChannel,
-                    title: `Probe hit (margin ${(top.margin || 0).toFixed(2)})`,
-                    description: `pos ${top.pos_score?.toFixed(3)} / neg ${top.neg_score?.toFixed(3)} at ${new Date(top.timestamp_ms || Date.now()).toLocaleString()}`,
-                    severity: severity,
-                    state: 'new',
-                    timestamp_ms: top.timestamp_ms,
-                }),
-            }).then(resp => resp.json()).then(data => {
-                if (data.error) {
-                    probeStatus.textContent = 'Bookmark failed: ' + data.error;
-                    probeStatus.classList.add('error');
-                } else {
-                    probeStatus.textContent = 'Bookmarked top hit';
-                    probeStatus.classList.remove('error');
+            setProbeStatus('Saving...');
+            try {
+                const resp = await fetch('/probes/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Save failed');
                 }
-            }).catch(err => {
-                probeStatus.textContent = 'Bookmark error: ' + err.message;
-                probeStatus.classList.add('error');
+                const saved = data.probe;
+                activeProbeId = saved.id || activeProbeId;
+                setProbeStatus(`Saved probe ${saved.name || saved.id}`);
+                await loadProbeList();
+                await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+                startProbeRunLoop(true);
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        async function runActiveProbe(quiet = false) {
+            if (probeRunInFlight) return;
+            const payload = collectProbeForm();
+            if (!payload.positives.length || !payload.negatives.length) {
+                setProbeStatus('Add at least one positive and one negative probe.', true);
+                if (probeRunTimer) stopProbeRunLoop();
+                return;
+            }
+            const channelId = payload.channel_id;
+            await ensureProbeCapture(channelId, true);
+            if (!quiet) setProbeStatus('Running...');
+            probeRunInFlight = true;
+            try {
+                let resp;
+                if (activeProbeId) {
+                    resp = await fetch('/probes/run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: activeProbeId })
+                    });
+                } else {
+                    resp = await fetch('/probes/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                }
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Probe failed');
+                const hits = data.results || [];
+                const framesCount = data.frames_indexed || data.status?.frames || 0;
+                renderProbeHits(hits, framesCount, payload.window_sec);
+                if (data.probe) {
+                    activeProbeId = data.probe.id || activeProbeId;
+                    await loadProbeList();
+                } else {
+                    renderProbeCards();
+                }
+                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Frames: ${framesCount}`);
+            } catch (err) {
+                renderProbeHits([], 0);
+                setProbeStatus(err.message, true);
+            } finally {
+                probeRunInFlight = false;
+            }
+        }
+
+        function startProbeRunLoop(quiet = false) {
+            stopProbeRunLoop();
+            updateRunButton(true);
+            runActiveProbe(quiet);
+            probeRunTimer = setInterval(() => runActiveProbe(true), 5000);
+        }
+
+        async function deleteProbe(id) {
+            if (!id) {
+                setProbeStatus('No probe selected', true);
+                return;
+            }
+            try {
+                const resp = await fetch('/probes/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Delete failed');
+                if (activeProbeId === id) activeProbeId = null;
+                setProbeStatus('Probe deleted');
+                await loadProbeList(true);
+                stopProbeRunLoop();
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        function handleProbeCardClick(event) {
+            const btn = event.target.closest('button[data-action]');
+            if (!btn) return;
+            const id = btn.getAttribute('data-id');
+            const action = btn.getAttribute('data-action');
+            const probe = probeList.find(p => String(p.id) === String(id));
+            if (!action) return;
+            if (action === 'expand' && probe) {
+                setActiveProbe(probe);
+            } else if (action === 'run' && probe) {
+                setActiveProbe(probe);
+                startProbeRunLoop();
+            } else if (action === 'delete') {
+                deleteProbe(id);
+            }
+        }
+
+        if (probeRunBtn) {
+            probeRunBtn.addEventListener('click', () => {
+                if (probeRunTimer) {
+                    stopProbeRunLoop('Stopped probe loop');
+                } else {
+                    startProbeRunLoop();
+                }
             });
         }
-        if (probeBookmarkTopBtn) {
-            probeBookmarkTopBtn.addEventListener('click', bookmarkTopProbeHit);
+        if (probeSaveBtn) probeSaveBtn.addEventListener('click', saveActiveProbe);
+        if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
+            if (activeProbeId) deleteProbe(activeProbeId);
+            else {
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                setProbeStatus('Cleared unsaved probe');
+            }
+        });
+        if (probeStartCaptureBtn) {
+            probeStartCaptureBtn.addEventListener('click', () => ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10)));
         }
-        function loadProbePresets() {
-            try {
-                const stored = localStorage.getItem('probe_presets');
-                if (stored) {
-                    probePresets = JSON.parse(stored) || [];
+        if (probeStopCaptureBtn) {
+            probeStopCaptureBtn.addEventListener('click', () => stopProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), 'paused'));
+        }
+        if (probeStopAllBtn) {
+            probeStopAllBtn.addEventListener('click', () => {
+                Object.keys(probeCaptureState).forEach((cid) => stopProbeCapture(parseInt(cid, 10), 'stopped'));
+                stopProbeRunLoop();
+            });
+        }
+        if (probeChannelSelect) {
+            probeChannelSelect.addEventListener('change', () => {
+                const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+                startProbePreview(cid);
+            });
+        }
+        if (probeCards) {
+            probeCards.addEventListener('click', handleProbeCardClick);
+        }
+        if (probeNewBtn) {
+            probeNewBtn.addEventListener('click', () => {
+                activeProbeId = null;
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                setProbeStatus('New probe');
+            });
+        }
+        if (probeReloadBtn) {
+            probeReloadBtn.addEventListener('click', () => loadProbeList(true));
+        }
+        if (probeImageFile) {
+            probeImageFile.addEventListener('change', () => {
+                const file = probeImageFile.files && probeImageFile.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const base64 = reader.result.split(',')[1];
+                    probeImageState = { name: file.name, data: base64 };
+                    applyImageThumb(base64);
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+        if (probeAddPairBtn && probePairsContainer) {
+            probeAddPairBtn.addEventListener('click', () => {
+                probePairsState.push({ pos: '', neg: '' });
+                renderPairs();
+            });
+            probePairsContainer.addEventListener('input', (e) => {
+                const target = e.target;
+                const idx = parseInt(target.getAttribute('data-idx') || '-1', 10);
+                if (!Number.isFinite(idx) || idx < 0 || idx >= probePairsState.length) return;
+                if (target.classList.contains('probe-pos')) {
+                    probePairsState[idx].pos = target.value;
+                } else if (target.classList.contains('probe-neg')) {
+                    probePairsState[idx].neg = target.value;
                 }
-            } catch (e) {
-                probePresets = [];
-            }
-            if (probePresetSelect) {
-                probePresetSelect.innerHTML = probePresets.map((p, idx) => `<option value="${idx}">${p.name}</option>`).join('');
-            }
+            });
+            probePairsContainer.addEventListener('click', (e) => {
+                const btn = e.target.closest('button[data-remove]');
+                if (!btn) return;
+                const idx = parseInt(btn.getAttribute('data-remove') || '-1', 10);
+                if (!Number.isFinite(idx) || idx < 0 || probePairsState.length <= 1) return;
+                probePairsState.splice(idx, 1);
+                renderPairs();
+            });
         }
-        loadProbePresets();
-
-        function saveProbePreset() {
-            const name = (probePresetNameInput && probePresetNameInput.value.trim()) || `preset-${Date.now()}`;
-            const preset = {
-                name,
-                channel_id: parseInt(probeChannelSelect.value || luxriotActiveChannel, 10),
-                positives: (probePositivesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean),
-                negatives: (probeNegativesInput.value || '').split('\\n').map(s => s.trim()).filter(Boolean),
-                pos_floor: parseFloat(probePosFloorInput.value) || 0.2,
-                margin: parseFloat(probeMarginInput.value) || 0.05,
-                top_k: parseInt(probeTopKInput.value, 10) || 6,
-                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
-            };
-            probePresets.push(preset);
-            localStorage.setItem('probe_presets', JSON.stringify(probePresets));
-            loadProbePresets();
-            if (probePresetNameInput) probePresetNameInput.value = '';
-            probeStatus.textContent = 'Preset saved';
-            probeStatus.classList.remove('error');
+        if (probeDetLeftBtn && probeResults) {
+            probeDetLeftBtn.addEventListener('click', () => {
+                probeResults.scrollBy({ left: -260, behavior: 'smooth' });
+            });
+        }
+        if (probeDetRightBtn && probeResults) {
+            probeDetRightBtn.addEventListener('click', () => {
+                probeResults.scrollBy({ left: 260, behavior: 'smooth' });
+            });
         }
 
-        function loadSelectedPreset() {
-            if (!probePresetSelect || !probePresets.length) return;
-            const idx = parseInt(probePresetSelect.value, 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= probePresets.length) return;
-            const p = probePresets[idx];
-            if (probeChannelSelect) probeChannelSelect.value = p.channel_id;
-            if (probePositivesInput) probePositivesInput.value = (p.positives || []).join('\\n');
-            if (probeNegativesInput) probeNegativesInput.value = (p.negatives || []).join('\\n');
-            if (probePosFloorInput) probePosFloorInput.value = p.pos_floor;
-            if (probeMarginInput) probeMarginInput.value = p.margin;
-            if (probeTopKInput) probeTopKInput.value = p.top_k;
-            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = p.severity || 'critical';
-            probeStatus.textContent = `Loaded preset: ${p.name}`;
-            probeStatus.classList.remove('error');
-        }
-
-        if (probeSavePresetBtn) {
-            probeSavePresetBtn.addEventListener('click', saveProbePreset);
-        }
-        if (probeLoadPresetBtn) {
-            probeLoadPresetBtn.addEventListener('click', loadSelectedPreset);
-        }
-        
         // Mode switching
-        textModeBtn.addEventListener('click', () => setMode('text'));
-        imageModeBtn.addEventListener('click', () => setMode('image'));
-        videoModeBtn.addEventListener('click', () => setMode('video'));
-        monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+        if (textModeBtn) textModeBtn.addEventListener('click', () => setMode('text'));
+        if (imageModeBtn) imageModeBtn.addEventListener('click', () => setMode('image'));
+        if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
+        if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -4453,6 +5119,58 @@ probe_manager = ProbeManager(
     jpeg_encoder=_encode_jpeg,
 )
 luxriot_manager.probe_manager = probe_manager
+
+
+class ProbesStore:
+    def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
+        self.path = Path(path)
+        self.data: Dict[str, Any] = {"probes": []}
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text())
+            except Exception:
+                self.data = {"probes": []}
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self.data, indent=2))
+        except Exception:
+            pass
+
+    def list_probes(self) -> List[Dict[str, Any]]:
+        return list(self.data.get("probes", []))
+
+    def upsert_probe(self, probe: Dict[str, Any]) -> Dict[str, Any]:
+        self.data.setdefault("probes", [])
+        probe_list: List[Dict[str, Any]] = self.data["probes"]
+        if not probe.get("id"):
+            probe["id"] = f"probe-{int(time.time() * 1000)}"
+        existing = None
+        for idx, item in enumerate(probe_list):
+            if item.get("id") == probe["id"]:
+                existing = idx
+                break
+        if existing is None:
+            probe_list.append(probe)
+        else:
+            probe_list[existing] = probe
+        self._save()
+        return probe
+
+    def delete_probe(self, probe_id: str) -> bool:
+        probes = self.data.get("probes", [])
+        new_probes = [p for p in probes if p.get("id") != probe_id]
+        if len(new_probes) == len(probes):
+            return False
+        self.data["probes"] = new_probes
+        self._save()
+        return True
+
+
+probes_store = ProbesStore()
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -6026,7 +6744,11 @@ def probes_query():
         top_k = int(data.get('top_k', 5))
     except Exception:
         top_k = 5
-    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k)
+    try:
+        window_sec = float(data.get('window_sec', 0))
+    except Exception:
+        window_sec = 0
+    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec)
     status_code = 200 if 'error' not in result else 400
     return jsonify(result), status_code
 
@@ -6038,6 +6760,137 @@ def probes_status():
         return jsonify(probe_manager.status(channel_id))
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/start_capture', methods=['POST'])
+def probes_start_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        state = luxriot_manager.start_probe_capture(channel_id)
+        return jsonify({'success': True, 'state': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/stop_capture', methods=['POST'])
+def probes_stop_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        state = luxriot_manager.stop_probe_capture(channel_id)
+        return jsonify({'success': True, 'state': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/save', methods=['POST'])
+def probes_save():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    positives = [str(x).strip() for x in (data.get('positives') or []) if str(x).strip()]
+    negatives = [str(x).strip() for x in (data.get('negatives') or []) if str(x).strip()]
+    if not positives or not negatives:
+        return jsonify({'error': 'Provide at least one positive and one negative.'}), 400
+
+    def _float(val, default):
+        try:
+            return float(val)
+        except Exception:
+            return default
+
+    def _int(val, default):
+        try:
+            return int(val)
+        except Exception:
+            return default
+
+    probe = {
+        "id": data.get('id') or None,
+        "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
+        "channel_id": channel_id,
+        "positives": positives,
+        "negatives": negatives,
+        "pos_floor": _float(data.get('pos_floor'), 0.2),
+        "margin": _float(data.get('margin'), 0.05),
+        "top_k": _int(data.get('top_k'), 6),
+        "window_sec": _float(data.get('window_sec'), 300.0),
+        "severity": (data.get('severity') or 'critical').lower(),
+        "bookmark": bool(data.get('bookmark', True)),
+        "enabled": bool(data.get('enabled', True)),
+        "image_probe": data.get('image_probe'),
+        "pairs": data.get('pairs') or [],
+        "last_hit": data.get('last_hit'),
+    }
+    saved = probes_store.upsert_probe(probe)
+    return jsonify({'success': True, 'probe': saved})
+
+
+@app.route('/probes/list', methods=['GET'])
+def probes_list():
+    probes = probes_store.list_probes()
+    return jsonify({'probes': probes})
+
+
+@app.route('/probes/delete', methods=['POST'])
+def probes_delete():
+    data = request.json or {}
+    probe_id = data.get('id')
+    if not probe_id:
+        return jsonify({'error': 'Provide probe id'}), 400
+    ok = probes_store.delete_probe(probe_id)
+    if not ok:
+        return jsonify({'error': 'Probe not found'}), 404
+    return jsonify({'success': True})
+
+
+@app.route('/probes/run', methods=['POST'])
+def probes_run():
+    data = request.json or {}
+    probe_id = data.get('id')
+    if not probe_id:
+        return jsonify({'error': 'Provide probe id'}), 400
+    probes = {p.get('id'): p for p in probes_store.list_probes()}
+    probe = probes.get(probe_id)
+    if not probe:
+        return jsonify({'error': 'Probe not found'}), 404
+    result = probe_manager.query(
+        probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+        probe.get('positives', []),
+        probe.get('negatives', []),
+        probe.get('pos_floor', 0.2),
+        probe.get('margin', 0.05),
+        probe.get('top_k', 6),
+        window_sec=probe.get('window_sec', 300.0),
+    )
+    if 'error' in result:
+        return jsonify(result), 400
+    hits = result.get('results') or []
+    if hits:
+        probe['last_hit'] = hits[0]
+        probes_store.upsert_probe(probe)
+        if probe.get('bookmark'):
+            try:
+                luxriot_manager.send_bookmark_event(
+                    channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                    title=f"Probe hit: {probe.get('name', 'probe')}",
+                    description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                    severity=probe.get('severity', 'critical'),
+                    state='new',
+                    timestamp_ms=hits[0].get('timestamp_ms'),
+                )
+            except Exception:
+                pass
+    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe})
 
 
 @app.route('/settings', methods=['GET'])

@@ -52,10 +52,18 @@ class ProbeBuffer:
         pos_floor: float,
         margin_thr: float,
         top_k: int,
+        min_ts_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not self.embeddings or self.index is None:
             return []
         mat = np.stack(self.embeddings, axis=0).astype(np.float32)
+        meta = list(self.meta)
+        if min_ts_ms is not None:
+            keep = [i for i, m in enumerate(meta) if m.get("timestamp_ms") and m["timestamp_ms"] >= min_ts_ms]
+            if not keep:
+                return []
+            mat = mat[keep]
+            meta = [meta[i] for i in keep]
         pos_scores = mat @ pos_embs.T
         pos_max = pos_scores.max(axis=1)
         if neg_embs.size > 0:
@@ -73,12 +81,12 @@ class ProbeBuffer:
         selected = selected[:top_k]
         results: List[Dict[str, Any]] = []
         for i, p, n, m in selected:
-            meta = self.meta[i]
+            meta_row = meta[i]
             results.append(
                 {
-                    "timestamp_ms": meta.get("timestamp_ms"),
-                    "channel_id": meta.get("channel_id"),
-                    "thumbnail": meta.get("thumb"),
+                    "timestamp_ms": meta_row.get("timestamp_ms"),
+                    "channel_id": meta_row.get("channel_id"),
+                    "thumbnail": meta_row.get("thumb"),
                     "pos_score": p,
                     "neg_score": n,
                     "margin": m,
@@ -143,6 +151,7 @@ class ProbeManager:
         pos_floor: float,
         margin_thr: float,
         top_k: int,
+        window_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         pos_texts = [p.strip() for p in positives if str(p).strip()]
         neg_texts = [n.strip() for n in negatives if str(n).strip()]
@@ -150,11 +159,14 @@ class ProbeManager:
             return {"error": "Provide at least one positive and one negative probe."}
         pos_embs = self._embed_texts(pos_texts)
         neg_embs = self._embed_texts(neg_texts)
+        min_ts_ms: Optional[int] = None
+        if window_sec and window_sec > 0:
+            min_ts_ms = int((time.time() - float(window_sec)) * 1000)
         with self.lock:
             buf = self.buffers.get(channel_id)
             if not buf:
                 return {"results": [], "frames_indexed": 0}
-            results = buf.query(pos_embs, neg_embs, pos_floor, margin_thr, top_k)
+            results = buf.query(pos_embs, neg_embs, pos_floor, margin_thr, top_k, min_ts_ms=min_ts_ms)
             status = buf.status()
         return {"results": results, "status": status, "frames_indexed": status.get("frames", 0)}
 
@@ -168,4 +180,3 @@ class ProbeManager:
     def clear(self, channel_id: int) -> None:
         with self.lock:
             self.buffers.pop(channel_id, None)
-

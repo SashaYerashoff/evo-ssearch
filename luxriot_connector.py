@@ -326,6 +326,7 @@ class LuxriotManager:
         self.probe_manager = probe_manager
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
+        self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
         self.cache_lock = threading.Lock()
         self.channels_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
 
@@ -410,6 +411,24 @@ class LuxriotManager:
             session.stop()
             return {"channel_id": channel_id, "running": False}
         return {"channel_id": channel_id, "running": False, "message": "No active session"}
+
+    def start_probe_capture(self, channel_id: int) -> Dict[str, Any]:
+        with self.cache_lock:
+            existing = self.probe_sessions.get(channel_id)
+            if existing:
+                return existing.status()
+            session = LuxriotCaptureSession(self, channel_id, batch_size=1, prompt="", model_hint=None)
+            self.probe_sessions[channel_id] = session
+            session.start()
+            return session.status()
+
+    def stop_probe_capture(self, channel_id: int) -> Dict[str, Any]:
+        with self.cache_lock:
+            session = self.probe_sessions.pop(channel_id, None)
+        if session:
+            session.stop()
+            return {"channel_id": channel_id, "running": False}
+        return {"channel_id": channel_id, "running": False, "message": "No active probe capture"}
 
     def flush_session(self, channel_id: int) -> Dict[str, Any]:
         with self.cache_lock:
