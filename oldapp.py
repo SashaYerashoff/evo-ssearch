@@ -2405,6 +2405,7 @@ def home():
         let probeRunTimer = null;
         let probeRunInFlight = false;
         let probePreviewTimer = null;
+        let lastProbeRefresh = 0;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -3366,8 +3367,10 @@ def home():
             hits.forEach(addHit);
             const combined = Array.from(merged.values()).sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0)).slice(0, 40);
             probeHitsCache = combined;
+            lastProbeRefresh = Date.now();
             if (probeHitsMeta) {
-                probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length}`;
+                const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
+                probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length} · Updated: ${tsLabel}`;
             }
             if (!probeResults) return;
             if (!combined.length) {
@@ -3627,7 +3630,9 @@ def home():
             stopProbeRunLoop();
             updateRunButton(true);
             runActiveProbe(quiet);
-            probeRunTimer = setInterval(() => runActiveProbe(true), 5000);
+            const windowSec = parseFloat(probeWindowSec?.value) || 30;
+            const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
+            probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
         }
 
         async function deleteProbe(id) {
@@ -6750,6 +6755,19 @@ def probes_query():
         window_sec = 0
     result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec)
     status_code = 200 if 'error' not in result else 400
+    hits = result.get('results') or []
+    if hits and data.get('bookmark'):
+        try:
+            luxriot_manager.send_bookmark_event(
+                channel_id=channel_id,
+                title=f"Probe hit: {data.get('name') or 'probe'}",
+                description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                severity=(data.get('severity') or 'critical'),
+                state='new',
+                timestamp_ms=hits[0].get('timestamp_ms'),
+            )
+        except Exception:
+            pass
     return jsonify(result), status_code
 
 
