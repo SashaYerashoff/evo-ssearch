@@ -2013,6 +2013,7 @@ def home():
                                 <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
                             </div>
                             <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                            <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
                             <div class="probe-row" style="align-items:center; gap:0.4rem;">
                                 <label>FPS:</label>
                                 <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
@@ -2378,6 +2379,7 @@ def home():
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
+        const probeBufferInfo = document.getElementById('probeBufferInfo');
         
         let currentFolder = '';
         let currentMode = 'text';
@@ -2406,6 +2408,7 @@ def home():
         let probeRunInFlight = false;
         let probePreviewTimer = null;
         let lastProbeRefresh = 0;
+        let probeStatusTimer = null;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2472,11 +2475,13 @@ def home():
                 startProbePreview(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10));
                 refreshProbeStatus();
                 loadProbeList();
+                startProbeStatusPoll();
             } else {
                 stopLuxriotPreview();
                 stopLuxriotSummaryPoll();
                 stopProbePreview();
                 stopProbeRunLoop();
+                stopProbeStatusPoll();
             }
         }
 
@@ -3546,6 +3551,10 @@ def home():
                 if (probeCaptureStatus) {
                     probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
                 }
+                if (probeBufferInfo) {
+                    const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
+                    probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
+                }
             } catch (err) {
                 setProbeStatus('Status error: ' + err.message, true);
             }
@@ -3633,6 +3642,19 @@ def home():
             const windowSec = parseFloat(probeWindowSec?.value) || 30;
             const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
             probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
+        }
+
+        function startProbeStatusPoll() {
+            if (probeStatusTimer) return;
+            refreshProbeStatus();
+            probeStatusTimer = setInterval(() => refreshProbeStatus(), 8000);
+        }
+
+        function stopProbeStatusPoll() {
+            if (probeStatusTimer) {
+                clearInterval(probeStatusTimer);
+                probeStatusTimer = null;
+            }
         }
 
         async function deleteProbe(id) {

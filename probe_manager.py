@@ -96,10 +96,12 @@ class ProbeBuffer:
 
     def status(self) -> Dict[str, Any]:
         if not self.meta:
-            return {"frames": 0, "time_range_ms": None}
+            return {"frames": 0, "time_range_ms": None, "last_timestamp_ms": None, "first_timestamp_ms": None}
         return {
             "frames": len(self.meta),
             "time_range_ms": (self.meta[0]["timestamp_ms"], self.meta[-1]["timestamp_ms"]),
+            "last_timestamp_ms": self.meta[-1]["timestamp_ms"],
+            "first_timestamp_ms": self.meta[0]["timestamp_ms"],
         }
 
 
