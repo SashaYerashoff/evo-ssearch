@@ -160,13 +160,17 @@ class LuxriotCaptureSession:
         batch_size: int,
         prompt: str,
         model_hint: Optional[str] = None,
+        interval_override: Optional[float] = None,
     ) -> None:
         self.manager = manager
         self.channel_id = channel_id
         self.batch_size = batch_size
         self.prompt = prompt
         self.model_hint = model_hint
-        self.interval = max(1, int(getattr(manager.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
+        if interval_override and interval_override > 0:
+            self.interval = max(0.2, float(interval_override))
+        else:
+            self.interval = max(1, int(getattr(manager.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         self.max_edge = int(getattr(manager.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800))
         self.max_buffer = int(getattr(manager.config, "LUXRIOT_MAX_BUFFER_FRAMES", 180))
         self.client = manager.build_client()
@@ -389,12 +393,15 @@ class LuxriotManager:
             return {"channel_id": channel_id, "running": False}
         return {"channel_id": channel_id, "running": False, "message": "No active session"}
 
-    def start_probe_capture(self, channel_id: int) -> Dict[str, Any]:
+    def start_probe_capture(self, channel_id: int, fps: Optional[float] = None) -> Dict[str, Any]:
         with self.cache_lock:
             existing = self.probe_sessions.get(channel_id)
             if existing:
                 return existing.status()
-            session = LuxriotCaptureSession(self, channel_id, batch_size=1, prompt="", model_hint=None)
+            interval = None
+            if fps and fps > 0:
+                interval = 1.0 / float(fps)
+            session = LuxriotCaptureSession(self, channel_id, batch_size=1, prompt="", model_hint=None, interval_override=interval)
             self.probe_sessions[channel_id] = session
             session.start()
             return session.status()

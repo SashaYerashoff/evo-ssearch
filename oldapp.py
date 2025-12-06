@@ -3587,6 +3587,25 @@ def home():
             probeRunBtn.classList.toggle('primary', running);
         }
 
+        async function persistProbeEnabled(enabled) {
+            if (!activeProbeId) return;
+            const payload = collectProbeForm();
+            payload.id = activeProbeId;
+            payload.enabled = enabled;
+            try {
+                const resp = await fetch('/probes/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Save failed');
+                await loadProbeList();
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+        }
+
         function stopProbeRunLoop(message) {
             if (probeRunTimer) {
                 clearInterval(probeRunTimer);
@@ -3724,6 +3743,7 @@ def home():
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
+            return activeProbeId;
         }
 
         async function runActiveProbe(quiet = false) {
@@ -3780,6 +3800,7 @@ def home():
             const windowSec = parseFloat(probeWindowSec?.value) || 30;
             const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
             probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
+            persistProbeEnabled(true);
         }
 
         function startProbeStatusPoll() {
@@ -3838,8 +3859,13 @@ def home():
             probeRunBtn.addEventListener('click', () => {
                 if (probeRunTimer) {
                     stopProbeRunLoop('Stopped probe loop');
+                    persistProbeEnabled(false);
                 } else {
-                    startProbeRunLoop();
+                    if (!activeProbeId) {
+                        saveActiveProbe().then(() => startProbeRunLoop());
+                    } else {
+                        startProbeRunLoop();
+                    }
                 }
             });
         }
@@ -7045,7 +7071,14 @@ def probes_start_capture():
     except Exception:
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     try:
-        state = luxriot_manager.start_probe_capture(channel_id)
+        fps = data.get('fps')
+        fps_val = None
+        try:
+            if fps is not None:
+                fps_val = float(fps)
+        except Exception:
+            fps_val = None
+        state = luxriot_manager.start_probe_capture(channel_id, fps=fps_val)
         return jsonify({'success': True, 'state': state})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -7171,6 +7204,38 @@ def probes_run():
             except Exception:
                 pass
     return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe})
+
+
+@app.route('/probes/bench', methods=['GET'])
+def probes_bench():
+    """Lightweight throughput estimate (image embedding)."""
+    try:
+        import torch  # type: ignore
+        init_clip()
+    except Exception:
+        return jsonify({
+            "error": "PyTorch/CLIP not available; install torch+clip to run benchmark."
+        }), 400
+    batch = int(request.args.get('batch', PROBE_BENCH_BATCH))
+    batch = max(4, min(64, batch))
+    try:
+        # build random batch at 224x224
+        rnd = torch.randint(0, 255, (batch, 3, 224, 224), device=device, dtype=torch.uint8)
+        images = rnd.float() / 255.0
+        started = time.time()
+        with torch.no_grad():
+            feats = clip_model.encode_image(images)  # type: ignore
+            _ = feats.cpu()
+        elapsed = time.time() - started
+        fps = batch / elapsed if elapsed > 0 else 0
+        return jsonify({
+            "batch": batch,
+            "elapsed_sec": round(elapsed, 3),
+            "approx_fps": round(fps, 1),
+            "device": device,
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route('/settings', methods=['GET'])
