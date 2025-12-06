@@ -2160,6 +2160,10 @@ def home():
                                 <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
                                 <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
                                 <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+                                <label style="display:flex; align-items:center; gap:0.3rem;">
+                                    <input type="checkbox" id="probeEnableToggle" checked>
+                                    Enable probe
+                                </label>
                             </div>
                             <div class="probe-pairs" id="probePairs">
                                 <div class="probe-pairs-header">
@@ -2496,6 +2500,7 @@ def home():
         const resultsContainer = document.getElementById('results');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
         const probeStreamState = document.getElementById('probeStreamState');
+        const probeEnableToggle = document.getElementById('probeEnableToggle');
         
         let currentFolder = '';
         let currentMode = 'text';
@@ -3468,7 +3473,7 @@ def home():
                 window_sec: parseFloat(probeWindowSec?.value) || 300,
                 severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
                 bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
-                enabled: true,
+                enabled: probeEnableToggle ? probeEnableToggle.checked : true,
                 image_probe: {
                     data: probeImageState?.data,
                     name: probeImageState?.name,
@@ -3543,6 +3548,7 @@ def home():
                             <div class="probe-mini-actions">
                                 <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
                                 <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
+                                <button class="feature-btn" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}">${status === 'disabled' ? 'Enable' : 'Disable'}</button>
                                 <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
                             </div>
                         </div>
@@ -3566,6 +3572,7 @@ def home():
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
             if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
             if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
+            if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== False;
             probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
             if (probe?.image_probe?.data) {
                 probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
@@ -3601,6 +3608,7 @@ def home():
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Save failed');
                 await loadProbeList();
+                if (probeEnableToggle) probeEnableToggle.checked = enabled;
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
@@ -3850,8 +3858,16 @@ def home():
             } else if (action === 'run' && probe) {
                 setActiveProbe(probe);
                 startProbeRunLoop();
+            } else if (action === 'enable' && probe) {
+                setActiveProbe(probe);
+                persistProbeEnabled(true);
+                ensureProbeCapture(probe.channel_id || luxriotActiveChannel, true);
             } else if (action === 'delete') {
                 deleteProbe(id);
+            } else if (action === 'disable' && probe) {
+                setActiveProbe(probe);
+                persistProbeEnabled(false);
+                stopProbeRunLoop();
             }
         }
 
@@ -3909,6 +3925,7 @@ def home():
                 applyImageThumb('');
                 renderPairs();
                 setProbeStatus('New probe');
+                if (probeEnableToggle) probeEnableToggle.checked = true;
             });
         }
         if (probeReloadBtn) {
@@ -3989,6 +4006,18 @@ def home():
                         </div>
                     `;
                 }).join('');
+            });
+        }
+        if (probeEnableToggle) {
+            probeEnableToggle.addEventListener('change', (e) => {
+                const enabled = e.target.checked;
+                persistProbeEnabled(enabled);
+                if (enabled) {
+                    ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), true);
+                    runActiveProbe(true);
+                } else {
+                    stopProbeRunLoop('Probe disabled');
+                }
             });
         }
 
