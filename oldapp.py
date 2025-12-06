@@ -25,6 +25,9 @@ from config import config
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
+import numpy as np
+import threading
+import time
 try:
     from heads.mask2former_head import Mask2FormerHead
 except Exception:  # pragma: no cover - optional dependency
@@ -2523,6 +2526,7 @@ def home():
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
         let probeHitsOffset = 0;
+        const channelCaptureConfig = {};
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -3620,10 +3624,14 @@ def home():
                 return;
             }
             try {
+                channelCaptureConfig[channelId] = {
+                    fps: parseFloat(probeFps?.value) || 0,
+                    windowSec: parseFloat(probeWindowSec?.value) || 300,
+                };
                 const resp = await fetch('/probes/start_capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId })
+                    body: JSON.stringify({ channel_id: channelId, fps: channelCaptureConfig[channelId].fps })
                 });
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
@@ -5301,6 +5309,8 @@ luxriot_manager = LuxriotManager(
 )
 
 PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
+PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
+PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
 
 probe_manager = ProbeManager(
     embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
@@ -5308,6 +5318,8 @@ probe_manager = ProbeManager(
     jpeg_encoder=_encode_jpeg,
 )
 luxriot_manager.probe_manager = probe_manager
+probe_daemon_thread: Optional[threading.Thread] = None
+probe_daemon_stop = threading.Event()
 
 
 class ProbesStore:
@@ -5383,6 +5395,62 @@ def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
 def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*color)
 
+
+def _probe_daemon() -> None:
+    """Background runner: execute enabled probes across channels."""
+    while not probe_daemon_stop.is_set():
+        try:
+            probes = probes_store.list_probes()
+            # Group probes by channel
+            by_channel: Dict[int, List[Dict[str, Any]]] = {}
+            for p in probes:
+                if p.get("enabled") is False:
+                    continue
+                ch = int(p.get("channel_id", config.LUXRIOT_DEFAULT_CHANNEL_ID))
+                by_channel.setdefault(ch, []).append(p)
+            for ch, plist in by_channel.items():
+                try:
+                    # Ensure capture running for this channel
+                    try:
+                        luxriot_manager.start_probe_capture(ch)
+                    except Exception:
+                        pass
+                    for probe in plist:
+                        result = probe_manager.query(
+                            probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                            probe.get('positives', []),
+                            probe.get('negatives', []),
+                            probe.get('pos_floor', 0.2),
+                            probe.get('margin', 0.05),
+                            probe.get('top_k', 6),
+                            window_sec=probe.get('window_sec', 300.0),
+                        )
+                        if 'error' in result:
+                            continue
+                        hits = result.get('results') or []
+                        if hits:
+                            probe['last_hit'] = hits[0]
+                            recent = probe.get('recent_hits') or []
+                            recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
+                            probe['recent_hits'] = recent
+                            if probe.get('bookmark'):
+                                try:
+                                    luxriot_manager.send_bookmark_event(
+                                        channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                                        title=f"Probe hit: {probe.get('name', 'probe')}",
+                                        description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                                        severity=probe.get('severity', 'critical'),
+                                        state='new',
+                                        timestamp_ms=hits[0].get('timestamp_ms'),
+                                    )
+                                except Exception:
+                                    pass
+                            probes_store.upsert_probe(probe)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        probe_daemon_stop.wait(PROBE_DAEMON_INTERVAL_SEC)
 
 def _render_segmentation_overlay(
     seg_map: np.ndarray,
@@ -7403,4 +7471,7 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 if __name__ == '__main__':
     ensure_embedder_loaded()
     config.print_startup_info()
+    if probe_daemon_thread is None:
+        probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)
+        probe_daemon_thread.start()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

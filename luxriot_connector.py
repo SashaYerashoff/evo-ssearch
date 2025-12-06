@@ -238,30 +238,7 @@ class LuxriotCaptureSession:
                 "duration_sec": duration,
                 "prompt": self.prompt,
             }
-            # Attempt to parse alerts from summary and send bookmarks
-            if self.manager.alert_parser and self.manager.auto_bookmarks:
-                try:
-                    latest_ts_ms = None
-                    if frames_copy:
-                        latest_ts = frames_copy[-1].get('captured_at') or frames_copy[-1].get('time_sec')
-                        if isinstance(latest_ts, (int, float)):
-                            latest_ts_ms = int(latest_ts * 1000)
-                    alerts = self.manager.alert_parser(summary, self.channel_id, default_ts_ms=latest_ts_ms) or []
-                    for alert in alerts:
-                        try:
-                            self.manager.send_bookmark_event(
-                                channel_id=alert.get("channel_id", self.channel_id),
-                                title=alert.get("title", "External event"),
-                                description=alert.get("description", ""),
-                                severity=alert.get("severity", "critical"),
-                                state=alert.get("state", "new"),
-                                timestamp_ms=alert.get("timestamp_ms"),
-                            )
-                        except Exception as bookmark_exc:
-                            # Keep running; attach error to log entry for visibility
-                            entry.setdefault("bookmark_errors", []).append(str(bookmark_exc))
-                except Exception as parse_exc:
-                    entry.setdefault("bookmark_errors", []).append(f"parse: {parse_exc}")
+            # Bookmarks from video understanding are disabled (hidden automation)
             with self.lock:
                 self.logs.append(entry)
                 self.total_flushes += 1
