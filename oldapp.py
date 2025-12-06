@@ -1610,6 +1610,12 @@ def home():
             gap: 0.5rem;
         }
 
+        .probe-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 0.75rem;
+        }
+
         .probe-result {
             background: #0a0a0a;
             border: 1px solid #1d1d1d;
@@ -3572,7 +3578,7 @@ def home():
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
             if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
             if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
-            if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== False;
+            if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
             probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
             if (probe?.image_probe?.data) {
                 probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
