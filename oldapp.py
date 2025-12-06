@@ -356,11 +356,36 @@ def home():
             align-items: center;
             margin-bottom: 2rem;
         }
-        
-        h1 {
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+        }
+
+        .brand-title {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        .brand-main {
             font-size: 2rem;
-            font-weight: 300;
-            letter-spacing: -0.02em;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            margin: 0;
+        }
+
+        .brand-sub {
+            color: #d8d8d8;
+            font-size: 1.05rem;
+            margin: 0;
+        }
+
+        .brand-note {
+            color: #9c9c9c;
+            font-size: 0.9rem;
+            font-style: italic;
             margin: 0;
         }
         
@@ -1924,7 +1949,13 @@ def home():
 <body>
     <div class="container">
         <div class="header">
-            <h1>Natural Language Image Search</h1>
+            <div class="brand">
+                <div class="brand-title">
+                    <div class="brand-main">SISU</div>
+                    <div class="brand-sub">Smart Image Search and Understanding.</div>
+                    <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
+                </div>
+            </div>
             <div class="settings-icon" id="settingsBtn">
                 <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                     <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
@@ -2491,6 +2522,7 @@ def home():
         let probePreviewTimer = null;
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
+        let probeHitsOffset = 0;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -3460,12 +3492,15 @@ def home():
                 const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
                 probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length} · Updated: ${tsLabel}`;
             }
+            probeHitsOffset = 0;
             if (!probeResults) return;
             if (!combined.length) {
                 probeResults.innerHTML = '<div class="loading">No matches</div>';
                 return;
             }
-            probeResults.innerHTML = combined.map((hit) => {
+            const pageSize = 4;
+            const slice = combined.slice(probeHitsOffset, probeHitsOffset + pageSize);
+            probeResults.innerHTML = slice.map((hit) => {
                 const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
                 return `
                     <div class="probe-result">
@@ -3678,7 +3713,6 @@ def home():
                 setProbeStatus(`Saved probe ${saved.name || saved.id}`);
                 await loadProbeList();
                 await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
-                startProbeRunLoop(true);
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
@@ -3885,12 +3919,42 @@ def home():
         }
         if (probeDetLeftBtn && probeResults) {
             probeDetLeftBtn.addEventListener('click', () => {
-                probeResults.scrollBy({ left: -260, behavior: 'smooth' });
+                if (!probeHitsCache || !probeHitsCache.length) return;
+                const pageSize = 4;
+                probeHitsOffset = Math.max(0, probeHitsOffset - pageSize);
+                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
+                if (!slice.length) return;
+                probeResults.innerHTML = slice.map((hit) => {
+                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                    return `
+                        <div class="probe-result">
+                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                            <div><strong>${ts}</strong></div>
+                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                        </div>
+                    `;
+                }).join('');
             });
         }
         if (probeDetRightBtn && probeResults) {
             probeDetRightBtn.addEventListener('click', () => {
-                probeResults.scrollBy({ left: 260, behavior: 'smooth' });
+                if (!probeHitsCache || !probeHitsCache.length) return;
+                const pageSize = 4;
+                if (probeHitsOffset + pageSize < probeHitsCache.length) {
+                    probeHitsOffset += pageSize;
+                }
+                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
+                if (!slice.length) return;
+                probeResults.innerHTML = slice.map((hit) => {
+                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                    return `
+                        <div class="probe-result">
+                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                            <div><strong>${ts}</strong></div>
+                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                        </div>
+                    `;
+                }).join('');
             });
         }
 
@@ -5235,6 +5299,8 @@ luxriot_manager = LuxriotManager(
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
 )
+
+PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
 
 probe_manager = ProbeManager(
     embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
@@ -6886,6 +6952,11 @@ def probes_query():
             )
         except Exception:
             pass
+    if hits:
+        # trim recent hits (kept in request payload only; not persisted unless saved)
+        recent_hits = data.get('recent_hits') or []
+        recent_hits = (recent_hits + hits)[:PROBE_MAX_STORED_HITS]
+        result['recent_hits'] = recent_hits
     return jsonify(result), status_code
 
 
@@ -6966,6 +7037,7 @@ def probes_save():
         "image_probe": data.get('image_probe'),
         "pairs": data.get('pairs') or [],
         "last_hit": data.get('last_hit'),
+        "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
     }
     saved = probes_store.upsert_probe(probe)
     return jsonify({'success': True, 'probe': saved})
@@ -7013,6 +7085,10 @@ def probes_run():
     hits = result.get('results') or []
     if hits:
         probe['last_hit'] = hits[0]
+        # keep a short rolling history of hits for UI while capping thumbnails
+        recent = probe.get('recent_hits') or []
+        recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
+        probe['recent_hits'] = recent
         probes_store.upsert_probe(probe)
         if probe.get('bookmark'):
             try:
