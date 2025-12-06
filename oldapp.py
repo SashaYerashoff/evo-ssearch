@@ -1697,9 +1697,11 @@ def home():
             border: 1px solid #1f1f1f;
             border-radius: 10px;
             padding: 0.7rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
+            display: grid;
+            grid-template-columns: 1fr 120px;
+            gap: 0.6rem;
+            align-items: stretch;
+            min-height: 120px;
         }
 
         .probe-mini-card.active {
@@ -1743,6 +1745,31 @@ def home():
             display: flex;
             gap: 0.4rem;
             flex-wrap: wrap;
+        }
+
+        .probe-mini-thumb {
+            position: relative;
+            border: 1px solid #222;
+            border-radius: 8px;
+            background: #0a0a0a;
+            overflow: hidden;
+            min-height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .probe-mini-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .probe-thumb-pill {
+            position: absolute;
+            top: 6px;
+            right: 6px;
         }
 
         .probe-pairs {
@@ -3461,21 +3488,28 @@ def home():
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
                 const status = p.enabled === false ? 'disabled' : (last ? 'running' : 'idle');
                 const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
+                const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
                 return `
                     <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
-                        <div class="probe-mini-head">
-                            <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
-                            <div class="probe-status-pill ${pillClass}">${status}</div>
+                        <div style="display:flex; flex-direction:column; gap:0.35rem;">
+                            <div class="probe-mini-head">
+                                <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
+                                <div class="probe-status-pill ${pillClass}">${status}</div>
+                            </div>
+                            <div class="probe-mini-meta">
+                                Channel: ${p.channel_id || luxriotActiveChannel}<br>
+                                Last: ${last ? ts : 'n/a'}<br>
+                                P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
+                            </div>
+                            <div class="probe-mini-actions">
+                                <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
+                                <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
+                                <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
+                            </div>
                         </div>
-                        <div class="probe-mini-meta">
-                            Channel: ${p.channel_id || luxriotActiveChannel}<br>
-                            Last: ${last ? ts : 'n/a'}<br>
-                            P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
-                        </div>
-                        <div class="probe-mini-actions">
-                            <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
-                            <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
-                            <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
+                        <div class="probe-mini-thumb">
+                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
+                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
                         </div>
                     </div>
                 `;
