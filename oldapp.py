@@ -1692,6 +1692,59 @@ def home():
             gap: 1rem;
         }
 
+        .probe-mini-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.7rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .probe-mini-card.active {
+            border-color: #3a6346;
+            box-shadow: 0 0 0 1px rgba(58, 99, 70, 0.35);
+        }
+
+        .probe-mini-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .probe-mini-name {
+            font-weight: 600;
+            color: #e5e5e5;
+        }
+
+        .probe-status-pill {
+            padding: 0.15rem 0.45rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+            border: 1px solid #2e2e2e;
+        }
+
+        .pill-running { background: rgba(58, 99, 70, 0.2); color: #9bd2a8; border-color: #3a6346; }
+        .pill-paused { background: rgba(140, 120, 60, 0.15); color: #e4c47c; border-color: #8c783c; }
+        .pill-idle { background: rgba(90, 90, 90, 0.2); color: #cfcfcf; border-color: #555; }
+        .pill-disabled { background: rgba(110, 30, 30, 0.18); color: #e8a4a4; border-color: #8b0000; }
+
+        .probe-mini-meta {
+            color: #b4b4b4;
+            font-size: 0.9rem;
+            line-height: 1.35;
+        }
+
+        .probe-mini-actions {
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+
         .probe-pairs {
             background: #0f0f0f;
             border: 1px solid #1f1f1f;
@@ -2014,6 +2067,7 @@ def home():
                             </div>
                             <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
                             <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
+                            <div class="probe-meta" id="probeStreamState"></div>
                             <div class="probe-row" style="align-items:center; gap:0.4rem;">
                                 <label>FPS:</label>
                                 <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
@@ -2380,6 +2434,7 @@ def home():
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
+        const probeStreamState = document.getElementById('probeStreamState');
         
         let currentFolder = '';
         let currentMode = 'text';
@@ -3269,6 +3324,7 @@ def home():
                 setPreviewState('No channel', true);
                 return;
             }
+            if (probeStreamState) probeStreamState.textContent = `Streaming channel ${channelId}`;
             const refresh = () => {
                 if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
                 probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
@@ -3403,11 +3459,13 @@ def home():
             probeCards.innerHTML = probeList.map((p) => {
                 const last = p.last_hit;
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
+                const status = p.enabled === false ? 'disabled' : (last ? 'running' : 'idle');
+                const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
                 return `
                     <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
                         <div class="probe-mini-head">
                             <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
-                            <div class="probe-mini-status">${p.enabled === false ? 'DISABLED' : 'ready'}</div>
+                            <div class="probe-status-pill ${pillClass}">${status}</div>
                         </div>
                         <div class="probe-mini-meta">
                             Channel: ${p.channel_id || luxriotActiveChannel}<br>
@@ -3554,6 +3612,10 @@ def home():
                 if (probeBufferInfo) {
                     const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
                     probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
+                }
+                if (probeStreamState) {
+                    const pill = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
+                    probeStreamState.textContent = pill;
                 }
             } catch (err) {
                 setProbeStatus('Status error: ' + err.message, true);
