@@ -2565,6 +2565,7 @@ def home():
         let probeStatusTimer = null;
         let probeHitsOffset = 0;
         const channelCaptureConfig = {};
+        const channelFpsDesired = {};
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -3514,6 +3515,7 @@ def home():
                 margin: parseFloat(probeMarginInput?.value) || 0.05,
                 top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
                 window_sec: parseFloat(probeWindowSec?.value) || 300,
+                fps: parseFloat(probeFps?.value) || 0,
                 severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
                 bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
                 enabled: probeEnableToggle ? probeEnableToggle.checked : true,
@@ -3614,6 +3616,8 @@ def home():
             }
             if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
+            if (probeFps) probeFps.value = probe?.fps ?? 0;
+            if (probeWindowSec) probeWindowSec.value = probe?.window_sec ?? 300;
             if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
             if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
             if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
@@ -3775,8 +3779,9 @@ def home():
 
         async function saveActiveProbe() {
             const payload = collectProbeForm();
-            if (!payload.positives.length || !payload.negatives.length) {
-                setProbeStatus('Add at least one positive and one negative probe.', true);
+            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+            if (!hasPos) {
+                setProbeStatus('Add a text positive or enable an image probe.', true);
                 return;
             }
             setProbeStatus('Saving...');
@@ -3792,9 +3797,9 @@ def home():
                 }
                 const saved = data.probe;
                 activeProbeId = saved.id || activeProbeId;
-                setProbeStatus(`Saved probe ${saved.name || saved.id}`);
-                await loadProbeList();
-                await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+            setProbeStatus(`Saved probe ${saved.name || saved.id}`);
+            await loadProbeList();
+            await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
@@ -3804,8 +3809,9 @@ def home():
         async function runActiveProbe(quiet = false) {
             if (probeRunInFlight) return;
             const payload = collectProbeForm();
-            if (!payload.positives.length || !payload.negatives.length) {
-                setProbeStatus('Add at least one positive and one negative probe.', true);
+            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+            if (!hasPos) {
+                setProbeStatus('Add a text positive or enable an image probe.', true);
                 if (probeRunTimer) stopProbeRunLoop();
                 return;
             }
@@ -5540,7 +5546,8 @@ def _probe_daemon() -> None:
                 try:
                     # Ensure capture running for this channel
                     try:
-                        luxriot_manager.start_probe_capture(ch)
+                        fps_desired = max([p.get('fps') or 0 for p in plist] or [0])
+                        luxriot_manager.start_probe_capture(ch, fps=fps_desired if fps_desired > 0 else None)
                     except Exception:
                         pass
                     for probe in plist:
@@ -7210,8 +7217,9 @@ def probes_save():
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     positives = [str(x).strip() for x in (data.get('positives') or []) if str(x).strip()]
     negatives = [str(x).strip() for x in (data.get('negatives') or []) if str(x).strip()]
-    if not positives or not negatives:
-        return jsonify({'error': 'Provide at least one positive and one negative.'}), 400
+    image_probe = data.get('image_probe') or {}
+    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
+        return jsonify({'error': 'Provide at least one positive (text or image).'}), 400
 
     def _float(val, default):
         try:
@@ -7238,7 +7246,7 @@ def probes_save():
         "severity": (data.get('severity') or 'critical').lower(),
         "bookmark": bool(data.get('bookmark', True)),
         "enabled": bool(data.get('enabled', True)),
-        "image_probe": data.get('image_probe'),
+        "image_probe": image_probe,
         "pairs": data.get('pairs') or [],
         "last_hit": data.get('last_hit'),
         "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
