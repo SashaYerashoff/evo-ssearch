@@ -1,5 +1,7 @@
+import base64
 import threading
 import time
+from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import faiss  # type: ignore
@@ -145,6 +147,14 @@ class ProbeManager:
         mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
         return mat
 
+    def _embed_image_base64(self, data: str) -> Optional[np.ndarray]:
+        try:
+            raw = base64.b64decode(data)
+            img = Image.open(BytesIO(raw)).convert("RGB")
+            return self.embed_image_fn(img)
+        except Exception:
+            return None
+
     def query(
         self,
         channel_id: int,
@@ -154,13 +164,33 @@ class ProbeManager:
         margin_thr: float,
         top_k: int,
         window_sec: Optional[float] = None,
+        image_probe: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         pos_texts = [p.strip() for p in positives if str(p).strip()]
         neg_texts = [n.strip() for n in negatives if str(n).strip()]
-        if not pos_texts or not neg_texts:
-            return {"error": "Provide at least one positive and one negative probe."}
+        image_enabled = False
+        image_pos_floor = None
+        image_emb = None
+        if image_probe and image_probe.get("data") and image_probe.get("enabled", True) is not False:
+            image_emb = self._embed_image_base64(image_probe["data"])
+            image_enabled = image_emb is not None
+            if image_enabled:
+                try:
+                    image_pos_floor = float(image_probe.get("pos_floor", pos_floor))
+                except Exception:
+                    image_pos_floor = None
+        if not pos_texts and not image_enabled:
+            return {"error": "Provide at least one positive probe (text or image)."}
+        if not neg_texts:
+            return {"error": "Provide at least one negative probe."}
         pos_embs = self._embed_texts(pos_texts)
+        if image_emb is not None:
+            if image_emb.ndim != 1:
+                image_emb = image_emb.flatten()
+            pos_embs = np.vstack([pos_embs, image_emb[np.newaxis, :]]) if pos_embs.size else image_emb[np.newaxis, :]
         neg_embs = self._embed_texts(neg_texts)
+        if image_pos_floor is not None:
+            pos_floor = max(pos_floor, image_pos_floor)
         min_ts_ms: Optional[int] = None
         if window_sec and window_sec > 0:
             min_ts_ms = int((time.time() - float(window_sec)) * 1000)

@@ -2554,6 +2554,7 @@ def home():
         let probeHitsCache = [];
         let probePairsState = [];
         let probeImageState = null;
+        let imageProbeEnabled = false;
         let probeList = [];
         let activeProbeId = null;
         const probeCaptureState = {};
@@ -3483,6 +3484,16 @@ def home():
             }
         }
 
+        function updateImageProbeStatus(enabled) {
+            imageProbeEnabled = enabled && Boolean(probeImageState?.data);
+            if (probeImageEnableBtn) {
+                probeImageEnableBtn.textContent = imageProbeEnabled ? 'Disable Image Probe' : 'Enable Image Probe';
+            }
+            if (probeImageStatus) {
+                probeImageStatus.textContent = `Status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}`;
+            }
+        }
+
         function collectProbeForm() {
             const positives = [];
             const negatives = [];
@@ -3510,6 +3521,7 @@ def home():
                     data: probeImageState?.data,
                     name: probeImageState?.name,
                     pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
+                    enabled: imageProbeEnabled,
                 },
             };
         }
@@ -3610,9 +3622,12 @@ def home():
                 probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
                 applyImageThumb(probe.image_probe.data);
                 if (probeImagePosInput) probeImagePosInput.value = probe.image_probe.pos_floor || 0.7;
+                const enabled = probe.image_probe.enabled !== false;
+                updateImageProbeStatus(enabled);
             } else {
                 probeImageState = null;
                 applyImageThumb('');
+                updateImageProbeStatus(false);
             }
             renderPairs();
             renderProbeHits(probe?.last_hit ? [probe.last_hit] : [], probe?.last_hit ? 1 : 0);
@@ -3972,6 +3987,7 @@ def home():
                     const base64 = reader.result.split(',')[1];
                     probeImageState = { name: file.name, data: base64 };
                     applyImageThumb(base64);
+                    updateImageProbeStatus(imageProbeEnabled);
                 };
                 reader.readAsDataURL(file);
             });
@@ -4050,6 +4066,15 @@ def home():
                 } else {
                     stopProbeRunLoop('Probe disabled');
                 }
+            });
+        }
+        if (probeImageEnableBtn) {
+            probeImageEnableBtn.addEventListener('click', () => {
+                if (!probeImageState?.data) {
+                    setProbeStatus('Select an image first.', true);
+                    return;
+                }
+                updateImageProbeStatus(!imageProbeEnabled);
             });
         }
         if (probeBenchBtn && probeBenchOutput) {
@@ -5527,6 +5552,7 @@ def _probe_daemon() -> None:
                             probe.get('margin', 0.05),
                             probe.get('top_k', 6),
                             window_sec=probe.get('window_sec', 300.0),
+                            image_probe=probe.get('image_probe'),
                         )
                         if 'error' in result:
                             continue
@@ -7108,7 +7134,7 @@ def probes_query():
         window_sec = float(data.get('window_sec', 0))
     except Exception:
         window_sec = 0
-    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec)
+    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec, image_probe=data.get('image_probe'))
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
     if hits and data.get('bookmark'):
@@ -7257,6 +7283,7 @@ def probes_run():
         probe.get('margin', 0.05),
         probe.get('top_k', 6),
         window_sec=probe.get('window_sec', 300.0),
+        image_probe=probe.get('image_probe'),
     )
     if 'error' in result:
         return jsonify(result), 400
