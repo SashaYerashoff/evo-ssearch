@@ -230,7 +230,8 @@ class LuxriotCaptureSession:
             return
         started = time.time()
         try:
-            messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt)
+            system_prompt = getattr(self.manager, "system_prompt", "") or ""
+            messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
             summary = self.manager.lm_callback(messages, model_override=self.model_hint)
             duration = time.time() - started
             entry = {
@@ -305,6 +306,7 @@ class LuxriotManager:
         self.alert_parser = alert_parser
         self.auto_bookmarks = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         self.probe_manager = probe_manager
+        self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
@@ -364,6 +366,7 @@ class LuxriotManager:
         batch_size: Optional[int] = None,
         prompt: str = "",
         model_hint: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         sizes = list(getattr(self.config, "LUXRIOT_BATCH_SIZES", (12, 24, 36)))
         default_size = sizes[0] if sizes else 12
@@ -380,6 +383,8 @@ class LuxriotManager:
             existing = self.sessions.pop(channel_id, None)
             if existing:
                 existing.stop()
+            if system_prompt:
+                self.system_prompt = system_prompt
             session = LuxriotCaptureSession(self, channel_id, batch, prompt, model_hint=model_hint)
             self.sessions[channel_id] = session
             session.start()

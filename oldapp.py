@@ -2050,11 +2050,11 @@ def home():
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
             <div id="videoBox" class="video-box" style="display: none;">
-                <div class="luxriot-grid">
-                    <div class="luxriot-card">
-                        <div class="luxriot-header">
-                            <h4>Luxriot Live Preview</h4>
-                            <div id="luxriotStatus" class="luxriot-status">Not connected</div>
+        <div class="luxriot-grid">
+            <div class="luxriot-card">
+                <div class="luxriot-header">
+                    <h4>Luxriot Live Preview</h4>
+                    <div id="luxriotStatus" class="luxriot-status">Not connected</div>
                         </div>
                         <div class="luxriot-row">
                             <label for="luxriotChannelSelect">Channel:</label>
@@ -2073,15 +2073,19 @@ def home():
                             <button id="luxriotStopCapture" class="feature-btn">Stop</button>
                             <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
                         </div>
-                        <div class="luxriot-row">
-                            <label for="luxriotPrompt">Prompt:</label>
-                        </div>
-                        <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
-                        <div class="luxriot-viewport" id="luxriotViewport">
-                            <img id="luxriotPreview" src="" alt="Luxriot live preview" />
-                            <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
-                        </div>
-                    </div>
+                <div class="luxriot-row">
+                    <label for="luxriotPrompt">Prompt:</label>
+                </div>
+                <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                <div class="luxriot-row">
+                    <label for="luxriotSystemPrompt">System prompt (LLM role):</label>
+                </div>
+                <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for summaries">{luxriot_system_prompt_default}</textarea>
+                <div class="luxriot-viewport" id="luxriotViewport">
+                    <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                    <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                </div>
+            </div>
                     <div class="luxriot-card">
                         <div class="luxriot-header">
                             <h4>Live Summaries</h4>
@@ -2492,6 +2496,7 @@ def home():
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaries = document.getElementById('luxriotSummaries');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
+        const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
         const probeChannelSelect = document.getElementById('probeChannelSelect');
         const probeTopKInput = document.getElementById('probeTopK');
         const probePosFloorInput = document.getElementById('probePosFloor');
@@ -2798,6 +2803,7 @@ def home():
                 ? parseInt(luxriotBatchSizeSelect.value, 10)
                 : luxriotDefaults.batchSize || 12;
             const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
+            const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
             const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
             luxriotStartCaptureBtn.disabled = true;
             setLuxriotStatus('Starting summaries...');
@@ -2809,7 +2815,8 @@ def home():
                         channel_id: channelId,
                         batch_size: batchSize,
                         prompt: prompt || fallbackPrompt,
-                        model: videoModelInput ? videoModelInput.value.trim() : ''
+                        model: videoModelInput ? videoModelInput.value.trim() : '',
+                        system_prompt: systemPrompt
                     })
                 });
                 const data = await resp.json();
@@ -5241,7 +5248,7 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
     ]
 
 
-def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
+def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str, system_prompt: str) -> List[Dict[str, Any]]:
     prompt = (user_prompt or '').strip() or "Describe notable activity, people, vehicles, and anomalies."
     intro = (
         f"Live snapshots from Luxriot channel {channel_label}. "
@@ -5263,27 +5270,7 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
                     },
                 }
             )
-    system_msg = (
-        "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
-        "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
-        "Always append a JSON block in this form (alerts may be empty, but must be present):\n"
-        "```json\n"
-        "{\n"
-        '  \"alerts\": [\n'
-        '    {\n'
-        '      \"title\": \"short alert title\",\n'
-        '      \"description\": \"1-2 sentence description with any time/frame hints\",\n'
-        '      \"severity\": \"info|low|normal|high|critical\",\n'
-        '      \"state\": \"new|inprogress|closed|hidden|none\",\n'
-        '      \"channel_id\": <channel id>,\n'
-        '      \"timestamp_ms\": <milliseconds since epoch>\n'
-        '    }\n'
-        '  ]\n'
-        "}\n"
-        "```\n"
-        "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
-        "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
-    )
+    system_msg = system_prompt.strip() or LUXRIOT_SYSTEM_PROMPT_DEFAULT
     return [
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
         {'role': 'user', 'content': user_content},
@@ -5445,6 +5432,16 @@ luxriot_manager = LuxriotManager(
 PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
 PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
 PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
+LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+    "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
+    "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
+    "Always append a JSON block in this form (alerts may be empty, but must be present): "
+    "{ 'alerts': [ { 'title': 'short alert title', 'description': '1-2 sentence description with any time/frame hints', "
+    "'severity': 'info|low|normal|high|critical', 'state': 'new|inprogress|closed|hidden|none', "
+    "'channel_id': <channel id>, 'timestamp_ms': <milliseconds since epoch> } ] }. "
+    "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
+    "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
+)
 
 probe_manager = ProbeManager(
     embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
