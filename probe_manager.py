@@ -181,8 +181,7 @@ class ProbeManager:
                     image_pos_floor = None
         if not pos_texts and not image_enabled:
             return {"error": "Provide at least one positive probe (text or image)."}
-        if not neg_texts:
-            return {"error": "Provide at least one negative probe."}
+        # Negatives optional; if none, margin uses zero neg scores.
         pos_embs = self._embed_texts(pos_texts)
         if image_emb is not None:
             if image_emb.ndim != 1:

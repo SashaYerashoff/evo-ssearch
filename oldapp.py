@@ -3574,7 +3574,7 @@ def home():
             probeCards.innerHTML = probeList.map((p) => {
                 const last = p.last_hit;
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-                const status = p.enabled === false ? 'disabled' : (last ? 'running' : 'idle');
+                const status = p.enabled === false ? 'disabled' : (p.enabled ? 'running' : 'idle');
                 const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
                 const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
                 return `
