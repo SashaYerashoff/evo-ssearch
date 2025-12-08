@@ -1823,6 +1823,21 @@ def home():
             right: 6px;
         }
 
+        .new-probe-card {
+            border: 1px dashed #2f5a3a;
+            background: #0b0b0b;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            grid-template-columns: 1fr;
+            min-height: 120px;
+        }
+
+        .new-probe-card button {
+            padding: 0.75rem 1.25rem;
+            font-weight: 600;
+        }
+
         .probe-pairs {
             background: #0f0f0f;
             border: 1px solid #1f1f1f;
@@ -3577,10 +3592,13 @@ def home():
         function renderProbeCards() {
             if (!probeCards) return;
             if (!probeList.length) {
-                probeCards.innerHTML = '<div class="loading">No saved probes</div>';
+                probeCards.innerHTML = `
+                    <div class="probe-mini-card new-probe-card">
+                        <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                    </div>`;
                 return;
             }
-            probeCards.innerHTML = probeList.map((p) => {
+            const cards = probeList.map((p) => {
                 const last = p.last_hit;
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
                 const status = p.enabled === false ? 'disabled' : (p.enabled ? 'running' : 'idle');
@@ -3611,7 +3629,13 @@ def home():
                         </div>
                     </div>
                 `;
-            }).join('');
+            });
+            cards.push(`
+                <div class="probe-mini-card new-probe-card">
+                    <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                </div>
+            `);
+            probeCards.innerHTML = cards.join('');
         }
 
         function setActiveProbe(probe) {
@@ -3928,6 +3952,14 @@ def home():
                 setActiveProbe(probe);
                 persistProbeEnabled(false);
                 stopProbeRunLoop();
+            } else if (action === 'new') {
+                activeProbeId = null;
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                if (probeEnableToggle) probeEnableToggle.checked = true;
+                setProbeStatus('New probe');
             }
         }
 
