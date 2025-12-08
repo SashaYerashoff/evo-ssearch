@@ -1616,6 +1616,23 @@ def home():
             gap: 0.75rem;
         }
 
+        .bench-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.75rem;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .bench-meta {
+            color: #bcbcbc;
+            font-size: 0.95rem;
+            line-height: 1.35;
+        }
+
         .probe-result {
             background: #0a0a0a;
             border: 1px solid #1d1d1d;
@@ -2235,6 +2252,13 @@ def home():
                         </div>
                         <div id="probeCards" class="probe-grid"></div>
                     </div>
+                    <div class="bench-card">
+                        <div>
+                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
+                            <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
+                        </div>
+                        <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2507,6 +2531,8 @@ def home():
         const probeBufferInfo = document.getElementById('probeBufferInfo');
         const probeStreamState = document.getElementById('probeStreamState');
         const probeEnableToggle = document.getElementById('probeEnableToggle');
+        const probeBenchBtn = document.getElementById('probeBenchBtn');
+        const probeBenchOutput = document.getElementById('probeBenchOutput');
         
         let currentFolder = '';
         let currentMode = 'text';
@@ -4023,6 +4049,22 @@ def home():
                     runActiveProbe(true);
                 } else {
                     stopProbeRunLoop('Probe disabled');
+                }
+            });
+        }
+        if (probeBenchBtn && probeBenchOutput) {
+            probeBenchBtn.addEventListener('click', async () => {
+                probeBenchBtn.disabled = true;
+                probeBenchOutput.textContent = 'Benchmark running...';
+                try {
+                    const resp = await fetch('/probes/bench');
+                    const data = await resp.json();
+                    if (!resp.ok || data.error) throw new Error(data.error || 'Benchmark failed');
+                    probeBenchOutput.textContent = `~${data.approx_fps} fps @ batch ${data.batch} on ${data.device} (elapsed ${data.elapsed_sec}s)`;
+                } catch (err) {
+                    probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
+                } finally {
+                    probeBenchBtn.disabled = false;
                 }
             });
         }
