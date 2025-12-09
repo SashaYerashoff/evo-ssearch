@@ -34,6 +34,7 @@ SISU is a CLIP/DINO-powered search and monitoring toolkit with Luxriot Evo S int
 - CUDA-capable GPU recommended for probes/monitoring (NVIDIA, drivers + CUDA toolkit)
 - **LM Studio** with a vision-capable model (e.g., Qwen3-VL) running, if using Video Understanding
 - **Luxriot Evo S** server up and reachable, if using monitoring/bookmarks
+- **vLLM** (optional, faster Video Understanding) with a vision model such as Qwen/Qwen3-VL-4B-Instruct
 
 ## Installation & Setup
 
@@ -73,6 +74,14 @@ pip install -r requirements.txt
 # Download weights manually and place in embedders/dino_encoder or per your config.
 # Example (adjust model name/path as needed):
 # wget -O embedders/dino_encoder/dinov3_vitb16_pretrain.pth https://dl.fbaipublicfiles.com/dinov3/dinov3_vitb16_pretrain.pth
+
+# (Optional) vLLM for Video Understanding (vision)
+# Clone HF model locally (example: Qwen/Qwen3-VL-4B-Instruct)
+# git clone https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct /path/to/Qwen3-VL-4B-Instruct
+# Start vLLM (CUDA):
+# export VLLM_WORKER_USE_VISION_ENGINE=1
+# vllm serve /path/to/Qwen3-VL-4B-Instruct --port 8000 --api-type openai --trust-remote-code --max-model-len 4096
+# Then set EVOSSEARCH_LM_BASE_URL=http://localhost:8000/v1 and EVOSSEARCH_LM_MODEL=Qwen/Qwen3-VL-4B-Instruct
 ```
 
 ## Running the Application
@@ -157,6 +166,11 @@ EVOSSEARCH_PROBE_BENCH_BATCH=16         # batch size for /probes/bench
 
 # DINOv3 weights (manual download)
 # Place weights in embedders/dino_encoder or configure the path in config.py
+
+# vLLM (Video Understanding via OpenAI-compatible endpoint)
+# Set the base URL/model to point to your vLLM server running a vision model
+# e.g., EVOSSEARCH_LM_BASE_URL=http://localhost:8000/v1
+#       EVOSSEARCH_LM_MODEL=Qwen/Qwen3-VL-4B-Instruct
 ```
 
 ### Example Usage
