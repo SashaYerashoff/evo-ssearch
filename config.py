@@ -29,13 +29,26 @@ class Config:
     # Embedder configuration
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', 'ViT-B/32')
-    DINO_MODEL = os.getenv('EVOSSEARCH_DINO_MODEL', 'dinov3_vitb16')
+    DINO_MODEL = os.getenv('EVOSSEARCH_DINO_MODEL', 'dinov3_vith16plus')
     try:
-        EMB_DIM_DINO = int(os.getenv('EVOSSEARCH_EMB_DIM_DINO', '768'))
+        EMB_DIM_DINO = int(os.getenv('EVOSSEARCH_EMB_DIM_DINO', '1280'))
     except ValueError:
-        EMB_DIM_DINO = 768
-    DINO_WEIGHTS_PATH = os.getenv('EVOSSEARCH_DINO_WEIGHTS_PATH', '')
-    DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', '').strip()
+        EMB_DIM_DINO = 1280
+    DINO_WEIGHTS_PATH = os.getenv(
+        'EVOSSEARCH_DINO_WEIGHTS_PATH',
+        '/home/sasha/Downloads/dinoweigths/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth',
+    )
+    DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', 'cuda:0').strip()
+
+    MASK2FORMER_ENABLED = _get_bool_env('EVOSSEARCH_M2F_ENABLED', 'True')
+    MASK2FORMER_MODEL = os.getenv('EVOSSEARCH_M2F_MODEL', 'facebook/mask2former-swin-base-ade-semantic')
+    MASK2FORMER_DEVICE = os.getenv('EVOSSEARCH_M2F_DEVICE', DINO_DEVICE or 'cuda:0').strip()
+    try:
+        MASK2FORMER_MAX_SIZE = int(os.getenv('EVOSSEARCH_M2F_MAX_SIZE', '1024'))
+    except (TypeError, ValueError):
+        MASK2FORMER_MAX_SIZE = 1024
+    if MASK2FORMER_MAX_SIZE < 256:
+        MASK2FORMER_MAX_SIZE = 256
 
     INDEX_MODE = os.getenv('EVOSSEARCH_INDEX_MODE', 'clip').strip().lower()
     if INDEX_MODE not in {'clip', 'dino', 'dual'}:
@@ -88,6 +101,88 @@ class Config:
 
     # Security configuration
     MAX_FILE_SIZE_MB = int(os.getenv('EVOSSEARCH_MAX_FILE_SIZE_MB', '50'))
+
+    # LM Studio / Qwen video understanding
+    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://192.168.1.104:1234/v1').strip().rstrip('/')
+    LM_MODEL = os.getenv('EVOSSEARCH_LM_MODEL', 'qwen/qwen3-vl-4b').strip()
+    LM_API_KEY = os.getenv('EVOSSEARCH_LM_API_KEY', '').strip()
+    try:
+        LM_TIMEOUT = int(os.getenv('EVOSSEARCH_LM_TIMEOUT', '120'))
+    except (TypeError, ValueError):
+        LM_TIMEOUT = 120
+    try:
+        LM_VIDEO_DEFAULT_FRAMES = int(os.getenv('EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES', '16'))
+    except (TypeError, ValueError):
+        LM_VIDEO_DEFAULT_FRAMES = 16
+    if LM_VIDEO_DEFAULT_FRAMES < 1:
+        LM_VIDEO_DEFAULT_FRAMES = 1
+    try:
+        LM_VIDEO_MAX_FRAMES = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_FRAMES', '64'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_FRAMES = 64
+    if LM_VIDEO_MAX_FRAMES < 1:
+        LM_VIDEO_MAX_FRAMES = 1
+    LM_VIDEO_FRAME_OPTIONS = (16, 32, 64)
+    try:
+        LM_VIDEO_MAX_EDGE = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_EDGE', '960'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_EDGE = 960
+    try:
+        LM_VIDEO_MAX_TOKENS = int(os.getenv('EVOSSEARCH_LM_VIDEO_MAX_TOKENS', '1536'))
+    except (TypeError, ValueError):
+        LM_VIDEO_MAX_TOKENS = 1536
+    try:
+        LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
+    except (TypeError, ValueError):
+        LM_VIDEO_TEMPERATURE = 0.2
+    LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
+    # Luxriot Evo integration
+    LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://192.168.1.102:8080').strip().rstrip('/')
+    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', 'admin').strip()
+    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '123').strip()
+    try:
+        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
+    except (TypeError, ValueError):
+        LUXRIOT_SNAPSHOT_INTERVAL = 5
+    try:
+        LUXRIOT_SNAPSHOT_MAX_EDGE = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE', '800'))
+    except (TypeError, ValueError):
+        LUXRIOT_SNAPSHOT_MAX_EDGE = 800
+    if LUXRIOT_SNAPSHOT_MAX_EDGE < 640:
+        LUXRIOT_SNAPSHOT_MAX_EDGE = 640
+    LUXRIOT_BATCH_SIZES = (12, 24, 36)
+    try:
+        LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '103'))
+    except (TypeError, ValueError):
+        LUXRIOT_DEFAULT_CHANNEL_ID = 103
+    try:
+        LUXRIOT_MAX_BUFFER_FRAMES = int(os.getenv('EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES', '180'))
+    except (TypeError, ValueError):
+        LUXRIOT_MAX_BUFFER_FRAMES = 180
+    if LUXRIOT_MAX_BUFFER_FRAMES < 12:
+        LUXRIOT_MAX_BUFFER_FRAMES = 12
+    LUXRIOT_AUTO_BOOKMARKS = _get_bool_env('EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS', 'False')
+    LUXRIOT_SEVERITY_MAP = {
+        'info': os.getenv('EVOSSEARCH_LUXRIOT_SEV_INFO', 'info').lower(),
+        'low': os.getenv('EVOSSEARCH_LUXRIOT_SEV_LOW', 'low').lower(),
+        'normal': os.getenv('EVOSSEARCH_LUXRIOT_SEV_NORMAL', 'normal').lower(),
+        'high': os.getenv('EVOSSEARCH_LUXRIOT_SEV_HIGH', 'high').lower(),
+        'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
+    }
+
+    # Probe / CLIP monitoring
+    try:
+        PROBE_MAX_FRAMES = int(os.getenv('EVOSSEARCH_PROBE_MAX_FRAMES', '2000'))
+    except (TypeError, ValueError):
+        PROBE_MAX_FRAMES = 2000
+    if PROBE_MAX_FRAMES < 100:
+        PROBE_MAX_FRAMES = 100
+    try:
+        PROBE_THUMB_MAX_EDGE = int(os.getenv('EVOSSEARCH_PROBE_THUMB_MAX_EDGE', '256'))
+    except (TypeError, ValueError):
+        PROBE_THUMB_MAX_EDGE = 256
+    if PROBE_THUMB_MAX_EDGE < 64:
+        PROBE_THUMB_MAX_EDGE = 64
 
     @classmethod
     def get_server_urls(cls):
@@ -153,7 +248,24 @@ class Config:
                 'enabled' if cls.DINO_SEGMENTS_ENABLED else 'disabled', cls.DINO_SEGMENT_MIN_PATCHES
             )
         )
+        print(
+            f"Video LM: {cls.LM_MODEL} @ {cls.LM_BASE_URL or 'unset'} "
+            f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, max_edge={cls.LM_VIDEO_MAX_EDGE})"
+        )
+        if cls.MASK2FORMER_ENABLED:
+            print(
+                f"Mask2Former: enabled ({cls.MASK2FORMER_MODEL}, device={cls.MASK2FORMER_DEVICE}, max_edge={cls.MASK2FORMER_MAX_SIZE})"
+            )
+        else:
+            print("Mask2Former: disabled")
         print(f"Result Limits: {cls.MIN_RESULTS}-{cls.MAX_RESULTS} (default: {cls.DEFAULT_RESULTS})")
+        print(
+            f"Luxriot Evo: {cls.LUXRIOT_BASE_URL or 'unset'} "
+            f"(default channel: {cls.LUXRIOT_DEFAULT_CHANNEL_ID}, "
+            f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
+            f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
+            f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
+        )
         print()
         print("Server available at:")
         for url in cls.get_server_urls():

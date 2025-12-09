@@ -4,13 +4,17 @@ import base64
 import json
 import pickle
 import time
+import math
+import requests
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from urllib.parse import unquote
+from threading import Lock
 
 import numpy as np
 import torch
+import cv2
 import clip
 import faiss
 from PIL import Image
@@ -19,6 +23,15 @@ from flask_cors import CORS
 
 from config import config
 from embedders.dino_encoder import DINOEncoder
+from luxriot_connector import LuxriotManager
+from probe_manager import ProbeManager
+import numpy as np
+import threading
+import time
+try:
+    from heads.mask2former_head import Mask2FormerHead
+except Exception:  # pragma: no cover - optional dependency
+    Mask2FormerHead = None  # type: ignore[misc]
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +41,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model: Optional[torch.nn.Module] = None
 clip_preprocess = None
 dino_encoder: Optional[DINOEncoder] = None
+mask2former_head: Optional["Mask2FormerHead"] = None
+_mask2former_lock = Lock()
+_mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
@@ -49,11 +65,31 @@ def init_dino() -> None:
     global dino_encoder
     if dino_encoder is not None:
         return
+    weights_path = (config.DINO_WEIGHTS_PATH or "").strip()
+    if not weights_path:
+        raise RuntimeError(
+            "EVOSSEARCH_DINO_WEIGHTS_PATH is not set. Provide a local DINO checkpoint to keep inference on GPU."
+        )
+    weights_file = Path(weights_path).expanduser()
+    if not weights_file.exists():
+        raise FileNotFoundError(f"DINO weights file not found: {weights_file}")
+    config.DINO_WEIGHTS_PATH = str(weights_file.resolve())
+
+    device_hint = (config.DINO_DEVICE or "").strip()
+    if not device_hint:
+        if torch.cuda.is_available():
+            device_hint = "cuda:0"
+        else:
+            raise RuntimeError("CUDA device required for DINO encoder; none detected.")
+    if not device_hint.startswith("cuda"):
+        raise RuntimeError("DINO encoder must run on CUDA. Set EVOSSEARCH_DINO_DEVICE accordingly.")
+    config.DINO_DEVICE = device_hint
+
     dino_encoder = DINOEncoder(
         model_name=config.DINO_MODEL,
         batch_size=config.BATCH_SIZE,
-        weights_path=config.DINO_WEIGHTS_PATH or None,
-        device=config.DINO_DEVICE or None,
+        weights_path=config.DINO_WEIGHTS_PATH,
+        device=config.DINO_DEVICE,
     )
 
 
@@ -68,6 +104,35 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         init_dino()
     else:
         raise ValueError(f"Unsupported embedder: {target}")
+
+
+def ensure_mask_head() -> Optional["Mask2FormerHead"]:
+    global mask2former_head, _mask2former_failed
+    if not config.MASK2FORMER_ENABLED:
+        return None
+    if Mask2FormerHead is None:
+        if not _mask2former_failed:
+            print("Mask2Former head unavailable: transformers vision deps missing; disabling head.")
+            _mask2former_failed = True
+        return None
+    if mask2former_head is not None:
+        return mask2former_head
+    with _mask2former_lock:
+        if mask2former_head is not None:
+            return mask2former_head
+        try:
+            target_device = config.MASK2FORMER_DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
+            mask2former_head = Mask2FormerHead(
+                model_name=config.MASK2FORMER_MODEL,
+                device=target_device,
+                max_size=config.MASK2FORMER_MAX_SIZE,
+            )
+        except Exception as exc:
+            _mask2former_failed = True
+            print(f"Mask2Former head initialization failed: {exc}")
+            config.MASK2FORMER_ENABLED = False
+            return None
+    return mask2former_head
 
 
 def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
@@ -248,6 +313,12 @@ def home():
         result_options.append(f'<option value="{i}" {selected}>{i}</option>')
     
     result_options_html = '\n                            '.join(result_options)
+    luxriot_batch_options = []
+    for size in config.LUXRIOT_BATCH_SIZES:
+        selected = "selected" if size == config.LUXRIOT_BATCH_SIZES[0] else ""
+        luxriot_batch_options.append(f'<option value="{size}" {selected}>{size}</option>')
+    luxriot_batch_options_html = '\n                            '.join(luxriot_batch_options)
+    luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
     
     # Use string formatting for the result options
     html_template = '''
@@ -288,11 +359,36 @@ def home():
             align-items: center;
             margin-bottom: 2rem;
         }
-        
-        h1 {
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+        }
+
+        .brand-title {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        .brand-main {
             font-size: 2rem;
-            font-weight: 300;
-            letter-spacing: -0.02em;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            margin: 0;
+        }
+
+        .brand-sub {
+            color: #d8d8d8;
+            font-size: 1.05rem;
+            margin: 0;
+        }
+
+        .brand-note {
+            color: #9c9c9c;
+            font-size: 0.9rem;
+            font-style: italic;
             margin: 0;
         }
         
@@ -668,6 +764,40 @@ def home():
             gap: 0.5rem;
         }
         
+        .segment-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .segment-controls label {
+            font-size: 0.85rem;
+            color: #bbb;
+        }
+        
+        .segment-threshold-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .segment-threshold-control input[type="range"] {
+            width: 160px;
+            accent-color: #ff9d1a;
+        }
+        
+        .segment-threshold-value {
+            font-variant-numeric: tabular-nums;
+            min-width: 3.5ch;
+            text-align: right;
+            color: #e0e0e0;
+        }
+        
+        .segment-threshold-control.disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+        
         .sort-control label,
         .limit-control label {
             color: #888;
@@ -776,6 +906,10 @@ def home():
             display: block;
         }
         
+        .thumbnail.segment-enabled {
+            cursor: crosshair;
+        }
+        
         
         .result-info {
             padding: 0.75rem;
@@ -846,6 +980,216 @@ def home():
             padding: 1rem;
             border-top: 1px solid #333;
             background: #0f0f0f;
+        }
+        
+        .segments-panel {
+            display: none;
+            padding: 1rem;
+            border-top: 1px solid #2a2a2a;
+            background: #111;
+        }
+        
+        .result-item.expanded .segments-panel {
+            display: block;
+        }
+        
+        .segments-status {
+            font-size: 0.85rem;
+            margin-bottom: 0.75rem;
+            color: #bcbcbc;
+        }
+        
+        .segments-status.success {
+            color: #7dd97b;
+        }
+        
+        .segments-status.error {
+            color: #ff6b6b;
+        }
+        
+        .segments-status.warning {
+            color: #f4c066;
+        }
+        
+        .segment-overlay-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            align-items: flex-start;
+            margin-bottom: 0.75rem;
+        }
+        
+        .segment-overlay-figure,
+        .segment-segmap-figure {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            max-width: 280px;
+        }
+        
+        .segment-overlay-figure figcaption,
+        .segment-segmap-figure figcaption {
+            color: #aaa;
+            font-size: 0.78rem;
+            letter-spacing: 0.01em;
+        }
+        
+        .segment-overlay-stack {
+            position: relative;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid #1f1f1f;
+        }
+        
+        .segment-overlay-stack img {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+        
+        .segment-overlay-stack .overlay-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        
+        .segment-overlay-stack .overlay-heatmap {
+            mix-blend-mode: screen;
+            opacity: 0.85;
+        }
+        
+        .segment-overlay-stack .overlay-mask {
+            mix-blend-mode: multiply;
+            opacity: 0.45;
+        }
+        
+        .segment-overlay-stack .overlay-crosshair {
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            margin-left: -7px;
+            margin-top: -7px;
+            border-radius: 50%;
+            border: 2px solid #ffdf6b;
+            box-shadow: 0 0 6px rgba(255, 223, 107, 0.7);
+            pointer-events: none;
+        }
+
+        .segment-segmap {
+            width: 100%;
+            border-radius: 10px;
+            border: 1px solid #1f1f1f;
+            display: block;
+        }
+        
+        .segment-legend {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+            margin-bottom: 0.75rem;
+        }
+        
+        .segment-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.78rem;
+            color: #cfcfcf;
+        }
+        
+        .segment-legend-item.highlight {
+            color: #ffffff;
+            font-weight: 600;
+        }
+        
+        .segment-legend-swatch {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+            border: 1px solid rgba(0, 0, 0, 0.6);
+            box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+        }
+        
+        .segment-legend-item.highlight .segment-legend-swatch {
+            box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
+        }
+        
+        .segment-overlay-images img {
+            max-width: 160px;
+            border: 1px solid #222;
+            border-radius: 4px;
+            background: #000;
+        }
+        
+        .segment-results-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        
+        .segment-results-list li {
+            background: #181818;
+            border: 1px solid #242424;
+            border-radius: 6px;
+            padding: 0.6rem 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            font-size: 0.82rem;
+        }
+        
+        .segment-title {
+            color: #e0e0e0;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+        
+        .segment-meta {
+            color: #888;
+            font-size: 0.78rem;
+        }
+        
+        .segment-match-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+        
+        .segment-match-row {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 5px;
+            padding: 0.35rem 0.5rem;
+        }
+        
+        .segment-match-thumb {
+            width: 44px;
+            height: 44px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid #1f1f1f;
+        }
+        
+        .segment-match-thumb.placeholder {
+            background: repeating-linear-gradient(45deg, #222, #222 6px, #1a1a1a 6px, #1a1a1a 12px);
+        }
+        
+        .segment-match-meta {
+            display: flex;
+            flex-direction: column;
+            font-size: 0.75rem;
+            color: #cfcfcf;
+            line-height: 1.35;
         }
         
         .result-item.expanded .comment-section {
@@ -990,32 +1334,631 @@ def home():
             background: rgba(0, 0, 0, 0.9);
             transform: scale(1.1);
         }
-        
-        
-        .find-similar-icon {
-            position: absolute;
-            top: 8px;
-            right: 8px;
-            background: rgba(0, 0, 0, 0.7);
+
+        .result-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin-top: 0.35rem;
+        }
+
+        .action-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: #1a1a1a;
+            border: 1px solid #2d2d2d;
             border-radius: 4px;
             padding: 4px;
             cursor: pointer;
-            pointer-events: auto; /* Re-enable clicks for the icon */
             transition: all 0.2s ease;
+        }
+
+        .action-icon:hover {
+            background: #202020;
+            border-color: #3a3a3a;
+        }
+        /* Video understanding */
+        .video-box {
+            display: none;
+            flex-direction: column;
+            gap: 0.8rem;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .video-row {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .video-row .input-group {
+            flex: 1;
+            min-width: 220px;
+        }
+
+        .video-prompt {
+            width: 100%;
+            min-height: 110px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.75rem;
+            resize: vertical;
+        }
+
+        .video-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .video-status {
+            font-size: 0.9rem;
+            color: #ccc;
+            min-height: 20px;
+        }
+
+        .video-output {
+            background: #0f0f0f;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 0.9rem;
+            color: #eaeaea;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .video-frame-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .video-frame-grid img {
+            width: 140px;
+            height: auto;
+            border-radius: 5px;
+            border: 1px solid #222;
+            background: #111;
+        }
+
+        /* Luxriot live view */
+        .luxriot-grid {
+            display: grid;
+            grid-template-columns: 1.3fr 1fr;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        @media (max-width: 1180px) {
+            .luxriot-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .luxriot-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+
+        .luxriot-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+        }
+
+        .luxriot-header h4 {
+            font-size: 1rem;
+        }
+
+        .luxriot-status {
+            font-size: 0.9rem;
+            color: #a6ffb0;
+        }
+
+        .luxriot-status.error {
+            color: #ff9080;
+        }
+
+        .luxriot-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-row label {
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        .luxriot-viewport {
+            position: relative;
+            background: #050505;
+            border: 1px solid #222;
+            border-radius: 8px;
+            min-height: 260px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .luxriot-viewport img {
+            width: 100%;
+            max-height: 500px;
+            object-fit: contain;
+            display: block;
+        }
+
+        .luxriot-viewport .luxriot-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #777;
+            font-size: 0.9rem;
+            pointer-events: none;
+            background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+        }
+
+        .luxriot-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-prompt {
+            width: 100%;
+            min-height: 80px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.65rem;
+            resize: vertical;
+        }
+
+        .luxriot-summaries {
+            max-height: 340px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .luxriot-summary {
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 6px;
+            padding: 0.65rem;
+        }
+
+        .luxriot-summary .timestamp {
+            color: #aaa;
+            font-size: 0.82rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .luxriot-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.55rem;
+            background: #161616;
+            border: 1px solid #2b2b2b;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            color: #cfcfcf;
+        }
+
+        .luxriot-mini-input {
+            min-width: 120px;
+        }
+
+        /* Probes */
+        .probe-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+            margin-top: 0.5rem;
+        }
+
+        .probe-row {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .probe-row label {
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        .probe-textarea {
+            width: 100%;
+            min-height: 60px;
+            background: #0f0f0f;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            color: #eaeaea;
+            padding: 0.65rem;
+            resize: vertical;
+        }
+
+        .probe-results {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 0.5rem;
+        }
+
+        .probe-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 0.75rem;
+        }
+
+        .bench-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.75rem;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .bench-meta {
+            color: #bcbcbc;
+            font-size: 0.95rem;
+            line-height: 1.35;
+        }
+
+        .probe-result {
+            background: #0a0a0a;
+            border: 1px solid #1d1d1d;
+            border-radius: 8px;
+            padding: 0.6rem;
+        }
+
+        .probe-result img {
+            width: 100%;
+            border-radius: 6px;
+            margin-bottom: 0.4rem;
+        }
+
+        /* Monitoring mock-inspired layout */
+        .monitor-grid {
+            display: grid;
+            grid-template-columns: 35% 65%;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .monitor-panel {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 10px;
+            padding: 0.75rem;
+        }
+
+        .monitor-panel h4 {
+            margin: 0 0 0.6rem 0;
+        }
+
+        .monitor-stream-preview {
+            width: 100%;
+            aspect-ratio: 16/9;
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 6px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .monitor-stream-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .monitor-stream-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, rgba(0,0,0,0.35), rgba(0,0,0,0.2));
+            color: #c8c8c8;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            pointer-events: none;
+        }
+
+        .monitor-inline {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .monitor-btn-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .monitor-actions-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .monitor-probe-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .monitor-probe-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.8rem;
+        }
+
+        .monitor-probe-box {
+            background: #0c0c0c;
+            border: 1px solid #1f1f1f;
+            border-radius: 8px;
+            padding: 0.6rem;
+        }
+
+        .probe-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .probe-mini-card {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.7rem;
+            display: grid;
+            grid-template-columns: 1fr 120px;
+            gap: 0.6rem;
+            align-items: stretch;
+            min-height: 120px;
+        }
+
+        .probe-mini-card.active {
+            border-color: #3a6346;
+            box-shadow: 0 0 0 1px rgba(58, 99, 70, 0.35);
+        }
+
+        .probe-mini-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .probe-mini-name {
+            font-weight: 600;
+            color: #e5e5e5;
+        }
+
+        .probe-status-pill {
+            padding: 0.15rem 0.45rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+            border: 1px solid #2e2e2e;
+        }
+
+        .pill-running { background: rgba(58, 99, 70, 0.2); color: #9bd2a8; border-color: #3a6346; }
+        .pill-paused { background: rgba(140, 120, 60, 0.15); color: #e4c47c; border-color: #8c783c; }
+        .pill-idle { background: rgba(90, 90, 90, 0.2); color: #cfcfcf; border-color: #555; }
+        .pill-disabled { background: rgba(110, 30, 30, 0.18); color: #e8a4a4; border-color: #8b0000; }
+
+        .probe-mini-meta {
+            color: #b4b4b4;
+            font-size: 0.9rem;
+            line-height: 1.35;
+        }
+
+        .probe-mini-actions {
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+
+        .probe-mini-thumb {
+            position: relative;
+            border: 1px solid #222;
+            border-radius: 8px;
+            background: #0a0a0a;
+            overflow: hidden;
+            min-height: 80px;
             display: flex;
             align-items: center;
             justify-content: center;
         }
-        
-        .find-similar-icon:hover {
-            background: rgba(0, 0, 0, 0.9);
-            transform: scale(1.1);
+
+        .probe-mini-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .probe-thumb-pill {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+        }
+
+        .new-probe-card {
+            border: 1px dashed #2f5a3a;
+            background: #0b0b0b;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            grid-template-columns: 1fr;
+            min-height: 120px;
+        }
+
+        .new-probe-card button {
+            padding: 0.75rem 1.25rem;
+            font-weight: 600;
+        }
+
+        .probe-pairs {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .probe-pairs-header {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr 60px;
+            gap: 0.35rem;
+            align-items: center;
+            color: #bdbdbd;
+            font-weight: 600;
+        }
+
+        .probe-pair-row {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr 60px;
+            gap: 0.35rem;
+            align-items: center;
+        }
+
+        .probe-pair-idx {
+            color: #a5a5a5;
+            text-align: center;
+        }
+
+        .probe-add-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            margin-top: 0.25rem;
+        }
+
+        .probe-meta {
+            color: #9a9a9a;
+            font-size: 0.9rem;
+        }
+
+        .image-probe-panel {
+            background: #101010;
+            border: 1px solid #203527;
+            border-radius: 10px;
+            padding: 0.75rem;
+            display: grid;
+            grid-template-columns: 65% 35%;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        .image-probe-left {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .image-probe-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .image-probe-pos {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .image-probe-actions {
+            display: flex;
+            gap: 0.6rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .probe-preview {
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 8px;
+            min-height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .probe-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .probe-preview-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, rgba(0,0,0,0.4), rgba(0,0,0,0.25));
+            color: #cfcfcf;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            text-align: center;
+            padding: 0.5rem;
+        }
+
+        .monitor-actions-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
         }
         
-        /* Show find similar icon only when expanded */
-        .result-item.expanded .find-similar-icon {
-            display: flex !important;
-        }
         
         /* Copy icon styling */
         .copy-icon {
@@ -1047,7 +1990,13 @@ def home():
 <body>
     <div class="container">
         <div class="header">
-            <h1>Natural Language Image Search</h1>
+            <div class="brand">
+                <div class="brand-title">
+                    <div class="brand-main">SISU</div>
+                    <div class="brand-sub">Smart Image Search and Understanding.</div>
+                    <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
+                </div>
+            </div>
             <div class="settings-icon" id="settingsBtn">
                 <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                     <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
@@ -1063,11 +2012,13 @@ def home():
             <div class="status" id="indexStatus"></div>
         </div>
         
-        <div class="search-panel">
-            <div class="search-mode-tabs">
-                <button id="textModeBtn" class="mode-tab active">Text Search</button>
-                <button id="imageModeBtn" class="mode-tab">Image Search</button>
-            </div>
+            <div class="search-panel">
+                <div class="search-mode-tabs">
+                    <button id="textModeBtn" class="mode-tab active">Text Search</button>
+                    <button id="imageModeBtn" class="mode-tab">Image Search</button>
+                    <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
+                    <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
+                </div>
             <div class="search-controls">
                 <div class="control-group">
                     <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
@@ -1085,6 +2036,13 @@ def home():
                         <select id="resultLimit">
                             {result_options_html}
                         </select>
+                    </div>
+                    <div class="segment-controls">
+                        <label for="segmentThresholdSlider">Region threshold:</label>
+                        <div class="segment-threshold-control" id="segmentThresholdControl">
+                            <input type="range" id="segmentThresholdSlider" min="40" max="99" value="70" step="1">
+                            <span class="segment-threshold-value" id="segmentThresholdValue">70%</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1106,8 +2064,221 @@ def home():
                 </div>
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
+            <div id="videoBox" class="video-box" style="display: none;">
+        <div class="luxriot-grid">
+            <div class="luxriot-card">
+                <div class="luxriot-header">
+                    <h4>Luxriot Live Preview</h4>
+                    <div id="luxriotStatus" class="luxriot-status">Not connected</div>
+                        </div>
+                        <div class="luxriot-row">
+                            <label for="luxriotChannelSelect">Channel:</label>
+                            <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
+                            <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
+                            <span class="luxriot-pill">Batch:
+                                <select id="luxriotBatchSize" class="luxriot-mini-input">
+                                    {luxriot_batch_options}
+                                </select>
+                            </span>
+                            <span class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
+                        </div>
+                        <div class="luxriot-actions">
+                            <button id="luxriotPreviewBtn" class="feature-btn">Preview</button>
+                            <button id="luxriotStartCapture" class="feature-btn primary">Start summaries</button>
+                            <button id="luxriotStopCapture" class="feature-btn">Stop</button>
+                            <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
+                        </div>
+                <div class="luxriot-row">
+                    <label for="luxriotPrompt">Prompt:</label>
+                </div>
+                <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                <div class="luxriot-row">
+                    <label for="luxriotSystemPrompt">System prompt (LLM role):</label>
+                </div>
+                <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for summaries">{luxriot_system_prompt_default}</textarea>
+                <div class="luxriot-viewport" id="luxriotViewport">
+                    <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                    <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                </div>
+            </div>
+                    <div class="luxriot-card">
+                        <div class="luxriot-header">
+                            <h4>Live Summaries</h4>
+                    <div class="luxriot-actions">
+                        <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
+                    </div>
+                </div>
+                <div id="luxriotSummaries" class="luxriot-summaries">
+                    <div class="loading">No summaries yet.</div>
+                </div>
+            </div>
         </div>
-        
+        <div class="video-row">
+            <div class="input-group">
+                <label for="videoPath" class="input-label">Video Path:</label>
+                <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+            </div>
+                    <div class="input-group">
+                        <label class="input-label" for="videoModel">Model ID:</label>
+                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
+                    </div>
+                </div>
+                <div class="video-row">
+                    <div class="input-group">
+                        <label class="input-label" for="videoFrameCount">Frames to sample:</label>
+                        <select id="videoFrameCount">
+                            <option value="16">16</option>
+                            <option value="32">32</option>
+                            <option value="64">64</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label class="input-label" for="videoSampleFps">Target sample FPS (optional):</label>
+                        <input type="number" id="videoSampleFps" min="0" step="0.1" placeholder="auto" />
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label class="input-label" for="videoPrompt">Prompt:</label>
+                    <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
+                    <label style="color: #aaa; font-size: 0.85rem;">
+                        <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
+                    </label>
+                </div>
+                <div class="video-controls">
+                    <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
+                    <button id="saveSummaryBtn" class="feature-btn" style="display:none;">Save summary as comment</button>
+                    <div id="videoStatus" class="video-status"></div>
+                </div>
+                <div id="videoOutput" class="video-output" style="display: none;"></div>
+                <div id="videoFrames" class="video-frame-grid"></div>
+            </div>
+                        <div id="monitorBox" class="video-box" style="display: none;">
+                <div class="probe-shell">
+                    <div class="probe-panel">
+                        <div class="probe-header">
+                            <div>
+                                <h4 style="margin:0;">Saved probes</h4>
+                                <div class="probe-meta">Click to expand, run, or delete.</div>
+                            </div>
+                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
+                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                            </div>
+                        </div>
+                        <div id="probeCards" class="probe-grid"></div>
+                    </div>
+                    <div class="bench-card">
+                        <div>
+                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
+                            <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
+                        </div>
+                        <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
+                    </div>
+                    <div class="monitor-grid">
+                        <div class="monitor-panel">
+                            <div class="probe-header" style="justify-content: space-between;">
+                                <h4>Live stream</h4>
+                                <span id="probeStatus" class="luxriot-status">Idle</span>
+                            </div>
+                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                                <label>Channel:</label>
+                                <select id="probeChannelSelect" class="luxriot-mini-input" style="flex:1;"></select>
+                            </div>
+                            <div class="monitor-stream-preview">
+                                <img id="probePreviewImg" src="" alt="" />
+                                <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                            </div>
+                            <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                            <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
+                            <div class="probe-meta" id="probeStreamState"></div>
+                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                                <label>FPS:</label>
+                                <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
+                                <label>Buffer (sec):</label>
+                                <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
+                            </div>
+                            <div class="probe-row spread">
+                                <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
+                                <div style="margin-left:auto; display:flex; align-items:center; gap:0.35rem;">
+                                    <label>Severity:</label>
+                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                                        <option value="info">info</option>
+                                        <option value="low">low</option>
+                                        <option value="normal">normal</option>
+                                        <option value="high">high</option>
+                                        <option value="critical" selected>critical</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="monitor-btn-row">
+                                <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
+                                <button id="probeStopCapture" class="feature-btn">Pause</button>
+                                <button id="probeStopAll" class="feature-btn">Stop</button>
+                            </div>
+                        </div>
+                        <div class="monitor-panel">
+                            <div class="monitor-probe-header">
+                                <label>Probe name:</label>
+                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
+                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+                                <label style="display:flex; align-items:center; gap:0.3rem;">
+                                    <input type="checkbox" id="probeEnableToggle" checked>
+                                    Enable probe
+                                </label>
+                            </div>
+                            <div class="probe-pairs" id="probePairs">
+                                <div class="probe-pairs-header">
+                                    <div></div>
+                                    <div>Positive Examples:</div>
+                                    <div>Negative Examples:</div>
+                                    <div style="text-align:center;">&nbsp;</div>
+                                </div>
+                            </div>
+                            <div class="probe-add-row">
+                                <span class="probe-pair-idx">+</span>
+                                <button id="probeAddPair" class="feature-btn">Add pair</button>
+                            </div>
+                            <div class="image-probe-panel">
+                                <div class="image-probe-left">
+                                    <div class="image-probe-row">
+                                        <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
+                                    </div>
+                                    <div class="image-probe-pos">
+                                        <label>Image Pos:</label>
+                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                    </div>
+                                    <div class="image-probe-actions">
+                                        <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
+                                        <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
+                                    </div>
+                                </div>
+                                <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
+                                    <img id="probeImageThumb" src="" alt="" />
+                                    <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="monitor-actions-bar">
+                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                            <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                            <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
+                        </div>
+                        <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
+                    </div>
+                    <div class="probe-panel">
+                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
+                            <h4 style="margin:0;">Latest Detections</h4>
+                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+                        </div>
+                        <div class="probe-nav">
+                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+                            <div id="probeResults" class="probe-results"></div>
+                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+                        </div>
+                    </div>
+                </div>
         <div id="results" class="results-grid"></div>
     </div>
     
@@ -1200,6 +2371,52 @@ def home():
                     <span class="range-value" id="qualityValue">85</span>
                 </div>
             </div>
+
+            <div class="settings-section">
+                <h3>Luxriot Evo</h3>
+                <div class="settings-row">
+                    <label class="settings-label">Base URL:</label>
+                    <input type="text" id="luxriotBaseUrl" class="settings-input" placeholder="http://192.168.1.102:8080">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Username:</label>
+                    <input type="text" id="luxriotUsername" class="settings-input" placeholder="admin">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Password:</label>
+                    <input type="password" id="luxriotPassword" class="settings-input" placeholder="••••••">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Default Channel ID:</label>
+                    <input type="number" id="luxriotDefaultChannelId" class="settings-input" min="1" placeholder="103">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Snapshot Interval (s):</label>
+                    <input type="number" id="luxriotSnapshotInterval" class="settings-input" min="1" max="300" placeholder="5">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Snapshot Max Edge (px):</label>
+                    <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Max Buffer Frames:</label>
+                    <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Auto Bookmark Alerts:</label>
+                    <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Severity Mapping:</label>
+                    <div style="display:flex; gap:0.4rem; flex-wrap: wrap;">
+                        <input type="text" id="luxriotSevInfo" class="settings-input" style="width:110px;" placeholder="info">
+                        <input type="text" id="luxriotSevLow" class="settings-input" style="width:110px;" placeholder="low">
+                        <input type="text" id="luxriotSevNormal" class="settings-input" style="width:110px;" placeholder="normal">
+                        <input type="text" id="luxriotSevHigh" class="settings-input" style="width:110px;" placeholder="high">
+                        <input type="text" id="luxriotSevCritical" class="settings-input" style="width:110px;" placeholder="critical">
+                    </div>
+                </div>
+            </div>
             
             <div class="settings-section">
                 <h3>Advanced Settings</h3>
@@ -1261,15 +2478,442 @@ def home():
         const imageSearchBtn = document.getElementById('imageSearchBtn');
         const textModeBtn = document.getElementById('textModeBtn');
         const imageModeBtn = document.getElementById('imageModeBtn');
+        const videoModeBtn = document.getElementById('videoModeBtn');
         const textSearchBox = document.getElementById('textSearchBox');
         const imageSearchBox = document.getElementById('imageSearchBox');
+        const videoBox = document.getElementById('videoBox');
+        const videoPathInput = document.getElementById('videoPath');
+        const videoModelInput = document.getElementById('videoModel');
+        const videoFrameCount = document.getElementById('videoFrameCount');
+        const videoSampleFpsInput = document.getElementById('videoSampleFps');
+        const videoPromptInput = document.getElementById('videoPrompt');
+        const saveVideoPromptInput = document.getElementById('saveVideoPrompt');
+        const videoRunBtn = document.getElementById('videoRunBtn');
+        const videoStatus = document.getElementById('videoStatus');
+        const videoOutput = document.getElementById('videoOutput');
+        const videoFrames = document.getElementById('videoFrames');
+        const saveSummaryBtn = document.getElementById('saveSummaryBtn');
+        const monitorModeBtn = document.getElementById('monitorModeBtn');
+        const monitorBox = document.getElementById('monitorBox');
+        const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
+        const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
+        const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
+        const luxriotStatusLabel = document.getElementById('luxriotStatus');
+        const luxriotPreviewImg = document.getElementById('luxriotPreview');
+        const luxriotOverlay = document.getElementById('luxriotOverlay');
+        const luxriotPreviewBtn = document.getElementById('luxriotPreviewBtn');
+        const luxriotStartCaptureBtn = document.getElementById('luxriotStartCapture');
+        const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
+        const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
+        const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
+        const luxriotSummaries = document.getElementById('luxriotSummaries');
+        const luxriotPromptInput = document.getElementById('luxriotPrompt');
+        const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
+        const probeChannelSelect = document.getElementById('probeChannelSelect');
+        const probeTopKInput = document.getElementById('probeTopK');
+        const probePosFloorInput = document.getElementById('probePosFloor');
+        const probeMarginInput = document.getElementById('probeMargin');
+        const probeNameInput = document.getElementById('probeName');
+        const probeRunBtn = document.getElementById('probeRunBtn');
+        const probeSaveBtn = document.getElementById('probeSaveBtn');
+        const probeDeleteBtn = document.getElementById('probeDeleteBtn');
+        const probeResults = document.getElementById('probeResults');
+        const probeStatus = document.getElementById('probeStatus');
+        const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
+        const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
+        const probeStartCaptureBtn = document.getElementById('probeStartCapture');
+        const probeStopCaptureBtn = document.getElementById('probeStopCapture');
+        const probeStopAllBtn = document.getElementById('probeStopAll');
+        const probeCaptureStatus = document.getElementById('probeCaptureStatus');
+        const probeHitsMeta = document.getElementById('probeHitsMeta');
+        const probeCards = document.getElementById('probeCards');
+        const probeNewBtn = document.getElementById('probeNewBtn');
+        const probeReloadBtn = document.getElementById('probeReloadBtn');
+        const probePreviewImg = document.getElementById('probePreviewImg');
+        const probePreviewOverlay = document.getElementById('probePreviewOverlay');
+        const probePairsContainer = document.getElementById('probePairs');
+        const probeAddPairBtn = document.getElementById('probeAddPair');
+        const probeImageFile = document.getElementById('probeImageFile');
+        const probeImageEnableBtn = document.getElementById('probeImageEnable');
+        const probeImageStatus = document.getElementById('probeImageStatus');
+        const probeImageThumb = document.getElementById('probeImageThumb');
+        const probeImageOverlay = document.getElementById('probeImageOverlay');
+        const probeImagePosInput = document.getElementById('probeImagePos');
+        const probeDetLeftBtn = document.getElementById('probeDetLeft');
+        const probeDetRightBtn = document.getElementById('probeDetRight');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
+        const probeBufferInfo = document.getElementById('probeBufferInfo');
+        const probeStreamState = document.getElementById('probeStreamState');
+        const probeEnableToggle = document.getElementById('probeEnableToggle');
+        const probeBenchBtn = document.getElementById('probeBenchBtn');
+        const probeBenchOutput = document.getElementById('probeBenchOutput');
         
         let currentFolder = '';
         let currentMode = 'text';
+        let videoTimerHandle = null;
+        let videoRequestStarted = 0;
+        let lastSummaryText = '';
+        let lastSummaryTarget = null;
+        const luxriotDefaults = {
+            channelId: {luxriot_default_channel},
+            snapshotInterval: {luxriot_snapshot_interval},
+            snapshotMaxEdge: {luxriot_snapshot_max_edge},
+            baseUrl: '{luxriot_base_url}',
+            batchSize: {luxriot_batch_default}
+        };
+        let luxriotActiveChannel = luxriotDefaults.channelId;
+        let luxriotPreviewTimer = null;
+        let luxriotSummaryTimer = null;
+        let luxriotInitialized = false;
+        let probeHitsCache = [];
+        let probePairsState = [];
+        let probeImageState = null;
+        let imageProbeEnabled = false;
+        let probeList = [];
+        let activeProbeId = null;
+        const probeCaptureState = {};
+        let probeRunTimer = null;
+        let probeRunInFlight = false;
+        let probePreviewTimer = null;
+        let lastProbeRefresh = 0;
+        let probeStatusTimer = null;
+        let probeHitsOffset = 0;
+        const channelCaptureConfig = {};
+        const channelFpsDesired = {};
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+            const safe = escapeHtml(text || '');
+            return safe
+                .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/\\n/g, '<br>');
+        }
+
+        function formatDuration(seconds) {
+            if (!Number.isFinite(seconds)) return 'n/a';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}m ${secs}s`;
+        }
+
+        function startVideoTimer() {
+            videoRequestStarted = performance.now();
+            if (videoTimerHandle) clearInterval(videoTimerHandle);
+            videoTimerHandle = setInterval(() => {
+                const elapsed = (performance.now() - videoRequestStarted) / 1000;
+                const base = videoStatus.dataset.base || '';
+                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
+            }, 200);
+        }
+
+        function stopVideoTimer(finalize = false) {
+            const elapsed = videoRequestStarted ? (performance.now() - videoRequestStarted) / 1000 : 0;
+            if (videoTimerHandle) {
+                clearInterval(videoTimerHandle);
+                videoTimerHandle = null;
+            }
+            if (finalize) {
+                const base = videoStatus.dataset.base || '';
+                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
+            }
+            videoRequestStarted = 0;
+        }
+
+        function setMode(mode) {
+            currentMode = mode;
+            textModeBtn.classList.toggle('active', mode === 'text');
+            imageModeBtn.classList.toggle('active', mode === 'image');
+            videoModeBtn.classList.toggle('active', mode === 'video');
+            monitorModeBtn.classList.toggle('active', mode === 'monitor');
+            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
+            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
+            videoBox.style.display = mode === 'video' ? 'flex' : 'none';
+            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
+            if (mode === 'video') {
+                ensureLuxriotInit();
+                startLuxriotPreview();
+                refreshLuxriotSummaries();
+                syncProbeChannelSelect();
+            } else if (mode === 'monitor') {
+                ensureLuxriotInit();
+                syncProbeChannelSelect();
+                startProbePreview(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10));
+                refreshProbeStatus();
+                loadProbeList();
+                startProbeStatusPoll();
+            } else {
+                stopLuxriotPreview();
+                stopLuxriotSummaryPoll();
+                stopProbePreview();
+                stopProbeRunLoop();
+                stopProbeStatusPoll();
+            }
+        }
+
+        function setLuxriotStatus(text, isError = false) {
+            if (!luxriotStatusLabel) return;
+            luxriotStatusLabel.textContent = text;
+            luxriotStatusLabel.classList.toggle('error', Boolean(isError));
+            if (isError) {
+                luxriotStatusLabel.title = text;
+            } else {
+                luxriotStatusLabel.removeAttribute('title');
+            }
+        }
+
+        function stopLuxriotPreview() {
+            if (luxriotPreviewTimer) {
+                clearInterval(luxriotPreviewTimer);
+                luxriotPreviewTimer = null;
+            }
+        }
+
+        function stopLuxriotSummaryPoll() {
+            if (luxriotSummaryTimer) {
+                clearInterval(luxriotSummaryTimer);
+                luxriotSummaryTimer = null;
+            }
+        }
+
+        function getSelectedLuxriotChannel() {
+            const raw = luxriotChannelSelect ? luxriotChannelSelect.value : '';
+            const parsed = parseInt(raw || luxriotActiveChannel, 10);
+            if (Number.isFinite(parsed)) {
+                luxriotActiveChannel = parsed;
+                return parsed;
+            }
+            return luxriotDefaults.channelId;
+        }
+
+        async function fetchLuxriotChannels(force = false) {
+            if (!luxriotChannelSelect) return;
+            luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
+            try {
+                const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`);
+                const data = await response.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                const channels = data.channels || [];
+                if (!channels.length) {
+                    luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    setLuxriotStatus('No channels available', true);
+                    return;
+                }
+                const options = channels.map((ch) => {
+                    const id = ch.id;
+                    const label = ch.title || `Channel ${id}`;
+                    const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
+                    return `<option value="${id}" ${selected}>${label} (#${id})</option>`;
+                });
+                luxriotChannelSelect.innerHTML = options.join('');
+                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
+                    luxriotActiveChannel = channels[0].id;
+                    luxriotChannelSelect.value = luxriotActiveChannel;
+                }
+                setLuxriotStatus(`Loaded ${channels.length} channels`);
+            } catch (err) {
+                luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                setLuxriotStatus('Channel load failed: ' + err.message, true);
+            }
+        }
+
+        function startLuxriotPreview() {
+            if (!luxriotPreviewImg) return;
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel to preview', true);
+                return;
+            }
+            const refresh = () => {
+                if (luxriotOverlay) {
+                    luxriotOverlay.textContent = 'Loading...';
+                }
+                luxriotPreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
+            };
+            luxriotPreviewImg.onload = () => {
+                if (luxriotOverlay) luxriotOverlay.textContent = '';
+                setLuxriotStatus(`Previewing channel ${channelId}`);
+            };
+            luxriotPreviewImg.onerror = () => {
+                if (luxriotOverlay) luxriotOverlay.textContent = 'Preview failed';
+                setLuxriotStatus('Preview failed', true);
+            };
+            stopLuxriotPreview();
+            refresh();
+            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
+            luxriotPreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function renderLuxriotSummaries(logs) {
+            if (!luxriotSummaries) return;
+            if (!logs || !logs.length) {
+                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet.</div>';
+                return;
+            }
+            const html = logs
+                .slice()
+                .reverse()
+                .map((log) => {
+                    const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
+                    const tsLabel = ts ? ts.toLocaleString() : 'n/a';
+                    const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
+                    return `
+                        <div class="luxriot-summary">
+                            <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}</div>
+                            <div class="summary-body">${renderMarkdown(log.summary || '')}</div>
+                        </div>
+                    `;
+                })
+                .join('');
+            luxriotSummaries.innerHTML = html;
+        }
+
+        async function refreshLuxriotSummaries(channelId = getSelectedLuxriotChannel()) {
+            if (!channelId) return;
+            try {
+                const resp = await fetch(`/luxriot/session?channel_id=${channelId}`);
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                renderLuxriotSummaries(data.logs || []);
+                let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
+                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
+                    baseStatus += ` · ${data.pending_frames} frames queued`;
+                }
+                setLuxriotStatus(baseStatus, Boolean(data.last_error));
+                if (data.last_error) {
+                    luxriotStatusLabel.title = data.last_error;
+                }
+            } catch (err) {
+                setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
+            }
+        }
+
+        function startLuxriotSummaryPoll(channelId = getSelectedLuxriotChannel()) {
+            stopLuxriotSummaryPoll();
+            luxriotSummaryTimer = setInterval(() => refreshLuxriotSummaries(channelId), 8000);
+        }
+
+        async function startLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel first', true);
+                return;
+            }
+            const batchSize = luxriotBatchSizeSelect
+                ? parseInt(luxriotBatchSizeSelect.value, 10)
+                : luxriotDefaults.batchSize || 12;
+            const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
+            const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
+            const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
+            luxriotStartCaptureBtn.disabled = true;
+            setLuxriotStatus('Starting summaries...');
+            try {
+                const resp = await fetch('/luxriot/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        batch_size: batchSize,
+                        prompt: prompt || fallbackPrompt,
+                        model: videoModelInput ? videoModelInput.value.trim() : '',
+                        system_prompt: systemPrompt
+                    })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Luxriot start failed');
+                }
+                setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
+                refreshLuxriotSummaries(channelId);
+                startLuxriotSummaryPoll(channelId);
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            } finally {
+                luxriotStartCaptureBtn.disabled = false;
+            }
+        }
+
+        async function stopLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            setLuxriotStatus('Stopping...');
+            try {
+                const resp = await fetch('/luxriot/stop_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                stopLuxriotSummaryPoll();
+                setLuxriotStatus('Summaries stopped');
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            }
+        }
+
+        async function flushLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            setLuxriotStatus('Flushing...');
+            try {
+                const resp = await fetch('/luxriot/flush_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || data.message || 'Flush failed');
+                }
+                setLuxriotStatus('Buffer flushed');
+                if (data.status) {
+                    renderLuxriotSummaries(data.status.logs || []);
+                }
+            } catch (err) {
+                setLuxriotStatus(err.message, true);
+            }
+        }
+
+        async function ensureLuxriotInit() {
+            if (luxriotInitialized) return;
+            luxriotInitialized = true;
+            await fetchLuxriotChannels();
+            startLuxriotPreview();
+            refreshLuxriotSummaries();
+        }
+
+        const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
+        if (savedVideoPrompt && videoPromptInput) {
+            videoPromptInput.value = savedVideoPrompt;
+            if (saveVideoPromptInput) {
+                saveVideoPromptInput.checked = true;
+            }
+        }
+        if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
+            luxriotPromptInput.value = videoPromptInput.value;
+        }
+        function syncProbeChannelSelect() {
+            if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
+                probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
+                probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
+            }
+        }
+        syncProbeChannelSelect();
+
+        setMode(currentMode);
         
         // Settings modal elements
         const settingsBtn = document.getElementById('settingsBtn');
@@ -1292,6 +2936,44 @@ def home():
         const rerankTopKInput = document.getElementById('rerankTopK');
         const segmentsEnabledInput = document.getElementById('segmentsEnabled');
         const segmentMinPatchesInput = document.getElementById('segmentMinPatches');
+        const segmentThresholdSlider = document.getElementById('segmentThresholdSlider');
+        const segmentThresholdValueEl = document.getElementById('segmentThresholdValue');
+        const segmentThresholdControl = document.getElementById('segmentThresholdControl');
+        const luxriotBaseUrlInput = document.getElementById('luxriotBaseUrl');
+        const luxriotUsernameInput = document.getElementById('luxriotUsername');
+        const luxriotPasswordInput = document.getElementById('luxriotPassword');
+        const luxriotDefaultChannelIdInput = document.getElementById('luxriotDefaultChannelId');
+        const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
+        const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
+        const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
+        const luxriotAutoBookmarksInput = document.getElementById('luxriotAutoBookmarks');
+        const luxriotSevInfoInput = document.getElementById('luxriotSevInfo');
+        const luxriotSevLowInput = document.getElementById('luxriotSevLow');
+        const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
+        const luxriotSevHighInput = document.getElementById('luxriotSevHigh');
+        const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
+        
+        let segmentThreshold = 0.7;
+
+        function clampSegmentThreshold(value) {
+            const numeric = Number.parseFloat(value);
+            if (!Number.isFinite(numeric)) {
+                return segmentThreshold;
+            }
+            return Math.min(0.99, Math.max(0.0, numeric));
+        }
+
+        function setSegmentThresholdFromPercent(percentValue) {
+            const pct = Number.parseInt(percentValue, 10);
+            const clamped = Math.min(99, Math.max(0, Number.isFinite(pct) ? pct : Math.round(segmentThreshold * 100)));
+            segmentThreshold = clamped / 100;
+            if (segmentThresholdSlider) {
+                segmentThresholdSlider.value = String(clamped);
+            }
+            if (segmentThresholdValueEl) {
+                segmentThresholdValueEl.textContent = `${clamped}%`;
+            }
+        }
 
         function formatPercent(value) {
             if (!Number.isFinite(value)) {
@@ -1369,6 +3051,13 @@ def home():
             fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
         });
 
+        if (segmentThresholdSlider) {
+            segmentThresholdSlider.addEventListener('input', (e) => {
+                setSegmentThresholdFromPercent(e.target.value);
+            });
+            setSegmentThresholdFromPercent(segmentThresholdSlider.value);
+        }
+
         fusionEnabledInput.addEventListener('change', () => {
             updateFusionUI(fusionEnabledInput.checked);
         });
@@ -1379,6 +3068,7 @@ def home():
 
         segmentsEnabledInput.addEventListener('change', () => {
             updateSegmentsUI(segmentsEnabledInput.checked);
+            refreshSegmentsPanels();
         });
 
         // Load current settings
@@ -1416,10 +3106,29 @@ def home():
                     document.getElementById('maxCommentLength').value = settings.maxCommentLength;
                     document.getElementById('maxFileSize').value = settings.maxFileSize;
                     document.getElementById('indexFolderName').value = settings.indexFolderName;
+                    if (luxriotBaseUrlInput) luxriotBaseUrlInput.value = settings.luxriotBaseUrl || '';
+                    if (luxriotUsernameInput) luxriotUsernameInput.value = settings.luxriotUsername || '';
+                    if (luxriotPasswordInput) luxriotPasswordInput.value = settings.luxriotPassword || '';
+                    if (luxriotDefaultChannelIdInput) luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
+                    if (luxriotSnapshotIntervalInput) luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
+                    if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
+                    if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
+                    if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = Boolean(settings.luxriotAutoBookmarks);
+                    if (settings.luxriotSeverityMap) {
+                        if (luxriotSevInfoInput) luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
+                        if (luxriotSevLowInput) luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
+                        if (luxriotSevNormalInput) luxriotSevNormalInput.value = settings.luxriotSeverityMap.normal || 'normal';
+                        if (luxriotSevHighInput) luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
+                        if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
+                    }
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
+                    const thresholdRaw = clampSegmentThreshold(settings.segmentThreshold);
+                    const pctValue = Math.round(thresholdRaw * 100);
+                    setSegmentThresholdFromPercent(pctValue);
                     updateSegmentsUI(segmentsEnabledInput.checked);
+                    refreshSegmentsPanels();
                 } else {
                     showSettingsStatus('Error loading settings: ' + data.error, 'error');
                 }
@@ -1442,6 +3151,7 @@ def home():
                     rerankTopK: parseInt(rerankTopKInput.value),
                     segmentsEnabled: segmentsEnabledInput.checked,
                     segmentMinPatches: parseInt(segmentMinPatchesInput.value),
+                    segmentThreshold: segmentThreshold,
                     clipModel: document.getElementById('clipModel').value,
                     dinoModel: dinoModelInput.value.trim(),
                     dinoEmbedDim: parseInt(dinoEmbedDimInput.value),
@@ -1454,7 +3164,22 @@ def home():
                     thumbnailQuality: parseInt(document.getElementById('thumbnailQuality').value),
                     maxCommentLength: parseInt(document.getElementById('maxCommentLength').value),
                     maxFileSize: parseInt(document.getElementById('maxFileSize').value),
-                    indexFolderName: document.getElementById('indexFolderName').value.trim()
+                    indexFolderName: document.getElementById('indexFolderName').value.trim(),
+                    luxriotBaseUrl: luxriotBaseUrlInput.value.trim(),
+                    luxriotUsername: luxriotUsernameInput.value.trim(),
+                    luxriotPassword: luxriotPasswordInput ? luxriotPasswordInput.value : '',
+                    luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput ? luxriotDefaultChannelIdInput.value : config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                    luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput ? luxriotSnapshotIntervalInput.value : config.LUXRIOT_SNAPSHOT_INTERVAL),
+                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput ? luxriotSnapshotMaxEdgeInput.value : config.LUXRIOT_SNAPSHOT_MAX_EDGE),
+                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput ? luxriotMaxBufferFramesInput.value : config.LUXRIOT_MAX_BUFFER_FRAMES),
+                    luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
+                    luxriotSeverityMap: {
+                        info: luxriotSevInfoInput ? (luxriotSevInfoInput.value.trim() || 'info') : 'info',
+                        low: luxriotSevLowInput ? (luxriotSevLowInput.value.trim() || 'low') : 'low',
+                        normal: luxriotSevNormalInput ? (luxriotSevNormalInput.value.trim() || 'normal') : 'normal',
+                        high: luxriotSevHighInput ? (luxriotSevHighInput.value.trim() || 'high') : 'high',
+                        critical: luxriotSevCriticalInput ? (luxriotSevCriticalInput.value.trim() || 'critical') : 'critical'
+                    }
                 };
                 
                 // Basic validation
@@ -1495,6 +3220,8 @@ def home():
                     const defaultSegments = parseInt(segmentMinPatchesInput.placeholder) || 3;
                     settings.segmentMinPatches = Number.isFinite(defaultSegments) && defaultSegments > 0 ? defaultSegments : 3;
                 }
+
+                settings.segmentThreshold = clampSegmentThreshold(settings.segmentThreshold);
 
                 if (settings.embedder === 'dino' && !settings.dinoModel) {
                     showSettingsStatus('DINO model name is required when DINO backend is selected', 'error');
@@ -1540,6 +3267,7 @@ def home():
                 rerankTopKInput.value = '50';
                 segmentsEnabledInput.checked = false;
                 segmentMinPatchesInput.value = '3';
+                setSegmentThresholdFromPercent(70);
                 dinoModelInput.value = 'dinov3_vitb16';
                 dinoEmbedDimInput.value = '1280';
                 dinoWeightsInput.value = '';
@@ -1554,9 +3282,23 @@ def home():
                 document.getElementById('maxCommentLength').value = '100';
                 document.getElementById('maxFileSize').value = '50';
                 document.getElementById('indexFolderName').value = '.clip_index';
+                luxriotBaseUrlInput.value = 'http://192.168.1.102:8080';
+                luxriotUsernameInput.value = 'admin';
+                luxriotPasswordInput.value = '123';
+                luxriotDefaultChannelIdInput.value = '103';
+                luxriotSnapshotIntervalInput.value = '5';
+                luxriotSnapshotMaxEdgeInput.value = '800';
+                luxriotMaxBufferFramesInput.value = '180';
+                if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
+                if (luxriotSevInfoInput) luxriotSevInfoInput.value = 'info';
+                if (luxriotSevLowInput) luxriotSevLowInput.value = 'low';
+                if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
+                if (luxriotSevHighInput) luxriotSevHighInput.value = 'high';
+                if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = 'critical';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
+                refreshSegmentsPanels();
                 applyEmbedderUI(embedderSelect.value);
             }
         });
@@ -1597,9 +3339,17 @@ def home():
         function updateSegmentsUI(enabled) {
             segmentMinPatchesInput.disabled = !enabled;
             segmentMinPatchesInput.classList.toggle('disabled', !enabled);
+            updateSegmentControlsUI(enabled);
+        }
+
+        function updateSegmentControlsUI(enabled) {
+            if (!segmentThresholdSlider || !segmentThresholdControl) return;
+            segmentThresholdSlider.disabled = !enabled;
+            segmentThresholdControl.classList.toggle('disabled', !enabled);
         }
 
         updateSegmentsUI(segmentsEnabledInput.checked);
+        refreshSegmentsPanels();
 
         function applyEmbedderUI(embedder) {
             const showDino = embedder === 'dino' || embedder === 'fusion';
@@ -1617,16 +3367,12 @@ def home():
                 textModeBtn.disabled = true;
                 textModeBtn.title = 'Text search is only available with the CLIP backend.';
                 textModeBtn.classList.remove('active');
-                imageModeBtn.classList.add('active');
-                currentMode = 'image';
-                textSearchBox.style.display = 'none';
-                imageSearchBox.style.display = 'flex';
+                setMode('image');
             } else {
                 textModeBtn.disabled = false;
                 textModeBtn.title = '';
                 if (currentMode === 'text') {
-                    textSearchBox.style.display = 'flex';
-                    imageSearchBox.style.display = 'none';
+                    setMode('text');
                 }
             }
         }
@@ -1635,23 +3381,766 @@ def home():
             applyEmbedderUI(event.target.value);
         });
         applyEmbedderUI(embedderSelect.value);
+        if (luxriotRefreshChannelsBtn) {
+            luxriotRefreshChannelsBtn.addEventListener('click', () => {
+                fetchLuxriotChannels(true).then(syncProbeChannelSelect);
+            });
+        }
+        if (luxriotPreviewBtn) {
+            luxriotPreviewBtn.addEventListener('click', () => {
+                fetchLuxriotChannels();
+                syncProbeChannelSelect();
+                startLuxriotPreview();
+            });
+        }
+        if (luxriotStartCaptureBtn) {
+            luxriotStartCaptureBtn.addEventListener('click', startLuxriotCapture);
+        }
+        if (luxriotStopCaptureBtn) {
+            luxriotStopCaptureBtn.addEventListener('click', stopLuxriotCapture);
+        }
+        if (luxriotFlushCaptureBtn) {
+            luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
+        }
+        if (luxriotRefreshSummariesBtn) {
+            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries());
+        }
+        if (luxriotChannelSelect) {
+            luxriotChannelSelect.addEventListener('change', () => {
+                luxriotActiveChannel = getSelectedLuxriotChannel();
+                syncProbeChannelSelect();
+                startLuxriotPreview();
+                refreshLuxriotSummaries();
+            });
+        }
         
+        // -------- Monitoring / Probes --------
+        function setProbeStatus(message, isError = false) {
+            if (!probeStatus) return;
+            probeStatus.textContent = message;
+            probeStatus.classList.toggle('error', Boolean(isError));
+        }
+
+        function setPreviewState(text, clearImage = false) {
+            if (probePreviewOverlay) {
+                probePreviewOverlay.style.display = text ? 'flex' : 'none';
+                if (text) probePreviewOverlay.textContent = text;
+            }
+            if (clearImage && probePreviewImg) {
+                probePreviewImg.src = '';
+            }
+        }
+
+        function stopProbePreview() {
+            if (probePreviewTimer) {
+                clearInterval(probePreviewTimer);
+                probePreviewTimer = null;
+            }
+        }
+
+        function startProbePreview(channelId) {
+            if (!probePreviewImg) return;
+            stopProbePreview();
+            if (!channelId && channelId !== 0) {
+                setPreviewState('No channel', true);
+                return;
+            }
+            if (probeStreamState) probeStreamState.textContent = `Streaming channel ${channelId}`;
+            const refresh = () => {
+                if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
+                probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
+            };
+            probePreviewImg.onload = () => setPreviewState('');
+            probePreviewImg.onerror = () => setPreviewState('Preview failed');
+            refresh();
+            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
+            probePreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function ensurePairsSeed() {
+            if (!probePairsState || !probePairsState.length) {
+                probePairsState = [
+                    { pos: '', neg: '' },
+                    { pos: '', neg: '' },
+                    { pos: '', neg: '' },
+                ];
+            }
+        }
+
+        function renderPairs() {
+            if (!probePairsContainer) return;
+            ensurePairsSeed();
+            const rows = probePairsState.map((row, idx) => {
+                const canRemove = probePairsState.length > 1;
+                const removeBtn = canRemove ? `<button class="feature-btn" data-remove="${idx}" style="width:54px;">×</button>` : '<div class="probe-pair-idx">–</div>';
+                return `
+                    <div class="probe-pair-row" data-idx="${idx}">
+                        <div class="probe-pair-idx">${idx + 1}.</div>
+                        <input type="text" class="settings-input probe-pos" data-idx="${idx}" value="${escapeHtml(row.pos || '')}" placeholder="Positive probe ${idx + 1}">
+                        <input type="text" class="settings-input probe-neg" data-idx="${idx}" value="${escapeHtml(row.neg || '')}" placeholder="Negative probe ${idx + 1}">
+                        ${removeBtn}
+                    </div>
+                `;
+            }).join('');
+            probePairsContainer.innerHTML = `
+                <div class="probe-pairs-header">
+                    <div></div>
+                    <div>Positive Examples:</div>
+                    <div>Negative Examples:</div>
+                    <div style="text-align:center;">&nbsp;</div>
+                </div>
+                ${rows}
+            `;
+        }
+
+        function applyImageThumb(base64) {
+            if (!probeImageThumb || !probeImageOverlay) return;
+            if (base64) {
+                probeImageThumb.src = `data:image/jpeg;base64,${base64}`;
+                probeImageOverlay.style.display = 'none';
+            } else {
+                probeImageThumb.src = '';
+                probeImageOverlay.style.display = 'flex';
+            }
+        }
+
+        function updateImageProbeStatus(enabled) {
+            imageProbeEnabled = enabled && Boolean(probeImageState?.data);
+            if (probeImageEnableBtn) {
+                probeImageEnableBtn.textContent = imageProbeEnabled ? 'Disable Image Probe' : 'Enable Image Probe';
+            }
+            if (probeImageStatus) {
+                probeImageStatus.textContent = `Status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}`;
+            }
+        }
+
+        function collectProbeForm() {
+            const positives = [];
+            const negatives = [];
+            ensurePairsSeed();
+            probePairsState.forEach((row) => {
+                if (row.pos?.trim()) positives.push(row.pos.trim());
+                if (row.neg?.trim()) negatives.push(row.neg.trim());
+            });
+            const channelId = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            return {
+                id: activeProbeId,
+                name: (probeNameInput?.value || '').trim(),
+                channel_id: Number.isFinite(channelId) ? channelId : luxriotActiveChannel,
+                pairs: probePairsState.slice(),
+                positives,
+                negatives,
+                pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
+                margin: parseFloat(probeMarginInput?.value) || 0.05,
+                top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
+                window_sec: parseFloat(probeWindowSec?.value) || 300,
+                fps: parseFloat(probeFps?.value) || 0,
+                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
+                bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
+                enabled: probeEnableToggle ? probeEnableToggle.checked : true,
+                image_probe: {
+                    data: probeImageState?.data,
+                    name: probeImageState?.name,
+                    pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
+                    enabled: imageProbeEnabled,
+                },
+            };
+        }
+
+        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null) {
+            const now = Date.now();
+            const minTs = windowSec && windowSec > 0 ? now - windowSec * 1000 : null;
+            const merged = new Map();
+            const addHit = (hit) => {
+                if (!hit) return;
+                if (minTs && hit.timestamp_ms && hit.timestamp_ms < minTs) return;
+                const key = `${hit.timestamp_ms || 0}-${(hit.pos_score || 0).toFixed(3)}-${(hit.neg_score || 0).toFixed(3)}`;
+                merged.set(key, hit);
+            };
+            (probeHitsCache || []).forEach(addHit);
+            hits.forEach(addHit);
+            const combined = Array.from(merged.values()).sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0)).slice(0, 40);
+            probeHitsCache = combined;
+            lastProbeRefresh = Date.now();
+            if (probeHitsMeta) {
+                const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
+                probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length} · Updated: ${tsLabel}`;
+            }
+            probeHitsOffset = 0;
+            if (!probeResults) return;
+            if (!combined.length) {
+                probeResults.innerHTML = '<div class="loading">No matches</div>';
+                return;
+            }
+            const pageSize = 4;
+            const slice = combined.slice(probeHitsOffset, probeHitsOffset + pageSize);
+            probeResults.innerHTML = slice.map((hit) => {
+                const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                return `
+                    <div class="probe-result">
+                        ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                        <div><strong>${ts}</strong></div>
+                        <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderProbeCards() {
+            if (!probeCards) return;
+            if (!probeList.length) {
+                probeCards.innerHTML = `
+                    <div class="probe-mini-card new-probe-card">
+                        <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                    </div>`;
+                return;
+            }
+            const cards = probeList.map((p) => {
+                const last = p.last_hit;
+                const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
+                const status = p.enabled === false ? 'disabled' : (p.enabled ? 'running' : 'idle');
+                const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
+                const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
+                return `
+                    <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
+                        <div style="display:flex; flex-direction:column; gap:0.35rem;">
+                            <div class="probe-mini-head">
+                                <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
+                                <div class="probe-status-pill ${pillClass}">${status}</div>
+                            </div>
+                            <div class="probe-mini-meta">
+                                Channel: ${p.channel_id || luxriotActiveChannel}<br>
+                                Last: ${last ? ts : 'n/a'}<br>
+                                P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
+                            </div>
+                            <div class="probe-mini-actions">
+                                <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
+                                <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
+                                <button class="feature-btn" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}">${status === 'disabled' ? 'Enable' : 'Disable'}</button>
+                                <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
+                            </div>
+                        </div>
+                        <div class="probe-mini-thumb">
+                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
+                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
+                        </div>
+                    </div>
+                `;
+            });
+            cards.push(`
+                <div class="probe-mini-card new-probe-card">
+                    <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                </div>
+            `);
+            probeCards.innerHTML = cards.join('');
+        }
+
+        function setActiveProbe(probe) {
+            activeProbeId = probe && probe.id ? probe.id : null;
+            if (probeNameInput) probeNameInput.value = (probe && probe.name) || '';
+            if (probeChannelSelect && probe && probe.channel_id) {
+                probeChannelSelect.value = probe.channel_id;
+                startProbePreview(probe.channel_id);
+            }
+            if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
+            if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
+            if (probeFps) probeFps.value = probe?.fps ?? 0;
+            if (probeWindowSec) probeWindowSec.value = probe?.window_sec ?? 300;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
+            if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
+            if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
+            probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
+            if (probe?.image_probe?.data) {
+                probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
+                applyImageThumb(probe.image_probe.data);
+                if (probeImagePosInput) probeImagePosInput.value = probe.image_probe.pos_floor || 0.7;
+                const enabled = probe.image_probe.enabled !== false;
+                updateImageProbeStatus(enabled);
+            } else {
+                probeImageState = null;
+                applyImageThumb('');
+                updateImageProbeStatus(false);
+            }
+            renderPairs();
+            renderProbeHits(probe?.last_hit ? [probe.last_hit] : [], probe?.last_hit ? 1 : 0);
+            renderProbeCards();
+            setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
+        }
+
+        function updateRunButton(running) {
+            if (!probeRunBtn) return;
+            probeRunBtn.textContent = running ? 'Stop probe' : 'Run probe';
+            probeRunBtn.classList.toggle('primary', running);
+        }
+
+        async function persistProbeEnabled(enabled) {
+            if (!activeProbeId) return;
+            const payload = collectProbeForm();
+            payload.id = activeProbeId;
+            payload.enabled = enabled;
+            try {
+                const resp = await fetch('/probes/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Save failed');
+                await loadProbeList();
+                if (probeEnableToggle) probeEnableToggle.checked = enabled;
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        function stopProbeRunLoop(message) {
+            if (probeRunTimer) {
+                clearInterval(probeRunTimer);
+                probeRunTimer = null;
+            }
+            updateRunButton(false);
+            if (message) setProbeStatus(message);
+        }
+
+        async function loadProbeList(showStatus = false) {
+            try {
+                const resp = await fetch('/probes/list');
+                const data = await resp.json();
+                probeList = data.probes || [];
+                if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
+                const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
+                if (match) {
+                    setActiveProbe(match);
+                } else if (!activeProbeId && probeList.length) {
+                    setActiveProbe(probeList[0]);
+                } else {
+                    renderProbeCards();
+                }
+            } catch (err) {
+                setProbeStatus('Failed to load probes: ' + err.message, true);
+            }
+        }
+
+        async function ensureProbeCapture(channelId, quiet = false) {
+            if (!channelId && channelId !== 0) return;
+            if (probeCaptureState[channelId]) {
+                if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                setPreviewState('');
+                startProbePreview(channelId);
+                return;
+            }
+            try {
+                channelCaptureConfig[channelId] = {
+                    fps: parseFloat(probeFps?.value) || 0,
+                    windowSec: parseFloat(probeWindowSec?.value) || 300,
+                };
+                const resp = await fetch('/probes/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId, fps: channelCaptureConfig[channelId].fps })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
+                probeCaptureState[channelId] = true;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                setPreviewState('');
+                startProbePreview(channelId);
+            } catch (err) {
+                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (!quiet) setProbeStatus(err.message, true);
+            }
+        }
+
+        async function stopProbeCapture(channelId, reason = 'stopped') {
+            if (!channelId && channelId !== 0) return;
+            try {
+                const resp = await fetch('/probes/stop_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ channel_id: channelId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
+                delete probeCaptureState[channelId];
+                if (reason === 'paused') {
+                    setPreviewState('Paused');
+                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
+                } else {
+                    setPreviewState('Stopped', true);
+                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
+                }
+                if (reason !== 'paused') stopProbePreview();
+            } catch (err) {
+                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        async function refreshProbeStatus(channelIdOverride) {
+            const channelId = channelIdOverride || parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            try {
+                const resp = await fetch(`/probes/status?channel_id=${channelId}`);
+                const data = await resp.json();
+                if (data.error) {
+                    setProbeStatus(data.error, true);
+                    return;
+                }
+                const range = data.time_range_ms && data.time_range_ms.length === 2
+                    ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
+                    : 'n/a';
+                setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
+                if (probeCaptureStatus) {
+                    probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
+                }
+                if (probeBufferInfo) {
+                    const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
+                    probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
+                }
+                if (probeStreamState) {
+                    const pill = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
+                    probeStreamState.textContent = pill;
+                }
+            } catch (err) {
+                setProbeStatus('Status error: ' + err.message, true);
+            }
+        }
+
+        async function saveActiveProbe() {
+            const payload = collectProbeForm();
+            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+            if (!hasPos) {
+                setProbeStatus('Add a text positive or enable an image probe.', true);
+                return;
+            }
+            setProbeStatus('Saving...');
+            try {
+                const resp = await fetch('/probes/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Save failed');
+                }
+                const saved = data.probe;
+                activeProbeId = saved.id || activeProbeId;
+            setProbeStatus(`Saved probe ${saved.name || saved.id}`);
+            await loadProbeList();
+            await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+            return activeProbeId;
+        }
+
+        async function runActiveProbe(quiet = false) {
+            if (probeRunInFlight) return;
+            const payload = collectProbeForm();
+            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+            if (!hasPos) {
+                setProbeStatus('Add a text positive or enable an image probe.', true);
+                if (probeRunTimer) stopProbeRunLoop();
+                return;
+            }
+            const channelId = payload.channel_id;
+            await ensureProbeCapture(channelId, true);
+            if (!quiet) setProbeStatus('Running...');
+            probeRunInFlight = true;
+            try {
+                let resp;
+                if (activeProbeId) {
+                    resp = await fetch('/probes/run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: activeProbeId })
+                    });
+                } else {
+                    resp = await fetch('/probes/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                }
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Probe failed');
+                const hits = data.results || [];
+                const framesCount = data.frames_indexed || data.status?.frames || 0;
+                renderProbeHits(hits, framesCount, payload.window_sec);
+                if (data.probe) {
+                    activeProbeId = data.probe.id || activeProbeId;
+                    await loadProbeList();
+                } else {
+                    renderProbeCards();
+                }
+                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Frames: ${framesCount}`);
+            } catch (err) {
+                renderProbeHits([], 0);
+                setProbeStatus(err.message, true);
+            } finally {
+                probeRunInFlight = false;
+            }
+        }
+
+        function startProbeRunLoop(quiet = false) {
+            stopProbeRunLoop();
+            updateRunButton(true);
+            runActiveProbe(quiet);
+            const windowSec = parseFloat(probeWindowSec?.value) || 30;
+            const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
+            probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
+            persistProbeEnabled(true);
+        }
+
+        function startProbeStatusPoll() {
+            if (probeStatusTimer) return;
+            refreshProbeStatus();
+            probeStatusTimer = setInterval(() => refreshProbeStatus(), 8000);
+        }
+
+        function stopProbeStatusPoll() {
+            if (probeStatusTimer) {
+                clearInterval(probeStatusTimer);
+                probeStatusTimer = null;
+            }
+        }
+
+        async function deleteProbe(id) {
+            if (!id) {
+                setProbeStatus('No probe selected', true);
+                return;
+            }
+            try {
+                const resp = await fetch('/probes/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || 'Delete failed');
+                if (activeProbeId === id) activeProbeId = null;
+                setProbeStatus('Probe deleted');
+                await loadProbeList(true);
+                stopProbeRunLoop();
+            } catch (err) {
+                setProbeStatus(err.message, true);
+            }
+        }
+
+        function handleProbeCardClick(event) {
+            const btn = event.target.closest('button[data-action]');
+            if (!btn) return;
+            const id = btn.getAttribute('data-id');
+            const action = btn.getAttribute('data-action');
+            const probe = probeList.find(p => String(p.id) === String(id));
+            if (!action) return;
+            if (action === 'expand' && probe) {
+                setActiveProbe(probe);
+            } else if (action === 'run' && probe) {
+                setActiveProbe(probe);
+                startProbeRunLoop();
+            } else if (action === 'enable' && probe) {
+                setActiveProbe(probe);
+                persistProbeEnabled(true);
+                ensureProbeCapture(probe.channel_id || luxriotActiveChannel, true);
+            } else if (action === 'delete') {
+                deleteProbe(id);
+            } else if (action === 'disable' && probe) {
+                setActiveProbe(probe);
+                persistProbeEnabled(false);
+                stopProbeRunLoop();
+            } else if (action === 'new') {
+                activeProbeId = null;
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                if (probeEnableToggle) probeEnableToggle.checked = true;
+                setProbeStatus('New probe');
+            }
+        }
+
+        if (probeRunBtn) {
+            probeRunBtn.addEventListener('click', () => {
+                if (probeRunTimer) {
+                    stopProbeRunLoop('Stopped probe loop');
+                    persistProbeEnabled(false);
+                } else {
+                    if (!activeProbeId) {
+                        saveActiveProbe().then(() => startProbeRunLoop());
+                    } else {
+                        startProbeRunLoop();
+                    }
+                }
+            });
+        }
+        if (probeSaveBtn) probeSaveBtn.addEventListener('click', saveActiveProbe);
+        if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
+            if (activeProbeId) deleteProbe(activeProbeId);
+            else {
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                setProbeStatus('Cleared unsaved probe');
+            }
+        });
+        if (probeStartCaptureBtn) {
+            probeStartCaptureBtn.addEventListener('click', () => ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10)));
+        }
+        if (probeStopCaptureBtn) {
+            probeStopCaptureBtn.addEventListener('click', () => stopProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), 'paused'));
+        }
+        if (probeStopAllBtn) {
+            probeStopAllBtn.addEventListener('click', () => {
+                Object.keys(probeCaptureState).forEach((cid) => stopProbeCapture(parseInt(cid, 10), 'stopped'));
+                stopProbeRunLoop();
+            });
+        }
+        if (probeChannelSelect) {
+            probeChannelSelect.addEventListener('change', () => {
+                const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+                startProbePreview(cid);
+            });
+        }
+        if (probeCards) {
+            probeCards.addEventListener('click', handleProbeCardClick);
+        }
+        if (probeNewBtn) {
+            probeNewBtn.addEventListener('click', () => {
+                activeProbeId = null;
+                probePairsState = [];
+                probeImageState = null;
+                applyImageThumb('');
+                renderPairs();
+                setProbeStatus('New probe');
+                if (probeEnableToggle) probeEnableToggle.checked = true;
+            });
+        }
+        if (probeReloadBtn) {
+            probeReloadBtn.addEventListener('click', () => loadProbeList(true));
+        }
+        if (probeImageFile) {
+            probeImageFile.addEventListener('change', () => {
+                const file = probeImageFile.files && probeImageFile.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const base64 = reader.result.split(',')[1];
+                    probeImageState = { name: file.name, data: base64 };
+                    applyImageThumb(base64);
+                    updateImageProbeStatus(imageProbeEnabled);
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+        if (probeAddPairBtn && probePairsContainer) {
+            probeAddPairBtn.addEventListener('click', () => {
+                probePairsState.push({ pos: '', neg: '' });
+                renderPairs();
+            });
+            probePairsContainer.addEventListener('input', (e) => {
+                const target = e.target;
+                const idx = parseInt(target.getAttribute('data-idx') || '-1', 10);
+                if (!Number.isFinite(idx) || idx < 0 || idx >= probePairsState.length) return;
+                if (target.classList.contains('probe-pos')) {
+                    probePairsState[idx].pos = target.value;
+                } else if (target.classList.contains('probe-neg')) {
+                    probePairsState[idx].neg = target.value;
+                }
+            });
+            probePairsContainer.addEventListener('click', (e) => {
+                const btn = e.target.closest('button[data-remove]');
+                if (!btn) return;
+                const idx = parseInt(btn.getAttribute('data-remove') || '-1', 10);
+                if (!Number.isFinite(idx) || idx < 0 || probePairsState.length <= 1) return;
+                probePairsState.splice(idx, 1);
+                renderPairs();
+            });
+        }
+        if (probeDetLeftBtn && probeResults) {
+            probeDetLeftBtn.addEventListener('click', () => {
+                if (!probeHitsCache || !probeHitsCache.length) return;
+                const pageSize = 4;
+                probeHitsOffset = Math.max(0, probeHitsOffset - pageSize);
+                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
+                if (!slice.length) return;
+                probeResults.innerHTML = slice.map((hit) => {
+                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                    return `
+                        <div class="probe-result">
+                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                            <div><strong>${ts}</strong></div>
+                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                        </div>
+                    `;
+                }).join('');
+            });
+        }
+        if (probeDetRightBtn && probeResults) {
+            probeDetRightBtn.addEventListener('click', () => {
+                if (!probeHitsCache || !probeHitsCache.length) return;
+                const pageSize = 4;
+                if (probeHitsOffset + pageSize < probeHitsCache.length) {
+                    probeHitsOffset += pageSize;
+                }
+                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
+                if (!slice.length) return;
+                probeResults.innerHTML = slice.map((hit) => {
+                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                    return `
+                        <div class="probe-result">
+                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
+                            <div><strong>${ts}</strong></div>
+                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
+                        </div>
+                    `;
+                }).join('');
+            });
+        }
+        if (probeEnableToggle) {
+            probeEnableToggle.addEventListener('change', (e) => {
+                const enabled = e.target.checked;
+                persistProbeEnabled(enabled);
+                if (enabled) {
+                    ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), true);
+                    runActiveProbe(true);
+                } else {
+                    stopProbeRunLoop('Probe disabled');
+                }
+            });
+        }
+        if (probeImageEnableBtn) {
+            probeImageEnableBtn.addEventListener('click', () => {
+                if (!probeImageState?.data) {
+                    setProbeStatus('Select an image first.', true);
+                    return;
+                }
+                updateImageProbeStatus(!imageProbeEnabled);
+            });
+        }
+        if (probeBenchBtn && probeBenchOutput) {
+            probeBenchBtn.addEventListener('click', async () => {
+                probeBenchBtn.disabled = true;
+                probeBenchOutput.textContent = 'Benchmark running...';
+                try {
+                    const resp = await fetch('/probes/bench');
+                    const data = await resp.json();
+                    if (!resp.ok || data.error) throw new Error(data.error || 'Benchmark failed');
+                    probeBenchOutput.textContent = `~${data.approx_fps} fps @ batch ${data.batch} on ${data.device} (elapsed ${data.elapsed_sec}s)`;
+                } catch (err) {
+                    probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
+                } finally {
+                    probeBenchBtn.disabled = false;
+                }
+            });
+        }
+
         // Mode switching
-        textModeBtn.addEventListener('click', () => {
-            currentMode = 'text';
-            textModeBtn.classList.add('active');
-            imageModeBtn.classList.remove('active');
-            textSearchBox.style.display = 'flex';
-            imageSearchBox.style.display = 'none';
-        });
-        
-        imageModeBtn.addEventListener('click', () => {
-            currentMode = 'image';
-            imageModeBtn.classList.add('active');
-            textModeBtn.classList.remove('active');
-            imageSearchBox.style.display = 'flex';
-            textSearchBox.style.display = 'none';
-        });
+        if (textModeBtn) textModeBtn.addEventListener('click', () => setMode('text'));
+        if (imageModeBtn) imageModeBtn.addEventListener('click', () => setMode('image'));
+        if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
+        if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -1784,6 +4273,142 @@ def home():
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
             }
         });
+
+        function renderVideoFrames(frames) {
+            if (!videoFrames) return;
+            if (!frames || !frames.length) {
+                videoFrames.innerHTML = '';
+                return;
+            }
+            const html = frames.map((frame, idx) => {
+                const ts = typeof frame.time_sec === 'number' ? `${frame.time_sec.toFixed(2)}s` : 'n/a';
+                return `<div title="Frame ${idx + 1} (${ts})"><img src="data:image/jpeg;base64,${frame.thumbnail}" alt="Frame ${idx + 1}" /></div>`;
+            }).join('');
+            videoFrames.innerHTML = html;
+        }
+
+        async function runVideoUnderstanding() {
+            const videoPath = videoPathInput.value.trim();
+            const frameCount = parseInt(videoFrameCount.value, 10) || 16;
+            const sampleFpsValue = Number.parseFloat(videoSampleFpsInput.value);
+            const prompt = videoPromptInput.value.trim();
+            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
+
+            if (!videoPath) {
+                videoStatus.textContent = 'Provide a video path.';
+                videoStatus.className = 'video-status error';
+                return;
+            }
+
+            if (saveVideoPromptInput && saveVideoPromptInput.checked) {
+                localStorage.setItem('evs_video_prompt', prompt);
+            } else {
+                localStorage.removeItem('evs_video_prompt');
+            }
+
+            videoRunBtn.disabled = true;
+            saveSummaryBtn.style.display = 'none';
+            lastSummaryText = '';
+            lastSummaryTarget = null;
+            videoStatus.dataset.base = 'Sampling frames and querying the model...';
+            videoStatus.textContent = videoStatus.dataset.base;
+            videoStatus.className = 'video-status';
+            videoOutput.style.display = 'none';
+            videoOutput.innerHTML = '';
+            renderVideoFrames([]);
+            startVideoTimer();
+
+            try {
+                const payload = {
+                    video: videoPath,
+                    frame_count: frameCount,
+                    prompt,
+                };
+                if (modelId) {
+                    payload.model = modelId;
+                }
+                if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
+                    payload.sample_fps = sampleFpsValue;
+                }
+                const response = await fetch('/video_understanding', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    videoStatus.dataset.base = data.error || 'Video understanding request failed.';
+                    videoStatus.textContent = videoStatus.dataset.base;
+                    videoStatus.className = 'video-status error';
+                    stopVideoTimer();
+                    return;
+                }
+                const durationLabel = typeof data.duration_sec === 'number' ? ` · Duration: ${formatDuration(data.duration_sec)}` : '';
+                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
+                videoStatus.textContent = videoStatus.dataset.base;
+                if (data.summary) {
+                    videoOutput.style.display = 'block';
+                    videoOutput.innerHTML = renderMarkdown(data.summary);
+                    lastSummaryText = data.summary;
+                    lastSummaryTarget = null;
+                    saveSummaryBtn.style.display = 'inline-flex';
+                } else {
+                    videoOutput.style.display = 'block';
+                    videoOutput.textContent = '(No summary returned)';
+                    lastSummaryText = '';
+                    lastSummaryTarget = null;
+                    saveSummaryBtn.style.display = 'none';
+                }
+                renderVideoFrames(data.frames || []);
+                stopVideoTimer(true);
+            } catch (error) {
+                videoStatus.dataset.base = 'Error: ' + error.message;
+                videoStatus.textContent = videoStatus.dataset.base;
+                videoStatus.className = 'video-status error';
+                stopVideoTimer(true);
+            } finally {
+                videoRunBtn.disabled = false;
+            }
+        }
+
+        if (videoRunBtn) {
+            videoRunBtn.addEventListener('click', runVideoUnderstanding);
+        }
+
+        async function saveSummaryAsComment() {
+            if (!lastSummaryText || !lastSummaryTarget || !lastSummaryTarget.path) {
+                alert('No summary or target image available to save.');
+                return;
+            }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+            try {
+                const response = await fetch('/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder,
+                        image_path: lastSummaryTarget.path,
+                        comment: lastSummaryText,
+                    }),
+                });
+                const data = await response.json();
+                if (data.success) {
+                    alert('Summary saved as comment.');
+                } else {
+                    alert('Failed to save comment: ' + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Failed to save comment: ' + err.message);
+            }
+        }
+
+        if (saveSummaryBtn) {
+            saveSummaryBtn.addEventListener('click', saveSummaryAsComment);
+        }
         
         // Show commented images
         showCommentedBtn.addEventListener('click', async () => {
@@ -1793,6 +4418,7 @@ def home():
                 alert('Please enter a folder path first');
                 return;
             }
+            setMode('text');
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
             
@@ -1828,11 +4454,6 @@ def home():
                                 <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
                             </svg>
                         </div>
-                        <div class="find-similar-icon" data-index="${index}" data-path="${result.path}" style="display: none;">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
-                            </svg>
-                        </div>
                     </div>
                 </div>
                 <div class="result-info">
@@ -1843,6 +4464,21 @@ def home():
                         </svg>
                     </div>
                     <div class="similarity">${similarityMarkup}</div>
+                    <div class="result-actions">
+                        <button class="action-icon describe-icon" data-index="${index}" data-path="${result.path || ''}" title="Describe with LM">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
+                            </svg>
+                        </button>
+                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${result.path || ''}" title="Find similar">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="segments-panel" id="segments-${index}">
+                    <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
                 </div>
                 <div class="comment-section">
                     <div class="comments-list" id="comments-${index}">
@@ -1867,26 +4503,63 @@ def home():
             
             // Handle copy icon click
             const copyIcon = item.querySelector('.copy-icon');
-            copyIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                copyImagePath(result.path);
-            });
+            if (copyIcon) {
+                if (result.path) {
+                    copyIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        copyImagePath(result.path);
+                    });
+                } else {
+                    copyIcon.style.display = 'none';
+                }
+            }
             
             
             // Handle find similar button
             const findSimilarIcon = item.querySelector('.find-similar-icon');
-            findSimilarIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                findSimilarImages(result.path);
-            });
+            if (findSimilarIcon) {
+                if (result.path) {
+                    findSimilarIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        findSimilarImages(result.path);
+                    });
+                } else {
+                    findSimilarIcon.style.display = 'none';
+                }
+            }
+
+            const describeIcon = item.querySelector('.describe-icon');
+            if (describeIcon) {
+                if (result.path) {
+                    describeIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        describeImageWithLM(result.path);
+                    });
+                } else {
+                    describeIcon.style.display = 'none';
+                }
+            }
             
             // Add save comment functionality
             const saveBtn = item.querySelector(`#save-btn-${index}`);
             const commentInput = item.querySelector(`#comment-input-${index}`);
             
-            saveBtn.addEventListener('click', () => {
-                saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
-            });
+            if (saveBtn) {
+                if (result.path) {
+                    saveBtn.addEventListener('click', () => {
+                        saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+                    });
+                } else {
+                    saveBtn.disabled = true;
+                }
+            }
+
+            const img = item.querySelector('.thumbnail');
+            if (img) {
+                img.addEventListener('click', (e) => {
+                    handleSegmentClick(e, result, index, item);
+                });
+            }
         }
 
         // Display results
@@ -1896,11 +4569,15 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
+                item.dataset.resultIndex = index;
                 item.innerHTML = generateResultItemHTML(result, index, false);
                 
                 setupResultItemEventHandlers(item, result, index);
+                resetSegmentsPanel(item, index);
                 resultsContainer.appendChild(item);
             });
+
+            refreshSegmentsPanels();
         }
         
         // Display commented results (similar to displayResults but with comment info)
@@ -1910,11 +4587,15 @@ def home():
             results.forEach((result, index) => {
                 const item = document.createElement('div');
                 item.className = 'result-item';
+                item.dataset.resultIndex = index;
                 item.innerHTML = generateResultItemHTML(result, index, true);
                 
                 setupResultItemEventHandlers(item, result, index);
+                resetSegmentsPanel(item, index);
                 resultsContainer.appendChild(item);
             });
+
+            refreshSegmentsPanels();
         }
         
         // Comment functionality
@@ -1999,12 +4680,6 @@ def home():
             }
         }
         
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        
         function toggleImageExpansion(item, result, index) {
             const img = item.querySelector('.thumbnail');
             const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
@@ -2014,6 +4689,8 @@ def home():
                 // Collapse: switch back to thumbnail
                 img.src = `data:image/jpeg;base64,${result.thumbnail}`;
                 item.classList.remove('expanded');
+                resetSegmentsPanel(item, index);
+                img.classList.remove('segment-enabled');
                 // Update icon to expand
                 expandCollapseIcon.innerHTML = `
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
@@ -2026,6 +4703,10 @@ def home():
                 img.src = originalImageUrl;
                 item.classList.add('expanded');
                 loadComments(index, result.path, folderInput.value.trim());
+                prepareSegmentsPanel(item, result, index);
+                if (segmentsEnabledInput.checked) {
+                    img.classList.add('segment-enabled');
+                }
                 // Update icon to collapse
                 expandCollapseIcon.innerHTML = `
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
@@ -2034,7 +4715,219 @@ def home():
                 `;
             }
         }
-        
+
+        function resetSegmentsPanel(item, index) {
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+            if (!segmentsEnabledInput.checked) {
+                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
+            } else {
+                panel.innerHTML = '<div class="segments-status">Expand the image and click on an area to propose regions.</div>';
+            }
+        }
+
+        function prepareSegmentsPanel(item, result, index) {
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+            if (!segmentsEnabledInput.checked) {
+                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
+                return;
+            }
+            panel.innerHTML = '<div class="segments-status">Click inside the image to propose a region near the selected point.</div>';
+        }
+
+        function refreshSegmentsPanels() {
+            document.querySelectorAll('.result-item').forEach((item) => {
+                const indexAttr = item.dataset.resultIndex;
+                if (typeof indexAttr === 'undefined') return;
+                const index = parseInt(indexAttr, 10);
+                if (Number.isNaN(index)) return;
+                if (item.classList.contains('expanded')) {
+                    prepareSegmentsPanel(item, null, index);
+                    const img = item.querySelector('.thumbnail');
+                    if (img) {
+                        if (segmentsEnabledInput.checked) {
+                            img.classList.add('segment-enabled');
+                        } else {
+                            img.classList.remove('segment-enabled');
+                        }
+                    }
+                } else {
+                    resetSegmentsPanel(item, index);
+                    const img = item.querySelector('.thumbnail');
+                    if (img) {
+                        img.classList.remove('segment-enabled');
+                    }
+                }
+            });
+        }
+
+        function clamp01(value) {
+            if (!Number.isFinite(value)) return 0;
+            return Math.min(1, Math.max(0, value));
+        }
+
+        async function handleSegmentClick(event, result, index, item) {
+            if (!segmentsEnabledInput.checked) return;
+            if (!item.classList.contains('expanded')) return;
+
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                const panel = item.querySelector(`#segments-${index}`);
+                if (panel) {
+                    panel.innerHTML = '<div class="segments-status error">Provide a folder path before running region proposals.</div>';
+                }
+                return;
+            }
+
+            if (item.dataset.segmentLoading === '1') {
+                return;
+            }
+
+            const panel = item.querySelector(`#segments-${index}`);
+            if (!panel) return;
+
+            const img = event.currentTarget;
+            const rect = img.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return;
+
+            const xNorm = clamp01((event.clientX - rect.left) / rect.width);
+            const yNorm = clamp01((event.clientY - rect.top) / rect.height);
+
+            const limitValue = parseInt(resultLimitSelect.value, 10);
+            const payload = {
+                folder,
+                image_path: result.path,
+                x: xNorm,
+                y: yNorm,
+                limit: Number.isFinite(limitValue) ? limitValue : 12,
+                sort_by: sortBySelect.value || 'similarity',
+                targets: ['images', 'segments'],
+                threshold: segmentThreshold,
+            };
+
+            item.dataset.segmentLoading = '1';
+            panel.innerHTML = '<div class="segments-status">Proposing region around the selected point...</div>';
+
+            try {
+                const response = await fetch('/segment_from_point', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || 'Region proposal failed');
+                }
+                renderSegmentResponse(panel, data, xNorm, yNorm, img.currentSrc || img.src);
+            } catch (error) {
+                panel.innerHTML = `<div class="segments-status error">Segment error: ${escapeHtml(error.message || String(error))}</div>`;
+            } finally {
+                delete item.dataset.segmentLoading;
+            }
+        }
+
+        function renderSegmentResponse(panel, data, xNorm, yNorm, baseImageSrc) {
+            const segments = Array.isArray(data && data.segments) ? data.segments : [];
+            const overlay = data && data.overlay ? data.overlay : {};
+            const pctX = (xNorm * 100).toFixed(1);
+            const pctY = (yNorm * 100).toFixed(1);
+            const safeBaseSrc = baseImageSrc ? escapeHtml(baseImageSrc) : '';
+
+            const baseOverlayFigure = safeBaseSrc ? `
+                <figure class="segment-overlay-figure">
+                    <div class="segment-overlay-stack">
+                        <img src="${safeBaseSrc}" alt="Expanded image region" />
+                        ${overlay.heatmap_png ? `<img class="overlay-layer overlay-heatmap" src="data:image/png;base64,${overlay.heatmap_png}" alt="Heatmap overlay" />` : ''}
+                        ${overlay.mask_png ? `<img class="overlay-layer overlay-mask" src="data:image/png;base64,${overlay.mask_png}" alt="Refined mask overlay" />` : ''}
+                        <div class="overlay-crosshair" style="left: ${pctX}%; top: ${pctY}%"></div>
+                    </div>
+                    <figcaption>Region overlay</figcaption>
+                </figure>
+            ` : '';
+
+            const segmentationFigure = overlay.segmentation_png ? `
+                <figure class="segment-segmap-figure">
+                    <img class="segment-segmap" src="data:image/png;base64,${overlay.segmentation_png}" alt="Semantic segmentation" />
+                    <figcaption>Mask2Former segmentation</figcaption>
+                </figure>
+            ` : '';
+
+            const legendItems = Array.isArray(overlay.legend)
+                ? overlay.legend.map((entry) => {
+                    const color = escapeHtml(String(entry.color || '#888'));
+                    const labelText = entry.label ? escapeHtml(String(entry.label)) : escapeHtml(String(entry.id || 'class'));
+                    const highlightClass = entry.highlight ? ' highlight' : '';
+                    return `<div class="segment-legend-item${highlightClass}"><span class="segment-legend-swatch" style="background:${color};"></span><span>${labelText}</span></div>`;
+                }).join('')
+                : '';
+
+            const legendHtml = legendItems ? `<div class="segment-legend">${legendItems}</div>` : '';
+
+            const overlayHtml = (baseOverlayFigure || segmentationFigure)
+                ? `<div class="segment-overlay-grid">${baseOverlayFigure}${segmentationFigure}</div>${legendHtml}`
+                : legendHtml;
+
+            const listItems = segments.slice(0, 3).map((segment, idx) => {
+                const segId = escapeHtml(String(segment.segment_id || `region-${idx + 1}`));
+                const fraction = typeof segment.patch_fraction === 'number'
+                    ? `${(segment.patch_fraction * 100).toFixed(1)}% area`
+                    : 'Area n/a';
+                const patchCount = typeof segment.patch_count === 'number'
+                    ? `${segment.patch_count} patch${segment.patch_count === 1 ? '' : 'es'}`
+                    : '';
+                const humanLabel = segment.label ? ` · ${escapeHtml(String(segment.label))}` : '';
+
+                const matches = Array.isArray(segment.image_results) ? segment.image_results.slice(0, 3) : [];
+                const matchRows = matches.map((match, matchIdx) => {
+                    const label = escapeHtml(String(match.filename || match.path || `Match ${matchIdx + 1}`));
+                    const score = typeof match.similarity === 'number' ? `${(match.similarity * 100).toFixed(1)}%` : 'n/a';
+                    const thumb = match.thumbnail
+                        ? `<img class="segment-match-thumb" src="data:image/jpeg;base64,${match.thumbnail}" alt="${label}" />`
+                        : '<div class="segment-match-thumb placeholder"></div>';
+                    return `
+                        <div class="segment-match-row">
+                            ${thumb}
+                            <div class="segment-match-meta">
+                                <span>${label}</span>
+                                <span>Similarity: ${score}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+                const matchList = matchRows || '<div class="segments-status warning">No close matches for this region.</div>';
+
+                return `
+                    <li>
+                        <span class="segment-title">#${idx + 1} · ${segId}${humanLabel}</span>
+                        <span class="segment-meta">${fraction}${patchCount ? ` · ${patchCount}` : ''}</span>
+                        <div class="segment-match-list">
+                            ${matchList}
+                        </div>
+                    </li>
+                `;
+            }).join('');
+
+            const refinementNote = overlay.refinement
+                ? `<div class="segment-meta">Mask source: ${escapeHtml(String(overlay.refinement))}${overlay.refined_label ? ` · ${escapeHtml(String(overlay.refined_label))}` : ''}</div>`
+                : '';
+            const areaNote = typeof overlay.mask_fraction === 'number'
+                ? `<div class="segment-meta">Refined mask coverage: ${(overlay.mask_fraction * 100).toFixed(1)}%</div>`
+                : '';
+            const resultsHtml = listItems
+                ? `<ul class="segment-results-list">${listItems}</ul>`
+                : '<div class="segments-status warning">Region proposals returned no matches.</div>';
+
+            panel.innerHTML = `
+                <div class="segments-status success">Regions proposed near (${pctX}%, ${pctY}%) · ${segments.length} candidate(s)</div>
+                ${overlayHtml}
+                ${refinementNote}
+                ${typeof overlay.threshold === 'number' ? `<div class="segment-meta">Heatmap threshold: ${(overlay.threshold * 100).toFixed(1)}%</div>` : ''}
+                ${areaNote}
+                ${resultsHtml}
+            `;
+        }
         
         async function copyImagePath(imagePath) {
             try {
@@ -2122,6 +5015,61 @@ def home():
                 indexStatus.className = 'status error';
             }
         }
+
+        async function describeImageWithLM(imagePath) {
+            if (!imagePath) {
+                alert('No filesystem path is available for this image.');
+                return;
+            }
+            const prompt = videoPromptInput.value.trim();
+            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
+            setMode('video');
+            videoStatus.dataset.base = 'Querying model...';
+            videoStatus.textContent = videoStatus.dataset.base;
+            videoStatus.className = 'video-status';
+            videoRunBtn.disabled = true;
+            saveSummaryBtn.style.display = 'none';
+            videoOutput.style.display = 'none';
+            videoOutput.innerHTML = '';
+            renderVideoFrames([]);
+            startVideoTimer();
+
+            try {
+                const response = await fetch('/describe_image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image_path: imagePath, prompt, model: modelId }),
+                });
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    videoStatus.dataset.base = data.error || 'Describe request failed.';
+                    videoStatus.textContent = videoStatus.dataset.base;
+                    videoStatus.className = 'video-status error';
+                    stopVideoTimer();
+                    return;
+                }
+                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Image described`;
+                videoStatus.textContent = videoStatus.dataset.base;
+                if (data.summary) {
+                    videoOutput.style.display = 'block';
+                    videoOutput.innerHTML = renderMarkdown(data.summary);
+                    lastSummaryText = data.summary;
+                    lastSummaryTarget = { path: imagePath };
+                    saveSummaryBtn.style.display = 'inline-flex';
+                }
+                if (data.thumbnail) {
+                    videoFrames.innerHTML = `<div title="Image"><img src="data:image/jpeg;base64,${data.thumbnail}" alt="Image" /></div>`;
+                }
+                stopVideoTimer(true);
+            } catch (err) {
+                videoStatus.dataset.base = 'Error: ' + err.message;
+                videoStatus.textContent = videoStatus.dataset.base;
+                videoStatus.className = 'video-status error';
+                stopVideoTimer(true);
+            } finally {
+                videoRunBtn.disabled = false;
+            }
+        }
         
         // Enter key support
         searchInput.addEventListener('keypress', (e) => {
@@ -2155,7 +5103,14 @@ def home():
     # Replace the placeholder with actual options and timestamp
     current_timestamp = str(int(time.time()))
     response_html = html_template.replace('{result_options_html}', result_options_html)
+    response_html = response_html.replace('{luxriot_batch_options}', luxriot_batch_options_html)
     response_html = response_html.replace('{timestamp}', current_timestamp)
+    response_html = response_html.replace('{lm_model}', config.LM_MODEL)
+    response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
+    response_html = response_html.replace('{luxriot_base_url}', config.LUXRIOT_BASE_URL)
+    response_html = response_html.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
+    response_html = response_html.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
+    response_html = response_html.replace('{luxriot_batch_default}', str(luxriot_default_batch))
     
     # Create response with cache-busting headers
     response = make_response(response_html)
@@ -2197,6 +5152,507 @@ def _image_to_base64(img: Image.Image) -> str:
     buffer = BytesIO()
     img.save(buffer, format='PNG')
     return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int = 85) -> str:
+    if max_edge and max(img.size) > max_edge:
+        scale = max_edge / float(max(img.size))
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    buffer = BytesIO()
+    img.save(buffer, format='JPEG', quality=quality)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
+    alpha = alpha_image.convert('L')
+    scale = float(opacity_scale)
+    if scale <= 0:
+        alpha = alpha.point(lambda _: 0)
+    elif scale < 0.999:
+        alpha = alpha.point(lambda v: int(max(0, min(255, v * scale))))
+    overlay = Image.new('RGBA', alpha.size, color + (0,))
+    overlay.putalpha(alpha)
+    return overlay
+
+
+_SEGMENT_COLOR_TABLE: Tuple[Tuple[int, int, int], ...] = (
+    (244, 67, 54),
+    (30, 136, 229),
+    (102, 187, 106),
+    (255, 202, 40),
+    (171, 71, 188),
+    (255, 112, 67),
+    (66, 165, 245),
+    (38, 166, 154),
+    (156, 204, 101),
+    (255, 238, 88),
+    (239, 83, 80),
+    (126, 87, 194),
+    (0, 188, 212),
+    (255, 171, 145),
+    (156, 39, 176),
+    (124, 179, 66),
+)
+
+
+def _class_color(class_id: int) -> Tuple[int, int, int]:
+    table = _SEGMENT_COLOR_TABLE
+    return table[class_id % len(table)]
+
+
+def _sample_video_frames(
+    video_path: Union[str, Path],
+    max_frames: int,
+    sample_fps: Optional[float],
+    max_edge: int,
+) -> Tuple[List[Dict[str, Any]], float, Optional[float]]:
+    path_obj = Path(video_path)
+    cap = cv2.VideoCapture(str(path_obj))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = (total_frames / fps) if fps > 0 else None
+    target_frames = max(1, min(int(max_frames), config.LM_VIDEO_MAX_FRAMES))
+
+    if total_frames > 0:
+        if sample_fps and sample_fps > 0 and fps > 0:
+            step = max(1, int(round(fps / sample_fps)))
+            frame_indices = list(range(0, total_frames, step))
+        else:
+            frame_indices = list(np.linspace(0, total_frames - 1, num=target_frames, dtype=int))
+        frame_indices = sorted(set(frame_indices))[:target_frames]
+    else:
+        frame_indices = list(range(target_frames))
+
+    frames: List[Dict[str, Any]] = []
+    try:
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            frames.append(
+                {
+                    'index': int(idx),
+                    'time_sec': round(idx / fps, 2) if fps > 0 else None,
+                    'thumbnail': _encode_jpeg(pil_img, max_edge=max_edge, quality=85),
+                    'width': pil_img.width,
+                    'height': pil_img.height,
+                }
+            )
+            if len(frames) >= target_frames:
+                break
+    finally:
+        cap.release()
+    return frames, fps, duration
+
+
+def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
+    prompt = (user_prompt or '').strip() or "Summarize the key events, people, and objects in this video."
+    intro = f"Video file: {Path(video_path).name}. {len(frames)} sampled frames are provided."
+    user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
+    for idx, frame in enumerate(frames):
+        ts = frame.get('time_sec')
+        ts_label = f"{ts:.2f}s" if isinstance(ts, (int, float)) else "n/a"
+        user_content.append({'type': 'text', 'text': f"Frame {idx + 1} (t={ts_label})"})
+        user_content.append(
+            {
+                'type': 'image_url',
+                'image_url': {
+                    'url': f"data:image/jpeg;base64,{frame['thumbnail']}",
+                    'detail': 'high',
+                },
+            }
+        )
+    system_msg = (
+        "You analyze short videos using sampled frames. Provide a concise, factual summary, key events, "
+        "notable objects, people, and any scene changes. Avoid repeating the same detail for each frame."
+    )
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
+        {'role': 'user', 'content': user_content},
+    ]
+
+
+def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str, system_prompt: str) -> List[Dict[str, Any]]:
+    prompt = (user_prompt or '').strip() or "Describe notable activity, people, vehicles, and anomalies."
+    intro = (
+        f"Live snapshots from Luxriot channel {channel_label}. "
+        f"{len(frames)} snapshots captured roughly every {config.LUXRIOT_SNAPSHOT_INTERVAL}s."
+    )
+    user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
+    for idx, frame in enumerate(frames):
+        ts_raw = frame.get('captured_at') or frame.get('time_sec')
+        ts_label = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_raw)) if isinstance(ts_raw, (int, float)) else 'n/a'
+        user_content.append({'type': 'text', 'text': f"Snapshot {idx + 1} (captured at {ts_label})"})
+        thumbnail = frame.get('thumbnail')
+        if thumbnail:
+            user_content.append(
+                {
+                    'type': 'image_url',
+                    'image_url': {
+                        'url': f"data:image/jpeg;base64,{thumbnail}",
+                        'detail': 'high',
+                    },
+                }
+            )
+    system_msg = system_prompt.strip() or LUXRIOT_SYSTEM_PROMPT_DEFAULT
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
+        {'role': 'user', 'content': user_content},
+    ]
+
+
+def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
+    base_url = (config.LM_BASE_URL or '').rstrip('/')
+    if not base_url:
+        raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
+    endpoint = f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if config.LM_API_KEY:
+        headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
+
+    target_model = (model_override or config.LM_MODEL).strip()
+    payload = {
+        "model": target_model,
+        "messages": messages,
+        "temperature": float(config.LM_VIDEO_TEMPERATURE),
+        "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
+    }
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=config.LM_TIMEOUT)
+        response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"LM Studio request failed: {exc}") from exc
+
+    data = response.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message", {}) or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        content_text = "\n".join(parts).strip()
+    else:
+        content_text = str(content).strip()
+    return content_text or "(empty response from model)"
+
+
+def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
+    return _call_lm_chat(messages, model_override=model_override)
+
+
+def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Extract alert objects from LM output; expects optional JSON with an alerts array."""
+    import json
+    import re
+    now_ms = int(time.time() * 1000)
+    base_ts_ms = default_ts_ms or now_ms
+
+    def _validate_alert(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        title = (raw.get('title') or '').strip() or 'External event'
+        description = (raw.get('description') or '').strip()
+        severity = str(raw.get('severity') or 'critical').lower()
+        allowed_sev = {'info', 'low', 'normal', 'high', 'critical'}
+        if severity not in allowed_sev:
+            severity = 'critical'
+        state = str(raw.get('state') or 'new').lower()
+        allowed_state = {'none', 'new', 'inprogress', 'closed', 'hidden'}
+        if state not in allowed_state:
+            state = 'new'
+        channel_id = raw.get('channel_id') or default_channel_id
+        try:
+            channel_id = int(channel_id)
+        except Exception:
+            channel_id = default_channel_id
+        timestamp_ms = raw.get('timestamp_ms') or base_ts_ms
+        try:
+            timestamp_ms = int(timestamp_ms)
+        except Exception:
+            timestamp_ms = base_ts_ms
+        return {
+            'title': title,
+            'description': description,
+            'severity': severity,
+            'state': state,
+            'channel_id': channel_id,
+            'timestamp_ms': timestamp_ms,
+        }
+
+    def _extract_candidates(blob: str) -> List[Any]:
+        candidates: List[Any] = []
+        try:
+            parsed = json.loads(blob)
+            candidates.append(parsed)
+        except Exception:
+            pass
+        for match in re.finditer(r"```json(.*?)```", blob, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                candidates.append(json.loads(match.group(1)))
+            except Exception:
+                continue
+        for match in re.finditer(r"ALERTS_JSON:(\{.*?\})", blob, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                candidates.append(json.loads(match.group(1)))
+            except Exception:
+                continue
+        return candidates
+
+    alerts: List[Dict[str, Any]] = []
+    for candidate in _extract_candidates(text or ''):
+        if isinstance(candidate, dict) and isinstance(candidate.get('alerts'), list):
+            for raw_alert in candidate['alerts']:
+                validated = _validate_alert(raw_alert)
+                if validated:
+                    alerts.append(validated)
+            if alerts:
+                break
+
+    if not alerts:
+        # Heuristic fallbacks
+        lowered = (text or '').lower()
+        threat_keywords = [
+            'weapon', 'gun', 'handgun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
+            'оружие', 'пистолет', 'револьвер', 'винтовк', 'нож', 'стрел', 'выстрел', 'агресс', 'драк', 'насили'
+        ]
+        phone_keywords = ['phone', 'call', 'talking on phone', 'звон', 'телефон', 'разговаривает по телефону']
+        pet_keywords = ['orl', 'orland', 'maz', 'cat', 'кот', 'кошка', 'питом']
+
+        def add_fallback(title: str, severity: str, reason: str) -> None:
+            val = _validate_alert(
+                {
+                    'title': title,
+                    'description': f"Heuristic trigger: {reason}. Summary snippet: {text.strip()[:200]}",
+                    'severity': severity,
+                    'state': 'new',
+                    'channel_id': default_channel_id,
+                    'timestamp_ms': now_ms,
+                }
+            )
+            if val:
+                alerts.append(val)
+
+        if any(k in lowered for k in threat_keywords):
+            add_fallback('Possible weapon or aggression detected', 'critical', 'weapon/aggression keywords')
+        elif any(k in lowered for k in phone_keywords):
+            add_fallback('Phone call detected', 'info', 'phone keywords')
+        elif any(k in lowered for k in pet_keywords):
+            add_fallback('Pet interaction detected', 'low', 'pet keywords')
+
+    return alerts
+
+
+luxriot_manager = LuxriotManager(
+    config=config,
+    lm_callback=_call_video_understanding,
+    message_builder=_build_luxriot_messages,
+    jpeg_encoder=_encode_jpeg,
+    alert_parser=_parse_lm_alerts,
+    probe_manager=None,  # will be assigned after probe_manager init
+)
+
+PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
+PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
+PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
+LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+    "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
+    "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
+    "Always append a JSON block in this form (alerts may be empty, but must be present): "
+    "{ 'alerts': [ { 'title': 'short alert title', 'description': '1-2 sentence description with any time/frame hints', "
+    "'severity': 'info|low|normal|high|critical', 'state': 'new|inprogress|closed|hidden|none', "
+    "'channel_id': <channel id>, 'timestamp_ms': <milliseconds since epoch> } ] }. "
+    "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
+    "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
+)
+
+probe_manager = ProbeManager(
+    embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
+    embed_text_fn=lambda text: get_text_embedding(text),
+    jpeg_encoder=_encode_jpeg,
+)
+luxriot_manager.probe_manager = probe_manager
+probe_daemon_thread: Optional[threading.Thread] = None
+probe_daemon_stop = threading.Event()
+
+
+class ProbesStore:
+    def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
+        self.path = Path(path)
+        self.data: Dict[str, Any] = {"probes": []}
+        self._load()
+
+    def _load(self) -> None:
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text())
+            except Exception:
+                self.data = {"probes": []}
+
+    def _save(self) -> None:
+        try:
+            self.path.write_text(json.dumps(self.data, indent=2))
+        except Exception:
+            pass
+
+    def list_probes(self) -> List[Dict[str, Any]]:
+        return list(self.data.get("probes", []))
+
+    def upsert_probe(self, probe: Dict[str, Any]) -> Dict[str, Any]:
+        self.data.setdefault("probes", [])
+        probe_list: List[Dict[str, Any]] = self.data["probes"]
+        if not probe.get("id"):
+            probe["id"] = f"probe-{int(time.time() * 1000)}"
+        existing = None
+        for idx, item in enumerate(probe_list):
+            if item.get("id") == probe["id"]:
+                existing = idx
+                break
+        if existing is None:
+            probe_list.append(probe)
+        else:
+            probe_list[existing] = probe
+        self._save()
+        return probe
+
+    def delete_probe(self, probe_id: str) -> bool:
+        probes = self.data.get("probes", [])
+        new_probes = [p for p in probes if p.get("id") != probe_id]
+        if len(new_probes) == len(probes):
+            return False
+        self.data["probes"] = new_probes
+        self._save()
+        return True
+
+
+probes_store = ProbesStore()
+
+
+def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
+    user_prompt = (prompt or '').strip() or "Describe the main content of this image clearly and concisely."
+    user_content = [
+        {'type': 'text', 'text': f"Image: {Path(image_path).name}\n\nTask: {user_prompt}"},
+        {
+            'type': 'image_url',
+            'image_url': {
+                'url': f"data:image/jpeg;base64,{_encode_jpeg(Image.open(image_path), max_edge=config.THUMBNAIL_SIZE[0])}",
+                'detail': 'high',
+            },
+        },
+    ]
+    return [
+        {'role': 'system', 'content': [{'type': 'text', 'text': 'You are an expert visual analyst. Be concise and factual.'}]},
+        {'role': 'user', 'content': user_content},
+    ]
+
+
+def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*color)
+
+
+def _probe_daemon() -> None:
+    """Background runner: execute enabled probes across channels."""
+    while not probe_daemon_stop.is_set():
+        try:
+            probes = probes_store.list_probes()
+            # Group probes by channel
+            by_channel: Dict[int, List[Dict[str, Any]]] = {}
+            for p in probes:
+                if p.get("enabled") is False:
+                    continue
+                ch = int(p.get("channel_id", config.LUXRIOT_DEFAULT_CHANNEL_ID))
+                by_channel.setdefault(ch, []).append(p)
+            for ch, plist in by_channel.items():
+                try:
+                    # Ensure capture running for this channel
+                    try:
+                        fps_desired = max([p.get('fps') or 0 for p in plist] or [0])
+                        luxriot_manager.start_probe_capture(ch, fps=fps_desired if fps_desired > 0 else None)
+                    except Exception:
+                        pass
+                    for probe in plist:
+                        result = probe_manager.query(
+                            probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                            probe.get('positives', []),
+                            probe.get('negatives', []),
+                            probe.get('pos_floor', 0.2),
+                            probe.get('margin', 0.05),
+                            probe.get('top_k', 6),
+                            window_sec=probe.get('window_sec', 300.0),
+                            image_probe=probe.get('image_probe'),
+                        )
+                        if 'error' in result:
+                            continue
+                        hits = result.get('results') or []
+                        if hits:
+                            probe['last_hit'] = hits[0]
+                            recent = probe.get('recent_hits') or []
+                            recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
+                            probe['recent_hits'] = recent
+                            if probe.get('bookmark'):
+                                try:
+                                    luxriot_manager.send_bookmark_event(
+                                        channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                                        title=f"Probe hit: {probe.get('name', 'probe')}",
+                                        description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                                        severity=probe.get('severity', 'critical'),
+                                        state='new',
+                                        timestamp_ms=hits[0].get('timestamp_ms'),
+                                    )
+                                except Exception:
+                                    pass
+                            probes_store.upsert_probe(probe)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        probe_daemon_stop.wait(PROBE_DAEMON_INTERVAL_SEC)
+
+def _render_segmentation_overlay(
+    seg_map: np.ndarray,
+    label_lookup: Optional[Dict[int, str]],
+    highlight_id: Optional[int],
+) -> Tuple[Optional[Image.Image], List[Dict[str, Any]]]:
+    if seg_map is None or not isinstance(seg_map, np.ndarray):
+        return None, []
+    seg_int = np.asarray(seg_map, dtype=np.int32)
+    if seg_int.ndim != 2:
+        return None, []
+    height, width = seg_int.shape
+    if height == 0 or width == 0:
+        return None, []
+
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    legend: List[Dict[str, Any]] = []
+
+    labels = label_lookup or {}
+    unique_ids = np.unique(seg_int)
+    for class_id in unique_ids:
+        class_int = int(class_id)
+        color = _class_color(class_int)
+        mask = seg_int == class_int
+        alpha = 220 if highlight_id is not None and class_int == highlight_id else 150
+        rgba[..., :3][mask] = color
+        rgba[..., 3][mask] = alpha
+        legend.append(
+            {
+                'id': class_int,
+                'label': labels.get(class_int, f'class_{class_int}'),
+                'color': _rgb_to_hex(color),
+                'highlight': bool(highlight_id is not None and class_int == highlight_id),
+            }
+        )
+
+    legend.sort(key=lambda entry: (0 if entry['highlight'] else 1, entry['label']))
+
+    overlay_img = Image.fromarray(rgba, mode='RGBA')
+    return overlay_img, legend
 
 
 def _available_indexes(folder_path: Union[str, Path]) -> List[str]:
@@ -2828,67 +6284,50 @@ def save_comment():
 @app.route('/commented_images', methods=['POST'])
 def get_commented_images():
     """Get all images that have comments in the indexed folder"""
-    folder = request.json.get('folder')
+    payload = request.json if request.is_json else None
+    folder = (payload or {}).get('folder')
     if not folder:
         return jsonify({'error': 'No folder specified'}), 400
-    
+
     try:
-        # Load index to get image paths
-        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
-        if index is None:
-            message = 'Folder not indexed for the current backend'
-            available = _available_indexes(folder)
-            if available:
-                message += f" (available: {', '.join(available)})"
-            return jsonify({'error': message}), 400
-        
-        # Load comments
+        available = _available_indexes(folder)
+        image_paths: List[str] = []
+        image_metadata: List[Dict[str, Any]] = []
+        metadata_map: Dict[str, Dict[str, Any]] = {}
+
+        if available:
+            targets = [active_embedder] + [m for m in available if m != active_embedder]
+            for emb in targets:
+                idx_obj, paths, metas, meta_info = load_index(folder, embedder=emb)
+                if idx_obj is not None:
+                    image_paths = paths or []
+                    image_metadata = metas or []
+                    metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+                    break
+
         comments_data = load_comments(folder)
-        
-        # Build results for images with comments
-        results = []
-        for image_path in comments_data.keys():
-            if image_path in image_paths:
-                try:
-                    # Get index position for metadata lookup
-                    idx = image_paths.index(image_path)
-                    
-                    # Create thumbnail
-                    img = Image.open(image_path)
-                    img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-                    
-                    # Convert to base64
-                    buffer = BytesIO()
-                    img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode()
-                    
-                    # Get metadata if available
-                    metadata_info = {}
-                    if image_metadata and idx < len(image_metadata):
-                        meta = image_metadata[idx]
-                        metadata_info = {
-                            'mtime': meta.get('mtime', 0),
-                            'size': meta.get('size', 0)
-                        }
-                    
-                    results.append({
-                        'path': image_path,
-                        'filename': os.path.basename(image_path),
-                        'thumbnail': img_base64,
-                        'comment_count': len(comments_data[image_path]),
-                        'latest_comment': comments_data[image_path][-1] if comments_data[image_path] else '',
-                        'metadata': metadata_info
-                    })
-                except Exception as img_error:
-                    print(f"Error processing commented image {image_path}: {img_error}")
-                    continue
-        
-        # Sort by most recent comment first
-        results.sort(key=lambda x: x['latest_comment'], reverse=True)
-        
+        if not comments_data:
+            return jsonify({'results': []})
+
+        results: List[Dict[str, Any]] = []
+        for image_path, comment_list in comments_data.items():
+            if not Path(image_path).exists():
+                continue
+            entry = _build_result_entry(
+                image_path,
+                similarity=1.0,
+                metadata=metadata_map.get(image_path, {}),
+                extra={
+                    'comment_count': len(comment_list),
+                    'latest_comment': comment_list[-1] if comment_list else '',
+                },
+            )
+            if entry:
+                results.append(entry)
+
+        results.sort(key=lambda x: (x.get('metadata', {}).get('mtime', 0), x.get('comment_count', 0)), reverse=True)
         return jsonify({'results': results})
     except Exception as e:
-        print(f"Error getting commented images: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/check_index', methods=['POST'])
@@ -3070,6 +6509,90 @@ def index_segments():
             ],
         }
     )
+
+
+@app.route('/video_understanding', methods=['POST'])
+def video_understanding():
+    data = request.json or {}
+    video_path = (data.get('video') or '').strip()
+    if not video_path:
+        return jsonify({'error': 'Provide a video path.'}), 400
+    max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
+    try:
+        max_frames_int = int(max_frames)
+    except (TypeError, ValueError):
+        max_frames_int = config.LM_VIDEO_DEFAULT_FRAMES
+    if max_frames_int < 1:
+        max_frames_int = 1
+    max_frames_int = min(max_frames_int, config.LM_VIDEO_MAX_FRAMES)
+
+    sample_fps_raw = data.get('sample_fps')
+    try:
+        sample_fps_val = float(sample_fps_raw) if sample_fps_raw is not None else None
+        if sample_fps_val is not None and sample_fps_val <= 0:
+            sample_fps_val = None
+    except (TypeError, ValueError):
+        sample_fps_val = None
+
+    user_prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip()
+
+    try:
+        frames, fps, duration = _sample_video_frames(
+            video_path,
+            max_frames=max_frames_int,
+            sample_fps=sample_fps_val,
+            max_edge=config.LM_VIDEO_MAX_EDGE,
+        )
+        if not frames:
+            return jsonify({'error': 'No frames could be extracted from the video.'}), 400
+        messages = _build_video_messages(video_path, frames, user_prompt)
+        summary = _call_video_understanding(messages, model_override=model_hint or None)
+        return jsonify(
+            {
+                'summary': summary,
+                'frames': [
+                    {
+                        'index': f['index'],
+                        'time_sec': f['time_sec'],
+                        'thumbnail': f['thumbnail'],
+                    }
+                    for f in frames
+                ],
+                'fps': fps,
+                'duration_sec': duration,
+                'model': model_hint or config.LM_MODEL,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/describe_image', methods=['POST'])
+def describe_image():
+    data = request.json or {}
+    image_path = (data.get('image_path') or '').strip()
+    prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip()
+    if not image_path:
+        return jsonify({'error': 'image_path is required'}), 400
+    path_obj = Path(image_path)
+    if not path_obj.exists():
+        return jsonify({'error': f'Image not found: {image_path}'}), 400
+    try:
+        messages = _build_image_messages(image_path, prompt)
+        summary = _call_lm_chat(messages, model_override=model_hint or None)
+        thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
+        return jsonify(
+            {
+                'summary': summary,
+                'thumbnail': thumb,
+                'model': model_hint or config.LM_MODEL,
+                'image_path': image_path,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
@@ -3351,6 +6874,8 @@ def segment_from_point():
     target_modes = _parse_targets(data.get('targets') or data.get('target'))
     segment_ids = _parse_segment_ids(data.get('segment_ids'))
     label_map = _parse_segment_labels(data.get('segment_labels'))
+    if not isinstance(label_map, dict):
+        label_map = {}
 
     try:
         limit = int(limit)
@@ -3365,15 +6890,19 @@ def segment_from_point():
     if dino_encoder is None:
         return jsonify({'error': 'DINO encoder is not available'}), 500
 
+    pil_image: Optional[Image.Image] = None
     if uploaded_image:
-        image_obj = Image.open(uploaded_image.stream)
-        if image_obj.mode != 'RGB':
-            image_obj = image_obj.convert('RGB')
-        image_input: Union[str, Path, Image.Image] = image_obj
+        pil_image = Image.open(uploaded_image.stream)
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
     else:
         if not os.path.exists(image_path):
             return jsonify({'error': f'Image file not found: {image_path}'}), 400
-        image_input = image_path
+        with Image.open(image_path) as src:
+            pil_image = src.convert('RGB')
+
+    assert pil_image is not None
+    image_input: Union[str, Path, Image.Image] = pil_image
 
     try:
         heatmap, _, grid, patch_coords = dino_encoder.patch_similarity_map(
@@ -3390,17 +6919,65 @@ def segment_from_point():
     if not mask_bool.any() and flat.size:
         mask_bool.flat[int(np.argmax(flat))] = True
 
-    mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+    coarse_mask_uint8 = (mask_bool.astype(np.uint8) * 255)
+    mask_fraction = float(np.count_nonzero(coarse_mask_uint8)) / float(coarse_mask_uint8.size) if coarse_mask_uint8.size else 0.0
+
     heatmap_norm = heatmap - heatmap.min()
     if heatmap_norm.max() > 0:
         heatmap_norm = heatmap_norm / heatmap_norm.max()
 
     crop_size = getattr(dino_encoder, 'crop_size', 224)
-    heatmap_img = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(
-        (crop_size, crop_size),
-        resample=Image.BILINEAR,
-    )
-    mask_img = Image.fromarray(mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+
+    base_size = pil_image.size
+    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=Image.NEAREST)
+    refinement_source = 'dino_heatmap'
+    refined_label: Optional[str] = None
+    segment_value = 255
+    refine_result: Optional[Dict[str, Any]] = None
+
+    head = ensure_mask_head()
+    if head is not None:
+        try:
+            refine_result = head.refine(pil_image, coarse_mask_uint8, (x_norm, y_norm))
+            if refine_result and isinstance(refine_result, dict):
+                refined_mask_arr = refine_result.get('mask')
+                if isinstance(refined_mask_arr, np.ndarray) and refined_mask_arr.any():
+                    refinement_source = 'mask2former'
+                    refined_label = refine_result.get('label')
+                    mask_fraction = float(refine_result.get('mask_fraction', mask_fraction))
+                    segment_value = int(refine_result.get('segment_value', 255))
+                    overlay_mask_source = Image.fromarray(refined_mask_arr.astype(np.uint8), mode='L')
+                    if overlay_mask_source.size != base_size:
+                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=Image.NEAREST)
+                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=Image.NEAREST)
+                    if refined_label:
+                        label_map[str(segment_value)] = refined_label
+        except Exception as exc:
+            print(f"Mask2Former refinement error: {exc}")
+
+    # Update mask coverage fraction based on overlay image size
+    overlay_mask_np = np.asarray(overlay_mask_source)
+    if overlay_mask_np.size:
+        mask_fraction = float(np.count_nonzero(overlay_mask_np)) / float(overlay_mask_np.size)
+
+    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=Image.BILINEAR)
+    heatmap_overlay = _create_overlay_rgba(heatmap_alpha, (255, 155, 40), 0.9)
+    mask_overlay = _create_overlay_rgba(overlay_mask_source, (94, 196, 255), 0.6)
+    segmentation_overlay_img: Optional[Image.Image] = None
+    legend_entries: List[Dict[str, Any]] = []
+
+    if refine_result:
+        seg_map = refine_result.get('segmentation')
+        class_labels_raw = refine_result.get('class_labels')
+        class_labels = {}
+        if isinstance(class_labels_raw, dict):
+            class_labels = {int(k): str(v) for k, v in class_labels_raw.items()}
+        seg_overlay, legend_entries = _render_segmentation_overlay(seg_map, class_labels, int(refine_result.get('class_id', segment_value)))
+        if seg_overlay is not None:
+            if seg_overlay.size != base_size:
+                seg_overlay = seg_overlay.resize(base_size, resample=Image.NEAREST)
+            segmentation_overlay_img = seg_overlay
 
     try:
         segments_response, segment_map = _mask_search_pipeline(
@@ -3426,11 +7003,19 @@ def segment_from_point():
         'grid_size': grid,
         'patch_coords': {'x': patch_coords[0], 'y': patch_coords[1]},
         'threshold': threshold,
-        'heatmap_png': _image_to_base64(heatmap_img),
-        'mask_png': _image_to_base64(mask_img),
+        'heatmap_png': _image_to_base64(heatmap_overlay),
+        'mask_png': _image_to_base64(mask_overlay),
+        'mask_fraction': mask_fraction,
+        'refinement': refinement_source,
+        'refined_label': refined_label,
+        'segment_value': segment_value,
         'patch_count': int(selected_meta.get('patch_count', 0)),
         'patch_fraction': float(selected_meta.get('patch_fraction', 0.0)),
     }
+    if segmentation_overlay_img is not None:
+        overlay['segmentation_png'] = _image_to_base64(segmentation_overlay_img)
+    if legend_entries:
+        overlay['legend'] = legend_entries
 
     return jsonify(
         {
@@ -3440,6 +7025,356 @@ def segment_from_point():
             'overlay': overlay,
         }
     )
+
+
+@app.route('/luxriot/channels', methods=['GET'])
+def luxriot_channels():
+    """Fetch available Luxriot channels (cached briefly)."""
+    force = str(request.args.get('force', '')).lower() in {'1', 'true', 'yes'}
+    try:
+        channels = luxriot_manager.get_channels(force=force)
+        return jsonify({'channels': channels})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/snapshot/<int:channel_id>', methods=['GET'])
+def luxriot_snapshot(channel_id: int):
+    stream_type = request.args.get('stream', 'mainStream')
+    try:
+        encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
+        img_bytes = base64.b64decode(encoded)
+        response = make_response(img_bytes)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['X-Image-Width'] = str(meta.get('width'))
+        response.headers['X-Image-Height'] = str(meta.get('height'))
+        return response
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/start_capture', methods=['POST'])
+def luxriot_start_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    batch_size = data.get('batch_size')
+    prompt = data.get('prompt') or ''
+    model_hint = (data.get('model') or '').strip() or None
+    try:
+        status = luxriot_manager.start_session(channel_id, batch_size=batch_size, prompt=prompt, model_hint=model_hint)
+        return jsonify({'success': True, 'session': status})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/stop_capture', methods=['POST'])
+def luxriot_stop_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        state = luxriot_manager.stop_session(channel_id)
+        return jsonify({'success': True, 'session': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/flush_capture', methods=['POST'])
+def luxriot_flush_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        result = luxriot_manager.flush_session(channel_id)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/session', methods=['GET'])
+def luxriot_session_status():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    try:
+        status = luxriot_manager.session_status(channel_id)
+        return jsonify(status)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/bookmark', methods=['POST'])
+def luxriot_bookmark():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    title = (data.get('title') or '').strip() or 'External event'
+    description = data.get('description') or ''
+    severity = (data.get('severity') or 'critical').strip().lower()
+    state = (data.get('state') or 'new').strip().lower()
+    timestamp_ms = data.get('timestamp_ms')
+    try:
+        if timestamp_ms is not None:
+            timestamp_ms = int(timestamp_ms)
+    except Exception:
+        timestamp_ms = None
+    try:
+        result = luxriot_manager.send_bookmark_event(
+            channel_id=channel_id,
+            title=title,
+            description=description,
+            severity=severity,
+            state=state,
+            timestamp_ms=timestamp_ms,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/query', methods=['POST'])
+def probes_query():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    positives = data.get('positives') or []
+    negatives = data.get('negatives') or []
+    try:
+        pos_floor = float(data.get('pos_floor', 0.2))
+    except Exception:
+        pos_floor = 0.2
+    try:
+        margin_thr = float(data.get('margin', 0.05))
+    except Exception:
+        margin_thr = 0.05
+    try:
+        top_k = int(data.get('top_k', 5))
+    except Exception:
+        top_k = 5
+    try:
+        window_sec = float(data.get('window_sec', 0))
+    except Exception:
+        window_sec = 0
+    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec, image_probe=data.get('image_probe'))
+    status_code = 200 if 'error' not in result else 400
+    hits = result.get('results') or []
+    if hits and data.get('bookmark'):
+        try:
+            luxriot_manager.send_bookmark_event(
+                channel_id=channel_id,
+                title=f"Probe hit: {data.get('name') or 'probe'}",
+                description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                severity=(data.get('severity') or 'critical'),
+                state='new',
+                timestamp_ms=hits[0].get('timestamp_ms'),
+            )
+        except Exception:
+            pass
+    if hits:
+        # trim recent hits (kept in request payload only; not persisted unless saved)
+        recent_hits = data.get('recent_hits') or []
+        recent_hits = (recent_hits + hits)[:PROBE_MAX_STORED_HITS]
+        result['recent_hits'] = recent_hits
+    return jsonify(result), status_code
+
+
+@app.route('/probes/status', methods=['GET'])
+def probes_status():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    try:
+        return jsonify(probe_manager.status(channel_id))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/start_capture', methods=['POST'])
+def probes_start_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        fps = data.get('fps')
+        fps_val = None
+        try:
+            if fps is not None:
+                fps_val = float(fps)
+        except Exception:
+            fps_val = None
+        state = luxriot_manager.start_probe_capture(channel_id, fps=fps_val)
+        return jsonify({'success': True, 'state': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/stop_capture', methods=['POST'])
+def probes_stop_capture():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    try:
+        state = luxriot_manager.stop_probe_capture(channel_id)
+        return jsonify({'success': True, 'state': state})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/probes/save', methods=['POST'])
+def probes_save():
+    data = request.json or {}
+    try:
+        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    positives = [str(x).strip() for x in (data.get('positives') or []) if str(x).strip()]
+    negatives = [str(x).strip() for x in (data.get('negatives') or []) if str(x).strip()]
+    image_probe = data.get('image_probe') or {}
+    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
+        return jsonify({'error': 'Provide at least one positive (text or image).'}), 400
+
+    def _float(val, default):
+        try:
+            return float(val)
+        except Exception:
+            return default
+
+    def _int(val, default):
+        try:
+            return int(val)
+        except Exception:
+            return default
+
+    probe = {
+        "id": data.get('id') or None,
+        "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
+        "channel_id": channel_id,
+        "positives": positives,
+        "negatives": negatives,
+        "pos_floor": _float(data.get('pos_floor'), 0.2),
+        "margin": _float(data.get('margin'), 0.05),
+        "top_k": _int(data.get('top_k'), 6),
+        "window_sec": _float(data.get('window_sec'), 300.0),
+        "severity": (data.get('severity') or 'critical').lower(),
+        "bookmark": bool(data.get('bookmark', True)),
+        "enabled": bool(data.get('enabled', True)),
+        "image_probe": image_probe,
+        "pairs": data.get('pairs') or [],
+        "last_hit": data.get('last_hit'),
+        "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
+    }
+    saved = probes_store.upsert_probe(probe)
+    return jsonify({'success': True, 'probe': saved})
+
+
+@app.route('/probes/list', methods=['GET'])
+def probes_list():
+    probes = probes_store.list_probes()
+    return jsonify({'probes': probes})
+
+
+@app.route('/probes/delete', methods=['POST'])
+def probes_delete():
+    data = request.json or {}
+    probe_id = data.get('id')
+    if not probe_id:
+        return jsonify({'error': 'Provide probe id'}), 400
+    ok = probes_store.delete_probe(probe_id)
+    if not ok:
+        return jsonify({'error': 'Probe not found'}), 404
+    return jsonify({'success': True})
+
+
+@app.route('/probes/run', methods=['POST'])
+def probes_run():
+    data = request.json or {}
+    probe_id = data.get('id')
+    if not probe_id:
+        return jsonify({'error': 'Provide probe id'}), 400
+    probes = {p.get('id'): p for p in probes_store.list_probes()}
+    probe = probes.get(probe_id)
+    if not probe:
+        return jsonify({'error': 'Probe not found'}), 404
+    result = probe_manager.query(
+        probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+        probe.get('positives', []),
+        probe.get('negatives', []),
+        probe.get('pos_floor', 0.2),
+        probe.get('margin', 0.05),
+        probe.get('top_k', 6),
+        window_sec=probe.get('window_sec', 300.0),
+        image_probe=probe.get('image_probe'),
+    )
+    if 'error' in result:
+        return jsonify(result), 400
+    hits = result.get('results') or []
+    if hits:
+        probe['last_hit'] = hits[0]
+        # keep a short rolling history of hits for UI while capping thumbnails
+        recent = probe.get('recent_hits') or []
+        recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
+        probe['recent_hits'] = recent
+        probes_store.upsert_probe(probe)
+        if probe.get('bookmark'):
+            try:
+                luxriot_manager.send_bookmark_event(
+                    channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                    title=f"Probe hit: {probe.get('name', 'probe')}",
+                    description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                    severity=probe.get('severity', 'critical'),
+                    state='new',
+                    timestamp_ms=hits[0].get('timestamp_ms'),
+                )
+            except Exception:
+                pass
+    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe})
+
+
+@app.route('/probes/bench', methods=['GET'])
+def probes_bench():
+    """Lightweight throughput estimate (image embedding)."""
+    try:
+        import torch  # type: ignore
+        init_clip()
+    except Exception:
+        return jsonify({
+            "error": "PyTorch/CLIP not available; install torch+clip to run benchmark."
+        }), 400
+    batch = int(request.args.get('batch', PROBE_BENCH_BATCH))
+    batch = max(4, min(64, batch))
+    try:
+        # build random batch at 224x224
+        rnd = torch.randint(0, 255, (batch, 3, 224, 224), device=device, dtype=torch.uint8)
+        images = rnd.float() / 255.0
+        started = time.time()
+        with torch.no_grad():
+            feats = clip_model.encode_image(images)  # type: ignore
+            _ = feats.cpu()
+        elapsed = time.time() - started
+        fps = batch / elapsed if elapsed > 0 else 0
+        return jsonify({
+            "batch": batch,
+            "elapsed_sec": round(elapsed, 3),
+            "approx_fps": round(fps, 1),
+            "device": device,
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
 
 @app.route('/settings', methods=['GET'])
 def get_settings():
@@ -3463,6 +7398,16 @@ def get_settings():
             'segmentsEnabled': config.DINO_SEGMENTS_ENABLED,
             'segmentMinPatches': config.DINO_SEGMENT_MIN_PATCHES,
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
+            'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
+            'luxriotUsername': config.LUXRIOT_USERNAME,
+            'luxriotPassword': config.LUXRIOT_PASSWORD,
+            'luxriotSnapshotInterval': config.LUXRIOT_SNAPSHOT_INTERVAL,
+            'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
+            'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
+            'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
+            'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
+            'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
+            'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
             'defaultResults': config.DEFAULT_RESULTS,
@@ -3552,6 +7497,42 @@ def save_settings():
             segment_threshold = config.DINO_HEATMAP_THRESHOLD
         segment_threshold = min(0.99, max(0.0, segment_threshold))
 
+        luxriot_base_url = str(data.get('luxriotBaseUrl', config.LUXRIOT_BASE_URL)).strip().rstrip('/')
+        luxriot_username = str(data.get('luxriotUsername', config.LUXRIOT_USERNAME)).strip()
+        luxriot_password = str(data.get('luxriotPassword', config.LUXRIOT_PASSWORD)).strip()
+        try:
+            luxriot_snapshot_interval = int(data.get('luxriotSnapshotInterval', config.LUXRIOT_SNAPSHOT_INTERVAL))
+        except (TypeError, ValueError):
+            luxriot_snapshot_interval = config.LUXRIOT_SNAPSHOT_INTERVAL
+        if luxriot_snapshot_interval < 1:
+            luxriot_snapshot_interval = 5
+        try:
+            luxriot_snapshot_max_edge = int(data.get('luxriotSnapshotMaxEdge', config.LUXRIOT_SNAPSHOT_MAX_EDGE))
+        except (TypeError, ValueError):
+            luxriot_snapshot_max_edge = config.LUXRIOT_SNAPSHOT_MAX_EDGE
+        if luxriot_snapshot_max_edge < 640:
+            luxriot_snapshot_max_edge = 640
+        try:
+            luxriot_default_channel_id = int(data.get('luxriotDefaultChannelId', config.LUXRIOT_DEFAULT_CHANNEL_ID))
+        except (TypeError, ValueError):
+            luxriot_default_channel_id = config.LUXRIOT_DEFAULT_CHANNEL_ID
+        try:
+            luxriot_max_buffer_frames = int(data.get('luxriotMaxBufferFrames', config.LUXRIOT_MAX_BUFFER_FRAMES))
+        except (TypeError, ValueError):
+            luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
+        if luxriot_max_buffer_frames < 12:
+            luxriot_max_buffer_frames = 12
+        luxriot_auto_bookmarks_raw = data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS)
+        if isinstance(luxriot_auto_bookmarks_raw, str):
+            luxriot_auto_bookmarks = luxriot_auto_bookmarks_raw.strip().lower() in {'true', '1', 'yes', 'on'}
+        else:
+            luxriot_auto_bookmarks = bool(luxriot_auto_bookmarks_raw)
+        severity_map = data.get('luxriotSeverityMap', {}) or {}
+        merged_sev = dict(config.LUXRIOT_SEVERITY_MAP)
+        for key in ['info', 'low', 'normal', 'high', 'critical']:
+            if key in severity_map:
+                merged_sev[key] = str(severity_map[key] or merged_sev.get(key, key)).lower()
+
         embedder = str(data.get('embedder', active_embedder)).strip().lower()
         if embedder == 'fusion' and not fusion_enabled:
             embedder = 'clip'
@@ -3599,6 +7580,25 @@ EVOSSEARCH_RERANK_TOP_K={rerank_top_k}
 EVOSSEARCH_DINO_SEGMENTS_ENABLED={str(segments_enabled).lower()}
 EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES={segment_min_patches}
 EVOSSEARCH_DINO_HEATMAP_THRESHOLD={segment_threshold:.4f}
+EVOSSEARCH_M2F_ENABLED={str(config.MASK2FORMER_ENABLED).lower()}
+EVOSSEARCH_M2F_MODEL={config.MASK2FORMER_MODEL}
+EVOSSEARCH_M2F_DEVICE={config.MASK2FORMER_DEVICE}
+EVOSSEARCH_M2F_MAX_SIZE={config.MASK2FORMER_MAX_SIZE}
+
+# Luxriot Evo integration
+EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
+EVOSSEARCH_LUXRIOT_USERNAME={luxriot_username}
+EVOSSEARCH_LUXRIOT_PASSWORD={luxriot_password}
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
+EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
+EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
+EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
+EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
+EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
+EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
+EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
+EVOSSEARCH_LUXRIOT_SEV_HIGH={merged_sev['high']}
+EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -3647,6 +7647,15 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.DINO_SEGMENTS_ENABLED = segments_enabled
         config.DINO_SEGMENT_MIN_PATCHES = segment_min_patches
         config.DINO_HEATMAP_THRESHOLD = segment_threshold
+        config.LUXRIOT_BASE_URL = luxriot_base_url
+        config.LUXRIOT_USERNAME = luxriot_username
+        config.LUXRIOT_PASSWORD = luxriot_password
+        config.LUXRIOT_DEFAULT_CHANNEL_ID = luxriot_default_channel_id
+        config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
+        config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
+        config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
+        config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
+        config.LUXRIOT_SEVERITY_MAP = merged_sev
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
@@ -3665,4 +7674,7 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 if __name__ == '__main__':
     ensure_embedder_loaded()
     config.print_startup_info()
+    if probe_daemon_thread is None:
+        probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)
+        probe_daemon_thread.start()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

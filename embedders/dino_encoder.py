@@ -54,9 +54,18 @@ class DINOEncoder:
         weights_path: Optional[str] = None,
     ) -> None:
         self.model_name = self._resolve_model_name(model_name)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "")
+        self.device = torch.device(resolved_device)
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                "DINOEncoder requires a CUDA device. Set EVOSSEARCH_DINO_DEVICE to an available cuda device."
+            )
         self.batch_size = max(1, int(batch_size))
         self.weights_path = self._validate_weights_path(weights_path)
+        if self.weights_path is None:
+            raise RuntimeError(
+                "EVOSSEARCH_DINO_WEIGHTS_PATH must point to a local DINO checkpoint to avoid CPU fallback."
+            )
 
         self.transform: Optional[TransformType] = None
         self.model: Optional[torch.nn.Module] = None
@@ -150,12 +159,10 @@ class DINOEncoder:
 
     def _init_torch_hub(self) -> None:
         load_kwargs = {
-            'pretrained': True,
+            'pretrained': False,
             'trust_repo': True,
             'map_location': self.device,
         }
-        if self.weights_path is not None:
-            load_kwargs['weights'] = str(self.weights_path)
 
         try:
             with warnings.catch_warnings():
@@ -171,8 +178,7 @@ class DINOEncoder:
         except HTTPError as exc:
             if getattr(exc, 'code', None) == 403:
                 raise RuntimeError(
-                    "DINO weights download returned HTTP 403. Manually download the checkpoint from "
-                    "https://github.com/facebookresearch/dinov3 and set EVOSSEARCH_DINO_WEIGHTS_PATH to the local file."
+                    "DINO architecture download blocked (403). Ensure the Dinov3 repo is available offline."
                 ) from exc
             raise
         except ModuleNotFoundError as exc:
@@ -187,8 +193,20 @@ class DINOEncoder:
             raise
 
         assert self.model is not None
-        self.model.eval()
+
+        state_dict = torch.load(str(self.weights_path), map_location=self.device)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Loaded DINO weights mismatch. Missing keys: {missing}; unexpected keys: {unexpected}"
+            )
+        del state_dict
+
         self.model.to(self.device)
+        self.model.eval()
+        first_param = next(self.model.parameters(), None)
+        if first_param is None or first_param.device.type != "cuda":
+            raise RuntimeError("DINO model failed to remain on CUDA device; aborting to protect session.")
 
         embed_dim = getattr(self.model, "embed_dim", None) or getattr(self.model, "num_features", None)
         if embed_dim is None:  # pragma: no cover - defensive check
@@ -200,7 +218,10 @@ class DINOEncoder:
             tokens_param = getattr(self.model, "register_tokens", None)
             if tokens_param is not None and hasattr(tokens_param, "shape"):
                 register_tokens = tokens_param.shape[-2] if tokens_param.ndim >= 2 else tokens_param.shape[0]
-        self._register_token_count = int(register_tokens or 0)
+        register_tokens = self._coerce_register_token_count(register_tokens)
+        if not register_tokens:
+            register_tokens = getattr(self.model, "n_storage_tokens", None)
+        self._register_token_count = self._coerce_register_token_count(register_tokens)
 
     def _encode_images_hf(self, batch: List[ImageInput]) -> np.ndarray:
         assert self.processor is not None and self.hf_model is not None
@@ -246,9 +267,12 @@ class DINOEncoder:
                 chunk = stack[start : start + self.batch_size]
                 feats = self.model(chunk)
                 if isinstance(feats, dict):  # pragma: no cover - defensive
-                    feats = feats.get("x_norm_clstoken") or feats.get("x_norm_cls")
-                    if feats is None:
+                    token = feats.get("x_norm_clstoken")
+                    if token is None:
+                        token = feats.get("x_norm_cls")
+                    if token is None:
                         raise RuntimeError("Unexpected DINO forward output structure")
+                    feats = token
                 feats = F.normalize(feats, dim=-1)
                 embeddings.append(feats.detach().cpu())
         result = torch.cat(embeddings, dim=0).numpy().astype(np.float32, copy=False)
@@ -273,13 +297,21 @@ class DINOEncoder:
 
         tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
         with torch.inference_mode():
-            outputs = self.model(tensor)
+            forward_features = getattr(self.model, "forward_features", None)
+            if callable(forward_features):
+                outputs = forward_features(tensor)
+            else:
+                outputs = self.model(tensor)
 
         if not isinstance(outputs, dict):  # pragma: no cover - defensive
             raise RuntimeError("DINO torch hub model did not return patch tokens")
 
-        cls_token = outputs.get("x_norm_clstoken") or outputs.get("x_norm_cls")
-        patch_tokens = outputs.get("x_norm_patchtokens") or outputs.get("x_norm_patch")
+        cls_token = outputs.get("x_norm_clstoken")
+        if cls_token is None:
+            cls_token = outputs.get("x_norm_cls")
+        patch_tokens = outputs.get("x_norm_patchtokens")
+        if patch_tokens is None:
+            patch_tokens = outputs.get("x_norm_patch")
         if cls_token is None or patch_tokens is None:
             raise RuntimeError("DINO model outputs do not expose normalized patch tokens")
 
@@ -467,11 +499,19 @@ class DINOEncoder:
             assert self.model is not None and self.transform is not None
             tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
             with torch.inference_mode():
-                outputs = self.model(tensor)
+                forward_features = getattr(self.model, "forward_features", None)
+                if callable(forward_features):
+                    outputs = forward_features(tensor)
+                else:
+                    outputs = self.model(tensor)
             if not isinstance(outputs, dict):  # pragma: no cover - defensive
                 raise RuntimeError("DINO torch hub model did not return patch tokens")
-            cls_token = outputs.get("x_norm_clstoken") or outputs.get("x_norm_cls")
-            patch_tokens = outputs.get("x_norm_patchtokens") or outputs.get("x_norm_patch")
+            cls_token = outputs.get("x_norm_clstoken")
+            if cls_token is None:
+                cls_token = outputs.get("x_norm_cls")
+            patch_tokens = outputs.get("x_norm_patchtokens")
+            if patch_tokens is None:
+                patch_tokens = outputs.get("x_norm_patch")
             if cls_token is None or patch_tokens is None:
                 raise RuntimeError("DINO model outputs do not expose normalized patch tokens")
             cls_token = F.normalize(cls_token, dim=-1).detach().cpu()
@@ -524,3 +564,15 @@ class DINOEncoder:
                 arr = (arr * 255).astype(np.uint8)
             return Image.fromarray(arr).convert("RGB")
         raise TypeError(f"Unsupported image input type: {type(image)!r}")
+    @staticmethod
+    def _coerce_register_token_count(value: Optional[Union[int, float, torch.Tensor]]) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return int(value.item())
+            return int(value.view(-1)[0].item())
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0

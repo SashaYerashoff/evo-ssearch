@@ -113,6 +113,25 @@ EVOSSEARCH_CLIP_MODEL=ViT-B/32   # CLIP model variant
 EVOSSEARCH_BATCH_SIZE=32         # Processing batch size
 EVOSSEARCH_THUMBNAIL_QUALITY=85  # JPEG quality (50-100)
 
+# LM Studio video understanding (Qwen3-VL)
+EVOSSEARCH_LM_BASE_URL=http://192.168.1.104:1234/v1
+EVOSSEARCH_LM_MODEL=qwen/qwen3-vl-4b
+EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES=16   # default frames to sample per video
+EVOSSEARCH_LM_VIDEO_MAX_FRAMES=64       # hard cap on frames sent to the model
+EVOSSEARCH_LM_VIDEO_MAX_EDGE=960        # resize frames before sending
+EVOSSEARCH_LM_VIDEO_MAX_TOKENS=1536     # cap model output tokens (increase if responses are cut)
+EVOSSEARCH_LM_VIDEO_TEMPERATURE=0.2     # decoding temperature
+EVOSSEARCH_LM_TIMEOUT=120               # request timeout (seconds)
+
+# Luxriot Evo S live integration
+EVOSSEARCH_LUXRIOT_BASE_URL=http://192.168.1.102:8080
+EVOSSEARCH_LUXRIOT_USERNAME=admin
+EVOSSEARCH_LUXRIOT_PASSWORD=123
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=103
+EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=5
+EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
+EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES=180   # cap buffered snapshots before forced flush
+
 # Advanced settings
 EVOSSEARCH_MAX_COMMENT_LENGTH=500 # Max comment characters
 EVOSSEARCH_MAX_FILE_SIZE_MB=50   # Max upload file size
@@ -137,15 +156,19 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 2. **Search Images**: 
    - **Text Mode**: Type a natural language description
    - **Image Mode**: Upload an image file OR enter an image path for similarity search
-3. **Configure Search**: 
+3. **Video Understanding**:
+   - Switch to the **Video Understanding** tab
+   - Provide a video path, choose how many frames to sample (16/32/64), optional sampling FPS, and a prompt (can be remembered)
+   - Click **Analyze Video** to send sampled frames to Qwen3-VL via LM Studio; the response supports basic markdown formatting
+4. **Configure Search**: 
    - Choose sorting by similarity or time (newest first)
    - Adjust the number of results using the dropdown
-4. **Interact with Results**: 
+5. **Interact with Results**: 
    - **Expand**: Click the expand icon (⤢) in bottom-right corner of any image
    - **Find Similar**: Click the search icon (🔍) on expanded images to find similar images
    - **Copy Path**: Click the copy icon (📋) next to the filename
    - **Add Comments**: In expanded view, add comments that persist across searches
-5. **View Commented Images**: Click "Show Commented Images" to see only images with comments
+6. **View Commented Images**: Click "Show Commented Images" to see only images with comments
 
 ## UI Controls
 
