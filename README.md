@@ -25,12 +25,15 @@ A CLIP-powered natural language image search application with semantic similarit
 **Configurable & Accessible**
 - Settings modal writes `.env`; all prompts visible and editable
 - Network-accessible; CORS enabled
+- DINOv3 support for image search/segmentation (manual weights download; see below)
 
 ## Prerequisites
 - Windows 10/11 or Ubuntu 20.04+
 - Python 3.10+ (64-bit recommended)
 - Git
 - CUDA-capable GPU recommended for probes/monitoring (NVIDIA, drivers + CUDA toolkit)
+- **LM Studio** with a vision-capable model (e.g., Qwen3-VL) running, if using Video Understanding
+- **Luxriot Evo S** server up and reachable, if using monitoring/bookmarks
 
 ## Installation & Setup
 
@@ -42,6 +45,8 @@ A CLIP-powered natural language image search application with semantic similarit
 ```sh
 git clone https://github.com/SashaYerashoff/evo-ssearch.git
 cd evo-ssearch
+# Monitoring/VideoUnderstanding live on branch
+git checkout lxrt-inntegration
 ```
 
 ### 3. Create a Virtual Environment
@@ -63,6 +68,11 @@ python -m venv .venv
 ```sh
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# (Optional) DINOv3 weights (for image search/segmentation)
+# Download weights manually and place in embedders/dino_encoder or per your config.
+# Example (adjust model name/path as needed):
+# wget -O embedders/dino_encoder/dinov3_vitb16_pretrain.pth https://dl.fbaipublicfiles.com/dinov3/dinov3_vitb16_pretrain.pth
 ```
 
 ## Running the Application
@@ -144,6 +154,9 @@ EVOSSEARCH_PROBE_MAX_FRAMES=500         # frames kept per channel buffer
 EVOSSEARCH_PROBE_MAX_STORED_HITS=30     # recent hits retained per probe
 EVOSSEARCH_PROBE_DAEMON_INTERVAL_SEC=5  # background runner interval
 EVOSSEARCH_PROBE_BENCH_BATCH=16         # batch size for /probes/bench
+
+# DINOv3 weights (manual download)
+# Place weights in embedders/dino_encoder or configure the path in config.py
 ```
 
 ### Example Usage
