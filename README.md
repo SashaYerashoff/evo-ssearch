@@ -1,36 +1,39 @@
-# evo-ssearch
+# SISU (Smart Image Search and Understanding)
 
-A CLIP-powered natural language image search application with semantic similarity using OpenAI's CLIP model and FAISS indexing.
+SISU is a CLIP/DINO-powered search and monitoring toolkit with Luxriot Evo S integration, background probes, and vision LLM summaries. “Sisu” is also a Finnish word for grit, resilience, and determination—fitting for a system that keeps watching.
 
 ## Features
 
-**Modern Dark UI with SVG Overlay Controls:**
-- Clean, minimal dark interface optimized for image browsing
-- SVG overlay icons for intuitive image interaction
-- Network-accessible with automatic IP detection
+**Monitoring & Probes (Luxriot Evo S)**
+- Live Luxriot channel preview and user-visible system prompt (no hidden LLM prompts)
+- Continuous per-channel capture feeding per-probe FAISS buffers
+- Text probes and image probes (image-only supported); enable/disable per probe
+- Background probe runner executes all enabled probes across channels; per-probe FPS hint
+- Bookmark sending to Luxriot with severity control and bookmark toggle
+- Saved probe cards with thumbnails/status, inline “New probe” card
+- Latest detections carousel with hit metadata
 
-**Dual Search Modes:**
-- **Text Search**: Natural language descriptions (e.g., "red car", "sunset over mountains")
-- **Image Search**: Upload an image file OR enter an image path to find visually similar images
+**Benchmarks & Layout**
+- Built-in GPU embed benchmark (/probes/bench) surfaced in UI
+- Monitoring layout optimized for many probes: cards/benchmark on top, editor/detections below
 
-**Advanced Image Management:**
-- **Expand/Collapse**: Click overlay icon (bottom-right) to toggle between thumbnail and full view
-- **Full-Width Expanded View**: Expanded images take the complete row with 900px minimum width and no cropping
-- **Find Similar**: Click search icon on expanded images to find visually similar images
-- **Quick Copy**: Click copy icon next to filename to copy full file path to clipboard
-- **Comment System**: Add timestamped comments to any image with persistent storage
+**Search & Browse (tools in the toolkit)**
+- Text search (CLIP) and image search (upload/path) with FAISS indexing
+- Expand, find similar, copy path, and comment on images (persistent)
+- Sort by similarity or time; adjustable result count
 
-**Configurable & Accessible:**
-- Dynamic result limits (3-48 images, configurable via environment variables)
-- Sort by similarity or modification time (newest first)
-- Network access - server accessible from any device on local network
-- Comprehensive configuration via `config.py` and environment variables
+**Configurable & Accessible**
+- Settings modal writes `.env`; all prompts visible and editable
+- Network-accessible; CORS enabled
+- DINOv3 support for image search/segmentation (manual weights download; see below)
 
 ## Prerequisites
 - Windows 10/11 or Ubuntu 20.04+
-- Python 3.10 or newer (64-bit recommended)
+- Python 3.10+ (64-bit recommended)
 - Git
-- (Optional) CUDA-capable GPU for faster search (NVIDIA, with drivers installed)
+- CUDA-capable GPU recommended for probes/monitoring (NVIDIA, drivers + CUDA toolkit)
+- **LM Studio** with a vision-capable model (e.g., Qwen3-VL) running, if using Video Understanding
+- **Luxriot Evo S** server up and reachable, if using monitoring/bookmarks
 
 ## Installation & Setup
 
@@ -42,6 +45,8 @@ A CLIP-powered natural language image search application with semantic similarit
 ```sh
 git clone https://github.com/SashaYerashoff/evo-ssearch.git
 cd evo-ssearch
+# Monitoring/VideoUnderstanding live on branch
+git checkout lxrt-inntegration
 ```
 
 ### 3. Create a Virtual Environment
@@ -63,6 +68,11 @@ python -m venv .venv
 ```sh
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# (Optional) DINOv3 weights (for image search/segmentation)
+# Download weights manually and place in embedders/dino_encoder or per your config.
+# Example (adjust model name/path as needed):
+# wget -O embedders/dino_encoder/dinov3_vitb16_pretrain.pth https://dl.fbaipublicfiles.com/dinov3/dinov3_vitb16_pretrain.pth
 ```
 
 ## Running the Application
@@ -131,11 +141,22 @@ EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=103
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=5
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES=180   # cap buffered snapshots before forced flush
+EVOSSEARCH_LUXRIOT_SYSTEM_PROMPT_DEFAULT="You summarize real-time CCTV snapshots..."
+EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS=False     # hidden auto-bookmarks are disabled by default
 
 # Advanced settings
 EVOSSEARCH_MAX_COMMENT_LENGTH=500 # Max comment characters
 EVOSSEARCH_MAX_FILE_SIZE_MB=50   # Max upload file size
 EVOSSEARCH_INDEX_FOLDER=.clip_index # Index folder name
+
+# Probe runner
+EVOSSEARCH_PROBE_MAX_FRAMES=500         # frames kept per channel buffer
+EVOSSEARCH_PROBE_MAX_STORED_HITS=30     # recent hits retained per probe
+EVOSSEARCH_PROBE_DAEMON_INTERVAL_SEC=5  # background runner interval
+EVOSSEARCH_PROBE_BENCH_BATCH=16         # batch size for /probes/bench
+
+# DINOv3 weights (manual download)
+# Place weights in embedders/dino_encoder or configure the path in config.py
 ```
 
 ### Example Usage
@@ -159,16 +180,23 @@ EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
 3. **Video Understanding**:
    - Switch to the **Video Understanding** tab
    - Provide a video path, choose how many frames to sample (16/32/64), optional sampling FPS, and a prompt (can be remembered)
+   - System prompt is visible/editable; bookmarks are user-controlled
    - Click **Analyze Video** to send sampled frames to Qwen3-VL via LM Studio; the response supports basic markdown formatting
-4. **Configure Search**: 
+4. **Monitoring (Luxriot + Probes)**:
+   - Switch to **Monitoring**
+   - Set system prompt (LLM role), channel, batch/FPS, and start stream
+   - Create/edit probes (text or image-only), enable/disable, and save; background runner executes all enabled probes per channel
+   - View saved probes (grid), run/disable/delete from cards; detections carousel shows recent hits; optional bookmarks to Luxriot
+   - Run GPU benchmark (button) to estimate throughput
+5. **Configure Search**: 
    - Choose sorting by similarity or time (newest first)
    - Adjust the number of results using the dropdown
-5. **Interact with Results**: 
+6. **Interact with Results**: 
    - **Expand**: Click the expand icon (⤢) in bottom-right corner of any image
    - **Find Similar**: Click the search icon (🔍) on expanded images to find similar images
    - **Copy Path**: Click the copy icon (📋) next to the filename
    - **Add Comments**: In expanded view, add comments that persist across searches
-6. **View Commented Images**: Click "Show Commented Images" to see only images with comments
+7. **View Commented Images**: Click "Show Commented Images" to see only images with comments
 
 ## UI Controls
 
@@ -227,6 +255,7 @@ evo-ssearch/
 - **Fewer Results**: Check that images are in supported formats and properly indexed
 - **Comments Not Saving**: Ensure write permissions to the indexed folder
 - **Network Access**: Make sure firewall allows connections on the configured port
+- **Luxriot/Probes idle**: Ensure probe FPS > 0, probes are enabled, and the correct channel is selected; use the benchmark to size concurrency
 
 ---
 

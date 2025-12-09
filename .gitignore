@@ -54,3 +54,5 @@ Thumbs.db
 *.log
 *.tmp
 .clip_index/
+probes_store.json
+video/
