@@ -1,13 +1,8 @@
-# evo-ssearch
+# SISU (Smart Image Search and Understanding)
 
-A CLIP-powered natural language image search application with semantic similarity using OpenAI's CLIP model and FAISS indexing.
+SISU is a CLIP/DINO-powered search and monitoring toolkit with Luxriot Evo S integration, background probes, and vision LLM summaries. “Sisu” is also a Finnish word for grit, resilience, and determination—fitting for a system that keeps watching.
 
 ## Features
-
-**Search & Browse**
-- Text search (CLIP) and image search (upload/path) with FAISS indexing
-- Expand, find similar, copy path, and comment on images (persistent)
-- Sort by similarity or time; adjustable result count
 
 **Monitoring & Probes (Luxriot Evo S)**
 - Live Luxriot channel preview and user-visible system prompt (no hidden LLM prompts)
@@ -21,6 +16,11 @@ A CLIP-powered natural language image search application with semantic similarit
 **Benchmarks & Layout**
 - Built-in GPU embed benchmark (/probes/bench) surfaced in UI
 - Monitoring layout optimized for many probes: cards/benchmark on top, editor/detections below
+
+**Search & Browse (tools in the toolkit)**
+- Text search (CLIP) and image search (upload/path) with FAISS indexing
+- Expand, find similar, copy path, and comment on images (persistent)
+- Sort by similarity or time; adjustable result count
 
 **Configurable & Accessible**
 - Settings modal writes `.env`; all prompts visible and editable
