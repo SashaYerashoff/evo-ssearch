@@ -2152,8 +2152,28 @@ def home():
                 <div id="videoOutput" class="video-output" style="display: none;"></div>
                 <div id="videoFrames" class="video-frame-grid"></div>
             </div>
-            <div id="monitorBox" class="video-box" style="display: none;">
+                        <div id="monitorBox" class="video-box" style="display: none;">
                 <div class="probe-shell">
+                    <div class="probe-panel">
+                        <div class="probe-header">
+                            <div>
+                                <h4 style="margin:0;">Saved probes</h4>
+                                <div class="probe-meta">Click to expand, run, or delete.</div>
+                            </div>
+                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
+                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                            </div>
+                        </div>
+                        <div id="probeCards" class="probe-grid"></div>
+                    </div>
+                    <div class="bench-card">
+                        <div>
+                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
+                            <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
+                        </div>
+                        <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
+                    </div>
                     <div class="monitor-grid">
                         <div class="monitor-panel">
                             <div class="probe-header" style="justify-content: space-between;">
@@ -2258,30 +2278,7 @@ def home():
                             <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
                         </div>
                     </div>
-                    <div class="probe-panel">
-                        <div class="probe-header">
-                            <div>
-                                <h4 style="margin:0;">Saved probes</h4>
-                                <div class="probe-meta">Click to expand, run, or delete.</div>
-                            </div>
-                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
-                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
-                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
-                            </div>
-                        </div>
-                        <div id="probeCards" class="probe-grid"></div>
-                    </div>
-                    <div class="bench-card">
-                        <div>
-                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
-                            <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
-                        </div>
-                        <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
-                    </div>
                 </div>
-            </div>
-        </div>
-        
         <div id="results" class="results-grid"></div>
     </div>
     
