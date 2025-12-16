@@ -176,7 +176,11 @@ class LuxriotCaptureSession:
         self.max_edge = int(getattr(manager.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800))
         self.max_buffer = int(getattr(manager.config, "LUXRIOT_MAX_BUFFER_FRAMES", 180))
         if not self.enable_summaries:
-            self.max_buffer = 1
+            self.max_buffer = int(getattr(manager.config, "LUXRIOT_PROBE_BUFFER_FRAMES", 12))
+            if self.max_buffer < 1:
+                self.max_buffer = 1
+            if self.max_buffer > 120:
+                self.max_buffer = 120
         self.client = manager.build_client()
 
         self.frames: List[Dict[str, Any]] = []
@@ -202,9 +206,11 @@ class LuxriotCaptureSession:
             try:
                 snapshot = self.client.get_snapshot(self.channel_id)
                 captured_at = time.time()
+                ts_ms = int(captured_at * 1000)
                 frame = {
                     "thumbnail": self.manager.jpeg_encoder(snapshot, max_edge=self.max_edge, quality=85),
                     "captured_at": captured_at,
+                    "timestamp_ms": ts_ms,
                     "time_sec": captured_at,
                     "width": snapshot.width,
                     "height": snapshot.height,

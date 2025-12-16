@@ -3912,19 +3912,18 @@ def home():
 	                if (hasDetection && channelId) {
 	                    const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 	                    probeHitImage.dataset.loadToken = token;
-	                    const maxEdge = 1400;
-	                    const snapshotUrl = `/luxriot/snapshot/${channelId}?t=${Date.now()}&max_edge=${maxEdge}`;
+	                    const frameUrl = `/luxriot/probe_frame/${channelId}?ts=${tsMs || ''}&t=${Date.now()}`;
 	                    const preload = new Image();
 	                    preload.onload = () => {
 	                        if (!probeHitImage) return;
 	                        if (probeHitImage.dataset.loadToken !== token) return;
-	                        probeHitImage.src = snapshotUrl;
+	                        probeHitImage.src = frameUrl;
 	                        probeHitImage.style.display = '';
 	                    };
 	                    preload.onerror = () => {
 	                        // Keep the embedded thumbnail fallback (if any).
 	                    };
-	                    preload.src = snapshotUrl;
+	                    preload.src = frameUrl;
 	                }
 	            }
 	            if (probeHitMeta) {
@@ -7555,6 +7554,59 @@ def luxriot_snapshot(channel_id: int):
         response.headers['X-Image-Width'] = str(getattr(snapshot, 'width', ''))
         response.headers['X-Image-Height'] = str(getattr(snapshot, 'height', ''))
         response.headers['X-Image-Max-Edge'] = str(max_edge)
+        return response
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/probe_frame/<int:channel_id>', methods=['GET'])
+def luxriot_probe_frame(channel_id: int):
+    """Return the nearest buffered probe-capture frame for a channel (higher-res than probe thumbnails)."""
+    ts_ms: Optional[int] = None
+    ts_raw = request.args.get('ts') or request.args.get('timestamp_ms')
+    if ts_raw is not None and str(ts_raw).strip() != '':
+        try:
+            ts_ms = int(str(ts_raw).strip())
+        except Exception:
+            ts_ms = None
+    max_delta_ms = 20000
+    max_delta_raw = request.args.get('max_delta_ms')
+    if max_delta_raw is not None and str(max_delta_raw).strip() != '':
+        try:
+            max_delta_ms = max(0, min(int(str(max_delta_raw).strip()), 120000))
+        except Exception:
+            max_delta_ms = 20000
+    try:
+        with luxriot_manager.cache_lock:
+            session = luxriot_manager.probe_sessions.get(channel_id)
+        if not session:
+            return jsonify({'error': 'No active probe capture session'}), 404
+        with session.lock:
+            frames = list(getattr(session, 'frames', []) or [])
+        if not frames:
+            return jsonify({'error': 'No buffered frames'}), 404
+        chosen = frames[-1]
+        chosen_ts = chosen.get('timestamp_ms') or int((chosen.get('captured_at') or 0) * 1000)
+        if ts_ms is not None:
+            best = None
+            best_diff = None
+            for frame in frames:
+                frame_ts = frame.get('timestamp_ms') or int((frame.get('captured_at') or 0) * 1000)
+                diff = abs(frame_ts - ts_ms)
+                if best is None or (best_diff is not None and diff < best_diff):
+                    best = frame
+                    best_diff = diff
+            if best is not None and (best_diff is None or best_diff <= max_delta_ms):
+                chosen = best
+                chosen_ts = chosen.get('timestamp_ms') or int((chosen.get('captured_at') or 0) * 1000)
+        thumb_b64 = chosen.get('thumbnail') or ''
+        if not thumb_b64:
+            return jsonify({'error': 'Buffered frame has no thumbnail'}), 404
+        img_bytes = base64.b64decode(thumb_b64)
+        response = make_response(img_bytes)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['X-Frame-Timestamp-MS'] = str(chosen_ts)
         return response
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
