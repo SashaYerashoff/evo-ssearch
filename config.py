@@ -36,7 +36,7 @@ class Config:
         EMB_DIM_DINO = 1280
     DINO_WEIGHTS_PATH = os.getenv(
         'EVOSSEARCH_DINO_WEIGHTS_PATH',
-        '/home/sasha/Downloads/dinoweigths/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth',
+        '/home/luxriot/Downloads/dino/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth',
     )
     DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', 'cuda:0').strip()
 

@@ -161,18 +161,22 @@ class LuxriotCaptureSession:
         prompt: str,
         model_hint: Optional[str] = None,
         interval_override: Optional[float] = None,
+        enable_summaries: bool = True,
     ) -> None:
         self.manager = manager
         self.channel_id = channel_id
         self.batch_size = batch_size
         self.prompt = prompt
         self.model_hint = model_hint
+        self.enable_summaries = bool(enable_summaries)
         if interval_override and interval_override > 0:
             self.interval = max(0.2, float(interval_override))
         else:
             self.interval = max(1, int(getattr(manager.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         self.max_edge = int(getattr(manager.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800))
         self.max_buffer = int(getattr(manager.config, "LUXRIOT_MAX_BUFFER_FRAMES", 180))
+        if not self.enable_summaries:
+            self.max_buffer = 1
         self.client = manager.build_client()
 
         self.frames: List[Dict[str, Any]] = []
@@ -214,7 +218,7 @@ class LuxriotCaptureSession:
                         self.manager.probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
                 except Exception as pm_exc:
                     self.last_error = str(pm_exc)
-                if len(self.frames) >= self.batch_size:
+                if self.enable_summaries and len(self.frames) >= self.batch_size:
                     self._summarize_batch()
                     with self.lock:
                         self.frames.clear()
@@ -274,6 +278,7 @@ class LuxriotCaptureSession:
             "running": not self.stop_event.is_set() and self.thread.is_alive(),
             "channel_id": self.channel_id,
             "batch_size": self.batch_size,
+            "summaries_enabled": self.enable_summaries,
             "pending_frames": pending_frames,
             "interval_sec": self.interval,
             "max_edge": self.max_edge,
@@ -406,7 +411,15 @@ class LuxriotManager:
             interval = None
             if fps and fps > 0:
                 interval = 1.0 / float(fps)
-            session = LuxriotCaptureSession(self, channel_id, batch_size=1, prompt="", model_hint=None, interval_override=interval)
+            session = LuxriotCaptureSession(
+                self,
+                channel_id,
+                batch_size=1,
+                prompt="",
+                model_hint=None,
+                interval_override=interval,
+                enable_summaries=False,
+            )
             self.probe_sessions[channel_id] = session
             session.start()
             return session.status()

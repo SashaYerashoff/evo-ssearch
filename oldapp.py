@@ -6,6 +6,7 @@ import pickle
 import time
 import math
 import requests
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -44,6 +45,9 @@ dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
 _mask2former_failed = False
+mask2former_disabled_reason: Optional[str] = None
+dino_available = True
+dino_disabled_reason: Optional[str] = None
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
@@ -60,19 +64,96 @@ def init_clip() -> None:
     clip_model.eval()
 
 
+def _disable_dino(reason: str) -> None:
+    """Disable DINO gracefully and fall back to CLIP."""
+    global dino_encoder, dino_available, active_embedder, dino_disabled_reason
+    dino_encoder = None
+    dino_available = False
+    dino_disabled_reason = reason
+    print(f"DINO disabled: {reason}")
+    if active_embedder in {"dino", "fusion"}:
+        active_embedder = "clip"
+        config.EMBEDDER = "clip"
+        config.INDEX_MODE = "clip"
+        print("Falling back to CLIP embedder.")
+
+
+def _resolve_dino_weights_path(raw_path: str, model_name: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve a weights file or local Hugging Face directory from a user-provided path."""
+    candidate = Path(raw_path).expanduser()
+    if not candidate.exists():
+        return None, f"DINO weights path not found: {candidate}"
+
+    if candidate.is_file():
+        return candidate, None
+
+    if candidate.is_dir():
+        # Hugging Face local directory support (config.json + weights inside)
+        if (candidate / "config.json").exists():
+            return candidate, None
+
+        tokens = {str(model_name or "").strip().lower()}
+        token = next(iter(tokens))
+        if token.startswith("dinov3_"):
+            tokens.add(token[len("dinov3_") :])
+        tokens = {t for t in tokens if t}
+
+        checkpoint_files: List[Path] = []
+        for pattern in ("*.pth", "*.pt"):
+            checkpoint_files.extend(candidate.glob(pattern))
+        checkpoint_files.sort(key=lambda p: p.name.lower())
+        if not checkpoint_files:
+            return None, f"DINO weights directory contains no .pth/.pt files: {candidate}"
+
+        matches = (
+            [p for p in checkpoint_files if any(tok in p.name.lower() for tok in tokens)]
+            if tokens
+            else []
+        )
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            preferred = [p for p in matches if "pretrain" in p.name.lower()]
+            if len(preferred) == 1:
+                return preferred[0], None
+            sample = ", ".join(p.name for p in matches[:5])
+            more = "" if len(matches) <= 5 else f" (and {len(matches) - 5} more)"
+            return (
+                None,
+                f"Multiple DINO checkpoints match {model_name!r} in {candidate}: {sample}{more}. "
+                "Point EVOSSEARCH_DINO_WEIGHTS_PATH to a specific .pth file.",
+            )
+
+        if len(checkpoint_files) == 1:
+            return checkpoint_files[0], None
+        sample = ", ".join(p.name for p in checkpoint_files[:5])
+        more = "" if len(checkpoint_files) <= 5 else f" (and {len(checkpoint_files) - 5} more)"
+        return (
+            None,
+            f"DINO weights directory must contain a checkpoint matching {model_name!r}. Found: {sample}{more}. "
+            "Point EVOSSEARCH_DINO_WEIGHTS_PATH to a specific .pth file.",
+        )
+
+    return None, f"DINO weights path must be a file or directory: {candidate}"
+
+
 def init_dino() -> None:
     """Load the DINO encoder lazily."""
-    global dino_encoder
+    global dino_encoder, dino_available, dino_disabled_reason
     if dino_encoder is not None:
+        return
+    if not dino_available:
         return
     weights_path = (config.DINO_WEIGHTS_PATH or "").strip()
     if not weights_path:
-        raise RuntimeError(
-            "EVOSSEARCH_DINO_WEIGHTS_PATH is not set. Provide a local DINO checkpoint to keep inference on GPU."
+        _disable_dino(
+            "EVOSSEARCH_DINO_WEIGHTS_PATH is not set. Provide a local DINO checkpoint to enable DINO features."
         )
-    weights_file = Path(weights_path).expanduser()
-    if not weights_file.exists():
-        raise FileNotFoundError(f"DINO weights file not found: {weights_file}")
+        return
+    weights_file, error = _resolve_dino_weights_path(weights_path, config.DINO_MODEL)
+    if weights_file is None:
+        _disable_dino(error or "Invalid DINO weights path.")
+        return
     config.DINO_WEIGHTS_PATH = str(weights_file.resolve())
 
     device_hint = (config.DINO_DEVICE or "").strip()
@@ -80,17 +161,24 @@ def init_dino() -> None:
         if torch.cuda.is_available():
             device_hint = "cuda:0"
         else:
-            raise RuntimeError("CUDA device required for DINO encoder; none detected.")
+            _disable_dino("CUDA device required for DINO encoder; none detected.")
+            return
     if not device_hint.startswith("cuda"):
-        raise RuntimeError("DINO encoder must run on CUDA. Set EVOSSEARCH_DINO_DEVICE accordingly.")
+        _disable_dino("DINO encoder must run on CUDA. Set EVOSSEARCH_DINO_DEVICE accordingly.")
+        return
     config.DINO_DEVICE = device_hint
 
-    dino_encoder = DINOEncoder(
-        model_name=config.DINO_MODEL,
-        batch_size=config.BATCH_SIZE,
-        weights_path=config.DINO_WEIGHTS_PATH,
-        device=config.DINO_DEVICE,
-    )
+    try:
+        dino_encoder = DINOEncoder(
+            model_name=config.DINO_MODEL,
+            batch_size=config.BATCH_SIZE,
+            weights_path=config.DINO_WEIGHTS_PATH,
+            device=config.DINO_DEVICE,
+        )
+        dino_available = True
+        dino_disabled_reason = None
+    except Exception as exc:
+        _disable_dino(f"failed to initialize DINO encoder: {exc}")
 
 
 def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
@@ -99,26 +187,42 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         init_clip()
     elif target == "dino":
         init_dino()
+        if not dino_available or dino_encoder is None:
+            if embedder is None:
+                return  # fallback silently when DINO was the default but got disabled
+            raise RuntimeError(
+                "DINO is disabled or unavailable. Set EVOSSEARCH_DINO_WEIGHTS_PATH to a valid checkpoint to enable."
+            )
     elif target == "fusion":
         init_clip()
         init_dino()
+        if not dino_available or dino_encoder is None:
+            if embedder is None:
+                return
+            raise RuntimeError(
+                "DINO is disabled or unavailable, cannot use fusion mode. Set EVOSSEARCH_DINO_WEIGHTS_PATH to enable."
+            )
     else:
         raise ValueError(f"Unsupported embedder: {target}")
 
 
 def ensure_mask_head() -> Optional["Mask2FormerHead"]:
-    global mask2former_head, _mask2former_failed
+    global mask2former_head, _mask2former_failed, mask2former_disabled_reason
     if not config.MASK2FORMER_ENABLED:
+        mask2former_disabled_reason = "Mask2Former disabled in config."
         return None
     if Mask2FormerHead is None:
+        mask2former_disabled_reason = "Mask2Former head unavailable (transformers vision dependencies missing)."
         if not _mask2former_failed:
-            print("Mask2Former head unavailable: transformers vision deps missing; disabling head.")
+            print(mask2former_disabled_reason)
             _mask2former_failed = True
         return None
     if mask2former_head is not None:
+        mask2former_disabled_reason = None
         return mask2former_head
     with _mask2former_lock:
         if mask2former_head is not None:
+            mask2former_disabled_reason = None
             return mask2former_head
         try:
             target_device = config.MASK2FORMER_DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -127,10 +231,12 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
                 device=target_device,
                 max_size=config.MASK2FORMER_MAX_SIZE,
             )
+            mask2former_disabled_reason = None
+            _mask2former_failed = False
         except Exception as exc:
             _mask2former_failed = True
+            mask2former_disabled_reason = str(exc)
             print(f"Mask2Former head initialization failed: {exc}")
-            config.MASK2FORMER_ENABLED = False
             return None
     return mask2former_head
 
@@ -1792,11 +1898,55 @@ def home():
             line-height: 1.35;
         }
 
-        .probe-mini-actions {
-            display: flex;
-            gap: 0.4rem;
-            flex-wrap: wrap;
-        }
+	        .probe-mini-actions {
+	            display: flex;
+	            gap: 0.4rem;
+	            flex-wrap: wrap;
+	        }
+	
+	        .probe-action-icon {
+	            display: inline-flex;
+	            align-items: center;
+	            justify-content: center;
+	            width: 32px;
+	            height: 32px;
+	            padding: 0;
+	            border-radius: 8px;
+	            background: #121212;
+	            border: 1px solid #262626;
+	            color: #e3e3e3;
+	            cursor: pointer;
+	            transition: all 0.2s ease;
+	        }
+	
+	        .probe-action-icon:hover {
+	            background: #1a1a1a;
+	            border-color: #3a3a3a;
+	        }
+	
+	        .probe-action-icon svg {
+	            display: block;
+	        }
+	
+	        .probe-action-icon[data-action="enable"] {
+	            color: #4ade80;
+	            border-color: rgba(74, 222, 128, 0.28);
+	        }
+	
+	        .probe-action-icon[data-action="enable"]:hover {
+	            background: rgba(74, 222, 128, 0.08);
+	            border-color: rgba(74, 222, 128, 0.5);
+	        }
+	
+	        .probe-action-icon.danger {
+	            color: #f87171;
+	            border-color: rgba(248, 113, 113, 0.28);
+	        }
+	
+	        .probe-action-icon.danger:hover {
+	            background: rgba(248, 113, 113, 0.08);
+	            border-color: rgba(248, 113, 113, 0.55);
+	        }
 
         .probe-mini-thumb {
             position: relative;
@@ -2064,6 +2214,7 @@ def home():
                 </div>
                 <button id="imageSearchBtn">Search by Image</button>
             </div>
+            <div id="results" class="results-grid"></div>
             <div id="videoBox" class="video-box" style="display: none;">
         <div class="luxriot-grid">
             <div class="luxriot-card">
@@ -2154,17 +2305,17 @@ def home():
             </div>
                         <div id="monitorBox" class="video-box" style="display: none;">
                 <div class="probe-shell">
-                    <div class="probe-panel">
-                        <div class="probe-header">
-                            <div>
-                                <h4 style="margin:0;">Saved probes</h4>
-                                <div class="probe-meta">Click to expand, run, or delete.</div>
-                            </div>
-                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
-                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
-                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
-                            </div>
-                        </div>
+	                    <div class="probe-panel">
+	                        <div class="probe-header">
+	                            <div>
+	                                <h4 style="margin:0;">Saved probes</h4>
+	                                <div class="probe-meta">Use icons to expand, run, toggle, or delete.</div>
+	                            </div>
+	                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+	                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
+	                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+	                            </div>
+	                        </div>
                         <div id="probeCards" class="probe-grid"></div>
                     </div>
                     <div class="bench-card">
@@ -2266,21 +2417,20 @@ def home():
                             <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
                         </div>
                         <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
-                    </div>
-                    <div class="probe-panel">
-                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
-                            <h4 style="margin:0;">Latest Detections</h4>
-                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
-                        </div>
-                        <div class="probe-nav">
-                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
-                            <div id="probeResults" class="probe-results"></div>
-                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
-                        </div>
-                    </div>
-                </div>
-        <div id="results" class="results-grid"></div>
-    </div>
+	                    </div>
+	                    <div class="probe-panel">
+	                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
+	                            <h4 style="margin:0;">Latest Detections</h4>
+	                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+	                        </div>
+	                        <div class="probe-nav">
+	                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+	                            <div id="probeResults" class="probe-results"></div>
+	                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+	                        </div>
+	                    </div>
+	                </div>
+	    </div>
     
     <!-- Settings Modal -->
     <div id="settingsModal" class="settings-modal">
@@ -2421,6 +2571,22 @@ def home():
             <div class="settings-section">
                 <h3>Advanced Settings</h3>
                 <div class="settings-row">
+                    <label class="settings-label">LM Base URL:</label>
+                    <input type="text" id="lmBaseUrl" class="settings-input" placeholder="http://192.168.1.104:1234">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">LM Model:</label>
+                    <input type="text" id="lmModel" class="settings-input" placeholder="qwen/qwen3-vl-4b">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">LM API Key (optional):</label>
+                    <input type="password" id="lmApiKey" class="settings-input" placeholder="sk-...">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">LM Timeout (s):</label>
+                    <input type="number" id="lmTimeout" class="settings-input" min="5" max="600" placeholder="120">
+                </div>
+                <div class="settings-row">
                     <label class="settings-label">Max Comment Length:</label>
                     <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
                 </div>
@@ -2467,15 +2633,16 @@ def home():
         </div>
     </div>
     
-    <script>
-        const folderInput = document.getElementById('folderPath');
-        const indexBtn = document.getElementById('indexBtn');
-        const indexStatus = document.getElementById('indexStatus');
-        const searchInput = document.getElementById('searchQuery');
-        const searchBtn = document.getElementById('searchBtn');
-        const imageUpload = document.getElementById('imageUpload');
-        const imagePath = document.getElementById('imagePath');
-        const imageSearchBtn = document.getElementById('imageSearchBtn');
+	    <script>
+	        const folderInput = document.getElementById('folderPath');
+	        const indexBtn = document.getElementById('indexBtn');
+	        const indexStatus = document.getElementById('indexStatus');
+	        const controlPanel = document.querySelector('.control-panel');
+	        const searchInput = document.getElementById('searchQuery');
+	        const searchBtn = document.getElementById('searchBtn');
+	        const imageUpload = document.getElementById('imageUpload');
+	        const imagePath = document.getElementById('imagePath');
+	        const imageSearchBtn = document.getElementById('imageSearchBtn');
         const textModeBtn = document.getElementById('textModeBtn');
         const imageModeBtn = document.getElementById('imageModeBtn');
         const videoModeBtn = document.getElementById('videoModeBtn');
@@ -2541,14 +2708,15 @@ def home():
         const probeImagePosInput = document.getElementById('probeImagePos');
         const probeDetLeftBtn = document.getElementById('probeDetLeft');
         const probeDetRightBtn = document.getElementById('probeDetRight');
-        const resultLimitSelect = document.getElementById('resultLimit');
-        const sortBySelect = document.getElementById('sortBy');
-        const showCommentedBtn = document.getElementById('showCommentedBtn');
-        const resultsContainer = document.getElementById('results');
-        const probeBufferInfo = document.getElementById('probeBufferInfo');
-        const probeStreamState = document.getElementById('probeStreamState');
-        const probeEnableToggle = document.getElementById('probeEnableToggle');
-        const probeBenchBtn = document.getElementById('probeBenchBtn');
+	        const resultLimitSelect = document.getElementById('resultLimit');
+	        const sortBySelect = document.getElementById('sortBy');
+	        const showCommentedBtn = document.getElementById('showCommentedBtn');
+	        const searchControls = document.querySelector('.search-controls');
+	        const resultsContainer = document.getElementById('results');
+	        const probeBufferInfo = document.getElementById('probeBufferInfo');
+	        const probeStreamState = document.getElementById('probeStreamState');
+	        const probeEnableToggle = document.getElementById('probeEnableToggle');
+	        const probeBenchBtn = document.getElementById('probeBenchBtn');
         const probeBenchOutput = document.getElementById('probeBenchOutput');
         
         let currentFolder = '';
@@ -2628,21 +2796,27 @@ def home():
             videoRequestStarted = 0;
         }
 
-        function setMode(mode) {
-            currentMode = mode;
-            textModeBtn.classList.toggle('active', mode === 'text');
-            imageModeBtn.classList.toggle('active', mode === 'image');
-            videoModeBtn.classList.toggle('active', mode === 'video');
-            monitorModeBtn.classList.toggle('active', mode === 'monitor');
-            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
-            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
-            videoBox.style.display = mode === 'video' ? 'flex' : 'none';
-            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
-            if (mode === 'video') {
-                ensureLuxriotInit();
-                startLuxriotPreview();
-                refreshLuxriotSummaries();
-                syncProbeChannelSelect();
+		        function setMode(mode) {
+		            currentMode = mode;
+		            const isSearchMode = (mode === 'text' || mode === 'image');
+		            textModeBtn.classList.toggle('active', mode === 'text');
+		            imageModeBtn.classList.toggle('active', mode === 'image');
+		            videoModeBtn.classList.toggle('active', mode === 'video');
+		            monitorModeBtn.classList.toggle('active', mode === 'monitor');
+		            if (controlPanel) controlPanel.style.display = isSearchMode ? '' : 'none';
+		            if (searchControls) searchControls.style.display = isSearchMode ? '' : 'none';
+		            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
+		            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
+		            videoBox.style.display = mode === 'video' ? 'flex' : 'none';
+		            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
+		            if (resultsContainer) {
+		                resultsContainer.style.display = isSearchMode ? 'grid' : 'none';
+		            }
+		            if (mode === 'video') {
+		                ensureLuxriotInit();
+		                startLuxriotPreview();
+		                refreshLuxriotSummaries();
+	                syncProbeChannelSelect();
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
                 syncProbeChannelSelect();
@@ -2952,6 +3126,10 @@ def home():
         const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
         const luxriotSevHighInput = document.getElementById('luxriotSevHigh');
         const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
+        const lmBaseUrlInput = document.getElementById('lmBaseUrl');
+        const lmModelInput = document.getElementById('lmModel');
+        const lmApiKeyInput = document.getElementById('lmApiKey');
+        const lmTimeoutInput = document.getElementById('lmTimeout');
         
         let segmentThreshold = 0.7;
 
@@ -3121,6 +3299,10 @@ def home():
                         if (luxriotSevHighInput) luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
                         if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
                     }
+                    if (lmBaseUrlInput) lmBaseUrlInput.value = settings.lmBaseUrl || '';
+                    if (lmModelInput) lmModelInput.value = settings.lmModel || '';
+                    if (lmApiKeyInput) lmApiKeyInput.value = settings.lmApiKey || '';
+                    if (lmTimeoutInput) lmTimeoutInput.value = settings.lmTimeout || '';
                     applyEmbedderUI(embedderSelect.value);
                     segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
@@ -3179,7 +3361,11 @@ def home():
                         normal: luxriotSevNormalInput ? (luxriotSevNormalInput.value.trim() || 'normal') : 'normal',
                         high: luxriotSevHighInput ? (luxriotSevHighInput.value.trim() || 'high') : 'high',
                         critical: luxriotSevCriticalInput ? (luxriotSevCriticalInput.value.trim() || 'critical') : 'critical'
-                    }
+                    },
+                    lmBaseUrl: lmBaseUrlInput ? lmBaseUrlInput.value.trim() : '',
+                    lmModel: lmModelInput ? lmModelInput.value.trim() : '',
+                    lmApiKey: lmApiKeyInput ? lmApiKeyInput.value.trim() : '',
+                    lmTimeout: lmTimeoutInput ? parseInt(lmTimeoutInput.value, 10) : 120
                 };
                 
                 // Basic validation
@@ -3225,6 +3411,10 @@ def home():
 
                 if (settings.embedder === 'dino' && !settings.dinoModel) {
                     showSettingsStatus('DINO model name is required when DINO backend is selected', 'error');
+                    return;
+                }
+                if (!settings.lmBaseUrl) {
+                    showSettingsStatus('LM base URL cannot be empty', 'error');
                     return;
                 }
                 
@@ -3295,6 +3485,10 @@ def home():
                 if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
                 if (luxriotSevHighInput) luxriotSevHighInput.value = 'high';
                 if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = 'critical';
+                if (lmBaseUrlInput) lmBaseUrlInput.value = 'http://192.168.1.104:1234';
+                if (lmModelInput) lmModelInput.value = 'qwen/qwen3-vl-4b';
+                if (lmApiKeyInput) lmApiKeyInput.value = '';
+                if (lmTimeoutInput) lmTimeoutInput.value = '120';
                 updateFusionUI(false);
                 updateRerankUI(false);
                 updateSegmentsUI(false);
@@ -3547,7 +3741,7 @@ def home():
             };
         }
 
-        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null) {
+	        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null) {
             const now = Date.now();
             const minTs = windowSec && windowSec > 0 ? now - windowSec * 1000 : null;
             const merged = new Map();
@@ -3584,12 +3778,24 @@ def home():
                     </div>
                 `;
             }).join('');
-        }
+	        }
+	
+	        const PROBE_CARD_ICONS = {
+	            expand: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M120-120v-320h80v184l504-504H520v-80h320v320h-80v-184L256-200h184v80H120Z"/></svg>',
+	            run: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M320-200v-560l440 280-440 280Zm80-280Zm0 134 210-134-210-134v268Z"/></svg>',
+	            enable: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M280-240q-100 0-170-70T40-480q0-100 70-170t170-70h400q100 0 170 70t70 170q0 100-70 170t-170 70H280Zm0-80h400q66 0 113-47t47-113q0-66-47-113t-113-47H280q-66 0-113 47t-47 113q0 66 47 113t113 47Zm400-40q50 0 85-35t35-85q0-50-35-85t-85-35q-50 0-85 35t-35 85q0 50 35 85t85 35ZM480-480Z"/></svg>',
+	            disable: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M280-240q-100 0-170-70T40-480q0-100 70-170t170-70h400q100 0 170 70t70 170q0 100-70 170t-170 70H280Zm0-80h400q66 0 113-47t47-113q0-66-47-113t-113-47H280q-66 0-113 47t-47 113q0 66 47 113t113 47Zm0-40q50 0 85-35t35-85q0-50-35-85t-85-35q-50 0-85 35t-35 85q0 50 35 85t85 35Zm200-120Z"/></svg>',
+	            delete: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360ZM280-720v520-520Z"/></svg>',
+	        };
+	
+	        function probeCardIcon(name) {
+	            return PROBE_CARD_ICONS[name] || '';
+	        }
 
-        function renderProbeCards() {
-            if (!probeCards) return;
-            if (!probeList.length) {
-                probeCards.innerHTML = `
+	        function renderProbeCards() {
+	            if (!probeCards) return;
+	            if (!probeList.length) {
+	                probeCards.innerHTML = `
                     <div class="probe-mini-card new-probe-card">
                         <button class="feature-btn primary" data-action="new">+ New Probe</button>
                     </div>`;
@@ -3612,17 +3818,17 @@ def home():
                                 Channel: ${p.channel_id || luxriotActiveChannel}<br>
                                 Last: ${last ? ts : 'n/a'}<br>
                                 P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
-                            </div>
-                            <div class="probe-mini-actions">
-                                <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
-                                <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
-                                <button class="feature-btn" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}">${status === 'disabled' ? 'Enable' : 'Disable'}</button>
-                                <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
-                            </div>
-                        </div>
-                        <div class="probe-mini-thumb">
-                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
-                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
+	                            </div>
+	                            <div class="probe-mini-actions">
+	                                <button class="probe-action-icon" data-action="expand" data-id="${p.id}" title="Expand" aria-label="Expand">${probeCardIcon('expand')}</button>
+	                                <button class="probe-action-icon" data-action="run" data-id="${p.id}" title="Run" aria-label="Run">${probeCardIcon('run')}</button>
+	                                <button class="probe-action-icon" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}" title="${status === 'disabled' ? 'Enable' : 'Disable'}" aria-label="${status === 'disabled' ? 'Enable' : 'Disable'}">${probeCardIcon(status === 'disabled' ? 'enable' : 'disable')}</button>
+	                                <button class="probe-action-icon danger" data-action="delete" data-id="${p.id}" title="Delete" aria-label="Delete">${probeCardIcon('delete')}</button>
+	                            </div>
+	                        </div>
+	                        <div class="probe-mini-thumb">
+	                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
+	                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
                         </div>
                     </div>
                 `;
@@ -3724,7 +3930,7 @@ def home():
         async function ensureProbeCapture(channelId, quiet = false) {
             if (!channelId && channelId !== 0) return;
             if (probeCaptureState[channelId]) {
-                if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                if (probeStreamState && !quiet) probeStreamState.textContent = `Capture active (channel ${channelId})`;
                 setPreviewState('');
                 startProbePreview(channelId);
                 return;
@@ -3742,11 +3948,11 @@ def home():
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
                 probeCaptureState[channelId] = true;
-                if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                if (probeStreamState) probeStreamState.textContent = `Capture active (channel ${channelId})`;
                 setPreviewState('');
                 startProbePreview(channelId);
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeStreamState) probeStreamState.textContent = `Capture error: ${err.message}`;
                 if (!quiet) setProbeStatus(err.message, true);
             }
         }
@@ -3764,14 +3970,14 @@ def home():
                 delete probeCaptureState[channelId];
                 if (reason === 'paused') {
                     setPreviewState('Paused');
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
+                    if (probeStreamState) probeStreamState.textContent = 'Paused';
                 } else {
                     setPreviewState('Stopped', true);
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
+                    if (probeStreamState) probeStreamState.textContent = 'Stream stopped';
                 }
                 if (reason !== 'paused') stopProbePreview();
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeStreamState) probeStreamState.textContent = err.message;
                 setProbeStatus(err.message, true);
             }
         }
@@ -3779,27 +3985,62 @@ def home():
         async function refreshProbeStatus(channelIdOverride) {
             const channelId = channelIdOverride || parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
             try {
-                const resp = await fetch(`/probes/status?channel_id=${channelId}`);
-                const data = await resp.json();
-                if (data.error) {
-                    setProbeStatus(data.error, true);
+                const [bufferResp, captureResp, daemonResp] = await Promise.all([
+                    fetch(`/probes/status?channel_id=${channelId}`),
+                    fetch(`/probes/capture_status?channel_id=${channelId}`),
+                    fetch('/probes/daemon_status'),
+                ]);
+                const bufferData = await bufferResp.json();
+                const captureData = await captureResp.json();
+                const daemonData = await daemonResp.json();
+
+                if (bufferData.error) {
+                    setProbeStatus(bufferData.error, true);
                     return;
                 }
-                const range = data.time_range_ms && data.time_range_ms.length === 2
-                    ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
+
+                const range = bufferData.time_range_ms && bufferData.time_range_ms.length === 2
+                    ? `${new Date(bufferData.time_range_ms[0]).toLocaleTimeString()} - ${new Date(bufferData.time_range_ms[1]).toLocaleTimeString()}`
                     : 'n/a';
-                setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
+                const frames = bufferData.frames || 0;
+
                 if (probeCaptureStatus) {
-                    probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
+                    probeCaptureStatus.textContent = `Frames: ${frames} · Range: ${range}`;
                 }
                 if (probeBufferInfo) {
-                    const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
+                    const lastTs = bufferData.last_timestamp_ms ? new Date(bufferData.last_timestamp_ms).toLocaleTimeString() : 'n/a';
                     probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
                 }
-                if (probeStreamState) {
-                    const pill = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
-                    probeStreamState.textContent = pill;
+
+                const captureRunning = Boolean(captureData && captureData.running);
+                if (captureRunning) {
+                    probeCaptureState[channelId] = true;
+                } else {
+                    delete probeCaptureState[channelId];
                 }
+
+                const nowSec = Date.now() / 1000;
+                let daemonState = daemonData && daemonData.alive ? 'alive' : 'stopped';
+                const daemonTick = daemonData && typeof daemonData.last_tick === 'number' ? daemonData.last_tick : null;
+                const daemonInterval = daemonData && typeof daemonData.interval_sec === 'number' ? daemonData.interval_sec : 0;
+                if (daemonTick && daemonInterval > 0 && daemonData.alive) {
+                    const age = nowSec - daemonTick;
+                    if (age > daemonInterval * 3) {
+                        daemonState = `stale (${Math.round(age)}s)`;
+                    }
+                }
+
+                const captureLine = captureRunning ? `Capture: running` : 'Capture: stopped';
+                const captureErr = captureData && captureData.last_error ? ` · ${captureData.last_error}` : '';
+                const daemonLine = ` · Daemon: ${daemonState}`;
+
+                if (probeStreamState) {
+                    probeStreamState.textContent = captureLine + captureErr + daemonLine;
+                }
+
+                const staleSec = bufferData.last_timestamp_ms ? (Date.now() - bufferData.last_timestamp_ms) / 1000 : null;
+                const staleNote = staleSec !== null && staleSec > 15 ? ` · stale ${Math.round(staleSec)}s` : '';
+                setProbeStatus(`Frames: ${frames} · Range: ${range}${staleNote}`);
             } catch (err) {
                 setProbeStatus('Status error: ' + err.message, true);
             }
@@ -4150,7 +4391,11 @@ def home():
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folder })
                 });
-                return await response.json();
+                const data = await response.json();
+                if (!response.ok || data.error) {
+                    return { indexed: false, available_modes: data.available_modes || [], error: data.error || 'Check failed' };
+                }
+                return data;
             } catch (error) {
                 return { indexed: false, available_modes: [] };
             }
@@ -4217,6 +4462,10 @@ def home():
                 });
                 
                 const data = await response.json();
+                if (!response.ok || data.error) {
+                    resultsContainer.innerHTML = '<div class="loading">Error: ' + (data.error || 'Search failed') + '</div>';
+                    return;
+                }
                 
                 if (data.results && data.results.length > 0) {
                     displayResults(data.results);
@@ -4263,6 +4512,10 @@ def home():
                 });
                 
                 const data = await response.json();
+                if (!response.ok || data.error) {
+                    resultsContainer.innerHTML = '<div class="loading">Error: ' + (data.error || 'Image search failed') + '</div>';
+                    return;
+                }
                 
                 if (data.results && data.results.length > 0) {
                     displayResults(data.results);
@@ -4430,6 +4683,10 @@ def home():
                 });
                 
                 const data = await response.json();
+                if (!response.ok || data.error) {
+                    resultsContainer.innerHTML = '<div class="loading">Error: ' + (data.error || 'Failed to load commented images') + '</div>';
+                    return;
+                }
                 
                 if (data.results && data.results.length > 0) {
                     displayCommentedResults(data.results);
@@ -5480,6 +5737,10 @@ probe_manager = ProbeManager(
 luxriot_manager.probe_manager = probe_manager
 probe_daemon_thread: Optional[threading.Thread] = None
 probe_daemon_stop = threading.Event()
+probe_daemon_last_tick: Optional[float] = None
+probe_daemon_last_error: Optional[str] = None
+probe_daemon_last_error_ts: Optional[float] = None
+probe_daemon_iterations: int = 0
 
 
 class ProbesStore:
@@ -5559,24 +5820,35 @@ def _rgb_to_hex(color: Tuple[int, int, int]) -> str:
 def _probe_daemon() -> None:
     """Background runner: execute enabled probes across channels."""
     while not probe_daemon_stop.is_set():
+        global probe_daemon_last_tick, probe_daemon_last_error, probe_daemon_last_error_ts, probe_daemon_iterations
+        probe_daemon_iterations += 1
+        probe_daemon_last_tick = time.time()
+        had_error = False
         try:
             probes = probes_store.list_probes()
             # Group probes by channel
             by_channel: Dict[int, List[Dict[str, Any]]] = {}
-            for p in probes:
-                if p.get("enabled") is False:
+            for probe in probes:
+                if probe.get("enabled") is False:
                     continue
-                ch = int(p.get("channel_id", config.LUXRIOT_DEFAULT_CHANNEL_ID))
-                by_channel.setdefault(ch, []).append(p)
-            for ch, plist in by_channel.items():
                 try:
-                    # Ensure capture running for this channel
+                    channel_id = int(probe.get("channel_id", config.LUXRIOT_DEFAULT_CHANNEL_ID))
+                except Exception:
+                    channel_id = config.LUXRIOT_DEFAULT_CHANNEL_ID
+                by_channel.setdefault(channel_id, []).append(probe)
+
+            for channel_id, probe_list in by_channel.items():
+                # Ensure capture running for this channel (best-effort)
+                try:
+                    fps_desired = max([p.get('fps') or 0 for p in probe_list] or [0])
+                    luxriot_manager.start_probe_capture(channel_id, fps=fps_desired if fps_desired > 0 else None)
+                except Exception as exc:
+                    had_error = True
+                    probe_daemon_last_error = f"probe capture start failed (channel {channel_id}): {exc}"
+                    probe_daemon_last_error_ts = time.time()
+
+                for probe in probe_list:
                     try:
-                        fps_desired = max([p.get('fps') or 0 for p in plist] or [0])
-                        luxriot_manager.start_probe_capture(ch, fps=fps_desired if fps_desired > 0 else None)
-                    except Exception:
-                        pass
-                    for probe in plist:
                         result = probe_manager.query(
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
                             probe.get('positives', []),
@@ -5587,31 +5859,45 @@ def _probe_daemon() -> None:
                             window_sec=probe.get('window_sec', 300.0),
                             image_probe=probe.get('image_probe'),
                         )
-                        if 'error' in result:
-                            continue
-                        hits = result.get('results') or []
-                        if hits:
-                            probe['last_hit'] = hits[0]
-                            recent = probe.get('recent_hits') or []
-                            recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
-                            probe['recent_hits'] = recent
-                            if probe.get('bookmark'):
-                                try:
-                                    luxriot_manager.send_bookmark_event(
-                                        channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
-                                        title=f"Probe hit: {probe.get('name', 'probe')}",
-                                        description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
-                                        severity=probe.get('severity', 'critical'),
-                                        state='new',
-                                        timestamp_ms=hits[0].get('timestamp_ms'),
-                                    )
-                                except Exception:
-                                    pass
-                            probes_store.upsert_probe(probe)
-                except Exception:
-                    continue
-        except Exception:
-            pass
+                    except Exception as exc:
+                        had_error = True
+                        probe_daemon_last_error = f"probe query failed ({probe.get('id') or probe.get('name') or 'probe'}): {exc}"
+                        probe_daemon_last_error_ts = time.time()
+                        continue
+
+                    if 'error' in result:
+                        continue
+
+                    hits = result.get('results') or []
+                    if not hits:
+                        continue
+
+                    probe['last_hit'] = hits[0]
+                    recent = probe.get('recent_hits') or []
+                    recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
+                    probe['recent_hits'] = recent
+
+                    if probe.get('bookmark'):
+                        try:
+                            luxriot_manager.send_bookmark_event(
+                                channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
+                                title=f"Probe hit: {probe.get('name', 'probe')}",
+                                description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
+                                severity=probe.get('severity', 'critical'),
+                                state='new',
+                                timestamp_ms=hits[0].get('timestamp_ms'),
+                            )
+                        except Exception:
+                            pass
+
+                    probes_store.upsert_probe(probe)
+
+            if not had_error:
+                probe_daemon_last_error = None
+        except Exception as exc:
+            had_error = True
+            probe_daemon_last_error = str(exc)
+            probe_daemon_last_error_ts = time.time()
         probe_daemon_stop.wait(PROBE_DAEMON_INTERVAL_SEC)
 
 def _render_segmentation_overlay(
@@ -7199,6 +7485,44 @@ def probes_status():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/probes/daemon_status', methods=['GET'])
+def probes_daemon_status():
+    """Expose background probe daemon heartbeat for UI/debug."""
+    alive = bool(probe_daemon_thread and probe_daemon_thread.is_alive())
+    enabled = 0
+    try:
+        enabled = sum(1 for p in probes_store.list_probes() if p.get("enabled") is not False)
+    except Exception:
+        enabled = 0
+    return jsonify(
+        {
+            "alive": alive,
+            "iterations": probe_daemon_iterations,
+            "last_tick": probe_daemon_last_tick,
+            "last_error": probe_daemon_last_error,
+            "last_error_ts": probe_daemon_last_error_ts,
+            "interval_sec": PROBE_DAEMON_INTERVAL_SEC,
+            "enabled_probes": enabled,
+        }
+    )
+
+
+@app.route('/probes/capture_status', methods=['GET'])
+def probes_capture_status():
+    """Expose Luxriot probe capture session state for a channel."""
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    try:
+        with luxriot_manager.cache_lock:
+            session = luxriot_manager.probe_sessions.get(channel_id)
+        if session is None:
+            return jsonify({"channel_id": channel_id, "running": False, "message": "No active probe capture"})
+        status = session.status()
+        status.setdefault("channel_id", channel_id)
+        return jsonify(status)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/probes/start_capture', methods=['POST'])
 def probes_start_capture():
     data = request.json or {}
@@ -7408,6 +7732,10 @@ def get_settings():
             'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
             'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
             'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
+            'lmBaseUrl': config.LM_BASE_URL,
+            'lmModel': config.LM_MODEL,
+            'lmApiKey': config.LM_API_KEY,
+            'lmTimeout': config.LM_TIMEOUT,
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
             'defaultResults': config.DEFAULT_RESULTS,
@@ -7415,11 +7743,113 @@ def get_settings():
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
             'maxCommentLength': config.MAX_COMMENT_LENGTH,
             'maxFileSize': config.MAX_FILE_SIZE_MB,
-            'indexFolderName': config.INDEX_FOLDER_NAME
+            'indexFolderName': config.INDEX_FOLDER_NAME,
+            'runtime': {
+                'cudaAvailable': torch.cuda.is_available(),
+                'dinoAvailable': bool(dino_available and dino_encoder is not None),
+                'dinoDisabledReason': dino_disabled_reason,
+                'mask2formerEnabled': bool(getattr(config, 'MASK2FORMER_ENABLED', False)),
+                'mask2formerLoaded': bool(mask2former_head is not None),
+                'mask2formerDisabledReason': mask2former_disabled_reason,
+            },
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Lightweight runtime diagnostics (no model loading)."""
+    now = time.time()
+    cuda_available = torch.cuda.is_available()
+    device_count = 0
+    gpu_name = None
+    if cuda_available:
+        try:
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            device_count = 0
+            gpu_name = None
+
+    weights_raw = str(getattr(config, "DINO_WEIGHTS_PATH", "") or "").strip()
+    weights_info: Dict[str, Any] = {"configured": bool(weights_raw)}
+    if weights_raw:
+        try:
+            candidate = Path(weights_raw).expanduser()
+            weights_info.update(
+                {
+                    "path": str(candidate),
+                    "exists": candidate.exists(),
+                    "is_dir": candidate.is_dir(),
+                    "is_file": candidate.is_file(),
+                }
+            )
+        except Exception as exc:
+            weights_info.update({"error": str(exc)})
+
+    lm_base = str(getattr(config, "LM_BASE_URL", "") or "").strip().rstrip("/")
+    lm_model = str(getattr(config, "LM_MODEL", "") or "").strip()
+    check_lm = str(request.args.get("check_lm", "")).lower() in {"1", "true", "yes", "on"}
+    lm_status: Dict[str, Any] = {"configured": bool(lm_base), "base_url": lm_base, "model": lm_model}
+    if check_lm and lm_base:
+        try:
+            resp = requests.get(
+                f"{lm_base}/models",
+                headers={"Accept": "application/json"},
+                timeout=2,
+            )
+            resp.raise_for_status()
+            lm_status["reachable"] = True
+        except Exception as exc:
+            lm_status["reachable"] = False
+            lm_status["error"] = str(exc)
+
+    daemon_alive = bool(probe_daemon_thread and probe_daemon_thread.is_alive())
+    return jsonify(
+        {
+            "ok": True,
+            "ts": now,
+            "pid": os.getpid(),
+            "python": sys.version.split()[0],
+            "torch": getattr(torch, "__version__", None),
+            "cuda": {
+                "available": cuda_available,
+                "device_count": device_count,
+                "gpu0": gpu_name,
+                "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
+            },
+            "embedder": {
+                "active": active_embedder,
+                "config_embedder": getattr(config, "EMBEDDER", None),
+                "index_mode": getattr(config, "INDEX_MODE", None),
+                "fusion_enabled": bool(getattr(config, "FUSION_ENABLED", False)),
+                "dino_available": bool(dino_available and dino_encoder is not None),
+                "dino_disabled_reason": dino_disabled_reason,
+                "dino_model": getattr(config, "DINO_MODEL", None),
+                "dino_device": getattr(config, "DINO_DEVICE", None),
+                "dino_weights": weights_info,
+            },
+            "mask2former": {
+                "enabled": bool(getattr(config, "MASK2FORMER_ENABLED", False)),
+                "loaded": bool(mask2former_head is not None),
+                "model": getattr(config, "MASK2FORMER_MODEL", None),
+                "device": getattr(config, "MASK2FORMER_DEVICE", None),
+                "max_size": getattr(config, "MASK2FORMER_MAX_SIZE", None),
+                "last_error": mask2former_disabled_reason,
+            },
+            "lm": lm_status,
+            "probes": {
+                "daemon_alive": daemon_alive,
+                "daemon_last_tick": probe_daemon_last_tick,
+                "daemon_last_error": probe_daemon_last_error,
+                "daemon_last_error_ts": probe_daemon_last_error_ts,
+                "daemon_interval_sec": PROBE_DAEMON_INTERVAL_SEC,
+            },
+        }
+    )
 
 @app.route('/settings', methods=['POST'])
 def save_settings():
@@ -7429,7 +7859,7 @@ def save_settings():
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, dino_encoder
+        global active_embedder, clip_model, clip_preprocess, dino_encoder, dino_available, dino_disabled_reason
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
@@ -7533,6 +7963,17 @@ def save_settings():
             if key in severity_map:
                 merged_sev[key] = str(severity_map[key] or merged_sev.get(key, key)).lower()
 
+        lm_base_url = str(data.get('lmBaseUrl', config.LM_BASE_URL)).strip().rstrip('/')
+        lm_model = str(data.get('lmModel', config.LM_MODEL)).strip() or config.LM_MODEL
+        lm_api_key = str(data.get('lmApiKey', config.LM_API_KEY)).strip()
+        try:
+            lm_timeout = int(data.get('lmTimeout', config.LM_TIMEOUT))
+        except (TypeError, ValueError):
+            lm_timeout = config.LM_TIMEOUT
+        lm_timeout = max(5, min(lm_timeout, 600))
+        if not lm_base_url:
+            return jsonify({'success': False, 'error': 'LM base URL cannot be empty'}), 400
+
         embedder = str(data.get('embedder', active_embedder)).strip().lower()
         if embedder == 'fusion' and not fusion_enabled:
             embedder = 'clip'
@@ -7544,12 +7985,25 @@ def save_settings():
         except (TypeError, ValueError):
             dino_dim = config.EMB_DIM_DINO
 
-        dino_weights_path = data.get('dinoWeightsPath', config.DINO_WEIGHTS_PATH) or ''
+        dino_weights_path = str(data.get('dinoWeightsPath', config.DINO_WEIGHTS_PATH) or '').strip()
         dino_device = str(data.get('dinoDevice', config.DINO_DEVICE)).strip()
 
         index_mode = str(data.get('indexMode', config.INDEX_MODE)).strip().lower()
         if index_mode not in {'clip', 'dino', 'dual'}:
             index_mode = 'clip'
+
+        needs_dino = embedder in {"dino", "fusion"} or index_mode in {"dino", "dual"} or segments_enabled
+        if needs_dino:
+            if not dino_weights_path:
+                return jsonify({'success': False, 'error': 'DINO weights path is required when DINO is enabled'}), 400
+            resolved, error = _resolve_dino_weights_path(dino_weights_path, dino_model)
+            if resolved is None:
+                return jsonify({'success': False, 'error': error or 'Invalid DINO weights path'}), 400
+            dino_weights_path = str(resolved.resolve())
+            if not dino_device:
+                dino_device = "cuda:0"
+            if not dino_device.startswith("cuda"):
+                return jsonify({'success': False, 'error': 'DINO device must be a CUDA device (e.g. cuda:0)'}), 400
 
         batch_size = int(data.get('batchSize', config.BATCH_SIZE))
         thumbnail_quality = int(data.get('thumbnailQuality', config.THUMBNAIL_QUALITY))
@@ -7599,6 +8053,12 @@ EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
 EVOSSEARCH_LUXRIOT_SEV_HIGH={merged_sev['high']}
 EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
+
+# LM Studio
+EVOSSEARCH_LM_BASE_URL={lm_base_url}
+EVOSSEARCH_LM_MODEL={lm_model}
+EVOSSEARCH_LM_API_KEY={lm_api_key}
+EVOSSEARCH_LM_TIMEOUT={lm_timeout}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -7656,6 +8116,10 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
         config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
         config.LUXRIOT_SEVERITY_MAP = merged_sev
+        config.LM_BASE_URL = lm_base_url or config.LM_BASE_URL
+        config.LM_MODEL = lm_model
+        config.LM_API_KEY = lm_api_key
+        config.LM_TIMEOUT = lm_timeout
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
@@ -7663,6 +8127,8 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         clip_model = None
         clip_preprocess = None
         dino_encoder = None
+        dino_available = True
+        dino_disabled_reason = None
         ensure_embedder_loaded()
 
         return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server if issues persist.'})

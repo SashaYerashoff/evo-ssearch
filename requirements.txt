@@ -6,8 +6,10 @@ torchmetrics>=1.2.0
 termcolor>=2.4.0
 numpy>=1.26.0
 pillow>=10.0.0
+scipy>=1.10.0
 faiss-cpu>=1.7.4
 git+https://github.com/openai/CLIP.git
+opencv-python-headless>=4.8.0
 timm>=0.9.10
 einops>=0.7.0
 transformers>=4.40.0
