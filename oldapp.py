@@ -1752,13 +1752,13 @@ def home():
             margin-bottom: 0.4rem;
         }
 
-        /* Monitoring mock-inspired layout */
-        .monitor-grid {
-            display: grid;
-            grid-template-columns: 35% 65%;
-            gap: 1rem;
-            margin-bottom: 1rem;
-        }
+	        /* Monitoring mock-inspired layout */
+	        .monitor-grid {
+	            display: grid;
+	            grid-template-columns: 1fr;
+	            gap: 1rem;
+	            margin-bottom: 1rem;
+	        }
 
         .monitor-panel {
             background: #111;
@@ -2030,16 +2030,32 @@ def home():
 	            margin-bottom: 0.3rem;
 	        }
 
-	        .probe-hit-section-title {
-	            margin-top: 0.75rem;
-	            margin-bottom: 0.4rem;
-	            color: #e0e0e0;
-	            font-weight: 600;
-	        }
+		        .probe-hit-section-title {
+		            margin-top: 0.75rem;
+		            margin-bottom: 0.4rem;
+		            color: #e0e0e0;
+		            font-weight: 600;
+		        }
+		
+		        .probe-settings-modal-content {
+		            max-width: 980px;
+		            padding: 1.25rem;
+		        }
+		
+		        .probe-settings-modal-content .settings-header {
+		            margin-bottom: 1rem;
+		            padding-bottom: 0.75rem;
+		        }
+		
+		        .probe-settings-modal-body {
+		            display: flex;
+		            flex-direction: column;
+		            gap: 0.85rem;
+		        }
 
-	        .new-probe-card {
-	            border: 1px dashed #2f5a3a;
-	            background: #0b0b0b;
+		        .new-probe-card {
+		            border: 1px dashed #2f5a3a;
+		            background: #0b0b0b;
 	            align-items: center;
             justify-content: center;
             text-align: center;
@@ -2389,11 +2405,11 @@ def home():
                         </div>
                         <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
                     </div>
-                    <div class="monitor-grid">
-                        <div class="monitor-panel">
-                            <div class="probe-header" style="justify-content: space-between;">
-                                <h4>Live stream</h4>
-                                <span id="probeStatus" class="luxriot-status">Idle</span>
+	                    <div class="monitor-grid">
+	                        <div class="monitor-panel">
+	                            <div class="probe-header" style="justify-content: space-between;">
+	                                <h4>Live stream</h4>
+	                                <span id="probeStatus" class="luxriot-status">Idle</span>
                             </div>
                             <div class="probe-row" style="align-items:center; gap:0.4rem;">
                                 <label>Channel:</label>
@@ -2428,64 +2444,14 @@ def home():
                             <div class="monitor-btn-row">
                                 <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
                                 <button id="probeStopCapture" class="feature-btn">Pause</button>
-                                <button id="probeStopAll" class="feature-btn">Stop</button>
-                            </div>
-                        </div>
-                        <div class="monitor-panel">
-                            <div class="monitor-probe-header">
-                                <label>Probe name:</label>
-                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
-                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
-                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
-                                <label style="display:flex; align-items:center; gap:0.3rem;">
-                                    <input type="checkbox" id="probeEnableToggle" checked>
-                                    Enable probe
-                                </label>
-                            </div>
-                            <div class="probe-pairs" id="probePairs">
-                                <div class="probe-pairs-header">
-                                    <div></div>
-                                    <div>Positive Examples:</div>
-                                    <div>Negative Examples:</div>
-                                    <div style="text-align:center;">&nbsp;</div>
-                                </div>
-                            </div>
-                            <div class="probe-add-row">
-                                <span class="probe-pair-idx">+</span>
-                                <button id="probeAddPair" class="feature-btn">Add pair</button>
-                            </div>
-                            <div class="image-probe-panel">
-                                <div class="image-probe-left">
-                                    <div class="image-probe-row">
-                                        <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
-                                    </div>
-                                    <div class="image-probe-pos">
-                                        <label>Image Pos:</label>
-                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
-                                    </div>
-                                    <div class="image-probe-actions">
-                                        <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
-                                        <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
-                                    </div>
-                                </div>
-                                <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
-                                    <img id="probeImageThumb" src="" alt="" />
-                                    <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="monitor-actions-bar">
-                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                            <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                            <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
-                        </div>
-                        <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
+	                                <button id="probeStopAll" class="feature-btn">Stop</button>
+	                            </div>
+	                        </div>
 	                    </div>
-	                    <div class="probe-panel">
-	                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
-	                            <h4 style="margin:0;">Latest Detections</h4>
-	                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+		                    <div class="probe-panel">
+		                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
+		                            <h4 style="margin:0;">Latest Detections</h4>
+		                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
 	                        </div>
 	                        <div class="probe-nav">
 	                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
@@ -2698,11 +2664,11 @@ def home():
 	    </div>
 
 	    <!-- Probe Detection Modal -->
-	    <div id="probeHitModal" class="settings-modal">
-	        <div class="settings-modal-content probe-hit-modal-content">
-	            <div class="settings-header">
-	                <div style="display:flex; flex-direction:column; gap:0.25rem;">
-	                    <h2 id="probeHitTitle">Probe detection</h2>
+		    <div id="probeHitModal" class="settings-modal">
+		        <div class="settings-modal-content probe-hit-modal-content">
+		            <div class="settings-header">
+		                <div style="display:flex; flex-direction:column; gap:0.25rem;">
+		                    <h2 id="probeHitTitle">Probe detection</h2>
 	                    <div id="probeHitSubtitle" class="probe-meta"></div>
 	                </div>
 	                <button class="close-btn" id="probeHitClose">&times;</button>
@@ -2710,11 +2676,76 @@ def home():
 	            <div class="probe-hit-modal-grid">
 	                <img id="probeHitImage" class="probe-hit-modal-image" src="" alt="" />
 	                <div id="probeHitMeta" class="probe-hit-modal-meta"></div>
-	            </div>
-	        </div>
-	    </div>
-	    
-		    <script>
+		            </div>
+		        </div>
+		    </div>
+
+		    <!-- Probe Settings Modal -->
+		    <div id="probeSettingsModal" class="settings-modal">
+		        <div class="settings-modal-content probe-settings-modal-content">
+		            <div class="settings-header">
+		                <div style="display:flex; flex-direction:column; gap:0.25rem;">
+		                    <h2 id="probeSettingsTitle">Probe settings</h2>
+		                    <div id="probeSettingsSubtitle" class="probe-meta"></div>
+		                </div>
+		                <button class="close-btn" id="probeSettingsClose">&times;</button>
+		            </div>
+		            <div class="probe-settings-modal-body">
+		                <div class="monitor-panel">
+		                    <div class="monitor-probe-header">
+		                        <label>Probe name:</label>
+		                        <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+		                        <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
+		                        <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+		                        <label style="display:flex; align-items:center; gap:0.3rem;">
+		                            <input type="checkbox" id="probeEnableToggle" checked>
+		                            Enable probe
+		                        </label>
+		                    </div>
+		                    <div class="probe-pairs" id="probePairs">
+		                        <div class="probe-pairs-header">
+		                            <div></div>
+		                            <div>Positive Examples:</div>
+		                            <div>Negative Examples:</div>
+		                            <div style="text-align:center;">&nbsp;</div>
+		                        </div>
+		                    </div>
+		                    <div class="probe-add-row">
+		                        <span class="probe-pair-idx">+</span>
+		                        <button id="probeAddPair" class="feature-btn">Add pair</button>
+		                    </div>
+		                    <div class="image-probe-panel">
+		                        <div class="image-probe-left">
+		                            <div class="image-probe-row">
+		                                <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
+		                            </div>
+		                            <div class="image-probe-pos">
+		                                <label>Image Pos:</label>
+		                                <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+		                            </div>
+		                            <div class="image-probe-actions">
+		                                <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
+		                                <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
+		                            </div>
+		                        </div>
+		                        <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
+		                            <img id="probeImageThumb" src="" alt="" />
+		                            <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
+		                        </div>
+		                    </div>
+		                </div>
+		                <div class="monitor-actions-bar">
+		                    <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+		                        <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+		                        <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
+		                    </div>
+		                    <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
+		                </div>
+		            </div>
+		        </div>
+		    </div>
+		    
+			    <script>
 	        const folderInput = document.getElementById('folderPath');
 	        const indexBtn = document.getElementById('indexBtn');
 	        const indexStatus = document.getElementById('indexStatus');
@@ -2802,11 +2833,15 @@ def home():
 	        const probeHitModal = document.getElementById('probeHitModal');
 	        const probeHitCloseBtn = document.getElementById('probeHitClose');
 	        const probeHitTitle = document.getElementById('probeHitTitle');
-	        const probeHitSubtitle = document.getElementById('probeHitSubtitle');
-	        const probeHitImage = document.getElementById('probeHitImage');
-	        const probeHitMeta = document.getElementById('probeHitMeta');
-	        
-	        let currentFolder = '';
+		        const probeHitSubtitle = document.getElementById('probeHitSubtitle');
+		        const probeHitImage = document.getElementById('probeHitImage');
+		        const probeHitMeta = document.getElementById('probeHitMeta');
+		        const probeSettingsModal = document.getElementById('probeSettingsModal');
+		        const probeSettingsCloseBtn = document.getElementById('probeSettingsClose');
+		        const probeSettingsTitle = document.getElementById('probeSettingsTitle');
+		        const probeSettingsSubtitle = document.getElementById('probeSettingsSubtitle');
+		        
+		        let currentFolder = '';
 	        let currentMode = 'text';
         let videoTimerHandle = null;
         let videoRequestStarted = 0;
@@ -2883,14 +2918,17 @@ def home():
             videoRequestStarted = 0;
         }
 
-		        function setMode(mode) {
-		            currentMode = mode;
-		            const isSearchMode = (mode === 'text' || mode === 'image');
-		            if (mode !== 'monitor') closeProbeHitModal();
-		            textModeBtn.classList.toggle('active', mode === 'text');
-		            imageModeBtn.classList.toggle('active', mode === 'image');
-		            videoModeBtn.classList.toggle('active', mode === 'video');
-		            monitorModeBtn.classList.toggle('active', mode === 'monitor');
+			        function setMode(mode) {
+			            currentMode = mode;
+			            const isSearchMode = (mode === 'text' || mode === 'image');
+			            if (mode !== 'monitor') {
+			                closeProbeHitModal();
+			                closeProbeSettingsModal();
+			            }
+			            textModeBtn.classList.toggle('active', mode === 'text');
+			            imageModeBtn.classList.toggle('active', mode === 'image');
+			            videoModeBtn.classList.toggle('active', mode === 'video');
+			            monitorModeBtn.classList.toggle('active', mode === 'monitor');
 		            if (controlPanel) controlPanel.style.display = isSearchMode ? '' : 'none';
 		            if (searchControls) searchControls.style.display = isSearchMode ? '' : 'none';
 		            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
@@ -3882,14 +3920,37 @@ def home():
 	            delete: '<svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360ZM280-720v520-520Z"/></svg>',
 	        };
 	
-	        function probeCardIcon(name) {
-	            return PROBE_CARD_ICONS[name] || '';
-	        }
+		        function probeCardIcon(name) {
+		            return PROBE_CARD_ICONS[name] || '';
+		        }
 
-	        function closeProbeHitModal() {
-	            if (!probeHitModal) return;
-	            probeHitModal.style.display = 'none';
-	            if (probeHitImage) {
+		        function closeProbeSettingsModal() {
+		            if (!probeSettingsModal) return;
+		            probeSettingsModal.style.display = 'none';
+		            if (probeSettingsSubtitle) probeSettingsSubtitle.textContent = '';
+		        }
+
+		        function openProbeSettingsModal(probe = null) {
+		            if (!probeSettingsModal) return;
+		            const channelId = parseInt(probeChannelSelect?.value || luxriotActiveChannel || luxriotDefaults.channelId, 10);
+		            const isNew = !probe || !probe.id;
+		            const title = isNew ? 'New probe' : (probe.name || probe.id || 'Probe settings');
+		            if (probeSettingsTitle) probeSettingsTitle.textContent = title;
+		            if (probeSettingsSubtitle) {
+		                const name = (probeNameInput?.value || '').trim();
+		                const nameHint = name ? ` · ${name}` : '';
+		                probeSettingsSubtitle.textContent = `Channel ${Number.isFinite(channelId) ? channelId : luxriotDefaults.channelId}${nameHint}`;
+		            }
+		            probeSettingsModal.style.display = 'block';
+		            if (probeNameInput) {
+		                setTimeout(() => probeNameInput.focus(), 0);
+		            }
+		        }
+
+		        function closeProbeHitModal() {
+		            if (!probeHitModal) return;
+		            probeHitModal.style.display = 'none';
+		            if (probeHitImage) {
 	                probeHitImage.src = '';
 	                delete probeHitImage.dataset.loadToken;
 	                probeHitImage.style.display = '';
@@ -4376,6 +4437,7 @@ def home():
 	                if (!action) return;
 	                if (action === 'expand' && probe) {
 	                    setActiveProbe(probe);
+	                    openProbeSettingsModal(probe);
 	                } else if (action === 'run' && probe) {
 	                    setActiveProbe(probe);
 	                    startProbeRunLoop();
@@ -4391,12 +4453,16 @@ def home():
 	                    stopProbeRunLoop();
 	                } else if (action === 'new') {
 	                    activeProbeId = null;
+	                    if (probeNameInput) probeNameInput.value = '';
+	                    if (probePosFloorInput) probePosFloorInput.value = '0.2';
+	                    if (probeMarginInput) probeMarginInput.value = '0.05';
 	                    probePairsState = [];
 	                    probeImageState = null;
 	                    applyImageThumb('');
 	                    renderPairs();
 	                    if (probeEnableToggle) probeEnableToggle.checked = true;
 	                    setProbeStatus('New probe');
+	                    openProbeSettingsModal(null);
 	                }
 	                return;
 	            }
@@ -4408,21 +4474,29 @@ def home():
 	            if (probe) openProbeHitModal(probe);
 	        }
 
-	        if (probeHitCloseBtn) {
-	            probeHitCloseBtn.addEventListener('click', closeProbeHitModal);
-	        }
-	        if (probeHitModal) {
-	            probeHitModal.addEventListener('click', (e) => {
-	                if (e.target === probeHitModal) closeProbeHitModal();
-	            });
-	        }
-	        document.addEventListener('keydown', (e) => {
-	            if (e.key === 'Escape' && probeHitModal && probeHitModal.style.display === 'block') {
-	                closeProbeHitModal();
-	            }
-	        });
+		        if (probeHitCloseBtn) {
+		            probeHitCloseBtn.addEventListener('click', closeProbeHitModal);
+		        }
+		        if (probeHitModal) {
+		            probeHitModal.addEventListener('click', (e) => {
+		                if (e.target === probeHitModal) closeProbeHitModal();
+		            });
+		        }
+		        if (probeSettingsCloseBtn) {
+		            probeSettingsCloseBtn.addEventListener('click', closeProbeSettingsModal);
+		        }
+		        if (probeSettingsModal) {
+		            probeSettingsModal.addEventListener('click', (e) => {
+		                if (e.target === probeSettingsModal) closeProbeSettingsModal();
+		            });
+		        }
+		        document.addEventListener('keydown', (e) => {
+		            if (e.key !== 'Escape') return;
+		            if (probeHitModal && probeHitModal.style.display === 'block') closeProbeHitModal();
+		            if (probeSettingsModal && probeSettingsModal.style.display === 'block') closeProbeSettingsModal();
+		        });
 
-	        if (probeRunBtn) {
+		        if (probeRunBtn) {
 	            probeRunBtn.addEventListener('click', () => {
 	                if (probeRunTimer) {
                     stopProbeRunLoop('Stopped probe loop');
@@ -4468,17 +4542,21 @@ def home():
         if (probeCards) {
             probeCards.addEventListener('click', handleProbeCardClick);
         }
-        if (probeNewBtn) {
-            probeNewBtn.addEventListener('click', () => {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                applyImageThumb('');
-                renderPairs();
-                setProbeStatus('New probe');
-                if (probeEnableToggle) probeEnableToggle.checked = true;
-            });
-        }
+	        if (probeNewBtn) {
+	            probeNewBtn.addEventListener('click', () => {
+	                activeProbeId = null;
+	                if (probeNameInput) probeNameInput.value = '';
+	                if (probePosFloorInput) probePosFloorInput.value = '0.2';
+	                if (probeMarginInput) probeMarginInput.value = '0.05';
+	                probePairsState = [];
+	                probeImageState = null;
+	                applyImageThumb('');
+	                renderPairs();
+	                setProbeStatus('New probe');
+	                if (probeEnableToggle) probeEnableToggle.checked = true;
+	                openProbeSettingsModal(null);
+	            });
+	        }
         if (probeReloadBtn) {
             probeReloadBtn.addEventListener('click', () => loadProbeList(true));
         }
