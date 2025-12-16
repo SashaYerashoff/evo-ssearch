@@ -7593,12 +7593,13 @@ def luxriot_probe_frame(channel_id: int):
             for frame in frames:
                 frame_ts = frame.get('timestamp_ms') or int((frame.get('captured_at') or 0) * 1000)
                 diff = abs(frame_ts - ts_ms)
-                if best is None or (best_diff is not None and diff < best_diff):
+                if best_diff is None or diff < best_diff:
                     best = frame
                     best_diff = diff
-            if best is not None and (best_diff is None or best_diff <= max_delta_ms):
-                chosen = best
-                chosen_ts = chosen.get('timestamp_ms') or int((chosen.get('captured_at') or 0) * 1000)
+            if best is None or best_diff is None or best_diff > max_delta_ms:
+                return jsonify({'error': 'No buffered frame near requested timestamp'}), 404
+            chosen = best
+            chosen_ts = chosen.get('timestamp_ms') or int((chosen.get('captured_at') or 0) * 1000)
         thumb_b64 = chosen.get('thumbnail') or ''
         if not thumb_b64:
             return jsonify({'error': 'Buffered frame has no thumbnail'}), 404
