@@ -1948,23 +1948,31 @@ def home():
 	            border-color: rgba(248, 113, 113, 0.55);
 	        }
 
-        .probe-mini-thumb {
-            position: relative;
-            border: 1px solid #222;
-            border-radius: 8px;
-            background: #0a0a0a;
-            overflow: hidden;
-            min-height: 80px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
+	        .probe-mini-thumb {
+	            position: relative;
+	            border: 1px solid #222;
+	            border-radius: 8px;
+	            background: #0a0a0a;
+	            overflow: hidden;
+	            min-height: 80px;
+	            display: flex;
+	            align-items: center;
+	            justify-content: center;
+	        }
 
-        .probe-mini-thumb img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            display: block;
+	        .probe-mini-thumb[data-action="preview"] {
+	            cursor: pointer;
+	        }
+
+	        .probe-mini-thumb[data-action="preview"] * {
+	            cursor: pointer;
+	        }
+
+	        .probe-mini-thumb img {
+	            width: 100%;
+	            height: 100%;
+	            object-fit: cover;
+	            display: block;
         }
 
 	        .probe-thumb-pill {
@@ -2948,38 +2956,44 @@ def home():
             return luxriotDefaults.channelId;
         }
 
-        async function fetchLuxriotChannels(force = false) {
-            if (!luxriotChannelSelect) return;
-            luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
-            try {
-                const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`);
+	        async function fetchLuxriotChannels(force = false) {
+	            if (!luxriotChannelSelect) return;
+	            luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
+	            try {
+	                const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`);
                 const data = await response.json();
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                const channels = data.channels || [];
-                if (!channels.length) {
-                    luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
-                    setLuxriotStatus('No channels available', true);
-                    return;
-                }
-                const options = channels.map((ch) => {
-                    const id = ch.id;
-                    const label = ch.title || `Channel ${id}`;
+	                const channels = data.channels || [];
+	                if (!channels.length) {
+	                    luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
+	                    setLuxriotStatus('No channels available', true);
+	                    syncProbeChannelSelect();
+	                    return;
+	                }
+	                const options = channels.map((ch) => {
+	                    const id = ch.id;
+	                    const label = ch.title || `Channel ${id}`;
                     const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
                     return `<option value="${id}" ${selected}>${label} (#${id})</option>`;
                 });
-                luxriotChannelSelect.innerHTML = options.join('');
-                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
-                    luxriotActiveChannel = channels[0].id;
-                    luxriotChannelSelect.value = luxriotActiveChannel;
-                }
-                setLuxriotStatus(`Loaded ${channels.length} channels`);
-            } catch (err) {
-                luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
-                setLuxriotStatus('Channel load failed: ' + err.message, true);
-            }
-        }
+	                luxriotChannelSelect.innerHTML = options.join('');
+	                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
+	                    luxriotActiveChannel = channels[0].id;
+	                    luxriotChannelSelect.value = luxriotActiveChannel;
+	                }
+	                setLuxriotStatus(`Loaded ${channels.length} channels`);
+	                syncProbeChannelSelect();
+	                if (currentMode === 'monitor' && probeChannelSelect) {
+	                    const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+	                    if (Number.isFinite(cid)) startProbePreview(cid);
+	                }
+	            } catch (err) {
+	                luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
+	                setLuxriotStatus('Channel load failed: ' + err.message, true);
+	            }
+	        }
 
         function startLuxriotPreview() {
             if (!luxriotPreviewImg) return;
