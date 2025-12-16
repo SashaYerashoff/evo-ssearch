@@ -1967,16 +1967,72 @@ def home():
             display: block;
         }
 
-        .probe-thumb-pill {
-            position: absolute;
-            top: 6px;
-            right: 6px;
-        }
+	        .probe-thumb-pill {
+	            position: absolute;
+	            top: 6px;
+	            right: 6px;
+	        }
 
-        .new-probe-card {
-            border: 1px dashed #2f5a3a;
-            background: #0b0b0b;
-            align-items: center;
+	        .probe-hit-modal-content {
+	            max-width: 980px;
+	            padding: 1.25rem;
+	        }
+
+	        .probe-hit-modal-content .settings-header {
+	            margin-bottom: 1rem;
+	            padding-bottom: 0.75rem;
+	        }
+
+	        .probe-hit-modal-grid {
+	            display: grid;
+	            grid-template-columns: 1fr;
+	            gap: 1rem;
+	        }
+
+	        @media (min-width: 980px) {
+	            .probe-hit-modal-grid {
+	                grid-template-columns: minmax(0, 1fr) 340px;
+	                align-items: start;
+	            }
+	        }
+
+	        .probe-hit-modal-image {
+	            width: 100%;
+	            max-height: 70vh;
+	            object-fit: contain;
+	            border-radius: 10px;
+	            border: 1px solid #262626;
+	            background: #0a0a0a;
+	        }
+
+	        .probe-hit-modal-meta {
+	            background: #0f0f0f;
+	            border: 1px solid #222;
+	            border-radius: 10px;
+	            padding: 0.85rem;
+	            color: #b8b8b8;
+	            font-size: 0.9rem;
+	        }
+
+	        .probe-hit-modal-meta .metric-line {
+	            display: flex;
+	            gap: 0.35rem;
+	            align-items: baseline;
+	            color: #a8a8a8;
+	            margin-bottom: 0.3rem;
+	        }
+
+	        .probe-hit-section-title {
+	            margin-top: 0.75rem;
+	            margin-bottom: 0.4rem;
+	            color: #e0e0e0;
+	            font-weight: 600;
+	        }
+
+	        .new-probe-card {
+	            border: 1px dashed #2f5a3a;
+	            background: #0b0b0b;
+	            align-items: center;
             justify-content: center;
             text-align: center;
             grid-template-columns: 1fr;
@@ -2309,7 +2365,7 @@ def home():
 	                        <div class="probe-header">
 	                            <div>
 	                                <h4 style="margin:0;">Saved probes</h4>
-	                                <div class="probe-meta">Use icons to expand, run, toggle, or delete.</div>
+	                                <div class="probe-meta">Use icons to expand, run, toggle, or delete. Click thumbnail for details.</div>
 	                            </div>
 	                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
 	                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
@@ -2433,11 +2489,11 @@ def home():
 	    </div>
     
     <!-- Settings Modal -->
-    <div id="settingsModal" class="settings-modal">
-        <div class="settings-modal-content">
-            <div class="settings-header">
-                <h2>Settings</h2>
-                <button class="close-btn" id="closeSettings">&times;</button>
+	    <div id="settingsModal" class="settings-modal">
+	        <div class="settings-modal-content">
+	            <div class="settings-header">
+	                <h2>Settings</h2>
+	                <button class="close-btn" id="closeSettings">&times;</button>
             </div>
             
             <div class="settings-section">
@@ -2629,11 +2685,28 @@ def home():
                 <button class="settings-btn primary" id="saveSettings">Save Settings</button>
             </div>
             
-            <div id="settingsStatus" class="settings-status"></div>
-        </div>
-    </div>
-    
-	    <script>
+	            <div id="settingsStatus" class="settings-status"></div>
+	        </div>
+	    </div>
+
+	    <!-- Probe Detection Modal -->
+	    <div id="probeHitModal" class="settings-modal">
+	        <div class="settings-modal-content probe-hit-modal-content">
+	            <div class="settings-header">
+	                <div style="display:flex; flex-direction:column; gap:0.25rem;">
+	                    <h2 id="probeHitTitle">Probe detection</h2>
+	                    <div id="probeHitSubtitle" class="probe-meta"></div>
+	                </div>
+	                <button class="close-btn" id="probeHitClose">&times;</button>
+	            </div>
+	            <div class="probe-hit-modal-grid">
+	                <img id="probeHitImage" class="probe-hit-modal-image" src="" alt="" />
+	                <div id="probeHitMeta" class="probe-hit-modal-meta"></div>
+	            </div>
+	        </div>
+	    </div>
+	    
+		    <script>
 	        const folderInput = document.getElementById('folderPath');
 	        const indexBtn = document.getElementById('indexBtn');
 	        const indexStatus = document.getElementById('indexStatus');
@@ -2717,10 +2790,16 @@ def home():
 	        const probeStreamState = document.getElementById('probeStreamState');
 	        const probeEnableToggle = document.getElementById('probeEnableToggle');
 	        const probeBenchBtn = document.getElementById('probeBenchBtn');
-        const probeBenchOutput = document.getElementById('probeBenchOutput');
-        
-        let currentFolder = '';
-        let currentMode = 'text';
+	        const probeBenchOutput = document.getElementById('probeBenchOutput');
+	        const probeHitModal = document.getElementById('probeHitModal');
+	        const probeHitCloseBtn = document.getElementById('probeHitClose');
+	        const probeHitTitle = document.getElementById('probeHitTitle');
+	        const probeHitSubtitle = document.getElementById('probeHitSubtitle');
+	        const probeHitImage = document.getElementById('probeHitImage');
+	        const probeHitMeta = document.getElementById('probeHitMeta');
+	        
+	        let currentFolder = '';
+	        let currentMode = 'text';
         let videoTimerHandle = null;
         let videoRequestStarted = 0;
         let lastSummaryText = '';
@@ -2799,6 +2878,7 @@ def home():
 		        function setMode(mode) {
 		            currentMode = mode;
 		            const isSearchMode = (mode === 'text' || mode === 'image');
+		            if (mode !== 'monitor') closeProbeHitModal();
 		            textModeBtn.classList.toggle('active', mode === 'text');
 		            imageModeBtn.classList.toggle('active', mode === 'image');
 		            videoModeBtn.classList.toggle('active', mode === 'video');
@@ -3792,6 +3872,112 @@ def home():
 	            return PROBE_CARD_ICONS[name] || '';
 	        }
 
+	        function closeProbeHitModal() {
+	            if (!probeHitModal) return;
+	            probeHitModal.style.display = 'none';
+	            if (probeHitImage) {
+	                probeHitImage.src = '';
+	                delete probeHitImage.dataset.loadToken;
+	                probeHitImage.style.display = '';
+	            }
+	            if (probeHitMeta) probeHitMeta.innerHTML = '';
+	        }
+
+	        function openProbeHitModal(probe) {
+	            if (!probe || !probeHitModal) return;
+	            const hit = probe.last_hit || null;
+	            const hasDetection = Boolean(hit && hit.thumbnail);
+	            const status = probe.enabled === false ? 'disabled' : (probe.enabled ? 'running' : 'idle');
+	            const channelId = probe.channel_id || hit?.channel_id || luxriotActiveChannel || luxriotDefaults.channelId;
+	            const tsMs = hit?.timestamp_ms || null;
+	            const tsStr = tsMs ? new Date(tsMs).toLocaleString() : 'n/a';
+	            const imageBase64 = (hit && hit.thumbnail) ? hit.thumbnail : (probe.image_probe?.data || '');
+
+	            if (probeHitTitle) {
+	                probeHitTitle.textContent = probe.name || probe.id || 'Probe detection';
+	            }
+	            if (probeHitSubtitle) {
+	                const mode = hasDetection ? 'Detection' : (imageBase64 ? 'Probe image' : 'No preview');
+	                probeHitSubtitle.textContent = `${mode} · Channel ${channelId} · ${hasDetection ? tsStr : status}`;
+	            }
+	            if (probeHitImage) {
+	                if (imageBase64) {
+	                    probeHitImage.src = `data:image/jpeg;base64,${imageBase64}`;
+	                    probeHitImage.style.display = '';
+	                } else {
+	                    probeHitImage.src = '';
+	                    probeHitImage.style.display = 'none';
+	                }
+	                delete probeHitImage.dataset.loadToken;
+	                if (hasDetection && channelId) {
+	                    const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	                    probeHitImage.dataset.loadToken = token;
+	                    const maxEdge = 1400;
+	                    const snapshotUrl = `/luxriot/snapshot/${channelId}?t=${Date.now()}&max_edge=${maxEdge}`;
+	                    const preload = new Image();
+	                    preload.onload = () => {
+	                        if (!probeHitImage) return;
+	                        if (probeHitImage.dataset.loadToken !== token) return;
+	                        probeHitImage.src = snapshotUrl;
+	                        probeHitImage.style.display = '';
+	                    };
+	                    preload.onerror = () => {
+	                        // Keep the embedded thumbnail fallback (if any).
+	                    };
+	                    preload.src = snapshotUrl;
+	                }
+	            }
+	            if (probeHitMeta) {
+	                const lines = [];
+	                lines.push(`<div class="metric-line"><span class="metric-label">Probe ID:</span> ${escapeHtml(String(probe.id || ''))}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Status:</span> ${escapeHtml(status)}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Channel:</span> ${escapeHtml(String(channelId))}</div>`);
+	                lines.push('<div class="probe-hit-section-title">Detection</div>');
+	                if (hasDetection) {
+	                    const ageSec = tsMs ? Math.max(0, (Date.now() - tsMs) / 1000) : null;
+	                    const ageLabel = ageSec !== null ? `${ageSec.toFixed(0)}s ago` : '';
+	                    const ageNote = ageLabel ? ` <span class="metric-note">(${escapeHtml(ageLabel)})</span>` : '';
+	                    lines.push(`<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(tsStr)}${ageNote}</div>`);
+	                    const posScore = Number.isFinite(hit?.pos_score) ? hit.pos_score.toFixed(3) : '—';
+	                    const negScore = Number.isFinite(hit?.neg_score) ? hit.neg_score.toFixed(3) : '—';
+	                    const marginScore = Number.isFinite(hit?.margin) ? hit.margin.toFixed(3) : '—';
+	                    lines.push(`<div class="metric-line"><span class="metric-label">Scores:</span> pos ${posScore} · neg ${negScore} · margin ${marginScore}</div>`);
+	                } else {
+	                    lines.push('<div class="metric-line"><span class="metric-label">Last hit:</span> none yet</div>');
+	                }
+
+	                lines.push('<div class="probe-hit-section-title">Probe config</div>');
+	                const posFloor = Number.isFinite(probe.pos_floor) ? probe.pos_floor.toFixed(2) : '—';
+	                const marginThr = Number.isFinite(probe.margin) ? probe.margin.toFixed(2) : '—';
+	                const topK = Number.isFinite(probe.top_k) ? String(probe.top_k) : '—';
+	                const windowSec = Number.isFinite(probe.window_sec) ? `${probe.window_sec}s` : '—';
+	                const fps = Number.isFinite(probe.fps) ? String(probe.fps) : '—';
+	                lines.push(`<div class="metric-line"><span class="metric-label">Pos floor:</span> ${posFloor}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Margin thr:</span> ${marginThr}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Top-K:</span> ${escapeHtml(topK)}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Window:</span> ${escapeHtml(windowSec)}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">FPS:</span> ${escapeHtml(fps)}</div>`);
+	                const positivesCount = Array.isArray(probe.positives) ? probe.positives.length : 0;
+	                const negativesCount = Array.isArray(probe.negatives) ? probe.negatives.length : 0;
+	                lines.push(`<div class="metric-line"><span class="metric-label">Positives:</span> ${positivesCount}</div>`);
+	                lines.push(`<div class="metric-line"><span class="metric-label">Negatives:</span> ${negativesCount}</div>`);
+	                if (probe.image_probe?.data) {
+	                    const imgEnabled = probe.image_probe.enabled !== false ? 'enabled' : 'disabled';
+	                    const imgFloor = Number.isFinite(probe.image_probe.pos_floor) ? probe.image_probe.pos_floor.toFixed(2) : '—';
+	                    lines.push(`<div class="metric-line"><span class="metric-label">Image probe:</span> ${escapeHtml(imgEnabled)} (floor ${escapeHtml(imgFloor)})</div>`);
+	                }
+	                if (probe.bookmark !== undefined) {
+	                    lines.push(`<div class="metric-line"><span class="metric-label">Bookmark:</span> ${probe.bookmark ? 'on' : 'off'}</div>`);
+	                }
+	                if (probe.severity) {
+	                    lines.push(`<div class="metric-line"><span class="metric-label">Severity:</span> ${escapeHtml(String(probe.severity))}</div>`);
+	                }
+
+	                probeHitMeta.innerHTML = lines.join('');
+	            }
+	            probeHitModal.style.display = 'block';
+	        }
+
 	        function renderProbeCards() {
 	            if (!probeCards) return;
 	            if (!probeList.length) {
@@ -3819,17 +4005,17 @@ def home():
                                 Last: ${last ? ts : 'n/a'}<br>
                                 P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
 	                            </div>
-	                            <div class="probe-mini-actions">
-	                                <button class="probe-action-icon" data-action="expand" data-id="${p.id}" title="Expand" aria-label="Expand">${probeCardIcon('expand')}</button>
-	                                <button class="probe-action-icon" data-action="run" data-id="${p.id}" title="Run" aria-label="Run">${probeCardIcon('run')}</button>
-	                                <button class="probe-action-icon" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}" title="${status === 'disabled' ? 'Enable' : 'Disable'}" aria-label="${status === 'disabled' ? 'Enable' : 'Disable'}">${probeCardIcon(status === 'disabled' ? 'enable' : 'disable')}</button>
-	                                <button class="probe-action-icon danger" data-action="delete" data-id="${p.id}" title="Delete" aria-label="Delete">${probeCardIcon('delete')}</button>
-	                            </div>
+		                            <div class="probe-mini-actions">
+		                                <button class="probe-action-icon" data-action="expand" data-id="${p.id}" title="Expand" aria-label="Expand">${probeCardIcon('expand')}</button>
+		                                <button class="probe-action-icon" data-action="run" data-id="${p.id}" title="Run" aria-label="Run">${probeCardIcon('run')}</button>
+		                                <button class="probe-action-icon" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}" title="${status === 'disabled' ? 'Enable' : 'Disable'}" aria-label="${status === 'disabled' ? 'Enable' : 'Disable'}">${probeCardIcon(status === 'disabled' ? 'enable' : 'disable')}</button>
+		                                <button class="probe-action-icon danger" data-action="delete" data-id="${p.id}" title="Delete" aria-label="Delete">${probeCardIcon('delete')}</button>
+		                            </div>
+		                        </div>
+		                        <div class="probe-mini-thumb" data-action="preview" data-id="${p.id}" title="Open detection details">
+		                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
+		                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
 	                        </div>
-	                        <div class="probe-mini-thumb">
-	                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
-	                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
-                        </div>
                     </div>
                 `;
             });
@@ -4168,42 +4354,64 @@ def home():
             }
         }
 
-        function handleProbeCardClick(event) {
-            const btn = event.target.closest('button[data-action]');
-            if (!btn) return;
-            const id = btn.getAttribute('data-id');
-            const action = btn.getAttribute('data-action');
-            const probe = probeList.find(p => String(p.id) === String(id));
-            if (!action) return;
-            if (action === 'expand' && probe) {
-                setActiveProbe(probe);
-            } else if (action === 'run' && probe) {
-                setActiveProbe(probe);
-                startProbeRunLoop();
-            } else if (action === 'enable' && probe) {
-                setActiveProbe(probe);
-                persistProbeEnabled(true);
-                ensureProbeCapture(probe.channel_id || luxriotActiveChannel, true);
-            } else if (action === 'delete') {
-                deleteProbe(id);
-            } else if (action === 'disable' && probe) {
-                setActiveProbe(probe);
-                persistProbeEnabled(false);
-                stopProbeRunLoop();
-            } else if (action === 'new') {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                applyImageThumb('');
-                renderPairs();
-                if (probeEnableToggle) probeEnableToggle.checked = true;
-                setProbeStatus('New probe');
-            }
-        }
+	        function handleProbeCardClick(event) {
+	            const btn = event.target.closest('button[data-action]');
+	            if (btn) {
+	                const id = btn.getAttribute('data-id');
+	                const action = btn.getAttribute('data-action');
+	                const probe = probeList.find(p => String(p.id) === String(id));
+	                if (!action) return;
+	                if (action === 'expand' && probe) {
+	                    setActiveProbe(probe);
+	                } else if (action === 'run' && probe) {
+	                    setActiveProbe(probe);
+	                    startProbeRunLoop();
+	                } else if (action === 'enable' && probe) {
+	                    setActiveProbe(probe);
+	                    persistProbeEnabled(true);
+	                    ensureProbeCapture(probe.channel_id || luxriotActiveChannel, true);
+	                } else if (action === 'delete') {
+	                    deleteProbe(id);
+	                } else if (action === 'disable' && probe) {
+	                    setActiveProbe(probe);
+	                    persistProbeEnabled(false);
+	                    stopProbeRunLoop();
+	                } else if (action === 'new') {
+	                    activeProbeId = null;
+	                    probePairsState = [];
+	                    probeImageState = null;
+	                    applyImageThumb('');
+	                    renderPairs();
+	                    if (probeEnableToggle) probeEnableToggle.checked = true;
+	                    setProbeStatus('New probe');
+	                }
+	                return;
+	            }
 
-        if (probeRunBtn) {
-            probeRunBtn.addEventListener('click', () => {
-                if (probeRunTimer) {
+	            const thumb = event.target.closest('.probe-mini-thumb[data-action="preview"]');
+	            if (!thumb) return;
+	            const id = thumb.getAttribute('data-id');
+	            const probe = probeList.find(p => String(p.id) === String(id));
+	            if (probe) openProbeHitModal(probe);
+	        }
+
+	        if (probeHitCloseBtn) {
+	            probeHitCloseBtn.addEventListener('click', closeProbeHitModal);
+	        }
+	        if (probeHitModal) {
+	            probeHitModal.addEventListener('click', (e) => {
+	                if (e.target === probeHitModal) closeProbeHitModal();
+	            });
+	        }
+	        document.addEventListener('keydown', (e) => {
+	            if (e.key === 'Escape' && probeHitModal && probeHitModal.style.display === 'block') {
+	                closeProbeHitModal();
+	            }
+	        });
+
+	        if (probeRunBtn) {
+	            probeRunBtn.addEventListener('click', () => {
+	                if (probeRunTimer) {
                     stopProbeRunLoop('Stopped probe loop');
                     persistProbeEnabled(false);
                 } else {
@@ -7327,14 +7535,26 @@ def luxriot_channels():
 @app.route('/luxriot/snapshot/<int:channel_id>', methods=['GET'])
 def luxriot_snapshot(channel_id: int):
     stream_type = request.args.get('stream', 'mainStream')
+    max_edge = config.LUXRIOT_SNAPSHOT_MAX_EDGE
+    max_edge_raw = request.args.get('max_edge')
+    if max_edge_raw is not None and str(max_edge_raw).strip() != '':
+        try:
+            parsed = int(str(max_edge_raw).strip())
+            if parsed > 0:
+                max_edge = parsed
+        except Exception:
+            pass
+    max_edge = max(128, min(int(max_edge), 2048))
     try:
-        encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
-        img_bytes = base64.b64decode(encoded)
+        client = luxriot_manager.build_client()
+        snapshot = client.get_snapshot(channel_id, stream=stream_type)
+        img_bytes = base64.b64decode(_encode_jpeg(snapshot, max_edge=max_edge, quality=85))
         response = make_response(img_bytes)
         response.headers['Content-Type'] = 'image/jpeg'
         response.headers['Cache-Control'] = 'no-store, must-revalidate'
-        response.headers['X-Image-Width'] = str(meta.get('width'))
-        response.headers['X-Image-Height'] = str(meta.get('height'))
+        response.headers['X-Image-Width'] = str(getattr(snapshot, 'width', ''))
+        response.headers['X-Image-Height'] = str(getattr(snapshot, 'height', ''))
+        response.headers['X-Image-Max-Edge'] = str(max_edge)
         return response
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
