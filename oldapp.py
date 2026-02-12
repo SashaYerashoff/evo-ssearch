@@ -12,7 +12,7 @@ import uuid
 import requests
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote
 from threading import Lock
 
@@ -29,10 +29,12 @@ from config import config
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
-try:
+if TYPE_CHECKING:
     from heads.mask2former_head import Mask2FormerHead
+try:
+    from heads.mask2former_head import Mask2FormerHead as _Mask2FormerHeadRuntime
 except Exception:  # pragma: no cover - optional dependency
-    Mask2FormerHead = None  # type: ignore[misc]
+    _Mask2FormerHeadRuntime = None  # type: ignore[misc]
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
@@ -49,6 +51,16 @@ _mask2former_lock = Lock()
 _mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
+FaissIndexBundle = Tuple[Optional[faiss.Index], Optional[List[str]], Optional[List[Dict[str, Any]]], Dict[str, Any]]
+
+if hasattr(Image, "Resampling"):
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
+    RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+else:  # pragma: no cover - Pillow compatibility fallback
+    RESAMPLE_NEAREST = Image.NEAREST  # type: ignore[attr-defined]
+    RESAMPLE_BILINEAR = Image.BILINEAR  # type: ignore[attr-defined]
+    RESAMPLE_LANCZOS = Image.LANCZOS  # type: ignore[attr-defined]
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
 if active_embedder == "fusion" and not config.FUSION_ENABLED:
     active_embedder = "clip"
@@ -211,7 +223,7 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
     global mask2former_head, _mask2former_failed
     if not config.MASK2FORMER_ENABLED:
         return None
-    if Mask2FormerHead is None:
+    if _Mask2FormerHeadRuntime is None:
         if not _mask2former_failed:
             print("Mask2Former head unavailable: transformers vision deps missing; disabling head.")
             _mask2former_failed = True
@@ -223,17 +235,34 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
             return mask2former_head
         try:
             target_device = config.MASK2FORMER_DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
-            mask2former_head = Mask2FormerHead(
+            created_head = _Mask2FormerHeadRuntime(
                 model_name=config.MASK2FORMER_MODEL,
                 device=target_device,
                 max_size=config.MASK2FORMER_MAX_SIZE,
             )
+            mask2former_head = cast(Any, created_head)
         except Exception as exc:
             _mask2former_failed = True
             print(f"Mask2Former head initialization failed: {exc}")
             config.MASK2FORMER_ENABLED = False
             return None
     return mask2former_head
+
+
+def _faiss_add_vectors(index: faiss.Index, vectors: np.ndarray) -> None:
+    """Typed wrapper for FAISS add; FAISS runtime monkey-patches signatures."""
+    cast(Any, index).add(vectors)
+
+
+def _faiss_search(index: faiss.Index, query: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Typed wrapper for FAISS search; returns (distances, indices)."""
+    distances, labels = cast(Any, index).search(query, int(k))
+    return np.asarray(distances), np.asarray(labels)
+
+
+def _faiss_reconstruct(index: faiss.Index, idx: int) -> np.ndarray:
+    """Typed wrapper for FAISS reconstruct."""
+    return np.asarray(cast(Any, index).reconstruct(int(idx)), dtype=np.float32)
 
 
 def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
@@ -355,7 +384,7 @@ def _create_index_for_embedder(entries: List[Tuple[Path, Dict[str, Any]]], embed
 
     embeddings_array = np.array(embeddings, dtype='float32')
     index = faiss.IndexFlatIP(embeddings_array.shape[1])
-    index.add(embeddings_array)
+    _faiss_add_vectors(index, embeddings_array)
     index_meta = _build_index_metadata(embedder, {'image_count': len(image_paths)})
     return index, image_paths, image_metadata, index_meta
 
@@ -741,6 +770,10 @@ def home():
             padding: 1.5rem;
             margin-bottom: 2rem;
             border: 1px solid var(--panel-border);
+            position: sticky;
+            top: 0.75rem;
+            z-index: 15;
+            backdrop-filter: blur(6px);
         }
         
         .folder-select {
@@ -810,12 +843,14 @@ def home():
             padding: 1.5rem;
             margin-bottom: 2rem;
             border: 1px solid var(--panel-border);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
         }
         
         .search-mode-tabs {
             display: flex;
             gap: 0;
-            margin-bottom: 1rem;
             border-radius: var(--radius-md);
             overflow: hidden;
         }
@@ -844,11 +879,39 @@ def home():
         }
         
         .search-controls {
-            margin-bottom: 1rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 1rem;
+        }
+
+        .archive-box {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .archive-workspace {
+            display: grid;
+            grid-template-columns: 320px minmax(0, 1fr);
+            gap: 1rem;
+            align-items: start;
+        }
+
+        .archive-results-panel {
+            background: #101010;
+            border: 1px solid #232323;
+            border-radius: var(--radius-md);
+            padding: 0.9rem;
+            min-height: 280px;
+        }
+
+        .archive-results-head {
+            color: #bdbdbd;
+            font-size: 0.82rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            margin-bottom: 0.75rem;
         }
         
         .control-group {
@@ -872,6 +935,17 @@ def home():
         .feature-btn:hover {
             background: #345a44;
             border-color: #4a6a54;
+        }
+
+        .feature-btn.primary {
+            background: #3a6346;
+            border-color: #4e7a5b;
+            color: #eef8f1;
+        }
+
+        .feature-btn.primary:hover {
+            background: #447454;
+            border-color: #5d8e6e;
         }
         
         .feature-btn:active {
@@ -961,6 +1035,9 @@ def home():
             display: flex;
             flex-direction: column;
             gap: 1rem;
+            position: sticky;
+            top: 1rem;
+            align-self: start;
         }
 
         .archive-section {
@@ -1017,22 +1094,11 @@ def home():
             font-weight: 500;
         }
         
-        .input-separator {
-            text-align: center;
-            color: #666;
-            font-size: 0.8rem;
-            font-weight: bold;
-            padding: 0.25rem 0;
-        }
-        
         .results-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
             gap: 1.5rem;
-        }
-
-        .results-grid.hidden {
-            display: none;
+            align-content: start;
         }
         
         .result-item {
@@ -1466,6 +1532,10 @@ def home():
             font-size: 0.85rem;
             padding: 0.5rem;
         }
+
+        .is-hidden {
+            display: none;
+        }
         
         
         /* Image Container and Overlay */
@@ -1530,11 +1600,43 @@ def home():
         .video-box {
             display: none;
             flex-direction: column;
-            gap: 0.8rem;
+            gap: 1rem;
             background: #111;
             border: 1px solid #222;
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 1rem;
+        }
+
+        .monitor-box {
+            display: none;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 10px;
+            padding: 1rem;
+        }
+
+        .video-analysis-grid {
+            display: grid;
+            grid-template-columns: minmax(300px, 0.95fr) minmax(380px, 1.05fr);
+            gap: 1rem;
+            margin-top: 0.25rem;
+        }
+
+        .video-analysis-form {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .video-analysis-output {
+            background: #0d0d0d;
+            border: 1px solid #1f1f1f;
+            border-radius: 8px;
+            padding: 0.75rem;
+            min-height: 240px;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
         }
 
         .video-row {
@@ -1566,10 +1668,22 @@ def home():
             flex-wrap: wrap;
         }
 
+        .video-prompt-note {
+            color: #aaa;
+            font-size: 0.85rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
         .video-status {
             font-size: 0.9rem;
             color: #ccc;
             min-height: 20px;
+        }
+
+        .video-status.error {
+            color: #ff9080;
         }
 
         .video-output {
@@ -1582,15 +1696,33 @@ def home():
             white-space: pre-wrap;
         }
 
-        .video-frame-grid {
+        .video-output-wrap,
+        .video-frame-block {
             display: flex;
-            flex-wrap: wrap;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .video-block-title {
+            color: #bdbdbd;
+            font-size: 0.82rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+        }
+
+        .video-frame-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
             gap: 0.5rem;
+            max-height: 360px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
         }
 
         .video-frame-grid img {
-            width: 140px;
-            height: auto;
+            width: 100%;
+            height: 92px;
+            object-fit: cover;
             border-radius: 5px;
             border: 1px solid #222;
             background: #111;
@@ -1722,6 +1854,11 @@ def home():
             margin-bottom: 0.35rem;
         }
 
+        .summary-body {
+            color: #d7d7d7;
+            line-height: 1.45;
+        }
+
         .luxriot-pill {
             display: inline-flex;
             align-items: center;
@@ -1754,6 +1891,84 @@ def home():
             display: flex;
             gap: 0.5rem;
             flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .probe-row.spread {
+            justify-content: space-between;
+        }
+
+        .probe-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 0.65rem;
+            flex-wrap: wrap;
+            margin-bottom: 0.6rem;
+        }
+
+        .probe-header.split {
+            align-items: center;
+        }
+
+        .probe-header h4 {
+            margin: 0;
+        }
+
+        .probe-header-actions {
+            display: flex;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+        }
+
+        .probe-panel {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+        }
+
+        .probe-select-grow {
+            flex: 1;
+        }
+
+        .probe-severity-wrap {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
+        .small-label-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            color: #bdbdbd;
+            font-size: 0.88rem;
+        }
+
+        .probe-short-input {
+            max-width: 84px;
+        }
+
+        .inline-check {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .probe-pairs-spacer {
+            text-align: center;
+        }
+
+        .probe-remove-btn {
+            width: 54px;
+        }
+
+        .probe-mini-main {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
         }
 
         .probe-row label {
@@ -1817,9 +2032,10 @@ def home():
         /* Monitoring mock-inspired layout */
         .monitor-grid {
             display: grid;
-            grid-template-columns: 35% 65%;
+            grid-template-columns: minmax(260px, 0.9fr) minmax(420px, 1.3fr) minmax(280px, 1fr);
             gap: 1rem;
             margin-bottom: 1rem;
+            align-items: start;
         }
 
         .monitor-panel {
@@ -1831,6 +2047,34 @@ def home():
 
         .monitor-panel h4 {
             margin: 0 0 0.6rem 0;
+        }
+
+        .monitor-detections-panel .probe-nav {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 0.5rem;
+            align-items: stretch;
+        }
+
+        .probe-nav-btn {
+            background: #1a1a1a;
+            border: 1px solid #2d2d2d;
+            color: #cfcfcf;
+            border-radius: 6px;
+            padding: 0.4rem 0.55rem;
+            min-width: 36px;
+        }
+
+        .probe-nav-btn:hover {
+            background: #232323;
+            border-color: #3a3a3a;
+        }
+
+        .monitor-detections-panel .probe-results {
+            grid-template-columns: 1fr;
+            max-height: 520px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
         }
 
         .monitor-stream-preview {
@@ -2119,12 +2363,38 @@ def home():
             padding: 0.5rem;
         }
 
+        .probe-preview.compact {
+            max-width: 220px;
+            min-height: 140px;
+            justify-self: end;
+        }
+
         .monitor-actions-bar {
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 0.75rem;
             flex-wrap: wrap;
+        }
+
+        .monitor-actions-main {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .severity-row {
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+
+        .settings-short-input {
+            width: 110px;
+        }
+
+        .input-text {
+            min-width: 200px;
         }
         
         
@@ -2170,10 +2440,26 @@ def home():
                 flex-direction: column;
             }
 
+            .control-panel {
+                position: static;
+            }
+
             .search-controls {
                 flex-direction: column;
                 align-items: stretch;
                 gap: 0.75rem;
+            }
+
+            .archive-workspace {
+                grid-template-columns: 1fr;
+            }
+
+            .archive-search-shell {
+                position: static;
+            }
+
+            .archive-results-panel {
+                padding: 0.65rem;
             }
 
             .control-group {
@@ -2191,12 +2477,29 @@ def home():
                 margin-right: 0;
             }
 
+            .video-analysis-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .video-analysis-output {
+                min-height: 0;
+            }
+
             .monitor-grid {
                 grid-template-columns: 1fr;
             }
 
+            .monitor-detections-panel .probe-results {
+                max-height: 320px;
+            }
+
             .image-probe-panel {
                 grid-template-columns: 1fr;
+            }
+
+            .probe-preview.compact {
+                max-width: none;
+                justify-self: stretch;
             }
 
             .result-item.expanded .thumbnail {
@@ -2244,55 +2547,63 @@ def home():
                     <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
                     <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
                 </div>
-            <div class="search-controls">
-                <div class="control-group">
-                    <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
-                </div>
-                <div class="control-group">
-                    <div class="sort-control">
-                        <label for="sortBy">Sort by:</label>
-                        <select id="sortBy">
-                            <option value="similarity" selected>Similarity</option>
-                            <option value="time">Time (Newest First)</option>
-                        </select>
+            <div id="archiveBox" class="archive-box">
+                <div class="search-controls">
+                    <div class="control-group">
+                        <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
                     </div>
-                    <div class="limit-control">
-                        <label for="resultLimit">Results:</label>
-                        <select id="resultLimit">
-                            {result_options_html}
-                        </select>
-                    </div>
-                    <div class="segment-controls">
-                        <label for="segmentThresholdSlider">Region threshold:</label>
-                        <div class="segment-threshold-control" id="segmentThresholdControl">
-                            <input type="range" id="segmentThresholdSlider" min="40" max="99" value="70" step="1">
-                            <span class="segment-threshold-value" id="segmentThresholdValue">70%</span>
+                    <div class="control-group">
+                        <div class="sort-control">
+                            <label for="sortBy">Sort by:</label>
+                            <select id="sortBy">
+                                <option value="similarity" selected>Similarity</option>
+                                <option value="time">Time (Newest First)</option>
+                            </select>
                         </div>
-                    </div>
-                </div>
-            </div>
-            <div id="archiveSearchBox" class="archive-search-shell">
-                <div class="archive-section">
-                    <div class="archive-section-title">Text Query</div>
-                    <div id="textSearchBox" class="search-box">
-                        <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                        <button id="searchBtn">Search</button>
-                    </div>
-                </div>
-                <div class="archive-section">
-                    <div class="archive-section-title">Image Query</div>
-                    <div id="imageSearchBox" class="search-box">
-                        <div class="image-search-inputs">
-                            <div class="input-group">
-                                <label for="imageUpload" class="input-label">Upload File:</label>
-                                <input type="file" id="imageUpload" accept="image/*" />
+                        <div class="limit-control">
+                            <label for="resultLimit">Results:</label>
+                            <select id="resultLimit">
+                                {result_options_html}
+                            </select>
+                        </div>
+                        <div class="segment-controls">
+                            <label for="segmentThresholdSlider">Region threshold:</label>
+                            <div class="segment-threshold-control" id="segmentThresholdControl">
+                                <input type="range" id="segmentThresholdSlider" min="40" max="99" value="70" step="1">
+                                <span class="segment-threshold-value" id="segmentThresholdValue">70%</span>
                             </div>
                         </div>
-                        <button id="imageSearchBtn">Search by Image</button>
+                    </div>
+                </div>
+                <div class="archive-workspace">
+                    <div id="archiveSearchBox" class="archive-search-shell">
+                        <div class="archive-section">
+                            <div class="archive-section-title">Text Query</div>
+                            <div id="textSearchBox" class="search-box">
+                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
+                                <button id="searchBtn">Search</button>
+                            </div>
+                        </div>
+                        <div class="archive-section">
+                            <div class="archive-section-title">Image Query</div>
+                            <div id="imageSearchBox" class="search-box">
+                                <div class="image-search-inputs">
+                                    <div class="input-group">
+                                        <label for="imageUpload" class="input-label">Upload File:</label>
+                                        <input type="file" id="imageUpload" accept="image/*" />
+                                    </div>
+                                </div>
+                                <button id="imageSearchBtn">Search by Image</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="archive-results-panel">
+                        <div class="archive-results-head">Search Results</div>
+                        <div id="results" class="results-grid"></div>
                     </div>
                 </div>
             </div>
-            <div id="videoBox" class="video-box" style="display: none;">
+            <div id="videoBox" class="video-box">
         <div class="luxriot-grid">
             <div class="luxriot-card">
                 <div class="luxriot-header">
@@ -2341,11 +2652,13 @@ def home():
                 </div>
             </div>
         </div>
-        <div class="video-row">
-            <div class="input-group">
-                <label for="videoPath" class="input-label">Video Path:</label>
-                <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
-            </div>
+        <div class="video-analysis-grid">
+            <div class="video-analysis-form">
+                <div class="video-row">
+                    <div class="input-group">
+                        <label for="videoPath" class="input-label">Video Path:</label>
+                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+                    </div>
                     <div class="input-group">
                         <label class="input-label" for="videoModel">Model ID:</label>
                         <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
@@ -2368,27 +2681,37 @@ def home():
                 <div class="input-group">
                     <label class="input-label" for="videoPrompt">Prompt:</label>
                     <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
-                    <label style="color: #aaa; font-size: 0.85rem;">
+                    <label class="video-prompt-note">
                         <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
                     </label>
                 </div>
                 <div class="video-controls">
                     <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
-                    <button id="saveSummaryBtn" class="feature-btn" style="display:none;">Save summary as comment</button>
+                    <button id="saveSummaryBtn" class="feature-btn is-hidden">Save summary as comment</button>
                     <div id="videoStatus" class="video-status"></div>
                 </div>
-                <div id="videoOutput" class="video-output" style="display: none;"></div>
-                <div id="videoFrames" class="video-frame-grid"></div>
             </div>
-                        <div id="monitorBox" class="video-box" style="display: none;">
+            <div class="video-analysis-output">
+                <div class="video-output-wrap">
+                    <div class="video-block-title">Summary</div>
+                    <div id="videoOutput" class="video-output is-hidden"></div>
+                </div>
+                <div class="video-frame-block">
+                    <div class="video-block-title">Sampled Frames</div>
+                    <div id="videoFrames" class="video-frame-grid"></div>
+                </div>
+            </div>
+        </div>
+            </div>
+                        <div id="monitorBox" class="monitor-box">
                 <div class="probe-shell">
                     <div class="probe-panel">
                         <div class="probe-header">
                             <div>
-                                <h4 style="margin:0;">Saved probes</h4>
+                                <h4>Saved probes</h4>
                                 <div class="probe-meta">Click to expand, run, or delete.</div>
                             </div>
-                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                            <div class="probe-header-actions">
                                 <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
                                 <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
                             </div>
@@ -2404,13 +2727,13 @@ def home():
                     </div>
                     <div class="monitor-grid">
                         <div class="monitor-panel">
-                            <div class="probe-header" style="justify-content: space-between;">
+                            <div class="probe-header split">
                                 <h4>Live stream</h4>
                                 <span id="probeStatus" class="luxriot-status">Idle</span>
                             </div>
-                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                            <div class="probe-row">
                                 <label>Channel:</label>
-                                <select id="probeChannelSelect" class="luxriot-mini-input" style="flex:1;"></select>
+                                <select id="probeChannelSelect" class="luxriot-mini-input probe-select-grow"></select>
                             </div>
                             <div class="monitor-stream-preview">
                                 <img id="probePreviewImg" src="" alt="" />
@@ -2419,7 +2742,7 @@ def home():
                             <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
                             <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
                             <div class="probe-meta" id="probeStreamState"></div>
-                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
+                            <div class="probe-row">
                                 <label>FPS:</label>
                                 <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
                                 <label>Buffer (sec):</label>
@@ -2427,7 +2750,7 @@ def home():
                             </div>
                             <div class="probe-row spread">
                                 <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
-                                <div style="margin-left:auto; display:flex; align-items:center; gap:0.35rem;">
+                                <div class="probe-severity-wrap">
                                     <label>Severity:</label>
                                     <select id="probeBookmarkSeverity" class="luxriot-mini-input">
                                         <option value="info">info</option>
@@ -2450,7 +2773,7 @@ def home():
                                 <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
                                 <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
                                 <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
-                                <label style="display:flex; align-items:center; gap:0.3rem;">
+                                <label class="inline-check">
                                     <input type="checkbox" id="probeEnableToggle" checked>
                                     Enable probe
                                 </label>
@@ -2460,7 +2783,7 @@ def home():
                                     <div></div>
                                     <div>Positive Examples:</div>
                                     <div>Negative Examples:</div>
-                                    <div style="text-align:center;">&nbsp;</div>
+                                    <div class="probe-pairs-spacer">&nbsp;</div>
                                 </div>
                             </div>
                             <div class="probe-add-row">
@@ -2481,34 +2804,33 @@ def home():
                                         <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
                                     </div>
                                 </div>
-                                <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
+                                <div class="probe-preview compact">
                                     <img id="probeImageThumb" src="" alt="" />
                                     <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
                                 </div>
                             </div>
                         </div>
+                        <div class="monitor-panel monitor-detections-panel">
+                            <div class="probe-header split">
+                                <h4>Latest Detections</h4>
+                                <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+                            </div>
+                            <div class="probe-nav">
+                                <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+                                <div id="probeResults" class="probe-results"></div>
+                                <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+                            </div>
+                        </div>
                     </div>
                     <div class="monitor-actions-bar">
-                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                        <div class="monitor-actions-main">
                             <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
                             <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
                         </div>
                         <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
                     </div>
-                    <div class="probe-panel">
-                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
-                            <h4 style="margin:0;">Latest Detections</h4>
-                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
-                        </div>
-                        <div class="probe-nav">
-                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
-                            <div id="probeResults" class="probe-results"></div>
-                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
-                        </div>
-                    </div>
                 </div>
             </div>
-        <div id="results" class="results-grid"></div>
     </div>
     
     <!-- Settings Modal -->
@@ -2637,12 +2959,12 @@ def home():
                 </div>
                 <div class="settings-row">
                     <label class="settings-label">Severity Mapping:</label>
-                    <div style="display:flex; gap:0.4rem; flex-wrap: wrap;">
-                        <input type="text" id="luxriotSevInfo" class="settings-input" style="width:110px;" placeholder="info">
-                        <input type="text" id="luxriotSevLow" class="settings-input" style="width:110px;" placeholder="low">
-                        <input type="text" id="luxriotSevNormal" class="settings-input" style="width:110px;" placeholder="normal">
-                        <input type="text" id="luxriotSevHigh" class="settings-input" style="width:110px;" placeholder="high">
-                        <input type="text" id="luxriotSevCritical" class="settings-input" style="width:110px;" placeholder="critical">
+                    <div class="severity-row">
+                        <input type="text" id="luxriotSevInfo" class="settings-input settings-short-input" placeholder="info">
+                        <input type="text" id="luxriotSevLow" class="settings-input settings-short-input" placeholder="low">
+                        <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
+                        <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
+                        <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
                     </div>
                 </div>
             </div>
@@ -2706,8 +3028,7 @@ def home():
         const imageSearchBtn = document.getElementById('imageSearchBtn');
         const archiveModeBtn = document.getElementById('archiveModeBtn');
         const videoModeBtn = document.getElementById('videoModeBtn');
-        const searchControls = document.querySelector('.search-controls');
-        const archiveSearchBox = document.getElementById('archiveSearchBox');
+        const archiveBox = document.getElementById('archiveBox');
         const videoBox = document.getElementById('videoBox');
         const videoPathInput = document.getElementById('videoPath');
         const videoModelInput = document.getElementById('videoModel');
@@ -2901,13 +3222,11 @@ def home():
             archiveModeBtn.classList.toggle('active', mode === 'archive');
             videoModeBtn.classList.toggle('active', mode === 'video');
             monitorModeBtn.classList.toggle('active', mode === 'monitor');
-            if (searchControls) {
-                searchControls.style.display = mode === 'archive' ? 'flex' : 'none';
+            if (archiveBox) {
+                archiveBox.style.display = mode === 'archive' ? 'flex' : 'none';
             }
-            archiveSearchBox.style.display = mode === 'archive' ? 'flex' : 'none';
             videoBox.style.display = mode === 'video' ? 'flex' : 'none';
-            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
-            resultsContainer.classList.toggle('hidden', mode === 'monitor');
+            monitorBox.style.display = mode === 'monitor' ? 'block' : 'none';
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
@@ -3757,7 +4076,7 @@ def home():
             ensurePairsSeed();
             const rows = probePairsState.map((row, idx) => {
                 const canRemove = probePairsState.length > 1;
-                const removeBtn = canRemove ? `<button class="feature-btn" data-remove="${idx}" style="width:54px;">×</button>` : '<div class="probe-pair-idx">–</div>';
+                const removeBtn = canRemove ? `<button class="feature-btn probe-remove-btn" data-remove="${idx}">×</button>` : '<div class="probe-pair-idx">–</div>';
                 return `
                     <div class="probe-pair-row" data-idx="${idx}">
                         <div class="probe-pair-idx">${idx + 1}.</div>
@@ -3772,7 +4091,7 @@ def home():
                     <div></div>
                     <div>Positive Examples:</div>
                     <div>Negative Examples:</div>
-                    <div style="text-align:center;">&nbsp;</div>
+                    <div class="probe-pairs-spacer">&nbsp;</div>
                 </div>
                 ${rows}
             `;
@@ -3888,7 +4207,7 @@ def home():
                 const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
                 return `
                     <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
-                        <div style="display:flex; flex-direction:column; gap:0.35rem;">
+                        <div class="probe-mini-main">
                             <div class="probe-mini-head">
                                 <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
                                 <div class="probe-status-pill ${pillClass}">${status}</div>
@@ -4788,7 +5107,7 @@ def home():
                         <div class="no-comments">No LLM description yet.</div>
                     </div>
                     <div class="lm-description-actions">
-                        <button class="save-comment-btn" id="lm-save-btn-${index}" style="display:none;">Save LLM as comment</button>
+                        <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
                     </div>
                     <div class="comments-list" id="comments-${index}">
                         <div class="comment-loading">Loading comments...</div>
@@ -5563,7 +5882,7 @@ def _image_to_base64(img: Image.Image) -> str:
 def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int = 85) -> str:
     if max_edge and max(img.size) > max_edge:
         scale = max_edge / float(max(img.size))
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), RESAMPLE_LANCZOS)
     buffer = BytesIO()
     img.save(buffer, format='JPEG', quality=quality)
     return base64.b64encode(buffer.getvalue()).decode()
@@ -5572,10 +5891,12 @@ def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int 
 def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
     alpha = alpha_image.convert('L')
     scale = float(opacity_scale)
+    alpha_arr = np.asarray(alpha, dtype=np.float32)
     if scale <= 0:
-        alpha = alpha.point(lambda _: 0)
+        alpha_arr.fill(0.0)
     elif scale < 0.999:
-        alpha = alpha.point(lambda v: int(max(0, min(255, v * scale))))
+        alpha_arr = np.clip(alpha_arr * scale, 0.0, 255.0)
+    alpha = Image.fromarray(alpha_arr.astype(np.uint8), mode='L')
     overlay = Image.new('RGBA', alpha.size, color + (0,))
     overlay.putalpha(alpha)
     return overlay
@@ -5858,7 +6179,7 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
 luxriot_manager = LuxriotManager(
     config=config,
     lm_callback=_call_video_understanding,
-    message_builder=_build_luxriot_messages,
+    message_builder=cast(Any, _build_luxriot_messages),
     jpeg_encoder=_encode_jpeg,
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
@@ -6112,7 +6433,7 @@ def save_index(index_results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[
         meta_path.write_text(json.dumps(index_meta, indent=2), encoding='utf-8')
 
 
-def load_index(folder_path, embedder: Optional[str] = None):
+def load_index(folder_path: Union[str, Path], embedder: Optional[str] = None) -> FaissIndexBundle:
     """Load FAISS index, metadata, and embedder info for the requested backend."""
     target = embedder or active_embedder
     if target not in EMBEDDER_SUBDIRS:
@@ -6183,7 +6504,7 @@ def save_segment_index(
         index = faiss.IndexFlatIP(embeddings.shape[1])
         existing_meta = []
 
-    index.add(embeddings)
+    _faiss_add_vectors(index, embeddings)
     existing_meta.extend(segment_metadata)
 
     faiss.write_index(index, str(index_path))
@@ -6345,10 +6666,10 @@ def _reconstruct_vectors(index: faiss.Index, ids: Sequence[int]) -> Optional[np.
     vectors: List[np.ndarray] = []
     for idx in ids:
         try:
-            vec = index.reconstruct(int(idx))
+            vec = _faiss_reconstruct(index, int(idx))
         except (AttributeError, RuntimeError, IndexError, TypeError):
             return None
-        vectors.append(np.asarray(vec, dtype=np.float32))
+        vectors.append(vec)
     if not vectors:
         return None
     try:
@@ -6446,7 +6767,7 @@ def _build_ranked_results(
     return results
 
 
-def _load_fusion_indexes(folder_path: Union[str, Path]):
+def _load_fusion_indexes(folder_path: Union[str, Path]) -> Tuple[FaissIndexBundle, FaissIndexBundle]:
     clip_data = load_index(folder_path, embedder='clip')
     dino_data = load_index(folder_path, embedder='dino')
     return clip_data, dino_data
@@ -6463,7 +6784,14 @@ def _merge_metadata_maps(primary: Dict[str, Dict[str, Any]], secondary: Dict[str
     return merged
 
 
-def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarray, limit: int, sort_by: str) -> List[Dict[str, Any]]:
+def _fuse_results(
+    clip_data: FaissIndexBundle,
+    dino_data: FaissIndexBundle,
+    clip_vec: np.ndarray,
+    dino_vec: np.ndarray,
+    limit: int,
+    sort_by: str,
+) -> List[Dict[str, Any]]:
     clip_index, clip_paths, clip_metadata, _ = clip_data
     dino_index, dino_paths, dino_metadata, _ = dino_data
     if clip_index is None or dino_index is None:
@@ -6476,15 +6804,16 @@ def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarr
     limit = max(1, limit)
     alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
 
-    def _search(index, vec, paths):
+    def _search(index: Optional[faiss.Index], vec: np.ndarray, paths: Optional[Sequence[str]]) -> Dict[str, float]:
         if index is None or not paths:
             return {}
         k = min(limit * 2, len(paths))
-        sims, inds = index.search(vec.reshape(1, -1), k)
-        scores = {}
+        sims, inds = _faiss_search(index, vec.reshape(1, -1), k)
+        scores: Dict[str, float] = {}
         for idx, sim in zip(inds[0], sims[0]):
-            if 0 <= idx < len(paths):
-                scores[paths[idx]] = float(sim)
+            idx_int = int(idx)
+            if 0 <= idx_int < len(paths):
+                scores[paths[idx_int]] = float(sim)
         return scores
 
     clip_scores = _search(clip_index, clip_vec, clip_paths)
@@ -6539,7 +6868,7 @@ def _build_segment_search_results(
     if k == 0:
         return []
 
-    similarities, indices = segment_index.search(query_vec.reshape(1, -1), k)
+    similarities, indices = _faiss_search(segment_index, query_vec.reshape(1, -1), k)
 
     results: List[Dict[str, Any]] = []
     for idx, sim in zip(indices[0], similarities[0]):
@@ -6641,7 +6970,7 @@ def _mask_search_pipeline(
 
         if 'images' in target_modes:
             k = _candidate_pool_size(limit, len(image_paths), sort_by)
-            similarities, indices = image_index.search(embedding.reshape(1, -1), k)
+            similarities, indices = _faiss_search(image_index, embedding.reshape(1, -1), k)
             entry['image_results'] = _build_ranked_results(
                 image_index,
                 embedding,
@@ -6917,6 +7246,8 @@ def index_segments():
     label_map = _parse_segment_labels(data.get('segment_labels'))
 
     ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        return jsonify({'error': 'DINO encoder is not available'}), 500
     segments = dino_encoder.encode_masked(
         str(image_obj),
         mask_image,
@@ -7096,7 +7427,7 @@ def search():
         limit = config.DEFAULT_RESULTS
 
     index, image_paths, image_metadata, index_meta = load_index(folder, embedder=search_mode)
-    if index is None:
+    if index is None or not image_paths:
         message = 'Folder not indexed for the current backend'
         available = _available_indexes(folder)
         if available:
@@ -7113,7 +7444,7 @@ def search():
         if k == 0:
             print(f"Text search: query='{query}' candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
-        similarities, indices = index.search(text_embedding.reshape(1, -1), k)
+        similarities, indices = _faiss_search(index, text_embedding.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
         candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
@@ -7174,6 +7505,12 @@ def search_by_image():
 
     fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
 
+    clip_data: Optional[FaissIndexBundle] = None
+    dino_data: Optional[FaissIndexBundle] = None
+    index: Optional[faiss.Index] = None
+    image_paths: List[str] = []
+    image_metadata: List[Dict[str, Any]] = []
+
     if fusion_active:
         clip_data, dino_data = _load_fusion_indexes(folder)
         clip_index, clip_paths, clip_metadata, _ = clip_data
@@ -7185,15 +7522,18 @@ def search_by_image():
                 message += f" (available: {', '.join(available)})"
             return jsonify({'error': message}), 400
     else:
-        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
-        if index is None:
+        index, loaded_paths, loaded_metadata, index_meta = load_index(folder, embedder=active_embedder)
+        if index is None or not loaded_paths:
             message = 'Folder not indexed for the current backend'
             available = _available_indexes(folder)
             if available:
                 message += f" (available: {', '.join(available)})"
             return jsonify({'error': message}), 400
+        image_paths = loaded_paths
+        image_metadata = loaded_metadata or []
 
     try:
+        dino_vec: Optional[np.ndarray] = None
         if file:
             uploaded_image = Image.open(file.stream)
             if uploaded_image.mode != 'RGB':
@@ -7214,14 +7554,18 @@ def search_by_image():
                 dino_vec = get_image_embedding(image_obj, embedder='dino')
 
         if fusion_active:
+            if clip_data is None or dino_data is None or dino_vec is None:
+                return jsonify({'error': 'Fusion search requires both CLIP and DINO query embeddings'}), 500
             results = _fuse_results(clip_data, dino_data, clip_vec, dino_vec, limit, sort_by)
             return jsonify({'results': results})
 
+        if index is None or not image_paths:
+            return jsonify({'error': 'Backend index is unavailable for image search'}), 400
         k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
             print(f"Image search: candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
-        similarities, indices = index.search(clip_vec.reshape(1, -1), k)
+        similarities, indices = _faiss_search(index, clip_vec.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
         candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
@@ -7294,6 +7638,8 @@ def search_by_mask():
         return jsonify({'error': 'Mask is required for masked search'}), 400
 
     ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        return jsonify({'error': 'DINO encoder is not available'}), 500
 
     if uploaded_image:
         query_image = Image.open(uploaded_image.stream)
@@ -7370,9 +7716,13 @@ def segment_from_point():
     if not image_path and uploaded_image is None:
         return jsonify({'error': 'Provide image_path or upload an image file'}), 400
 
+    x_raw = data.get('x')
+    y_raw = data.get('y')
+    if x_raw is None or y_raw is None:
+        return jsonify({'error': 'Invalid or missing x/y coordinates'}), 400
     try:
-        x_norm = float(data.get('x'))
-        y_norm = float(data.get('y'))
+        x_norm = float(x_raw)
+        y_norm = float(y_raw)
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid or missing x/y coordinates'}), 400
 
@@ -7445,10 +7795,10 @@ def segment_from_point():
         heatmap_norm = heatmap_norm / heatmap_norm.max()
 
     crop_size = getattr(dino_encoder, 'crop_size', 224)
-    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=RESAMPLE_NEAREST)
 
     base_size = pil_image.size
-    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=Image.NEAREST)
+    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=RESAMPLE_NEAREST)
     refinement_source = 'dino_heatmap'
     refined_label: Optional[str] = None
     segment_value = 255
@@ -7467,8 +7817,8 @@ def segment_from_point():
                     segment_value = int(refine_result.get('segment_value', 255))
                     overlay_mask_source = Image.fromarray(refined_mask_arr.astype(np.uint8), mode='L')
                     if overlay_mask_source.size != base_size:
-                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=Image.NEAREST)
-                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=Image.NEAREST)
+                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=RESAMPLE_NEAREST)
+                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=RESAMPLE_NEAREST)
                     if refined_label:
                         label_map[str(segment_value)] = refined_label
         except Exception as exc:
@@ -7479,7 +7829,7 @@ def segment_from_point():
     if overlay_mask_np.size:
         mask_fraction = float(np.count_nonzero(overlay_mask_np)) / float(overlay_mask_np.size)
 
-    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=Image.BILINEAR)
+    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=RESAMPLE_BILINEAR)
     heatmap_overlay = _create_overlay_rgba(heatmap_alpha, (255, 155, 40), 0.9)
     mask_overlay = _create_overlay_rgba(overlay_mask_source, (94, 196, 255), 0.6)
     segmentation_overlay_img: Optional[Image.Image] = None
@@ -7491,10 +7841,16 @@ def segment_from_point():
         class_labels = {}
         if isinstance(class_labels_raw, dict):
             class_labels = {int(k): str(v) for k, v in class_labels_raw.items()}
-        seg_overlay, legend_entries = _render_segmentation_overlay(seg_map, class_labels, int(refine_result.get('class_id', segment_value)))
+        seg_overlay: Optional[Image.Image] = None
+        if isinstance(seg_map, np.ndarray):
+            seg_overlay, legend_entries = _render_segmentation_overlay(
+                seg_map,
+                class_labels,
+                int(refine_result.get('class_id', segment_value)),
+            )
         if seg_overlay is not None:
             if seg_overlay.size != base_size:
-                seg_overlay = seg_overlay.resize(base_size, resample=Image.NEAREST)
+                seg_overlay = seg_overlay.resize(base_size, resample=RESAMPLE_NEAREST)
             segmentation_overlay_img = seg_overlay
 
     try:
