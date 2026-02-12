@@ -3,11 +3,38 @@ import json
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, cast
 
 import requests
 from PIL import Image
 from requests.auth import HTTPDigestAuth
+
+
+class ProbeManagerLike(Protocol):
+    def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> Any: ...
+
+
+def _parse_optional_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    try:
+        return int(cast(Any, value))
+    except Exception:
+        return None
 
 
 class LuxriotClient:
@@ -94,20 +121,19 @@ class LuxriotClient:
         for item in channels:
             if not isinstance(item, dict):
                 continue
-            channel_id_raw = item.get("id")
-            channel_id: Optional[int] = None
-            try:
-                if channel_id_raw is not None:
-                    channel_id = int(channel_id_raw)
-            except Exception:
-                channel_id = None
+            item_map = cast(Mapping[str, object], item)
+            channel_id = _parse_optional_int(item_map.get("id"))
+            title_value = item_map.get("title")
+            title = str(title_value).strip() if title_value is not None else ""
+            if not title:
+                title = f"Channel {channel_id if channel_id is not None else 'unknown'}"
             cleaned.append(
                 {
                     "id": channel_id,
-                    "guid": item.get("guid"),
-                    "title": item.get("title") or f"Channel {channel_id}",
-                    "server": item.get("server"),
-                    "ptzCapabilities": item.get("ptzCapabilities"),
+                    "guid": item_map.get("guid"),
+                    "title": title,
+                    "server": item_map.get("server"),
+                    "ptzCapabilities": item_map.get("ptzCapabilities"),
                 }
             )
         return cleaned
@@ -214,7 +240,7 @@ class LuxriotCaptureSession:
                     probe_manager = self.manager.probe_manager
                     if probe_manager is not None:
                         ts_ms = int(captured_at * 1000)
-                        cast(Any, probe_manager).add_frame(self.channel_id, snapshot, ts_ms)
+                        probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
                 except Exception as pm_exc:
                     self.last_error = str(pm_exc)
                 if len(self.frames) >= self.batch_size:
@@ -300,7 +326,7 @@ class LuxriotManager:
         message_builder: Callable[[str, List[Dict[str, Any]], str, str], List[Dict[str, Any]]],
         jpeg_encoder: Callable[..., str],
         alert_parser: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
-        probe_manager: Optional[Any] = None,
+        probe_manager: Optional[ProbeManagerLike] = None,
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
@@ -308,7 +334,7 @@ class LuxriotManager:
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
         self.auto_bookmarks = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
-        self.probe_manager = probe_manager
+        self.probe_manager: Optional[ProbeManagerLike] = probe_manager
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
