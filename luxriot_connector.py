@@ -3,7 +3,7 @@ import json
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
 
 import requests
 from PIL import Image
@@ -94,11 +94,13 @@ class LuxriotClient:
         for item in channels:
             if not isinstance(item, dict):
                 continue
-            channel_id = item.get("id")
+            channel_id_raw = item.get("id")
+            channel_id: Optional[int] = None
             try:
-                channel_id = int(channel_id)
+                if channel_id_raw is not None:
+                    channel_id = int(channel_id_raw)
             except Exception:
-                pass
+                channel_id = None
             cleaned.append(
                 {
                     "id": channel_id,
@@ -209,9 +211,10 @@ class LuxriotCaptureSession:
                     self.frames.append(frame)
                     self._enforce_buffer_locked()
                 try:
-                    if getattr(self.manager, "probe_manager", None):
+                    probe_manager = self.manager.probe_manager
+                    if probe_manager is not None:
                         ts_ms = int(captured_at * 1000)
-                        self.manager.probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
+                        cast(Any, probe_manager).add_frame(self.channel_id, snapshot, ts_ms)
                 except Exception as pm_exc:
                     self.last_error = str(pm_exc)
                 if len(self.frames) >= self.batch_size:
@@ -232,7 +235,7 @@ class LuxriotCaptureSession:
         try:
             system_prompt = getattr(self.manager, "system_prompt", "") or ""
             messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
-            summary = self.manager.lm_callback(messages, model_override=self.model_hint)
+            summary = self.manager.lm_callback(messages, self.model_hint)
             duration = time.time() - started
             entry = {
                 "channel_id": self.channel_id,
@@ -294,7 +297,7 @@ class LuxriotManager:
         self,
         config: Any,
         lm_callback: Callable[[List[Dict[str, Any]], Optional[str]], str],
-        message_builder: Callable[[str, List[Dict[str, Any]], str], List[Dict[str, Any]]],
+        message_builder: Callable[[str, List[Dict[str, Any]], str, str], List[Dict[str, Any]]],
         jpeg_encoder: Callable[..., str],
         alert_parser: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
         probe_manager: Optional[Any] = None,
