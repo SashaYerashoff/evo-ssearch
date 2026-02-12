@@ -1,10 +1,14 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import base64
+import copy
 import json
-import pickle
-import time
 import math
+import pickle
+import secrets
+import threading
+import time
+import uuid
 import requests
 from io import BytesIO
 from pathlib import Path
@@ -25,16 +29,15 @@ from config import config
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
-import numpy as np
-import threading
-import time
 try:
     from heads.mask2former_head import Mask2FormerHead
 except Exception:  # pragma: no cover - optional dependency
     Mask2FormerHead = None  # type: ignore[misc]
 
 app = Flask(__name__)
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
+if config.CORS_ALLOWED_ORIGINS:
+    CORS(app, resources={r"/*": {"origins": list(config.CORS_ALLOWED_ORIGINS)}})
 
 # Global embedder state
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -49,6 +52,104 @@ EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
 if active_embedder == "fusion" and not config.FUSION_ENABLED:
     active_embedder = "clip"
+
+LOCAL_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+
+
+def _json_body() -> Dict[str, Any]:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _is_local_request() -> bool:
+    return (request.remote_addr or "") in LOCAL_HOSTS
+
+
+def _request_admin_token() -> str:
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return (request.headers.get("X-Admin-Token") or "").strip()
+
+
+def _has_admin_access() -> bool:
+    configured = (config.ADMIN_TOKEN or "").strip()
+    if not configured:
+        return False
+    provided = _request_admin_token()
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, configured)
+
+
+def _settings_guard(write: bool = False):
+    if write:
+        return _mutation_guard()
+    if config.ADMIN_TOKEN:
+        if _has_admin_access():
+            return None
+        return jsonify({"success": False, "error": "Admin token required"}), 401
+    if config.SETTINGS_LOCAL_ONLY and not _is_local_request():
+        return jsonify({"success": False, "error": "Remote settings access is disabled."}), 403
+    return None
+
+
+def _mutation_guard():
+    configured = (config.ADMIN_TOKEN or "").strip()
+    if not configured:
+        return jsonify(
+            {
+                "success": False,
+                "error": "Admin token is required for mutating endpoints. Set EVOSSEARCH_ADMIN_TOKEN.",
+            }
+        ), 503
+    if _has_admin_access():
+        return None
+    return jsonify({"success": False, "error": "Admin token required"}), 401
+
+
+def _mutation_guard_error():
+    guard = _mutation_guard()
+    if guard is None:
+        return None
+    body, status = guard
+    payload = body.get_json(silent=True) if hasattr(body, "get_json") else {}
+    message = (payload or {}).get("error") or "Admin token required"
+    return jsonify({"error": message}), status
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_folder_path(folder_raw: Any, require_index: bool = False) -> Path:
+    folder_text = str(folder_raw or "").strip()
+    if not folder_text:
+        raise ValueError("No folder specified")
+    folder_path = Path(folder_text).expanduser().resolve()
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise ValueError("Invalid folder path")
+    if config.ALLOWED_ROOTS:
+        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+        if not any(_path_within(folder_path, root) for root in allowed_roots):
+            raise ValueError("Folder path is outside configured allowed roots")
+    if require_index:
+        index_root = folder_path / config.INDEX_FOLDER_NAME
+        has_index = (index_root / "index.faiss").exists() or any(
+            (index_root / subdir / "index.faiss").exists() for subdir in EMBEDDER_SUBDIRS.values()
+        )
+        if not has_index:
+            raise ValueError("Folder is not indexed")
+    return folder_path
+
+
+@app.errorhandler(413)
+def payload_too_large(_: Exception):
+    return jsonify({"error": f"Payload too large (max {config.MAX_FILE_SIZE_MB} MB)."}), 413
 
 
 def init_clip() -> None:
@@ -330,6 +431,19 @@ def home():
     <title>Natural Language Image Search</title>
     <!-- Cache buster: {timestamp} -->
     <style>
+        :root {
+            --bg: #0a0a0a;
+            --panel: #161616;
+            --panel-border: #262626;
+            --surface: #0f0f0f;
+            --field: #0a0a0a;
+            --field-border: #333;
+            --text: #e0e0e0;
+            --muted: #8f8f8f;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -338,18 +452,19 @@ def home():
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0a0a;
-            color: #e0e0e0;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
         }
         
         .container {
-            max-width: 1200px;
-            min-width: 900px;                     
+            width: 100%;
+            max-width: 1280px;
+            min-width: 0;
             margin: 0 auto;
-            padding: 2rem;
+            padding: 1.5rem;
             flex: 1;
         }
         
@@ -358,6 +473,12 @@ def home():
             justify-content: space-between;
             align-items: center;
             margin-bottom: 2rem;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
 
         .brand {
@@ -615,11 +736,11 @@ def home():
         }
         
         .control-panel {
-            background: #161616;
-            border-radius: 12px;
+            background: var(--panel);
+            border-radius: var(--radius-lg);
             padding: 1.5rem;
             margin-bottom: 2rem;
-            border: 1px solid #262626;
+            border: 1px solid var(--panel-border);
         }
         
         .folder-select {
@@ -630,13 +751,14 @@ def home():
         
         input[type="text"] {
             flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #333;
+            background: var(--field);
+            border: 1px solid var(--field-border);
             padding: 0.75rem 1rem;
-            border-radius: 8px;
-            color: #e0e0e0;
+            border-radius: var(--radius-md);
+            color: var(--text);
             font-size: 0.95rem;
             transition: border-color 0.2s;
+            min-width: 0;
         }
         
         input[type="text"]:focus {
@@ -646,10 +768,10 @@ def home():
         
         button {
             background: #1a1a1a;
-            border: 1px solid #333;
-            color: #e0e0e0;
+            border: 1px solid var(--field-border);
+            color: var(--text);
             padding: 0.75rem 1.5rem;
-            border-radius: 8px;
+            border-radius: var(--radius-md);
             cursor: pointer;
             font-size: 0.95rem;
             transition: all 0.2s;
@@ -677,20 +799,24 @@ def home():
         .status.error {
             color: #f87171;
         }
+
+        .status.warning {
+            color: #f4c066;
+        }
         
         .search-panel {
-            background: #161616;
-            border-radius: 12px;
+            background: var(--panel);
+            border-radius: var(--radius-lg);
             padding: 1.5rem;
             margin-bottom: 2rem;
-            border: 1px solid #262626;
+            border: 1px solid var(--panel-border);
         }
         
         .search-mode-tabs {
             display: flex;
             gap: 0;
             margin-bottom: 1rem;
-            border-radius: 8px;
+            border-radius: var(--radius-md);
             overflow: hidden;
         }
         
@@ -828,14 +954,38 @@ def home():
         .search-box {
             display: flex;
             gap: 1rem;
+            align-items: flex-end;
+        }
+
+        .archive-search-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .archive-section {
+            background: var(--surface);
+            border: 1px solid #222;
+            border-radius: var(--radius-md);
+            padding: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.7rem;
+        }
+
+        .archive-section-title {
+            color: #bdbdbd;
+            font-size: 0.85rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
         }
         
         input[type="file"] {
-            background: #0a0a0a;
-            border: 1px solid #333;
+            background: var(--field);
+            border: 1px solid var(--field-border);
             padding: 0.75rem 1rem;
-            border-radius: 8px;
-            color: #e0e0e0;
+            border-radius: var(--radius-md);
+            color: var(--text);
             font-size: 0.95rem;
             transition: border-color 0.2s;
             width: 100%;
@@ -852,7 +1002,7 @@ def home():
             flex-direction: column;
             gap: 1rem;
             flex: 1;
-            margin-right: 1rem;
+            min-width: 0;
         }
         
         .input-group {
@@ -879,6 +1029,10 @@ def home():
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
             gap: 1.5rem;
+        }
+
+        .results-grid.hidden {
+            display: none;
         }
         
         .result-item {
@@ -1194,6 +1348,20 @@ def home():
         
         .result-item.expanded .comment-section {
             display: block;
+        }
+
+        .lm-description {
+            margin-bottom: 0.75rem;
+        }
+
+        .lm-description-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 0.75rem;
+        }
+
+        .lm-comment {
+            border-left-color: #3f6d54;
         }
         
         .comments-list {
@@ -1980,9 +2148,60 @@ def home():
         /* Expanded image display */
         .result-item.expanded .thumbnail {
             width: 100%;
-            min-width: 900px;
+            min-width: 0;
+            max-height: 70vh;
             height: auto;
             object-fit: contain;
+            background: #080808;
+        }
+
+        @media (max-width: 980px) {
+            .container {
+                padding: 1rem;
+            }
+
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.75rem;
+            }
+
+            .folder-select {
+                flex-direction: column;
+            }
+
+            .search-controls {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.75rem;
+            }
+
+            .control-group {
+                width: 100%;
+                flex-wrap: wrap;
+                justify-content: flex-start;
+            }
+
+            .search-box {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .image-search-inputs {
+                margin-right: 0;
+            }
+
+            .monitor-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .image-probe-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .result-item.expanded .thumbnail {
+                max-height: 55vh;
+            }
         }
         
     </style>
@@ -1997,10 +2216,17 @@ def home():
                     <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
                 </div>
             </div>
-            <div class="settings-icon" id="settingsBtn">
-                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                    <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
-                </svg>
+            <div class="header-actions">
+                <div class="settings-icon" id="authTokenBtn" title="Set admin token">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="M240-160q-33 0-56.5-23.5T160-240v-480q0-33 23.5-56.5T240-800h360q33 0 56.5 23.5T680-720v160h40q33 0 56.5 23.5T800-480v240q0 33-23.5 56.5T720-160H240Zm0-80h480v-240H240v240Zm120-320h240v-160H360v160Zm120 200q17 0 28.5-11.5T520-400q0-17-11.5-28.5T480-440q-17 0-28.5 11.5T440-400q0 17 11.5 28.5T480-360Z"/>
+                    </svg>
+                </div>
+                <div class="settings-icon" id="settingsBtn">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
+                    </svg>
+                </div>
             </div>
         </div>
         
@@ -2014,8 +2240,7 @@ def home():
         
             <div class="search-panel">
                 <div class="search-mode-tabs">
-                    <button id="textModeBtn" class="mode-tab active">Text Search</button>
-                    <button id="imageModeBtn" class="mode-tab">Image Search</button>
+                    <button id="archiveModeBtn" class="mode-tab active">Archive Research</button>
                     <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
                     <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
                 </div>
@@ -2046,23 +2271,26 @@ def home():
                     </div>
                 </div>
             </div>
-            <div id="textSearchBox" class="search-box">
-                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                <button id="searchBtn">Search</button>
-            </div>
-            <div id="imageSearchBox" class="search-box" style="display: none;">
-                <div class="image-search-inputs">
-                    <div class="input-group">
-                        <label for="imageUpload" class="input-label">Upload File:</label>
-                        <input type="file" id="imageUpload" accept="image/*" />
-                    </div>
-                    <div class="input-separator">OR</div>
-                    <div class="input-group">
-                        <label for="imagePath" class="input-label">Enter Image Path:</label>
-                        <input type="text" id="imagePath" placeholder="C:\\path\\to\\image.jpg" />
+            <div id="archiveSearchBox" class="archive-search-shell">
+                <div class="archive-section">
+                    <div class="archive-section-title">Text Query</div>
+                    <div id="textSearchBox" class="search-box">
+                        <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
+                        <button id="searchBtn">Search</button>
                     </div>
                 </div>
-                <button id="imageSearchBtn">Search by Image</button>
+                <div class="archive-section">
+                    <div class="archive-section-title">Image Query</div>
+                    <div id="imageSearchBox" class="search-box">
+                        <div class="image-search-inputs">
+                            <div class="input-group">
+                                <label for="imageUpload" class="input-label">Upload File:</label>
+                                <input type="file" id="imageUpload" accept="image/*" />
+                            </div>
+                        </div>
+                        <button id="imageSearchBtn">Search by Image</button>
+                    </div>
+                </div>
             </div>
             <div id="videoBox" class="video-box" style="display: none;">
         <div class="luxriot-grid">
@@ -2279,6 +2507,7 @@ def home():
                         </div>
                     </div>
                 </div>
+            </div>
         <div id="results" class="results-grid"></div>
     </div>
     
@@ -2474,13 +2703,11 @@ def home():
         const searchInput = document.getElementById('searchQuery');
         const searchBtn = document.getElementById('searchBtn');
         const imageUpload = document.getElementById('imageUpload');
-        const imagePath = document.getElementById('imagePath');
         const imageSearchBtn = document.getElementById('imageSearchBtn');
-        const textModeBtn = document.getElementById('textModeBtn');
-        const imageModeBtn = document.getElementById('imageModeBtn');
+        const archiveModeBtn = document.getElementById('archiveModeBtn');
         const videoModeBtn = document.getElementById('videoModeBtn');
-        const textSearchBox = document.getElementById('textSearchBox');
-        const imageSearchBox = document.getElementById('imageSearchBox');
+        const searchControls = document.querySelector('.search-controls');
+        const archiveSearchBox = document.getElementById('archiveSearchBox');
         const videoBox = document.getElementById('videoBox');
         const videoPathInput = document.getElementById('videoPath');
         const videoModelInput = document.getElementById('videoModel');
@@ -2552,7 +2779,7 @@ def home():
         const probeBenchOutput = document.getElementById('probeBenchOutput');
         
         let currentFolder = '';
-        let currentMode = 'text';
+        let currentMode = 'archive';
         let videoTimerHandle = null;
         let videoRequestStarted = 0;
         let lastSummaryText = '';
@@ -2583,6 +2810,47 @@ def home():
         let probeHitsOffset = 0;
         const channelCaptureConfig = {};
         const channelFpsDesired = {};
+        const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
+
+        function getAdminToken() {
+            return (localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '').trim();
+        }
+
+        function saveAdminToken(token) {
+            const clean = (token || '').trim();
+            if (clean) {
+                localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, clean);
+            } else {
+                localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+            }
+        }
+
+        (function seedAdminTokenFromQuery() {
+            try {
+                const url = new URL(window.location.href);
+                const qp = (url.searchParams.get('admin_token') || '').trim();
+                if (!qp) return;
+                saveAdminToken(qp);
+                url.searchParams.delete('admin_token');
+                window.history.replaceState({}, '', url.toString());
+            } catch (_) {
+                // no-op
+            }
+        })();
+
+        const rawFetch = window.fetch.bind(window);
+        window.fetch = (input, init = {}) => {
+            const options = init ? { ...init } : {};
+            const token = getAdminToken();
+            if (token) {
+                const headers = new Headers(options.headers || {});
+                if (!headers.has('X-Admin-Token') && !headers.has('Authorization')) {
+                    headers.set('X-Admin-Token', token);
+                }
+                options.headers = headers;
+            }
+            return rawFetch(input, options);
+        };
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2630,14 +2898,16 @@ def home():
 
         function setMode(mode) {
             currentMode = mode;
-            textModeBtn.classList.toggle('active', mode === 'text');
-            imageModeBtn.classList.toggle('active', mode === 'image');
+            archiveModeBtn.classList.toggle('active', mode === 'archive');
             videoModeBtn.classList.toggle('active', mode === 'video');
             monitorModeBtn.classList.toggle('active', mode === 'monitor');
-            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
-            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
+            if (searchControls) {
+                searchControls.style.display = mode === 'archive' ? 'flex' : 'none';
+            }
+            archiveSearchBox.style.display = mode === 'archive' ? 'flex' : 'none';
             videoBox.style.display = mode === 'video' ? 'flex' : 'none';
             monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
+            resultsContainer.classList.toggle('hidden', mode === 'monitor');
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
@@ -2916,6 +3186,7 @@ def home():
         setMode(currentMode);
         
         // Settings modal elements
+        const authTokenBtn = document.getElementById('authTokenBtn');
         const settingsBtn = document.getElementById('settingsBtn');
         const settingsModal = document.getElementById('settingsModal');
         const closeSettingsBtn = document.getElementById('closeSettings');
@@ -3023,6 +3294,25 @@ def home():
             }
 
             return lines.join('');
+        }
+
+        if (authTokenBtn) {
+            authTokenBtn.addEventListener('click', () => {
+                const existing = getAdminToken();
+                const entered = window.prompt(
+                    'Set admin token (stored in this browser for mutating API calls). Leave empty to clear.',
+                    existing
+                );
+                if (entered === null) {
+                    return;
+                }
+                saveAdminToken(entered);
+                const hasToken = !!getAdminToken();
+                authTokenBtn.style.opacity = hasToken ? '1' : '0.6';
+                indexStatus.textContent = hasToken ? 'Admin token saved in browser.' : 'Admin token cleared.';
+                indexStatus.className = hasToken ? 'status success' : 'status warning';
+            });
+            authTokenBtn.style.opacity = getAdminToken() ? '1' : '0.6';
         }
         
         // Settings modal functionality
@@ -3363,18 +3653,13 @@ def home():
                 row.style.display = embedder === 'dino' ? 'none' : 'flex';
             });
 
-            if (embedder === 'dino') {
-                textModeBtn.disabled = true;
-                textModeBtn.title = 'Text search is only available with the CLIP backend.';
-                textModeBtn.classList.remove('active');
-                setMode('image');
-            } else {
-                textModeBtn.disabled = false;
-                textModeBtn.title = '';
-                if (currentMode === 'text') {
-                    setMode('text');
-                }
-            }
+            const textSearchAvailable = embedder !== 'dino';
+            searchInput.disabled = !textSearchAvailable;
+            searchBtn.disabled = !textSearchAvailable;
+            searchInput.placeholder = textSearchAvailable
+                ? "Describe what you're looking for..."
+                : 'Text search requires CLIP or Fusion backend.';
+            searchBtn.title = textSearchAvailable ? '' : 'Text search is disabled when backend is DINO.';
         }
 
         embedderSelect.addEventListener('change', (event) => {
@@ -4137,8 +4422,7 @@ def home():
         }
 
         // Mode switching
-        if (textModeBtn) textModeBtn.addEventListener('click', () => setMode('text'));
-        if (imageModeBtn) imageModeBtn.addEventListener('click', () => setMode('image'));
+        if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
         if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
         if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
         
@@ -4154,6 +4438,20 @@ def home():
             } catch (error) {
                 return { indexed: false, available_modes: [] };
             }
+        }
+
+        async function parseApiJson(response, fallbackMessage) {
+            let data = {};
+            try {
+                data = await response.json();
+            } catch (_) {
+                data = {};
+            }
+            if (!response.ok || data.error) {
+                const message = data.error || `${fallbackMessage} (${response.status})`;
+                throw new Error(message);
+            }
+            return data;
         }
         
         // Index folder
@@ -4200,6 +4498,7 @@ def home():
         
         // Text search
         searchBtn.addEventListener('click', async () => {
+            setMode('archive');
             const query = searchInput.value.trim();
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
@@ -4216,7 +4515,7 @@ def home():
                     body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
                 });
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Text search failed');
                 
                 if (data.results && data.results.length > 0) {
                     displayResults(data.results);
@@ -4230,15 +4529,14 @@ def home():
         
         // Image search
         imageSearchBtn.addEventListener('click', async () => {
+            setMode('archive');
             const folder = folderInput.value.trim();
             const file = imageUpload.files[0];
-            const imagePathValue = imagePath.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
             
-            // Check if we have either a file or a path
-            if (!folder || (!file && !imagePathValue)) {
-                alert('Please select a folder and either upload an image file or enter an image path.');
+            if (!folder || !file) {
+                alert('Please select a folder and upload an image file.');
                 return;
             }
             
@@ -4249,20 +4547,14 @@ def home():
                 formData.append('folder', folder);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
-                
-                // Prioritize file upload over path
-                if (file) {
-                    formData.append('image', file);
-                } else if (imagePathValue) {
-                    formData.append('image_path', imagePathValue);
-                }
+                formData.append('image', file);
                 
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
                     body: formData
                 });
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Image search failed');
                 
                 if (data.results && data.results.length > 0) {
                     displayResults(data.results);
@@ -4418,7 +4710,7 @@ def home():
                 alert('Please enter a folder path first');
                 return;
             }
-            setMode('text');
+            setMode('archive');
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
             
@@ -4429,7 +4721,7 @@ def home():
                     body: JSON.stringify({ folder })
                 });
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Loading commented images failed');
                 
                 if (data.results && data.results.length > 0) {
                     displayCommentedResults(data.results);
@@ -4444,10 +4736,21 @@ def home():
         // Generate common HTML structure for result items
         function generateResultItemHTML(result, index, isCommented = false) {
             const similarityMarkup = buildSimilarityMetrics(result, isCommented);
+            const safeFilename = escapeHtml(result.filename || 'unnamed');
+            const rawPath = String(result.path || '');
+            const safePath = escapeHtml(rawPath);
+            const thumb = String(result.thumbnail || '').trim();
+            const fallbackSvg = encodeURIComponent(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="260">' +
+                '<rect width="100%" height="100%" fill="#1f2026"/>' +
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#9aa0ad" font-size="18">No thumbnail</text>' +
+                '</svg>'
+            );
+            const thumbnailSrc = thumb ? `data:image/jpeg;base64,${thumb}` : `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
                 
             return `
                 <div class="image-container">
-                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                    <img src="${thumbnailSrc}" class="thumbnail" alt="" />
                     <div class="image-overlay">
                         <div class="expand-collapse-icon" data-index="${index}">
                             <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
@@ -4458,19 +4761,19 @@ def home():
                 </div>
                 <div class="result-info">
                     <div class="filename">
-                        ${result.filename}
+                        ${safeFilename}
                         <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
                             <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
                         </svg>
                     </div>
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
-                        <button class="action-icon describe-icon" data-index="${index}" data-path="${result.path || ''}" title="Describe with LM">
+                        <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
                             <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                                 <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
                             </svg>
                         </button>
-                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${result.path || ''}" title="Find similar">
+                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${safePath}" title="Find similar">
                             <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                                 <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
                             </svg>
@@ -4481,6 +4784,12 @@ def home():
                     <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
                 </div>
                 <div class="comment-section">
+                    <div class="lm-description" id="lm-desc-${index}">
+                        <div class="no-comments">No LLM description yet.</div>
+                    </div>
+                    <div class="lm-description-actions">
+                        <button class="save-comment-btn" id="lm-save-btn-${index}" style="display:none;">Save LLM as comment</button>
+                    </div>
                     <div class="comments-list" id="comments-${index}">
                         <div class="comment-loading">Loading comments...</div>
                     </div>
@@ -4533,7 +4842,7 @@ def home():
                 if (result.path) {
                     describeIcon.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        describeImageWithLM(result.path);
+                        describeImageWithLM(index, result.path, item, result);
                     });
                 } else {
                     describeIcon.style.display = 'none';
@@ -4551,6 +4860,17 @@ def home():
                     });
                 } else {
                     saveBtn.disabled = true;
+                }
+            }
+
+            const lmSaveBtn = item.querySelector(`#lm-save-btn-${index}`);
+            if (lmSaveBtn) {
+                if (result.path) {
+                    lmSaveBtn.addEventListener('click', () => {
+                        saveLmDescriptionAsComment(index, result.path);
+                    });
+                } else {
+                    lmSaveBtn.style.display = 'none';
                 }
             }
 
@@ -4638,6 +4958,68 @@ def home():
                 container.appendChild(commentDiv);
             });
         }
+
+        function renderLmDescription(index, summary, modelLabel = '') {
+            const descContainer = document.getElementById(`lm-desc-${index}`);
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!descContainer || !saveBtn) return;
+
+            const now = new Date().toLocaleString();
+            const modelSuffix = modelLabel ? ` · ${escapeHtml(modelLabel)}` : '';
+            descContainer.innerHTML = `
+                <div class="comment-item lm-comment">
+                    <div class="comment-timestamp">LLM Description${modelSuffix} · ${escapeHtml(now)}</div>
+                    <div class="comment-text">${renderMarkdown(summary || '')}</div>
+                </div>
+            `;
+            saveBtn.dataset.summary = summary || '';
+            saveBtn.style.display = 'inline-flex';
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save LLM as comment';
+        }
+
+        async function saveLmDescriptionAsComment(index, imagePath) {
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!saveBtn) return;
+            const summary = (saveBtn.dataset.summary || '').trim();
+            if (!summary) {
+                alert('No LLM description to save yet.');
+                return;
+            }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+
+            const originalText = saveBtn.textContent;
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            try {
+                const response = await fetch('/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder,
+                        image_path: imagePath,
+                        comment: summary,
+                    }),
+                });
+                const data = await parseApiJson(response, 'Saving LLM description failed');
+                const commentsContainer = document.getElementById(`comments-${index}`);
+                if (commentsContainer && Array.isArray(data.comments)) {
+                    displayComments(commentsContainer, data.comments);
+                }
+                indexStatus.textContent = 'LLM description saved as comment.';
+                indexStatus.className = 'status success';
+                saveBtn.textContent = 'Saved';
+            } catch (err) {
+                alert('Failed to save LLM description: ' + err.message);
+                saveBtn.textContent = originalText;
+            } finally {
+                saveBtn.disabled = false;
+            }
+        }
         
         async function saveComment(index, imagePath, folder, comment) {
             if (!comment) return;
@@ -4699,7 +5081,13 @@ def home():
                 `;
             } else {
                 // Expand: show original image and load comments
-                const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
+                const activeFolder = folderInput.value.trim();
+                const params = new URLSearchParams();
+                if (activeFolder) {
+                    params.set('folder', activeFolder);
+                }
+                params.set('image_path', result.path || '');
+                const originalImageUrl = `/image?${params.toString()}`;
                 img.src = originalImageUrl;
                 item.classList.add('expanded');
                 loadComments(index, result.path, folderInput.value.trim());
@@ -4974,7 +5362,13 @@ def home():
             
             try {
                 // Fetch the image file from the server using existing image route
-                const imageResponse = await fetch(`/image/${encodeURIComponent(imagePath)}`);
+                const activeFolder = folderInput.value.trim();
+                const params = new URLSearchParams();
+                if (activeFolder) {
+                    params.set('folder', activeFolder);
+                }
+                params.set('image_path', imagePath);
+                const imageResponse = await fetch(`/image?${params.toString()}`);
                 if (!imageResponse.ok) {
                     throw new Error('Failed to load image file');
                 }
@@ -5016,58 +5410,56 @@ def home():
             }
         }
 
-        async function describeImageWithLM(imagePath) {
+        async function describeImageWithLM(index, imagePath, item = null, result = null) {
             if (!imagePath) {
                 alert('No filesystem path is available for this image.');
                 return;
             }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+
             const prompt = videoPromptInput.value.trim();
             const modelId = videoModelInput ? videoModelInput.value.trim() : '';
-            setMode('video');
-            videoStatus.dataset.base = 'Querying model...';
-            videoStatus.textContent = videoStatus.dataset.base;
-            videoStatus.className = 'video-status';
-            videoRunBtn.disabled = true;
-            saveSummaryBtn.style.display = 'none';
-            videoOutput.style.display = 'none';
-            videoOutput.innerHTML = '';
-            renderVideoFrames([]);
-            startVideoTimer();
+
+            setMode('archive');
+            const targetItem = item || document.querySelector(`.result-item[data-result-index="${index}"]`);
+            if (targetItem && !targetItem.classList.contains('expanded') && result) {
+                toggleImageExpansion(targetItem, result, index);
+            }
+
+            const descContainer = document.getElementById(`lm-desc-${index}`);
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!descContainer || !saveBtn) {
+                alert('Unable to render LLM description panel for this result.');
+                return;
+            }
+
+            descContainer.innerHTML = '<div class="comment-loading"><div class="spinner"></div> Generating LLM description...</div>';
+            saveBtn.style.display = 'none';
+            saveBtn.dataset.summary = '';
 
             try {
                 const response = await fetch('/describe_image', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image_path: imagePath, prompt, model: modelId }),
+                    body: JSON.stringify({
+                        folder,
+                        image_path: imagePath,
+                        prompt,
+                        model: modelId
+                    }),
                 });
-                const data = await response.json();
-                if (!response.ok || data.error) {
-                    videoStatus.dataset.base = data.error || 'Describe request failed.';
-                    videoStatus.textContent = videoStatus.dataset.base;
-                    videoStatus.className = 'video-status error';
-                    stopVideoTimer();
+                const data = await parseApiJson(response, 'Describe request failed');
+                if (data.summary) {
+                    renderLmDescription(index, data.summary, data.model || modelId || 'LM Studio');
                     return;
                 }
-                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Image described`;
-                videoStatus.textContent = videoStatus.dataset.base;
-                if (data.summary) {
-                    videoOutput.style.display = 'block';
-                    videoOutput.innerHTML = renderMarkdown(data.summary);
-                    lastSummaryText = data.summary;
-                    lastSummaryTarget = { path: imagePath };
-                    saveSummaryBtn.style.display = 'inline-flex';
-                }
-                if (data.thumbnail) {
-                    videoFrames.innerHTML = `<div title="Image"><img src="data:image/jpeg;base64,${data.thumbnail}" alt="Image" /></div>`;
-                }
-                stopVideoTimer(true);
+                descContainer.innerHTML = '<div class="no-comments">(No description returned)</div>';
             } catch (err) {
-                videoStatus.dataset.base = 'Error: ' + err.message;
-                videoStatus.textContent = videoStatus.dataset.base;
-                videoStatus.className = 'video-status error';
-                stopVideoTimer(true);
-            } finally {
-                videoRunBtn.disabled = false;
+                descContainer.innerHTML = `<div class="no-comments">Error: ${escapeHtml(err.message || String(err))}</div>`;
             }
         }
         
@@ -5121,20 +5513,34 @@ def home():
     return response
 
 
-@app.route('/image/<path:filepath>')
-def serve_image(filepath):
-    """Serve original images from absolute paths."""
+@app.route('/image', methods=['GET'])
+@app.route('/image/<path:filepath>', methods=['GET'])
+def serve_image(filepath: str = ""):
+    """Serve image files only from indexed folders."""
     try:
-        decoded = unquote(filepath)
+        folder_raw = request.args.get('folder')
+        if not folder_raw:
+            return "Missing folder parameter", 400
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+
+        source_path = request.args.get('image_path') or filepath
+        if not source_path:
+            return "Missing image path", 400
+
+        decoded = unquote(source_path)
         path_obj = Path(decoded)
-        if '..' in path_obj.parts:
-            return "Access denied", 403
         if not path_obj.is_absolute():
-            path_obj = Path('/') / path_obj
+            path_obj = folder_path / path_obj
         abs_path = path_obj.resolve()
+        if abs_path.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return "Unsupported file type", 403
+        if not _path_within(abs_path, folder_path):
+            return "Access denied", 403
         if not abs_path.exists() or not abs_path.is_file():
             return "Image not found", 404
         return send_file(str(abs_path))
+    except ValueError as exc:
+        return str(exc), 400
     except Exception as exc:
         return f"Error serving image: {exc}", 500
 
@@ -5486,49 +5892,59 @@ class ProbesStore:
     def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
         self.path = Path(path)
         self.data: Dict[str, Any] = {"probes": []}
+        self.lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text())
-            except Exception:
-                self.data = {"probes": []}
+        with self.lock:
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding='utf-8'))
+                    if isinstance(loaded, dict):
+                        self.data = loaded
+                    else:
+                        self.data = {"probes": []}
+                except Exception:
+                    self.data = {"probes": []}
 
-    def _save(self) -> None:
-        try:
-            self.path.write_text(json.dumps(self.data, indent=2))
-        except Exception:
-            pass
+    def _save_locked(self) -> None:
+        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(self.data, indent=2), encoding='utf-8')
+        tmp_path.replace(self.path)
 
     def list_probes(self) -> List[Dict[str, Any]]:
-        return list(self.data.get("probes", []))
+        with self.lock:
+            probes = self.data.get("probes", [])
+            return copy.deepcopy(probes if isinstance(probes, list) else [])
 
     def upsert_probe(self, probe: Dict[str, Any]) -> Dict[str, Any]:
-        self.data.setdefault("probes", [])
-        probe_list: List[Dict[str, Any]] = self.data["probes"]
-        if not probe.get("id"):
-            probe["id"] = f"probe-{int(time.time() * 1000)}"
-        existing = None
-        for idx, item in enumerate(probe_list):
-            if item.get("id") == probe["id"]:
-                existing = idx
-                break
-        if existing is None:
-            probe_list.append(probe)
-        else:
-            probe_list[existing] = probe
-        self._save()
-        return probe
+        with self.lock:
+            self.data.setdefault("probes", [])
+            probe_list: List[Dict[str, Any]] = self.data["probes"]
+            stored_probe = copy.deepcopy(probe)
+            if not stored_probe.get("id"):
+                stored_probe["id"] = f"probe-{uuid.uuid4().hex[:12]}"
+            existing = None
+            for idx, item in enumerate(probe_list):
+                if item.get("id") == stored_probe["id"]:
+                    existing = idx
+                    break
+            if existing is None:
+                probe_list.append(stored_probe)
+            else:
+                probe_list[existing] = stored_probe
+            self._save_locked()
+            return copy.deepcopy(stored_probe)
 
     def delete_probe(self, probe_id: str) -> bool:
-        probes = self.data.get("probes", [])
-        new_probes = [p for p in probes if p.get("id") != probe_id]
-        if len(new_probes) == len(probes):
-            return False
-        self.data["probes"] = new_probes
-        self._save()
-        return True
+        with self.lock:
+            probes = self.data.get("probes", [])
+            new_probes = [p for p in probes if p.get("id") != probe_id]
+            if len(new_probes) == len(probes):
+                return False
+            self.data["probes"] = new_probes
+            self._save_locked()
+            return True
 
 
 probes_store = ProbesStore()
@@ -5574,8 +5990,8 @@ def _probe_daemon() -> None:
                     try:
                         fps_desired = max([p.get('fps') or 0 for p in plist] or [0])
                         luxriot_manager.start_probe_capture(ch, fps=fps_desired if fps_desired > 0 else None)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        print(f"Probe daemon failed to start capture for channel {ch}: {exc}")
                     for probe in plist:
                         result = probe_manager.query(
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
@@ -5605,13 +6021,14 @@ def _probe_daemon() -> None:
                                         state='new',
                                         timestamp_ms=hits[0].get('timestamp_ms'),
                                     )
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    print(f"Probe daemon failed to send bookmark for probe {probe.get('id')}: {exc}")
                             probes_store.upsert_probe(probe)
-                except Exception:
+                except Exception as exc:
+                    print(f"Probe daemon channel loop error (channel {ch}): {exc}")
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Probe daemon loop error: {exc}")
         probe_daemon_stop.wait(PROBE_DAEMON_INTERVAL_SEC)
 
 def _render_segmentation_overlay(
@@ -5871,25 +6288,29 @@ def _prepare_metadata_map(image_paths: Optional[List[str]], image_metadata: Opti
 
 
 def _build_result_entry(img_path: str, similarity: float, metadata: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    result = {
+        'path': img_path,
+        'filename': os.path.basename(img_path),
+        'similarity': float(similarity),
+        'thumbnail': '',
+        'metadata': dict(metadata or {}),
+    }
     try:
-        img = Image.open(img_path)
-        img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-        buffer = BytesIO()
-        img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-        img_base64 = base64.b64encode(buffer.getvalue()).decode()
-        result = {
-            'path': img_path,
-            'filename': os.path.basename(img_path),
-            'similarity': float(similarity),
-            'thumbnail': img_base64,
-            'metadata': metadata or {},
-        }
-        if extra:
-            result.update(extra)
-        return result
+        with Image.open(img_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
+            result['thumbnail'] = base64.b64encode(buffer.getvalue()).decode()
     except Exception as img_error:
-        print(f"Error processing image {img_path}: {img_error}")
-        return None
+        # Keep the result entry even if thumbnail creation fails so search never collapses to empty.
+        # Frontend can still show filename/path and let operators inspect the source image directly.
+        result['metadata']['thumbnail_error'] = str(img_error)
+        print(f"Warning: thumbnail generation failed for {img_path}: {img_error}")
+    if extra:
+        result.update(extra)
+    return result
 
 
 def _should_rerank(sort_by: str) -> bool:
@@ -6000,6 +6421,7 @@ def _build_ranked_results(
 
     results: List[Dict[str, Any]] = []
     max_results = min(limit, len(ranked)) if limit > 0 else len(ranked)
+    skipped = 0
 
     for idx, score, original_score, applied in ranked[:max_results]:
         path = image_paths[idx]
@@ -6015,6 +6437,11 @@ def _build_ranked_results(
         entry = _build_result_entry(path, float(score), metadata_map.get(path, {}), extra=extra)
         if entry:
             results.append(entry)
+        else:
+            skipped += 1
+
+    if skipped:
+        print(f"Warning: skipped {skipped}/{max_results} ranked entries while building results.")
 
     return results
 
@@ -6242,15 +6669,18 @@ def _mask_search_pipeline(
 @app.route('/comments', methods=['GET'])
 def get_comments():
     """Get comments for a specific image"""
-    folder = request.args.get('folder')
+    folder_raw = request.args.get('folder')
     image_path = request.args.get('image_path')
     
-    if not folder or not image_path:
+    if not folder_raw or not image_path:
         return jsonify({'error': 'Missing folder or image_path parameter'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         comments = get_image_comments(folder, image_path)
         return jsonify({'comments': comments})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as e:
         print(f"Error getting comments: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6258,12 +6688,15 @@ def get_comments():
 @app.route('/comments', methods=['POST'])
 def save_comment():
     """Save a new comment for an image"""
-    data = request.json
-    folder = data.get('folder')
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    folder_raw = data.get('folder')
     image_path = data.get('image_path')
     comment = data.get('comment', '').strip()
     
-    if not folder or not image_path or not comment:
+    if not folder_raw or not image_path or not comment:
         return jsonify({'error': 'Missing folder, image_path, or comment'}), 400
     
     # Basic input sanitization
@@ -6271,12 +6704,15 @@ def save_comment():
         return jsonify({'error': f'Comment too long (max {config.MAX_COMMENT_LENGTH} characters)'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         success = add_image_comment(folder, image_path, comment)
         if success:
             comments = get_image_comments(folder, image_path)
             return jsonify({'success': True, 'comments': comments})
         else:
             return jsonify({'error': 'Failed to save comment'}), 500
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as e:
         print(f"Error saving comment: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6284,12 +6720,13 @@ def save_comment():
 @app.route('/commented_images', methods=['POST'])
 def get_commented_images():
     """Get all images that have comments in the indexed folder"""
-    payload = request.json if request.is_json else None
-    folder = (payload or {}).get('folder')
-    if not folder:
+    payload = _json_body()
+    folder_raw = payload.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'No folder specified'}), 400
 
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         available = _available_indexes(folder)
         image_paths: List[str] = []
         image_metadata: List[Dict[str, Any]] = []
@@ -6333,9 +6770,14 @@ def get_commented_images():
 @app.route('/check_index', methods=['POST'])
 def check_index():
     """Check if folder is indexed"""
-    folder = request.json.get('folder')
-    if not folder:
+    data = _json_body()
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'No folder specified'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     
     available = _available_indexes(folder)
     if active_embedder == 'fusion':
@@ -6353,11 +6795,16 @@ def check_index():
 @app.route('/index', methods=['POST'])
 def index_folder():
     """Index a folder"""
-    folder = request.json.get('folder')
-    if not folder or not os.path.exists(folder):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Invalid folder path'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         index_results = create_index(folder)
         if not index_results:
             return jsonify({'error': 'No images found in folder'}), 400
@@ -6424,7 +6871,8 @@ def _load_mask_from_request() -> Optional[Image.Image]:
     mask_file = request.files.get('mask')
     if mask_file:
         return Image.open(mask_file.stream).convert('L')
-    mask_base64 = request.form.get('mask') or (request.json or {}).get('mask') if request.is_json else None
+    payload = _json_body()
+    mask_base64 = request.form.get('mask') or payload.get('mask')
     if mask_base64:
         try:
             mask_bytes = base64.b64decode(mask_base64)
@@ -6437,18 +6885,29 @@ def _load_mask_from_request() -> Optional[Image.Image]:
 @app.route('/index_segments', methods=['POST'])
 def index_segments():
     """Index DINO segment embeddings derived from a mask."""
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
     if not config.DINO_SEGMENTS_ENABLED:
         return jsonify({'error': 'Segment indexing is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
 
-    data = request.form if request.form else (request.json or {})
+    data = request.form if request.form else _json_body()
 
-    folder = data.get('folder')
+    folder_raw = data.get('folder')
     image_path = data.get('image_path')
-    if not folder or not image_path:
+    if not folder_raw or not image_path:
         return jsonify({'error': 'Both folder and image_path are required'}), 400
-
-    if not Path(image_path).exists():
+    try:
+        folder_path = _resolve_folder_path(folder_raw)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    image_obj = Path(image_path).expanduser().resolve()
+    if not image_obj.exists() or not image_obj.is_file():
         return jsonify({'error': f'Image file not found: {image_path}'}), 400
+    if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+        return jsonify({'error': 'Unsupported image file type'}), 400
+    if not _path_within(image_obj, folder_path):
+        return jsonify({'error': 'image_path must be inside folder'}), 400
 
     mask_image = _load_mask_from_request()
     if mask_image is None:
@@ -6459,7 +6918,7 @@ def index_segments():
 
     ensure_embedder_loaded('dino')
     segments = dino_encoder.encode_masked(
-        image_path,
+        str(image_obj),
         mask_image,
         segment_ids=segment_ids,
         min_patches=config.DINO_SEGMENT_MIN_PATCHES,
@@ -6493,7 +6952,7 @@ def index_segments():
         return jsonify({'error': 'Mask did not yield any segments beyond the full image aggregate'}), 400
 
     embedding_matrix = np.stack(embeddings, axis=0)
-    save_segment_index(folder, embedding_matrix, entries)
+    save_segment_index(str(folder_path), embedding_matrix, entries)
 
     return jsonify(
         {
@@ -6513,10 +6972,17 @@ def index_segments():
 
 @app.route('/video_understanding', methods=['POST'])
 def video_understanding():
-    data = request.json or {}
+    data = _json_body()
     video_path = (data.get('video') or '').strip()
     if not video_path:
         return jsonify({'error': 'Provide a video path.'}), 400
+    video_obj = Path(video_path).expanduser().resolve()
+    if not video_obj.exists() or not video_obj.is_file():
+        return jsonify({'error': f'Video file not found: {video_path}'}), 400
+    if config.ALLOWED_ROOTS:
+        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+        if not any(_path_within(video_obj, root) for root in allowed_roots):
+            return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
     max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
     try:
         max_frames_int = int(max_frames)
@@ -6539,14 +7005,14 @@ def video_understanding():
 
     try:
         frames, fps, duration = _sample_video_frames(
-            video_path,
+            str(video_obj),
             max_frames=max_frames_int,
             sample_fps=sample_fps_val,
             max_edge=config.LM_VIDEO_MAX_EDGE,
         )
         if not frames:
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
-        messages = _build_video_messages(video_path, frames, user_prompt)
+        messages = _build_video_messages(str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(messages, model_override=model_hint or None)
         return jsonify(
             {
@@ -6570,17 +7036,23 @@ def video_understanding():
 
 @app.route('/describe_image', methods=['POST'])
 def describe_image():
-    data = request.json or {}
+    data = _json_body()
+    folder_raw = data.get('folder')
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
-    if not image_path:
-        return jsonify({'error': 'image_path is required'}), 400
-    path_obj = Path(image_path)
-    if not path_obj.exists():
-        return jsonify({'error': f'Image not found: {image_path}'}), 400
+    if not folder_raw or not image_path:
+        return jsonify({'error': 'folder and image_path are required'}), 400
     try:
-        messages = _build_image_messages(image_path, prompt)
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+        path_obj = Path(image_path).expanduser().resolve()
+        if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return jsonify({'error': 'Unsupported image file type'}), 400
+        if not path_obj.exists() or not path_obj.is_file():
+            return jsonify({'error': f'Image not found: {image_path}'}), 400
+        if not _path_within(path_obj, folder_path):
+            return jsonify({'error': 'image_path must be inside folder'}), 400
+        messages = _build_image_messages(str(path_obj), prompt)
         summary = _call_lm_chat(messages, model_override=model_hint or None)
         thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
         return jsonify(
@@ -6588,22 +7060,27 @@ def describe_image():
                 'summary': summary,
                 'thumbnail': thumb,
                 'model': model_hint or config.LM_MODEL,
-                'image_path': image_path,
+                'image_path': str(path_obj),
             }
         )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
-    folder = request.json.get('folder')
-    query = request.json.get('query')
-    limit = request.json.get('limit', 10)
-    sort_by = request.json.get('sort_by', 'similarity')  # 'similarity' or 'time'
-    print(f"Search request: folder={folder}, query={query}, limit={limit}, sort_by={sort_by}")
-
-    if not folder or not query:
+    data = _json_body()
+    folder_raw = data.get('folder')
+    query = data.get('query')
+    limit = data.get('limit', 10)
+    sort_by = data.get('sort_by', 'similarity')  # 'similarity' or 'time'
+    if not folder_raw or not query:
         return jsonify({'error': 'Missing folder or query'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw, require_index=True))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
     fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
     search_mode = 'clip' if fusion_active else active_embedder
@@ -6634,10 +7111,12 @@ def search():
     try:
         k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
+            print(f"Text search: query='{query}' candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
         similarities, indices = index.search(text_embedding.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
         results = _build_ranked_results(
             index,
             text_embedding,
@@ -6652,6 +7131,10 @@ def search():
         if sort_by == 'time':
             results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
 
+        print(
+            f"Text search: query='{query}' candidates={candidate_count} "
+            f"returned={len(results)} folder='{folder}'"
+        )
         return jsonify({'results': results})
     except Exception as e:
         print(f"Text search error: {e}")
@@ -6662,12 +7145,16 @@ def search():
 @app.route('/search_by_image', methods=['POST'])
 def search_by_image():
     """Search for images using an uploaded image"""
-    folder = request.form.get('folder')
+    folder_raw = request.form.get('folder')
     limit = request.form.get('limit', 12)
     sort_by = request.form.get('sort_by', 'similarity')  # 'similarity' or 'time'
 
-    if not folder:
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw, require_index=True))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
     try:
         limit = int(limit)
@@ -6715,11 +7202,16 @@ def search_by_image():
             if fusion_active:
                 dino_vec = get_image_embedding_from_pil(uploaded_image, embedder='dino')
         else:
-            if not os.path.exists(image_path):
+            image_obj = Path(str(image_path)).expanduser().resolve()
+            if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return jsonify({'error': 'Unsupported image file type'}), 400
+            if not image_obj.exists() or not image_obj.is_file():
                 return jsonify({'error': f'Image file not found: {image_path}'}), 400
-            clip_vec = get_image_embedding(image_path, embedder='clip') if fusion_active else get_image_embedding(image_path, embedder=active_embedder)
+            if not _path_within(image_obj, Path(folder)):
+                return jsonify({'error': 'image_path must be inside folder'}), 400
+            clip_vec = get_image_embedding(image_obj, embedder='clip') if fusion_active else get_image_embedding(image_obj, embedder=active_embedder)
             if fusion_active:
-                dino_vec = get_image_embedding(image_path, embedder='dino')
+                dino_vec = get_image_embedding(image_obj, embedder='dino')
 
         if fusion_active:
             results = _fuse_results(clip_data, dino_data, clip_vec, dino_vec, limit, sort_by)
@@ -6727,10 +7219,12 @@ def search_by_image():
 
         k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
+            print(f"Image search: candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
         similarities, indices = index.search(clip_vec.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
         results = _build_ranked_results(
             index,
             clip_vec,
@@ -6745,6 +7239,10 @@ def search_by_image():
         if sort_by == 'time':
             results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
 
+        print(
+            f"Image search: candidates={candidate_count} returned={len(results)} "
+            f"folder='{folder}'"
+        )
         return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -6753,14 +7251,19 @@ def search_by_image():
 @app.route('/search_by_mask', methods=['POST'])
 def search_by_mask():
     """Search using a masked region of an image leveraging DINO segment embeddings."""
-    data = request.form if request.form else (request.json or {})
+    data = request.form if request.form else _json_body()
 
     if not config.DINO_SEGMENTS_ENABLED:
         return jsonify({'error': 'Segment search is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
 
-    folder = data.get('folder')
-    if not folder:
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    folder = str(folder_path)
 
     limit = data.get('limit', config.DEFAULT_RESULTS)
     sort_by = data.get('sort_by', 'similarity')
@@ -6798,9 +7301,14 @@ def search_by_mask():
             query_image = query_image.convert('RGB')
         image_input: Union[Image.Image, str] = query_image
     else:
-        if not Path(image_source).exists():
+        image_obj = Path(str(image_source)).expanduser().resolve()
+        if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return jsonify({'error': 'Unsupported image file type'}), 400
+        if not image_obj.exists():
             return jsonify({'error': f'Image file not found: {image_source}'}), 400
-        image_input = image_source
+        if not _path_within(image_obj, folder_path):
+            return jsonify({'error': 'image_path must be inside folder'}), 400
+        image_input = str(image_obj)
 
     try:
         segment_map = dino_encoder.encode_masked(
@@ -6844,13 +7352,18 @@ def search_by_mask():
 @app.route('/segment_from_point', methods=['POST'])
 def segment_from_point():
     """Derive a mask from a clicked point and run masked search."""
-    data = request.json if request.is_json else request.form
+    data = request.form if request.form else _json_body()
     if data is None:
         return jsonify({'error': 'No data provided'}), 400
 
-    folder = data.get('folder')
-    if not folder:
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    folder = str(folder_path)
 
     image_path = data.get('image_path')
     uploaded_image = request.files.get('image')
@@ -6896,9 +7409,14 @@ def segment_from_point():
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
     else:
-        if not os.path.exists(image_path):
+        image_obj = Path(str(image_path)).expanduser().resolve()
+        if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return jsonify({'error': 'Unsupported image file type'}), 400
+        if not image_obj.exists() or not image_obj.is_file():
             return jsonify({'error': f'Image file not found: {image_path}'}), 400
-        with Image.open(image_path) as src:
+        if not _path_within(image_obj, folder_path):
+            return jsonify({'error': 'image_path must be inside folder'}), 400
+        with Image.open(image_obj) as src:
             pil_image = src.convert('RGB')
 
     assert pil_image is not None
@@ -7056,7 +7574,10 @@ def luxriot_snapshot(channel_id: int):
 
 @app.route('/luxriot/start_capture', methods=['POST'])
 def luxriot_start_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7073,7 +7594,10 @@ def luxriot_start_capture():
 
 @app.route('/luxriot/stop_capture', methods=['POST'])
 def luxriot_stop_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7087,7 +7611,10 @@ def luxriot_stop_capture():
 
 @app.route('/luxriot/flush_capture', methods=['POST'])
 def luxriot_flush_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7113,7 +7640,10 @@ def luxriot_session_status():
 
 @app.route('/luxriot/bookmark', methods=['POST'])
 def luxriot_bookmark():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7144,7 +7674,10 @@ def luxriot_bookmark():
 
 @app.route('/probes/query', methods=['POST'])
 def probes_query():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7201,7 +7734,10 @@ def probes_status():
 
 @app.route('/probes/start_capture', methods=['POST'])
 def probes_start_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7222,7 +7758,10 @@ def probes_start_capture():
 
 @app.route('/probes/stop_capture', methods=['POST'])
 def probes_stop_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7236,7 +7775,10 @@ def probes_stop_capture():
 
 @app.route('/probes/save', methods=['POST'])
 def probes_save():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7289,7 +7831,10 @@ def probes_list():
 
 @app.route('/probes/delete', methods=['POST'])
 def probes_delete():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     probe_id = data.get('id')
     if not probe_id:
         return jsonify({'error': 'Provide probe id'}), 400
@@ -7301,7 +7846,10 @@ def probes_delete():
 
 @app.route('/probes/run', methods=['POST'])
 def probes_run():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     probe_id = data.get('id')
     if not probe_id:
         return jsonify({'error': 'Provide probe id'}), 400
@@ -7379,6 +7927,9 @@ def probes_bench():
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
     try:
         requested_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder
         settings = {
@@ -7400,7 +7951,8 @@ def get_settings():
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
             'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
             'luxriotUsername': config.LUXRIOT_USERNAME,
-            'luxriotPassword': config.LUXRIOT_PASSWORD,
+            'luxriotPassword': '',
+            'luxriotPasswordSet': bool(config.LUXRIOT_PASSWORD),
             'luxriotSnapshotInterval': config.LUXRIOT_SNAPSHOT_INTERVAL,
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
@@ -7415,7 +7967,11 @@ def get_settings():
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
             'maxCommentLength': config.MAX_COMMENT_LENGTH,
             'maxFileSize': config.MAX_FILE_SIZE_MB,
-            'indexFolderName': config.INDEX_FOLDER_NAME
+            'indexFolderName': config.INDEX_FOLDER_NAME,
+            'settingsLocalOnly': config.SETTINGS_LOCAL_ONLY,
+            'adminTokenSet': bool(config.ADMIN_TOKEN),
+            'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
+            'allowedRoots': list(config.ALLOWED_ROOTS),
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
@@ -7424,8 +7980,11 @@ def get_settings():
 @app.route('/settings', methods=['POST'])
 def save_settings():
     """Save configuration settings to .env file"""
+    guard = _settings_guard(write=True)
+    if guard is not None:
+        return guard
     try:
-        data = request.json
+        data = _json_body()
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
@@ -7499,7 +8058,11 @@ def save_settings():
 
         luxriot_base_url = str(data.get('luxriotBaseUrl', config.LUXRIOT_BASE_URL)).strip().rstrip('/')
         luxriot_username = str(data.get('luxriotUsername', config.LUXRIOT_USERNAME)).strip()
-        luxriot_password = str(data.get('luxriotPassword', config.LUXRIOT_PASSWORD)).strip()
+        luxriot_password_raw = data.get('luxriotPassword', None)
+        if luxriot_password_raw is None:
+            luxriot_password = config.LUXRIOT_PASSWORD
+        else:
+            luxriot_password = str(luxriot_password_raw).strip() or config.LUXRIOT_PASSWORD
         try:
             luxriot_snapshot_interval = int(data.get('luxriotSnapshotInterval', config.LUXRIOT_SNAPSHOT_INTERVAL))
         except (TypeError, ValueError):
@@ -7617,6 +8180,10 @@ EVOSSEARCH_MAX_COMMENT_LENGTH={max_comment_length}
 
 # Security configuration
 EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
+EVOSSEARCH_ADMIN_TOKEN={config.ADMIN_TOKEN}
+EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
+EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
+EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
 
         with open('.env', 'w', encoding='utf-8') as f:
@@ -7640,6 +8207,7 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.MAX_COMMENT_LENGTH = max_comment_length
         config.MAX_FILE_SIZE_MB = max_file_size
         config.INDEX_FOLDER_NAME = index_folder
+        app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
         config.FUSION_ENABLED = fusion_enabled
         config.FUSION_ALPHA = fusion_alpha
         config.RERANK_ENABLED = rerank_enabled
