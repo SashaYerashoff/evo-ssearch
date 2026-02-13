@@ -20,6 +20,29 @@ def _get_bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).lower() in ('true', '1', 'yes', 'on')
 
 
+def _get_list_env(name: str, separator: str = ',') -> tuple[str, ...]:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return ()
+    return tuple(item.strip() for item in raw.split(separator) if item.strip())
+
+
+def _get_path_list_env(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return ()
+    resolved: list[str] = []
+    for part in raw.split(os.pathsep):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            resolved.append(str(Path(token).expanduser().resolve()))
+        except Exception:
+            continue
+    return tuple(resolved)
+
+
 class Config:
     # Server configuration
     HOST = os.getenv('EVOSSEARCH_HOST', '0.0.0.0')  # 0.0.0.0 allows network access
@@ -101,6 +124,10 @@ class Config:
 
     # Security configuration
     MAX_FILE_SIZE_MB = int(os.getenv('EVOSSEARCH_MAX_FILE_SIZE_MB', '50'))
+    ADMIN_TOKEN = os.getenv('EVOSSEARCH_ADMIN_TOKEN', '').strip()
+    SETTINGS_LOCAL_ONLY = _get_bool_env('EVOSSEARCH_SETTINGS_LOCAL_ONLY', 'True')
+    CORS_ALLOWED_ORIGINS = _get_list_env('EVOSSEARCH_CORS_ALLOWED_ORIGINS')
+    ALLOWED_ROOTS = _get_path_list_env('EVOSSEARCH_ALLOWED_ROOTS')
 
     # LM Studio / Qwen video understanding
     LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://192.168.1.104:1234/v1').strip().rstrip('/')
@@ -138,8 +165,8 @@ class Config:
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
     # Luxriot Evo integration
     LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://192.168.1.102:8080').strip().rstrip('/')
-    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', 'admin').strip()
-    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '123').strip()
+    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
+    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '').strip()
     try:
         LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
     except (TypeError, ValueError):
@@ -205,17 +232,19 @@ class Config:
             except Exception:
                 pass
 
-            # Try to get all network interfaces
-            try:
-                hostname = socket.gethostname()
-                for addr_info in socket.getaddrinfo(hostname, None):
-                    ip = addr_info[4][0]
-                    if ip not in ['127.0.0.1', '::1'] and not ip.startswith('169.254'):
-                        url = f"http://{ip}:{cls.PORT}"
-                        if url not in urls:
-                            urls.append(url)
-            except Exception:
-                pass
+                # Try to get all network interfaces
+                try:
+                    hostname = socket.gethostname()
+                    for addr_info in socket.getaddrinfo(hostname, None):
+                        ip = addr_info[4][0]
+                        if not isinstance(ip, str):
+                            continue
+                        if ip not in ['127.0.0.1', '::1'] and not ip.startswith('169.254'):
+                            url = f"http://{ip}:{cls.PORT}"
+                            if url not in urls:
+                                urls.append(url)
+                except Exception:
+                    pass
 
         return urls
 
@@ -265,6 +294,15 @@ class Config:
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
             f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
             f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
+        )
+        print(
+            "Security: upload_limit={}MB, settings_local_only={}, admin_token={}, cors_origins={}, allowed_roots={}".format(
+                cls.MAX_FILE_SIZE_MB,
+                'on' if cls.SETTINGS_LOCAL_ONLY else 'off',
+                'set' if cls.ADMIN_TOKEN else 'unset',
+                len(cls.CORS_ALLOWED_ORIGINS),
+                len(cls.ALLOWED_ROOTS),
+            )
         )
         print()
         print("Server available at:")
