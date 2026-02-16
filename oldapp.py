@@ -1235,6 +1235,50 @@ def home():
             margin-bottom: 0.25rem;
             word-break: break-all;
         }
+
+        .result-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .result-badge {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            border: 1px solid #333;
+            padding: 0.1rem 0.45rem;
+            font-size: 0.68rem;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            color: #cfd3db;
+            background: rgba(180, 186, 201, 0.12);
+        }
+
+        .result-badge.mode-clip {
+            border-color: #2e6b45;
+            background: rgba(46, 107, 69, 0.2);
+            color: #b7f0ca;
+        }
+
+        .result-badge.mode-fusion {
+            border-color: #3d5da8;
+            background: rgba(61, 93, 168, 0.24);
+            color: #c4d6ff;
+        }
+
+        .result-badge.mode-dino {
+            border-color: #7b5a30;
+            background: rgba(123, 90, 48, 0.22);
+            color: #f7d8ad;
+        }
+
+        .result-badge.warning {
+            border-color: #8a6232;
+            background: rgba(138, 98, 50, 0.22);
+            color: #ffd39e;
+        }
         
         .similarity {
             color: #bbb;
@@ -4427,6 +4471,55 @@ def home():
             return lines.join('');
         }
 
+        function buildResultBadges(result) {
+            if (!result || typeof result !== 'object') return '';
+            const badges = [];
+            if (result.is_detection) {
+                badges.push({ label: 'Detection', classes: '' });
+            }
+
+            const modeRaw = String(result.search_mode || '').trim().toLowerCase();
+            if (modeRaw) {
+                if (modeRaw === 'clip') {
+                    badges.push({ label: 'CLIP', classes: 'mode-clip' });
+                } else if (modeRaw === 'fusion') {
+                    badges.push({ label: 'Fusion', classes: 'mode-fusion' });
+                } else if (modeRaw === 'dino') {
+                    badges.push({ label: 'DINO', classes: 'mode-dino' });
+                } else {
+                    badges.push({ label: modeRaw, classes: '' });
+                }
+            }
+
+            const dinoFallback = Boolean(result.dino_fallback || result?.fusion?.dino_fallback);
+            if (dinoFallback) {
+                badges.push({ label: 'DINO fallback', classes: 'warning' });
+            }
+
+            if (!badges.length) return '';
+            return `<div class="result-badges">${badges.map((badge) => {
+                const cls = badge.classes ? ` result-badge ${badge.classes}` : 'result-badge';
+                return `<span class="${cls}">${escapeHtml(String(badge.label || ''))}</span>`;
+            }).join('')}</div>`;
+        }
+
+        function decorateDetectionSearchResults(results, modeUsed = '', modeRequested = '') {
+            return (results || []).map((raw) => {
+                if (!raw || typeof raw !== 'object') return raw;
+                const item = { ...raw };
+                if (modeUsed && !item.search_mode) {
+                    item.search_mode = String(modeUsed).trim().toLowerCase();
+                }
+                if (modeRequested && !item.mode_requested) {
+                    item.mode_requested = String(modeRequested).trim().toLowerCase();
+                }
+                if (item.dino_fallback === undefined && item.fusion && typeof item.fusion === 'object') {
+                    item.dino_fallback = Boolean(item.fusion.dino_fallback);
+                }
+                return item;
+            });
+        }
+
         function setArchiveDetectionsMeta(text, isError = false) {
             if (!archiveDetectionsMeta) return;
             archiveDetectionsMeta.textContent = text;
@@ -6054,7 +6147,10 @@ def home():
                 const data = await parseApiJson(response, 'Text search failed');
                 
                 if (data.results && data.results.length > 0) {
-                    displayResults(data.results);
+                    const renderedResults = detectionsScope
+                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
+                        : data.results;
+                    displayResults(renderedResults);
                     if (detectionsScope && data.mode_requested && data.mode_used && data.mode_requested !== data.mode_used) {
                         indexStatus.textContent = `Detections text search uses ${data.mode_used.toUpperCase()} backend.`;
                         indexStatus.className = 'status warning';
@@ -6112,7 +6208,10 @@ def home():
                 const data = await parseApiJson(response, 'Image search failed');
                 
                 if (data.results && data.results.length > 0) {
-                    displayResults(data.results);
+                    const renderedResults = detectionsScope
+                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
+                        : data.results;
+                    displayResults(renderedResults);
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 }
@@ -6291,6 +6390,7 @@ def home():
         // Generate common HTML structure for result items
         function generateResultItemHTML(result, index, isCommented = false) {
             const similarityMarkup = buildSimilarityMetrics(result, isCommented);
+            const badgesMarkup = buildResultBadges(result);
             const safeFilename = escapeHtml(result.filename || 'unnamed');
             const rawPath = String(result.path || '');
             const hasPath = rawPath.length > 0;
@@ -6324,6 +6424,7 @@ def home():
                             <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
                         </svg>
                     </div>
+                    ${badgesMarkup}
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
                         <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
@@ -8748,6 +8849,8 @@ def _build_detection_search_result(
         "margin": float(item.get("margin") or 0.0),
         "source": item.get("source"),
         "shard_key": item.get("shard_key"),
+        "search_mode": mode,
+        "dino_fallback": bool(dino_fallback),
     }
     if mode in {"fusion", "dino"}:
         result["fusion"] = {
