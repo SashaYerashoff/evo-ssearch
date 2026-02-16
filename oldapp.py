@@ -1014,6 +1014,12 @@ def home():
         .feature-btn:active {
             transform: translateY(1px);
         }
+
+        .feature-btn:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+            transform: none;
+        }
         
         .sort-control {
             display: flex;
@@ -3028,6 +3034,8 @@ def home():
                                 </div>
                             </div>
                             <div class="archive-detections-actions">
+                                <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
+                                <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
                                 <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
                                 <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
                             </div>
@@ -3591,6 +3599,8 @@ def home():
         const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
         const loadDetectionsBtn = document.getElementById('loadDetectionsBtn');
         const refreshDetectionsFiltersBtn = document.getElementById('refreshDetectionsFiltersBtn');
+        const archiveDetectionsPrevBtn = document.getElementById('archiveDetectionsPrev');
+        const archiveDetectionsNextBtn = document.getElementById('archiveDetectionsNext');
         const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
         const probeStreamState = document.getElementById('probeStreamState');
@@ -3636,6 +3646,7 @@ def home():
         let probeStatusTimer = null;
         let archiveDetectionsOffset = 0;
         let archiveDetectionsTotal = 0;
+        let archiveDetectionsHasMore = false;
         const channelCaptureConfig = {};
         const channelFpsDesired = {};
         const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
@@ -4407,6 +4418,15 @@ def home():
             archiveDetectionsMeta.style.color = isError ? '#ff8e8e' : '#9aa0ad';
         }
 
+        function updateArchiveDetectionsNav() {
+            if (archiveDetectionsPrevBtn) {
+                archiveDetectionsPrevBtn.disabled = archiveDetectionsOffset <= 0;
+            }
+            if (archiveDetectionsNextBtn) {
+                archiveDetectionsNextBtn.disabled = !archiveDetectionsHasMore;
+            }
+        }
+
         function applySelectOptions(selectEl, options, selected = '') {
             if (!selectEl) return;
             const previous = selected || selectEl.value || '';
@@ -4460,6 +4480,9 @@ def home():
         }
 
         async function refreshArchiveFilters() {
+            archiveDetectionsOffset = 0;
+            archiveDetectionsHasMore = false;
+            updateArchiveDetectionsNav();
             await Promise.all([refreshArchiveChannelFilter(), refreshArchiveProbeFilter()]);
         }
 
@@ -4498,6 +4521,8 @@ def home():
             if (resetOffset) {
                 archiveDetectionsOffset = 0;
             }
+            archiveDetectionsHasMore = false;
+            updateArchiveDetectionsNav();
             const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
             const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
             const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
@@ -4522,19 +4547,24 @@ def home():
                 const data = await parseApiJson(response, 'Failed to load detections archive');
                 const detections = Array.isArray(data.detections) ? data.detections : [];
                 archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
+                archiveDetectionsHasMore = Boolean(data.has_more);
                 const mapped = normalizeDetectionResults(detections);
                 if (!mapped.length) {
                     resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
                     setArchiveDetectionsMeta('No detections found for selected filters.');
+                    updateArchiveDetectionsNav();
                     return;
                 }
                 displayResults(mapped);
                 const shownFrom = archiveDetectionsOffset + 1;
                 const shownTo = archiveDetectionsOffset + mapped.length;
                 setArchiveDetectionsMeta(`Showing detections ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}.`);
+                updateArchiveDetectionsNav();
             } catch (err) {
                 resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
                 setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
             }
         }
 
@@ -5816,19 +5846,50 @@ def home():
         if (refreshDetectionsFiltersBtn) {
             refreshDetectionsFiltersBtn.addEventListener('click', () => refreshArchiveFilters());
         }
+        if (archiveDetectionsPrevBtn) {
+            archiveDetectionsPrevBtn.addEventListener('click', () => {
+                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
+                const size = Number.isFinite(pageSize) ? pageSize : 24;
+                archiveDetectionsOffset = Math.max(0, archiveDetectionsOffset - size);
+                loadDetectionsArchive(false);
+            });
+        }
+        if (archiveDetectionsNextBtn) {
+            archiveDetectionsNextBtn.addEventListener('click', () => {
+                if (!archiveDetectionsHasMore) return;
+                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
+                const size = Number.isFinite(pageSize) ? pageSize : 24;
+                archiveDetectionsOffset += Math.max(1, size);
+                loadDetectionsArchive(false);
+            });
+        }
         if (archiveChannelFilter) {
             archiveChannelFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
                 refreshArchiveProbeFilter();
             });
         }
         if (archiveProbeFilter) {
             archiveProbeFilter.addEventListener('change', () => {
                 archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
             });
         }
         if (archiveTimeFilter) {
             archiveTimeFilter.addEventListener('change', () => {
                 archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+            });
+        }
+        if (archiveDetectionsLimit) {
+            archiveDetectionsLimit.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
             });
         }
         
@@ -7124,6 +7185,7 @@ def home():
             }
         }
 
+        updateArchiveDetectionsNav();
         refreshArchiveFilters().catch(() => {
             setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
         });
