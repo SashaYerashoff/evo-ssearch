@@ -27,6 +27,7 @@ from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 
 from config import config
+from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
@@ -1110,6 +1111,24 @@ def home():
             display: flex;
             flex-direction: column;
             gap: 0.7rem;
+        }
+
+        .archive-filter-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.7rem;
+        }
+
+        .archive-detections-actions {
+            display: flex;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        .archive-detections-meta {
+            color: #9aa0ad;
+            font-size: 0.82rem;
+            min-height: 1.2rem;
         }
 
         .archive-section-title {
@@ -2848,6 +2867,10 @@ def home():
                 padding: 0.65rem;
             }
 
+            .archive-filter-grid {
+                grid-template-columns: 1fr;
+            }
+
             .control-group {
                 width: 100%;
                 flex-wrap: wrap;
@@ -2968,6 +2991,48 @@ def home():
                 </div>
                 <div class="archive-workspace">
                     <div id="archiveSearchBox" class="archive-search-shell">
+                        <div class="archive-section">
+                            <div class="archive-section-title">Detections Archive</div>
+                            <div class="archive-filter-grid">
+                                <div class="input-group">
+                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
+                                    <select id="archiveChannelFilter">
+                                        <option value="">All streams</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveProbeFilter" class="input-label">Probe:</label>
+                                    <select id="archiveProbeFilter">
+                                        <option value="">All probes</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveTimeFilter" class="input-label">Time range:</label>
+                                    <select id="archiveTimeFilter">
+                                        <option value="1">Last 1h</option>
+                                        <option value="6">Last 6h</option>
+                                        <option value="24" selected>Last 24h</option>
+                                        <option value="72">Last 3d</option>
+                                        <option value="168">Last 7d</option>
+                                        <option value="0">All time</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
+                                    <select id="archiveDetectionsLimit">
+                                        <option value="12">12</option>
+                                        <option value="24" selected>24</option>
+                                        <option value="36">36</option>
+                                        <option value="48">48</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="archive-detections-actions">
+                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
+                                <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
+                            </div>
+                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
+                        </div>
                         <div class="archive-section">
                             <div class="archive-section-title">Text Query</div>
                             <div id="textSearchBox" class="search-box">
@@ -3520,6 +3585,13 @@ def home():
         const sortBySelect = document.getElementById('sortBy');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
+        const archiveChannelFilter = document.getElementById('archiveChannelFilter');
+        const archiveProbeFilter = document.getElementById('archiveProbeFilter');
+        const archiveTimeFilter = document.getElementById('archiveTimeFilter');
+        const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
+        const loadDetectionsBtn = document.getElementById('loadDetectionsBtn');
+        const refreshDetectionsFiltersBtn = document.getElementById('refreshDetectionsFiltersBtn');
+        const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
         const probeStreamState = document.getElementById('probeStreamState');
         const probeEnableToggle = document.getElementById('probeEnableToggle');
@@ -3562,6 +3634,8 @@ def home():
         let probePreviewTimer = null;
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
+        let archiveDetectionsOffset = 0;
+        let archiveDetectionsTotal = 0;
         const channelCaptureConfig = {};
         const channelFpsDesired = {};
         const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
@@ -3680,6 +3754,7 @@ def home():
                 stopProbePreview();
                 stopProbeRunLoop();
                 stopProbeStatusPoll();
+                refreshArchiveFilters().catch(() => {});
                 if (probeEditorModal) {
                     probeEditorModal.style.display = 'none';
                 }
@@ -4277,6 +4352,20 @@ def home():
                 return `<div class="metric-line"><span class="metric-label">Comments:</span> ${count}${trimmed ? ` <span class="metric-note">Latest: ${trimmed}</span>` : ''}</div>`;
             }
 
+            if (result && result.is_detection) {
+                const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
+                const channel = result.channel_id !== undefined && result.channel_id !== null ? String(result.channel_id) : 'n/a';
+                const sev = result.severity ? escapeHtml(String(result.severity)) : 'n/a';
+                const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
+                const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
+                const margin = Number.isFinite(result.margin) ? result.margin.toFixed(3) : 'n/a';
+                return [
+                    `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
+                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channel)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
+                    `<div class="metric-line"><span class="metric-label">P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
+                ].join('');
+            }
+
             const lines = [];
             lines.push(`<div class="metric-line"><span class="metric-label">Final:</span> ${formatPercent(result.similarity)}</div>`);
 
@@ -4310,6 +4399,143 @@ def home():
             }
 
             return lines.join('');
+        }
+
+        function setArchiveDetectionsMeta(text, isError = false) {
+            if (!archiveDetectionsMeta) return;
+            archiveDetectionsMeta.textContent = text;
+            archiveDetectionsMeta.style.color = isError ? '#ff8e8e' : '#9aa0ad';
+        }
+
+        function applySelectOptions(selectEl, options, selected = '') {
+            if (!selectEl) return;
+            const previous = selected || selectEl.value || '';
+            selectEl.innerHTML = options.map((opt) => `<option value="${escapeHtml(String(opt.value))}">${escapeHtml(String(opt.label))}</option>`).join('');
+            const hasPrevious = options.some((opt) => String(opt.value) === String(previous));
+            selectEl.value = hasPrevious ? String(previous) : String(options[0]?.value || '');
+        }
+
+        async function refreshArchiveChannelFilter() {
+            if (!archiveChannelFilter) return;
+            try {
+                const response = await fetch('/luxriot/channels');
+                const data = await parseApiJson(response, 'Failed to load channels');
+                const channels = Array.isArray(data.channels) ? data.channels : [];
+                const options = [{ value: '', label: 'All streams' }];
+                channels.forEach((channel) => {
+                    const id = channel.channel_id ?? channel.id;
+                    if (id === undefined || id === null) return;
+                    const label = channel.name ? `${id} · ${channel.name}` : String(id);
+                    options.push({ value: String(id), label });
+                });
+                applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
+            } catch (_) {
+                applySelectOptions(archiveChannelFilter, [{ value: '', label: 'All streams' }], '');
+            }
+        }
+
+        async function refreshArchiveProbeFilter() {
+            if (!archiveProbeFilter) return;
+            try {
+                const params = new URLSearchParams({ hours: '168', limit: '300' });
+                const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+                if (channelId) {
+                    params.set('channel_id', channelId);
+                }
+                const response = await fetch(`/detections/summary?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load detection probes');
+                const summary = Array.isArray(data.summary) ? data.summary : [];
+                const options = [{ value: '', label: 'All probes' }];
+                summary.forEach((item) => {
+                    const id = String(item.probe_id || '').trim();
+                    if (!id) return;
+                    const labelBase = item.probe_name ? String(item.probe_name) : id;
+                    const label = `${labelBase} (${item.hit_count || 0})`;
+                    options.push({ value: id, label });
+                });
+                applySelectOptions(archiveProbeFilter, options, archiveProbeFilter.value);
+            } catch (_) {
+                applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All probes' }], '');
+            }
+        }
+
+        async function refreshArchiveFilters() {
+            await Promise.all([refreshArchiveChannelFilter(), refreshArchiveProbeFilter()]);
+        }
+
+        function normalizeDetectionResults(detections) {
+            return (detections || []).map((det, idx) => {
+                const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
+                const probeLabel = det?.probe_name || det?.probe_id || 'probe';
+                const tsLabel = ts ? new Date(ts).toLocaleString() : 'n/a';
+                return {
+                    filename: `${probeLabel} · ${tsLabel}`,
+                    path: det?.payload?.image_path || '',
+                    thumbnail: det?.thumbnail || '',
+                    is_detection: true,
+                    detection_id: det?.id,
+                    timestamp_ms: ts,
+                    channel_id: det?.channel_id,
+                    probe_id: det?.probe_id,
+                    probe_name: det?.probe_name,
+                    severity: det?.severity,
+                    pos_score: Number.isFinite(det?.pos_score) ? det.pos_score : _coerceNumeric(det?.pos_score),
+                    neg_score: Number.isFinite(det?.neg_score) ? det.neg_score : _coerceNumeric(det?.neg_score),
+                    margin: Number.isFinite(det?.margin) ? det.margin : _coerceNumeric(det?.margin),
+                    source: det?.source || '',
+                    _raw_index: idx,
+                };
+            });
+        }
+
+        function _coerceNumeric(value) {
+            const parsed = Number.parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : 0;
+        }
+
+        async function loadDetectionsArchive(resetOffset = true) {
+            if (!resultsContainer) return;
+            if (resetOffset) {
+                archiveDetectionsOffset = 0;
+            }
+            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
+            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+            const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
+            const params = new URLSearchParams();
+            const parsedHours = Number.parseFloat(hoursRaw);
+            if (Number.isFinite(parsedHours) && parsedHours > 0) {
+                params.set('hours', String(parsedHours));
+            } else {
+                params.set('hours', '0');
+            }
+            if (channelId) params.set('channel_id', channelId);
+            if (probeId) params.set('probe_id', probeId);
+            const limit = Number.parseInt(limitRaw, 10);
+            params.set('limit', String(Number.isFinite(limit) ? limit : 24));
+            params.set('offset', String(Math.max(0, archiveDetectionsOffset)));
+
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading detections archive...</div>';
+            setArchiveDetectionsMeta('Loading detections...');
+            try {
+                const response = await fetch(`/detections/list?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load detections archive');
+                const detections = Array.isArray(data.detections) ? data.detections : [];
+                archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
+                const mapped = normalizeDetectionResults(detections);
+                if (!mapped.length) {
+                    resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
+                    setArchiveDetectionsMeta('No detections found for selected filters.');
+                    return;
+                }
+                displayResults(mapped);
+                const shownFrom = archiveDetectionsOffset + 1;
+                const shownTo = archiveDetectionsOffset + mapped.length;
+                setArchiveDetectionsMeta(`Showing detections ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}.`);
+            } catch (err) {
+                resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
+                setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
+            }
         }
 
         if (authTokenBtn) {
@@ -5303,6 +5529,7 @@ def home():
                 if (!resp.ok || data.error) throw new Error(data.error || 'Probe failed');
                 const hits = data.results || [];
                 const framesCount = data.frames_indexed || data.status?.frames || 0;
+                const persistedCount = Number.isFinite(data.persisted_hits) ? data.persisted_hits : hits.length;
                 renderProbeHits(hits, framesCount, payload.window_sec);
                 if (data.probe) {
                     activeProbeId = data.probe.id || activeProbeId;
@@ -5310,7 +5537,7 @@ def home():
                 } else {
                     renderProbeCards();
                 }
-                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Frames: ${framesCount}`);
+                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Stored: ${persistedCount} · Frames: ${framesCount}`);
             } catch (err) {
                 renderProbeHits([], 0);
                 setProbeStatus(err.message, true);
@@ -5580,6 +5807,30 @@ def home():
         if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
         if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
         if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+        if (loadDetectionsBtn) {
+            loadDetectionsBtn.addEventListener('click', () => {
+                setMode('archive');
+                loadDetectionsArchive(true);
+            });
+        }
+        if (refreshDetectionsFiltersBtn) {
+            refreshDetectionsFiltersBtn.addEventListener('click', () => refreshArchiveFilters());
+        }
+        if (archiveChannelFilter) {
+            archiveChannelFilter.addEventListener('change', () => {
+                refreshArchiveProbeFilter();
+            });
+        }
+        if (archiveProbeFilter) {
+            archiveProbeFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+            });
+        }
+        if (archiveTimeFilter) {
+            archiveTimeFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+            });
+        }
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -5893,6 +6144,7 @@ def home():
             const similarityMarkup = buildSimilarityMetrics(result, isCommented);
             const safeFilename = escapeHtml(result.filename || 'unnamed');
             const rawPath = String(result.path || '');
+            const hasPath = rawPath.length > 0;
             const safePath = escapeHtml(rawPath);
             const thumb = String(result.thumbnail || '').trim();
             const fallbackSvg = encodeURIComponent(
@@ -5907,11 +6159,13 @@ def home():
                 <div class="image-container">
                     <img src="${thumbnailSrc}" class="thumbnail" alt="" />
                     <div class="image-overlay">
-                        <div class="expand-collapse-icon" data-index="${index}">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                            </svg>
-                        </div>
+                        ${hasPath ? `
+                            <div class="expand-collapse-icon" data-index="${index}">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                        ` : ''}
                     </div>
                 </div>
                 <div class="result-info">
@@ -5935,24 +6189,26 @@ def home():
                         </button>
                     </div>
                 </div>
-                <div class="segments-panel" id="segments-${index}">
-                    <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
-                </div>
-                <div class="comment-section">
-                    <div class="lm-description" id="lm-desc-${index}">
-                        <div class="no-comments">No LLM description yet.</div>
+                ${hasPath ? `
+                    <div class="segments-panel" id="segments-${index}">
+                        <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
                     </div>
-                    <div class="lm-description-actions">
-                        <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
+                    <div class="comment-section">
+                        <div class="lm-description" id="lm-desc-${index}">
+                            <div class="no-comments">No LLM description yet.</div>
+                        </div>
+                        <div class="lm-description-actions">
+                            <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
+                        </div>
+                        <div class="comments-list" id="comments-${index}">
+                            <div class="comment-loading">Loading comments...</div>
+                        </div>
+                        <div class="comment-form">
+                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                        </div>
                     </div>
-                    <div class="comments-list" id="comments-${index}">
-                        <div class="comment-loading">Loading comments...</div>
-                    </div>
-                    <div class="comment-form">
-                        <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                        <button class="save-comment-btn" id="save-btn-${index}">Save</button>
-                    </div>
-                </div>
+                ` : ''}
             `;
         }
 
@@ -5960,10 +6216,12 @@ def home():
         function setupResultItemEventHandlers(item, result, index) {
             // Handle expand/collapse via overlay icon
             const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-            expandCollapseIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                toggleImageExpansion(item, result, index);
-            });
+            if (expandCollapseIcon && result.path) {
+                expandCollapseIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageExpansion(item, result, index);
+                });
+            }
             
             // Handle copy icon click
             const copyIcon = item.querySelector('.copy-icon');
@@ -6030,7 +6288,7 @@ def home():
             }
 
             const img = item.querySelector('.thumbnail');
-            if (img) {
+            if (img && result.path) {
                 img.addEventListener('click', (e) => {
                     handleSegmentClick(e, result, index, item);
                 });
@@ -6865,6 +7123,10 @@ def home():
                 descContainer.innerHTML = `<div class="no-comments">Error: ${escapeHtml(err.message || String(err))}</div>`;
             }
         }
+
+        refreshArchiveFilters().catch(() => {
+            setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
+        });
         
         // Enter key support
         searchInput.addEventListener('keypress', (e) => {
@@ -7357,6 +7619,92 @@ class ProbesStore:
 
 
 probes_store = ProbesStore()
+detections_store = DetectionsStore()
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _probe_identity(probe_like: Dict[str, Any]) -> str:
+    probe_id = str(probe_like.get("id") or "").strip()
+    if probe_id:
+        return probe_id
+    channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    name = str(probe_like.get("name") or "probe").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name).strip("-")
+    if not slug:
+        slug = "probe"
+    return f"adhoc:{channel_id}:{slug[:48]}"
+
+
+def _store_probe_hits(
+    probe_like: Dict[str, Any],
+    hits: Sequence[Dict[str, Any]],
+    *,
+    source: str,
+    bookmark_sent: bool = False,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> int:
+    if not hits:
+        return 0
+    probe_id = _probe_identity(probe_like)
+    channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    probe_name = str(probe_like.get("name") or "").strip() or probe_id
+    severity = str(probe_like.get("severity") or "normal").strip().lower() or "normal"
+    bookmark_enabled = bool(probe_like.get("bookmark", False))
+    now_ms = int(time.time() * 1000)
+    records: List[Dict[str, Any]] = []
+    for idx, hit in enumerate(hits):
+        ts_raw = hit.get("timestamp_ms")
+        try:
+            ts_ms = int(ts_raw)
+        except Exception:
+            ts_ms = now_ms
+        pos_score = _to_float(hit.get("pos_score"), 0.0)
+        neg_score = _to_float(hit.get("neg_score"), 0.0)
+        margin = _to_float(hit.get("margin"), 0.0)
+        payload = {
+            "hit_index": idx,
+            "probe_window_sec": probe_like.get("window_sec"),
+            "probe_fps": probe_like.get("fps"),
+            "source": source,
+            "hit": {
+                "timestamp_ms": ts_ms,
+                "channel_id": channel_id,
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "margin": margin,
+            },
+        }
+        if isinstance(extra_payload, dict) and extra_payload:
+            payload["context"] = extra_payload
+        records.append(
+            {
+                "dedupe_key": f"{probe_id}:{source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
+                "timestamp_ms": ts_ms,
+                "probe_id": probe_id,
+                "probe_name": probe_name,
+                "channel_id": channel_id,
+                "severity": severity,
+                "bookmark_enabled": bookmark_enabled,
+                "bookmark_sent": bookmark_sent,
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "margin": margin,
+                "thumbnail_b64": hit.get("thumbnail"),
+                "source": source,
+                "payload": payload,
+            }
+        )
+    try:
+        return detections_store.add_detections(records)
+    except Exception as exc:
+        print(f"Detections store write failed for {probe_id}: {exc}")
+        return 0
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -7426,6 +7774,7 @@ def _probe_daemon() -> None:
                             recent = probe.get('recent_hits') or []
                             recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
                             probe['recent_hits'] = recent
+                            bookmark_sent = False
                             if probe.get('bookmark'):
                                 try:
                                     luxriot_manager.send_bookmark_event(
@@ -7436,8 +7785,16 @@ def _probe_daemon() -> None:
                                         state='new',
                                         timestamp_ms=hits[0].get('timestamp_ms'),
                                     )
+                                    bookmark_sent = True
                                 except Exception as exc:
                                     print(f"Probe daemon failed to send bookmark for probe {probe.get('id')}: {exc}")
+                            _store_probe_hits(
+                                probe,
+                                hits,
+                                source='probe_daemon',
+                                bookmark_sent=bookmark_sent,
+                                extra_payload={'frames_indexed': result.get('frames_indexed')},
+                            )
                             probes_store.upsert_probe(probe)
                 except Exception as exc:
                     print(f"Probe daemon channel loop error (channel {ch}): {exc}")
@@ -9287,9 +9644,28 @@ def probes_query():
         window_sec = float(data.get('window_sec', 0))
     except Exception:
         window_sec = 0
-    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec, image_probe=data.get('image_probe'))
+    probe_like = {
+        "id": data.get('id'),
+        "name": (data.get('name') or 'probe'),
+        "channel_id": channel_id,
+        "severity": (data.get('severity') or 'critical'),
+        "bookmark": bool(data.get('bookmark')),
+        "window_sec": window_sec,
+        "fps": data.get('fps'),
+    }
+    result = probe_manager.query(
+        channel_id,
+        positives,
+        negatives,
+        pos_floor,
+        margin_thr,
+        top_k,
+        window_sec=window_sec,
+        image_probe=data.get('image_probe'),
+    )
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
+    bookmark_sent = False
     if hits and data.get('bookmark'):
         try:
             luxriot_manager.send_bookmark_event(
@@ -9300,6 +9676,7 @@ def probes_query():
                 state='new',
                 timestamp_ms=hits[0].get('timestamp_ms'),
             )
+            bookmark_sent = True
         except Exception:
             pass
     if hits:
@@ -9307,6 +9684,15 @@ def probes_query():
         recent_hits = data.get('recent_hits') or []
         recent_hits = (recent_hits + hits)[:PROBE_MAX_STORED_HITS]
         result['recent_hits'] = recent_hits
+        result['persisted_hits'] = _store_probe_hits(
+            probe_like,
+            hits,
+            source='probes_query',
+            bookmark_sent=bookmark_sent,
+            extra_payload={'frames_indexed': result.get('frames_indexed')},
+        )
+    else:
+        result['persisted_hits'] = 0
     return jsonify(result), status_code
 
 
@@ -9459,6 +9845,7 @@ def probes_run():
     if 'error' in result:
         return jsonify(result), 400
     hits = result.get('results') or []
+    bookmark_sent = False
     if hits:
         probe['last_hit'] = hits[0]
         # keep a short rolling history of hits for UI while capping thumbnails
@@ -9476,9 +9863,19 @@ def probes_run():
                     state='new',
                     timestamp_ms=hits[0].get('timestamp_ms'),
                 )
+                bookmark_sent = True
             except Exception:
                 pass
-    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe})
+        persisted_hits = _store_probe_hits(
+            probe,
+            hits,
+            source='probes_run',
+            bookmark_sent=bookmark_sent,
+            extra_payload={'frames_indexed': result.get('frames_indexed')},
+        )
+    else:
+        persisted_hits = 0
+    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe, 'persisted_hits': persisted_hits})
 
 
 @app.route('/probes/bench', methods=['GET'])
@@ -9511,6 +9908,128 @@ def probes_bench():
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route('/detections/list', methods=['GET'])
+def detections_list():
+    probe_id_raw = (request.args.get('probe_id') or '').strip()
+    probe_id = probe_id_raw or None
+
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms_raw = (request.args.get('since_ms') or '').strip()
+    since_ms: Optional[int] = None
+    if since_ms_raw:
+        try:
+            since_ms = int(since_ms_raw)
+        except Exception:
+            return jsonify({'error': 'since_ms must be an integer'}), 400
+
+    until_ms_raw = (request.args.get('until_ms') or '').strip()
+    until_ms: Optional[int] = None
+    if until_ms_raw:
+        try:
+            until_ms = int(until_ms_raw)
+        except Exception:
+            return jsonify({'error': 'until_ms must be an integer'}), 400
+
+    hours_raw = (request.args.get('hours') or '').strip()
+    if since_ms is None:
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        offset = int(request.args.get('offset', 0))
+    except Exception:
+        offset = 0
+
+    try:
+        detections, total = detections_store.list_detections(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify(
+            {
+                'detections': detections,
+                'total': total,
+                'limit': max(1, min(500, int(limit or 50))),
+                'offset': max(0, int(offset or 0)),
+                'has_more': max(0, int(offset or 0)) + len(detections) < total,
+                'filters': {
+                    'probe_id': probe_id,
+                    'channel_id': channel_id,
+                    'since_ms': since_ms,
+                    'until_ms': until_ms,
+                },
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/detections/summary', methods=['GET'])
+def detections_summary():
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms_raw = (request.args.get('since_ms') or '').strip()
+    since_ms: Optional[int] = None
+    if since_ms_raw:
+        try:
+            since_ms = int(since_ms_raw)
+        except Exception:
+            return jsonify({'error': 'since_ms must be an integer'}), 400
+    else:
+        hours_raw = (request.args.get('hours') or '').strip()
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 100))
+    except Exception:
+        limit = 100
+
+    try:
+        summary = detections_store.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, limit=limit)
+        return jsonify(
+            {
+                'summary': summary,
+                'count': len(summary),
+                'filters': {
+                    'channel_id': channel_id,
+                    'since_ms': since_ms,
+                },
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/settings', methods=['GET'])
