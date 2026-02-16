@@ -3,7 +3,7 @@ import json
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, cast
 
 import requests
 from PIL import Image
@@ -189,12 +189,16 @@ class LuxriotCaptureSession:
         prompt: str,
         model_hint: Optional[str] = None,
         interval_override: Optional[float] = None,
+        summarization_enabled: bool = True,
+        capture_kind: str = "video",
     ) -> None:
         self.manager = manager
         self.channel_id = channel_id
         self.batch_size = batch_size
         self.prompt = prompt
         self.model_hint = model_hint
+        self.summarization_enabled = bool(summarization_enabled)
+        self.capture_kind = (capture_kind or "video").strip().lower()
         if interval_override and interval_override > 0:
             self.interval = max(0.2, float(interval_override))
         else:
@@ -243,7 +247,7 @@ class LuxriotCaptureSession:
                         probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
                 except Exception as pm_exc:
                     self.last_error = str(pm_exc)
-                if len(self.frames) >= self.batch_size:
+                if self.summarization_enabled and len(self.frames) >= self.batch_size:
                     self._summarize_batch()
                     with self.lock:
                         self.frames.clear()
@@ -291,7 +295,8 @@ class LuxriotCaptureSession:
 
     def flush_now(self) -> None:
         """Force a summary of current buffer."""
-        self._summarize_batch()
+        if self.summarization_enabled:
+            self._summarize_batch()
         with self.lock:
             self.frames.clear()
 
@@ -307,6 +312,8 @@ class LuxriotCaptureSession:
             "interval_sec": self.interval,
             "max_edge": self.max_edge,
             "max_buffer_frames": self.max_buffer,
+            "capture_kind": self.capture_kind,
+            "summarization_enabled": self.summarization_enabled,
             "dropped_frames": self.dropped_frames,
             "flush_count": self.total_flushes,
             "last_error": self.last_error,
@@ -333,12 +340,12 @@ class LuxriotManager:
         self.message_builder = message_builder
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
-        self.auto_bookmarks = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         self.probe_manager: Optional[ProbeManagerLike] = probe_manager
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
+        self.paused_probe_channels: Set[int] = set()
         self.cache_lock = threading.Lock()
         self.channels_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
 
@@ -414,7 +421,15 @@ class LuxriotManager:
                 existing.stop()
             if system_prompt:
                 self.system_prompt = system_prompt
-            session = LuxriotCaptureSession(self, channel_id, batch, prompt, model_hint=model_hint)
+            session = LuxriotCaptureSession(
+                self,
+                channel_id,
+                batch,
+                prompt,
+                model_hint=model_hint,
+                summarization_enabled=True,
+                capture_kind="video",
+            )
             self.sessions[channel_id] = session
             session.start()
             return session.status()
@@ -427,26 +442,61 @@ class LuxriotManager:
             return {"channel_id": channel_id, "running": False}
         return {"channel_id": channel_id, "running": False, "message": "No active session"}
 
-    def start_probe_capture(self, channel_id: int, fps: Optional[float] = None) -> Dict[str, Any]:
+    def start_probe_capture(self, channel_id: int, fps: Optional[float] = None, clear_pause: bool = True) -> Dict[str, Any]:
         with self.cache_lock:
+            if clear_pause:
+                self.paused_probe_channels.discard(channel_id)
+            elif channel_id in self.paused_probe_channels:
+                return {
+                    "channel_id": channel_id,
+                    "running": False,
+                    "paused": True,
+                    "message": "Probe capture paused",
+                    "capture_kind": "analytics",
+                    "summarization_enabled": False,
+                }
             existing = self.probe_sessions.get(channel_id)
             if existing:
                 return existing.status()
             interval = None
             if fps and fps > 0:
                 interval = 1.0 / float(fps)
-            session = LuxriotCaptureSession(self, channel_id, batch_size=1, prompt="", model_hint=None, interval_override=interval)
+            session = LuxriotCaptureSession(
+                self,
+                channel_id,
+                batch_size=1,
+                prompt="",
+                model_hint=None,
+                interval_override=interval,
+                summarization_enabled=False,
+                capture_kind="analytics",
+            )
             self.probe_sessions[channel_id] = session
             session.start()
-            return session.status()
+            status = session.status()
+            status["paused"] = False
+            return status
 
-    def stop_probe_capture(self, channel_id: int) -> Dict[str, Any]:
+    def stop_probe_capture(self, channel_id: int, pause: bool = True) -> Dict[str, Any]:
         with self.cache_lock:
+            if pause:
+                self.paused_probe_channels.add(channel_id)
+            else:
+                self.paused_probe_channels.discard(channel_id)
             session = self.probe_sessions.pop(channel_id, None)
         if session:
             session.stop()
-            return {"channel_id": channel_id, "running": False}
-        return {"channel_id": channel_id, "running": False, "message": "No active probe capture"}
+            return {"channel_id": channel_id, "running": False, "paused": pause}
+        return {
+            "channel_id": channel_id,
+            "running": False,
+            "paused": pause,
+            "message": "No active probe capture",
+        }
+
+    def is_probe_capture_paused(self, channel_id: int) -> bool:
+        with self.cache_lock:
+            return channel_id in self.paused_probe_channels
 
     def flush_session(self, channel_id: int) -> Dict[str, Any]:
         with self.cache_lock:
@@ -468,6 +518,75 @@ class LuxriotManager:
             "pending_frames": 0,
             "interval_sec": getattr(self.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5),
             "max_edge": getattr(self.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800),
+            "capture_kind": "video",
+            "summarization_enabled": True,
             "last_error": None,
             "logs": [],
+        }
+
+    @staticmethod
+    def _compact_stream_status(
+        stream_type: str,
+        status: Dict[str, Any],
+        paused_channels: Optional[Set[int]] = None,
+    ) -> Dict[str, Any]:
+        compact = dict(status)
+        logs = compact.pop("logs", None)
+        compact["log_count"] = len(logs) if isinstance(logs, list) else 0
+        compact["stream_type"] = stream_type
+        if paused_channels is not None:
+            channel_id = compact.get("channel_id")
+            compact["paused"] = bool(isinstance(channel_id, int) and channel_id in paused_channels)
+        return compact
+
+    def streams_status(self) -> Dict[str, Any]:
+        with self.cache_lock:
+            video_items = list(self.sessions.items())
+            analytics_items = list(self.probe_sessions.items())
+            paused = set(self.paused_probe_channels)
+        video_streams = [
+            self._compact_stream_status("video", session.status(), paused)
+            for _, session in video_items
+        ]
+        analytics_streams = [
+            self._compact_stream_status("analytics", session.status(), paused)
+            for _, session in analytics_items
+        ]
+        return {
+            "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
+            "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
+            "paused_analytics_channels": sorted(paused),
+            "running_total": len(video_streams) + len(analytics_streams),
+        }
+
+    def stop_stream(self, channel_id: int, stream_type: str = "both", pause_analytics: bool = True) -> Dict[str, Any]:
+        normalized = (stream_type or "both").strip().lower()
+        result: Dict[str, Any] = {"channel_id": channel_id, "stream_type": normalized}
+        if normalized in {"video", "summary", "summaries"}:
+            result["video"] = self.stop_session(channel_id)
+        elif normalized in {"analytics", "probe", "probes"}:
+            result["analytics"] = self.stop_probe_capture(channel_id, pause=pause_analytics)
+        elif normalized in {"both", "all"}:
+            result["video"] = self.stop_session(channel_id)
+            result["analytics"] = self.stop_probe_capture(channel_id, pause=pause_analytics)
+        else:
+            raise ValueError("stream_type must be one of: video, analytics, both")
+        return result
+
+    def stop_all_streams(
+        self,
+        stop_video: bool = True,
+        stop_analytics: bool = True,
+        pause_analytics: bool = True,
+    ) -> Dict[str, Any]:
+        with self.cache_lock:
+            video_channels = list(self.sessions.keys()) if stop_video else []
+            analytics_channels = list(self.probe_sessions.keys()) if stop_analytics else []
+        stopped_video = [self.stop_session(ch) for ch in video_channels]
+        stopped_analytics = [self.stop_probe_capture(ch, pause=pause_analytics) for ch in analytics_channels]
+        return {
+            "stopped_video_count": len(stopped_video),
+            "stopped_analytics_count": len(stopped_analytics),
+            "video": stopped_video,
+            "analytics": stopped_analytics,
         }
