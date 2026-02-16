@@ -1032,6 +1032,12 @@ def home():
             align-items: center;
             gap: 0.5rem;
         }
+
+        .scope-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
         
         .segment-controls {
             display: flex;
@@ -1068,7 +1074,8 @@ def home():
         }
         
         .sort-control label,
-        .limit-control label {
+        .limit-control label,
+        .scope-control label {
             color: #888;
             font-size: 0.9rem;
         }
@@ -2986,6 +2993,13 @@ def home():
                                 {result_options_html}
                             </select>
                         </div>
+                        <div class="scope-control">
+                            <label for="searchScope">Scope:</label>
+                            <select id="searchScope">
+                                <option value="folder" selected>Indexed Folder</option>
+                                <option value="detections">Detections Archive</option>
+                            </select>
+                        </div>
                         <div class="segment-controls">
                             <label for="segmentThresholdSlider">Region threshold:</label>
                             <div class="segment-threshold-control" id="segmentThresholdControl">
@@ -3591,6 +3605,7 @@ def home():
         const probeDetRightBtn = document.getElementById('probeDetRight');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
+        const searchScopeSelect = document.getElementById('searchScope');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
         const archiveChannelFilter = document.getElementById('archiveChannelFilter');
@@ -4565,6 +4580,38 @@ def home():
                 setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
                 archiveDetectionsHasMore = false;
                 updateArchiveDetectionsNav();
+            }
+        }
+
+        function buildDetectionSearchFilters() {
+            const payload = {};
+            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
+            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+            if (channelId) payload.channel_id = channelId;
+            if (probeId) payload.probe_id = probeId;
+            const parsedHours = Number.parseFloat(hoursRaw);
+            if (Number.isFinite(parsedHours)) {
+                payload.hours = parsedHours;
+            } else {
+                payload.hours = 24;
+            }
+            return payload;
+        }
+
+        function isDetectionsScope() {
+            return searchScopeSelect && searchScopeSelect.value === 'detections';
+        }
+
+        function updateSearchScopeUI() {
+            if (!searchScopeSelect) return;
+            if (isDetectionsScope()) {
+                if (searchInput) {
+                    searchInput.placeholder = 'Describe detection scene (filtered by stream/probe/time)...';
+                }
+                setArchiveDetectionsMeta('Detections scope active: text/image search runs over filtered detection shards.');
+            } else if (searchInput) {
+                searchInput.placeholder = "Describe what you're looking for...";
             }
         }
 
@@ -5892,6 +5939,11 @@ def home():
                 updateArchiveDetectionsNav();
             });
         }
+        if (searchScopeSelect) {
+            searchScopeSelect.addEventListener('change', () => {
+                updateSearchScopeUI();
+            });
+        }
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -5970,22 +6022,43 @@ def home():
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionsScope = isDetectionsScope();
             
-            if (!query || !folder) return;
+            if (!query || (!detectionsScope && !folder)) return;
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
             
             try {
-                const response = await fetch('/search', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
-                });
+                let response;
+                if (detectionsScope) {
+                    const payload = {
+                        query,
+                        limit,
+                        sort_by: sortBy,
+                        embedder: embedderSelect ? embedderSelect.value : 'clip',
+                        ...buildDetectionSearchFilters(),
+                    };
+                    response = await fetch('/detections/search_text', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                } else {
+                    response = await fetch('/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
+                    });
+                }
                 
                 const data = await parseApiJson(response, 'Text search failed');
                 
                 if (data.results && data.results.length > 0) {
                     displayResults(data.results);
+                    if (detectionsScope && data.mode_requested && data.mode_used && data.mode_requested !== data.mode_used) {
+                        indexStatus.textContent = `Detections text search uses ${data.mode_used.toUpperCase()} backend.`;
+                        indexStatus.className = 'status warning';
+                    }
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 }
@@ -6001,8 +6074,13 @@ def home():
             const file = imageUpload.files[0];
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionsScope = isDetectionsScope();
             
-            if (!folder || !file) {
+            if (!file) {
+                alert('Please upload an image file.');
+                return;
+            }
+            if (!detectionsScope && !folder) {
                 alert('Please select a folder and upload an image file.');
                 return;
             }
@@ -6011,12 +6089,22 @@ def home():
             
             try {
                 const formData = new FormData();
-                formData.append('folder', folder);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
                 formData.append('image', file);
+                if (detectionsScope) {
+                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
+                    const filters = buildDetectionSearchFilters();
+                    Object.entries(filters).forEach(([key, value]) => {
+                        if (value !== undefined && value !== null && String(value).length > 0) {
+                            formData.append(key, String(value));
+                        }
+                    });
+                } else {
+                    formData.append('folder', folder);
+                }
                 
-                const response = await fetch('/search_by_image', {
+                const response = await fetch(detectionsScope ? '/detections/search_image' : '/search_by_image', {
                     method: 'POST',
                     body: formData
                 });
@@ -7186,6 +7274,7 @@ def home():
         }
 
         updateArchiveDetectionsNav();
+        updateSearchScopeUI();
         refreshArchiveFilters().catch(() => {
             setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
         });
@@ -7683,6 +7772,85 @@ class ProbesStore:
 probes_store = ProbesStore()
 detections_store = DetectionsStore()
 
+DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
+DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
+DETECTIONS_SEARCH_SHARD_OVERFETCH = 200
+DETECTIONS_SEARCH_DINO_POOL_MIN = 64
+DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER = 8
+
+
+class _DetectionClipShardCache:
+    def __init__(self, store: DetectionsStore) -> None:
+        self.store = store
+        self.lock = threading.RLock()
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def clear(self) -> None:
+        with self.lock:
+            self._cache.clear()
+
+    def get(self, shard_key: str) -> Tuple[Optional[faiss.Index], Optional[np.ndarray]]:
+        shard = str(shard_key or "").strip()
+        if not shard:
+            return None, None
+        version = self.store.shard_version(shard, embedder="clip")
+        if version[0] <= 0:
+            with self.lock:
+                self._cache.pop(shard, None)
+            return None, None
+
+        with self.lock:
+            cached = self._cache.get(shard)
+            if cached and cached.get("version") == version:
+                return cached.get("index"), cached.get("ids")
+
+        ids, vectors = self.store.load_shard_vectors(shard, embedder="clip")
+        if not ids or vectors.size == 0:
+            with self.lock:
+                self._cache.pop(shard, None)
+            return None, None
+
+        index = faiss.IndexFlatIP(int(vectors.shape[1]))
+        _faiss_add_vectors(index, vectors)
+        ids_arr = np.asarray(ids, dtype=np.int64)
+
+        with self.lock:
+            self._cache[shard] = {
+                "version": version,
+                "index": index,
+                "ids": ids_arr,
+            }
+        return index, ids_arr
+
+
+detection_clip_shard_cache = _DetectionClipShardCache(detections_store)
+
+
+def _thumbnail_to_pil_image(thumbnail_b64: Any) -> Optional[Image.Image]:
+    raw_value = str(thumbnail_b64 or "").strip()
+    if not raw_value:
+        return None
+    try:
+        decoded = base64.b64decode(raw_value)
+        with Image.open(BytesIO(decoded)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            else:
+                img = img.copy()
+            return img
+    except Exception:
+        return None
+
+
+def _embed_thumbnail_b64(thumbnail_b64: Any, embedder: str) -> Optional[np.ndarray]:
+    pil_img = _thumbnail_to_pil_image(thumbnail_b64)
+    if pil_img is None:
+        return None
+    try:
+        return get_image_embedding_from_pil(pil_img, embedder=embedder)
+    except Exception:
+        return None
+
 
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -7729,11 +7897,15 @@ def _store_probe_hits(
         pos_score = _to_float(hit.get("pos_score"), 0.0)
         neg_score = _to_float(hit.get("neg_score"), 0.0)
         margin = _to_float(hit.get("margin"), 0.0)
+        thumbnail_b64 = hit.get("thumbnail")
+        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
+        image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
         payload = {
             "hit_index": idx,
             "probe_window_sec": probe_like.get("window_sec"),
             "probe_fps": probe_like.get("fps"),
             "source": source,
+            "image_path": image_path,
             "hit": {
                 "timestamp_ms": ts_ms,
                 "channel_id": channel_id,
@@ -7757,7 +7929,9 @@ def _store_probe_hits(
                 "pos_score": pos_score,
                 "neg_score": neg_score,
                 "margin": margin,
-                "thumbnail_b64": hit.get("thumbnail"),
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "image_path": image_path,
                 "source": source,
                 "payload": payload,
             }
@@ -8362,6 +8536,340 @@ def _fuse_results(
             results.append(entry)
         if len(results) >= limit:
             break
+    return results
+
+
+def _normalize_detection_search_mode(requested: Optional[str]) -> str:
+    mode = (requested or active_embedder or "clip").strip().lower()
+    if mode == "fusion" and not config.FUSION_ENABLED:
+        mode = "clip"
+    if mode not in {"clip", "dino", "fusion"}:
+        mode = "clip"
+    return mode
+
+
+def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DETECTIONS_SEARCH_DEFAULT_HOURS) -> Dict[str, Any]:
+    probe_raw = str(payload.get("probe_id") or "").strip()
+    probe_id = probe_raw or None
+
+    channel_raw = str(payload.get("channel_id") or "").strip()
+    channel_id: Optional[int] = None
+    if channel_raw:
+        channel_id = int(channel_raw)
+
+    since_raw = payload.get("since_ms")
+    until_raw = payload.get("until_ms")
+    since_ms: Optional[int] = int(since_raw) if str(since_raw or "").strip() else None
+    until_ms: Optional[int] = int(until_raw) if str(until_raw or "").strip() else None
+
+    if since_ms is None:
+        hours_raw = payload.get("hours")
+        if str(hours_raw or "").strip():
+            hours = float(hours_raw)
+        else:
+            hours = float(default_hours)
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    return {
+        "probe_id": probe_id,
+        "channel_id": channel_id,
+        "since_ms": since_ms,
+        "until_ms": until_ms,
+    }
+
+
+def _backfill_clip_vectors_for_filters(
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    *,
+    max_backfill: int = 2000,
+) -> int:
+    detections, _ = detections_store.list_detections(
+        probe_id=probe_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=max_backfill,
+        offset=0,
+    )
+    pending: List[Tuple[int, np.ndarray]] = []
+    for item in detections:
+        if item.get("has_clip"):
+            continue
+        thumb = item.get("thumbnail")
+        if not thumb:
+            continue
+        vec = _embed_thumbnail_b64(thumb, "clip")
+        if vec is None:
+            continue
+        try:
+            det_id = int(item.get("id"))
+        except Exception:
+            continue
+        pending.append((det_id, vec))
+    if not pending:
+        return 0
+    updated = detections_store.update_clip_embeddings(pending)
+    if updated > 0:
+        detection_clip_shard_cache.clear()
+    return updated
+
+
+def _search_detection_clip_shards(
+    candidates: Sequence[Dict[str, Any]],
+    clip_query_vec: np.ndarray,
+    limit: int,
+) -> Tuple[List[Tuple[int, float]], Dict[int, Dict[str, Any]]]:
+    candidate_map: Dict[int, Dict[str, Any]] = {}
+    allowed_by_shard: Dict[str, Set[int]] = {}
+    for item in candidates:
+        try:
+            det_id = int(item.get("id"))
+        except Exception:
+            continue
+        candidate_map[det_id] = item
+        shard = str(item.get("shard_key") or "").strip()
+        allowed_by_shard.setdefault(shard, set()).add(det_id)
+
+    ranked: List[Tuple[int, float]] = []
+    seen: Set[int] = set()
+    per_shard_k = max(DETECTIONS_SEARCH_SHARD_OVERFETCH, limit * 20)
+
+    for shard_key, allowed_ids in allowed_by_shard.items():
+        if not shard_key:
+            continue
+        index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        if index_obj is None or shard_ids is None or shard_ids.size == 0:
+            continue
+        k = min(int(shard_ids.size), per_shard_k)
+        if k <= 0:
+            continue
+        sims, inds = _faiss_search(index_obj, clip_query_vec.reshape(1, -1), k)
+        for local_idx, sim in zip(inds[0], sims[0]):
+            local_int = int(local_idx)
+            if local_int < 0 or local_int >= int(shard_ids.size):
+                continue
+            det_id = int(shard_ids[local_int])
+            if det_id not in allowed_ids or det_id in seen:
+                continue
+            seen.add(det_id)
+            ranked.append((det_id, float(sim)))
+
+    if len(seen) < len(candidate_map):
+        remaining = [det_id for det_id in candidate_map.keys() if det_id not in seen]
+        if remaining:
+            vec_rows = detections_store.fetch_detections_by_ids(remaining, include_vectors=True)
+            fallback_ranked: List[Tuple[int, float]] = []
+            for row in vec_rows:
+                clip_vec = row.get("clip_vec")
+                if clip_vec is None:
+                    continue
+                det_id = int(row.get("id"))
+                fallback_ranked.append((det_id, float(np.dot(clip_query_vec, clip_vec))))
+            fallback_ranked.sort(key=lambda item: item[1], reverse=True)
+            for det_id, score in fallback_ranked:
+                if det_id in seen:
+                    continue
+                seen.add(det_id)
+                ranked.append((det_id, score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked, candidate_map
+
+
+def _ensure_dino_vectors_for_ids(detection_ids: Sequence[int]) -> Dict[int, np.ndarray]:
+    ids_clean = [int(det_id) for det_id in detection_ids if det_id is not None]
+    if not ids_clean:
+        return {}
+    rows = detections_store.fetch_detections_by_ids(ids_clean, include_vectors=True)
+    dino_map: Dict[int, np.ndarray] = {}
+    pending_updates: List[Tuple[int, np.ndarray]] = []
+    for row in rows:
+        det_id = int(row.get("id"))
+        existing = row.get("dino_vec")
+        if existing is not None:
+            dino_map[det_id] = existing
+            continue
+        thumb = row.get("thumbnail")
+        if not thumb:
+            continue
+        vec = _embed_thumbnail_b64(thumb, "dino")
+        if vec is None:
+            continue
+        dino_map[det_id] = vec
+        pending_updates.append((det_id, vec))
+    if pending_updates:
+        detections_store.update_dino_embeddings(pending_updates)
+    return dino_map
+
+
+def _build_detection_search_result(
+    item: Dict[str, Any],
+    score: float,
+    clip_score: float,
+    dino_score: Optional[float],
+    mode: str,
+    alpha: float,
+    dino_fallback: bool,
+) -> Dict[str, Any]:
+    ts_ms = int(item.get("timestamp_ms") or 0)
+    ts_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000.0)) if ts_ms > 0 else "n/a"
+    probe_label = str(item.get("probe_name") or item.get("probe_id") or "probe")
+    image_path = str(item.get("image_path") or "").strip()
+    payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    if not image_path and isinstance(payload_obj, dict):
+        image_path = str(payload_obj.get("image_path") or "").strip()
+
+    result: Dict[str, Any] = {
+        "path": image_path,
+        "filename": f"{probe_label} · {ts_label}",
+        "similarity": float(score),
+        "thumbnail": item.get("thumbnail") or "",
+        "metadata": {
+            "mtime": ts_ms,
+            "detection_id": item.get("id"),
+            "source": item.get("source"),
+            "probe_id": item.get("probe_id"),
+            "probe_name": item.get("probe_name"),
+            "channel_id": item.get("channel_id"),
+        },
+        "is_detection": True,
+        "detection_id": item.get("id"),
+        "timestamp_ms": ts_ms,
+        "channel_id": item.get("channel_id"),
+        "probe_id": item.get("probe_id"),
+        "probe_name": item.get("probe_name"),
+        "severity": item.get("severity"),
+        "pos_score": float(item.get("pos_score") or 0.0),
+        "neg_score": float(item.get("neg_score") or 0.0),
+        "margin": float(item.get("margin") or 0.0),
+        "source": item.get("source"),
+        "shard_key": item.get("shard_key"),
+    }
+    if mode in {"fusion", "dino"}:
+        result["fusion"] = {
+            "clip_similarity": float(clip_score),
+            "dino_similarity": float(dino_score if dino_score is not None else clip_score),
+            "alpha": float(alpha),
+            "dino_fallback": bool(dino_fallback),
+        }
+    return result
+
+
+def _search_detections_archive(
+    *,
+    clip_query_vec: np.ndarray,
+    dino_query_vec: Optional[np.ndarray],
+    mode: str,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    sort_by: str,
+    candidate_limit: int,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
+    candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
+
+    candidates = detections_store.list_vector_candidates(
+        probe_id=probe_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=candidate_limit,
+        only_with_clip=True,
+        include_vectors=False,
+    )
+    if not candidates:
+        updated = _backfill_clip_vectors_for_filters(
+            probe_id,
+            channel_id,
+            since_ms,
+            until_ms,
+            max_backfill=min(candidate_limit, 2000),
+        )
+        if updated > 0:
+            candidates = detections_store.list_vector_candidates(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=candidate_limit,
+                only_with_clip=True,
+                include_vectors=False,
+            )
+    if not candidates:
+        return []
+
+    clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
+    if not clip_hits:
+        return []
+
+    alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
+    if mode == "clip":
+        alpha = 0.0
+    elif mode == "dino":
+        alpha = 1.0
+
+    dino_scores: Dict[int, float] = {}
+    if mode in {"dino", "fusion"} and dino_query_vec is not None:
+        pool_size = min(len(clip_hits), max(DETECTIONS_SEARCH_DINO_POOL_MIN, limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER))
+        pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
+        dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
+        for det_id in pool_ids:
+            vec = dino_vectors.get(det_id)
+            if vec is None:
+                continue
+            dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
+
+    scored: List[Tuple[int, float, float, Optional[float], bool]] = []
+    for det_id, clip_score in clip_hits:
+        dino_score = dino_scores.get(det_id)
+        dino_fallback = False
+        if mode == "clip":
+            final_score = clip_score
+        elif dino_query_vec is None:
+            dino_fallback = True
+            final_score = clip_score
+        elif mode == "dino":
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = dino_score
+        else:
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = (1.0 - alpha) * clip_score + alpha * dino_score
+        scored.append((det_id, float(final_score), float(clip_score), dino_score, dino_fallback))
+
+    if sort_by == "time":
+        scored.sort(key=lambda row: int(candidate_map.get(row[0], {}).get("timestamp_ms") or 0), reverse=True)
+    else:
+        scored.sort(key=lambda row: row[1], reverse=True)
+
+    results: List[Dict[str, Any]] = []
+    for det_id, final_score, clip_score, dino_score, dino_fallback in scored[:limit]:
+        item = candidate_map.get(det_id)
+        if not item:
+            continue
+        results.append(
+            _build_detection_search_result(
+                item=item,
+                score=final_score,
+                clip_score=clip_score,
+                dino_score=dino_score,
+                mode=mode,
+                alpha=alpha,
+                dino_fallback=dino_fallback,
+            )
+        )
     return results
 
 
@@ -9970,6 +10478,151 @@ def probes_bench():
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route('/detections/search_text', methods=['POST'])
+def detections_search_text():
+    data = _json_body()
+    query = str(data.get('query') or '').strip()
+    if not query:
+        return jsonify({'error': 'query is required'}), 400
+
+    try:
+        filters = _parse_detection_filters(data)
+    except Exception as exc:
+        return jsonify({'error': f'Invalid detection filters: {exc}'}), 400
+
+    try:
+        limit = int(data.get('limit', config.DEFAULT_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+    if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+        limit = config.DEFAULT_RESULTS
+
+    try:
+        candidate_limit = int(data.get('candidate_limit', 20000))
+    except Exception:
+        candidate_limit = 20000
+
+    sort_by = str(data.get('sort_by') or 'similarity').strip().lower()
+    if sort_by not in {'similarity', 'time'}:
+        sort_by = 'similarity'
+
+    mode_requested = _normalize_detection_search_mode(str(data.get('embedder') or active_embedder))
+    # DINO/Fusion cannot encode text prompts; fallback to CLIP retrieval.
+    mode = 'clip'
+
+    try:
+        clip_query_vec = get_text_embedding(query)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': f'Failed to embed text query: {exc}'}), 500
+
+    try:
+        results = _search_detections_archive(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=None,
+            mode=mode,
+            probe_id=filters['probe_id'],
+            channel_id=filters['channel_id'],
+            since_ms=filters['since_ms'],
+            until_ms=filters['until_ms'],
+            limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+        )
+        return jsonify(
+            {
+                'results': results,
+                'mode_requested': mode_requested,
+                'mode_used': mode,
+                'filters': filters,
+                'query': query,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/detections/search_image', methods=['POST'])
+def detections_search_image():
+    mode = _normalize_detection_search_mode(request.form.get('embedder') or active_embedder)
+
+    filters_payload = {
+        'probe_id': request.form.get('probe_id'),
+        'channel_id': request.form.get('channel_id'),
+        'since_ms': request.form.get('since_ms'),
+        'until_ms': request.form.get('until_ms'),
+        'hours': request.form.get('hours'),
+    }
+    try:
+        filters = _parse_detection_filters(filters_payload)
+    except Exception as exc:
+        return jsonify({'error': f'Invalid detection filters: {exc}'}), 400
+
+    try:
+        limit = int(request.form.get('limit', config.DEFAULT_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+    if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+        limit = config.DEFAULT_RESULTS
+
+    try:
+        candidate_limit = int(request.form.get('candidate_limit', 20000))
+    except Exception:
+        candidate_limit = 20000
+
+    sort_by = str(request.form.get('sort_by') or 'similarity').strip().lower()
+    if sort_by not in {'similarity', 'time'}:
+        sort_by = 'similarity'
+
+    file = request.files.get('image')
+    if file is None or file.filename == '':
+        return jsonify({'error': 'image file is required'}), 400
+
+    try:
+        pil_image = Image.open(file.stream)
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+    except Exception as exc:
+        return jsonify({'error': f'Failed to read uploaded image: {exc}'}), 400
+
+    try:
+        clip_query_vec = get_image_embedding_from_pil(pil_image, embedder='clip')
+    except Exception as exc:
+        return jsonify({'error': f'Failed to embed image query with CLIP: {exc}'}), 500
+
+    dino_query_vec: Optional[np.ndarray] = None
+    if mode in {'dino', 'fusion'}:
+        try:
+            dino_query_vec = get_image_embedding_from_pil(pil_image, embedder='dino')
+        except Exception as exc:
+            print(f"Detections image search: DINO query embedding unavailable, fallback to CLIP only ({exc})")
+            dino_query_vec = None
+
+    try:
+        results = _search_detections_archive(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=dino_query_vec,
+            mode=mode,
+            probe_id=filters['probe_id'],
+            channel_id=filters['channel_id'],
+            since_ms=filters['since_ms'],
+            until_ms=filters['until_ms'],
+            limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+        )
+        return jsonify(
+            {
+                'results': results,
+                'mode_used': mode,
+                'filters': filters,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/detections/list', methods=['GET'])
