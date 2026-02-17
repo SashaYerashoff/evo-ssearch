@@ -211,6 +211,51 @@ class Config:
     if PROBE_THUMB_MAX_EDGE < 64:
         PROBE_THUMB_MAX_EDGE = 64
 
+    # Detection archive + adaptive retention
+    DETECTIONS_ARCHIVE_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED', 'True')
+    DETECTIONS_ARCHIVE_DIR = os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_DIR', 'detections_archive').strip() or 'detections_archive'
+    try:
+        DETECTIONS_ARCHIVE_JPEG_QUALITY = int(os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY', '88'))
+    except (TypeError, ValueError):
+        DETECTIONS_ARCHIVE_JPEG_QUALITY = 88
+    DETECTIONS_ARCHIVE_JPEG_QUALITY = max(60, min(95, DETECTIONS_ARCHIVE_JPEG_QUALITY))
+
+    DETECTIONS_RETENTION_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_ENABLED', 'True')
+    DETECTIONS_RETENTION_DROP_SKIPPED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED', 'False')
+    try:
+        DETECTIONS_RETENTION_WINDOW_SEC = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC', '6'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_WINDOW_SEC = 6.0
+    DETECTIONS_RETENTION_WINDOW_SEC = max(0.5, DETECTIONS_RETENTION_WINDOW_SEC)
+    try:
+        DETECTIONS_RETENTION_FORCE_KEEP_SEC = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC', '20'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_FORCE_KEEP_SEC = 20.0
+    DETECTIONS_RETENTION_FORCE_KEEP_SEC = max(1.0, DETECTIONS_RETENTION_FORCE_KEEP_SEC)
+    try:
+        DETECTIONS_RETENTION_SIMILARITY_HIGH = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH', '0.985'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SIMILARITY_HIGH = 0.985
+    DETECTIONS_RETENTION_SIMILARITY_HIGH = min(0.9999, max(0.5, DETECTIONS_RETENTION_SIMILARITY_HIGH))
+    try:
+        DETECTIONS_RETENTION_SIMILARITY_LOW = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW', '0.94'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SIMILARITY_LOW = 0.94
+    DETECTIONS_RETENTION_SIMILARITY_LOW = min(
+        DETECTIONS_RETENTION_SIMILARITY_HIGH - 0.001,
+        max(0.3, DETECTIONS_RETENTION_SIMILARITY_LOW),
+    )
+    try:
+        DETECTIONS_RETENTION_MARGIN_DELTA = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA', '0.08'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_MARGIN_DELTA = 0.08
+    DETECTIONS_RETENTION_MARGIN_DELTA = max(0.0, DETECTIONS_RETENTION_MARGIN_DELTA)
+    try:
+        DETECTIONS_RETENTION_SCORE_DELTA = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA', '0.08'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SCORE_DELTA = 0.08
+    DETECTIONS_RETENTION_SCORE_DELTA = max(0.0, DETECTIONS_RETENTION_SCORE_DELTA)
+
     @classmethod
     def get_server_urls(cls):
         """Get list of server URLs for display"""
@@ -294,6 +339,16 @@ class Config:
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
             f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
             f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
+        )
+        print(
+            "Detections archive: {} ({}, adaptive retention {}, keep_all_rows {}, window {}s, force {}s)".format(
+                'enabled' if cls.DETECTIONS_ARCHIVE_ENABLED else 'disabled',
+                cls.DETECTIONS_ARCHIVE_DIR,
+                'on' if cls.DETECTIONS_RETENTION_ENABLED else 'off',
+                'on' if not cls.DETECTIONS_RETENTION_DROP_SKIPPED else 'off',
+                cls.DETECTIONS_RETENTION_WINDOW_SEC,
+                cls.DETECTIONS_RETENTION_FORCE_KEEP_SEC,
+            )
         )
         print(
             "Security: upload_limit={}MB, settings_local_only={}, admin_token={}, cors_origins={}, allowed_roots={}".format(

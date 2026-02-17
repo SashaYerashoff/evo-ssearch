@@ -322,6 +322,24 @@ class LuxriotCaptureSession:
             "model": self.model_hint,
         }
 
+    def nearest_frame_thumbnail(self, timestamp_ms: Optional[int] = None) -> Optional[str]:
+        with self.lock:
+            frames_copy = list(self.frames)
+        if not frames_copy:
+            return None
+        if timestamp_ms is None:
+            raw = frames_copy[-1].get("thumbnail")
+            value = str(raw or "").strip()
+            return value or None
+        target_sec = float(timestamp_ms) / 1000.0
+        best = min(
+            frames_copy,
+            key=lambda frame: abs(float(frame.get("time_sec") or frame.get("captured_at") or 0.0) - target_sec),
+        )
+        raw = best.get("thumbnail")
+        value = str(raw or "").strip()
+        return value or None
+
 
 class LuxriotManager:
     """Coordinator for Luxriot snapshots, summaries, and channel helpers."""
@@ -497,6 +515,16 @@ class LuxriotManager:
     def is_probe_capture_paused(self, channel_id: int) -> bool:
         with self.cache_lock:
             return channel_id in self.paused_probe_channels
+
+    def probe_frame_thumbnail(self, channel_id: int, timestamp_ms: Optional[int] = None) -> Optional[str]:
+        with self.cache_lock:
+            session = self.probe_sessions.get(channel_id)
+        if session is None:
+            return None
+        try:
+            return session.nearest_frame_thumbnail(timestamp_ms)
+        except Exception:
+            return None
 
     def flush_session(self, channel_id: int) -> Dict[str, Any]:
         with self.cache_lock:

@@ -94,6 +94,21 @@ The server will display available URLs on startup:
 - **Local**: [http://localhost:5000](http://localhost:5000)
 - **Network**: http://[your-ip]:5000 (accessible from other devices on your network)
 
+### Production Run (Gunicorn)
+
+```sh
+# install dependencies first
+./run_prod.sh
+```
+
+Optional runtime knobs:
+
+```bash
+EVOSSEARCH_GUNICORN_WORKERS=2
+EVOSSEARCH_GUNICORN_THREADS=4
+EVOSSEARCH_GUNICORN_TIMEOUT=180
+```
+
 ## Configuration
 
 ### Frontend Settings Panel (Recommended)
@@ -144,8 +159,8 @@ EVOSSEARCH_LM_TIMEOUT=120               # request timeout (seconds)
 
 # Luxriot Evo S live integration
 EVOSSEARCH_LUXRIOT_BASE_URL=http://192.168.1.102:8080
-EVOSSEARCH_LUXRIOT_USERNAME=admin
-EVOSSEARCH_LUXRIOT_PASSWORD=123
+EVOSSEARCH_LUXRIOT_USERNAME=
+EVOSSEARCH_LUXRIOT_PASSWORD=
 EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=103
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=5
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
@@ -157,6 +172,10 @@ EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS=False     # hidden auto-bookmarks are disabled
 EVOSSEARCH_MAX_COMMENT_LENGTH=500 # Max comment characters
 EVOSSEARCH_MAX_FILE_SIZE_MB=50   # Max upload file size
 EVOSSEARCH_INDEX_FOLDER=.clip_index # Index folder name
+EVOSSEARCH_SETTINGS_LOCAL_ONLY=True  # If no token is set, /settings GET is localhost-only
+EVOSSEARCH_ADMIN_TOKEN=change-me      # Required for mutating endpoints
+EVOSSEARCH_CORS_ALLOWED_ORIGINS=      # Optional comma-separated CORS allowlist
+EVOSSEARCH_ALLOWED_ROOTS=             # Optional pathsep-separated folder allowlist for indexing/search
 
 # Probe runner
 EVOSSEARCH_PROBE_MAX_FRAMES=500         # frames kept per channel buffer
@@ -171,6 +190,20 @@ EVOSSEARCH_PROBE_BENCH_BATCH=16         # batch size for /probes/bench
 # Set the base URL/model to point to your vLLM server running a vision model
 # e.g., EVOSSEARCH_LM_BASE_URL=http://localhost:8000/v1
 #       EVOSSEARCH_LM_MODEL=Qwen/Qwen3-VL-4B-Instruct
+```
+
+### Admin Token For Mutating Endpoints
+
+Set `EVOSSEARCH_ADMIN_TOKEN` to enable mutating endpoints (indexing, settings save, Luxriot capture control, probe save/delete/run, and comment writes).
+
+In the web UI, click the lock icon in the header to store the token in browser localStorage (or open with `?admin_token=<token>` once).
+
+Send the token as either:
+
+```bash
+Authorization: Bearer <token>
+# or
+X-Admin-Token: <token>
 ```
 
 ### Example Usage

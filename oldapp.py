@@ -7,6 +7,7 @@ import json
 import math
 import pickle
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -730,6 +731,34 @@ def home():
             font-size: 0.9rem;
             transition: border-color 0.2s;
             max-width: 200px;
+        }
+
+        .settings-row.align-start {
+            align-items: flex-start;
+        }
+
+        .env-editor {
+            flex: 1;
+            max-width: none;
+            min-height: 240px;
+            resize: vertical;
+            font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace;
+            font-size: 0.82rem;
+            line-height: 1.35;
+            white-space: pre;
+        }
+
+        .settings-note {
+            flex: 1;
+            color: #9aa0ad;
+            font-size: 0.82rem;
+        }
+
+        .env-editor-actions {
+            flex: 1;
+            display: flex;
+            gap: 0.5rem;
+            justify-content: flex-end;
         }
         
         .settings-input:focus {
@@ -3558,6 +3587,25 @@ def home():
                     <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3" value="{segment_min_patches_default}">
                 </div>
             </div>
+
+            <div class="settings-section">
+                <h3>Environment Variables</h3>
+                <div class="settings-row align-start">
+                    <label class="settings-label">`EVOSSEARCH_*` values:</label>
+                    <textarea id="envEditor" class="settings-input env-editor" spellcheck="false" placeholder="EVOSSEARCH_KEY=value"></textarea>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Env actions:</label>
+                    <div class="env-editor-actions">
+                        <button class="settings-btn" id="reloadEnvBtn">Reload Env</button>
+                        <button class="settings-btn primary" id="saveEnvBtn">Save Env</button>
+                    </div>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Runtime:</label>
+                    <div class="settings-note">Env changes are saved to `.env`. Restart server to apply all values.</div>
+                </div>
+            </div>
             
             <div class="settings-actions">
                 <button class="settings-btn" id="resetSettings">Reset to Defaults</button>
@@ -4342,6 +4390,9 @@ def home():
         const saveSettingsBtn = document.getElementById('saveSettings');
         const resetSettingsBtn = document.getElementById('resetSettings');
         const settingsStatus = document.getElementById('settingsStatus');
+        const envEditorInput = document.getElementById('envEditor');
+        const reloadEnvBtn = document.getElementById('reloadEnvBtn');
+        const saveEnvBtn = document.getElementById('saveEnvBtn');
         const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
         const qualityValue = document.getElementById('qualityValue');
         const embedderSelect = document.getElementById('embedder');
@@ -4429,11 +4480,23 @@ def home():
                 const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
                 const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
                 const margin = Number.isFinite(result.margin) ? result.margin.toFixed(3) : 'n/a';
-                return [
+                const similarity = Number.isFinite(result.similarity) ? formatPercent(result.similarity) : null;
+                const mode = String(result.search_mode || '').trim().toUpperCase();
+                const clipSearch = Number.isFinite(result?.fusion?.clip_similarity) ? formatPercent(result.fusion.clip_similarity) : null;
+                const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
+                const lines = [
                     `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
                     `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channel)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
-                    `<div class="metric-line"><span class="metric-label">P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
-                ].join('');
+                    `<div class="metric-line"><span class="metric-label">Probe P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
+                ];
+                if (similarity) {
+                    const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
+                    lines.push(`<div class="metric-line"><span class="metric-label">Search:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
+                }
+                if (clipSearch || dinoSearch) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">Search C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
+                }
+                return lines.join('');
             }
 
             const lines = [];
@@ -4601,7 +4664,7 @@ def home():
                 const tsLabel = ts ? new Date(ts).toLocaleString() : 'n/a';
                 return {
                     filename: `${probeLabel} · ${tsLabel}`,
-                    path: det?.payload?.image_path || '',
+                    path: det?.image_path || det?.payload?.image_path || '',
                     thumbnail: det?.thumbnail || '',
                     is_detection: true,
                     detection_id: det?.id,
@@ -4731,6 +4794,7 @@ def home():
         settingsBtn.addEventListener('click', () => {
             settingsModal.style.display = 'block';
             loadSettings();
+            loadEnvEditor();
         });
         
         closeSettingsBtn.addEventListener('click', () => {
@@ -4795,6 +4859,49 @@ def home():
             updateSegmentsUI(segmentsEnabledInput.checked);
             refreshSegmentsPanels();
         });
+
+        async function loadEnvEditor() {
+            if (!envEditorInput) return;
+            try {
+                const response = await fetch('/settings/env');
+                const data = await response.json();
+                if (data.success) {
+                    envEditorInput.value = String(data.envText || '');
+                } else {
+                    showSettingsStatus('Error loading environment variables: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showSettingsStatus('Error loading environment variables: ' + error.message, 'error');
+            }
+        }
+
+        async function saveEnvEditor() {
+            if (!envEditorInput || !saveEnvBtn) return;
+            const originalLabel = saveEnvBtn.textContent;
+            saveEnvBtn.disabled = true;
+            saveEnvBtn.textContent = 'Saving...';
+            try {
+                const response = await fetch('/settings/env', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        envText: envEditorInput.value || ''
+                    })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showSettingsStatus(data.message || 'Environment variables saved.', 'success');
+                    await loadEnvEditor();
+                } else {
+                    showSettingsStatus('Error saving environment variables: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showSettingsStatus('Error saving environment variables: ' + error.message, 'error');
+            } finally {
+                saveEnvBtn.disabled = false;
+                saveEnvBtn.textContent = originalLabel;
+            }
+        }
 
         // Load current settings
         async function loadSettings() {
@@ -5027,6 +5134,18 @@ def home():
                 applyEmbedderUI(embedderSelect.value);
             }
         });
+
+        if (reloadEnvBtn) {
+            reloadEnvBtn.addEventListener('click', () => {
+                loadEnvEditor();
+            });
+        }
+
+        if (saveEnvBtn) {
+            saveEnvBtn.addEventListener('click', () => {
+                saveEnvEditor();
+            });
+        }
 
         // Show settings status message
         function showSettingsStatus(message, type) {
@@ -6493,7 +6612,7 @@ def home():
                 if (result.path) {
                     findSimilarIcon.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        findSimilarImages(result.path);
+                        findSimilarImages(result.path, result);
                     });
                 } else {
                     findSimilarIcon.style.display = 'none';
@@ -6517,7 +6636,7 @@ def home():
             const commentInput = item.querySelector(`#comment-input-${index}`);
             
             if (saveBtn) {
-                if (result.path) {
+                if (result.path && !result.is_detection) {
                     saveBtn.addEventListener('click', () => {
                         saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
                     });
@@ -6528,7 +6647,7 @@ def home():
 
             const lmSaveBtn = item.querySelector(`#lm-save-btn-${index}`);
             if (lmSaveBtn) {
-                if (result.path) {
+                if (result.path && !result.is_detection) {
                     lmSaveBtn.addEventListener('click', () => {
                         saveLmDescriptionAsComment(index, result.path);
                     });
@@ -6538,7 +6657,7 @@ def home():
             }
 
             const img = item.querySelector('.thumbnail');
-            if (img && result.path) {
+            if (img && result.path && !result.is_detection) {
                 img.addEventListener('click', (e) => {
                     handleSegmentClick(e, result, index, item);
                 });
@@ -6748,17 +6867,23 @@ def home():
             } else {
                 // Expand: show original image and load comments
                 const activeFolder = folderInput.value.trim();
-                const params = new URLSearchParams();
-                if (activeFolder) {
-                    params.set('folder', activeFolder);
-                }
-                params.set('image_path', result.path || '');
-                const originalImageUrl = `/image?${params.toString()}`;
+                const originalImageUrl = buildImageFetchUrl(result.path || '', result);
                 img.src = originalImageUrl;
                 item.classList.add('expanded');
-                loadComments(index, result.path, folderInput.value.trim());
-                prepareSegmentsPanel(item, result, index);
-                if (segmentsEnabledInput.checked) {
+                if (!result.is_detection && activeFolder) {
+                    loadComments(index, result.path, activeFolder);
+                    prepareSegmentsPanel(item, result, index);
+                } else {
+                    const commentsContainer = document.getElementById(`comments-${index}`);
+                    if (commentsContainer) {
+                        commentsContainer.innerHTML = '<div class="no-comments">Comments are available for indexed-folder images only.</div>';
+                    }
+                    const panel = item.querySelector(`#segments-${index}`);
+                    if (panel) {
+                        panel.innerHTML = '<div class="segments-status warning">Segmentation is available for indexed-folder images only.</div>';
+                    }
+                }
+                if (segmentsEnabledInput.checked && !result.is_detection) {
                     img.classList.add('segment-enabled');
                 }
                 // Update icon to collapse
@@ -7257,63 +7382,91 @@ def home():
             }
         }
         
-        async function findSimilarImages(imagePath) {
+        function buildImageFetchUrl(imagePath, result = null) {
+            const params = new URLSearchParams();
+            params.set('image_path', imagePath || '');
+            if (result && result.is_detection) {
+                const activeFolder = folderInput.value.trim();
+                if (activeFolder && String(imagePath || '').startsWith(activeFolder)) {
+                    params.set('folder', activeFolder);
+                    return `/image?${params.toString()}`;
+                }
+                return `/detections/image?${params.toString()}`;
+            }
+            const activeFolder = folderInput.value.trim();
+            if (activeFolder) {
+                params.set('folder', activeFolder);
+            }
+            return `/image?${params.toString()}`;
+        }
+
+        async function findSimilarImages(imagePath, result = null) {
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionResult = Boolean(result && result.is_detection);
             
-            if (!folder) {
+            if (!detectionResult && !folder) {
                 alert('Please enter a folder path first');
                 return;
             }
             
-            // Show loading state
             indexStatus.textContent = 'Finding similar images...';
             indexStatus.className = 'status';
             
             try {
-                // Fetch the image file from the server using existing image route
-                const activeFolder = folderInput.value.trim();
-                const params = new URLSearchParams();
-                if (activeFolder) {
-                    params.set('folder', activeFolder);
-                }
-                params.set('image_path', imagePath);
-                const imageResponse = await fetch(`/image?${params.toString()}`);
+                const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
                 if (!imageResponse.ok) {
                     throw new Error('Failed to load image file');
                 }
                 
-                // Convert response to blob
                 const imageBlob = await imageResponse.blob();
-                
-                // Create FormData to match existing search_by_image endpoint
                 const formData = new FormData();
                 formData.append('image', imageBlob, 'reference_image.jpg');
-                formData.append('folder', folder);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
-                
-                // Call existing search_by_image endpoint
+
+                if (detectionResult || isDetectionsScope()) {
+                    const filters = buildDetectionSearchFilters();
+                    Object.entries(filters).forEach(([key, value]) => {
+                        if (value !== undefined && value !== null && String(value).trim() !== '') {
+                            formData.append(key, String(value));
+                        }
+                    });
+                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
+
+                    const response = await fetch('/detections/search_image', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await parseApiJson(response, 'Detection image search failed');
+                    const rendered = decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested);
+                    if (!rendered.length) {
+                        indexStatus.textContent = 'No similar detections found';
+                        indexStatus.className = 'status warning';
+                        return;
+                    }
+                    indexStatus.textContent = `Found ${rendered.length} similar detections`;
+                    indexStatus.className = 'status success';
+                    displayResults(rendered);
+                    return;
+                }
+
+                formData.append('folder', folder);
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
                     body: formData
                 });
-                
-                const data = await response.json();
-                
-                if (data.results) {
-                    if (data.results.length === 0) {
-                        indexStatus.textContent = 'No similar images found';
-                        indexStatus.className = 'status warning';
-                    } else {
-                        indexStatus.textContent = `Found ${data.results.length} similar images`;
-                        indexStatus.className = 'status success';
-                        displayResults(data.results);
-                    }
-                } else {
-                    throw new Error(data.error || 'Unknown error');
+                const data = await parseApiJson(response, 'Image search failed');
+                const results = Array.isArray(data.results) ? data.results : [];
+                if (!results.length) {
+                    indexStatus.textContent = 'No similar images found';
+                    indexStatus.className = 'status warning';
+                    return;
                 }
+                indexStatus.textContent = `Found ${results.length} similar images`;
+                indexStatus.className = 'status success';
+                displayResults(results);
             } catch (error) {
                 console.error('Find similar error:', error);
                 indexStatus.textContent = 'Error finding similar images: ' + error.message;
@@ -7326,8 +7479,10 @@ def home():
                 alert('No filesystem path is available for this image.');
                 return;
             }
+            const detectionResult = Boolean(result && result.is_detection);
             const folder = folderInput.value.trim();
-            if (!folder) {
+            const useFolderContext = !detectionResult || (folder && String(imagePath).startsWith(folder));
+            if (!useFolderContext && !detectionResult) {
                 alert('Please enter a folder path first.');
                 return;
             }
@@ -7356,16 +7511,27 @@ def home():
                 const response = await fetch('/describe_image', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        folder,
-                        image_path: imagePath,
-                        prompt,
-                        model: modelId
-                    }),
+                    body: JSON.stringify(
+                        useFolderContext
+                            ? {
+                                folder,
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                            : {
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                    ),
                 });
                 const data = await parseApiJson(response, 'Describe request failed');
                 if (data.summary) {
                     renderLmDescription(index, data.summary, data.model || modelId || 'LM Studio');
+                    if (detectionResult && !useFolderContext) {
+                        saveBtn.style.display = 'none';
+                    }
                     return;
                 }
                 descContainer.innerHTML = '<div class="no-comments">(No description returned)</div>';
@@ -7464,6 +7630,20 @@ def serve_image(filepath: str = ""):
         return str(exc), 400
     except Exception as exc:
         return f"Error serving image: {exc}", 500
+
+
+@app.route('/detections/image', methods=['GET'])
+def serve_detection_image():
+    image_path = request.args.get('image_path')
+    try:
+        resolved = detection_archive.resolve_archive_image_path(image_path)
+        return send_file(str(resolved))
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if message.lower() == "image not found" else 400
+        return message, status
+    except Exception as exc:
+        return f"Error serving detection image: {exc}", 500
 
 
 def _index_directory(folder_path: Union[str, Path], embedder: str) -> Path:
@@ -7972,6 +8152,257 @@ def _probe_identity(probe_like: Dict[str, Any]) -> str:
     return f"adhoc:{channel_id}:{slug[:48]}"
 
 
+def _slug_token(value: Any, fallback: str) -> str:
+    token = str(value or "").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in token).strip("-")
+    return slug[:64] if slug else fallback
+
+
+class _AdaptiveDetectionArchive:
+    def __init__(self) -> None:
+        root_raw = str(getattr(config, "DETECTIONS_ARCHIVE_DIR", "detections_archive") or "detections_archive").strip()
+        root_path = Path(root_raw).expanduser()
+        if not root_path.is_absolute():
+            root_path = (Path.cwd() / root_path).resolve()
+        else:
+            root_path = root_path.resolve()
+
+        self.archive_enabled = bool(getattr(config, "DETECTIONS_ARCHIVE_ENABLED", True))
+        self.retention_enabled = bool(getattr(config, "DETECTIONS_RETENTION_ENABLED", True))
+        self.drop_skipped = bool(getattr(config, "DETECTIONS_RETENTION_DROP_SKIPPED", True))
+        self.root = root_path
+        self.window_ms = int(max(500.0, float(getattr(config, "DETECTIONS_RETENTION_WINDOW_SEC", 6.0)) * 1000.0))
+        self.force_keep_ms = int(max(1000.0, float(getattr(config, "DETECTIONS_RETENTION_FORCE_KEEP_SEC", 20.0)) * 1000.0))
+        self.sim_high = float(getattr(config, "DETECTIONS_RETENTION_SIMILARITY_HIGH", 0.985))
+        self.sim_low = float(getattr(config, "DETECTIONS_RETENTION_SIMILARITY_LOW", 0.94))
+        self.margin_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_MARGIN_DELTA", 0.08))
+        self.score_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_SCORE_DELTA", 0.08))
+        self.jpeg_quality = int(getattr(config, "DETECTIONS_ARCHIVE_JPEG_QUALITY", 88))
+
+        self._lock = threading.RLock()
+        self._state: Dict[str, Dict[str, Any]] = {}
+        if self.archive_enabled:
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                print(f"Detections archive disabled (cannot create root {self.root}): {exc}")
+                self.archive_enabled = False
+
+    @staticmethod
+    def _normalize_vec(vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if vec is None:
+            return None
+        try:
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        norm = float(np.linalg.norm(arr))
+        if norm <= 0:
+            return None
+        return (arr / norm).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _state_key(channel_id: int, probe_id: str, source: str) -> str:
+        return f"{int(channel_id)}:{str(probe_id)}:{str(source)}"
+
+    def _resolve_existing_path(self, image_path: Optional[str]) -> Optional[str]:
+        raw_path = str(image_path or "").strip()
+        if not raw_path:
+            return None
+        try:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (self.root / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            if candidate.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return None
+            if not candidate.exists() or not candidate.is_file():
+                return None
+            return str(candidate)
+        except Exception:
+            return None
+
+    def _write_snapshot(
+        self,
+        *,
+        channel_id: int,
+        probe_id: str,
+        source: str,
+        timestamp_ms: int,
+        thumbnail_b64: Any,
+    ) -> Optional[str]:
+        if not self.archive_enabled:
+            return None
+        pil_img = _thumbnail_to_pil_image(thumbnail_b64)
+        if pil_img is None:
+            return None
+        ts_sec = max(0.0, float(timestamp_ms) / 1000.0)
+        date_key = time.strftime("%Y%m%d", time.localtime(ts_sec))
+        probe_slug = _slug_token(probe_id, "probe")
+        source_slug = _slug_token(source, "probe")
+        out_dir = self.root / f"ch{int(channel_id)}" / date_key / probe_slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(timestamp_ms)}_{source_slug}_{uuid.uuid4().hex[:8]}.jpg"
+        out_path = out_dir / filename
+        pil_img.save(str(out_path), format="JPEG", quality=self.jpeg_quality)
+        return str(out_path)
+
+    def _update_state_locked(
+        self,
+        *,
+        key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+        image_path: Optional[str],
+    ) -> None:
+        self._state[key] = {
+            "timestamp_ms": int(timestamp_ms),
+            "clip_vec": clip_vec.copy() if clip_vec is not None else None,
+            "pos_score": float(pos_score),
+            "neg_score": float(neg_score),
+            "margin": float(margin),
+            "image_path": image_path,
+        }
+
+    def _decide_keep_locked(
+        self,
+        *,
+        key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+    ) -> Tuple[bool, str, Optional[float]]:
+        if not self.retention_enabled:
+            return True, "retention_disabled", None
+
+        prev = self._state.get(key)
+        if prev is None:
+            return True, "bootstrap", None
+
+        dt_ms = max(0, int(timestamp_ms) - int(prev.get("timestamp_ms") or 0))
+        if dt_ms >= self.force_keep_ms:
+            return True, "force_interval", None
+
+        prev_vec = prev.get("clip_vec")
+        sim: Optional[float] = None
+        if isinstance(prev_vec, np.ndarray) and clip_vec is not None and clip_vec.shape == prev_vec.shape:
+            sim = float(np.clip(np.dot(clip_vec, prev_vec), -1.0, 1.0))
+
+        margin_delta = abs(float(margin) - float(prev.get("margin") or 0.0))
+        pos_delta = abs(float(pos_score) - float(prev.get("pos_score") or 0.0))
+        neg_delta = abs(float(neg_score) - float(prev.get("neg_score") or 0.0))
+
+        if sim is not None and sim <= self.sim_low:
+            return True, "novel_scene", sim
+        if margin_delta >= self.margin_delta_thr or pos_delta >= self.score_delta_thr or neg_delta >= self.score_delta_thr:
+            return True, "score_shift", sim
+        if dt_ms >= self.window_ms:
+            return True, "window_anchor", sim
+        if sim is not None and sim >= self.sim_high:
+            return False, "high_similarity_skip", sim
+        return False, "within_window_skip", sim
+
+    def handle_hit(
+        self,
+        *,
+        probe_id: str,
+        channel_id: int,
+        source: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        thumbnail_b64: Any,
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+        image_path: Optional[str],
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        normalized_vec = self._normalize_vec(clip_vec)
+        resolved_path = self._resolve_existing_path(image_path)
+        key = self._state_key(channel_id, probe_id, source)
+
+        with self._lock:
+            previous = self._state.get(key)
+            previous_path = None
+            if isinstance(previous, dict):
+                previous_path = str(previous.get("image_path") or "").strip() or None
+            keep, reason, similarity = self._decide_keep_locked(
+                key=key,
+                timestamp_ms=timestamp_ms,
+                clip_vec=normalized_vec,
+                pos_score=pos_score,
+                neg_score=neg_score,
+                margin=margin,
+            )
+            if resolved_path:
+                # Existing source path already preserved on disk; do not drop it.
+                keep = True
+                reason = "external_path"
+            saved_path = resolved_path
+            if keep and not saved_path:
+                saved_path = self._write_snapshot(
+                    channel_id=channel_id,
+                    probe_id=probe_id,
+                    source=source,
+                    timestamp_ms=timestamp_ms,
+                    thumbnail_b64=thumbnail_b64,
+                )
+                if saved_path:
+                    reason = f"{reason}_snapshot_saved"
+            if not keep and not saved_path and previous_path:
+                # Reuse previous anchor snapshot so expanded view remains useful across dense hit sequences.
+                saved_path = previous_path
+                reason = f"{reason}_reuse_snapshot"
+            if keep:
+                self._update_state_locked(
+                    key=key,
+                    timestamp_ms=timestamp_ms,
+                    clip_vec=normalized_vec,
+                    pos_score=pos_score,
+                    neg_score=neg_score,
+                    margin=margin,
+                    image_path=saved_path,
+                )
+
+        keep_record = keep or (not self.drop_skipped)
+        meta = {
+            "decision": reason,
+            "kept": bool(keep),
+            "record_persisted": bool(keep_record),
+            "similarity_to_last_kept": similarity,
+        }
+        return keep_record, saved_path, meta
+
+    def resolve_archive_image_path(self, image_path: Any) -> Path:
+        if not self.archive_enabled:
+            raise ValueError("detections archive is disabled")
+        raw = str(image_path or "").strip()
+        if not raw:
+            raise ValueError("Missing image_path")
+        path_obj = Path(raw).expanduser()
+        if not path_obj.is_absolute():
+            path_obj = (self.root / path_obj).resolve()
+        else:
+            path_obj = path_obj.resolve()
+        if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            raise ValueError("Unsupported image file type")
+        if not _path_within(path_obj, self.root):
+            raise ValueError("image_path is outside detections archive")
+        if not path_obj.exists() or not path_obj.is_file():
+            raise ValueError("Image not found")
+        return path_obj
+
+
+detection_archive = _AdaptiveDetectionArchive()
+
+
 def _store_probe_hits(
     probe_like: Dict[str, Any],
     hits: Sequence[Dict[str, Any]],
@@ -7989,7 +8420,25 @@ def _store_probe_hits(
     bookmark_enabled = bool(probe_like.get("bookmark", False))
     now_ms = int(time.time() * 1000)
     records: List[Dict[str, Any]] = []
-    for idx, hit in enumerate(hits):
+    def _resolve_archive_thumbnail(hit_thumb: Any, ts_ms: int) -> Any:
+        try:
+            hq_thumb = luxriot_manager.probe_frame_thumbnail(channel_id, ts_ms)
+            if hq_thumb:
+                return hq_thumb
+        except Exception:
+            pass
+        return hit_thumb
+
+    def _hit_sort_key(item: Tuple[int, Dict[str, Any]]) -> int:
+        try:
+            return int(item[1].get("timestamp_ms"))
+        except Exception:
+            return now_ms
+    ordered_hits = sorted(
+        enumerate(hits),
+        key=_hit_sort_key,
+    )
+    for idx, hit in ordered_hits:
         ts_raw = hit.get("timestamp_ms")
         try:
             ts_ms = int(ts_raw)
@@ -7999,14 +8448,31 @@ def _store_probe_hits(
         neg_score = _to_float(hit.get("neg_score"), 0.0)
         margin = _to_float(hit.get("margin"), 0.0)
         thumbnail_b64 = hit.get("thumbnail")
+        archive_thumbnail_b64 = _resolve_archive_thumbnail(thumbnail_b64, ts_ms)
         clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
-        image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
+        raw_image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
+        keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            timestamp_ms=ts_ms,
+            clip_vec=clip_vec,
+            thumbnail_b64=archive_thumbnail_b64,
+            pos_score=pos_score,
+            neg_score=neg_score,
+            margin=margin,
+            image_path=raw_image_path,
+        )
+        if not keep_record:
+            continue
+        image_path = saved_image_path or raw_image_path
         payload = {
             "hit_index": idx,
             "probe_window_sec": probe_like.get("window_sec"),
             "probe_fps": probe_like.get("fps"),
             "source": source,
             "image_path": image_path,
+            "retention": retention_meta,
             "hit": {
                 "timestamp_ms": ts_ms,
                 "channel_id": channel_id,
@@ -8037,6 +8503,8 @@ def _store_probe_hits(
                 "payload": payload,
             }
         )
+    if not records:
+        return 0
     try:
         return detections_store.add_detections(records)
     except Exception as exc:
@@ -9574,20 +10042,24 @@ def describe_image():
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
-    if not folder_raw or not image_path:
-        return jsonify({'error': 'folder and image_path are required'}), 400
+    if not image_path:
+        return jsonify({'error': 'image_path is required'}), 400
     try:
-        folder_path = _resolve_folder_path(folder_raw, require_index=True)
-        path_obj = Path(image_path).expanduser().resolve()
-        if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
-            return jsonify({'error': 'Unsupported image file type'}), 400
-        if not path_obj.exists() or not path_obj.is_file():
-            return jsonify({'error': f'Image not found: {image_path}'}), 400
-        if not _path_within(path_obj, folder_path):
-            return jsonify({'error': 'image_path must be inside folder'}), 400
+        if folder_raw:
+            folder_path = _resolve_folder_path(folder_raw, require_index=True)
+            path_obj = Path(image_path).expanduser().resolve()
+            if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return jsonify({'error': 'Unsupported image file type'}), 400
+            if not path_obj.exists() or not path_obj.is_file():
+                return jsonify({'error': f'Image not found: {image_path}'}), 400
+            if not _path_within(path_obj, folder_path):
+                return jsonify({'error': 'image_path must be inside folder'}), 400
+        else:
+            path_obj = detection_archive.resolve_archive_image_path(image_path)
         messages = _build_image_messages(str(path_obj), prompt)
         summary = _call_lm_chat(messages, model_override=model_hint or None)
-        thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
+        with Image.open(path_obj) as src:
+            thumb = _encode_jpeg(src, max_edge=config.THUMBNAIL_SIZE[0])
         return jsonify(
             {
                 'summary': summary,
@@ -10850,6 +11322,228 @@ def detections_summary():
         return jsonify({'error': str(exc)}), 500
 
 
+ENV_PREFIX = "EVOSSEARCH_"
+
+
+def _bool_to_env(value: Any) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
+    env_map: Dict[str, str] = {}
+    env_path = Path(path)
+    if not env_path.exists():
+        return env_map
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return env_map
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in raw_line:
+            continue
+        key_raw, value_raw = raw_line.split("=", 1)
+        key = key_raw.strip()
+        if not key:
+            continue
+        env_map[key] = value_raw.strip()
+    return env_map
+
+
+def _parse_env_editor_text(raw_text: Any) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    text = str(raw_text or "")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in raw_line:
+            continue
+        key_raw, value_raw = raw_line.split("=", 1)
+        key = key_raw.strip()
+        if not key or not key.startswith(ENV_PREFIX):
+            continue
+        parsed[key] = value_raw.strip()
+    return parsed
+
+
+def _serialize_env_map(env_map: Dict[str, str]) -> str:
+    keys_sorted = sorted(env_map.keys())
+    return "\n".join(f"{key}={env_map[key]}" for key in keys_sorted)
+
+
+def _runtime_env_map() -> Dict[str, str]:
+    sev = config.LUXRIOT_SEVERITY_MAP or {}
+    env: Dict[str, str] = {
+        "EVOSSEARCH_HOST": str(config.HOST),
+        "EVOSSEARCH_PORT": str(config.PORT),
+        "EVOSSEARCH_DEBUG": _bool_to_env(config.DEBUG),
+        "EVOSSEARCH_EMBEDDER": str(config.EMBEDDER),
+        "EVOSSEARCH_CLIP_MODEL": str(config.CLIP_MODEL),
+        "EVOSSEARCH_DINO_MODEL": str(config.DINO_MODEL),
+        "EVOSSEARCH_EMB_DIM_DINO": str(config.EMB_DIM_DINO),
+        "EVOSSEARCH_DINO_WEIGHTS_PATH": str(config.DINO_WEIGHTS_PATH),
+        "EVOSSEARCH_DINO_DEVICE": str(config.DINO_DEVICE),
+        "EVOSSEARCH_INDEX_MODE": str(config.INDEX_MODE),
+        "EVOSSEARCH_FUSION_ENABLED": _bool_to_env(config.FUSION_ENABLED),
+        "EVOSSEARCH_FUSION_ALPHA": str(config.FUSION_ALPHA),
+        "EVOSSEARCH_RERANK_ENABLED": _bool_to_env(config.RERANK_ENABLED),
+        "EVOSSEARCH_RERANK_TOP_K": str(config.RERANK_TOP_K),
+        "EVOSSEARCH_DINO_SEGMENTS_ENABLED": _bool_to_env(config.DINO_SEGMENTS_ENABLED),
+        "EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES": str(config.DINO_SEGMENT_MIN_PATCHES),
+        "EVOSSEARCH_DINO_HEATMAP_THRESHOLD": str(config.DINO_HEATMAP_THRESHOLD),
+        "EVOSSEARCH_M2F_ENABLED": _bool_to_env(config.MASK2FORMER_ENABLED),
+        "EVOSSEARCH_M2F_MODEL": str(config.MASK2FORMER_MODEL),
+        "EVOSSEARCH_M2F_DEVICE": str(config.MASK2FORMER_DEVICE),
+        "EVOSSEARCH_M2F_MAX_SIZE": str(config.MASK2FORMER_MAX_SIZE),
+        "EVOSSEARCH_LM_BASE_URL": str(config.LM_BASE_URL),
+        "EVOSSEARCH_LM_MODEL": str(config.LM_MODEL),
+        "EVOSSEARCH_LM_API_KEY": str(config.LM_API_KEY),
+        "EVOSSEARCH_LM_TIMEOUT": str(config.LM_TIMEOUT),
+        "EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES": str(config.LM_VIDEO_DEFAULT_FRAMES),
+        "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
+        "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
+        "EVOSSEARCH_LM_VIDEO_MAX_TOKENS": str(config.LM_VIDEO_MAX_TOKENS),
+        "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
+        "EVOSSEARCH_LUXRIOT_BASE_URL": str(config.LUXRIOT_BASE_URL),
+        "EVOSSEARCH_LUXRIOT_USERNAME": str(config.LUXRIOT_USERNAME),
+        "EVOSSEARCH_LUXRIOT_PASSWORD": str(config.LUXRIOT_PASSWORD),
+        "EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID": str(config.LUXRIOT_DEFAULT_CHANNEL_ID),
+        "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": str(config.LUXRIOT_SNAPSHOT_INTERVAL),
+        "EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE": str(config.LUXRIOT_SNAPSHOT_MAX_EDGE),
+        "EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES": str(config.LUXRIOT_MAX_BUFFER_FRAMES),
+        "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
+        "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
+        "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
+        "EVOSSEARCH_LUXRIOT_SEV_NORMAL": str(sev.get("normal", "normal")),
+        "EVOSSEARCH_LUXRIOT_SEV_HIGH": str(sev.get("high", "high")),
+        "EVOSSEARCH_LUXRIOT_SEV_CRITICAL": str(sev.get("critical", "critical")),
+        "EVOSSEARCH_PROBE_MAX_FRAMES": str(config.PROBE_MAX_FRAMES),
+        "EVOSSEARCH_PROBE_THUMB_MAX_EDGE": str(config.PROBE_THUMB_MAX_EDGE),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED": _bool_to_env(config.DETECTIONS_ARCHIVE_ENABLED),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_DIR": str(config.DETECTIONS_ARCHIVE_DIR),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY": str(config.DETECTIONS_ARCHIVE_JPEG_QUALITY),
+        "EVOSSEARCH_DETECTIONS_RETENTION_ENABLED": _bool_to_env(config.DETECTIONS_RETENTION_ENABLED),
+        "EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED": _bool_to_env(config.DETECTIONS_RETENTION_DROP_SKIPPED),
+        "EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC": str(config.DETECTIONS_RETENTION_WINDOW_SEC),
+        "EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC": str(config.DETECTIONS_RETENTION_FORCE_KEEP_SEC),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH": str(config.DETECTIONS_RETENTION_SIMILARITY_HIGH),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW": str(config.DETECTIONS_RETENTION_SIMILARITY_LOW),
+        "EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA": str(config.DETECTIONS_RETENTION_MARGIN_DELTA),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA": str(config.DETECTIONS_RETENTION_SCORE_DELTA),
+        "EVOSSEARCH_MIN_RESULTS": str(config.MIN_RESULTS),
+        "EVOSSEARCH_MAX_RESULTS": str(config.MAX_RESULTS),
+        "EVOSSEARCH_DEFAULT_RESULTS": str(config.DEFAULT_RESULTS),
+        "EVOSSEARCH_BATCH_SIZE": str(config.BATCH_SIZE),
+        "EVOSSEARCH_THUMBNAIL_QUALITY": str(config.THUMBNAIL_QUALITY),
+        "EVOSSEARCH_INDEX_FOLDER": str(config.INDEX_FOLDER_NAME),
+        "EVOSSEARCH_MAX_COMMENT_LENGTH": str(config.MAX_COMMENT_LENGTH),
+        "EVOSSEARCH_MAX_FILE_SIZE_MB": str(config.MAX_FILE_SIZE_MB),
+        "EVOSSEARCH_ADMIN_TOKEN": str(config.ADMIN_TOKEN),
+        "EVOSSEARCH_SETTINGS_LOCAL_ONLY": _bool_to_env(config.SETTINGS_LOCAL_ONLY),
+        "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
+        "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
+    }
+    return env
+
+
+def _effective_env_map() -> Dict[str, str]:
+    runtime_map = _runtime_env_map()
+    file_map = _read_env_file_map(".env")
+    merged = dict(runtime_map)
+    for key, value in file_map.items():
+        if key.startswith(ENV_PREFIX) and key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
+    existing_map = _read_env_file_map(".env")
+    extra_evos = [
+        f"{key}={value}"
+        for key, value in sorted(existing_map.items())
+        if key.startswith(ENV_PREFIX) and key not in known_keys
+    ]
+    extra_other = [
+        f"{key}={value}"
+        for key, value in sorted(existing_map.items())
+        if not key.startswith(ENV_PREFIX)
+    ]
+    chunks: List[str] = []
+    if extra_evos:
+        chunks.append("# Additional EVOSSEARCH variables")
+        chunks.extend(extra_evos)
+    if extra_other:
+        if chunks:
+            chunks.append("")
+        chunks.append("# Preserved external variables")
+        chunks.extend(extra_other)
+    return ("\n" + "\n".join(chunks) + "\n") if chunks else ""
+
+
+@app.route('/settings/env', methods=['GET'])
+def get_settings_env():
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
+    try:
+        env_map = _effective_env_map()
+        return jsonify(
+            {
+                'success': True,
+                'envVariables': env_map,
+                'envText': _serialize_env_map(env_map),
+                'count': len(env_map),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/settings/env', methods=['POST'])
+def save_settings_env():
+    guard = _settings_guard(write=True)
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        parsed_from_text = _parse_env_editor_text(data.get('envText', ''))
+        if parsed_from_text:
+            target_env = parsed_from_text
+        else:
+            payload_obj = data.get('envVariables')
+            if not isinstance(payload_obj, dict):
+                return jsonify({'success': False, 'error': 'Provide envText or envVariables'}), 400
+            target_env = {
+                str(k).strip(): str(v).strip()
+                for k, v in payload_obj.items()
+                if str(k).strip().startswith(ENV_PREFIX)
+            }
+        if not target_env:
+            return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
+
+        existing_map = _read_env_file_map(".env")
+        preserved_other = {
+            key: value
+            for key, value in existing_map.items()
+            if not key.startswith(ENV_PREFIX)
+        }
+        merged_map = dict(preserved_other)
+        merged_map.update(target_env)
+
+        env_lines = [f"{key}={merged_map[key]}" for key in sorted(merged_map.keys())]
+        header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
+        Path(".env").write_text(header + "\n".join(env_lines) + "\n", encoding="utf-8")
+
+        return jsonify(
+            {
+                'success': True,
+                'message': 'Environment variables saved to .env. Restart the server to apply all changes.',
+                'count': len(target_env),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""
@@ -10898,6 +11592,7 @@ def get_settings():
             'adminTokenSet': bool(config.ADMIN_TOKEN),
             'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
             'allowedRoots': list(config.ALLOWED_ROOTS),
+            'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
@@ -11062,6 +11757,17 @@ EVOSSEARCH_M2F_MODEL={config.MASK2FORMER_MODEL}
 EVOSSEARCH_M2F_DEVICE={config.MASK2FORMER_DEVICE}
 EVOSSEARCH_M2F_MAX_SIZE={config.MASK2FORMER_MAX_SIZE}
 
+# LM Studio / video understanding
+EVOSSEARCH_LM_BASE_URL={config.LM_BASE_URL}
+EVOSSEARCH_LM_MODEL={config.LM_MODEL}
+EVOSSEARCH_LM_API_KEY={config.LM_API_KEY}
+EVOSSEARCH_LM_TIMEOUT={config.LM_TIMEOUT}
+EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES={config.LM_VIDEO_DEFAULT_FRAMES}
+EVOSSEARCH_LM_VIDEO_MAX_FRAMES={config.LM_VIDEO_MAX_FRAMES}
+EVOSSEARCH_LM_VIDEO_MAX_EDGE={config.LM_VIDEO_MAX_EDGE}
+EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
+EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
+
 # Luxriot Evo integration
 EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
 EVOSSEARCH_LUXRIOT_USERNAME={luxriot_username}
@@ -11076,6 +11782,23 @@ EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
 EVOSSEARCH_LUXRIOT_SEV_HIGH={merged_sev['high']}
 EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
+
+# Probe / monitoring
+EVOSSEARCH_PROBE_MAX_FRAMES={config.PROBE_MAX_FRAMES}
+EVOSSEARCH_PROBE_THUMB_MAX_EDGE={config.PROBE_THUMB_MAX_EDGE}
+
+# Detections archive / adaptive retention
+EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED={str(config.DETECTIONS_ARCHIVE_ENABLED).lower()}
+EVOSSEARCH_DETECTIONS_ARCHIVE_DIR={config.DETECTIONS_ARCHIVE_DIR}
+EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY={config.DETECTIONS_ARCHIVE_JPEG_QUALITY}
+EVOSSEARCH_DETECTIONS_RETENTION_ENABLED={str(config.DETECTIONS_RETENTION_ENABLED).lower()}
+EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED={str(config.DETECTIONS_RETENTION_DROP_SKIPPED).lower()}
+EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC={config.DETECTIONS_RETENTION_WINDOW_SEC}
+EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC={config.DETECTIONS_RETENTION_FORCE_KEEP_SEC}
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH={config.DETECTIONS_RETENTION_SIMILARITY_HIGH}
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW={config.DETECTIONS_RETENTION_SIMILARITY_LOW}
+EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA={config.DETECTIONS_RETENTION_MARGIN_DELTA}
+EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA={config.DETECTIONS_RETENTION_SCORE_DELTA}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -11099,6 +11822,11 @@ EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
 EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
 EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
+
+        known_env_keys = set(_parse_env_editor_text(env_content).keys())
+        env_content = env_content.rstrip() + _preserve_additional_env_lines(known_env_keys)
+        if not env_content.endswith("\n"):
+            env_content += "\n"
 
         with open('.env', 'w', encoding='utf-8') as f:
             f.write(env_content)
@@ -11160,6 +11888,21 @@ def _stop_probe_daemon_thread() -> None:
         probe_daemon_thread.join(timeout=1.5)
 
 
+def _port_is_available(host: str, port: int) -> bool:
+    bind_host = (host or "").strip() or "0.0.0.0"
+    try:
+        port_num = int(port)
+    except Exception:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_host, port_num))
+            return True
+        except OSError:
+            return False
+
+
 @atexit.register
 def _shutdown_background_workers() -> None:
     try:
@@ -11173,6 +11916,10 @@ def _shutdown_background_workers() -> None:
 
 
 if __name__ == '__main__':
+    if not _port_is_available(config.HOST, config.PORT):
+        print(f"Startup aborted: {config.HOST}:{config.PORT} is already in use.")
+        print("Stop the existing server process or change EVOSSEARCH_PORT before starting oldapp.py.")
+        raise SystemExit(1)
     ensure_embedder_loaded()
     config.print_startup_info()
     if probe_daemon_thread is None:
