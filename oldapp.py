@@ -8140,6 +8140,35 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def _probe_identity(probe_like: Dict[str, Any]) -> str:
     probe_id = str(probe_like.get("id") or "").strip()
     if probe_id:
@@ -8430,20 +8459,14 @@ def _store_probe_hits(
         return hit_thumb
 
     def _hit_sort_key(item: Tuple[int, Dict[str, Any]]) -> int:
-        try:
-            return int(item[1].get("timestamp_ms"))
-        except Exception:
-            return now_ms
+        return _to_int(item[1].get("timestamp_ms"), now_ms)
     ordered_hits = sorted(
         enumerate(hits),
         key=_hit_sort_key,
     )
     for idx, hit in ordered_hits:
         ts_raw = hit.get("timestamp_ms")
-        try:
-            ts_ms = int(ts_raw)
-        except Exception:
-            ts_ms = now_ms
+        ts_ms = _to_int(ts_raw, now_ms)
         pos_score = _to_float(hit.get("pos_score"), 0.0)
         neg_score = _to_float(hit.get("neg_score"), 0.0)
         margin = _to_float(hit.get("margin"), 0.0)
@@ -9128,15 +9151,13 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
 
     since_raw = payload.get("since_ms")
     until_raw = payload.get("until_ms")
-    since_ms: Optional[int] = int(since_raw) if str(since_raw or "").strip() else None
-    until_ms: Optional[int] = int(until_raw) if str(until_raw or "").strip() else None
+    since_ms = _to_optional_int(since_raw)
+    until_ms = _to_optional_int(until_raw)
 
     if since_ms is None:
         hours_raw = payload.get("hours")
-        if str(hours_raw or "").strip():
-            hours = float(hours_raw)
-        else:
-            hours = float(default_hours)
+        parsed_hours = _to_optional_float(hours_raw)
+        hours = parsed_hours if parsed_hours is not None else float(default_hours)
         if hours > 0:
             since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
 
@@ -9164,7 +9185,7 @@ def _backfill_clip_vectors_for_filters(
         limit=max_backfill,
         offset=0,
     )
-    pending: List[Tuple[int, np.ndarray]] = []
+    pending: List[Tuple[int, Sequence[float]]] = []
     for item in detections:
         if item.get("has_clip"):
             continue
@@ -9174,11 +9195,10 @@ def _backfill_clip_vectors_for_filters(
         vec = _embed_thumbnail_b64(thumb, "clip")
         if vec is None:
             continue
-        try:
-            det_id = int(item.get("id"))
-        except Exception:
+        det_id = _to_optional_int(item.get("id"))
+        if det_id is None:
             continue
-        pending.append((det_id, vec))
+        pending.append((det_id, cast(Sequence[float], vec)))
     if not pending:
         return 0
     updated = detections_store.update_clip_embeddings(pending)
@@ -9195,9 +9215,8 @@ def _search_detection_clip_shards(
     candidate_map: Dict[int, Dict[str, Any]] = {}
     allowed_by_shard: Dict[str, Set[int]] = {}
     for item in candidates:
-        try:
-            det_id = int(item.get("id"))
-        except Exception:
+        det_id = _to_optional_int(item.get("id"))
+        if det_id is None:
             continue
         candidate_map[det_id] = item
         shard = str(item.get("shard_key") or "").strip()
@@ -9236,7 +9255,9 @@ def _search_detection_clip_shards(
                 clip_vec = row.get("clip_vec")
                 if clip_vec is None:
                     continue
-                det_id = int(row.get("id"))
+                det_id = _to_optional_int(row.get("id"))
+                if det_id is None:
+                    continue
                 fallback_ranked.append((det_id, float(np.dot(clip_query_vec, clip_vec))))
             fallback_ranked.sort(key=lambda item: item[1], reverse=True)
             for det_id, score in fallback_ranked:
@@ -9255,9 +9276,11 @@ def _ensure_dino_vectors_for_ids(detection_ids: Sequence[int]) -> Dict[int, np.n
         return {}
     rows = detections_store.fetch_detections_by_ids(ids_clean, include_vectors=True)
     dino_map: Dict[int, np.ndarray] = {}
-    pending_updates: List[Tuple[int, np.ndarray]] = []
+    pending_updates: List[Tuple[int, Sequence[float]]] = []
     for row in rows:
-        det_id = int(row.get("id"))
+        det_id = _to_optional_int(row.get("id"))
+        if det_id is None:
+            continue
         existing = row.get("dino_vec")
         if existing is not None:
             dino_map[det_id] = existing
@@ -9269,7 +9292,7 @@ def _ensure_dino_vectors_for_ids(detection_ids: Sequence[int]) -> Dict[int, np.n
         if vec is None:
             continue
         dino_map[det_id] = vec
-        pending_updates.append((det_id, vec))
+        pending_updates.append((det_id, cast(Sequence[float], vec)))
     if pending_updates:
         detections_store.update_dino_embeddings(pending_updates)
     return dino_map
