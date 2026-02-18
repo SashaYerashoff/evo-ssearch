@@ -509,6 +509,9 @@ def home():
             --muted: #8f8f8f;
             --radius-md: 8px;
             --radius-lg: 12px;
+            --control-h: 36px;
+            --panel-gap: 0.75rem;
+            --panel-header-gap: 0.65rem;
             --btn-sm-h: 30px;
             --btn-md-h: 36px;
             --btn-lg-h: 42px;
@@ -728,7 +731,8 @@ def home():
             flex: 1;
             background: #0a0a0a;
             border: 1px solid #333;
-            padding: 0.5rem 0.75rem;
+            min-height: var(--control-h);
+            padding: 0 0.75rem;
             border-radius: 6px;
             color: #e0e0e0;
             font-size: 0.9rem;
@@ -744,6 +748,7 @@ def home():
             flex: 1;
             max-width: none;
             min-height: 240px;
+            padding: 0.65rem 0.75rem;
             resize: vertical;
             font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace;
             font-size: 0.82rem;
@@ -782,7 +787,8 @@ def home():
         .settings-select {
             background: #0a0a0a;
             border: 1px solid #333;
-            padding: 0.5rem 0.75rem;
+            min-height: var(--control-h);
+            padding: 0 0.75rem;
             border-radius: 6px;
             color: #e0e0e0;
             font-size: 0.9rem;
@@ -820,11 +826,16 @@ def home():
             background: #2a2a2a;
             border: 1px solid #444;
             color: #e0e0e0;
-            padding: 0.75rem 1.5rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1.2rem;
             border-radius: 6px;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
         }
         
         .settings-btn:hover {
@@ -881,12 +892,20 @@ def home():
             flex: 1;
             background: var(--field);
             border: 1px solid var(--field-border);
-            padding: 0.75rem 1rem;
+            min-height: var(--control-h);
+            padding: 0 1rem;
             border-radius: var(--radius-md);
             color: var(--text);
             font-size: 0.95rem;
             transition: border-color 0.2s;
             min-width: 0;
+        }
+
+        input[type="number"],
+        input[type="password"],
+        select {
+            min-height: var(--control-h);
+            line-height: 1.2;
         }
         
         input[type="text"]:focus {
@@ -955,11 +974,15 @@ def home():
             background: #0a0a0a;
             border: 1px solid #333;
             color: #888;
-            padding: 0.75rem 1rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
             border-radius: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         
         .mode-tab.active {
@@ -1075,6 +1098,35 @@ def home():
             cursor: not-allowed;
             transform: none;
         }
+
+        button.is-loading,
+        .feature-btn.is-loading,
+        .settings-btn.is-loading,
+        .save-comment-btn.is-loading,
+        .segment-action-btn.is-loading {
+            position: relative;
+            color: transparent !important;
+            pointer-events: none;
+        }
+
+        button.is-loading::after,
+        .feature-btn.is-loading::after,
+        .settings-btn.is-loading::after,
+        .save-comment-btn.is-loading::after,
+        .segment-action-btn.is-loading::after {
+            content: '';
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.35);
+            border-top-color: rgba(255, 255, 255, 0.95);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        button[aria-busy="true"] {
+            cursor: progress;
+        }
         
         .sort-control {
             display: flex;
@@ -1139,7 +1191,7 @@ def home():
             background: #0a0a0a;
             border: 1px solid #333;
             color: #e0e0e0;
-            padding: 0.5rem 0.75rem;
+            padding: 0 0.75rem;
             border-radius: 6px;
             font-size: 0.9rem;
             cursor: pointer;
@@ -1178,7 +1230,7 @@ def home():
             padding: 0.9rem;
             display: flex;
             flex-direction: column;
-            gap: 0.7rem;
+            gap: var(--panel-gap);
         }
 
         .archive-filter-grid {
@@ -1189,7 +1241,7 @@ def home():
 
         .archive-detections-actions {
             display: flex;
-            gap: 0.6rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -1287,7 +1339,7 @@ def home():
         .image-query-actions {
             display: flex;
             align-items: center;
-            gap: 0.55rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -2097,14 +2149,14 @@ def home():
             padding: 0.85rem;
             display: flex;
             flex-direction: column;
-            gap: 0.6rem;
+            gap: var(--panel-gap);
         }
 
         .luxriot-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 0.75rem;
+            gap: var(--panel-header-gap);
         }
 
         .luxriot-header h4 {
@@ -2169,7 +2221,7 @@ def home():
         .luxriot-actions {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -2353,7 +2405,7 @@ def home():
             padding: 0.85rem;
             display: flex;
             flex-direction: column;
-            gap: 0.6rem;
+            gap: var(--panel-gap);
             margin-top: 0.5rem;
         }
 
@@ -2372,9 +2424,9 @@ def home():
             display: flex;
             align-items: flex-start;
             justify-content: space-between;
-            gap: 0.65rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
-            margin-bottom: 0.6rem;
+            margin-bottom: 0.2rem;
         }
 
         .probe-header.split {
@@ -2389,7 +2441,7 @@ def home():
 
         .probe-header-actions {
             display: flex;
-            gap: 0.35rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -2398,6 +2450,9 @@ def home():
             border: 1px solid #1f1f1f;
             border-radius: 10px;
             padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: var(--panel-gap);
         }
 
         .probe-select-grow {
@@ -2515,10 +2570,13 @@ def home():
             border: 1px solid #222;
             border-radius: 10px;
             padding: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: var(--panel-gap);
         }
 
         .monitor-panel h4 {
-            margin: 0 0 0.6rem 0;
+            margin: 0 0 0.2rem 0;
             line-height: 1.25;
             letter-spacing: 0.01em;
         }
@@ -2642,7 +2700,7 @@ def home():
         .monitor-actions-row {
             display: flex;
             justify-content: space-between;
-            gap: 0.5rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
             align-items: center;
         }
@@ -3023,13 +3081,13 @@ def home():
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 0.75rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
         .monitor-actions-main {
             display: flex;
-            gap: 0.5rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -4012,6 +4070,26 @@ def home():
             const mins = Math.floor(seconds / 60);
             const secs = Math.floor(seconds % 60);
             return `${mins}m ${secs}s`;
+        }
+
+        const buttonBusyState = new WeakMap();
+
+        function setButtonBusy(button, busy) {
+            if (!(button instanceof HTMLButtonElement)) return;
+            if (busy) {
+                if (!buttonBusyState.has(button)) {
+                    buttonBusyState.set(button, Boolean(button.disabled));
+                }
+                button.disabled = true;
+                button.classList.add('is-loading');
+                button.setAttribute('aria-busy', 'true');
+                return;
+            }
+            const wasDisabled = buttonBusyState.has(button) ? Boolean(buttonBusyState.get(button)) : false;
+            buttonBusyState.delete(button);
+            button.classList.remove('is-loading');
+            button.removeAttribute('aria-busy');
+            button.disabled = wasDisabled;
         }
 
         function startVideoTimer() {
@@ -5072,9 +5150,7 @@ def home():
 
         async function saveEnvEditor() {
             if (!envEditorInput || !saveEnvBtn) return;
-            const originalLabel = saveEnvBtn.textContent;
-            saveEnvBtn.disabled = true;
-            saveEnvBtn.textContent = 'Saving...';
+            setButtonBusy(saveEnvBtn, true);
             try {
                 const response = await fetch('/settings/env', {
                     method: 'POST',
@@ -5093,8 +5169,7 @@ def home():
             } catch (error) {
                 showSettingsStatus('Error saving environment variables: ' + error.message, 'error');
             } finally {
-                saveEnvBtn.disabled = false;
-                saveEnvBtn.textContent = originalLabel;
+                setButtonBusy(saveEnvBtn, false);
             }
         }
 
@@ -5255,8 +5330,7 @@ def home():
                     return;
                 }
                 
-                saveSettingsBtn.disabled = true;
-                saveSettingsBtn.textContent = 'Saving...';
+                setButtonBusy(saveSettingsBtn, true);
                 
                 const response = await fetch('/settings', {
                     method: 'POST',
@@ -5275,8 +5349,7 @@ def home():
             } catch (error) {
                 showSettingsStatus('Error saving settings: ' + error.message, 'error');
             } finally {
-                saveSettingsBtn.disabled = false;
-                saveSettingsBtn.textContent = 'Save Settings';
+                setButtonBusy(saveSettingsBtn, false);
             }
         });
         
@@ -6333,7 +6406,7 @@ def home():
         }
         if (probeBenchBtn && probeBenchOutput) {
             probeBenchBtn.addEventListener('click', async () => {
-                probeBenchBtn.disabled = true;
+                setButtonBusy(probeBenchBtn, true);
                 probeBenchOutput.textContent = 'Benchmark running...';
                 try {
                     const resp = await fetch('/probes/bench');
@@ -6343,7 +6416,7 @@ def home():
                 } catch (err) {
                     probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
                 } finally {
-                    probeBenchBtn.disabled = false;
+                    setButtonBusy(probeBenchBtn, false);
                 }
             });
         }
@@ -6448,7 +6521,7 @@ def home():
             
             indexStatus.textContent = 'Indexing...';
             indexStatus.className = 'status';
-            indexBtn.disabled = true;
+            setButtonBusy(indexBtn, true);
             
             try {
                 const response = await fetch('/index', {
@@ -6479,7 +6552,7 @@ def home():
                 indexStatus.textContent = 'Error: ' + error.message;
                 indexStatus.className = 'status error';
             } finally {
-                indexBtn.disabled = false;
+                setButtonBusy(indexBtn, false);
             }
         });
         
@@ -6494,6 +6567,7 @@ def home():
             
             if (!query || (!detectionsScope && !folder)) return;
             
+            setButtonBusy(searchBtn, true);
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
             
             try {
@@ -6535,6 +6609,8 @@ def home():
                 }
             } catch (error) {
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            } finally {
+                setButtonBusy(searchBtn, false);
             }
         });
         
@@ -6556,6 +6632,7 @@ def home():
                 return;
             }
             
+            setButtonBusy(imageSearchBtn, true);
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
             
             try {
@@ -6592,6 +6669,8 @@ def home():
                 }
             } catch (error) {
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            } finally {
+                setButtonBusy(imageSearchBtn, false);
             }
         });
 
@@ -6627,7 +6706,7 @@ def home():
                 localStorage.removeItem('evs_video_prompt');
             }
 
-            videoRunBtn.disabled = true;
+            setButtonBusy(videoRunBtn, true);
             saveSummaryBtn.style.display = 'none';
             lastSummaryText = '';
             lastSummaryTarget = null;
@@ -6688,7 +6767,7 @@ def home():
                 videoStatus.className = 'video-status error';
                 stopVideoTimer(true);
             } finally {
-                videoRunBtn.disabled = false;
+                setButtonBusy(videoRunBtn, false);
             }
         }
 
@@ -7032,9 +7111,7 @@ def home():
                 return;
             }
 
-            const originalText = saveBtn.textContent;
-            saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
+            setButtonBusy(saveBtn, true);
             try {
                 const response = await fetch('/comments', {
                     method: 'POST',
@@ -7052,12 +7129,10 @@ def home():
                 }
                 indexStatus.textContent = 'LLM description saved as comment.';
                 indexStatus.className = 'status success';
-                saveBtn.textContent = 'Saved';
             } catch (err) {
                 alert('Failed to save LLM description: ' + err.message);
-                saveBtn.textContent = originalText;
             } finally {
-                saveBtn.disabled = false;
+                setButtonBusy(saveBtn, false);
             }
         }
         
@@ -7067,9 +7142,7 @@ def home():
             const saveBtn = document.getElementById(`save-btn-${index}`);
             const commentInput = document.getElementById(`comment-input-${index}`);
             
-            // Disable button during save
-            saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
+            setButtonBusy(saveBtn, true);
             
             try {
                 const response = await fetch('/comments', {
@@ -7096,9 +7169,7 @@ def home():
                 console.error('Error saving comment:', error);
                 alert('Error saving comment: ' + error.message);
             } finally {
-                // Re-enable button
-                saveBtn.disabled = false;
-                saveBtn.textContent = 'Save';
+                setButtonBusy(saveBtn, false);
             }
         }
         
@@ -7293,10 +7364,8 @@ def home():
             }
 
             const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
-            const originalLabel = button ? button.textContent : '';
             if (button) {
-                button.disabled = true;
-                button.textContent = 'Searching...';
+                setButtonBusy(button, true);
             }
 
             try {
@@ -7339,8 +7408,7 @@ def home():
                 showSegmentPanelNotice(panel, `Mask search failed: ${err.message || String(err)}`, 'error');
             } finally {
                 if (button) {
-                    button.disabled = false;
-                    button.textContent = originalLabel || 'Search by mask';
+                    setButtonBusy(button, false);
                 }
             }
         }
@@ -7360,10 +7428,8 @@ def home():
             };
 
             const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
-            const originalLabel = button ? button.textContent : '';
             if (button) {
-                button.disabled = true;
-                button.textContent = 'Indexing...';
+                setButtonBusy(button, true);
             }
 
             try {
@@ -7395,8 +7461,7 @@ def home():
                 indexStatus.className = 'status error';
             } finally {
                 if (button) {
-                    button.disabled = false;
-                    button.textContent = originalLabel || 'Index segments';
+                    setButtonBusy(button, false);
                 }
             }
         }
