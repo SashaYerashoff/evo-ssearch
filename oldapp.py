@@ -2336,6 +2336,18 @@ def home():
             color: #e5d29b;
         }
 
+        .luxriot-stream-tag.idle {
+            border-color: #474747;
+            background: rgba(82, 82, 82, 0.22);
+            color: #c9c9c9;
+        }
+
+        .luxriot-stream-subline {
+            color: #bababa;
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+
         .luxriot-stream-controls {
             display: flex;
             align-items: center;
@@ -3445,15 +3457,15 @@ def home():
                 </div>
                 <div class="luxriot-stream-manager">
                     <div class="luxriot-stream-manager-head">
-                        <div class="video-block-title">Active Streams</div>
+                        <div class="video-block-title">Channel Runtime</div>
                         <div class="luxriot-actions">
                             <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
                             <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
-                            <button id="luxriotStopAllAnalytics" class="feature-btn">Stop analytics</button>
+                            <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
                         </div>
                     </div>
                     <div id="luxriotStreams" class="luxriot-stream-list">
-                        <div class="loading">No active streams.</div>
+                        <div class="loading">No active channels.</div>
                     </div>
                 </div>
             </div>
@@ -3997,6 +4009,7 @@ def home():
         let probeImageState = null;
         let imageProbeEnabled = false;
         let probeList = [];
+        let probeCatalog = [];
         let activeProbeId = null;
         const probeCaptureState = {};
         const probeChannelRuntime = {};
@@ -4221,6 +4234,16 @@ def home():
             }
         }
 
+        function getLuxriotChannelLabel(channelId) {
+            if (!Number.isFinite(channelId)) return 'Unknown channel';
+            if (!luxriotChannelSelect) return `Channel #${channelId}`;
+            const options = Array.from(luxriotChannelSelect.options || []);
+            const match = options.find((opt) => parseInt(opt.value || '', 10) === channelId);
+            if (!match) return `Channel #${channelId}`;
+            const label = String(match.textContent || '').trim();
+            return label || `Channel #${channelId}`;
+        }
+
         function startLuxriotPreview() {
             if (!luxriotPreviewImg) return;
             const channelId = getSelectedLuxriotChannel();
@@ -4308,6 +4331,14 @@ def home():
                 delete probeChannelRuntime[channelId];
             });
             Object.assign(probeChannelRuntime, nextState);
+            Object.keys(probeCaptureState).forEach((channelId) => {
+                delete probeCaptureState[channelId];
+            });
+            Object.entries(probeChannelRuntime).forEach(([channelId, state]) => {
+                if (state === 'running') {
+                    probeCaptureState[channelId] = true;
+                }
+            });
             if (rerender) {
                 renderProbeCards();
             }
@@ -4326,7 +4357,7 @@ def home():
             }
         }
 
-        function renderLuxriotStreams(payload) {
+        function renderLuxriotStreams(payload, probes = probeCatalog) {
             if (!luxriotStreams) return;
             const data = payload && typeof payload === 'object' ? payload : {};
             const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
@@ -4338,78 +4369,134 @@ def home():
             );
             updateProbeChannelRuntime(data, probeList.length > 0);
             luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
-            if (!videoStreams.length && !analyticsStreams.length && !pausedChannels.size) {
-                luxriotStreams.innerHTML = '<div class="loading">No active streams.</div>';
-                return;
-            }
-            const rows = [];
             const sortedVideo = videoStreams
                 .slice()
                 .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
             const sortedAnalytics = analyticsStreams
                 .slice()
                 .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
+            const videoByChannel = new Map();
             sortedVideo.forEach((stream) => {
-                const channelId = Number(stream.channel_id) || 0;
-                const batch = Number(stream.batch_size) || 0;
-                const queued = Number(stream.pending_frames) || 0;
-                const flushes = Number(stream.flush_count) || 0;
-                const parts = [`Channel #${channelId}`];
-                if (batch > 0) parts.push(`batch ${batch}`);
-                parts.push(`${queued} queued`);
-                if (flushes > 0) parts.push(`${flushes} flushes`);
-                if (stream.last_error) parts.push('error');
-                rows.push(`
-                    <div class="luxriot-stream-item">
-                        <div class="luxriot-stream-kind">Video</div>
-                        <div class="luxriot-stream-main">
-                            <div class="luxriot-stream-title">${escapeHtml(stream.running ? 'Running summary stream' : 'Stopped summary stream')}</div>
-                            <div class="luxriot-stream-meta">${escapeHtml(parts.join(' · '))}</div>
-                        </div>
-                        <div class="luxriot-stream-controls">
-                            <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video">Stop</button>
-                        </div>
-                    </div>
-                `);
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                videoByChannel.set(channelId, stream);
+            });
+            const analyticsByChannel = new Map();
+            sortedAnalytics.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                analyticsByChannel.set(channelId, stream);
+            });
+            const probeStatsByChannel = new Map();
+            (Array.isArray(probes) ? probes : []).forEach((probe) => {
+                const channelId = parseInt(String(probe?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                if (!probeStatsByChannel.has(channelId)) {
+                    probeStatsByChannel.set(channelId, { total: 0, enabled: 0, disabled: 0 });
+                }
+                const stats = probeStatsByChannel.get(channelId);
+                stats.total += 1;
+                if (probe?.enabled === false) stats.disabled += 1;
+                else stats.enabled += 1;
+            });
+            const channelIds = new Set();
+            sortedVideo.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (Number.isFinite(channelId)) channelIds.add(channelId);
             });
             sortedAnalytics.forEach((stream) => {
-                const channelId = Number(stream.channel_id) || 0;
-                const queued = Number(stream.pending_frames) || 0;
-                const intervalSec = Number(stream.interval_sec);
-                const fpsLabel = Number.isFinite(intervalSec) && intervalSec > 0 ? `${(1 / intervalSec).toFixed(2)} fps` : 'n/a fps';
-                const isPaused = pausedChannels.has(channelId);
-                const parts = [`Channel #${channelId}`, fpsLabel, `${queued} buffered`];
-                if (stream.last_error) parts.push('error');
-                rows.push(`
-                    <div class="luxriot-stream-item">
-                        <div class="luxriot-stream-kind analytics">Analytics</div>
-                        <div class="luxriot-stream-main">
-                            <div class="luxriot-stream-title">${escapeHtml(stream.running ? 'Running probe capture' : 'Stopped probe capture')}</div>
-                            <div class="luxriot-stream-meta">${escapeHtml(parts.join(' · '))}</div>
-                            ${isPaused ? '<span class="luxriot-stream-tag paused">paused</span>' : '<span class="luxriot-stream-tag">active</span>'}
-                        </div>
-                        <div class="luxriot-stream-controls">
-                            <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics">Stop</button>
-                        </div>
-                    </div>
-                `);
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (Number.isFinite(channelId)) channelIds.add(channelId);
             });
-            const runningAnalyticsChannels = new Set(sortedAnalytics.map((stream) => Number(stream.channel_id) || 0));
-            Array.from(pausedChannels)
-                .filter((channelId) => !runningAnalyticsChannels.has(channelId))
+            pausedChannels.forEach((channelId) => channelIds.add(channelId));
+            probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
+            if (!channelIds.size) {
+                luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
+                return;
+            }
+            const rows = Array.from(channelIds)
                 .sort((a, b) => a - b)
-                .forEach((channelId) => {
-                    rows.push(`
+                .map((channelId) => {
+                    const video = videoByChannel.get(channelId) || null;
+                    const analytics = analyticsByChannel.get(channelId) || null;
+                    const stats = probeStatsByChannel.get(channelId) || { total: 0, enabled: 0, disabled: 0 };
+                    const hasProbes = stats.total > 0;
+                    const enabledCount = stats.enabled || 0;
+                    const isVideoRunning = Boolean(video?.running);
+                    const isProbeRunning = Boolean(analytics?.running);
+                    const isProbePaused = pausedChannels.has(channelId);
+
+                    const videoParts = [];
+                    if (isVideoRunning) {
+                        const batch = Number(video?.batch_size) || 0;
+                        const queued = Number(video?.pending_frames) || 0;
+                        const flushes = Number(video?.flush_count) || 0;
+                        if (batch > 0) videoParts.push(`batch ${batch}`);
+                        videoParts.push(`${queued} queued`);
+                        if (flushes > 0) videoParts.push(`${flushes} flushes`);
+                        if (video?.last_error) videoParts.push('error');
+                    }
+                    const videoLine = isVideoRunning
+                        ? `Video summaries: active${videoParts.length ? ` · ${videoParts.join(' · ')}` : ''}`
+                        : 'Video summaries: idle';
+
+                    const probeParts = [];
+                    if (isProbeRunning) {
+                        const queued = Number(analytics?.pending_frames) || 0;
+                        const intervalSec = Number(analytics?.interval_sec);
+                        const fpsLabel = Number.isFinite(intervalSec) && intervalSec > 0 ? `${(1 / intervalSec).toFixed(2)} fps` : 'n/a fps';
+                        probeParts.push(fpsLabel, `${queued} buffered`);
+                        if (analytics?.last_error) probeParts.push('error');
+                    }
+                    const probeLine = isProbeRunning
+                        ? `Probe capture: active${probeParts.length ? ` · ${probeParts.join(' · ')}` : ''}`
+                        : isProbePaused
+                            ? 'Probe capture: paused'
+                            : enabledCount > 0
+                                ? 'Probe capture: idle'
+                                : hasProbes
+                                    ? 'Probe capture: all probes disabled'
+                                    : 'Probe capture: no probes configured';
+
+                    const probesLine = hasProbes
+                        ? `Probes: ${stats.total} total · ${enabledCount} enabled${stats.disabled ? ` · ${stats.disabled} disabled` : ''}`
+                        : 'Probes: none';
+                    const videoTag = isVideoRunning
+                        ? '<span class="luxriot-stream-tag">video active</span>'
+                        : '<span class="luxriot-stream-tag idle">video idle</span>';
+                    const probeTag = isProbeRunning
+                        ? '<span class="luxriot-stream-tag">probes active</span>'
+                        : isProbePaused
+                            ? '<span class="luxriot-stream-tag paused">probes paused</span>'
+                            : enabledCount > 0
+                                ? '<span class="luxriot-stream-tag idle">probes idle</span>'
+                                : hasProbes
+                                    ? '<span class="luxriot-stream-tag idle">probes disabled</span>'
+                                    : '<span class="luxriot-stream-tag idle">no probes</span>';
+                    const pauseLabel = isProbePaused ? 'Resume probes' : 'Pause probes';
+                    const pauseAction = isProbePaused ? 'resume' : 'pause';
+                    const canPauseProbes = !isProbePaused && (isProbeRunning || enabledCount > 0);
+                    const canResumeProbes = isProbePaused;
+                    const canProbeAction = canPauseProbes || canResumeProbes;
+                    const canStopAll = isVideoRunning || isProbeRunning;
+                    const channelLabel = getLuxriotChannelLabel(channelId);
+                    return `
                         <div class="luxriot-stream-item">
-                            <div class="luxriot-stream-kind analytics">Analytics</div>
+                            <div class="luxriot-stream-kind">Channel</div>
                             <div class="luxriot-stream-main">
-                                <div class="luxriot-stream-title">Paused probe capture</div>
-                                <div class="luxriot-stream-meta">Channel #${channelId}</div>
-                                <span class="luxriot-stream-tag paused">paused</span>
+                                <div class="luxriot-stream-title">${escapeHtml(channelLabel)}</div>
+                                <div class="luxriot-stream-subline">${escapeHtml(probesLine)}</div>
+                                <div class="luxriot-stream-subline">${escapeHtml(videoLine)}</div>
+                                <div class="luxriot-stream-subline">${escapeHtml(probeLine)}</div>
+                                <div class="luxriot-stream-meta">${videoTag} ${probeTag}</div>
                             </div>
-                            <div class="luxriot-stream-controls"></div>
+                            <div class="luxriot-stream-controls">
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video" ${isVideoRunning ? '' : 'disabled'}>Stop video</button>
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>
+                            </div>
                         </div>
-                    `);
+                    `;
                 });
             luxriotStreams.innerHTML = rows.join('');
         }
@@ -4422,9 +4509,56 @@ def home():
                 if (!resp.ok || data.error) {
                     throw new Error(data.error || 'Failed to fetch stream state');
                 }
-                renderLuxriotStreams(data);
+                try {
+                    const probesResp = await fetch('/probes/list');
+                    const probesData = await probesResp.json();
+                    if (probesResp.ok && !probesData.error && Array.isArray(probesData.probes)) {
+                        probeCatalog = probesData.probes;
+                    }
+                } catch (_) {
+                    // Keep previous probe catalog if probe listing fails.
+                }
+                renderLuxriotStreams(data, probeCatalog);
             } catch (err) {
                 luxriotStreams.innerHTML = `<div class="loading">Stream state unavailable: ${escapeHtml(err.message || 'Unknown error')}</div>`;
+            }
+        }
+
+        function guessProbeCaptureFps(channelId) {
+            const targetChannel = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(targetChannel)) return 0;
+            const fpsValues = (Array.isArray(probeCatalog) ? probeCatalog : [])
+                .filter((probe) => parseInt(String(probe?.channel_id ?? ''), 10) === targetChannel)
+                .map((probe) => Number.parseFloat(String(probe?.fps ?? '')))
+                .filter((fps) => Number.isFinite(fps) && fps > 0);
+            if (!fpsValues.length) return 0;
+            return Math.max(...fpsValues);
+        }
+
+        async function resumeLuxriotProbeCapture(channelId) {
+            const parsedChannelId = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsedChannelId)) {
+                setLuxriotStatus('Invalid channel id for probe resume', true);
+                return;
+            }
+            const fps = guessProbeCaptureFps(parsedChannelId);
+            setLuxriotStatus(`Resuming probe capture on channel ${parsedChannelId}...`);
+            try {
+                const response = await fetch('/probes/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: parsedChannelId,
+                        fps,
+                        clear_pause: true,
+                    }),
+                });
+                await parseApiJson(response, 'Probe resume failed');
+                await refreshLuxriotStreams();
+                await refreshProbeStatus(parsedChannelId);
+                setLuxriotStatus(`Probe capture resumed on channel ${parsedChannelId}`);
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Failed to resume probe capture', true);
             }
         }
 
@@ -4439,7 +4573,12 @@ def home():
                 setLuxriotStatus('Invalid stream type', true);
                 return;
             }
-            setLuxriotStatus(`Stopping ${normalizedType} stream on channel ${parsedChannelId}...`);
+            const actionLabel = normalizedType === 'analytics'
+                ? 'Pausing probe capture'
+                : normalizedType === 'video'
+                    ? 'Stopping video summaries'
+                    : 'Stopping video and pausing probes';
+            setLuxriotStatus(`${actionLabel} on channel ${parsedChannelId}...`);
             try {
                 const response = await fetch('/luxriot/streams/stop', {
                     method: 'POST',
@@ -4450,19 +4589,20 @@ def home():
                         pause_analytics: true,
                     }),
                 });
-                const data = await parseApiJson(response, 'Stream stop failed');
-                if (data.streams) {
-                    renderLuxriotStreams(data.streams);
-                } else {
-                    await refreshLuxriotStreams();
-                }
+                await parseApiJson(response, 'Stream stop failed');
+                await refreshLuxriotStreams();
                 if (normalizedType === 'video' || normalizedType === 'both') {
                     await refreshLuxriotSummaries(parsedChannelId);
                 }
                 if (normalizedType === 'analytics' || normalizedType === 'both') {
                     await refreshProbeStatus(parsedChannelId);
                 }
-                setLuxriotStatus(`Stopped ${normalizedType} stream on channel ${parsedChannelId}`);
+                const doneLabel = normalizedType === 'analytics'
+                    ? 'Probe capture paused'
+                    : normalizedType === 'video'
+                        ? 'Video summaries stopped'
+                        : 'Video summaries stopped, probes paused';
+                setLuxriotStatus(`${doneLabel} on channel ${parsedChannelId}`);
             } catch (err) {
                 setLuxriotStatus(err.message || 'Failed to stop stream', true);
             }
@@ -4473,7 +4613,12 @@ def home():
             const stopVideo = normalizedType === 'video' || normalizedType === 'both';
             const stopAnalytics = normalizedType === 'analytics' || normalizedType === 'both';
             if (!stopVideo && !stopAnalytics) return;
-            setLuxriotStatus(`Stopping ${normalizedType} streams...`);
+            const actionLabel = stopVideo && stopAnalytics
+                ? 'Stopping video summaries and pausing probes'
+                : stopVideo
+                    ? 'Stopping all video summaries'
+                    : 'Pausing all probe capture streams';
+            setLuxriotStatus(`${actionLabel}...`);
             try {
                 const response = await fetch('/luxriot/streams/stop_all', {
                     method: 'POST',
@@ -4484,12 +4629,8 @@ def home():
                         pause_analytics: true,
                     }),
                 });
-                const data = await parseApiJson(response, 'Stop-all failed');
-                if (data.streams) {
-                    renderLuxriotStreams(data.streams);
-                } else {
-                    await refreshLuxriotStreams();
-                }
+                await parseApiJson(response, 'Stop-all failed');
+                await refreshLuxriotStreams();
                 if (stopVideo) {
                     stopLuxriotSummaryPoll();
                     await refreshLuxriotSummaries();
@@ -4497,7 +4638,12 @@ def home():
                 if (stopAnalytics) {
                     await refreshProbeStatus();
                 }
-                setLuxriotStatus(`Stopped ${normalizedType} streams`);
+                const doneLabel = stopVideo && stopAnalytics
+                    ? 'Stopped video summaries and paused probes'
+                    : stopVideo
+                        ? 'Stopped all video summaries'
+                        : 'Paused all probe capture streams';
+                setLuxriotStatus(doneLabel);
             } catch (err) {
                 setLuxriotStatus(err.message || 'Failed to stop streams', true);
             }
@@ -5590,9 +5736,14 @@ def home():
                 if (!(button instanceof HTMLButtonElement)) return;
                 const channelId = parseInt(button.dataset.streamStop || '', 10);
                 const streamType = (button.dataset.streamType || '').trim().toLowerCase();
+                const streamAction = (button.dataset.streamAction || '').trim().toLowerCase();
                 if (!Number.isFinite(channelId) || !streamType) return;
                 event.preventDefault();
-                stopLuxriotStream(channelId, streamType);
+                if (streamType === 'analytics' && streamAction === 'resume') {
+                    resumeLuxriotProbeCapture(channelId);
+                } else {
+                    stopLuxriotStream(channelId, streamType);
+                }
             });
         }
         if (luxriotChannelSelect) {
@@ -6034,6 +6185,7 @@ def home():
                 const resp = await fetch('/probes/list');
                 const data = await resp.json();
                 probeList = data.probes || [];
+                probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
                 await refreshProbeRuntimeState(false);
                 if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
                 const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
@@ -6052,7 +6204,10 @@ def home():
 
         async function ensureProbeCapture(channelId, quiet = false) {
             if (!channelId && channelId !== 0) return;
-            if (probeCaptureState[channelId]) {
+            await refreshProbeRuntimeState(false);
+            const runtimeState = probeChannelRuntime[channelId];
+            if (runtimeState === 'running') {
+                probeCaptureState[channelId] = true;
                 if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
                 setPreviewState('');
                 startProbePreview(channelId);
@@ -6066,7 +6221,11 @@ def home():
                 const resp = await fetch('/probes/start_capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId, fps: channelCaptureConfig[channelId].fps })
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        fps: channelCaptureConfig[channelId].fps,
+                        clear_pause: true,
+                    })
                 });
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
@@ -6088,7 +6247,10 @@ def home():
                 const resp = await fetch('/probes/stop_capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId })
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        pause: reason === 'paused',
+                    })
                 });
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
