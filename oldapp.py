@@ -2133,7 +2133,7 @@ def home():
             display: grid;
             grid-template-columns: 1.3fr 1fr;
             gap: 0.75rem;
-            margin-bottom: 0.75rem;
+            margin-bottom: 0.65rem;
         }
 
         @media (max-width: 1180px) {
@@ -2237,11 +2237,44 @@ def home():
         }
 
         .luxriot-summaries {
-            max-height: 340px;
+            max-height: min(64vh, 720px);
+            min-height: 280px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 0.5rem;
+            gap: 0.55rem;
+            padding-right: 0.2rem;
+        }
+
+        .luxriot-summaries-card {
+            margin-bottom: 0.75rem;
+        }
+
+        .luxriot-stream-card .luxriot-stream-manager {
+            margin-top: 0;
+            padding-top: 0;
+            border-top: none;
+        }
+
+        .luxriot-summary-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-summary-toolbar .luxriot-mini-input {
+            min-width: 180px;
+        }
+
+        .luxriot-summary-meta {
+            color: #b0b0b0;
+            font-size: 0.82rem;
+            min-height: 1.1rem;
+        }
+
+        .luxriot-summary-meta.error {
+            color: #ff9a8e;
         }
 
         .luxriot-stream-manager {
@@ -2391,6 +2424,21 @@ def home():
         .summary-body {
             color: #d7d7d7;
             line-height: 1.45;
+            font-size: 0.96rem;
+            white-space: normal;
+        }
+
+        .summary-body strong {
+            color: #f0f0f0;
+            font-weight: 600;
+        }
+
+        .summary-body code {
+            color: #d4f1da;
+            background: rgba(150, 240, 170, 0.1);
+            border: 1px solid rgba(150, 240, 170, 0.22);
+            padding: 0.05rem 0.24rem;
+            border-radius: 4px;
         }
 
         .luxriot-pill {
@@ -3445,16 +3493,7 @@ def home():
                     <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
                 </div>
             </div>
-                    <div class="luxriot-card">
-                        <div class="luxriot-header">
-                            <h4>Live Summaries</h4>
-                    <div class="luxriot-actions">
-                        <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
-                    </div>
-                </div>
-                <div id="luxriotSummaries" class="luxriot-summaries">
-                    <div class="loading">No summaries yet.</div>
-                </div>
+                    <div class="luxriot-card luxriot-stream-card">
                 <div class="luxriot-stream-manager">
                     <div class="luxriot-stream-manager-head">
                         <div class="video-block-title">Channel Runtime</div>
@@ -3468,6 +3507,23 @@ def home():
                         <div class="loading">No active channels.</div>
                     </div>
                 </div>
+            </div>
+        </div>
+        <div class="luxriot-card luxriot-summaries-card">
+            <div class="luxriot-header">
+                <h4>Live Summaries</h4>
+                <div class="luxriot-summary-toolbar">
+                    <label for="luxriotSummaryChannelSelect">Channel:</label>
+                    <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
+                    <button id="luxriotSummaryFollowBtn" class="feature-btn">Follow live</button>
+                    <button id="luxriotSummaryPauseBtn" class="feature-btn">Pause updates</button>
+                    <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">Jump to latest</button>
+                    <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
+                </div>
+            </div>
+            <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
+            <div id="luxriotSummaries" class="luxriot-summaries">
+                <div class="loading">No summaries yet.</div>
             </div>
         </div>
         <div class="video-analysis-grid">
@@ -3915,6 +3971,11 @@ def home():
         const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
         const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
+        const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
+        const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
+        const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
+        const luxriotSummaryPauseBtn = document.getElementById('luxriotSummaryPauseBtn');
+        const luxriotSummaryJumpBtn = document.getElementById('luxriotSummaryJumpBtn');
         const luxriotSummaries = document.getElementById('luxriotSummaries');
         const luxriotStreams = document.getElementById('luxriotStreams');
         const luxriotRefreshStreamsBtn = document.getElementById('luxriotRefreshStreams');
@@ -3988,6 +4049,12 @@ def home():
         let lastSummaryTarget = null;
         let segmentContextByIndex = {};
         let luxriotSummaryLogCache = [];
+        const luxriotSummaryChannelCache = {};
+        const luxriotSummarySeenKeys = {};
+        let luxriotSummaryUnread = 0;
+        let luxriotSummaryChannel = null;
+        let luxriotSummaryFollowLive = true;
+        let luxriotSummaryAutoRefresh = true;
         const luxriotDefaults = {
             channelId: {luxriot_default_channel},
             snapshotInterval: {luxriot_snapshot_interval},
@@ -4142,7 +4209,7 @@ def home():
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
-                refreshLuxriotSummaries();
+                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
                 startLuxriotSummaryPoll();
                 syncProbeChannelSelect();
@@ -4201,6 +4268,67 @@ def home():
             return luxriotDefaults.channelId;
         }
 
+        function getSelectedSummaryChannel() {
+            const raw = luxriotSummaryChannelSelect ? luxriotSummaryChannelSelect.value : '';
+            const fallback = luxriotSummaryChannel ?? getSelectedLuxriotChannel();
+            const parsed = parseInt(raw || String(fallback || ''), 10);
+            if (Number.isFinite(parsed)) {
+                luxriotSummaryChannel = parsed;
+                return parsed;
+            }
+            return getSelectedLuxriotChannel();
+        }
+
+        function setSummaryUnread(count) {
+            luxriotSummaryUnread = Math.max(0, Number.isFinite(count) ? count : 0);
+            if (!luxriotSummaryJumpBtn) return;
+            if (luxriotSummaryUnread > 0) {
+                luxriotSummaryJumpBtn.classList.remove('is-hidden');
+                luxriotSummaryJumpBtn.textContent = `Jump to latest (${luxriotSummaryUnread})`;
+            } else {
+                luxriotSummaryJumpBtn.classList.add('is-hidden');
+                luxriotSummaryJumpBtn.textContent = 'Jump to latest';
+            }
+        }
+
+        function updateSummaryControlsUI() {
+            if (luxriotSummaryFollowBtn) {
+                luxriotSummaryFollowBtn.classList.toggle('primary', luxriotSummaryFollowLive);
+                luxriotSummaryFollowBtn.textContent = luxriotSummaryFollowLive ? 'Follow: ON' : 'Follow: OFF';
+            }
+            if (luxriotSummaryPauseBtn) {
+                luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
+                luxriotSummaryPauseBtn.textContent = luxriotSummaryAutoRefresh ? 'Pause updates' : 'Resume updates';
+            }
+        }
+
+        function syncLuxriotSummaryChannelSelect() {
+            if (!luxriotSummaryChannelSelect || !luxriotChannelSelect) return;
+            const options = Array.from(luxriotChannelSelect.options || [])
+                .map((opt) => {
+                    const value = String(opt.value || '').trim();
+                    const label = String(opt.textContent || '').trim();
+                    if (!value) return null;
+                    return `<option value="${value}">${escapeHtml(label)}</option>`;
+                })
+                .filter((opt) => Boolean(opt));
+            if (!options.length) {
+                luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
+                return;
+            }
+            const selected = Number.isFinite(luxriotSummaryChannel) ? luxriotSummaryChannel : getSelectedLuxriotChannel();
+            luxriotSummaryChannelSelect.innerHTML = options.join('');
+            const exists = Array.from(luxriotSummaryChannelSelect.options || [])
+                .some((opt) => parseInt(String(opt.value || ''), 10) === selected);
+            if (exists) {
+                luxriotSummaryChannelSelect.value = String(selected);
+            } else {
+                luxriotSummaryChannelSelect.selectedIndex = 0;
+                const first = parseInt(luxriotSummaryChannelSelect.value || '', 10);
+                luxriotSummaryChannel = Number.isFinite(first) ? first : getSelectedLuxriotChannel();
+            }
+        }
+
         async function fetchLuxriotChannels(force = false) {
             if (!luxriotChannelSelect) return;
             luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
@@ -4213,6 +4341,9 @@ def home():
                 const channels = data.channels || [];
                 if (!channels.length) {
                     luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    if (luxriotSummaryChannelSelect) {
+                        luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    }
                     setLuxriotStatus('No channels available', true);
                     return;
                 }
@@ -4227,9 +4358,16 @@ def home():
                     luxriotActiveChannel = channels[0].id;
                     luxriotChannelSelect.value = luxriotActiveChannel;
                 }
+                if (!Number.isFinite(luxriotSummaryChannel)) {
+                    luxriotSummaryChannel = luxriotActiveChannel;
+                }
+                syncLuxriotSummaryChannelSelect();
                 setLuxriotStatus(`Loaded ${channels.length} channels`);
             } catch (err) {
                 luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                if (luxriotSummaryChannelSelect) {
+                    luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                }
                 setLuxriotStatus('Channel load failed: ' + err.message, true);
             }
         }
@@ -4271,25 +4409,68 @@ def home():
             luxriotPreviewTimer = setInterval(refresh, intervalMs);
         }
 
-        function renderLuxriotSummaries(logs) {
+        function luxriotSummaryLogKey(log, idx = 0) {
+            const createdRaw = Number(log?.created_at);
+            const createdKey = Number.isFinite(createdRaw) ? createdRaw.toFixed(6) : `idx-${idx}`;
+            const frameKey = Number(log?.frame_count || 0);
+            const summaryKey = String(log?.summary || '').trim().slice(0, 160);
+            return `${createdKey}|${frameKey}|${summaryKey}`;
+        }
+
+        function isSummaryNearBottom(threshold = 48) {
+            if (!luxriotSummaries) return true;
+            return (luxriotSummaries.scrollTop + luxriotSummaries.clientHeight) >= (luxriotSummaries.scrollHeight - threshold);
+        }
+
+        function scrollSummaryToLatest() {
             if (!luxriotSummaries) return;
-            if (!logs || !logs.length) {
+            luxriotSummaries.scrollTop = luxriotSummaries.scrollHeight;
+        }
+
+        function setLuxriotSummaryMeta(text, isError = false) {
+            if (!luxriotSummaryMeta) return;
+            luxriotSummaryMeta.textContent = text;
+            luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
+        }
+
+        function renderLuxriotSummaries(logs, channelId = getSelectedSummaryChannel()) {
+            if (!luxriotSummaries) return;
+            const normalizedLogs = Array.isArray(logs) ? logs.slice() : [];
+            normalizedLogs.sort((a, b) => Number(a?.created_at || 0) - Number(b?.created_at || 0));
+            luxriotSummaryChannelCache[channelId] = normalizedLogs;
+
+            const prevKeys = Array.isArray(luxriotSummarySeenKeys[channelId]) ? luxriotSummarySeenKeys[channelId] : [];
+            const prevKeySet = new Set(prevKeys);
+            const newKeys = normalizedLogs.map((log, idx) => luxriotSummaryLogKey(log, idx));
+            luxriotSummarySeenKeys[channelId] = newKeys;
+            const newCount = newKeys.reduce((count, key) => count + (prevKeySet.has(key) ? 0 : 1), 0);
+            const shouldStickBottom = luxriotSummaryFollowLive && isSummaryNearBottom();
+            const prevScrollTop = luxriotSummaries.scrollTop;
+            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
+
+            if (!normalizedLogs.length) {
                 luxriotSummaryLogCache = [];
-                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet.</div>';
+                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet for this channel.</div>';
+                if (luxriotSummaryFollowLive) {
+                    setSummaryUnread(0);
+                }
+                luxriotSummaries.dataset.hasRender = '1';
                 return;
             }
-            luxriotSummaryLogCache = logs.slice().reverse();
+
+            luxriotSummaryLogCache = normalizedLogs;
             const html = luxriotSummaryLogCache
                 .map((log, idx) => {
                     const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
                     const tsLabel = ts ? ts.toLocaleString() : 'n/a';
                     const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
+                    const modelLabel = String(log.model || '').trim();
                     const summary = String(log.summary || '').trim();
                     const canBookmark = summary.length > 0;
                     return `
-                        <div class="luxriot-summary">
+                        <div class="luxriot-summary" data-log-key="${escapeHtml(luxriotSummaryLogKey(log, idx))}">
                             <div class="luxriot-summary-head">
-                                <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}</div>
+                                <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
                                 <button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${canBookmark ? '' : 'disabled'}>
                                     Bookmark
                                 </button>
@@ -4300,6 +4481,19 @@ def home():
                 })
                 .join('');
             luxriotSummaries.innerHTML = html;
+
+            if (shouldStickBottom || !hasInitialRender) {
+                scrollSummaryToLatest();
+            } else {
+                luxriotSummaries.scrollTop = prevScrollTop;
+            }
+            luxriotSummaries.dataset.hasRender = '1';
+
+            if (luxriotSummaryFollowLive) {
+                setSummaryUnread(0);
+            } else if (newCount > 0) {
+                setSummaryUnread(luxriotSummaryUnread + newCount);
+            }
         }
 
         function updateProbeChannelRuntime(payload, rerender = false) {
@@ -4367,6 +4561,11 @@ def home():
                     .map((val) => parseInt(String(val), 10))
                     .filter((val) => Number.isFinite(val))
             );
+            const historyChannels = new Set(
+                (Array.isArray(data.video_history_channels) ? data.video_history_channels : [])
+                    .map((val) => parseInt(String(val), 10))
+                    .filter((val) => Number.isFinite(val))
+            );
             updateProbeChannelRuntime(data, probeList.length > 0);
             luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
             const sortedVideo = videoStreams
@@ -4409,6 +4608,7 @@ def home():
                 if (Number.isFinite(channelId)) channelIds.add(channelId);
             });
             pausedChannels.forEach((channelId) => channelIds.add(channelId));
+            historyChannels.forEach((channelId) => channelIds.add(channelId));
             probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
             if (!channelIds.size) {
                 luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
@@ -4425,6 +4625,7 @@ def home():
                     const isVideoRunning = Boolean(video?.running);
                     const isProbeRunning = Boolean(analytics?.running);
                     const isProbePaused = pausedChannels.has(channelId);
+                    const hasVideoHistory = historyChannels.has(channelId);
 
                     const videoParts = [];
                     if (isVideoRunning) {
@@ -4438,7 +4639,9 @@ def home():
                     }
                     const videoLine = isVideoRunning
                         ? `Video summaries: active${videoParts.length ? ` · ${videoParts.join(' · ')}` : ''}`
-                        : 'Video summaries: idle';
+                        : hasVideoHistory
+                            ? 'Video summaries: stopped · history available'
+                            : 'Video summaries: idle';
 
                     const probeParts = [];
                     if (isProbeRunning) {
@@ -4491,6 +4694,7 @@ def home():
                                 <div class="luxriot-stream-meta">${videoTag} ${probeTag}</div>
                             </div>
                             <div class="luxriot-stream-controls">
+                                <button class="feature-btn" data-summary-channel="${channelId}">View summaries</button>
                                 <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video" ${isVideoRunning ? '' : 'disabled'}>Stop video</button>
                                 <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
                                 <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>
@@ -4592,7 +4796,7 @@ def home():
                 await parseApiJson(response, 'Stream stop failed');
                 await refreshLuxriotStreams();
                 if (normalizedType === 'video' || normalizedType === 'both') {
-                    await refreshLuxriotSummaries(parsedChannelId);
+                    await refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
                 }
                 if (normalizedType === 'analytics' || normalizedType === 'both') {
                     await refreshProbeStatus(parsedChannelId);
@@ -4633,7 +4837,7 @@ def home():
                 await refreshLuxriotStreams();
                 if (stopVideo) {
                     stopLuxriotSummaryPoll();
-                    await refreshLuxriotSummaries();
+                    await refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
                 }
                 if (stopAnalytics) {
                     await refreshProbeStatus();
@@ -4706,15 +4910,34 @@ def home():
             }
         }
 
-        async function refreshLuxriotSummaries(channelId = getSelectedLuxriotChannel()) {
+        async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false) {
             if (!channelId) return;
+            if (!luxriotSummaryAutoRefresh && !force) return;
             try {
                 const resp = await fetch(`/luxriot/session?channel_id=${channelId}`);
                 const data = await resp.json();
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                renderLuxriotSummaries(data.logs || []);
+                renderLuxriotSummaries(data.logs || [], channelId);
+                const historyCount = Number(data.archived_log_count || 0);
+                const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
+                const stateLabel = data.running ? 'running' : 'stopped';
+                const detailParts = [
+                    getLuxriotChannelLabel(channelId),
+                    `state: ${stateLabel}`,
+                    `entries: ${totalCount}`,
+                ];
+                if (historyCount > 0) {
+                    detailParts.push(`archived: ${historyCount}`);
+                }
+                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
+                    detailParts.push(`${data.pending_frames} queued`);
+                }
+                if (data.last_error) {
+                    detailParts.push('last error');
+                }
+                setLuxriotSummaryMeta(detailParts.join(' · '), Boolean(data.last_error));
                 let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
                 if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
                     baseStatus += ` · ${data.pending_frames} frames queued`;
@@ -4724,13 +4947,15 @@ def home():
                     luxriotStatusLabel.title = data.last_error;
                 }
             } catch (err) {
+                setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
                 setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
             }
         }
 
-        function startLuxriotSummaryPoll(channelId = getSelectedLuxriotChannel()) {
+        function startLuxriotSummaryPoll() {
             stopLuxriotSummaryPoll();
             luxriotSummaryTimer = setInterval(() => {
+                const channelId = getSelectedSummaryChannel();
                 refreshLuxriotSummaries(channelId);
                 refreshLuxriotStreams();
             }, 8000);
@@ -4767,9 +4992,14 @@ def home():
                     throw new Error(data.error || 'Luxriot start failed');
                 }
                 setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
-                refreshLuxriotSummaries(channelId);
+                luxriotSummaryChannel = channelId;
+                luxriotSummaryFollowLive = true;
+                syncLuxriotSummaryChannelSelect();
+                updateSummaryControlsUI();
+                setSummaryUnread(0);
+                refreshLuxriotSummaries(channelId, true);
                 refreshLuxriotStreams();
-                startLuxriotSummaryPoll(channelId);
+                startLuxriotSummaryPoll();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             } finally {
@@ -4791,7 +5021,7 @@ def home():
                     throw new Error(data.error);
                 }
                 setLuxriotStatus('Summaries stopped');
-                refreshLuxriotSummaries(channelId);
+                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
@@ -4813,7 +5043,9 @@ def home():
                 }
                 setLuxriotStatus('Buffer flushed');
                 if (data.status) {
-                    renderLuxriotSummaries(data.status.logs || []);
+                    if (getSelectedSummaryChannel() === channelId) {
+                        renderLuxriotSummaries(data.status.logs || [], channelId);
+                    }
                 }
                 refreshLuxriotStreams();
             } catch (err) {
@@ -4825,9 +5057,13 @@ def home():
             if (luxriotInitialized) return;
             luxriotInitialized = true;
             await fetchLuxriotChannels();
+            updateSummaryControlsUI();
+            setSummaryUnread(0);
+            syncLuxriotSummaryChannelSelect();
             startLuxriotPreview();
-            refreshLuxriotSummaries();
+            refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
             refreshLuxriotStreams();
+            startLuxriotSummaryPoll();
         }
 
         const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
@@ -5705,7 +5941,50 @@ def home():
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
         }
         if (luxriotRefreshSummariesBtn) {
-            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries());
+            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries(getSelectedSummaryChannel(), true));
+        }
+        if (luxriotSummaryChannelSelect) {
+            luxriotSummaryChannelSelect.addEventListener('change', () => {
+                luxriotSummaryChannel = getSelectedSummaryChannel();
+                setSummaryUnread(0);
+                refreshLuxriotSummaries(luxriotSummaryChannel, true);
+            });
+        }
+        if (luxriotSummaryFollowBtn) {
+            luxriotSummaryFollowBtn.addEventListener('click', () => {
+                luxriotSummaryFollowLive = !luxriotSummaryFollowLive;
+                updateSummaryControlsUI();
+                if (luxriotSummaryFollowLive) {
+                    setSummaryUnread(0);
+                    scrollSummaryToLatest();
+                }
+            });
+        }
+        if (luxriotSummaryPauseBtn) {
+            luxriotSummaryPauseBtn.addEventListener('click', () => {
+                luxriotSummaryAutoRefresh = !luxriotSummaryAutoRefresh;
+                updateSummaryControlsUI();
+                if (luxriotSummaryAutoRefresh) {
+                    refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                }
+            });
+        }
+        if (luxriotSummaryJumpBtn) {
+            luxriotSummaryJumpBtn.addEventListener('click', () => {
+                luxriotSummaryFollowLive = true;
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                scrollSummaryToLatest();
+            });
+        }
+        if (luxriotSummaries) {
+            luxriotSummaries.addEventListener('scroll', () => {
+                if (!luxriotSummaryFollowLive) return;
+                if (!isSummaryNearBottom()) {
+                    luxriotSummaryFollowLive = false;
+                    updateSummaryControlsUI();
+                }
+            });
         }
         if (luxriotRefreshStreamsBtn) {
             luxriotRefreshStreamsBtn.addEventListener('click', () => refreshLuxriotStreams());
@@ -5732,6 +6011,21 @@ def home():
             luxriotStreams.addEventListener('click', (event) => {
                 const target = event.target;
                 if (!(target instanceof Element)) return;
+                const summaryBtn = target.closest('[data-summary-channel]');
+                if (summaryBtn instanceof HTMLButtonElement) {
+                    const summaryChannelId = parseInt(summaryBtn.dataset.summaryChannel || '', 10);
+                    if (Number.isFinite(summaryChannelId)) {
+                        luxriotSummaryChannel = summaryChannelId;
+                        syncLuxriotSummaryChannelSelect();
+                        setSummaryUnread(0);
+                        luxriotSummaryFollowLive = true;
+                        updateSummaryControlsUI();
+                        refreshLuxriotSummaries(summaryChannelId, true);
+                        scrollSummaryToLatest();
+                    }
+                    event.preventDefault();
+                    return;
+                }
                 const button = target.closest('[data-stream-stop]');
                 if (!(button instanceof HTMLButtonElement)) return;
                 const channelId = parseInt(button.dataset.streamStop || '', 10);
@@ -5750,8 +6044,9 @@ def home():
             luxriotChannelSelect.addEventListener('change', () => {
                 luxriotActiveChannel = getSelectedLuxriotChannel();
                 syncProbeChannelSelect();
+                syncLuxriotSummaryChannelSelect();
                 startLuxriotPreview();
-                refreshLuxriotSummaries();
+                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             });
         }

@@ -3,7 +3,7 @@ import json
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, cast
 
 import requests
 from PIL import Image
@@ -366,6 +366,50 @@ class LuxriotManager:
         self.paused_probe_channels: Set[int] = set()
         self.cache_lock = threading.Lock()
         self.channels_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        try:
+            history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
+        except Exception:
+            history_limit = 600
+        self.summary_history_limit = max(40, history_limit)
+        self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
+
+    @staticmethod
+    def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str]:
+        created_raw = log.get("created_at")
+        try:
+            created = f"{float(created_raw):.6f}"
+        except Exception:
+            created = "0.000000"
+        frame_count = str(log.get("frame_count") or "")
+        summary = str(log.get("summary") or "").strip()
+        return (created, frame_count, summary[:160])
+
+    @classmethod
+    def _combine_summary_logs(
+        cls,
+        history_logs: Sequence[Mapping[str, Any]],
+        current_logs: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        ordered: List[Tuple[str, str, str]] = []
+        for item in list(history_logs) + list(current_logs):
+            if not isinstance(item, Mapping):
+                continue
+            key = cls._summary_log_key(item)
+            if key not in merged:
+                ordered.append(key)
+            merged[key] = dict(item)
+        ordered.sort(key=lambda key: float(key[0]))
+        return [merged[key] for key in ordered]
+
+    def _merge_summary_history_locked(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> None:
+        if not logs:
+            return
+        existing = self.summary_history.get(channel_id, [])
+        combined = self._combine_summary_logs(existing, logs)
+        if len(combined) > self.summary_history_limit:
+            combined = combined[-self.summary_history_limit :]
+        self.summary_history[channel_id] = combined
 
     def build_client(self) -> LuxriotClient:
         return LuxriotClient(
@@ -436,6 +480,10 @@ class LuxriotManager:
         with self.cache_lock:
             existing = self.sessions.pop(channel_id, None)
             if existing:
+                existing_status = existing.status()
+                existing_logs = existing_status.get("logs")
+                if isinstance(existing_logs, list):
+                    self._merge_summary_history_locked(channel_id, existing_logs)
                 existing.stop()
             if system_prompt:
                 self.system_prompt = system_prompt
@@ -456,9 +504,26 @@ class LuxriotManager:
         with self.cache_lock:
             session = self.sessions.pop(channel_id, None)
         if session:
+            status = session.status()
+            logs = status.get("logs")
             session.stop()
-            return {"channel_id": channel_id, "running": False}
-        return {"channel_id": channel_id, "running": False, "message": "No active session"}
+            with self.cache_lock:
+                if isinstance(logs, list):
+                    self._merge_summary_history_locked(channel_id, logs)
+                archived_count = len(self.summary_history.get(channel_id, []))
+            return {
+                "channel_id": channel_id,
+                "running": False,
+                "archived_log_count": archived_count,
+            }
+        with self.cache_lock:
+            archived_count = len(self.summary_history.get(channel_id, []))
+        return {
+            "channel_id": channel_id,
+            "running": False,
+            "archived_log_count": archived_count,
+            "message": "No active session",
+        }
 
     def start_probe_capture(self, channel_id: int, fps: Optional[float] = None, clear_pause: bool = True) -> Dict[str, Any]:
         with self.cache_lock:
@@ -537,8 +602,14 @@ class LuxriotManager:
     def session_status(self, channel_id: int) -> Dict[str, Any]:
         with self.cache_lock:
             session = self.sessions.get(channel_id)
+            history_logs = list(self.summary_history.get(channel_id, []))
         if session:
-            return session.status()
+            status = session.status()
+            current_logs = status.get("logs")
+            current_list = current_logs if isinstance(current_logs, list) else []
+            status["logs"] = self._combine_summary_logs(history_logs, current_list)
+            status["archived_log_count"] = len(history_logs)
+            return status
         return {
             "running": False,
             "channel_id": channel_id,
@@ -549,7 +620,8 @@ class LuxriotManager:
             "capture_kind": "video",
             "summarization_enabled": True,
             "last_error": None,
-            "logs": [],
+            "logs": history_logs,
+            "archived_log_count": len(history_logs),
         }
 
     @staticmethod
@@ -572,6 +644,7 @@ class LuxriotManager:
             video_items = list(self.sessions.items())
             analytics_items = list(self.probe_sessions.items())
             paused = set(self.paused_probe_channels)
+            history_channels = sorted(channel_id for channel_id, logs in self.summary_history.items() if logs)
         video_streams = [
             self._compact_stream_status("video", session.status(), paused)
             for _, session in video_items
@@ -584,6 +657,7 @@ class LuxriotManager:
             "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
             "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
             "paused_analytics_channels": sorted(paused),
+            "video_history_channels": history_channels,
             "running_total": len(video_streams) + len(analytics_streams),
         }
 
