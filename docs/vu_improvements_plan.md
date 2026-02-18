@@ -22,26 +22,25 @@ Improve Video Understanding usability for multi-channel operation (4-8 channels)
   - `Pause updates` toggle.
   - `Jump to latest` for unread batches.
   - Scroll no longer yanks when user is reading older entries.
+- Reader quality enhancements:
+  - Compact/expanded summary view mode.
+  - Per-entry collapse/expand and collapse-all control.
+  - Per-entry copy/export actions.
+- Retrieval model:
+  - Persisted run IDs for video sessions (`run_id` on capture sessions and summary entries).
+  - `/luxriot/session` supports run selectors (`latest`, `live`, `all`, explicit run ID).
+  - `/luxriot/session` supports time-window filtering (`from_ts`, `to_ts`) and limit.
+  - Reader toolbar run/time controls deferred until next UI stabilization pass.
 
 ## Next implementation slices
-1. Reader quality
-- Add compact/expanded summary card mode.
-- Add optional per-entry collapse.
-- Add copy/export actions per summary entry.
-
-2. Retrieval model
-- Add persisted run IDs for video sessions.
-- Add UI run selector (latest/live/previous runs).
-- Add search/filter by time window and channel.
-
-3. Hierarchical summarization pipeline
+1. Hierarchical summarization pipeline
 - L0: batch summaries (e.g., every 30s).
 - L1: periodic rollups over L0 (10-20 min windows, 12-16k token budget).
 - L2: hourly rollups over L1.
 - L3: shift/day rollups over L2.
 - Keep provenance links: L2 -> L1 -> L0 IDs.
 
-4. Multi-channel operator UX
+2. Multi-channel operator UX
 - Optional split reader for 2 channels.
 - Unread counters per channel in left/runtime panel.
 - Severity/event highlighting in summary cards.

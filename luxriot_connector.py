@@ -187,6 +187,8 @@ class LuxriotCaptureSession:
         channel_id: int,
         batch_size: int,
         prompt: str,
+        run_id: Optional[str] = None,
+        run_started_at: Optional[float] = None,
         model_hint: Optional[str] = None,
         interval_override: Optional[float] = None,
         summarization_enabled: bool = True,
@@ -196,6 +198,8 @@ class LuxriotCaptureSession:
         self.channel_id = channel_id
         self.batch_size = batch_size
         self.prompt = prompt
+        self.run_id = str(run_id or "").strip()
+        self.run_started_at = float(run_started_at) if run_started_at else time.time()
         self.model_hint = model_hint
         self.summarization_enabled = bool(summarization_enabled)
         self.capture_kind = (capture_kind or "video").strip().lower()
@@ -269,6 +273,7 @@ class LuxriotCaptureSession:
             duration = time.time() - started
             entry = {
                 "channel_id": self.channel_id,
+                "run_id": self.run_id,
                 "summary": summary,
                 "frame_count": len(frames_copy),
                 "batch_size": self.batch_size,
@@ -307,6 +312,8 @@ class LuxriotCaptureSession:
         return {
             "running": not self.stop_event.is_set() and self.thread.is_alive(),
             "channel_id": self.channel_id,
+            "run_id": self.run_id,
+            "run_started_at": self.run_started_at,
             "batch_size": self.batch_size,
             "pending_frames": pending_frames,
             "interval_sec": self.interval,
@@ -372,17 +379,20 @@ class LuxriotManager:
             history_limit = 600
         self.summary_history_limit = max(40, history_limit)
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
+        self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
+        self.active_summary_runs: Dict[int, str] = {}
 
     @staticmethod
-    def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str]:
+    def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str, str]:
         created_raw = log.get("created_at")
         try:
             created = f"{float(created_raw):.6f}"
         except Exception:
             created = "0.000000"
+        run_id = str(log.get("run_id") or "").strip()
         frame_count = str(log.get("frame_count") or "")
         summary = str(log.get("summary") or "").strip()
-        return (created, frame_count, summary[:160])
+        return (created, run_id, frame_count, summary[:160])
 
     @classmethod
     def _combine_summary_logs(
@@ -401,6 +411,122 @@ class LuxriotManager:
             merged[key] = dict(item)
         ordered.sort(key=lambda key: float(key[0]))
         return [merged[key] for key in ordered]
+
+    @staticmethod
+    def _coerce_float(value: object) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            num = float(value)
+        except Exception:
+            return None
+        return num if num == num else None
+
+    def _generate_run_id_locked(self, channel_id: int) -> str:
+        base = f"ch{channel_id}-{int(time.time() * 1000)}"
+        existing = {
+            str(run.get("run_id") or "").strip()
+            for run in self.summary_runs.get(channel_id, [])
+            if isinstance(run, Mapping)
+        }
+        run_id = base
+        suffix = 1
+        while run_id in existing:
+            run_id = f"{base}-{suffix}"
+            suffix += 1
+        return run_id
+
+    def _open_run_locked(
+        self,
+        channel_id: int,
+        batch_size: int,
+        prompt: str,
+        model_hint: Optional[str],
+        system_prompt: Optional[str],
+    ) -> Dict[str, Any]:
+        started_at = time.time()
+        run = {
+            "run_id": self._generate_run_id_locked(channel_id),
+            "channel_id": channel_id,
+            "started_at": started_at,
+            "ended_at": None,
+            "running": True,
+            "batch_size": int(batch_size),
+            "model": (model_hint or "").strip() or None,
+            "prompt": prompt or "",
+            "system_prompt": system_prompt or "",
+        }
+        self.summary_runs.setdefault(channel_id, []).append(run)
+        self.active_summary_runs[channel_id] = str(run["run_id"])
+        return dict(run)
+
+    def _close_run_locked(self, channel_id: int, run_id: Optional[str]) -> None:
+        normalized_run_id = str(run_id or "").strip()
+        active_run_id = str(self.active_summary_runs.get(channel_id) or "").strip()
+        target_run_id = normalized_run_id or active_run_id
+        if not target_run_id:
+            return
+        runs = self.summary_runs.get(channel_id, [])
+        for run in runs:
+            if str(run.get("run_id") or "").strip() == target_run_id:
+                run["running"] = False
+                if not run.get("ended_at"):
+                    run["ended_at"] = time.time()
+                break
+        if active_run_id == target_run_id:
+            self.active_summary_runs.pop(channel_id, None)
+
+    @staticmethod
+    def _filter_summary_logs(
+        logs: Sequence[Mapping[str, Any]],
+        run_id: Optional[str] = None,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized_run_id = str(run_id or "").strip()
+        filtered: List[Dict[str, Any]] = []
+        for item in logs:
+            if not isinstance(item, Mapping):
+                continue
+            if normalized_run_id:
+                item_run = str(item.get("run_id") or "").strip()
+                if item_run != normalized_run_id:
+                    continue
+            created = LuxriotManager._coerce_float(item.get("created_at"))
+            if start_ts is not None and (created is None or created < start_ts):
+                continue
+            if end_ts is not None and (created is None or created > end_ts):
+                continue
+            filtered.append(dict(item))
+        return filtered
+
+    @staticmethod
+    def _resolve_run_selector(
+        run_selector: Optional[str],
+        runs: Sequence[Mapping[str, Any]],
+        running_run_id: Optional[str],
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        normalized_selector = str(run_selector or "").strip()
+        if not normalized_selector:
+            normalized_selector = "latest"
+        available = [
+            str(run.get("run_id") or "").strip()
+            for run in runs
+            if isinstance(run, Mapping) and str(run.get("run_id") or "").strip()
+        ]
+        latest_run_id = available[0] if available else None
+        running_id = str(running_run_id or "").strip() or None
+        lowered = normalized_selector.lower()
+        if lowered == "all":
+            return "all", None, latest_run_id
+        if lowered == "live":
+            target = running_id or latest_run_id
+            return "live", target, latest_run_id
+        if lowered == "latest":
+            return "latest", latest_run_id, latest_run_id
+        if normalized_selector in available:
+            return normalized_selector, normalized_selector, latest_run_id
+        return "latest", latest_run_id, latest_run_id
 
     def _merge_summary_history_locked(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> None:
         if not logs:
@@ -484,14 +610,24 @@ class LuxriotManager:
                 existing_logs = existing_status.get("logs")
                 if isinstance(existing_logs, list):
                     self._merge_summary_history_locked(channel_id, existing_logs)
+                self._close_run_locked(channel_id, existing_status.get("run_id"))
                 existing.stop()
             if system_prompt:
                 self.system_prompt = system_prompt
+            run = self._open_run_locked(
+                channel_id=channel_id,
+                batch_size=batch,
+                prompt=prompt,
+                model_hint=model_hint,
+                system_prompt=self.system_prompt,
+            )
             session = LuxriotCaptureSession(
                 self,
                 channel_id,
                 batch,
                 prompt,
+                run_id=run.get("run_id"),
+                run_started_at=run.get("started_at"),
                 model_hint=model_hint,
                 summarization_enabled=True,
                 capture_kind="video",
@@ -510,13 +646,16 @@ class LuxriotManager:
             with self.cache_lock:
                 if isinstance(logs, list):
                     self._merge_summary_history_locked(channel_id, logs)
+                self._close_run_locked(channel_id, status.get("run_id"))
                 archived_count = len(self.summary_history.get(channel_id, []))
             return {
                 "channel_id": channel_id,
+                "run_id": status.get("run_id"),
                 "running": False,
                 "archived_log_count": archived_count,
             }
         with self.cache_lock:
+            self._close_run_locked(channel_id, None)
             archived_count = len(self.summary_history.get(channel_id, []))
         return {
             "channel_id": channel_id,
@@ -599,20 +738,79 @@ class LuxriotManager:
         session.flush_now()
         return {"success": True, "message": "Flushed buffered frames", "status": session.status()}
 
-    def session_status(self, channel_id: int) -> Dict[str, Any]:
+    def session_status(
+        self,
+        channel_id: int,
+        run_selector: Optional[str] = None,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
         with self.cache_lock:
             session = self.sessions.get(channel_id)
             history_logs = list(self.summary_history.get(channel_id, []))
+            run_items = [dict(run) for run in self.summary_runs.get(channel_id, []) if isinstance(run, Mapping)]
+            active_run_id = str(self.active_summary_runs.get(channel_id) or "").strip() or None
         if session:
             status = session.status()
             current_logs = status.get("logs")
             current_list = current_logs if isinstance(current_logs, list) else []
-            status["logs"] = self._combine_summary_logs(history_logs, current_list)
+            all_logs = self._combine_summary_logs(history_logs, current_list)
+            running_run_id = str(status.get("run_id") or "").strip() or active_run_id
+            if running_run_id:
+                active_run_id = running_run_id
+            log_count_by_run: Dict[str, int] = {}
+            for entry in all_logs:
+                run_id = str(entry.get("run_id") or "").strip()
+                if run_id:
+                    log_count_by_run[run_id] = log_count_by_run.get(run_id, 0) + 1
+            for run in run_items:
+                run_id = str(run.get("run_id") or "").strip()
+                run["log_count"] = int(log_count_by_run.get(run_id, 0))
+                run["running"] = bool(run_id and run_id == running_run_id)
+                if run["running"]:
+                    run["ended_at"] = None
+            run_items.sort(key=lambda item: float(item.get("started_at") or 0.0), reverse=True)
+            selected_run, selected_run_id, latest_run_id = self._resolve_run_selector(run_selector, run_items, running_run_id)
+            filtered_logs = self._filter_summary_logs(all_logs, selected_run_id, start_ts, end_ts)
+            if isinstance(limit, int) and limit > 0 and len(filtered_logs) > limit:
+                filtered_logs = filtered_logs[-limit:]
+            status["logs"] = filtered_logs
+            status["logs_total"] = len(all_logs)
+            status["logs_filtered"] = len(filtered_logs)
             status["archived_log_count"] = len(history_logs)
+            status["runs"] = run_items
+            status["running_run_id"] = running_run_id
+            status["latest_run_id"] = latest_run_id
+            status["selected_run"] = selected_run
+            status["run_filter_id"] = selected_run_id
+            status["from_ts"] = start_ts
+            status["to_ts"] = end_ts
+            status["limit"] = limit
             return status
+        all_logs = list(history_logs)
+        log_count_by_run: Dict[str, int] = {}
+        for entry in all_logs:
+            run_id = str(entry.get("run_id") or "").strip()
+            if run_id:
+                log_count_by_run[run_id] = log_count_by_run.get(run_id, 0) + 1
+        for run in run_items:
+            run_id = str(run.get("run_id") or "").strip()
+            run["log_count"] = int(log_count_by_run.get(run_id, 0))
+            run["running"] = bool(run_id and run_id == active_run_id)
+            if run["running"]:
+                run["ended_at"] = None
+        run_items.sort(key=lambda item: float(item.get("started_at") or 0.0), reverse=True)
+        selected_run, selected_run_id, latest_run_id = self._resolve_run_selector(run_selector, run_items, active_run_id)
+        filtered_logs = self._filter_summary_logs(all_logs, selected_run_id, start_ts, end_ts)
+        if isinstance(limit, int) and limit > 0 and len(filtered_logs) > limit:
+            filtered_logs = filtered_logs[-limit:]
         return {
             "running": False,
             "channel_id": channel_id,
+            "run_id": active_run_id,
             "batch_size": None,
             "pending_frames": 0,
             "interval_sec": getattr(self.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5),
@@ -620,8 +818,18 @@ class LuxriotManager:
             "capture_kind": "video",
             "summarization_enabled": True,
             "last_error": None,
-            "logs": history_logs,
+            "logs": filtered_logs,
+            "logs_total": len(all_logs),
+            "logs_filtered": len(filtered_logs),
             "archived_log_count": len(history_logs),
+            "runs": run_items,
+            "running_run_id": active_run_id,
+            "latest_run_id": latest_run_id,
+            "selected_run": selected_run,
+            "run_filter_id": selected_run_id,
+            "from_ts": start_ts,
+            "to_ts": end_ts,
+            "limit": limit,
         }
 
     @staticmethod
