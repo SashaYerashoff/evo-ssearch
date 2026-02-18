@@ -3999,6 +3999,7 @@ def home():
         let probeList = [];
         let activeProbeId = null;
         const probeCaptureState = {};
+        const probeChannelRuntime = {};
         let probeRunTimer = null;
         let probeRunInFlight = false;
         let probePreviewTimer = null;
@@ -4278,6 +4279,53 @@ def home():
             luxriotSummaries.innerHTML = html;
         }
 
+        function updateProbeChannelRuntime(payload, rerender = false) {
+            const data = payload && typeof payload === 'object' ? payload : {};
+            const pausedChannels = new Set(
+                (Array.isArray(data.paused_analytics_channels) ? data.paused_analytics_channels : [])
+                    .map((val) => parseInt(String(val), 10))
+                    .filter((val) => Number.isFinite(val))
+            );
+            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
+            const nextState = {};
+            analyticsStreams.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                if (stream?.running) {
+                    nextState[channelId] = 'running';
+                } else if (pausedChannels.has(channelId)) {
+                    nextState[channelId] = 'paused';
+                } else {
+                    nextState[channelId] = 'idle';
+                }
+            });
+            pausedChannels.forEach((channelId) => {
+                if (!(channelId in nextState)) {
+                    nextState[channelId] = 'paused';
+                }
+            });
+            Object.keys(probeChannelRuntime).forEach((channelId) => {
+                delete probeChannelRuntime[channelId];
+            });
+            Object.assign(probeChannelRuntime, nextState);
+            if (rerender) {
+                renderProbeCards();
+            }
+        }
+
+        async function refreshProbeRuntimeState(rerender = false) {
+            try {
+                const resp = await fetch('/luxriot/streams');
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Failed to fetch runtime stream state');
+                }
+                updateProbeChannelRuntime(data, rerender);
+            } catch (_) {
+                // Keep previous runtime snapshot when stream endpoint is unavailable.
+            }
+        }
+
         function renderLuxriotStreams(payload) {
             if (!luxriotStreams) return;
             const data = payload && typeof payload === 'object' ? payload : {};
@@ -4288,6 +4336,7 @@ def home():
                     .map((val) => parseInt(String(val), 10))
                     .filter((val) => Number.isFinite(val))
             );
+            updateProbeChannelRuntime(data, probeList.length > 0);
             luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
             if (!videoStreams.length && !analyticsStreams.length && !pausedChannels.size) {
                 luxriotStreams.innerHTML = '<div class="loading">No active streams.</div>';
@@ -5853,8 +5902,18 @@ def home():
             const cards = probeList.map((p) => {
                 const last = p.last_hit;
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-                const status = p.enabled === false ? 'disabled' : (p.enabled ? 'running' : 'idle');
-                const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
+                const channelId = parseInt(String(p.channel_id || luxriotActiveChannel), 10);
+                const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
+                const status = p.enabled === false
+                    ? 'disabled'
+                    : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
+                const pillClass = status === 'disabled'
+                    ? 'pill-disabled'
+                    : status === 'running'
+                        ? 'pill-running'
+                        : status === 'paused'
+                            ? 'pill-paused'
+                            : 'pill-idle';
                 const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
                 const toggleAction = status === 'disabled' ? 'enable' : 'disable';
                 const toggleTitle = status === 'disabled' ? 'Enable probe' : 'Disable probe';
@@ -5975,6 +6034,7 @@ def home():
                 const resp = await fetch('/probes/list');
                 const data = await resp.json();
                 probeList = data.probes || [];
+                await refreshProbeRuntimeState(false);
                 if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
                 const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
                 if (match) {
@@ -6011,6 +6071,8 @@ def home():
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
                 probeCaptureState[channelId] = true;
+                probeChannelRuntime[channelId] = 'running';
+                renderProbeCards();
                 if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
                 setPreviewState('');
                 startProbePreview(channelId);
@@ -6032,12 +6094,15 @@ def home():
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
                 delete probeCaptureState[channelId];
                 if (reason === 'paused') {
+                    probeChannelRuntime[channelId] = 'paused';
                     setPreviewState('Paused');
                     if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
                 } else {
+                    probeChannelRuntime[channelId] = 'idle';
                     setPreviewState('Stopped', true);
                     if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
                 }
+                renderProbeCards();
                 if (reason !== 'paused') stopProbePreview();
             } catch (err) {
                 if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
@@ -6165,7 +6230,11 @@ def home():
         function startProbeStatusPoll() {
             if (probeStatusTimer) return;
             refreshProbeStatus();
-            probeStatusTimer = setInterval(() => refreshProbeStatus(), 8000);
+            void refreshProbeRuntimeState(true);
+            probeStatusTimer = setInterval(() => {
+                refreshProbeStatus();
+                void refreshProbeRuntimeState(true);
+            }, 8000);
         }
 
         function stopProbeStatusPoll() {
