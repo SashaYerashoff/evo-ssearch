@@ -509,6 +509,9 @@ def home():
             --muted: #8f8f8f;
             --radius-md: 8px;
             --radius-lg: 12px;
+            --btn-sm-h: 30px;
+            --btn-md-h: 36px;
+            --btn-lg-h: 42px;
         }
 
         * {
@@ -1004,6 +1007,7 @@ def home():
             letter-spacing: 0.03em;
             text-transform: uppercase;
             margin-bottom: 0.75rem;
+            line-height: 1.2;
         }
         
         .control-group {
@@ -1016,12 +1020,34 @@ def home():
             background: #2a4a3a;
             border: 1px solid #3a5a4a;
             color: #e0e0e0;
-            padding: 0.5rem 1rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
             border-radius: 8px;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
             white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+
+        .feature-btn.btn-sm {
+            min-height: var(--btn-sm-h);
+            padding: 0 0.7rem;
+            font-size: 0.82rem;
+        }
+
+        .feature-btn.btn-md {
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
+        }
+
+        .feature-btn.btn-lg {
+            min-height: var(--btn-lg-h);
+            padding: 0 1.25rem;
+            font-size: 0.95rem;
         }
         
         .feature-btn:hover {
@@ -1178,22 +1204,52 @@ def home():
             font-size: 0.85rem;
             letter-spacing: 0.03em;
             text-transform: uppercase;
+            line-height: 1.2;
+        }
+
+        .section-help {
+            color: #8f96a7;
+            font-size: 0.8rem;
+            line-height: 1.35;
         }
         
-        input[type="file"] {
-            background: var(--field);
-            border: 1px solid var(--field-border);
-            padding: 0.75rem 1rem;
-            border-radius: var(--radius-md);
-            color: var(--text);
-            font-size: 0.95rem;
-            transition: border-color 0.2s;
+        .file-upload {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            min-width: 0;
+        }
+
+        .file-upload.inline {
             width: 100%;
         }
-        
-        input[type="file"]:focus {
-            outline: none;
-            border-color: #555;
+
+        .file-upload-input {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            overflow: hidden;
+            clip-path: inset(50%);
+            white-space: nowrap;
+        }
+
+        .file-upload-btn {
+            flex: 0 0 auto;
+            margin: 0;
+        }
+
+        .file-upload-name {
+            color: #9aa0ad;
+            font-size: 0.86rem;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-upload-name.is-hidden {
+            display: none;
         }
         
         /* Image search layout */
@@ -1215,6 +1271,90 @@ def home():
             color: #888;
             font-size: 0.9rem;
             font-weight: 500;
+        }
+
+        .image-search-box {
+            align-items: stretch;
+        }
+
+        .image-query-panel {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+        }
+
+        .image-query-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            flex-wrap: wrap;
+        }
+
+        .image-query-actions .file-upload {
+            flex: 1;
+            min-width: 210px;
+        }
+
+        .image-query-actions .file-upload-name {
+            display: none;
+        }
+
+        .image-query-panel.has-image .image-query-actions .file-upload-name {
+            display: inline;
+        }
+
+        .image-search-btn {
+            display: none;
+        }
+
+        .image-query-panel.has-image .image-search-btn {
+            display: inline-flex;
+        }
+
+        .archive-query-preview {
+            position: relative;
+            border: 1px solid #262b36;
+            border-radius: 8px;
+            overflow: hidden;
+            min-height: 100px;
+            max-height: 180px;
+            background: #0f1218;
+        }
+
+        .archive-query-preview.is-hidden {
+            display: none;
+        }
+
+        .archive-query-preview img {
+            width: 100%;
+            height: 100%;
+            min-height: 100px;
+            max-height: 180px;
+            object-fit: contain;
+            display: block;
+            background: #0b0f16;
+        }
+
+        .archive-query-preview.is-empty img {
+            display: none;
+        }
+
+        .archive-query-preview-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #8e95a6;
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            background: linear-gradient(140deg, rgba(9, 12, 18, 0.82), rgba(14, 19, 29, 0.58));
+        }
+
+        .archive-query-preview:not(.is-empty) .archive-query-preview-overlay {
+            display: none;
         }
         
         .results-grid {
@@ -1969,6 +2109,9 @@ def home():
 
         .luxriot-header h4 {
             font-size: 1rem;
+            margin: 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
         }
 
         .luxriot-status {
@@ -2240,6 +2383,8 @@ def home():
 
         .probe-header h4 {
             margin: 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
         }
 
         .probe-header-actions {
@@ -2374,6 +2519,8 @@ def home():
 
         .monitor-panel h4 {
             margin: 0 0 0.6rem 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
         }
 
         .monitor-detections-panel .probe-nav {
@@ -2795,6 +2942,14 @@ def home():
             align-items: center;
         }
 
+        .image-probe-panel.no-image {
+            grid-template-columns: 1fr;
+        }
+
+        .image-probe-panel.no-image .probe-preview.compact {
+            display: none;
+        }
+
         .image-probe-left {
             display: flex;
             flex-direction: column;
@@ -2805,6 +2960,10 @@ def home():
             display: flex;
             align-items: center;
             gap: 0.5rem;
+        }
+
+        .image-probe-row .file-upload {
+            width: 100%;
         }
 
         .image-probe-pos {
@@ -2972,6 +3131,21 @@ def home():
                 margin-right: 0;
             }
 
+            .file-upload {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 0.45rem;
+            }
+
+            .file-upload-btn {
+                text-align: center;
+            }
+
+            .image-query-actions .file-upload {
+                flex-direction: row;
+                align-items: center;
+            }
+
             .probe-editor-layout {
                 grid-template-columns: 1fr;
             }
@@ -3036,7 +3210,7 @@ def home():
         <div class="control-panel">
             <div class="folder-select">
                 <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                <button id="indexBtn">Index Folder</button>
+                <button id="indexBtn" class="feature-btn primary btn-md">Index Folder</button>
             </div>
             <div class="status" id="indexStatus"></div>
         </div>
@@ -3086,6 +3260,7 @@ def home():
                     <div id="archiveSearchBox" class="archive-search-shell">
                         <div class="archive-section">
                             <div class="archive-section-title">Detections Archive</div>
+                            <div class="section-help">Choose stream/probe/time filters, then run text or image search in current scope.</div>
                             <div class="archive-filter-grid">
                                 <div class="input-group">
                                     <label for="archiveChannelFilter" class="input-label">Stream:</label>
@@ -3130,21 +3305,30 @@ def home():
                         </div>
                         <div class="archive-section">
                             <div class="archive-section-title">Text Query</div>
+                            <div class="section-help">Use natural language; scope and filters apply automatically.</div>
                             <div id="textSearchBox" class="search-box">
                                 <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                                <button id="searchBtn">Search</button>
+                                <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
                             </div>
                         </div>
                         <div class="archive-section">
                             <div class="archive-section-title">Image Query</div>
-                            <div id="imageSearchBox" class="search-box">
-                                <div class="image-search-inputs">
-                                    <div class="input-group">
-                                        <label for="imageUpload" class="input-label">Upload File:</label>
-                                        <input type="file" id="imageUpload" accept="image/*" />
+                            <div class="section-help">Select an image and run visual similarity search.</div>
+                            <div id="imageSearchBox" class="search-box image-search-box">
+                                <div id="imageQueryPanel" class="image-query-panel">
+                                    <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
+                                        <img id="queryImageThumb" src="" alt="Selected query preview" />
+                                        <div class="archive-query-preview-overlay">No image selected</div>
+                                    </div>
+                                    <div class="image-query-actions">
+                                        <div class="file-upload inline">
+                                            <input type="file" id="imageUpload" class="file-upload-input" accept="image/*" />
+                                            <label for="imageUpload" class="feature-btn file-upload-btn btn-md">Choose Image</label>
+                                            <span id="imageUploadName" class="file-upload-name is-hidden">No file selected</span>
+                                        </div>
+                                        <button id="imageSearchBtn" class="feature-btn primary image-search-btn btn-md">Search by Image</button>
                                     </div>
                                 </div>
-                                <button id="imageSearchBtn">Search by Image</button>
                             </div>
                         </div>
                     </div>
@@ -3383,10 +3567,15 @@ def home():
                             <span class="probe-pair-idx">+</span>
                             <button id="probeAddPair" class="feature-btn">Add pair</button>
                         </div>
-                        <div class="image-probe-panel">
+                        <div class="image-probe-panel no-image">
                             <div class="image-probe-left">
+                                <div class="section-help">Optional: provide a reference image for CLIP-based probe matching.</div>
                                 <div class="image-probe-row">
-                                    <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
+                                    <div class="file-upload inline">
+                                        <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
+                                        <label for="probeImageFile" class="feature-btn file-upload-btn btn-md">Choose Image</label>
+                                        <span id="probeImageFileName" class="file-upload-name">No file selected</span>
+                                    </div>
                                 </div>
                                 <div class="image-probe-pos">
                                     <label>Image Pos:</label>
@@ -3623,6 +3812,10 @@ def home():
         const searchInput = document.getElementById('searchQuery');
         const searchBtn = document.getElementById('searchBtn');
         const imageUpload = document.getElementById('imageUpload');
+        const imageUploadName = document.getElementById('imageUploadName');
+        const imageQueryPanel = document.getElementById('imageQueryPanel');
+        const queryImagePreview = document.getElementById('queryImagePreview');
+        const queryImageThumb = document.getElementById('queryImageThumb');
         const imageSearchBtn = document.getElementById('imageSearchBtn');
         const archiveModeBtn = document.getElementById('archiveModeBtn');
         const videoModeBtn = document.getElementById('videoModeBtn');
@@ -3688,10 +3881,12 @@ def home():
         const probePairsContainer = document.getElementById('probePairs');
         const probeAddPairBtn = document.getElementById('probeAddPair');
         const probeImageFile = document.getElementById('probeImageFile');
+        const probeImageFileName = document.getElementById('probeImageFileName');
         const probeImageEnableBtn = document.getElementById('probeImageEnable');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
         const probeImageOverlay = document.getElementById('probeImageOverlay');
+        const probeImagePanel = document.querySelector('.image-probe-panel');
         const probeImagePosInput = document.getElementById('probeImagePos');
         const probeDetLeftBtn = document.getElementById('probeDetLeft');
         const probeDetRightBtn = document.getElementById('probeDetRight');
@@ -5376,6 +5571,55 @@ def home():
                 probeImageThumb.src = '';
                 probeImageOverlay.style.display = 'flex';
             }
+            if (probeImagePanel) {
+                probeImagePanel.classList.toggle('no-image', !base64);
+            }
+            if (probeImageFileName) {
+                const label = probeImageState?.name ? String(probeImageState.name) : 'No file selected';
+                probeImageFileName.textContent = label;
+                probeImageFileName.title = probeImageState?.name ? String(probeImageState.name) : '';
+            }
+        }
+
+        function setArchiveUploadName(file) {
+            if (!imageUploadName) return;
+            const label = file?.name ? String(file.name) : 'No file selected';
+            imageUploadName.textContent = label;
+            imageUploadName.title = file?.name ? String(file.name) : '';
+            imageUploadName.classList.toggle('is-hidden', !file?.name);
+        }
+
+        function setArchiveQueryPreview(file) {
+            if (!queryImagePreview || !queryImageThumb) return;
+            if (!file) {
+                queryImageThumb.src = '';
+                queryImagePreview.classList.add('is-empty');
+                queryImagePreview.classList.add('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = () => {
+                const result = typeof reader.result === 'string' ? reader.result : '';
+                if (!result) {
+                    queryImageThumb.src = '';
+                    queryImagePreview.classList.add('is-empty');
+                    queryImagePreview.classList.add('is-hidden');
+                    if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+                    return;
+                }
+                queryImageThumb.src = result;
+                queryImagePreview.classList.remove('is-empty');
+                queryImagePreview.classList.remove('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.add('has-image');
+            };
+            reader.onerror = () => {
+                queryImageThumb.src = '';
+                queryImagePreview.classList.add('is-empty');
+                queryImagePreview.classList.add('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+            };
+            reader.readAsDataURL(file);
         }
 
         function updateImageProbeStatus(enabled) {
@@ -5992,10 +6236,22 @@ def home():
         if (probeReloadBtn) {
             probeReloadBtn.addEventListener('click', () => loadProbeList(true));
         }
+        if (imageUpload) {
+            imageUpload.addEventListener('change', () => {
+                const file = imageUpload.files && imageUpload.files[0];
+                setArchiveUploadName(file || null);
+                setArchiveQueryPreview(file || null);
+            });
+        }
         if (probeImageFile) {
             probeImageFile.addEventListener('change', () => {
                 const file = probeImageFile.files && probeImageFile.files[0];
-                if (!file) return;
+                if (!file) {
+                    probeImageState = null;
+                    applyImageThumb('');
+                    updateImageProbeStatus(false);
+                    return;
+                }
                 const reader = new FileReader();
                 reader.onload = () => {
                     const base64 = reader.result.split(',')[1];
