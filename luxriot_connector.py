@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -381,6 +382,27 @@ class LuxriotManager:
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
+        try:
+            l1_window = int(getattr(config, "LUXRIOT_ROLLUP_L1_WINDOW_SEC", 900))
+        except Exception:
+            l1_window = 900
+        try:
+            l2_window = int(getattr(config, "LUXRIOT_ROLLUP_L2_WINDOW_SEC", 3600))
+        except Exception:
+            l2_window = 3600
+        try:
+            l3_window = int(getattr(config, "LUXRIOT_ROLLUP_L3_WINDOW_SEC", 21600))
+        except Exception:
+            l3_window = 21600
+        self.rollup_windows: Dict[str, int] = {
+            "L1": max(300, l1_window),
+            "L2": max(900, l2_window),
+            "L3": max(1800, l3_window),
+        }
+        try:
+            self.rollup_highlight_limit = max(1, int(getattr(config, "LUXRIOT_ROLLUP_HIGHLIGHTS", 3)))
+        except Exception:
+            self.rollup_highlight_limit = 3
 
     @staticmethod
     def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str, str]:
@@ -400,8 +422,8 @@ class LuxriotManager:
         history_logs: Sequence[Mapping[str, Any]],
         current_logs: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
-        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        ordered: List[Tuple[str, str, str]] = []
+        merged: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        ordered: List[Tuple[str, str, str, str]] = []
         for item in list(history_logs) + list(current_logs):
             if not isinstance(item, Mapping):
                 continue
@@ -527,6 +549,182 @@ class LuxriotManager:
         if normalized_selector in available:
             return normalized_selector, normalized_selector, latest_run_id
         return "latest", latest_run_id, latest_run_id
+
+    @staticmethod
+    def _stable_id(parts: Sequence[str], length: int = 12) -> str:
+        payload = "|".join(str(part) for part in parts).encode("utf-8", errors="ignore")
+        digest = hashlib.sha1(payload).hexdigest()
+        return digest[: max(6, int(length))]
+
+    @staticmethod
+    def _summary_headline(text: object, max_len: int = 180) -> str:
+        normalized = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+        if not normalized:
+            return ""
+        if len(normalized) <= max_len:
+            return normalized
+        return f"{normalized[: max_len - 3].rstrip()}..."
+
+    @staticmethod
+    def _bucket_start(ts: float, window_sec: int) -> int:
+        window = max(1, int(window_sec))
+        return int(ts // window) * window
+
+    @staticmethod
+    def _collect_highlights(nodes: Sequence[Mapping[str, Any]], max_items: int) -> List[str]:
+        output: List[str] = []
+        seen: Set[str] = set()
+        for node in nodes:
+            highlights = node.get("highlights")
+            candidates: List[str] = []
+            if isinstance(highlights, list):
+                for item in highlights:
+                    text = str(item or "").strip()
+                    if text:
+                        candidates.append(text)
+            if not candidates:
+                summary = str(node.get("summary") or "").strip()
+                if summary:
+                    candidates.append(LuxriotManager._summary_headline(summary))
+            for candidate in candidates:
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                output.append(candidate)
+                if len(output) >= max_items:
+                    return output
+        return output
+
+    def _compose_rollup_summary(
+        self,
+        level: str,
+        source_level: str,
+        item_count: int,
+        frame_count: int,
+        run_ids: Sequence[str],
+        highlights: Sequence[str],
+        window_sec: int,
+    ) -> str:
+        base = (
+            f"{level} rollup from {source_level}: {item_count} items over ~{max(1, int(window_sec // 60))} min"
+            if window_sec < 3600
+            else f"{level} rollup from {source_level}: {item_count} items over ~{max(1, int(window_sec // 3600))} hr"
+        )
+        if frame_count > 0:
+            base += f" ({frame_count} frames)"
+        if run_ids:
+            base += f", {len(run_ids)} run(s)"
+        if highlights:
+            base += ". Highlights: " + "; ".join(highlights[: self.rollup_highlight_limit])
+        else:
+            base += "."
+        return base
+
+    def _l0_nodes_from_logs(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        nodes: List[Dict[str, Any]] = []
+        for log in logs:
+            if not isinstance(log, Mapping):
+                continue
+            created = self._coerce_float(log.get("created_at"))
+            if created is None:
+                continue
+            frame_count = _parse_optional_int(log.get("frame_count")) or 0
+            run_id = str(log.get("run_id") or "").strip()
+            summary = str(log.get("summary") or "").strip()
+            headline = self._summary_headline(summary)
+            key = self._summary_log_key(log)
+            rollup_id = f"l0-ch{channel_id}-{self._stable_id(key, length=14)}"
+            nodes.append(
+                {
+                    "rollup_id": rollup_id,
+                    "channel_id": channel_id,
+                    "level": "L0",
+                    "source_level": None,
+                    "source_ids": [],
+                    "window_start": created,
+                    "window_end": created,
+                    "window_sec": 0,
+                    "item_count": 1,
+                    "frame_count": int(frame_count),
+                    "run_ids": [run_id] if run_id else [],
+                    "highlights": [headline] if headline else [],
+                    "summary": summary,
+                    "created_at": created,
+                }
+            )
+        nodes.sort(key=lambda item: float(item.get("window_start") or 0.0))
+        return nodes
+
+    def _build_rollup_level(
+        self,
+        channel_id: int,
+        level: str,
+        source_level: str,
+        window_sec: int,
+        source_nodes: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not source_nodes:
+            return []
+        buckets: Dict[int, List[Mapping[str, Any]]] = {}
+        for node in source_nodes:
+            ts = self._coerce_float(node.get("window_start"))
+            if ts is None:
+                continue
+            bucket = self._bucket_start(ts, window_sec)
+            buckets.setdefault(bucket, []).append(node)
+        out: List[Dict[str, Any]] = []
+        for bucket_start in sorted(buckets.keys()):
+            children = sorted(
+                buckets[bucket_start],
+                key=lambda item: float(self._coerce_float(item.get("window_start")) or 0.0),
+            )
+            source_ids: List[str] = []
+            frame_count = 0
+            item_count = 0
+            run_ids: Set[str] = set()
+            for child in children:
+                child_id = str(child.get("rollup_id") or "").strip()
+                if child_id:
+                    source_ids.append(child_id)
+                frame_count += _parse_optional_int(child.get("frame_count")) or 0
+                item_count += _parse_optional_int(child.get("item_count")) or 0
+                child_runs = child.get("run_ids")
+                if isinstance(child_runs, list):
+                    for run in child_runs:
+                        run_text = str(run or "").strip()
+                        if run_text:
+                            run_ids.add(run_text)
+            highlights = self._collect_highlights(children, self.rollup_highlight_limit)
+            summary = self._compose_rollup_summary(
+                level=level,
+                source_level=source_level,
+                item_count=item_count,
+                frame_count=frame_count,
+                run_ids=sorted(run_ids),
+                highlights=highlights,
+                window_sec=window_sec,
+            )
+            end_ts = float(bucket_start + max(1, int(window_sec)))
+            rollup_id = f"{level.lower()}-ch{channel_id}-{bucket_start}-{self._stable_id(source_ids, length=10)}"
+            out.append(
+                {
+                    "rollup_id": rollup_id,
+                    "channel_id": channel_id,
+                    "level": level,
+                    "source_level": source_level,
+                    "source_ids": source_ids,
+                    "window_start": float(bucket_start),
+                    "window_end": end_ts,
+                    "window_sec": int(window_sec),
+                    "item_count": int(item_count),
+                    "frame_count": int(frame_count),
+                    "run_ids": sorted(run_ids),
+                    "highlights": highlights,
+                    "summary": summary,
+                    "created_at": end_ts,
+                }
+            )
+        return out
 
     def _merge_summary_history_locked(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> None:
         if not logs:
@@ -830,6 +1028,78 @@ class LuxriotManager:
             "from_ts": start_ts,
             "to_ts": end_ts,
             "limit": limit,
+        }
+
+    def summary_rollups(
+        self,
+        channel_id: int,
+        run_selector: Optional[str] = None,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
+        level_limit: Optional[int] = 60,
+    ) -> Dict[str, Any]:
+        status = self.session_status(
+            channel_id=channel_id,
+            run_selector=run_selector,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=None,
+        )
+        logs_raw = status.get("logs")
+        logs = logs_raw if isinstance(logs_raw, list) else []
+
+        l0_nodes = self._l0_nodes_from_logs(channel_id, logs)
+        l1_nodes = self._build_rollup_level(
+            channel_id=channel_id,
+            level="L1",
+            source_level="L0",
+            window_sec=self.rollup_windows["L1"],
+            source_nodes=l0_nodes,
+        )
+        l2_nodes = self._build_rollup_level(
+            channel_id=channel_id,
+            level="L2",
+            source_level="L1",
+            window_sec=self.rollup_windows["L2"],
+            source_nodes=l1_nodes,
+        )
+        l3_nodes = self._build_rollup_level(
+            channel_id=channel_id,
+            level="L3",
+            source_level="L2",
+            window_sec=self.rollup_windows["L3"],
+            source_nodes=l2_nodes,
+        )
+
+        if isinstance(level_limit, int) and level_limit > 0:
+            l0_nodes = l0_nodes[-level_limit:]
+            l1_nodes = l1_nodes[-level_limit:]
+            l2_nodes = l2_nodes[-level_limit:]
+            l3_nodes = l3_nodes[-level_limit:]
+
+        return {
+            "channel_id": channel_id,
+            "running": bool(status.get("running")),
+            "selected_run": status.get("selected_run"),
+            "run_filter_id": status.get("run_filter_id"),
+            "running_run_id": status.get("running_run_id"),
+            "latest_run_id": status.get("latest_run_id"),
+            "from_ts": start_ts,
+            "to_ts": end_ts,
+            "window_sec": dict(self.rollup_windows),
+            "level_limit": level_limit,
+            "source_counts": {
+                "L0": len(l0_nodes),
+                "L1": len(l1_nodes),
+                "L2": len(l2_nodes),
+                "L3": len(l3_nodes),
+            },
+            "levels": {
+                "L0": l0_nodes,
+                "L1": l1_nodes,
+                "L2": l2_nodes,
+                "L3": l3_nodes,
+            },
         }
 
     @staticmethod

@@ -11852,6 +11852,26 @@ def luxriot_session_status():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/rollups', methods=['GET'])
+def luxriot_summary_rollups():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    run_selector = (request.args.get('run') or '').strip() or None
+    from_ts = request.args.get('from_ts', default=None, type=float)
+    to_ts = request.args.get('to_ts', default=None, type=float)
+    level_limit = request.args.get('level_limit', default=60, type=int)
+    try:
+        rollups = luxriot_manager.summary_rollups(
+            channel_id=channel_id,
+            run_selector=run_selector,
+            start_ts=from_ts,
+            end_ts=to_ts,
+            level_limit=level_limit,
+        )
+        return jsonify(rollups)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/luxriot/streams', methods=['GET'])
 def luxriot_streams_status():
     try:

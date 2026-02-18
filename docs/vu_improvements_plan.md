@@ -31,14 +31,16 @@ Improve Video Understanding usability for multi-channel operation (4-8 channels)
   - `/luxriot/session` supports run selectors (`latest`, `live`, `all`, explicit run ID).
   - `/luxriot/session` supports time-window filtering (`from_ts`, `to_ts`) and limit.
   - Reader toolbar run/time controls deferred until next UI stabilization pass.
+- Hierarchical summarization (backend scaffolding):
+  - Added `/luxriot/rollups` endpoint for layered rollups (`L0`, `L1`, `L2`, `L3`).
+  - L1/L2/L3 rollups aggregate prior level windows and expose provenance (`source_ids`).
+  - Rollups support run/time filtering (`run`, `from_ts`, `to_ts`) and per-level limit.
 
 ## Next implementation slices
-1. Hierarchical summarization pipeline
-- L0: batch summaries (e.g., every 30s).
-- L1: periodic rollups over L0 (10-20 min windows, 12-16k token budget).
-- L2: hourly rollups over L1.
-- L3: shift/day rollups over L2.
-- Keep provenance links: L2 -> L1 -> L0 IDs.
+1. Hierarchical summarization pipeline (phase 2)
+- Add optional LM-generated semantic rollup text over each window (token-budgeted).
+- Persist rollups for retrieval/history instead of on-demand only.
+- Add reader UX for level selection and drill-down from L3 -> L0.
 
 2. Multi-channel operator UX
 - Optional split reader for 2 channels.
