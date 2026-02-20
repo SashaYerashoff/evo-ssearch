@@ -196,6 +196,70 @@ class Config:
         'high': os.getenv('EVOSSEARCH_LUXRIOT_SEV_HIGH', 'high').lower(),
         'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
     }
+    LUXRIOT_ROLLUP_L1_LLM_ENABLED = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_L1_LLM_ENABLED', 'True')
+    try:
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_CHAR_BUDGET', '12000'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = 12000
+    if LUXRIOT_ROLLUP_L1_CHAR_BUDGET < 2000:
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = 2000
+    try:
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL', '2'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = 2
+    if LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL < 1:
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = 1
+    try:
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT', '800'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = 800
+    if LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT < 100:
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = 100
+    LUXRIOT_ROLLUP_CACHE_FILE = (
+        os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_CACHE_FILE', 'luxriot_rollups_cache.json').strip()
+        or 'luxriot_rollups_cache.json'
+    )
+    LUXRIOT_SUMMARY_STATE_FILE = (
+        os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_STATE_FILE', 'luxriot_summary_state.json').strip()
+        or 'luxriot_summary_state.json'
+    )
+    LUXRIOT_ROLLUP_TIME_ONLY = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY', 'True')
+    LUXRIOT_ROLLUP_L1_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_MODEL', '').strip()
+    LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT',
+        (
+            "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
+            "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+        ),
+    ).strip()
+    LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'
+    try:
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS', '8000'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = 8000
+    if LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS < 512:
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = 512
+    try:
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_CHAR_BUDGET', str(LUXRIOT_ROLLUP_L1_CHAR_BUDGET))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = LUXRIOT_ROLLUP_L1_CHAR_BUDGET
+    if LUXRIOT_ROLLUP_LLM_CHAR_BUDGET < 2000:
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = 2000
+    try:
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL', str(LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL
+    if LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL < 1:
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = 1
+    LUXRIOT_ROLLUP_LLM_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL', LUXRIOT_ROLLUP_L1_MODEL).strip()
+    LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT',
+        LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT,
+    ).strip()
 
     # Probe / CLIP monitoring
     try:
@@ -339,6 +403,19 @@ class Config:
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
             f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
             f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
+        )
+        print(
+            "Rollups: levels={} mode={} min_tokens={} char_budget={} max_new={} cache_limit={} cache_file={} state_file={} model={}".format(
+                cls.LUXRIOT_ROLLUP_LLM_LEVELS,
+                'time-only' if cls.LUXRIOT_ROLLUP_TIME_ONLY else 'token-gated',
+                cls.LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS,
+                cls.LUXRIOT_ROLLUP_LLM_CHAR_BUDGET,
+                cls.LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL,
+                cls.LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT,
+                cls.LUXRIOT_ROLLUP_CACHE_FILE,
+                cls.LUXRIOT_SUMMARY_STATE_FILE,
+                cls.LUXRIOT_ROLLUP_LLM_MODEL or cls.LM_MODEL,
+            )
         )
         print(
             "Detections archive: {} ({}, adaptive retention {}, keep_all_rows {}, window {}s, force {}s)".format(

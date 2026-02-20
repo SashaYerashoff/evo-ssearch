@@ -2259,13 +2259,41 @@ def home():
 
         .luxriot-summary-toolbar {
             display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.45rem;
+            width: 100%;
+        }
+
+        .luxriot-summary-filters {
+            display: flex;
             align-items: center;
             gap: 0.45rem;
             flex-wrap: wrap;
+            width: 100%;
+        }
+
+        .luxriot-summary-actions-row {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+            width: 100%;
         }
 
         .luxriot-summary-toolbar .luxriot-mini-input {
-            min-width: 180px;
+            min-width: 170px;
+        }
+
+        .luxriot-summary-toolbar .luxriot-mini-input.luxriot-mini-time {
+            min-width: 170px;
+        }
+
+        .luxriot-summary-custom-time {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex-wrap: wrap;
         }
 
         .luxriot-summary-meta {
@@ -2440,6 +2468,18 @@ def home():
             gap: 0.3rem;
             flex-wrap: wrap;
             justify-content: flex-end;
+        }
+
+        .luxriot-summary-rollup-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.14rem 0.45rem;
+            border: 1px solid #30514a;
+            border-radius: 999px;
+            background: rgba(41, 94, 80, 0.18);
+            color: #9acdbf;
+            font-size: 0.72rem;
         }
 
         .luxriot-summary .timestamp {
@@ -3558,16 +3598,35 @@ def home():
         </div>
         <div class="luxriot-card luxriot-summaries-card">
             <div class="luxriot-header">
-                <h4>Live Summaries</h4>
+                <h4>Live/Summaries</h4>
                 <div class="luxriot-summary-toolbar">
-                    <label for="luxriotSummaryChannelSelect">Channel:</label>
-                    <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
-                    <button id="luxriotSummaryFollowBtn" class="feature-btn">Follow live</button>
-                    <button id="luxriotSummaryPauseBtn" class="feature-btn">Pause updates</button>
-                    <button id="luxriotSummaryViewBtn" class="feature-btn">View: Expanded</button>
-                    <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">Collapse all</button>
-                    <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">Jump to latest</button>
-                    <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
+                    <div class="luxriot-summary-filters">
+                        <label for="luxriotSummaryChannelSelect">Channel:</label>
+                        <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
+                        <label for="luxriotSummaryRangeSelect">History:</label>
+                        <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
+                            <option value="6h" selected>last 6 hours</option>
+                            <option value="24h">last day</option>
+                            <option value="3d">last 3 days</option>
+                            <option value="7d">last week</option>
+                            <option value="30d">last month</option>
+                            <option value="all">all history</option>
+                        </select>
+                        <label for="luxriotSummaryLevelSelect">Depth:</label>
+                        <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
+                            <option value="L0" selected>Live</option>
+                            <option value="L1">Minutes</option>
+                            <option value="L2">Hours</option>
+                            <option value="L3">Days</option>
+                        </select>
+                    </div>
+                    <div class="luxriot-summary-actions-row">
+                        <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
+                        <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
+                        <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
+                        <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
+                        <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
+                    </div>
                 </div>
             </div>
             <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
@@ -4021,6 +4080,14 @@ def home():
         const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
+        const luxriotSummaryRunSelect = document.getElementById('luxriotSummaryRunSelect');
+        const luxriotSummaryRangeSelect = document.getElementById('luxriotSummaryRangeSelect');
+        const luxriotSummaryLevelSelect = document.getElementById('luxriotSummaryLevelSelect');
+        const luxriotSummaryCustomTime = document.getElementById('luxriotSummaryCustomTime');
+        const luxriotSummaryFromInput = document.getElementById('luxriotSummaryFromInput');
+        const luxriotSummaryToInput = document.getElementById('luxriotSummaryToInput');
+        const luxriotSummaryApplyFiltersBtn = document.getElementById('luxriotSummaryApplyFiltersBtn');
+        const luxriotSummaryBackBtn = document.getElementById('luxriotSummaryBackBtn');
         const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
         const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
         const luxriotSummaryPauseBtn = document.getElementById('luxriotSummaryPauseBtn');
@@ -4104,6 +4171,14 @@ def home():
         const luxriotSummarySeenKeys = {};
         let luxriotSummaryUnread = 0;
         let luxriotSummaryChannel = null;
+        let luxriotSummaryRunFilter = 'latest';
+        let luxriotSummaryRangePreset = '6h';
+        let luxriotSummaryFromTs = null;
+        let luxriotSummaryToTs = null;
+        let luxriotSummaryLevel = 'L0';
+        let luxriotSummaryRollupStack = [];
+        let luxriotSummaryRollupRows = [];
+        const luxriotSummaryRollupCache = {};
         let luxriotSummaryFollowLive = true;
         let luxriotSummaryAutoRefresh = true;
         let luxriotSummaryCompactMode = false;
@@ -4262,7 +4337,7 @@ def home():
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
-                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
                 startLuxriotSummaryPoll();
                 syncProbeChannelSelect();
@@ -4332,15 +4407,285 @@ def home():
             return getSelectedLuxriotChannel();
         }
 
+        function normalizeSummaryRun(value) {
+            const text = String(value || '').trim();
+            if (!text) return 'latest';
+            const lowered = text.toLowerCase();
+            if (lowered === 'latest' || lowered === 'live' || lowered === 'all') {
+                return lowered;
+            }
+            return text;
+        }
+
+        function normalizeSummaryRangePreset(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === '6h' || text === '24h' || text === '3d' || text === '7d' || text === '30d' || text === 'all' || text === 'custom') {
+                return text;
+            }
+            return '24h';
+        }
+
+        function getSummaryRangeBounds(rangePreset, nowSec = null) {
+            const normalized = normalizeSummaryRangePreset(rangePreset);
+            const now = Number.isFinite(nowSec) ? Number(nowSec) : Math.floor(Date.now() / 1000);
+            const toTs = now;
+            if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
+            if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
+            if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
+            if (normalized === '7d') return { fromTs: toTs - 7 * 24 * 3600, toTs };
+            if (normalized === '30d') return { fromTs: toTs - 30 * 24 * 3600, toTs };
+            return { fromTs: null, toTs: null };
+        }
+
+        function getSummaryRangeLabel() {
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            if (preset === '6h') return '6h';
+            if (preset === '24h') return '1d';
+            if (preset === '3d') return '3d';
+            if (preset === '7d') return '7d';
+            if (preset === '30d') return '30d';
+            if (preset === 'all') return 'all';
+            if (Number.isFinite(luxriotSummaryFromTs) || Number.isFinite(luxriotSummaryToTs)) {
+                return `custom ${formatRollupRange(luxriotSummaryFromTs, luxriotSummaryToTs)}`;
+            }
+            return 'custom';
+        }
+
+        function syncSummaryRangeUI() {
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            if (luxriotSummaryRangeSelect) {
+                luxriotSummaryRangeSelect.value = preset;
+            }
+            if (luxriotSummaryCustomTime) {
+                luxriotSummaryCustomTime.classList.toggle('is-hidden', preset !== 'custom');
+            }
+        }
+
+        function parseSummaryDatetimeInput(value) {
+            const text = String(value || '').trim();
+            if (!text) return null;
+            const ms = Date.parse(text);
+            if (!Number.isFinite(ms)) return null;
+            return ms / 1000;
+        }
+
+        function formatSummaryDatetimeInput(ts) {
+            const sec = Number(ts);
+            if (!Number.isFinite(sec)) return '';
+            const d = new Date(sec * 1000);
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mi = String(d.getMinutes()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+        }
+
+        function readSummaryFiltersFromInputs() {
+            const run = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
+            const rangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect ? luxriotSummaryRangeSelect.value : luxriotSummaryRangePreset);
+            let fromTs = null;
+            let toTs = null;
+            if (rangePreset === 'custom') {
+                fromTs = parseSummaryDatetimeInput(luxriotSummaryFromInput ? luxriotSummaryFromInput.value : '');
+                toTs = parseSummaryDatetimeInput(luxriotSummaryToInput ? luxriotSummaryToInput.value : '');
+            } else if (rangePreset !== 'all') {
+                const bounds = getSummaryRangeBounds(rangePreset);
+                fromTs = bounds.fromTs;
+                toTs = bounds.toTs;
+            }
+            if (fromTs !== null && toTs !== null && fromTs > toTs) {
+                const tmp = fromTs;
+                fromTs = toTs;
+                toTs = tmp;
+            }
+            return { run, fromTs, toTs, rangePreset };
+        }
+
+        function applySummaryFiltersFromInputs() {
+            const filters = readSummaryFiltersFromInputs();
+            luxriotSummaryRunFilter = filters.run;
+            luxriotSummaryRangePreset = normalizeSummaryRangePreset(filters.rangePreset);
+            luxriotSummaryFromTs = filters.fromTs;
+            luxriotSummaryToTs = filters.toTs;
+            if (luxriotSummaryRunSelect) {
+                luxriotSummaryRunSelect.value = luxriotSummaryRunFilter;
+            }
+            syncSummaryRangeUI();
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+            }
+        }
+
+        function clearSummaryFilters() {
+            luxriotSummaryRunFilter = 'latest';
+            luxriotSummaryRangePreset = '6h';
+            luxriotSummaryFromTs = null;
+            luxriotSummaryToTs = null;
+            if (luxriotSummaryRunSelect) {
+                luxriotSummaryRunSelect.value = 'latest';
+            }
+            if (luxriotSummaryRangeSelect) {
+                luxriotSummaryRangeSelect.value = '6h';
+            }
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = '';
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = '';
+            }
+            syncSummaryRangeUI();
+        }
+
+        function buildSummaryQueryParams(channelId) {
+            const params = new URLSearchParams();
+            params.set('channel_id', String(channelId));
+            const run = normalizeSummaryRun(luxriotSummaryRunFilter);
+            if (run) params.set('run', run);
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            let fromTs = luxriotSummaryFromTs;
+            let toTs = luxriotSummaryToTs;
+            if (preset !== 'custom') {
+                if (preset === 'all') {
+                    fromTs = null;
+                    toTs = null;
+                } else {
+                    const bounds = getSummaryRangeBounds(preset);
+                    fromTs = bounds.fromTs;
+                    toTs = bounds.toTs;
+                }
+                luxriotSummaryFromTs = fromTs;
+                luxriotSummaryToTs = toTs;
+            }
+            if (Number.isFinite(fromTs)) {
+                params.set('from_ts', String(fromTs));
+            }
+            if (Number.isFinite(toTs)) {
+                params.set('to_ts', String(toTs));
+            }
+            return params;
+        }
+
+        function syncSummaryRunSelectOptions(runs, selectedRun = null) {
+            if (!luxriotSummaryRunSelect) return;
+            const runItems = Array.isArray(runs) ? runs : [];
+            const currentValue = normalizeSummaryRun(
+                selectedRun || luxriotSummaryRunSelect.value || luxriotSummaryRunFilter || 'latest'
+            );
+            const baseOptions = [
+                { value: 'latest', label: 'Latest run' },
+                { value: 'live', label: 'Live run' },
+                { value: 'all', label: 'All runs' },
+            ];
+            const seen = new Set(baseOptions.map((item) => item.value));
+            const dynamicOptions = [];
+            runItems.forEach((run) => {
+                const runId = String(run?.run_id || '').trim();
+                if (!runId || seen.has(runId)) return;
+                seen.add(runId);
+                const logCount = Number(run?.log_count || 0);
+                const running = Boolean(run?.running);
+                const stateLabel = running ? 'live' : 'saved';
+                dynamicOptions.push({
+                    value: runId,
+                    label: `${runId} (${stateLabel}, ${logCount})`,
+                });
+            });
+            const optionsHtml = baseOptions
+                .concat(dynamicOptions)
+                .map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`)
+                .join('');
+            luxriotSummaryRunSelect.innerHTML = optionsHtml;
+            const hasCurrent = Array.from(luxriotSummaryRunSelect.options || [])
+                .some((opt) => String(opt.value) === currentValue);
+            luxriotSummaryRunSelect.value = hasCurrent ? currentValue : 'latest';
+            luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
+        }
+
+        function syncSummaryFiltersFromResponse(payload) {
+            const data = payload && typeof payload === 'object' ? payload : {};
+            if (Object.prototype.hasOwnProperty.call(data, 'selected_run')) {
+                luxriotSummaryRunFilter = normalizeSummaryRun(data.selected_run);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, 'from_ts')) {
+                const rawFrom = data.from_ts;
+                if (rawFrom === null || rawFrom === '' || typeof rawFrom === 'undefined') {
+                    luxriotSummaryFromTs = null;
+                } else {
+                    const fromTs = Number(rawFrom);
+                    luxriotSummaryFromTs = Number.isFinite(fromTs) && fromTs > 0 ? fromTs : null;
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(data, 'to_ts')) {
+                const rawTo = data.to_ts;
+                if (rawTo === null || rawTo === '' || typeof rawTo === 'undefined') {
+                    luxriotSummaryToTs = null;
+                } else {
+                    const toTs = Number(rawTo);
+                    luxriotSummaryToTs = Number.isFinite(toTs) && toTs > 0 ? toTs : null;
+                }
+            }
+            if (luxriotSummaryRunSelect) {
+                const hasRunValue = Array.from(luxriotSummaryRunSelect.options || [])
+                    .some((opt) => String(opt.value) === luxriotSummaryRunFilter);
+                luxriotSummaryRunSelect.value = hasRunValue ? luxriotSummaryRunFilter : 'latest';
+                luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
+            }
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+            }
+            syncSummaryRangeUI();
+        }
+
+        function normalizeSummaryLevel(value) {
+            const text = String(value || '').trim().toUpperCase();
+            if (text === 'L1' || text === 'L2' || text === 'L3') return text;
+            return 'L0';
+        }
+
+        function setSummaryBaseLevel(level) {
+            const normalized = normalizeSummaryLevel(level);
+            luxriotSummaryLevel = normalized;
+            luxriotSummaryRollupStack = [{ level: normalized, sourceIds: null, label: normalized }];
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = normalized;
+            }
+        }
+
+        function getCurrentSummaryRollupContext() {
+            if (!Array.isArray(luxriotSummaryRollupStack) || !luxriotSummaryRollupStack.length) {
+                setSummaryBaseLevel(luxriotSummaryLevel);
+            }
+            const last = luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1];
+            if (!last || typeof last !== 'object') {
+                setSummaryBaseLevel('L0');
+                return luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1] || null;
+            }
+            return last;
+        }
+
+        function isRollupViewActive() {
+            const ctx = getCurrentSummaryRollupContext();
+            if (!ctx) return false;
+            const hasFilter = Array.isArray(ctx.sourceIds) && ctx.sourceIds.length > 0;
+            return normalizeSummaryLevel(ctx.level) !== 'L0' || hasFilter;
+        }
+
         function setSummaryUnread(count) {
             luxriotSummaryUnread = Math.max(0, Number.isFinite(count) ? count : 0);
             if (!luxriotSummaryJumpBtn) return;
             if (luxriotSummaryUnread > 0) {
                 luxriotSummaryJumpBtn.classList.remove('is-hidden');
-                luxriotSummaryJumpBtn.textContent = `Jump to latest (${luxriotSummaryUnread})`;
+                luxriotSummaryJumpBtn.textContent = `⬇ Jump to latest (${luxriotSummaryUnread})`;
             } else {
                 luxriotSummaryJumpBtn.classList.add('is-hidden');
-                luxriotSummaryJumpBtn.textContent = 'Jump to latest';
+                luxriotSummaryJumpBtn.textContent = '⬇ Jump to latest';
             }
         }
 
@@ -4368,15 +4713,57 @@ def home():
             }
         }
 
+        function rollupSummaryKey(row, idx = 0) {
+            const level = normalizeSummaryLevel(row?.level || '');
+            const channelId = parseInt(String(row?.channel_id ?? ''), 10);
+            const windowStart = Number(row?.window_start);
+            const windowSecRaw = Number(row?.window_sec);
+            const windowEnd = Number(row?.window_end);
+            if (
+                level !== 'L0'
+                && Number.isFinite(channelId)
+                && Number.isFinite(windowStart)
+            ) {
+                const startBucket = Math.floor(windowStart);
+                let windowSec = Number.isFinite(windowSecRaw) ? Math.floor(windowSecRaw) : 0;
+                if (!(windowSec > 0) && Number.isFinite(windowEnd)) {
+                    windowSec = Math.max(1, Math.floor(windowEnd - windowStart));
+                }
+                return `rollup:${level}:ch${channelId}:w${windowSec}:t${startBucket}`;
+            }
+            const rid = String(row?.rollup_id || '').trim();
+            if (rid) return `rollup:${rid}`;
+            return `rollup:idx-${idx}`;
+        }
+
         function areAllSummariesCollapsed(channelId = getSelectedSummaryChannel()) {
+            if (isRollupViewActive()) {
+                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
+                if (!rows.length) return false;
+                return rows.every((row, idx) => isSummaryCollapsed(channelId, rollupSummaryKey(row, idx)));
+            }
             const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
             if (!logs.length) return false;
             return logs.every((log, idx) => isSummaryCollapsed(channelId, luxriotSummaryLogKey(log, idx)));
         }
 
         function collapseAllSummariesForChannel(channelId = getSelectedSummaryChannel(), collapsed = true) {
-            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
             const map = getSummaryCollapsedMap(channelId);
+            if (isRollupViewActive()) {
+                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
+                if (!rows.length) return;
+                if (collapsed) {
+                    rows.forEach((row, idx) => {
+                        map[rollupSummaryKey(row, idx)] = true;
+                    });
+                } else {
+                    rows.forEach((row, idx) => {
+                        delete map[rollupSummaryKey(row, idx)];
+                    });
+                }
+                return;
+            }
+            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
             if (!logs.length) return;
             if (collapsed) {
                 logs.forEach((log, idx) => {
@@ -4432,9 +4819,14 @@ def home():
         }
 
         function updateSummaryControlsUI() {
+            const rollupMode = isRollupViewActive();
             if (luxriotSummaryFollowBtn) {
-                luxriotSummaryFollowBtn.classList.toggle('primary', luxriotSummaryFollowLive);
-                luxriotSummaryFollowBtn.textContent = luxriotSummaryFollowLive ? 'Follow: ON' : 'Follow: OFF';
+                const liveOn = !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
+                luxriotSummaryFollowBtn.classList.toggle('primary', liveOn);
+                luxriotSummaryFollowBtn.textContent = rollupMode
+                    ? '▶ Live n/a'
+                    : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
+                luxriotSummaryFollowBtn.disabled = rollupMode;
             }
             if (luxriotSummaryPauseBtn) {
                 luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
@@ -4447,7 +4839,23 @@ def home():
             if (luxriotSummaryCollapseAllBtn) {
                 const collapsed = areAllSummariesCollapsed();
                 luxriotSummaryCollapseAllBtn.classList.toggle('primary', collapsed);
-                luxriotSummaryCollapseAllBtn.textContent = collapsed ? 'Expand all' : 'Collapse all';
+                luxriotSummaryCollapseAllBtn.textContent = collapsed ? '⇵ Expand all' : '⇵ Collapse all';
+                luxriotSummaryCollapseAllBtn.disabled = false;
+            }
+            if (luxriotSummaryBackBtn) {
+                luxriotSummaryBackBtn.disabled = !Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1;
+            }
+            if (luxriotSummaryJumpBtn) {
+                if (rollupMode) {
+                    luxriotSummaryJumpBtn.classList.add('is-hidden');
+                } else if (luxriotSummaryUnread > 0) {
+                    luxriotSummaryJumpBtn.classList.remove('is-hidden');
+                } else {
+                    luxriotSummaryJumpBtn.classList.add('is-hidden');
+                }
+            }
+            if (luxriotSummaryApplyFiltersBtn) {
+                luxriotSummaryApplyFiltersBtn.disabled = normalizeSummaryRangePreset(luxriotSummaryRangePreset) !== 'custom';
             }
         }
 
@@ -4659,6 +5067,209 @@ def home():
                 setSummaryUnread(luxriotSummaryUnread + newCount);
             }
             updateSummaryControlsUI();
+        }
+
+        function formatRollupRange(windowStart, windowEnd) {
+            const start = Number(windowStart);
+            const end = Number(windowEnd);
+            const startLabel = Number.isFinite(start) ? new Date(start * 1000).toLocaleString() : 'n/a';
+            const endLabel = Number.isFinite(end) ? new Date(end * 1000).toLocaleString() : 'n/a';
+            return `${startLabel} -> ${endLabel}`;
+        }
+
+        function formatLuxriotRollupExport(row) {
+            const nl = String.fromCharCode(10);
+            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const level = normalizeSummaryLevel(row?.level || 'L0');
+            const sourceLevel = String(row?.source_level || '').trim() || 'n/a';
+            const rollupId = String(row?.rollup_id || '').trim() || 'n/a';
+            const itemCount = Number(row?.item_count || 0);
+            const frameCount = Number(row?.frame_count || 0);
+            const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
+            const range = formatRollupRange(row?.window_start, row?.window_end);
+            const summary = String(row?.summary || '').trim();
+            const header = [
+                `Channel: ${channelId}`,
+                `Level: ${level}`,
+                `Rollup ID: ${rollupId}`,
+                `Range: ${range}`,
+                `Items: ${itemCount}`,
+                `Frames: ${frameCount}`,
+                `Runs: ${runCount}`,
+                `Source level: ${sourceLevel}`,
+            ].join(nl);
+            return `${header}${nl}${nl}${summary}`;
+        }
+
+        async function copyLuxriotRollupFromRow(rowIndex, triggerBtn = null) {
+            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
+                setLuxriotStatus('Invalid rollup selection', true);
+                return;
+            }
+            const row = luxriotSummaryRollupRows[idx] || {};
+            try {
+                await copyTextToClipboard(formatLuxriotRollupExport(row));
+                setLuxriotStatus('Rollup copied');
+                if (triggerBtn) {
+                    const original = triggerBtn.textContent;
+                    triggerBtn.textContent = 'Copied';
+                    setTimeout(() => {
+                        if (triggerBtn) triggerBtn.textContent = original || 'Copy';
+                    }, 1200);
+                }
+            } catch (_) {
+                setLuxriotStatus('Failed to copy rollup', true);
+            }
+        }
+
+        function exportLuxriotRollupFromRow(rowIndex) {
+            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
+                setLuxriotStatus('Invalid rollup selection', true);
+                return;
+            }
+            const row = luxriotSummaryRollupRows[idx] || {};
+            const level = normalizeSummaryLevel(row?.level || 'L0');
+            const stamp = Number.isFinite(Number(row?.window_start))
+                ? new Date(Number(row.window_start) * 1000).toISOString().replace(/[:]/g, '-')
+                : `entry-${idx + 1}`;
+            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const filename = `luxriot_rollup_${level.toLowerCase()}_ch${channelId}_${stamp}.txt`;
+            downloadTextFile(filename, formatLuxriotRollupExport(row));
+            setLuxriotStatus(`Exported ${filename}`);
+        }
+
+        function pushSummaryRollupContext(level, sourceIds = null, label = '') {
+            const normalized = normalizeSummaryLevel(level);
+            const ids = Array.isArray(sourceIds)
+                ? sourceIds.map((id) => String(id || '').trim()).filter((id) => id.length > 0)
+                : null;
+            luxriotSummaryRollupStack.push({
+                level: normalized,
+                sourceIds: ids && ids.length ? ids : null,
+                label: String(label || normalized).trim() || normalized,
+            });
+            luxriotSummaryLevel = normalized;
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = normalized;
+            }
+        }
+
+        function popSummaryRollupContext() {
+            if (!Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1) {
+                return null;
+            }
+            luxriotSummaryRollupStack.pop();
+            const ctx = getCurrentSummaryRollupContext();
+            luxriotSummaryLevel = normalizeSummaryLevel(ctx?.level || 'L0');
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = luxriotSummaryLevel;
+            }
+            return ctx;
+        }
+
+        function renderLuxriotRollups(payload, channelId = getSelectedSummaryChannel()) {
+            if (!luxriotSummaries) return 0;
+            const data = payload && typeof payload === 'object' ? payload : {};
+            const levels = data.levels && typeof data.levels === 'object' ? data.levels : {};
+            const ctx = getCurrentSummaryRollupContext();
+            const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
+            const sourceSet = Array.isArray(ctx?.sourceIds) && ctx.sourceIds.length
+                ? new Set(ctx.sourceIds.map((id) => String(id || '').trim()).filter((id) => id))
+                : null;
+            const levelRows = Array.isArray(levels[level]) ? levels[level] : [];
+            const rows = levelRows
+                .filter((row) => {
+                    if (!sourceSet) return true;
+                    const rowId = String(row?.rollup_id || '').trim();
+                    return rowId && sourceSet.has(rowId);
+                })
+                .sort((a, b) => Number(a?.window_start || 0) - Number(b?.window_start || 0));
+
+            luxriotSummaryRollupRows = rows;
+            luxriotSummaryLogCache = [];
+            if (!rows.length) {
+                luxriotSummaries.innerHTML = `<div class="loading">No ${level} rollups available for this selection.</div>`;
+                luxriotSummaries.dataset.hasRender = '1';
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                return 0;
+            }
+
+            const html = rows.map((row, idx) => {
+                const rowLevel = normalizeSummaryLevel(row?.level || level);
+                const rollupKey = rollupSummaryKey(row, idx);
+                const collapsed = isSummaryCollapsed(channelId, rollupKey);
+                const rangeLabel = formatRollupRange(row?.window_start, row?.window_end);
+                const itemCount = Number(row?.item_count || 0);
+                const frameCount = Number(row?.frame_count || 0);
+                const sourceTokens = Number(row?.source_tokens || 0);
+                const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
+                const sourceLevel = String(row?.source_level || '').trim();
+                const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
+                const summary = String(row?.summary || '').trim();
+                const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
+                const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
+                const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
+                return `
+                    <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
+                        <div class="luxriot-summary-head">
+                            <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
+                            <div class="luxriot-summary-actions">
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-export="${idx}">Export</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
+                            </div>
+                        </div>
+                        <div class="summary-body">${renderMarkdown(summary)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            luxriotSummaries.innerHTML = html;
+            luxriotSummaries.scrollTop = 0;
+            luxriotSummaries.dataset.hasRender = '1';
+            setSummaryUnread(0);
+            updateSummaryControlsUI();
+            return rows.length;
+        }
+
+        async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false) {
+            if (!channelId) return;
+            if (!luxriotSummaryAutoRefresh && !force) return;
+            try {
+                const params = buildSummaryQueryParams(channelId);
+                params.set('level_limit', '240');
+                const resp = await fetch(`/luxriot/rollups?${params.toString()}`);
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                syncSummaryRunSelectOptions(data.runs, data.selected_run);
+                syncSummaryFiltersFromResponse(data);
+                luxriotSummaryRollupCache[channelId] = data;
+                const renderedCount = renderLuxriotRollups(data, channelId);
+                const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
+                const ctx = getCurrentSummaryRollupContext();
+                const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
+                const drillLabel = ctx?.sourceIds ? ` · drill ${ctx.sourceIds.length}` : '';
+                const runLabel = luxriotSummaryRunFilter || 'latest';
+                const countsLabel = `L1 ${Number(counts.L1 || 0)} · L2 ${Number(counts.L2 || 0)} · L3 ${Number(counts.L3 || 0)}`;
+                setLuxriotSummaryMeta(`#${channelId} · ${level}${drillLabel} · ${renderedCount} items · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`);
+                setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
+            } catch (err) {
+                setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
+                setLuxriotStatus('Failed to fetch rollups: ' + err.message, true);
+            }
+        }
+
+        async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false) {
+            if (isRollupViewActive()) {
+                return refreshLuxriotRollups(channelId, force);
+            }
+            return refreshLuxriotSummaries(channelId, force);
         }
 
         function updateProbeChannelRuntime(payload, rerender = false) {
@@ -4965,7 +5576,7 @@ def home():
                 await parseApiJson(response, 'Stream stop failed');
                 await refreshLuxriotStreams();
                 if (normalizedType === 'video' || normalizedType === 'both') {
-                    await refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 }
                 if (normalizedType === 'analytics' || normalizedType === 'both') {
                     await refreshProbeStatus(parsedChannelId);
@@ -5006,7 +5617,7 @@ def home():
                 await refreshLuxriotStreams();
                 if (stopVideo) {
                     stopLuxriotSummaryPoll();
-                    await refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 }
                 if (stopAnalytics) {
                     await refreshProbeStatus();
@@ -5158,29 +5769,23 @@ def home():
             if (!channelId) return;
             if (!luxriotSummaryAutoRefresh && !force) return;
             try {
-                const resp = await fetch(`/luxriot/session?channel_id=${channelId}`);
+                const params = buildSummaryQueryParams(channelId);
+                params.set('limit', '240');
+                const resp = await fetch(`/luxriot/session?${params.toString()}`);
                 const data = await resp.json();
                 if (data.error) {
                     throw new Error(data.error);
                 }
+                syncSummaryRunSelectOptions(data.runs, data.selected_run);
+                syncSummaryFiltersFromResponse(data);
                 renderLuxriotSummaries(data.logs || [], channelId);
                 const historyCount = Number(data.archived_log_count || 0);
                 const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
-                const stateLabel = data.running ? 'running' : 'stopped';
-                const detailParts = [
-                    getLuxriotChannelLabel(channelId),
-                    `state: ${stateLabel}`,
-                    `entries: ${totalCount}`,
-                ];
-                if (historyCount > 0) {
-                    detailParts.push(`archived: ${historyCount}`);
-                }
-                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
-                    detailParts.push(`${data.pending_frames} queued`);
-                }
-                if (data.last_error) {
-                    detailParts.push('last error');
-                }
+                const stateLabel = data.running ? 'live' : 'stopped';
+                const detailParts = [`#${channelId}`, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
+                if (historyCount > 0) detailParts.push(`hist ${historyCount}`);
+                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) detailParts.push(`q ${data.pending_frames}`);
+                if (data.last_error) detailParts.push('err');
                 setLuxriotSummaryMeta(detailParts.join(' · '), Boolean(data.last_error));
                 let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
                 if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
@@ -5200,7 +5805,7 @@ def home():
             stopLuxriotSummaryPoll();
             luxriotSummaryTimer = setInterval(() => {
                 const channelId = getSelectedSummaryChannel();
-                refreshLuxriotSummaries(channelId);
+                refreshLuxriotSummaryView(channelId);
                 refreshLuxriotStreams();
             }, 8000);
         }
@@ -5241,7 +5846,7 @@ def home():
                 syncLuxriotSummaryChannelSelect();
                 updateSummaryControlsUI();
                 setSummaryUnread(0);
-                refreshLuxriotSummaries(channelId, true);
+                refreshLuxriotSummaryView(channelId, true);
                 refreshLuxriotStreams();
                 startLuxriotSummaryPoll();
             } catch (err) {
@@ -5265,7 +5870,7 @@ def home():
                     throw new Error(data.error);
                 }
                 setLuxriotStatus('Summaries stopped');
-                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
@@ -5288,7 +5893,11 @@ def home():
                 setLuxriotStatus('Buffer flushed');
                 if (data.status) {
                     if (getSelectedSummaryChannel() === channelId) {
-                        renderLuxriotSummaries(data.status.logs || [], channelId);
+                        if (isRollupViewActive()) {
+                            await refreshLuxriotSummaryView(channelId, true);
+                        } else {
+                            renderLuxriotSummaries(data.status.logs || [], channelId);
+                        }
                     }
                 }
                 refreshLuxriotStreams();
@@ -5305,7 +5914,7 @@ def home():
             setSummaryUnread(0);
             syncLuxriotSummaryChannelSelect();
             startLuxriotPreview();
-            refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
             refreshLuxriotStreams();
             startLuxriotSummaryPoll();
         }
@@ -5327,6 +5936,9 @@ def home():
             }
         }
         syncProbeChannelSelect();
+        syncSummaryRunSelectOptions([], luxriotSummaryRunFilter);
+        applySummaryFiltersFromInputs();
+        setSummaryBaseLevel(luxriotSummaryLevel);
 
         setMode(currentMode);
         
@@ -6185,22 +6797,96 @@ def home():
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
         }
         if (luxriotRefreshSummariesBtn) {
-            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries(getSelectedSummaryChannel(), true));
+            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaryView(getSelectedSummaryChannel(), true));
         }
         if (luxriotSummaryChannelSelect) {
             luxriotSummaryChannelSelect.addEventListener('change', () => {
                 luxriotSummaryChannel = getSelectedSummaryChannel();
+                setSummaryBaseLevel(luxriotSummaryLevel);
                 setSummaryUnread(0);
-                refreshLuxriotSummaries(luxriotSummaryChannel, true);
+                refreshLuxriotSummaryView(luxriotSummaryChannel, true);
+            });
+        }
+        if (luxriotSummaryRunSelect) {
+            luxriotSummaryRunSelect.addEventListener('change', () => {
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryRangeSelect) {
+            luxriotSummaryRangeSelect.addEventListener('change', () => {
+                luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
+                syncSummaryRangeUI();
+                if (luxriotSummaryRangePreset === 'custom') {
+                    updateSummaryControlsUI();
+                    return;
+                }
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryLevelSelect) {
+            luxriotSummaryLevelSelect.addEventListener('change', () => {
+                setSummaryBaseLevel(luxriotSummaryLevelSelect.value);
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryApplyFiltersBtn) {
+            luxriotSummaryApplyFiltersBtn.addEventListener('click', () => {
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryFromInput) {
+            luxriotSummaryFromInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryToInput) {
+            luxriotSummaryToInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryBackBtn) {
+            luxriotSummaryBackBtn.addEventListener('click', () => {
+                const ctx = popSummaryRollupContext();
+                if (!ctx) {
+                    updateSummaryControlsUI();
+                    return;
+                }
+                setSummaryUnread(0);
+                const channelId = getSelectedSummaryChannel();
+                const cached = luxriotSummaryRollupCache[channelId];
+                if (isRollupViewActive() && cached) {
+                    renderLuxriotRollups(cached, channelId);
+                    return;
+                }
+                refreshLuxriotSummaryView(channelId, true);
             });
         }
         if (luxriotSummaryFollowBtn) {
             luxriotSummaryFollowBtn.addEventListener('click', () => {
-                luxriotSummaryFollowLive = !luxriotSummaryFollowLive;
+                const enableLive = !(luxriotSummaryAutoRefresh && luxriotSummaryFollowLive);
+                luxriotSummaryAutoRefresh = enableLive;
+                luxriotSummaryFollowLive = enableLive;
                 updateSummaryControlsUI();
-                if (luxriotSummaryFollowLive) {
+                if (enableLive) {
                     setSummaryUnread(0);
                     scrollSummaryToLatest();
+                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 }
             });
         }
@@ -6209,7 +6895,7 @@ def home():
                 luxriotSummaryAutoRefresh = !luxriotSummaryAutoRefresh;
                 updateSummaryControlsUI();
                 if (luxriotSummaryAutoRefresh) {
-                    refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 }
             });
         }
@@ -6217,7 +6903,15 @@ def home():
             luxriotSummaryViewBtn.addEventListener('click', () => {
                 setSummaryCompactMode(!luxriotSummaryCompactMode);
                 updateSummaryControlsUI();
-                renderLuxriotSummaries(luxriotSummaryLogCache, getSelectedSummaryChannel());
+                if (isRollupViewActive()) {
+                    const channelId = getSelectedSummaryChannel();
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                } else {
+                    renderLuxriotSummaries(luxriotSummaryLogCache, getSelectedSummaryChannel());
+                }
             });
         }
         if (luxriotSummaryCollapseAllBtn) {
@@ -6225,11 +6919,19 @@ def home():
                 const channelId = getSelectedSummaryChannel();
                 const allCollapsed = areAllSummariesCollapsed(channelId);
                 collapseAllSummariesForChannel(channelId, !allCollapsed);
-                renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
+                if (isRollupViewActive()) {
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                } else {
+                    renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
+                }
             });
         }
         if (luxriotSummaryJumpBtn) {
             luxriotSummaryJumpBtn.addEventListener('click', () => {
+                if (isRollupViewActive()) return;
                 luxriotSummaryFollowLive = true;
                 setSummaryUnread(0);
                 updateSummaryControlsUI();
@@ -6238,6 +6940,7 @@ def home():
         }
         if (luxriotSummaries) {
             luxriotSummaries.addEventListener('scroll', () => {
+                if (isRollupViewActive()) return;
                 if (!luxriotSummaryFollowLive) return;
                 if (!isSummaryNearBottom()) {
                     luxriotSummaryFollowLive = false;
@@ -6258,6 +6961,58 @@ def home():
             luxriotSummaries.addEventListener('click', (event) => {
                 const target = event.target;
                 if (!(target instanceof Element)) return;
+                const rollupCollapseBtn = target.closest('[data-luxriot-rollup-collapse]');
+                if (rollupCollapseBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupCollapseBtn.dataset.luxriotRollupCollapse || '', 10);
+                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+                    event.preventDefault();
+                    const row = luxriotSummaryRollupRows[idx] || {};
+                    const channelId = getSelectedSummaryChannel();
+                    const key = rollupSummaryKey(row, idx);
+                    const nextState = !isSummaryCollapsed(channelId, key);
+                    setSummaryCollapsed(channelId, key, nextState);
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                    return;
+                }
+                const rollupCopyBtn = target.closest('[data-luxriot-rollup-copy]');
+                if (rollupCopyBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupCopyBtn.dataset.luxriotRollupCopy || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    copyLuxriotRollupFromRow(idx, rollupCopyBtn);
+                    return;
+                }
+                const rollupExportBtn = target.closest('[data-luxriot-rollup-export]');
+                if (rollupExportBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupExportBtn.dataset.luxriotRollupExport || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    exportLuxriotRollupFromRow(idx);
+                    return;
+                }
+                const rollupDrillBtn = target.closest('[data-luxriot-rollup-drill]');
+                if (rollupDrillBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupDrillBtn.dataset.luxriotRollupDrill || '', 10);
+                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+                    const row = luxriotSummaryRollupRows[idx] || {};
+                    const sourceLevel = String(row?.source_level || '').trim();
+                    const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
+                    if (!sourceLevel || !sourceIds.length) return;
+                    event.preventDefault();
+                    pushSummaryRollupContext(sourceLevel, sourceIds, formatRollupRange(row?.window_start, row?.window_end));
+                    setSummaryUnread(0);
+                    const channelId = getSelectedSummaryChannel();
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    } else {
+                        refreshLuxriotSummaryView(channelId, true);
+                    }
+                    return;
+                }
                 const collapseBtn = target.closest('[data-luxriot-collapse]');
                 if (collapseBtn instanceof HTMLButtonElement) {
                     const idx = parseInt(collapseBtn.dataset.luxriotCollapse || '', 10);
@@ -6300,11 +7055,14 @@ def home():
                     if (Number.isFinite(summaryChannelId)) {
                         luxriotSummaryChannel = summaryChannelId;
                         syncLuxriotSummaryChannelSelect();
+                        setSummaryBaseLevel(luxriotSummaryLevel);
                         setSummaryUnread(0);
                         luxriotSummaryFollowLive = true;
                         updateSummaryControlsUI();
-                        refreshLuxriotSummaries(summaryChannelId, true);
-                        scrollSummaryToLatest();
+                        refreshLuxriotSummaryView(summaryChannelId, true);
+                        if (!isRollupViewActive()) {
+                            scrollSummaryToLatest();
+                        }
                     }
                     event.preventDefault();
                     return;
@@ -6328,8 +7086,9 @@ def home():
                 luxriotActiveChannel = getSelectedLuxriotChannel();
                 syncProbeChannelSelect();
                 syncLuxriotSummaryChannelSelect();
+                setSummaryBaseLevel(luxriotSummaryLevel);
                 startLuxriotPreview();
-                refreshLuxriotSummaries(getSelectedSummaryChannel(), true);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             });
         }
@@ -13103,6 +13862,14 @@ def _port_is_available(host: str, port: int) -> bool:
 def _shutdown_background_workers() -> None:
     try:
         luxriot_manager.stop_all_streams(stop_video=True, stop_analytics=True, pause_analytics=False)
+    except Exception:
+        pass
+    try:
+        luxriot_manager.persist_summary_state()
+    except Exception:
+        pass
+    try:
+        luxriot_manager.persist_rollup_cache()
     except Exception:
         pass
     try:

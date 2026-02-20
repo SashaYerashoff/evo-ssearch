@@ -1,9 +1,11 @@
 import base64
 import hashlib
 import json
+import re
 import threading
 import time
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, cast
 
 import requests
@@ -268,7 +270,8 @@ class LuxriotCaptureSession:
             return
         started = time.time()
         try:
-            system_prompt = getattr(self.manager, "system_prompt", "") or ""
+            base_system_prompt = getattr(self.manager, "system_prompt", "") or ""
+            system_prompt = self.manager.compose_live_system_prompt(self.channel_id, base_system_prompt)
             messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
             summary = self.manager.lm_callback(messages, self.model_hint)
             duration = time.time() - started
@@ -288,6 +291,10 @@ class LuxriotCaptureSession:
                 self.total_flushes += 1
                 if len(self.logs) > 50:
                     self.logs = self.logs[-50:]
+            try:
+                self.manager.record_summary_log(self.channel_id, entry)
+            except Exception:
+                pass
         except Exception as exc:
             self.last_error = str(exc)
 
@@ -382,6 +389,15 @@ class LuxriotManager:
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
+        self.channel_routine_context: Dict[int, Dict[str, Any]] = {}
+        self.rollup_time_only = bool(getattr(config, "LUXRIOT_ROLLUP_TIME_ONLY", True))
+        summary_state_raw = str(getattr(config, "LUXRIOT_SUMMARY_STATE_FILE", "luxriot_summary_state.json") or "").strip()
+        if not summary_state_raw:
+            summary_state_raw = "luxriot_summary_state.json"
+        summary_state_path = Path(summary_state_raw).expanduser()
+        if not summary_state_path.is_absolute():
+            summary_state_path = Path.cwd() / summary_state_path
+        self.summary_state_file = summary_state_path
         try:
             l1_window = int(getattr(config, "LUXRIOT_ROLLUP_L1_WINDOW_SEC", 900))
         except Exception:
@@ -403,6 +419,84 @@ class LuxriotManager:
             self.rollup_highlight_limit = max(1, int(getattr(config, "LUXRIOT_ROLLUP_HIGHLIGHTS", 3)))
         except Exception:
             self.rollup_highlight_limit = 3
+        # Backward-compatible single-level flag is still supported, but we default to all levels.
+        legacy_l1_enabled = bool(getattr(config, "LUXRIOT_ROLLUP_L1_LLM_ENABLED", True))
+        llm_levels_raw = str(getattr(config, "LUXRIOT_ROLLUP_LLM_LEVELS", "L1,L2,L3") or "")
+        parsed_levels = {token.strip().upper() for token in llm_levels_raw.split(",") if token.strip()}
+        allowed_levels = {"L1", "L2", "L3"}
+        self.rollup_llm_levels: Set[str] = parsed_levels.intersection(allowed_levels) if parsed_levels else {"L1", "L2", "L3"}
+        if not legacy_l1_enabled and "L1" in self.rollup_llm_levels:
+            self.rollup_llm_levels.discard("L1")
+        try:
+            self.rollup_min_source_tokens = int(getattr(config, "LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS", 8000))
+        except Exception:
+            self.rollup_min_source_tokens = 8000
+        self.rollup_min_source_tokens = max(512, self.rollup_min_source_tokens)
+        try:
+            self.rollup_llm_char_budget = int(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_LLM_CHAR_BUDGET",
+                    getattr(config, "LUXRIOT_ROLLUP_L1_CHAR_BUDGET", 12000),
+                )
+            )
+        except Exception:
+            self.rollup_llm_char_budget = 12000
+        self.rollup_llm_char_budget = max(2000, self.rollup_llm_char_budget)
+        try:
+            self.rollup_llm_max_new_per_call = int(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL",
+                    getattr(config, "LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL", 2),
+                )
+            )
+        except Exception:
+            self.rollup_llm_max_new_per_call = 2
+        self.rollup_llm_max_new_per_call = max(1, self.rollup_llm_max_new_per_call)
+        try:
+            self.rollup_summary_cache_limit = int(getattr(config, "LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT", 800))
+        except Exception:
+            self.rollup_summary_cache_limit = 800
+        self.rollup_summary_cache_limit = max(100, self.rollup_summary_cache_limit)
+        self.rollup_llm_model_hint = (
+            str(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_LLM_MODEL",
+                    getattr(config, "LUXRIOT_ROLLUP_L1_MODEL", ""),
+                )
+                or ""
+            ).strip()
+            or None
+        )
+        self.rollup_llm_system_prompt = str(
+            getattr(
+                config,
+                "LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT",
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT",
+                    "",
+                )
+                or
+                (
+                    "You are a CCTV operations summarizer. Consolidate lower-level summaries into a clear higher-level batch summary. "
+                    "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+                ),
+            )
+            or ""
+        ).strip()
+        self.rollup_summary_cache: Dict[str, Dict[str, Any]] = {}
+        cache_file_raw = str(getattr(config, "LUXRIOT_ROLLUP_CACHE_FILE", "luxriot_rollups_cache.json") or "").strip()
+        if not cache_file_raw:
+            cache_file_raw = "luxriot_rollups_cache.json"
+        cache_path = Path(cache_file_raw).expanduser()
+        if not cache_path.is_absolute():
+            cache_path = Path.cwd() / cache_path
+        self.rollup_cache_file = cache_path
+        self._load_summary_state_from_disk()
+        self._load_rollup_cache_from_disk()
 
     @staticmethod
     def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str, str]:
@@ -433,6 +527,164 @@ class LuxriotManager:
             merged[key] = dict(item)
         ordered.sort(key=lambda key: float(key[0]))
         return [merged[key] for key in ordered]
+
+    def _normalize_summary_log_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        channel_id = _parse_optional_int(entry.get("channel_id"))
+        if channel_id is None:
+            return None
+        summary = str(entry.get("summary") or "").strip()
+        if not summary:
+            return None
+        created_at = self._coerce_float(entry.get("created_at"))
+        if created_at is None:
+            created_at = time.time()
+        frame_count = _parse_optional_int(entry.get("frame_count")) or 0
+        batch_size = _parse_optional_int(entry.get("batch_size")) or 0
+        duration_sec = self._coerce_float(entry.get("duration_sec")) or 0.0
+        return {
+            "channel_id": int(channel_id),
+            "run_id": str(entry.get("run_id") or "").strip(),
+            "summary": summary,
+            "frame_count": int(max(0, frame_count)),
+            "batch_size": int(max(0, batch_size)),
+            "created_at": float(created_at),
+            "duration_sec": float(max(0.0, duration_sec)),
+            "prompt": str(entry.get("prompt") or ""),
+        }
+
+    def _normalize_summary_run_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        channel_id = _parse_optional_int(entry.get("channel_id"))
+        run_id = str(entry.get("run_id") or "").strip()
+        if channel_id is None or not run_id:
+            return None
+        started_at = self._coerce_float(entry.get("started_at"))
+        if started_at is None:
+            started_at = time.time()
+        ended_at = self._coerce_float(entry.get("ended_at"))
+        batch_size = _parse_optional_int(entry.get("batch_size"))
+        return {
+            "run_id": run_id,
+            "channel_id": int(channel_id),
+            "started_at": float(started_at),
+            "ended_at": ended_at,
+            "running": bool(entry.get("running")),
+            "batch_size": int(batch_size) if batch_size is not None else 0,
+            "model": str(entry.get("model") or "").strip() or None,
+            "prompt": str(entry.get("prompt") or ""),
+            "system_prompt": str(entry.get("system_prompt") or ""),
+        }
+
+    def _persist_summary_state_locked(self) -> None:
+        history_payload: Dict[str, List[Dict[str, Any]]] = {}
+        for channel_id, logs in self.summary_history.items():
+            if not logs:
+                continue
+            history_payload[str(channel_id)] = [dict(log) for log in logs if isinstance(log, Mapping)]
+        runs_payload: Dict[str, List[Dict[str, Any]]] = {}
+        for channel_id, runs in self.summary_runs.items():
+            if not runs:
+                continue
+            runs_payload[str(channel_id)] = [dict(run) for run in runs if isinstance(run, Mapping)]
+        routine_payload: Dict[str, Dict[str, Any]] = {}
+        for channel_id, routine in self.channel_routine_context.items():
+            if not isinstance(routine, Mapping):
+                continue
+            routine_payload[str(channel_id)] = dict(routine)
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "summary_history": history_payload,
+            "summary_runs": runs_payload,
+            "channel_routines": routine_payload,
+        }
+        path = self.summary_state_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = path.with_suffix(f"{path.suffix}.tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_file.replace(path)
+        except Exception:
+            return
+
+    def _load_summary_state_from_disk(self) -> None:
+        path = self.summary_state_file
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        history_raw = payload.get("summary_history") if isinstance(payload, Mapping) else None
+        runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
+        routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
+        loaded_history: Dict[int, List[Dict[str, Any]]] = {}
+        if isinstance(history_raw, Mapping):
+            for channel_key, logs_value in history_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or not isinstance(logs_value, Sequence) or isinstance(logs_value, (str, bytes, bytearray)):
+                    continue
+                normalized_logs: List[Dict[str, Any]] = []
+                for raw_log in logs_value:
+                    if not isinstance(raw_log, Mapping):
+                        continue
+                    normalized = self._normalize_summary_log_entry(cast(Mapping[str, Any], raw_log))
+                    if normalized is not None:
+                        normalized_logs.append(normalized)
+                if not normalized_logs:
+                    continue
+                combined = self._combine_summary_logs([], normalized_logs)
+                if len(combined) > self.summary_history_limit:
+                    combined = combined[-self.summary_history_limit :]
+                loaded_history[int(channel_id)] = combined
+        loaded_runs: Dict[int, List[Dict[str, Any]]] = {}
+        if isinstance(runs_raw, Mapping):
+            for channel_key, runs_value in runs_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or not isinstance(runs_value, Sequence) or isinstance(runs_value, (str, bytes, bytearray)):
+                    continue
+                dedup: Dict[str, Dict[str, Any]] = {}
+                for raw_run in runs_value:
+                    if not isinstance(raw_run, Mapping):
+                        continue
+                    normalized_run = self._normalize_summary_run_entry(cast(Mapping[str, Any], raw_run))
+                    if normalized_run is None:
+                        continue
+                    normalized_run["running"] = False
+                    if normalized_run.get("ended_at") is None:
+                        normalized_run["ended_at"] = normalized_run.get("started_at")
+                    dedup[str(normalized_run["run_id"])] = normalized_run
+                runs_list = sorted(
+                    dedup.values(),
+                    key=lambda row: float(self._coerce_float(row.get("started_at")) or 0.0),
+                    reverse=True,
+                )
+                if runs_list:
+                    loaded_runs[int(channel_id)] = runs_list
+        loaded_routines: Dict[int, Dict[str, Any]] = {}
+        if isinstance(routines_raw, Mapping):
+            for channel_key, routine_value in routines_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or not isinstance(routine_value, Mapping):
+                    continue
+                routine_text = str(routine_value.get("routine") or "").strip()
+                if not routine_text:
+                    continue
+                loaded_routines[int(channel_id)] = {
+                    "channel_id": int(channel_id),
+                    "rollup_id": str(routine_value.get("rollup_id") or "").strip(),
+                    "window_end": float(self._coerce_float(routine_value.get("window_end")) or 0.0),
+                    "routine": routine_text,
+                    "updated_at": float(self._coerce_float(routine_value.get("updated_at")) or time.time()),
+                }
+        with self.cache_lock:
+            self.summary_history = loaded_history
+            self.summary_runs = loaded_runs
+            self.channel_routine_context = loaded_routines
+            self.active_summary_runs = {}
+
+    def persist_summary_state(self) -> None:
+        with self.cache_lock:
+            self._persist_summary_state_locked()
 
     @staticmethod
     def _coerce_float(value: object) -> Optional[float]:
@@ -480,6 +732,7 @@ class LuxriotManager:
         }
         self.summary_runs.setdefault(channel_id, []).append(run)
         self.active_summary_runs[channel_id] = str(run["run_id"])
+        self._persist_summary_state_locked()
         return dict(run)
 
     def _close_run_locked(self, channel_id: int, run_id: Optional[str]) -> None:
@@ -497,6 +750,7 @@ class LuxriotManager:
                 break
         if active_run_id == target_run_id:
             self.active_summary_runs.pop(channel_id, None)
+        self._persist_summary_state_locked()
 
     @staticmethod
     def _filter_summary_logs(
@@ -556,6 +810,12 @@ class LuxriotManager:
         digest = hashlib.sha1(payload).hexdigest()
         return digest[: max(6, int(length))]
 
+    def _source_signature(self, source_ids: Sequence[str]) -> str:
+        normalized = [str(item or "").strip() for item in source_ids if str(item or "").strip()]
+        if not normalized:
+            return ""
+        return self._stable_id(normalized, length=16)
+
     @staticmethod
     def _summary_headline(text: object, max_len: int = 180) -> str:
         normalized = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
@@ -564,6 +824,130 @@ class LuxriotManager:
         if len(normalized) <= max_len:
             return normalized
         return f"{normalized[: max_len - 3].rstrip()}..."
+
+    @staticmethod
+    def _sanitize_l0_summary(text: object, max_len: int = 520) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        # Remove frequent boilerplate prefixes produced by VLM.
+        cleaned = re.sub(
+            r"^\s*As a security expert(?:[^:.\n]*[:.])\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^\s*(Summary|Scene Overview|Detailed Analysis)\s*:\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        normalized = " ".join(cleaned.replace("\r", " ").replace("\n", " ").split())
+        if len(normalized) <= max_len:
+            return normalized
+        return f"{normalized[: max_len - 3].rstrip()}..."
+
+    @staticmethod
+    def _window_label(start_ts: Optional[float], end_ts: Optional[float]) -> str:
+        if isinstance(start_ts, (int, float)):
+            start_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(start_ts)))
+        else:
+            start_label = "n/a"
+        if isinstance(end_ts, (int, float)):
+            end_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(end_ts)))
+        else:
+            end_label = "n/a"
+        return f"{start_label} -> {end_label}"
+
+    @staticmethod
+    def _extract_markdown_section(text: str, heading: str) -> str:
+        pattern = re.compile(
+            rf"^###\s*{re.escape(heading)}\s*$\n(?P<body>.*?)(?:\n###\s|\Z)",
+            re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        match = pattern.search(text)
+        if not match:
+            return ""
+        body = match.group("body").strip()
+        return body
+
+    def _extract_routine_hint(self, summary_text: object) -> str:
+        text = str(summary_text or "").strip()
+        if not text:
+            return ""
+        baseline = self._extract_markdown_section(text, "Scene Baseline")
+        notes = self._extract_markdown_section(text, "Operator Notes")
+        chunks: List[str] = []
+        if baseline:
+            chunks.append(f"Scene baseline: {' '.join(baseline.split())}")
+        if notes:
+            chunks.append(f"Operator notes: {' '.join(notes.split())}")
+        if not chunks:
+            cleaned = self._sanitize_l0_summary(text, max_len=420)
+            if cleaned:
+                chunks.append(cleaned)
+        hint = " ".join(chunks).strip()
+        if len(hint) > 900:
+            hint = f"{hint[:897].rstrip()}..."
+        return hint
+
+    def _update_channel_routine_context(
+        self,
+        channel_id: int,
+        rollup_id: str,
+        summary_text: object,
+        window_end: Optional[float],
+    ) -> None:
+        routine_hint = self._extract_routine_hint(summary_text)
+        if not routine_hint:
+            return
+        channel_key = int(channel_id)
+        rollup_key = str(rollup_id or "").strip()
+        window_end_value = self._coerce_float(window_end) or 0.0
+        changed = False
+        with self.cache_lock:
+            current = self.channel_routine_context.get(channel_key)
+            current_window_end = self._coerce_float(current.get("window_end")) if isinstance(current, Mapping) else None
+            current_rollup_id = str(current.get("rollup_id") or "").strip() if isinstance(current, Mapping) else ""
+            current_hint = str(current.get("routine") or "").strip() if isinstance(current, Mapping) else ""
+            should_replace = (
+                current is None
+                or window_end_value > float(current_window_end or 0.0)
+                or (current_rollup_id == rollup_key and current_hint != routine_hint)
+            )
+            if should_replace:
+                self.channel_routine_context[channel_key] = {
+                    "channel_id": channel_key,
+                    "rollup_id": rollup_key,
+                    "window_end": window_end_value,
+                    "routine": routine_hint,
+                    "updated_at": time.time(),
+                }
+                changed = True
+            if changed:
+                self._persist_summary_state_locked()
+
+    def _get_channel_routine_prompt(self, channel_id: int) -> str:
+        with self.cache_lock:
+            current = self.channel_routine_context.get(int(channel_id))
+        if not isinstance(current, Mapping):
+            return ""
+        routine = str(current.get("routine") or "").strip()
+        if not routine:
+            return ""
+        return (
+            "Channel routine baseline from prior long-window summaries:\n"
+            f"{routine}\n"
+            "Use this as context for what is typical in this stream. Preserve key deviations and anomalies."
+        )
+
+    def compose_live_system_prompt(self, channel_id: int, base_prompt: Optional[str]) -> str:
+        base = str(base_prompt or "").strip()
+        routine = self._get_channel_routine_prompt(channel_id)
+        if routine:
+            return f"{base}\n\n{routine}" if base else routine
+        return base
 
     @staticmethod
     def _bucket_start(ts: float, window_sec: int) -> int:
@@ -620,6 +1004,565 @@ class LuxriotManager:
             base += "."
         return base
 
+    @staticmethod
+    def _estimate_token_count(text: object) -> int:
+        normalized = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+        if not normalized:
+            return 0
+        return max(1, int(len(normalized) / 4))
+
+    @staticmethod
+    def _normalize_rollup_level(level: object) -> str:
+        text = str(level or "").strip().upper()
+        if text in {"L1", "L2", "L3"}:
+            return text
+        return ""
+
+    @staticmethod
+    def _coerce_str_list(values: object) -> List[str]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
+            return []
+        out: List[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                out.append(text)
+        return out
+
+    @staticmethod
+    def _infer_channel_id_from_rollup_id(rollup_id: str) -> Optional[int]:
+        match = re.search(r"-ch(\d+)-", str(rollup_id or ""))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _canonical_rollup_id(level: str, channel_id: int, window_start: float, window_sec: int) -> str:
+        normalized_level = str(level or "").strip().lower()
+        start_bucket = int(float(window_start))
+        normalized_window = max(0, int(window_sec))
+        return f"{normalized_level}-ch{int(channel_id)}-w{normalized_window}-{start_bucket}"
+
+    def _rollup_identity_key(self, row: Mapping[str, Any]) -> Optional[str]:
+        level = self._normalize_rollup_level(row.get("level"))
+        channel_id = _parse_optional_int(row.get("channel_id"))
+        window_start = self._coerce_float(row.get("window_start"))
+        window_end = self._coerce_float(row.get("window_end"))
+        window_sec = _parse_optional_int(row.get("window_sec"))
+        if (
+            level in {"L1", "L2", "L3"}
+            and channel_id is not None
+            and window_start is not None
+        ):
+            if window_sec is None and window_end is not None:
+                try:
+                    window_sec = max(1, int(window_end - window_start))
+                except Exception:
+                    window_sec = 0
+            return self._canonical_rollup_id(level, int(channel_id), float(window_start), int(window_sec or 0))
+        rollup_id = str(row.get("rollup_id") or "").strip()
+        if rollup_id:
+            return rollup_id
+        return None
+
+    def _normalize_cached_rollup_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        rollup_id = str(entry.get("rollup_id") or "").strip()
+        summary = str(entry.get("summary") or "").strip()
+        if not summary:
+            return None
+        level = self._normalize_rollup_level(entry.get("level"))
+        if not level:
+            return None
+        channel_id = _parse_optional_int(entry.get("channel_id"))
+        if channel_id is None:
+            channel_id = self._infer_channel_id_from_rollup_id(rollup_id)
+        if channel_id is None:
+            return None
+        source_level = self._normalize_rollup_level(entry.get("source_level")) or None
+        window_start = self._coerce_float(entry.get("window_start"))
+        window_end = self._coerce_float(entry.get("window_end"))
+        window_sec = _parse_optional_int(entry.get("window_sec"))
+        if window_sec is None:
+            if window_start is not None and window_end is not None:
+                try:
+                    window_sec = max(1, int(window_end - window_start))
+                except Exception:
+                    window_sec = 0
+            else:
+                window_sec = 0
+        if level in {"L1", "L2", "L3"} and window_start is not None:
+            rollup_id = self._canonical_rollup_id(level, int(channel_id), float(window_start), int(window_sec or 0))
+        if not rollup_id:
+            return None
+        item_count = _parse_optional_int(entry.get("item_count")) or 0
+        frame_count = _parse_optional_int(entry.get("frame_count")) or 0
+        source_tokens = _parse_optional_int(entry.get("source_tokens")) or 0
+        run_ids = self._coerce_str_list(entry.get("run_ids"))
+        source_ids = self._coerce_str_list(entry.get("source_ids"))
+        source_signature = str(entry.get("source_signature") or "").strip()
+        if not source_signature:
+            source_signature = self._source_signature(source_ids)
+        highlights = self._coerce_str_list(entry.get("highlights"))
+        summary_kind = str(entry.get("summary_kind") or "").strip() or "llm_cached"
+        created_at = self._coerce_float(entry.get("created_at"))
+        if created_at is None:
+            created_at = time.time()
+        return {
+            "rollup_id": rollup_id,
+            "channel_id": int(channel_id),
+            "level": level,
+            "source_level": source_level,
+            "source_ids": source_ids,
+            "window_start": window_start,
+            "window_end": window_end,
+            "window_sec": int(max(0, window_sec)),
+            "item_count": int(max(0, item_count)),
+            "frame_count": int(max(0, frame_count)),
+            "source_tokens": int(max(0, source_tokens)),
+            "run_ids": run_ids,
+            "highlights": highlights,
+            "source_signature": source_signature,
+            "summary": summary,
+            "summary_kind": summary_kind,
+            "created_at": float(created_at),
+        }
+
+    def _persist_rollup_cache_locked(self) -> None:
+        payload_entries = [
+            dict(entry)
+            for entry in self.rollup_summary_cache.values()
+            if isinstance(entry, Mapping)
+        ]
+        cache_file = self.rollup_cache_file
+        payload = {"version": 1, "updated_at": time.time(), "entries": payload_entries}
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_file.replace(cache_file)
+        except Exception:
+            # Best-effort persistence should never interrupt the live stream loop.
+            return
+
+    def _load_rollup_cache_from_disk(self) -> None:
+        cache_file = self.rollup_cache_file
+        if not cache_file.exists():
+            return
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        raw_entries: Sequence[object]
+        if isinstance(payload, Mapping):
+            data_entries = payload.get("entries")
+            if isinstance(data_entries, Sequence) and not isinstance(data_entries, (str, bytes, bytearray)):
+                raw_entries = list(data_entries)
+            else:
+                raw_entries = [
+                    value
+                    for value in payload.values()
+                    if isinstance(value, Mapping) and value.get("rollup_id")
+                ]
+        elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+            raw_entries = list(payload)
+        else:
+            raw_entries = []
+        normalized_entries: List[Dict[str, Any]] = []
+        for item in raw_entries:
+            if not isinstance(item, Mapping):
+                continue
+            normalized = self._normalize_cached_rollup_entry(cast(Mapping[str, Any], item))
+            if normalized is None:
+                continue
+            normalized_entries.append(normalized)
+        normalized_entries.sort(key=lambda row: float(self._coerce_float(row.get("created_at")) or 0.0))
+        with self.cache_lock:
+            self.rollup_summary_cache.clear()
+            for entry in normalized_entries[-self.rollup_summary_cache_limit :]:
+                self.rollup_summary_cache[str(entry["rollup_id"])] = entry
+
+    def persist_rollup_cache(self) -> None:
+        with self.cache_lock:
+            self._persist_rollup_cache_locked()
+
+    def _get_cached_rollup_record(self, rollup_id: str) -> Optional[Dict[str, Any]]:
+        key = str(rollup_id or "").strip()
+        if not key:
+            return None
+        with self.cache_lock:
+            cached = self.rollup_summary_cache.get(key)
+        if not isinstance(cached, Mapping):
+            return None
+        return dict(cached)
+
+    def _put_cached_rollup_summary(self, rollup_id: str, summary: str, **meta: Any) -> None:
+        key = str(rollup_id or "").strip()
+        text = str(summary or "").strip()
+        if not key or not text:
+            return
+        payload: Dict[str, Any] = {"rollup_id": key, "summary": text, "created_at": time.time()}
+        payload.update(meta)
+        normalized_payload = self._normalize_cached_rollup_entry(payload)
+        if normalized_payload is None:
+            return
+        store_key = str(normalized_payload.get("rollup_id") or "").strip()
+        if not store_key:
+            return
+        with self.cache_lock:
+            self.rollup_summary_cache[store_key] = normalized_payload
+            while len(self.rollup_summary_cache) > self.rollup_summary_cache_limit:
+                oldest_key = next(iter(self.rollup_summary_cache))
+                if oldest_key == store_key and len(self.rollup_summary_cache) == 1:
+                    break
+                self.rollup_summary_cache.pop(oldest_key, None)
+            self._persist_rollup_cache_locked()
+
+    def _list_cached_rollups(
+        self,
+        channel_id: int,
+        start_ts: Optional[float],
+        end_ts: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        with self.cache_lock:
+            entries = [dict(val) for val in self.rollup_summary_cache.values() if isinstance(val, Mapping)]
+        out: List[Dict[str, Any]] = []
+        for entry in entries:
+            if _parse_optional_int(entry.get("channel_id")) != channel_id:
+                continue
+            window_start = self._coerce_float(entry.get("window_start"))
+            window_end = self._coerce_float(entry.get("window_end"))
+            if start_ts is not None and (window_end is None or window_end < start_ts):
+                continue
+            if end_ts is not None and (window_start is None or window_start > end_ts):
+                continue
+            out.append(entry)
+        out.sort(key=lambda item: float(self._coerce_float(item.get("window_start")) or 0.0))
+        return out
+
+    @staticmethod
+    def _rollup_matches_run_selector(entry: Mapping[str, Any], run_id: Optional[str]) -> bool:
+        selected = str(run_id or "").strip()
+        if not selected:
+            return True
+        run_ids = entry.get("run_ids")
+        if not isinstance(run_ids, Sequence) or isinstance(run_ids, (str, bytes, bytearray)):
+            return False
+        return selected in {str(item or "").strip() for item in run_ids}
+
+    def _merge_rollup_rows(
+        self,
+        generated_rows: Sequence[Mapping[str, Any]],
+        stored_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged_by_id: Dict[str, Dict[str, Any]] = {}
+        anonymous_rows: List[Dict[str, Any]] = []
+        for row in stored_rows:
+            row_dict = dict(row)
+            row_id = self._rollup_identity_key(row_dict)
+            if row_id:
+                merged_by_id[row_id] = row_dict
+            else:
+                anonymous_rows.append(row_dict)
+        for row in generated_rows:
+            row_dict = dict(row)
+            row_id = self._rollup_identity_key(row_dict)
+            if row_id:
+                current = merged_by_id.get(row_id)
+                if current:
+                    merged = dict(current)
+                    merged.update(row_dict)
+                    generated_kind = str(row_dict.get("summary_kind") or "").strip().lower()
+                    current_kind = str(current.get("summary_kind") or "").strip().lower()
+                    generated_signature = str(row_dict.get("source_signature") or "").strip()
+                    current_signature = str(current.get("source_signature") or "").strip()
+                    if (
+                        generated_kind == "pending_context"
+                        and current_kind in {"llm", "llm_cached"}
+                        and generated_signature
+                        and generated_signature == current_signature
+                    ):
+                        merged["summary"] = str(current.get("summary") or "")
+                        merged["summary_kind"] = current_kind
+                    merged["rollup_id"] = row_id
+                    merged_by_id[row_id] = merged
+                else:
+                    row_dict["rollup_id"] = row_id
+                    merged_by_id[row_id] = row_dict
+            else:
+                anonymous_rows.append(row_dict)
+        merged = list(merged_by_id.values()) + anonymous_rows
+        merged.sort(
+            key=lambda item: (
+                float(self._coerce_float(item.get("window_start")) or 0.0),
+                float(self._coerce_float(item.get("created_at")) or 0.0),
+            )
+        )
+        return merged
+
+    def _refresh_channel_routine_from_l2(self, channel_id: int, l2_rows: Sequence[Mapping[str, Any]]) -> None:
+        if not l2_rows:
+            return
+        latest = max(
+            l2_rows,
+            key=lambda row: float(self._coerce_float(row.get("window_end")) or 0.0),
+        )
+        summary_kind = str(latest.get("summary_kind") or "").strip().lower()
+        if summary_kind not in {"llm", "llm_cached"}:
+            return
+        rollup_id = str(latest.get("rollup_id") or "").strip()
+        summary = str(latest.get("summary") or "").strip()
+        if not rollup_id or not summary:
+            return
+        self._update_channel_routine_context(
+            channel_id=channel_id,
+            rollup_id=rollup_id,
+            summary_text=summary,
+            window_end=self._coerce_float(latest.get("window_end")),
+        )
+
+    def _select_rollup_source_lines(
+        self,
+        children: Sequence[Mapping[str, Any]],
+        char_budget: int,
+    ) -> List[str]:
+        items: List[Tuple[float, str]] = []
+        for child in sorted(children, key=lambda item: float(self._coerce_float(item.get("window_start")) or 0.0)):
+            ts = self._coerce_float(child.get("window_start"))
+            if ts is None:
+                continue
+            summary = self._sanitize_l0_summary(child.get("summary"), max_len=420)
+            if not summary:
+                continue
+            ts_label = time.strftime("%H:%M:%S", time.localtime(ts))
+            items.append((ts, f"- {ts_label} | {summary}"))
+        if not items:
+            return ["- No valid lower-level summaries in this window."]
+        if len(items) == 1:
+            return [items[0][1]]
+        # First pass: keep everything if it fits.
+        joined_len = sum(len(line) + 1 for _, line in items)
+        if joined_len <= char_budget:
+            return [line for _, line in items]
+        # Second pass: even timeline sampling + first/last anchors.
+        max_lines = max(8, min(len(items), int(char_budget / 180)))
+        if max_lines >= len(items):
+            selected_indexes = list(range(len(items)))
+        else:
+            selected_indexes = {0, len(items) - 1}
+            span = len(items) - 1
+            for step in range(1, max_lines - 1):
+                idx = int(round((step * span) / max(1, max_lines - 1)))
+                selected_indexes.add(max(0, min(len(items) - 1, idx)))
+            selected_indexes = sorted(selected_indexes)
+        lines = [items[idx][1] for idx in cast(Sequence[int], selected_indexes)]
+        # Final pass: trim trailing lines to budget.
+        out: List[str] = []
+        consumed = 0
+        for line in lines:
+            next_len = consumed + len(line) + 1
+            if next_len > char_budget and out:
+                break
+            out.append(line)
+            consumed = next_len
+        return out or [lines[0]]
+
+    def _build_rollup_messages(
+        self,
+        channel_id: int,
+        level: str,
+        source_level: str,
+        node: Mapping[str, Any],
+        children: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        system_msg = self.rollup_llm_system_prompt or (
+            "You summarize CCTV batches into concise operator-facing rollups."
+        )
+        window_start = float(self._coerce_float(node.get("window_start")) or 0.0)
+        window_end = float(self._coerce_float(node.get("window_end")) or 0.0)
+        frame_count = _parse_optional_int(node.get("frame_count")) or 0
+        item_count = _parse_optional_int(node.get("item_count")) or 0
+        run_ids_raw = node.get("run_ids")
+        run_ids = run_ids_raw if isinstance(run_ids_raw, list) else []
+        run_text = ", ".join(sorted({str(run).strip() for run in run_ids if str(run).strip()})) or "n/a"
+        source_tokens = _parse_optional_int(node.get("source_tokens")) or 0
+        lines = self._select_rollup_source_lines(children, self.rollup_llm_char_budget)
+        routine_context = self._get_channel_routine_prompt(channel_id)
+        user_text = "\n".join(
+            [
+                f"Channel: {channel_id}",
+                f"Target level: {level}",
+                f"Source level: {source_level}",
+                f"Window: {self._window_label(window_start, window_end)}",
+                f"Item count: {int(item_count)}",
+                f"Frame count: {int(frame_count)}",
+                f"Runs: {run_text}",
+                f"Approx source tokens: {int(source_tokens)}",
+                "",
+                "Context constraints:",
+                "- All source entries are from the same channel and continuous timeline window above.",
+                "- Source entries may be model-generated summaries from a lower level; avoid compounding uncertainty.",
+                "- Preserve rare but important events even if they appear once.",
+                "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
+                "",
+                "Task:",
+                f"- Write one concise {level} summary for operators.",
+                "- Deduplicate repeated scene descriptions and boilerplate.",
+                "- Keep meaningful changes in short timeline bullets across the full window.",
+                "- Mention risks/signals only when grounded in source text.",
+                "- If activity is routine, say so clearly without repeating identical details.",
+                "- Do not invent entities, times, or counts.",
+                "",
+                "Output format (Markdown):",
+                "### Window Snapshot",
+                "### Scene Baseline",
+                "### Key Changes",
+                "### Alerts/Signals",
+                "### Operator Notes",
+                "",
+                "Window Snapshot must begin with:",
+                f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
+                "",
+                "Known long-window routine context (if available):",
+                routine_context or "n/a",
+                "",
+                f"{source_level} summaries:",
+                *lines,
+            ]
+        )
+        return [
+            {"role": "system", "content": [{"type": "text", "text": system_msg}]},
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
+        ]
+
+    def _synthesize_rollup_summary(
+        self,
+        channel_id: int,
+        level: str,
+        source_level: str,
+        node: Mapping[str, Any],
+        children: Sequence[Mapping[str, Any]],
+        fallback_summary: str,
+    ) -> str:
+        try:
+            messages = self._build_rollup_messages(
+                channel_id=channel_id,
+                level=level,
+                source_level=source_level,
+                node=node,
+                children=children,
+            )
+            summary = str(self.lm_callback(messages, self.rollup_llm_model_hint)).strip()
+            return summary or fallback_summary
+        except Exception:
+            return fallback_summary
+
+    def _compose_pending_rollup_summary(
+        self,
+        level: str,
+        source_level: str,
+        source_tokens: int,
+        min_tokens: int,
+        item_count: int,
+        frame_count: int,
+    ) -> str:
+        return (
+            f"{level} pending from {source_level}: {item_count} items ({frame_count} frames). "
+            f"Collecting context {source_tokens}/{min_tokens} tokens."
+        )
+
+    def _apply_rollup_llm_summaries(
+        self,
+        channel_id: int,
+        level: str,
+        source_level: str,
+        node_children_pairs: Sequence[Tuple[Dict[str, Any], Sequence[Mapping[str, Any]]]],
+    ) -> None:
+        if level not in self.rollup_llm_levels or not node_children_pairs:
+            return
+        remaining_budget = self.rollup_llm_max_new_per_call
+        pairs = sorted(
+            node_children_pairs,
+            key=lambda pair: float(self._coerce_float(pair[0].get("window_start")) or 0.0),
+            reverse=True,
+        )
+        for node, children in pairs:
+            rollup_id = str(node.get("rollup_id") or "").strip()
+            if not rollup_id:
+                continue
+            source_tokens = _parse_optional_int(node.get("source_tokens")) or 0
+            source_signature = str(node.get("source_signature") or "").strip()
+            if not source_signature:
+                source_signature = self._source_signature(self._coerce_str_list(node.get("source_ids")))
+            if (not self.rollup_time_only) and source_tokens < self.rollup_min_source_tokens:
+                node["summary"] = self._compose_pending_rollup_summary(
+                    level=level,
+                    source_level=source_level,
+                    source_tokens=source_tokens,
+                    min_tokens=self.rollup_min_source_tokens,
+                    item_count=_parse_optional_int(node.get("item_count")) or 0,
+                    frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                )
+                node["summary_kind"] = "pending_context"
+                continue
+            cached = self._get_cached_rollup_record(rollup_id)
+            if cached:
+                cached_summary = str(cached.get("summary") or "").strip()
+                cached_signature = str(cached.get("source_signature") or "").strip()
+                if cached_summary and cached_signature and cached_signature == source_signature:
+                    node["summary"] = cached_summary
+                    node["summary_kind"] = "llm_cached"
+                    if level == "L2":
+                        self._update_channel_routine_context(
+                            channel_id=channel_id,
+                            rollup_id=rollup_id,
+                            summary_text=node.get("summary"),
+                            window_end=self._coerce_float(node.get("window_end")),
+                        )
+                    continue
+            if remaining_budget <= 0:
+                continue
+            fallback = str(node.get("summary") or "").strip()
+            summary = self._synthesize_rollup_summary(
+                channel_id=channel_id,
+                level=level,
+                source_level=source_level,
+                node=node,
+                children=children,
+                fallback_summary=fallback,
+            )
+            if summary and summary != fallback:
+                self._put_cached_rollup_summary(
+                    rollup_id,
+                    summary,
+                    channel_id=channel_id,
+                    level=level,
+                    source_level=source_level,
+                    window_start=self._coerce_float(node.get("window_start")),
+                    window_end=self._coerce_float(node.get("window_end")),
+                    window_sec=_parse_optional_int(node.get("window_sec")) or 0,
+                    item_count=_parse_optional_int(node.get("item_count")) or 0,
+                    frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                    source_tokens=source_tokens,
+                    run_ids=node.get("run_ids"),
+                    source_ids=node.get("source_ids"),
+                    source_signature=str(node.get("source_signature") or "").strip(),
+                    highlights=node.get("highlights"),
+                    summary_kind="llm",
+                )
+                node["summary"] = summary
+                node["summary_kind"] = "llm"
+                if level == "L2":
+                    self._update_channel_routine_context(
+                        channel_id=channel_id,
+                        rollup_id=rollup_id,
+                        summary_text=summary,
+                        window_end=self._coerce_float(node.get("window_end")),
+                    )
+            remaining_budget -= 1
+
     def _l0_nodes_from_logs(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         nodes: List[Dict[str, Any]] = []
         for log in logs:
@@ -673,6 +1616,7 @@ class LuxriotManager:
             bucket = self._bucket_start(ts, window_sec)
             buckets.setdefault(bucket, []).append(node)
         out: List[Dict[str, Any]] = []
+        llm_pairs: List[Tuple[Dict[str, Any], Sequence[Mapping[str, Any]]]] = []
         for bucket_start in sorted(buckets.keys()):
             children = sorted(
                 buckets[bucket_start],
@@ -681,6 +1625,7 @@ class LuxriotManager:
             source_ids: List[str] = []
             frame_count = 0
             item_count = 0
+            source_tokens = 0
             run_ids: Set[str] = set()
             for child in children:
                 child_id = str(child.get("rollup_id") or "").strip()
@@ -688,6 +1633,7 @@ class LuxriotManager:
                     source_ids.append(child_id)
                 frame_count += _parse_optional_int(child.get("frame_count")) or 0
                 item_count += _parse_optional_int(child.get("item_count")) or 0
+                source_tokens += self._estimate_token_count(child.get("summary"))
                 child_runs = child.get("run_ids")
                 if isinstance(child_runs, list):
                     for run in child_runs:
@@ -695,6 +1641,7 @@ class LuxriotManager:
                         if run_text:
                             run_ids.add(run_text)
             highlights = self._collect_highlights(children, self.rollup_highlight_limit)
+            source_signature = self._source_signature(source_ids)
             summary = self._compose_rollup_summary(
                 level=level,
                 source_level=source_level,
@@ -705,7 +1652,7 @@ class LuxriotManager:
                 window_sec=window_sec,
             )
             end_ts = float(bucket_start + max(1, int(window_sec)))
-            rollup_id = f"{level.lower()}-ch{channel_id}-{bucket_start}-{self._stable_id(source_ids, length=10)}"
+            rollup_id = self._canonical_rollup_id(level, channel_id, float(bucket_start), int(window_sec))
             out.append(
                 {
                     "rollup_id": rollup_id,
@@ -718,11 +1665,22 @@ class LuxriotManager:
                     "window_sec": int(window_sec),
                     "item_count": int(item_count),
                     "frame_count": int(frame_count),
+                    "source_tokens": int(source_tokens),
                     "run_ids": sorted(run_ids),
                     "highlights": highlights,
+                    "source_signature": source_signature,
                     "summary": summary,
                     "created_at": end_ts,
                 }
+            )
+            if level in self.rollup_llm_levels:
+                llm_pairs.append((out[-1], children))
+        if level in self.rollup_llm_levels and llm_pairs:
+            self._apply_rollup_llm_summaries(
+                channel_id=channel_id,
+                level=level,
+                source_level=source_level,
+                node_children_pairs=llm_pairs,
             )
         return out
 
@@ -734,6 +1692,14 @@ class LuxriotManager:
         if len(combined) > self.summary_history_limit:
             combined = combined[-self.summary_history_limit :]
         self.summary_history[channel_id] = combined
+        self._persist_summary_state_locked()
+
+    def record_summary_log(self, channel_id: int, entry: Mapping[str, Any]) -> None:
+        normalized = self._normalize_summary_log_entry(entry)
+        if normalized is None:
+            return
+        with self.cache_lock:
+            self._merge_summary_history_locked(channel_id, [normalized])
 
     def build_client(self) -> LuxriotClient:
         return LuxriotClient(
@@ -1071,15 +2037,37 @@ class LuxriotManager:
             source_nodes=l2_nodes,
         )
 
+        selected_run_id = str(status.get("run_filter_id") or "").strip() or None
+        stored_rollups = self._list_cached_rollups(channel_id=channel_id, start_ts=start_ts, end_ts=end_ts)
+        if selected_run_id:
+            stored_rollups = [row for row in stored_rollups if self._rollup_matches_run_selector(row, selected_run_id)]
+        stored_by_level: Dict[str, List[Dict[str, Any]]] = {"L1": [], "L2": [], "L3": []}
+        for row in stored_rollups:
+            level = self._normalize_rollup_level(row.get("level"))
+            if level in stored_by_level:
+                stored_by_level[level].append(dict(row))
+
+        l1_nodes = self._merge_rollup_rows(l1_nodes, stored_by_level["L1"])
+        l2_nodes = self._merge_rollup_rows(l2_nodes, stored_by_level["L2"])
+        l3_nodes = self._merge_rollup_rows(l3_nodes, stored_by_level["L3"])
+
         if isinstance(level_limit, int) and level_limit > 0:
             l0_nodes = l0_nodes[-level_limit:]
             l1_nodes = l1_nodes[-level_limit:]
             l2_nodes = l2_nodes[-level_limit:]
             l3_nodes = l3_nodes[-level_limit:]
+        self._refresh_channel_routine_from_l2(channel_id, l2_nodes)
+        stored_counts: Dict[str, int] = {}
+        for entry in stored_rollups:
+            level = str(entry.get("level") or "").strip().upper() or "UNKNOWN"
+            stored_counts[level] = stored_counts.get(level, 0) + 1
+        with self.cache_lock:
+            routine_context = dict(self.channel_routine_context.get(channel_id, {}))
 
         return {
             "channel_id": channel_id,
             "running": bool(status.get("running")),
+            "runs": status.get("runs"),
             "selected_run": status.get("selected_run"),
             "run_filter_id": status.get("run_filter_id"),
             "running_run_id": status.get("running_run_id"),
@@ -1088,6 +2076,11 @@ class LuxriotManager:
             "to_ts": end_ts,
             "window_sec": dict(self.rollup_windows),
             "level_limit": level_limit,
+            "rollup_mode": "time-only" if self.rollup_time_only else "token-gated",
+            "min_source_tokens": self.rollup_min_source_tokens,
+            "stored_rollups_count": len(stored_rollups),
+            "stored_counts": stored_counts,
+            "routine_context": routine_context,
             "source_counts": {
                 "L0": len(l0_nodes),
                 "L1": len(l1_nodes),

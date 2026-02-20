@@ -91,6 +91,52 @@ wget -O /path/to/dinov3_weights.pth <weights-url>
 
 Then set `EVOSSEARCH_DINO_WEIGHTS_PATH`.
 
+### Windows 11 Quickstart
+
+Use this for the fastest first run on a demo laptop.
+
+1. Open PowerShell in the repo folder.
+2. Create and activate venv.
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+```
+
+3. Install dependencies.
+
+```powershell
+pip install -r requirements.txt
+```
+
+4. Optional stability-first `.env` profile (recommended if GPU/CUDA is limited):
+
+```env
+EVOSSEARCH_EMBEDDER=clip
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_M2F_ENABLED=false
+```
+
+5. Start SISU.
+
+```powershell
+python oldapp.py
+```
+
+6. Open:
+
+```text
+http://localhost:5000
+```
+
+Windows notes:
+
+- `run_prod.sh` is Linux-oriented; use `python oldapp.py` on Windows.
+- If DINO/fusion is enabled, set a valid Windows path for `EVOSSEARCH_DINO_WEIGHTS_PATH`.
+- If execution policy blocks activation, run:
+  - `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
 ## Running
 
 ### Dev

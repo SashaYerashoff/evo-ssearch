@@ -30,11 +30,25 @@ Improve Video Understanding usability for multi-channel operation (4-8 channels)
   - Persisted run IDs for video sessions (`run_id` on capture sessions and summary entries).
   - `/luxriot/session` supports run selectors (`latest`, `live`, `all`, explicit run ID).
   - `/luxriot/session` supports time-window filtering (`from_ts`, `to_ts`) and limit.
-  - Reader toolbar run/time controls deferred until next UI stabilization pass.
+  - Reader toolbar exposes run selector and time-window filters (`from`, `to`) with apply/clear flow.
 - Hierarchical summarization (backend scaffolding):
   - Added `/luxriot/rollups` endpoint for layered rollups (`L0`, `L1`, `L2`, `L3`).
   - L1/L2/L3 rollups aggregate prior level windows and expose provenance (`source_ids`).
   - Rollups support run/time filtering (`run`, `from_ts`, `to_ts`) and per-level limit.
+- Hierarchical summarization (reader wiring):
+  - Live Summaries toolbar now includes level selector (`L0`-`L3`) and drill-back navigation.
+  - Reader supports drill-down via provenance (`source_ids`) from higher rollup layers.
+  - Rollup rows support copy/export actions and markdown rendering.
+  - Summary refresh path now auto-dispatches between session logs (`L0`) and rollup view (`L1`-`L3` or drilled context).
+  - Rollup API now includes run metadata (`runs`) so toolbar run selection remains consistent in rollup mode.
+- Hierarchical summarization (L1 quality pass):
+  - L1 rollups now support optional LLM synthesis over L0 summaries (dedupe + timeline-focused output).
+  - L1 synthesis is cache-backed by `rollup_id` and throttled per request to avoid overload.
+  - Tunables added via env: char budget, max new rollups per call, cache limit, and optional model override.
+- Hierarchical summarization (quality gate + retrieval):
+  - LLM synthesis now supports `L1/L2/L3` levels (configurable).
+  - Higher-level synthesis is gated by minimum source-context size (~token threshold) to avoid weak/truncated summaries.
+  - Generated rollup summaries are stored in cache with channel/level/window metadata and exposed in period-filtered rollup responses.
 
 ## Next implementation slices
 1. Hierarchical summarization pipeline (phase 2)
