@@ -4193,6 +4193,8 @@ def home():
         let luxriotActiveChannel = luxriotDefaults.channelId;
         let luxriotPreviewTimer = null;
         let luxriotSummaryTimer = null;
+        let luxriotSummaryRefreshInFlight = false;
+        let luxriotSummaryRefreshQueued = null;
         let luxriotStreamsCache = [];
         let luxriotInitialized = false;
         const probeHitsCacheByKey = {};
@@ -5173,6 +5175,9 @@ def home():
             if (!luxriotSummaries) return 0;
             const data = payload && typeof payload === 'object' ? payload : {};
             const levels = data.levels && typeof data.levels === 'object' ? data.levels : {};
+            const prevScrollTop = luxriotSummaries.scrollTop;
+            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
+            const shouldStickBottom = isSummaryNearBottom();
             const ctx = getCurrentSummaryRollupContext();
             const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
             const sourceSet = Array.isArray(ctx?.sourceIds) && ctx.sourceIds.length
@@ -5229,14 +5234,18 @@ def home():
             }).join('');
 
             luxriotSummaries.innerHTML = html;
-            luxriotSummaries.scrollTop = 0;
+            if (shouldStickBottom || !hasInitialRender) {
+                scrollSummaryToLatest();
+            } else {
+                luxriotSummaries.scrollTop = prevScrollTop;
+            }
             luxriotSummaries.dataset.hasRender = '1';
             setSummaryUnread(0);
             updateSummaryControlsUI();
             return rows.length;
         }
 
-        async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false) {
+        async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
             if (!channelId) return;
             if (!luxriotSummaryAutoRefresh && !force) return;
             try {
@@ -5249,6 +5258,19 @@ def home():
                 }
                 syncSummaryRunSelectOptions(data.runs, data.selected_run);
                 syncSummaryFiltersFromResponse(data);
+                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
+                if (
+                    allowRunFallback
+                    && !Boolean(data.running)
+                    && (selectedRun === 'live' || selectedRun === 'latest')
+                ) {
+                    luxriotSummaryRunFilter = 'all';
+                    if (luxriotSummaryRunSelect) {
+                        luxriotSummaryRunSelect.value = 'all';
+                    }
+                    refreshLuxriotSummaryView(channelId, true, false);
+                    return;
+                }
                 luxriotSummaryRollupCache[channelId] = data;
                 const renderedCount = renderLuxriotRollups(data, channelId);
                 const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
@@ -5265,11 +5287,36 @@ def home():
             }
         }
 
-        async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false) {
-            if (isRollupViewActive()) {
-                return refreshLuxriotRollups(channelId, force);
+        async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+            if (!channelId) return;
+            if (luxriotSummaryRefreshInFlight) {
+                const next = luxriotSummaryRefreshQueued || {};
+                luxriotSummaryRefreshQueued = {
+                    channelId,
+                    force: Boolean(force || next.force),
+                    allowRunFallback: Boolean((allowRunFallback !== false) || (next.allowRunFallback !== false)),
+                };
+                return;
             }
-            return refreshLuxriotSummaries(channelId, force);
+            luxriotSummaryRefreshInFlight = true;
+            try {
+                if (isRollupViewActive()) {
+                    await refreshLuxriotRollups(channelId, force, allowRunFallback);
+                } else {
+                    await refreshLuxriotSummaries(channelId, force, allowRunFallback);
+                }
+            } finally {
+                luxriotSummaryRefreshInFlight = false;
+                if (luxriotSummaryRefreshQueued) {
+                    const next = luxriotSummaryRefreshQueued;
+                    luxriotSummaryRefreshQueued = null;
+                    refreshLuxriotSummaryView(
+                        next.channelId || getSelectedSummaryChannel(),
+                        Boolean(next.force),
+                        next.allowRunFallback !== false,
+                    );
+                }
+            }
         }
 
         function updateProbeChannelRuntime(payload, rerender = false) {
