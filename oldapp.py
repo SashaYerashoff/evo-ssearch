@@ -15,7 +15,7 @@ import uuid
 import requests
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote
 from threading import Lock
 
@@ -25,6 +25,7 @@ import cv2
 import clip
 import faiss
 from PIL import Image
+from transformers import AutoModel, AutoProcessor
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 
@@ -49,6 +50,9 @@ if config.CORS_ALLOWED_ORIGINS:
 device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model: Optional[torch.nn.Module] = None
 clip_preprocess = None
+clip_processor: Optional[Any] = None
+clip_backend_kind = "openai_clip"
+clip_runtime_model = ""
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -186,12 +190,129 @@ def payload_too_large(_: Exception):
 
 
 def init_clip() -> None:
-    """Load the CLIP model lazily for embedding extraction."""
-    global clip_model, clip_preprocess
-    if clip_model is not None and clip_preprocess is not None:
-        return
-    clip_model, clip_preprocess = clip.load(config.CLIP_MODEL, device=device)
-    clip_model.eval()
+    """Load the CLIP-like model lazily for embedding extraction."""
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model
+    if clip_model is not None:
+        if clip_backend_kind == "openai_clip" and clip_preprocess is not None:
+            return
+        if clip_backend_kind == "siglip2" and clip_processor is not None:
+            return
+
+    requested_model = str(config.CLIP_MODEL or "").strip() or "ViT-B/32"
+    if _is_siglip2_clip_model(requested_model):
+        try:
+            model_obj, processor_obj = _load_siglip2_clip_model(requested_model)
+            clip_model = model_obj
+            clip_processor = processor_obj
+            clip_preprocess = None
+            clip_backend_kind = "siglip2"
+            clip_runtime_model = requested_model
+            return
+        except Exception as exc:
+            fallback_model = "ViT-B/32"
+            print(
+                f"SigLIP2 model '{requested_model}' failed to load ({exc}). "
+                f"Falling back to CLIP '{fallback_model}'."
+            )
+            model_obj, preprocess_obj = _load_openai_clip_model(fallback_model)
+            clip_model = model_obj
+            clip_preprocess = preprocess_obj
+            clip_processor = None
+            clip_backend_kind = "openai_clip"
+            clip_runtime_model = fallback_model
+            return
+
+    model_obj, preprocess_obj = _load_openai_clip_model(requested_model)
+    clip_model = model_obj
+    clip_preprocess = preprocess_obj
+    clip_processor = None
+    clip_backend_kind = "openai_clip"
+    clip_runtime_model = requested_model
+
+
+def _is_siglip2_clip_model(model_name: str) -> bool:
+    normalized = str(model_name or "").strip().lower()
+    return "siglip2" in normalized
+
+
+def _load_openai_clip_model(model_name: str) -> Tuple[torch.nn.Module, Any]:
+    model, preprocess = clip.load(model_name, device=device)
+    cast(torch.nn.Module, model).eval()
+    return cast(torch.nn.Module, model), preprocess
+
+
+def _load_siglip2_clip_model(model_name: str) -> Tuple[torch.nn.Module, Any]:
+    model = AutoModel.from_pretrained(model_name)
+    cast(torch.nn.Module, model).to(device)
+    cast(torch.nn.Module, model).eval()
+    processor = AutoProcessor.from_pretrained(model_name)
+    return cast(torch.nn.Module, model), processor
+
+
+def _normalize_l2_embeddings(features: torch.Tensor) -> torch.Tensor:
+    return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _processor_to_device(batch: Mapping[str, Any]) -> Dict[str, Any]:
+    moved: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarray:
+    ensure_embedder_loaded("clip")
+    if not images:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    normalized_images = [img.convert("RGB") for img in images]
+    with torch.no_grad():
+        if clip_backend_kind == "siglip2":
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 clip backend is not initialized")
+            processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs))
+            image_features = cast(Any, clip_model).get_image_features(**model_inputs)
+        else:
+            if clip_preprocess is None or clip_model is None:
+                raise RuntimeError("CLIP backend is not initialized")
+            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(device)  # type: ignore[operator]
+            image_features = cast(Any, clip_model).encode_image(image_batch)
+        image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
+    return image_features.cpu().numpy().astype(np.float32, copy=False)
+
+
+def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
+    ensure_embedder_loaded("clip")
+    prepared = [str(text or "").strip() for text in texts if str(text or "").strip()]
+    if not prepared:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    with torch.no_grad():
+        if clip_backend_kind == "siglip2":
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 clip backend is not initialized")
+            # SigLIP2 tokenization quality is better when text is lower-cased and max_length=64.
+            normalized_texts = [text.lower() for text in prepared]
+            processor_inputs = cast(Any, clip_processor)(
+                text=normalized_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+                return_tensors="pt",
+            )
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs))
+            text_features = cast(Any, clip_model).get_text_features(**model_inputs)
+        else:
+            if clip_model is None:
+                raise RuntimeError("CLIP backend is not initialized")
+            text_tokens = clip.tokenize(prepared).to(device)
+            text_features = cast(Any, clip_model).encode_text(text_tokens)
+        text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
+    return text_features.cpu().numpy().astype(np.float32, copy=False)
 
 
 def init_dino() -> None:
@@ -277,7 +398,19 @@ def _faiss_add_vectors(index: faiss.Index, vectors: np.ndarray) -> None:
 
 def _faiss_search(index: faiss.Index, query: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     """Typed wrapper for FAISS search; returns (distances, indices)."""
-    distances, labels = cast(Any, index).search(query, int(k))
+    query_arr = np.asarray(query, dtype=np.float32)
+    if query_arr.ndim != 2:
+        raise ValueError("FAISS query must be a 2D float32 array")
+    try:
+        index_dim = int(getattr(index, "d"))
+    except Exception:
+        index_dim = None
+    if index_dim is not None and int(query_arr.shape[1]) != index_dim:
+        raise ValueError(
+            f"Embedding dimension mismatch: query dim {int(query_arr.shape[1])} vs index dim {index_dim}. "
+            "Rebuild index for the selected CLIP model."
+        )
+    distances, labels = cast(Any, index).search(query_arr, int(k))
     return np.asarray(distances), np.asarray(labels)
 
 
@@ -293,11 +426,11 @@ def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = 
         target = "clip"
     ensure_embedder_loaded(target)
     if target == "clip":
-        image = clip_preprocess(Image.open(image_path)).unsqueeze(0).to(device)  # type: ignore[attr-defined]
-        with torch.no_grad():
-            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+        pil_image = Image.open(image_path).convert("RGB")
+        embeddings = _clip_image_embeddings_from_pils([pil_image])
+        if embeddings.size == 0:
+            raise RuntimeError("Failed to produce clip embedding from image")
+        return embeddings[0]
     else:
         assert dino_encoder is not None
         features = dino_encoder.encode_images(image_path)
@@ -311,11 +444,10 @@ def get_image_embedding_from_pil(pil_image: Image.Image, embedder: Optional[str]
         target = "clip"
     ensure_embedder_loaded(target)
     if target == "clip":
-        image = clip_preprocess(pil_image).unsqueeze(0).to(device)  # type: ignore[attr-defined]
-        with torch.no_grad():
-            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+        embeddings = _clip_image_embeddings_from_pils([pil_image])
+        if embeddings.size == 0:
+            raise RuntimeError("Failed to produce clip embedding from image")
+        return embeddings[0]
     else:
         assert dino_encoder is not None
         features = dino_encoder.encode_images(pil_image)
@@ -326,24 +458,31 @@ def get_text_embedding(text: str) -> np.ndarray:
     """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
     if active_embedder not in {"clip", "fusion"}:
         raise RuntimeError("Text search is only supported when the CLIP backend is active.")
-    ensure_embedder_loaded("clip")
-    text_tokens = clip.tokenize([text]).to(device)
-    with torch.no_grad():
-        text_features = clip_model.encode_text(text_tokens)  # type: ignore[union-attr]
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-    return text_features.cpu().numpy().flatten()
+    embeddings = _clip_text_embeddings([text])
+    if embeddings.size == 0:
+        raise RuntimeError("Text query is empty")
+    return embeddings[0]
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ensure_embedder_loaded(embedder)
     base: Dict[str, Any]
     if embedder == "clip":
-        embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+        runtime_model = str(clip_runtime_model or config.CLIP_MODEL or "unknown")
+        if clip_backend_kind == "siglip2":
+            projection_dim = getattr(getattr(clip_model, "config", None), "projection_dim", 1152)
+            embed_dim = int(projection_dim if projection_dim else 1152)
+            library = "google/siglip2"
+        else:
+            embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+            library = "openai/CLIP"
         base = {
             "embedder": "clip",
-            "model": config.CLIP_MODEL,
+            "model": runtime_model,
+            "requested_model": str(config.CLIP_MODEL),
             "embedding_dim": embed_dim,
-            "library": "openai/CLIP",
+            "library": library,
+            "backend": clip_backend_kind,
             "device": device,
         }
     else:
@@ -3924,6 +4063,7 @@ def home():
                         <option value="ViT-B/32">ViT-B/32</option>
                         <option value="ViT-B/16">ViT-B/16</option>
                         <option value="ViT-L/14">ViT-L/14</option>
+                        <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
                     </select>
                 </div>
                 <div class="settings-row">
@@ -11220,6 +11360,7 @@ def _backfill_clip_vectors_for_filters(
     since_ms: Optional[int],
     until_ms: Optional[int],
     *,
+    expected_dim: Optional[int] = None,
     max_backfill: int = 2000,
 ) -> int:
     detections, _ = detections_store.list_detections(
@@ -11230,18 +11371,35 @@ def _backfill_clip_vectors_for_filters(
         limit=max_backfill,
         offset=0,
     )
+    vector_by_id: Dict[int, np.ndarray] = {}
+    if expected_dim is not None and detections:
+        det_ids = [_to_optional_int(item.get("id")) for item in detections]
+        rows = detections_store.fetch_detections_by_ids([det_id for det_id in det_ids if det_id is not None], include_vectors=True)
+        for row in rows:
+            det_id = _to_optional_int(row.get("id"))
+            clip_vec = row.get("clip_vec")
+            if det_id is None or not isinstance(clip_vec, np.ndarray):
+                continue
+            vector_by_id[det_id] = clip_vec
     pending: List[Tuple[int, Sequence[float]]] = []
     for item in detections:
-        if item.get("has_clip"):
+        det_id = _to_optional_int(item.get("id"))
+        if det_id is None:
             continue
+        has_clip = bool(item.get("has_clip"))
+        if has_clip:
+            if expected_dim is None:
+                continue
+            existing = vector_by_id.get(det_id)
+            if isinstance(existing, np.ndarray) and existing.ndim == 1 and int(existing.shape[0]) == expected_dim:
+                continue
         thumb = item.get("thumbnail")
         if not thumb:
             continue
         vec = _embed_thumbnail_b64(thumb, "clip")
         if vec is None:
             continue
-        det_id = _to_optional_int(item.get("id"))
-        if det_id is None:
+        if expected_dim is not None and vec.ndim == 1 and int(vec.shape[0]) != expected_dim:
             continue
         pending.append((det_id, cast(Sequence[float], vec)))
     if not pending:
@@ -11270,6 +11428,7 @@ def _search_detection_clip_shards(
     ranked: List[Tuple[int, float]] = []
     seen: Set[int] = set()
     per_shard_k = max(DETECTIONS_SEARCH_SHARD_OVERFETCH, limit * 20)
+    query_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else 0
 
     for shard_key, allowed_ids in allowed_by_shard.items():
         if not shard_key:
@@ -11277,6 +11436,10 @@ def _search_detection_clip_shards(
         index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
         if index_obj is None or shard_ids is None or shard_ids.size == 0:
             continue
+        if query_dim > 0:
+            index_dim = _to_optional_int(getattr(index_obj, "d", None))
+            if index_dim is not None and index_dim != query_dim:
+                continue
         k = min(int(shard_ids.size), per_shard_k)
         if k <= 0:
             continue
@@ -11298,7 +11461,9 @@ def _search_detection_clip_shards(
             fallback_ranked: List[Tuple[int, float]] = []
             for row in vec_rows:
                 clip_vec = row.get("clip_vec")
-                if clip_vec is None:
+                if not isinstance(clip_vec, np.ndarray):
+                    continue
+                if clip_vec.shape != clip_query_vec.shape:
                     continue
                 det_id = _to_optional_int(row.get("id"))
                 if det_id is None:
@@ -11413,6 +11578,7 @@ def _search_detections_archive(
 ) -> List[Dict[str, Any]]:
     limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
     candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
+    clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
 
     candidates = detections_store.list_vector_candidates(
         probe_id=probe_id,
@@ -11429,6 +11595,7 @@ def _search_detections_archive(
             channel_id,
             since_ms,
             until_ms,
+            expected_dim=clip_dim,
             max_backfill=min(candidate_limit, 2000),
         )
         if updated > 0:
@@ -11445,6 +11612,26 @@ def _search_detections_archive(
         return []
 
     clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
+    if not clip_hits:
+        updated = _backfill_clip_vectors_for_filters(
+            probe_id,
+            channel_id,
+            since_ms,
+            until_ms,
+            expected_dim=clip_dim,
+            max_backfill=min(candidate_limit, 2000),
+        )
+        if updated > 0:
+            candidates = detections_store.list_vector_candidates(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=candidate_limit,
+                only_with_clip=True,
+                include_vectors=False,
+            )
+            clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
         return []
 
@@ -13134,13 +13321,21 @@ def probes_bench():
     batch = int(request.args.get('batch', PROBE_BENCH_BATCH))
     batch = max(4, min(64, batch))
     try:
-        # build random batch at 224x224
-        rnd = torch.randint(0, 255, (batch, 3, 224, 224), device=device, dtype=torch.uint8)
-        images = rnd.float() / 255.0
+        # Use a repeated random image batch so benchmark works across CLIP and SigLIP2 backends.
+        target_size = 224
+        if clip_backend_kind == "siglip2" and clip_processor is not None:
+            size_info = getattr(getattr(clip_processor, "image_processor", None), "size", None)
+            if isinstance(size_info, dict):
+                h = _to_optional_int(size_info.get("height")) or _to_optional_int(size_info.get("shortest_edge"))
+                w = _to_optional_int(size_info.get("width")) or h
+                if h is not None and w is not None:
+                    target_size = max(128, min(512, max(h, w)))
+        rnd = np.random.randint(0, 256, (target_size, target_size, 3), dtype=np.uint8)
+        probe_image = Image.fromarray(rnd, mode='RGB')
+        images = [probe_image] * batch
         started = time.time()
-        with torch.no_grad():
-            feats = clip_model.encode_image(images)  # type: ignore
-            _ = feats.cpu()
+        feats = _clip_image_embeddings_from_pils(images)
+        _ = feats.shape[0]
         elapsed = time.time() - started
         fps = batch / elapsed if elapsed > 0 else 0
         return jsonify({
@@ -13148,6 +13343,9 @@ def probes_bench():
             "elapsed_sec": round(elapsed, 3),
             "approx_fps": round(fps, 1),
             "device": device,
+            "backend": clip_backend_kind,
+            "model": clip_runtime_model or config.CLIP_MODEL,
+            "resolution": target_size,
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -13707,7 +13905,7 @@ def save_settings():
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, dino_encoder
+        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
@@ -13970,6 +14168,9 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
             active_embedder = 'clip'
         clip_model = None
         clip_preprocess = None
+        clip_processor = None
+        clip_backend_kind = "openai_clip"
+        clip_runtime_model = ""
         dino_encoder = None
         ensure_embedder_loaded()
 

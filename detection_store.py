@@ -568,9 +568,16 @@ class DetectionsStore:
                 ).fetchall()
                 ids: List[int] = []
                 vectors: List[np.ndarray] = []
+                target_dim: Optional[int] = None
                 for row in rows:
                     vec = self._blob_to_vec(row["vec_blob"])
                     if vec is None:
+                        continue
+                    if target_dim is None:
+                        target_dim = int(vec.shape[0]) if vec.ndim == 1 else None
+                    if target_dim is None:
+                        continue
+                    if vec.ndim != 1 or int(vec.shape[0]) != target_dim:
                         continue
                     ids.append(int(row["id"]))
                     vectors.append(vec)

@@ -255,7 +255,7 @@ EVOSSEARCH_DEBUG=false
 
 # Embedder/index
 EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion
-EVOSSEARCH_CLIP_MODEL=ViT-B/32
+EVOSSEARCH_CLIP_MODEL=ViT-B/32        # OpenAI CLIP or HF SigLIP2 model id (e.g. google/siglip2-so400m-patch14-384)
 EVOSSEARCH_DINO_MODEL=dinov3_vith16plus
 EVOSSEARCH_EMB_DIM_DINO=1280
 EVOSSEARCH_DINO_WEIGHTS_PATH=/path/to/weights.pth
@@ -339,6 +339,8 @@ Notes:
 
 - CORS is not globally open by default; set `EVOSSEARCH_CORS_ALLOWED_ORIGINS` explicitly.
 - `.env` edits require restart for full consistency.
+- `EVOSSEARCH_CLIP_MODEL` supports OpenAI CLIP names and SigLIP2 HF IDs.
+- If a SigLIP2 model fails to load, SISU auto-falls back to `ViT-B/32` so startup can continue.
 
 ## Typical Workflows
 
