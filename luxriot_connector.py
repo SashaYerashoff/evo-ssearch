@@ -1,6 +1,6 @@
-import base64
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -500,11 +500,8 @@ class LuxriotManager:
 
     @staticmethod
     def _summary_log_key(log: Mapping[str, Any]) -> Tuple[str, str, str, str]:
-        created_raw = log.get("created_at")
-        try:
-            created = f"{float(created_raw):.6f}"
-        except Exception:
-            created = "0.000000"
+        created_num = LuxriotManager._coerce_float(log.get("created_at"))
+        created = f"{created_num:.6f}" if created_num is not None else "0.000000"
         run_id = str(log.get("run_id") or "").strip()
         frame_count = str(log.get("frame_count") or "")
         summary = str(log.get("summary") or "").strip()
@@ -690,11 +687,25 @@ class LuxriotManager:
     def _coerce_float(value: object) -> Optional[float]:
         if value is None:
             return None
-        try:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
             num = float(value)
+            return num if math.isfinite(num) else None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                num = float(text)
+            except ValueError:
+                return None
+            return num if math.isfinite(num) else None
+        try:
+            num = float(cast(Any, value))
         except Exception:
             return None
-        return num if num == num else None
+        return num if math.isfinite(num) else None
 
     def _generate_run_id_locked(self, channel_id: int) -> str:
         base = f"ch{channel_id}-{int(time.time() * 1000)}"

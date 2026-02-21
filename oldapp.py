@@ -2482,6 +2482,18 @@ def home():
             font-size: 0.72rem;
         }
 
+        .luxriot-summary-channel-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.14rem 0.45rem;
+            border: 1px solid #3a4a61;
+            border-radius: 999px;
+            background: rgba(58, 88, 126, 0.16);
+            color: #b4cdee;
+            font-size: 0.72rem;
+        }
+
         .luxriot-summary .timestamp {
             color: #aaa;
             font-size: 0.82rem;
@@ -4992,6 +5004,37 @@ def home():
             luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
         }
 
+        function withSummaryUpdatedMeta(text) {
+            const base = String(text || '').trim();
+            const stamp = new Date().toLocaleTimeString();
+            return `${base} · updated ${stamp}`;
+        }
+
+        function formatSummaryWindowLabel(seconds) {
+            const value = Number(seconds);
+            if (!Number.isFinite(value) || value <= 0) return 'n/a';
+            if (value % 86400 === 0) return `${Math.floor(value / 86400)}d`;
+            if (value % 3600 === 0) return `${Math.floor(value / 3600)}h`;
+            if (value % 60 === 0) return `${Math.floor(value / 60)}m`;
+            return `${Math.floor(value)}s`;
+        }
+
+        function setSummaryRefreshButtonState(state = 'idle') {
+            if (!luxriotRefreshSummariesBtn) return;
+            if (state === 'busy') {
+                luxriotRefreshSummariesBtn.disabled = true;
+                luxriotRefreshSummariesBtn.textContent = '⟳ Refreshing...';
+                return;
+            }
+            if (state === 'queued') {
+                luxriotRefreshSummariesBtn.disabled = true;
+                luxriotRefreshSummariesBtn.textContent = '⟳ Queued...';
+                return;
+            }
+            luxriotRefreshSummariesBtn.disabled = false;
+            luxriotRefreshSummariesBtn.textContent = '⟳ Refresh';
+        }
+
         function renderLuxriotSummaries(logs, channelId = getSelectedSummaryChannel()) {
             if (!luxriotSummaries) return;
             const normalizedLogs = Array.isArray(logs) ? logs.slice() : [];
@@ -5027,13 +5070,18 @@ def home():
                     const tsLabel = ts ? ts.toLocaleString() : 'n/a';
                     const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
                     const modelLabel = String(log.model || '').trim();
+                    const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
+                    const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
+                    const channelLabel = Number.isFinite(rowChannelId)
+                        ? getLuxriotChannelLabel(rowChannelId)
+                        : 'Unknown channel';
                     const summary = String(log.summary || '').trim();
                     const canBookmark = summary.length > 0;
                     const collapsed = isSummaryCollapsed(channelId, logKey);
                     return `
                         <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}">
                             <div class="luxriot-summary-head">
-                                <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
+                                <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
                                 <div class="luxriot-summary-actions">
                                     <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
                                         ${collapsed ? 'Expand' : 'Collapse'}
@@ -5207,6 +5255,11 @@ def home():
                 const rollupKey = rollupSummaryKey(row, idx);
                 const collapsed = isSummaryCollapsed(channelId, rollupKey);
                 const rangeLabel = formatRollupRange(row?.window_start, row?.window_end);
+                const rowChannelId = parseInt(String(row?.channel_id ?? channelId), 10);
+                const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
+                const channelLabel = Number.isFinite(rowChannelId)
+                    ? getLuxriotChannelLabel(rowChannelId)
+                    : 'Unknown channel';
                 const itemCount = Number(row?.item_count || 0);
                 const frameCount = Number(row?.frame_count || 0);
                 const sourceTokens = Number(row?.source_tokens || 0);
@@ -5220,7 +5273,7 @@ def home():
                 return `
                     <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
                         <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
+                            <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
                             <div class="luxriot-summary-actions">
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
@@ -5279,7 +5332,15 @@ def home():
                 const drillLabel = ctx?.sourceIds ? ` · drill ${ctx.sourceIds.length}` : '';
                 const runLabel = luxriotSummaryRunFilter || 'latest';
                 const countsLabel = `L1 ${Number(counts.L1 || 0)} · L2 ${Number(counts.L2 || 0)} · L3 ${Number(counts.L3 || 0)}`;
-                setLuxriotSummaryMeta(`#${channelId} · ${level}${drillLabel} · ${renderedCount} items · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`);
+                const pendingCount = luxriotSummaryRollupRows
+                    .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
+                    .length;
+                const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
+                const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
+                const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
+                const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
+                const channelLabel = getLuxriotChannelLabel(channelId);
+                setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
                 setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
             } catch (err) {
                 setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
@@ -5296,7 +5357,10 @@ def home():
                     force: Boolean(force || next.force),
                     allowRunFallback: Boolean((allowRunFallback !== false) || (next.allowRunFallback !== false)),
                 };
-                return;
+                if (force) {
+                    setLuxriotStatus('Refresh queued...');
+                }
+                return false;
             }
             luxriotSummaryRefreshInFlight = true;
             try {
@@ -5305,12 +5369,13 @@ def home():
                 } else {
                     await refreshLuxriotSummaries(channelId, force, allowRunFallback);
                 }
+                return true;
             } finally {
                 luxriotSummaryRefreshInFlight = false;
                 if (luxriotSummaryRefreshQueued) {
                     const next = luxriotSummaryRefreshQueued;
                     luxriotSummaryRefreshQueued = null;
-                    refreshLuxriotSummaryView(
+                    void refreshLuxriotSummaryView(
                         next.channelId || getSelectedSummaryChannel(),
                         Boolean(next.force),
                         next.allowRunFallback !== false,
@@ -5812,7 +5877,7 @@ def home():
             renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
         }
 
-        async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false) {
+        async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
             if (!channelId) return;
             if (!luxriotSummaryAutoRefresh && !force) return;
             try {
@@ -5825,15 +5890,29 @@ def home():
                 }
                 syncSummaryRunSelectOptions(data.runs, data.selected_run);
                 syncSummaryFiltersFromResponse(data);
+                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
+                if (
+                    allowRunFallback
+                    && !Boolean(data.running)
+                    && (selectedRun === 'live' || selectedRun === 'latest')
+                ) {
+                    luxriotSummaryRunFilter = 'all';
+                    if (luxriotSummaryRunSelect) {
+                        luxriotSummaryRunSelect.value = 'all';
+                    }
+                    refreshLuxriotSummaryView(channelId, true, false);
+                    return;
+                }
                 renderLuxriotSummaries(data.logs || [], channelId);
                 const historyCount = Number(data.archived_log_count || 0);
                 const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
                 const stateLabel = data.running ? 'live' : 'stopped';
-                const detailParts = [`#${channelId}`, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
+                const channelLabel = getLuxriotChannelLabel(channelId);
+                const detailParts = [channelLabel, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
                 if (historyCount > 0) detailParts.push(`hist ${historyCount}`);
                 if (typeof data.pending_frames === 'number' && data.pending_frames > 0) detailParts.push(`q ${data.pending_frames}`);
                 if (data.last_error) detailParts.push('err');
-                setLuxriotSummaryMeta(detailParts.join(' · '), Boolean(data.last_error));
+                setLuxriotSummaryMeta(withSummaryUpdatedMeta(detailParts.join(' · ')), Boolean(data.last_error));
                 let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
                 if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
                     baseStatus += ` · ${data.pending_frames} frames queued`;
@@ -6844,7 +6923,24 @@ def home():
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
         }
         if (luxriotRefreshSummariesBtn) {
-            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaryView(getSelectedSummaryChannel(), true));
+            luxriotRefreshSummariesBtn.addEventListener('click', async () => {
+                setSummaryRefreshButtonState('busy');
+                setLuxriotStatus('Refreshing summaries...');
+                let queued = false;
+                try {
+                    const started = await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                    queued = started === false;
+                    if (queued) {
+                        setSummaryRefreshButtonState('queued');
+                    }
+                } finally {
+                    if (queued) {
+                        setTimeout(() => setSummaryRefreshButtonState('idle'), 800);
+                    } else {
+                        setSummaryRefreshButtonState('idle');
+                    }
+                }
+            });
         }
         if (luxriotSummaryChannelSelect) {
             luxriotSummaryChannelSelect.addEventListener('change', () => {

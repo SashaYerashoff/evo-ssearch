@@ -3,7 +3,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -129,8 +129,11 @@ class DetectionsStore:
         probe_id = str(record.get("probe_id") or "").strip()
         if not probe_id:
             raise ValueError("probe_id is required")
+        channel_raw = record.get("channel_id")
+        if channel_raw is None:
+            raise ValueError("channel_id is required")
         try:
-            channel_id = int(record.get("channel_id"))
+            channel_id = int(cast(Any, channel_raw))
         except Exception as exc:
             raise ValueError("channel_id is required") from exc
 
