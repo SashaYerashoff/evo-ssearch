@@ -1,14 +1,22 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import atexit
 import base64
+import copy
+import gc
+import html as html_lib
 import json
-import pickle
-import time
 import math
+import pickle
+import secrets
+import socket
+import threading
+import time
+import uuid
 import requests
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote
 from threading import Lock
 
@@ -18,46 +26,341 @@ import cv2
 import clip
 import faiss
 from PIL import Image
-from flask import Flask, request, jsonify, send_file, render_template_string, make_response
+from transformers import AutoModel, AutoProcessor
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 
 from config import config
+from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
-import numpy as np
-import threading
-import time
-try:
+if TYPE_CHECKING:
     from heads.mask2former_head import Mask2FormerHead
+try:
+    from heads.mask2former_head import Mask2FormerHead as _Mask2FormerHeadRuntime
 except Exception:  # pragma: no cover - optional dependency
-    Mask2FormerHead = None  # type: ignore[misc]
+    _Mask2FormerHeadRuntime = None  # type: ignore[misc]
 
 app = Flask(__name__)
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
+if config.CORS_ALLOWED_ORIGINS:
+    CORS(app, resources={r"/*": {"origins": list(config.CORS_ALLOWED_ORIGINS)}})
 
 # Global embedder state
 device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model: Optional[torch.nn.Module] = None
 clip_preprocess = None
+clip_processor: Optional[Any] = None
+clip_backend_kind = "openai_clip"
+clip_runtime_model = ""
+clip_runtime_device = device
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
 _mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
+FaissIndexBundle = Tuple[Optional[faiss.Index], Optional[List[str]], Optional[List[Dict[str, Any]]], Dict[str, Any]]
+
+if hasattr(Image, "Resampling"):
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
+    RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+else:  # pragma: no cover - Pillow compatibility fallback
+    RESAMPLE_NEAREST = Image.NEAREST  # type: ignore[attr-defined]
+    RESAMPLE_BILINEAR = Image.BILINEAR  # type: ignore[attr-defined]
+    RESAMPLE_LANCZOS = Image.LANCZOS  # type: ignore[attr-defined]
 active_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else "clip"
 if active_embedder == "fusion" and not config.FUSION_ENABLED:
     active_embedder = "clip"
 
+LOCAL_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
+FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
+
+
+def _json_body() -> Dict[str, Any]:
+    payload = request.get_json(silent=True)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_BOOL_STRINGS:
+            return True
+        if normalized in FALSE_BOOL_STRINGS:
+            return False
+        return default
+    return bool(value)
+
+
+def _is_local_request() -> bool:
+    return (request.remote_addr or "") in LOCAL_HOSTS
+
+
+def _request_admin_token() -> str:
+    auth_header = (request.headers.get("Authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return (request.headers.get("X-Admin-Token") or "").strip()
+
+
+def _has_admin_access() -> bool:
+    configured = (config.ADMIN_TOKEN or "").strip()
+    if not configured:
+        return False
+    provided = _request_admin_token()
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, configured)
+
+
+def _settings_guard(write: bool = False):
+    if write:
+        return _mutation_guard()
+    if config.ADMIN_TOKEN:
+        if _has_admin_access():
+            return None
+        return jsonify({"success": False, "error": "Admin token required"}), 401
+    if config.SETTINGS_LOCAL_ONLY and not _is_local_request():
+        return jsonify({"success": False, "error": "Remote settings access is disabled."}), 403
+    return None
+
+
+def _mutation_guard():
+    configured = (config.ADMIN_TOKEN or "").strip()
+    if not configured:
+        return jsonify(
+            {
+                "success": False,
+                "error": "Admin token is required for mutating endpoints. Set EVOSSEARCH_ADMIN_TOKEN.",
+            }
+        ), 503
+    if _has_admin_access():
+        return None
+    return jsonify({"success": False, "error": "Admin token required"}), 401
+
+
+def _mutation_guard_error():
+    guard = _mutation_guard()
+    if guard is None:
+        return None
+    body, status = guard
+    payload = body.get_json(silent=True) if hasattr(body, "get_json") else {}
+    message = (payload or {}).get("error") or "Admin token required"
+    return jsonify({"error": message}), status
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_folder_path(folder_raw: Any, require_index: bool = False) -> Path:
+    folder_text = str(folder_raw or "").strip()
+    if not folder_text:
+        raise ValueError("No folder specified")
+    folder_path = Path(folder_text).expanduser().resolve()
+    if not folder_path.exists() or not folder_path.is_dir():
+        raise ValueError("Invalid folder path")
+    if config.ALLOWED_ROOTS:
+        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+        if not any(_path_within(folder_path, root) for root in allowed_roots):
+            raise ValueError("Folder path is outside configured allowed roots")
+    if require_index:
+        index_root = folder_path / config.INDEX_FOLDER_NAME
+        has_index = (index_root / "index.faiss").exists() or any(
+            (index_root / subdir / "index.faiss").exists() for subdir in EMBEDDER_SUBDIRS.values()
+        )
+        if not has_index:
+            raise ValueError("Folder is not indexed")
+    return folder_path
+
+
+@app.errorhandler(413)
+def payload_too_large(_: Exception):
+    return jsonify({"error": f"Payload too large (max {config.MAX_FILE_SIZE_MB} MB)."}), 413
+
 
 def init_clip() -> None:
-    """Load the CLIP model lazily for embedding extraction."""
-    global clip_model, clip_preprocess
-    if clip_model is not None and clip_preprocess is not None:
+    """Load the CLIP-like model lazily for embedding extraction."""
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device
+    if clip_model is not None:
+        if clip_backend_kind == "openai_clip" and clip_preprocess is not None:
+            return
+        if clip_backend_kind == "siglip2" and clip_processor is not None:
+            return
+
+    preferred_device = device
+    requested_model = str(config.CLIP_MODEL or "").strip() or "ViT-B/32"
+    if _is_siglip2_clip_model(requested_model):
+        try:
+            model_obj, processor_obj = _load_siglip2_clip_model(requested_model, preferred_device)
+            clip_model = model_obj
+            clip_processor = processor_obj
+            clip_preprocess = None
+            clip_backend_kind = "siglip2"
+            clip_runtime_model = requested_model
+            clip_runtime_device = preferred_device
+            return
+        except Exception as exc:
+            fallback_model = "ViT-B/32"
+            print(
+                f"SigLIP2 model '{requested_model}' failed to load ({exc}). "
+                f"Falling back to CLIP '{fallback_model}'."
+            )
+            fallback_error: Optional[Exception] = None
+            fallback_device = preferred_device
+            if fallback_device.startswith("cuda"):
+                _release_cuda_memory()
+            try:
+                model_obj, preprocess_obj = _load_openai_clip_model(fallback_model, fallback_device)
+            except Exception as fallback_exc:
+                fallback_error = fallback_exc
+                if fallback_device.startswith("cuda"):
+                    _release_cuda_memory()
+                    fallback_device = "cpu"
+                    model_obj, preprocess_obj = _load_openai_clip_model(fallback_model, fallback_device)
+                else:
+                    raise
+            clip_model = model_obj
+            clip_preprocess = preprocess_obj
+            clip_processor = None
+            clip_backend_kind = "openai_clip"
+            clip_runtime_model = fallback_model
+            clip_runtime_device = fallback_device
+            if fallback_error is not None:
+                print(f"CLIP fallback recovered on {fallback_device} after initial failure: {fallback_error}")
+            return
+
+    fallback_device = preferred_device
+    initial_error: Optional[Exception] = None
+    try:
+        model_obj, preprocess_obj = _load_openai_clip_model(requested_model, fallback_device)
+    except Exception as exc:
+        initial_error = exc
+        if fallback_device.startswith("cuda"):
+            _release_cuda_memory()
+            fallback_device = "cpu"
+            model_obj, preprocess_obj = _load_openai_clip_model(requested_model, fallback_device)
+        else:
+            raise
+    clip_model = model_obj
+    clip_preprocess = preprocess_obj
+    clip_processor = None
+    clip_backend_kind = "openai_clip"
+    clip_runtime_model = requested_model
+    clip_runtime_device = fallback_device
+    if initial_error is not None:
+        print(f"CLIP model '{requested_model}' loaded on {fallback_device} after retry: {initial_error}")
+
+
+def _is_siglip2_clip_model(model_name: str) -> bool:
+    normalized = str(model_name or "").strip().lower()
+    return "siglip2" in normalized
+
+
+def _release_cuda_memory() -> None:
+    if not torch.cuda.is_available():
         return
-    clip_model, clip_preprocess = clip.load(config.CLIP_MODEL, device=device)
-    clip_model.eval()
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
+    model, preprocess = clip.load(model_name, device=target_device)
+    cast(torch.nn.Module, model).eval()
+    return cast(torch.nn.Module, model), preprocess
+
+
+def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
+    model = AutoModel.from_pretrained(model_name)
+    cast(torch.nn.Module, model).to(target_device)
+    cast(torch.nn.Module, model).eval()
+    processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+    return cast(torch.nn.Module, model), processor
+
+
+def _normalize_l2_embeddings(features: torch.Tensor) -> torch.Tensor:
+    return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _processor_to_device(batch: Mapping[str, Any], target_device: str) -> Dict[str, Any]:
+    moved: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(target_device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarray:
+    ensure_embedder_loaded("clip")
+    if not images:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    normalized_images = [img.convert("RGB") for img in images]
+    with torch.no_grad():
+        if clip_backend_kind == "siglip2":
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 clip backend is not initialized")
+            processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+            image_features = cast(Any, clip_model).get_image_features(**model_inputs)
+        else:
+            if clip_preprocess is None or clip_model is None:
+                raise RuntimeError("CLIP backend is not initialized")
+            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
+            image_features = cast(Any, clip_model).encode_image(image_batch)
+        image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
+    return image_features.cpu().numpy().astype(np.float32, copy=False)
+
+
+def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
+    ensure_embedder_loaded("clip")
+    prepared = [str(text or "").strip() for text in texts if str(text or "").strip()]
+    if not prepared:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    with torch.no_grad():
+        if clip_backend_kind == "siglip2":
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 clip backend is not initialized")
+            # SigLIP2 tokenization quality is better when text is lower-cased and max_length=64.
+            normalized_texts = [text.lower() for text in prepared]
+            processor_inputs = cast(Any, clip_processor)(
+                text=normalized_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+                return_tensors="pt",
+            )
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+            text_features = cast(Any, clip_model).get_text_features(**model_inputs)
+        else:
+            if clip_model is None:
+                raise RuntimeError("CLIP backend is not initialized")
+            text_tokens = clip.tokenize(prepared).to(clip_runtime_device)
+            text_features = cast(Any, clip_model).encode_text(text_tokens)
+        text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
+    return text_features.cpu().numpy().astype(np.float32, copy=False)
 
 
 def init_dino() -> None:
@@ -106,11 +409,49 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         raise ValueError(f"Unsupported embedder: {target}")
 
 
+def reset_embedder_runtime_state() -> None:
+    """Clear loaded embedding backends so they can be re-initialized."""
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device, dino_encoder
+    clip_model = None
+    clip_preprocess = None
+    clip_processor = None
+    clip_backend_kind = "openai_clip"
+    clip_runtime_model = ""
+    clip_runtime_device = device
+    dino_encoder = None
+
+
+def warm_start_embedder() -> Optional[str]:
+    """
+    Warm start embedding backend without aborting process on heavy model failures.
+
+    In fusion mode we intentionally warm only CLIP/SigLIP and defer DINO to first DINO/fusion call.
+    This prevents startup crashes when GPU memory is tight.
+    """
+    global active_embedder
+    requested = active_embedder
+    try:
+        if requested == "fusion":
+            ensure_embedder_loaded("clip")
+            return "Fusion warm-up loaded CLIP backend; DINO will load on demand."
+        ensure_embedder_loaded(requested)
+        return None
+    except Exception as exc:
+        if requested != "clip":
+            try:
+                ensure_embedder_loaded("clip")
+                active_embedder = "clip"
+                return f"{requested} warm-up failed ({exc}); fell back to CLIP backend."
+            except Exception as clip_exc:
+                return f"Embedder warm-up failed ({exc}); CLIP fallback also failed ({clip_exc})."
+        return f"Embedder warm-up failed: {exc}"
+
+
 def ensure_mask_head() -> Optional["Mask2FormerHead"]:
     global mask2former_head, _mask2former_failed
     if not config.MASK2FORMER_ENABLED:
         return None
-    if Mask2FormerHead is None:
+    if _Mask2FormerHeadRuntime is None:
         if not _mask2former_failed:
             print("Mask2Former head unavailable: transformers vision deps missing; disabling head.")
             _mask2former_failed = True
@@ -122,17 +463,46 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
             return mask2former_head
         try:
             target_device = config.MASK2FORMER_DEVICE or ("cuda:0" if torch.cuda.is_available() else "cpu")
-            mask2former_head = Mask2FormerHead(
+            created_head = _Mask2FormerHeadRuntime(
                 model_name=config.MASK2FORMER_MODEL,
                 device=target_device,
                 max_size=config.MASK2FORMER_MAX_SIZE,
             )
+            mask2former_head = cast(Any, created_head)
         except Exception as exc:
             _mask2former_failed = True
             print(f"Mask2Former head initialization failed: {exc}")
             config.MASK2FORMER_ENABLED = False
             return None
     return mask2former_head
+
+
+def _faiss_add_vectors(index: faiss.Index, vectors: np.ndarray) -> None:
+    """Typed wrapper for FAISS add; FAISS runtime monkey-patches signatures."""
+    cast(Any, index).add(vectors)
+
+
+def _faiss_search(index: faiss.Index, query: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Typed wrapper for FAISS search; returns (distances, indices)."""
+    query_arr = np.asarray(query, dtype=np.float32)
+    if query_arr.ndim != 2:
+        raise ValueError("FAISS query must be a 2D float32 array")
+    try:
+        index_dim = int(getattr(index, "d"))
+    except Exception:
+        index_dim = None
+    if index_dim is not None and int(query_arr.shape[1]) != index_dim:
+        raise ValueError(
+            f"Embedding dimension mismatch: query dim {int(query_arr.shape[1])} vs index dim {index_dim}. "
+            "Rebuild index for the selected CLIP model."
+        )
+    distances, labels = cast(Any, index).search(query_arr, int(k))
+    return np.asarray(distances), np.asarray(labels)
+
+
+def _faiss_reconstruct(index: faiss.Index, idx: int) -> np.ndarray:
+    """Typed wrapper for FAISS reconstruct."""
+    return np.asarray(cast(Any, index).reconstruct(int(idx)), dtype=np.float32)
 
 
 def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = None) -> np.ndarray:
@@ -142,11 +512,11 @@ def get_image_embedding(image_path: Union[str, Path], embedder: Optional[str] = 
         target = "clip"
     ensure_embedder_loaded(target)
     if target == "clip":
-        image = clip_preprocess(Image.open(image_path)).unsqueeze(0).to(device)  # type: ignore[attr-defined]
-        with torch.no_grad():
-            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+        pil_image = Image.open(image_path).convert("RGB")
+        embeddings = _clip_image_embeddings_from_pils([pil_image])
+        if embeddings.size == 0:
+            raise RuntimeError("Failed to produce clip embedding from image")
+        return embeddings[0]
     else:
         assert dino_encoder is not None
         features = dino_encoder.encode_images(image_path)
@@ -160,11 +530,10 @@ def get_image_embedding_from_pil(pil_image: Image.Image, embedder: Optional[str]
         target = "clip"
     ensure_embedder_loaded(target)
     if target == "clip":
-        image = clip_preprocess(pil_image).unsqueeze(0).to(device)  # type: ignore[attr-defined]
-        with torch.no_grad():
-            image_features = clip_model.encode_image(image)  # type: ignore[union-attr]
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-        return image_features.cpu().numpy().flatten()
+        embeddings = _clip_image_embeddings_from_pils([pil_image])
+        if embeddings.size == 0:
+            raise RuntimeError("Failed to produce clip embedding from image")
+        return embeddings[0]
     else:
         assert dino_encoder is not None
         features = dino_encoder.encode_images(pil_image)
@@ -175,25 +544,32 @@ def get_text_embedding(text: str) -> np.ndarray:
     """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
     if active_embedder not in {"clip", "fusion"}:
         raise RuntimeError("Text search is only supported when the CLIP backend is active.")
-    ensure_embedder_loaded("clip")
-    text_tokens = clip.tokenize([text]).to(device)
-    with torch.no_grad():
-        text_features = clip_model.encode_text(text_tokens)  # type: ignore[union-attr]
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-    return text_features.cpu().numpy().flatten()
+    embeddings = _clip_text_embeddings([text])
+    if embeddings.size == 0:
+        raise RuntimeError("Text query is empty")
+    return embeddings[0]
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ensure_embedder_loaded(embedder)
     base: Dict[str, Any]
     if embedder == "clip":
-        embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+        runtime_model = str(clip_runtime_model or config.CLIP_MODEL or "unknown")
+        if clip_backend_kind == "siglip2":
+            projection_dim = getattr(getattr(clip_model, "config", None), "projection_dim", 1152)
+            embed_dim = int(projection_dim if projection_dim else 1152)
+            library = "google/siglip2"
+        else:
+            embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+            library = "openai/CLIP"
         base = {
             "embedder": "clip",
-            "model": config.CLIP_MODEL,
+            "model": runtime_model,
+            "requested_model": str(config.CLIP_MODEL),
             "embedding_dim": embed_dim,
-            "library": "openai/CLIP",
-            "device": device,
+            "library": library,
+            "backend": clip_backend_kind,
+            "device": clip_runtime_device,
         }
     else:
         assert dino_encoder is not None
@@ -254,7 +630,7 @@ def _create_index_for_embedder(entries: List[Tuple[Path, Dict[str, Any]]], embed
 
     embeddings_array = np.array(embeddings, dtype='float32')
     index = faiss.IndexFlatIP(embeddings_array.shape[1])
-    index.add(embeddings_array)
+    _faiss_add_vectors(index, embeddings_array)
     index_meta = _build_index_metadata(embedder, {'image_count': len(image_paths)})
     return index, image_paths, image_metadata, index_meta
 
@@ -319,6 +695,24 @@ def home():
         luxriot_batch_options.append(f'<option value="{size}" {selected}>{size}</option>')
     luxriot_batch_options_html = '\n                            '.join(luxriot_batch_options)
     luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    default_video_frames = max(1, int(config.LM_VIDEO_DEFAULT_FRAMES))
+    max_video_frames = max(default_video_frames, int(config.LM_VIDEO_MAX_FRAMES))
+    video_frame_options_set: Set[int] = {default_video_frames}
+    for raw_option in getattr(config, "LM_VIDEO_FRAME_OPTIONS", ()):
+        try:
+            option = int(raw_option)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= option <= max_video_frames:
+            video_frame_options_set.add(option)
+    video_frame_options = sorted(video_frame_options_set)
+    video_frame_options_html = '\n                            '.join(
+        f'<option value="{count}" {"selected" if count == default_video_frames else ""}>{count}</option>'
+        for count in video_frame_options
+    )
+    segments_enabled_checked = "checked" if bool(config.DINO_SEGMENTS_ENABLED) else ""
+    segment_min_patches_default = max(1, int(config.DINO_SEGMENT_MIN_PATCHES))
+    segment_threshold_percent = min(99, max(40, int(round(float(config.DINO_HEATMAP_THRESHOLD) * 100))))
     
     # Use string formatting for the result options
     html_template = '''
@@ -330,6 +724,25 @@ def home():
     <title>Natural Language Image Search</title>
     <!-- Cache buster: {timestamp} -->
     <style>
+        :root {
+            --bg: #0a0a0a;
+            --panel: #161616;
+            --panel-border: #262626;
+            --surface: #0f0f0f;
+            --field: #0a0a0a;
+            --field-border: #333;
+            --text: #e0e0e0;
+            --muted: #8f8f8f;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+            --control-h: 36px;
+            --panel-gap: 0.75rem;
+            --panel-header-gap: 0.65rem;
+            --btn-sm-h: 30px;
+            --btn-md-h: 36px;
+            --btn-lg-h: 42px;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -338,18 +751,19 @@ def home():
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0a0a;
-            color: #e0e0e0;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
         }
         
         .container {
-            max-width: 1200px;
-            min-width: 900px;                     
+            width: 100%;
+            max-width: 1280px;
+            min-width: 0;
             margin: 0 auto;
-            padding: 2rem;
+            padding: 1.5rem;
             flex: 1;
         }
         
@@ -358,6 +772,12 @@ def home():
             justify-content: space-between;
             align-items: center;
             margin-bottom: 2rem;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
 
         .brand {
@@ -434,6 +854,35 @@ def home():
             overflow-y: auto;
             padding: 2rem;
         }
+
+        .probe-editor-modal-content {
+            max-width: 1040px;
+            width: min(96vw, 1040px);
+            max-height: 88vh;
+        }
+
+        .probe-editor-modal-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .probe-editor-layout {
+            display: grid;
+            grid-template-columns: minmax(280px, 0.9fr) minmax(500px, 1.1fr);
+            gap: 1rem;
+            align-items: start;
+        }
+
+        .probe-editor-settings {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .probe-editor-modal-actions {
+            margin-top: 0.25rem;
+        }
         
         .settings-header {
             display: flex;
@@ -508,12 +957,42 @@ def home():
             flex: 1;
             background: #0a0a0a;
             border: 1px solid #333;
-            padding: 0.5rem 0.75rem;
+            min-height: var(--control-h);
+            padding: 0 0.75rem;
             border-radius: 6px;
             color: #e0e0e0;
             font-size: 0.9rem;
             transition: border-color 0.2s;
             max-width: 200px;
+        }
+
+        .settings-row.align-start {
+            align-items: flex-start;
+        }
+
+        .env-editor {
+            flex: 1;
+            max-width: none;
+            min-height: 240px;
+            padding: 0.65rem 0.75rem;
+            resize: vertical;
+            font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace;
+            font-size: 0.82rem;
+            line-height: 1.35;
+            white-space: pre;
+        }
+
+        .settings-note {
+            flex: 1;
+            color: #9aa0ad;
+            font-size: 0.82rem;
+        }
+
+        .env-editor-actions {
+            flex: 1;
+            display: flex;
+            gap: 0.5rem;
+            justify-content: flex-end;
         }
         
         .settings-input:focus {
@@ -534,7 +1013,8 @@ def home():
         .settings-select {
             background: #0a0a0a;
             border: 1px solid #333;
-            padding: 0.5rem 0.75rem;
+            min-height: var(--control-h);
+            padding: 0 0.75rem;
             border-radius: 6px;
             color: #e0e0e0;
             font-size: 0.9rem;
@@ -572,11 +1052,16 @@ def home():
             background: #2a2a2a;
             border: 1px solid #444;
             color: #e0e0e0;
-            padding: 0.75rem 1.5rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1.2rem;
             border-radius: 6px;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
         }
         
         .settings-btn:hover {
@@ -615,11 +1100,12 @@ def home():
         }
         
         .control-panel {
-            background: #161616;
-            border-radius: 12px;
+            background: var(--panel);
+            border-radius: var(--radius-lg);
             padding: 1.5rem;
             margin-bottom: 2rem;
-            border: 1px solid #262626;
+            border: 1px solid var(--panel-border);
+            position: static;
         }
         
         .folder-select {
@@ -630,13 +1116,22 @@ def home():
         
         input[type="text"] {
             flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #333;
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            color: #e0e0e0;
+            background: var(--field);
+            border: 1px solid var(--field-border);
+            min-height: var(--control-h);
+            padding: 0 1rem;
+            border-radius: var(--radius-md);
+            color: var(--text);
             font-size: 0.95rem;
             transition: border-color 0.2s;
+            min-width: 0;
+        }
+
+        input[type="number"],
+        input[type="password"],
+        select {
+            min-height: var(--control-h);
+            line-height: 1.2;
         }
         
         input[type="text"]:focus {
@@ -646,10 +1141,10 @@ def home():
         
         button {
             background: #1a1a1a;
-            border: 1px solid #333;
-            color: #e0e0e0;
+            border: 1px solid var(--field-border);
+            color: var(--text);
             padding: 0.75rem 1.5rem;
-            border-radius: 8px;
+            border-radius: var(--radius-md);
             cursor: pointer;
             font-size: 0.95rem;
             transition: all 0.2s;
@@ -677,20 +1172,26 @@ def home():
         .status.error {
             color: #f87171;
         }
+
+        .status.warning {
+            color: #f4c066;
+        }
         
         .search-panel {
-            background: #161616;
-            border-radius: 12px;
+            background: var(--panel);
+            border-radius: var(--radius-lg);
             padding: 1.5rem;
             margin-bottom: 2rem;
-            border: 1px solid #262626;
+            border: 1px solid var(--panel-border);
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
         }
         
         .search-mode-tabs {
             display: flex;
             gap: 0;
-            margin-bottom: 1rem;
-            border-radius: 8px;
+            border-radius: var(--radius-md);
             overflow: hidden;
         }
         
@@ -699,11 +1200,15 @@ def home():
             background: #0a0a0a;
             border: 1px solid #333;
             color: #888;
-            padding: 0.75rem 1rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
             border-radius: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         
         .mode-tab.active {
@@ -718,11 +1223,40 @@ def home():
         }
         
         .search-controls {
-            margin-bottom: 1rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 1rem;
+        }
+
+        .archive-box {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .archive-workspace {
+            display: grid;
+            grid-template-columns: 320px minmax(0, 1fr);
+            gap: 1rem;
+            align-items: start;
+        }
+
+        .archive-results-panel {
+            background: #101010;
+            border: 1px solid #232323;
+            border-radius: var(--radius-md);
+            padding: 0.9rem;
+            min-height: 280px;
+        }
+
+        .archive-results-head {
+            color: #bdbdbd;
+            font-size: 0.82rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            margin-bottom: 0.75rem;
+            line-height: 1.2;
         }
         
         .control-group {
@@ -735,21 +1269,89 @@ def home():
             background: #2a4a3a;
             border: 1px solid #3a5a4a;
             color: #e0e0e0;
-            padding: 0.5rem 1rem;
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
             border-radius: 8px;
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.2s;
             white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+
+        .feature-btn.btn-sm {
+            min-height: var(--btn-sm-h);
+            padding: 0 0.7rem;
+            font-size: 0.82rem;
+        }
+
+        .feature-btn.btn-md {
+            min-height: var(--btn-md-h);
+            padding: 0 1rem;
+        }
+
+        .feature-btn.btn-lg {
+            min-height: var(--btn-lg-h);
+            padding: 0 1.25rem;
+            font-size: 0.95rem;
         }
         
         .feature-btn:hover {
             background: #345a44;
             border-color: #4a6a54;
         }
+
+        .feature-btn.primary {
+            background: #3a6346;
+            border-color: #4e7a5b;
+            color: #eef8f1;
+        }
+
+        .feature-btn.primary:hover {
+            background: #447454;
+            border-color: #5d8e6e;
+        }
         
         .feature-btn:active {
             transform: translateY(1px);
+        }
+
+        .feature-btn:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        button.is-loading,
+        .feature-btn.is-loading,
+        .settings-btn.is-loading,
+        .save-comment-btn.is-loading,
+        .segment-action-btn.is-loading {
+            position: relative;
+            color: transparent !important;
+            pointer-events: none;
+        }
+
+        button.is-loading::after,
+        .feature-btn.is-loading::after,
+        .settings-btn.is-loading::after,
+        .save-comment-btn.is-loading::after,
+        .segment-action-btn.is-loading::after {
+            content: '';
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.35);
+            border-top-color: rgba(255, 255, 255, 0.95);
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        button[aria-busy="true"] {
+            cursor: progress;
         }
         
         .sort-control {
@@ -759,6 +1361,12 @@ def home():
         }
         
         .limit-control {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .scope-control {
             display: flex;
             align-items: center;
             gap: 0.5rem;
@@ -799,7 +1407,8 @@ def home():
         }
         
         .sort-control label,
-        .limit-control label {
+        .limit-control label,
+        .scope-control label {
             color: #888;
             font-size: 0.9rem;
         }
@@ -808,7 +1417,7 @@ def home():
             background: #0a0a0a;
             border: 1px solid #333;
             color: #e0e0e0;
-            padding: 0.5rem 0.75rem;
+            padding: 0 0.75rem;
             border-radius: 6px;
             font-size: 0.9rem;
             cursor: pointer;
@@ -828,22 +1437,97 @@ def home():
         .search-box {
             display: flex;
             gap: 1rem;
+            align-items: flex-end;
+        }
+
+        .archive-search-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            position: sticky;
+            top: 1rem;
+            align-self: start;
+        }
+
+        .archive-section {
+            background: var(--surface);
+            border: 1px solid #222;
+            border-radius: var(--radius-md);
+            padding: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: var(--panel-gap);
+        }
+
+        .archive-filter-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.7rem;
+        }
+
+        .archive-detections-actions {
+            display: flex;
+            gap: var(--panel-header-gap);
+            flex-wrap: wrap;
+        }
+
+        .archive-detections-meta {
+            color: #9aa0ad;
+            font-size: 0.82rem;
+            min-height: 1.2rem;
+        }
+
+        .archive-section-title {
+            color: #bdbdbd;
+            font-size: 0.85rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            line-height: 1.2;
+        }
+
+        .section-help {
+            color: #8f96a7;
+            font-size: 0.8rem;
+            line-height: 1.35;
         }
         
-        input[type="file"] {
-            background: #0a0a0a;
-            border: 1px solid #333;
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            color: #e0e0e0;
-            font-size: 0.95rem;
-            transition: border-color 0.2s;
+        .file-upload {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            min-width: 0;
+        }
+
+        .file-upload.inline {
             width: 100%;
         }
-        
-        input[type="file"]:focus {
-            outline: none;
-            border-color: #555;
+
+        .file-upload-input {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            overflow: hidden;
+            clip-path: inset(50%);
+            white-space: nowrap;
+        }
+
+        .file-upload-btn {
+            flex: 0 0 auto;
+            margin: 0;
+        }
+
+        .file-upload-name {
+            color: #9aa0ad;
+            font-size: 0.86rem;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-upload-name.is-hidden {
+            display: none;
         }
         
         /* Image search layout */
@@ -852,7 +1536,7 @@ def home():
             flex-direction: column;
             gap: 1rem;
             flex: 1;
-            margin-right: 1rem;
+            min-width: 0;
         }
         
         .input-group {
@@ -866,19 +1550,96 @@ def home():
             font-size: 0.9rem;
             font-weight: 500;
         }
-        
-        .input-separator {
-            text-align: center;
-            color: #666;
-            font-size: 0.8rem;
-            font-weight: bold;
-            padding: 0.25rem 0;
+
+        .image-search-box {
+            align-items: stretch;
+        }
+
+        .image-query-panel {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+        }
+
+        .image-query-actions {
+            display: flex;
+            align-items: center;
+            gap: var(--panel-header-gap);
+            flex-wrap: wrap;
+        }
+
+        .image-query-actions .file-upload {
+            flex: 1;
+            min-width: 210px;
+        }
+
+        .image-query-actions .file-upload-name {
+            display: none;
+        }
+
+        .image-query-panel.has-image .image-query-actions .file-upload-name {
+            display: inline;
+        }
+
+        .image-search-btn {
+            display: none;
+        }
+
+        .image-query-panel.has-image .image-search-btn {
+            display: inline-flex;
+        }
+
+        .archive-query-preview {
+            position: relative;
+            border: 1px solid #262b36;
+            border-radius: 8px;
+            overflow: hidden;
+            min-height: 100px;
+            max-height: 180px;
+            background: #0f1218;
+        }
+
+        .archive-query-preview.is-hidden {
+            display: none;
+        }
+
+        .archive-query-preview img {
+            width: 100%;
+            height: 100%;
+            min-height: 100px;
+            max-height: 180px;
+            object-fit: contain;
+            display: block;
+            background: #0b0f16;
+        }
+
+        .archive-query-preview.is-empty img {
+            display: none;
+        }
+
+        .archive-query-preview-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #8e95a6;
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            background: linear-gradient(140deg, rgba(9, 12, 18, 0.82), rgba(14, 19, 29, 0.58));
+        }
+
+        .archive-query-preview:not(.is-empty) .archive-query-preview-overlay {
+            display: none;
         }
         
         .results-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
             gap: 1.5rem;
+            align-content: start;
         }
         
         .result-item {
@@ -920,6 +1681,50 @@ def home():
             color: #e0e0e0;
             margin-bottom: 0.25rem;
             word-break: break-all;
+        }
+
+        .result-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .result-badge {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            border: 1px solid #333;
+            padding: 0.1rem 0.45rem;
+            font-size: 0.68rem;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            color: #cfd3db;
+            background: rgba(180, 186, 201, 0.12);
+        }
+
+        .result-badge.mode-clip {
+            border-color: #2e6b45;
+            background: rgba(46, 107, 69, 0.2);
+            color: #b7f0ca;
+        }
+
+        .result-badge.mode-fusion {
+            border-color: #3d5da8;
+            background: rgba(61, 93, 168, 0.24);
+            color: #c4d6ff;
+        }
+
+        .result-badge.mode-dino {
+            border-color: #7b5a30;
+            background: rgba(123, 90, 48, 0.22);
+            color: #f7d8ad;
+        }
+
+        .result-badge.warning {
+            border-color: #8a6232;
+            background: rgba(138, 98, 50, 0.22);
+            color: #ffd39e;
         }
         
         .similarity {
@@ -1155,6 +1960,47 @@ def home():
             color: #888;
             font-size: 0.78rem;
         }
+
+        .segment-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .segment-action-btn {
+            border: 1px solid #2e2e2e;
+            background: #151515;
+            color: #ddd;
+            border-radius: 999px;
+            padding: 0.34rem 0.72rem;
+            font-size: 0.76rem;
+            cursor: pointer;
+            transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+        }
+
+        .segment-action-btn:hover {
+            border-color: #4a4a4a;
+            background: #1c1c1c;
+            color: #fff;
+        }
+
+        .segment-action-btn.primary {
+            border-color: #3f4d6a;
+            background: #1a2235;
+            color: #d7e3ff;
+        }
+
+        .segment-action-btn.primary:hover {
+            border-color: #5e73a5;
+            background: #22304d;
+            color: #ffffff;
+        }
+
+        .segment-action-btn:disabled {
+            opacity: 0.65;
+            cursor: default;
+        }
         
         .segment-match-list {
             display: flex;
@@ -1194,6 +2040,20 @@ def home():
         
         .result-item.expanded .comment-section {
             display: block;
+        }
+
+        .lm-description {
+            margin-bottom: 0.75rem;
+        }
+
+        .lm-description-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 0.75rem;
+        }
+
+        .lm-comment {
+            border-left-color: #3f6d54;
         }
         
         .comments-list {
@@ -1298,6 +2158,10 @@ def home():
             font-size: 0.85rem;
             padding: 0.5rem;
         }
+
+        .is-hidden {
+            display: none;
+        }
         
         
         /* Image Container and Overlay */
@@ -1362,11 +2226,43 @@ def home():
         .video-box {
             display: none;
             flex-direction: column;
-            gap: 0.8rem;
+            gap: 1rem;
             background: #111;
             border: 1px solid #222;
-            border-radius: 8px;
+            border-radius: 10px;
             padding: 1rem;
+        }
+
+        .monitor-box {
+            display: none;
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 10px;
+            padding: 1rem;
+        }
+
+        .video-analysis-grid {
+            display: grid;
+            grid-template-columns: minmax(300px, 0.95fr) minmax(380px, 1.05fr);
+            gap: 1rem;
+            margin-top: 0.25rem;
+        }
+
+        .video-analysis-form {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .video-analysis-output {
+            background: #0d0d0d;
+            border: 1px solid #1f1f1f;
+            border-radius: 8px;
+            padding: 0.75rem;
+            min-height: 240px;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
         }
 
         .video-row {
@@ -1398,10 +2294,22 @@ def home():
             flex-wrap: wrap;
         }
 
+        .video-prompt-note {
+            color: #aaa;
+            font-size: 0.85rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
         .video-status {
             font-size: 0.9rem;
             color: #ccc;
             min-height: 20px;
+        }
+
+        .video-status.error {
+            color: #ff9080;
         }
 
         .video-output {
@@ -1414,15 +2322,33 @@ def home():
             white-space: pre-wrap;
         }
 
-        .video-frame-grid {
+        .video-output-wrap,
+        .video-frame-block {
             display: flex;
-            flex-wrap: wrap;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .video-block-title {
+            color: #bdbdbd;
+            font-size: 0.82rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+        }
+
+        .video-frame-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
             gap: 0.5rem;
+            max-height: 360px;
+            overflow-y: auto;
+            padding-right: 0.25rem;
         }
 
         .video-frame-grid img {
-            width: 140px;
-            height: auto;
+            width: 100%;
+            height: 92px;
+            object-fit: cover;
             border-radius: 5px;
             border: 1px solid #222;
             background: #111;
@@ -1433,7 +2359,7 @@ def home():
             display: grid;
             grid-template-columns: 1.3fr 1fr;
             gap: 0.75rem;
-            margin-bottom: 0.75rem;
+            margin-bottom: 0.65rem;
         }
 
         @media (max-width: 1180px) {
@@ -1449,18 +2375,21 @@ def home():
             padding: 0.85rem;
             display: flex;
             flex-direction: column;
-            gap: 0.6rem;
+            gap: var(--panel-gap);
         }
 
         .luxriot-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 0.75rem;
+            gap: var(--panel-header-gap);
         }
 
         .luxriot-header h4 {
             font-size: 1rem;
+            margin: 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
         }
 
         .luxriot-status {
@@ -1518,7 +2447,7 @@ def home():
         .luxriot-actions {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
         }
 
@@ -1534,11 +2463,213 @@ def home():
         }
 
         .luxriot-summaries {
-            max-height: 340px;
+            max-height: min(64vh, 720px);
+            min-height: 280px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            padding-right: 0.2rem;
+        }
+
+        .luxriot-summaries-card {
+            margin-bottom: 0.75rem;
+        }
+
+        .luxriot-stream-card .luxriot-stream-manager {
+            margin-top: 0;
+            padding-top: 0;
+            border-top: none;
+        }
+
+        .luxriot-summary-toolbar {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.45rem;
+            width: 100%;
+        }
+
+        .luxriot-summary-filters {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+            width: 100%;
+        }
+
+        .luxriot-summary-actions-row {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+            width: 100%;
+        }
+
+        .luxriot-summary-toolbar .luxriot-mini-input {
+            min-width: 170px;
+        }
+
+        .luxriot-summary-toolbar .luxriot-mini-input.luxriot-mini-time {
+            min-width: 170px;
+        }
+
+        .luxriot-summary-custom-time {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-summary-meta {
+            color: #b0b0b0;
+            font-size: 0.82rem;
+            min-height: 1.1rem;
+        }
+
+        .luxriot-summary-meta.error {
+            color: #ff9a8e;
+        }
+
+        .luxriot-stream-manager {
+            margin-top: 0.2rem;
+            padding-top: 0.55rem;
+            border-top: 1px solid #1f1f1f;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .luxriot-stream-manager-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-stream-list {
+            max-height: 320px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
             gap: 0.5rem;
+            padding-right: 0.2rem;
+        }
+
+        .luxriot-stream-item {
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+            background: #0a0a0a;
+            border: 1px solid #232323;
+            border-radius: 8px;
+            padding: 0.55rem 0.6rem;
+        }
+
+        .luxriot-stream-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 0.55rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-stream-title-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            min-width: 0;
+        }
+
+        .luxriot-stream-kind {
+            font-size: 0.72rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            color: #c8d6cc;
+            background: #162017;
+            border: 1px solid #2d4b32;
+            border-radius: 999px;
+            padding: 0.14rem 0.45rem;
+            white-space: nowrap;
+        }
+
+        .luxriot-stream-kind.analytics {
+            color: #d3cfbf;
+            background: #1d1a12;
+            border-color: #4f4325;
+        }
+
+        .luxriot-stream-title {
+            color: #ececec;
+            font-size: 0.94rem;
+            font-weight: 600;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
+        }
+
+        .luxriot-stream-tags {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-stream-tag {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            border: 1px solid #2f5a3a;
+            background: rgba(36, 70, 44, 0.28);
+            color: #aed7b9;
+            font-size: 0.72rem;
+            padding: 0.1rem 0.4rem;
+            width: fit-content;
+        }
+
+        .luxriot-stream-tag.paused {
+            border-color: #5f5533;
+            background: rgba(84, 71, 32, 0.3);
+            color: #e5d29b;
+        }
+
+        .luxriot-stream-tag.idle {
+            border-color: #474747;
+            background: rgba(82, 82, 82, 0.22);
+            color: #c9c9c9;
+        }
+
+        .luxriot-stream-stats {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-stream-stat {
+            display: inline-flex;
+            align-items: center;
+            background: #121212;
+            border: 1px solid #2a2a2a;
+            border-radius: 999px;
+            padding: 0.14rem 0.48rem;
+            color: #bdbdbd;
+            font-size: 0.76rem;
+            line-height: 1.2;
+        }
+
+        .luxriot-stream-controls {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 0.35rem;
+            flex-wrap: wrap;
+        }
+
+        .luxriot-stream-controls .feature-btn {
+            padding: 0.2rem 0.55rem;
+            font-size: 0.75rem;
+            min-height: 30px;
         }
 
         .luxriot-summary {
@@ -1548,10 +2679,90 @@ def home():
             padding: 0.65rem;
         }
 
+        .luxriot-summary-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.5rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .luxriot-summary-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .luxriot-summary-rollup-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.14rem 0.45rem;
+            border: 1px solid #30514a;
+            border-radius: 999px;
+            background: rgba(41, 94, 80, 0.18);
+            color: #9acdbf;
+            font-size: 0.72rem;
+        }
+
+        .luxriot-summary-channel-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.14rem 0.45rem;
+            border: 1px solid #3a4a61;
+            border-radius: 999px;
+            background: rgba(58, 88, 126, 0.16);
+            color: #b4cdee;
+            font-size: 0.72rem;
+        }
+
         .luxriot-summary .timestamp {
             color: #aaa;
             font-size: 0.82rem;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0;
+        }
+
+        .luxriot-bookmark-btn,
+        .luxriot-summary-action-btn {
+            font-size: 0.72rem;
+            padding: 0.22rem 0.56rem;
+            border-radius: 999px;
+        }
+
+        .summary-body {
+            color: #d7d7d7;
+            line-height: 1.45;
+            font-size: 0.96rem;
+            white-space: normal;
+        }
+
+        .summary-body strong {
+            color: #f0f0f0;
+            font-weight: 600;
+        }
+
+        .summary-body code {
+            color: #d4f1da;
+            background: rgba(150, 240, 170, 0.1);
+            border: 1px solid rgba(150, 240, 170, 0.22);
+            padding: 0.05rem 0.24rem;
+            border-radius: 4px;
+        }
+
+        .luxriot-summaries.compact .summary-body {
+            display: -webkit-box;
+            -webkit-line-clamp: 4;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            line-height: 1.35;
+            font-size: 0.9rem;
+        }
+
+        .luxriot-summary.is-collapsed .summary-body {
+            display: none;
         }
 
         .luxriot-pill {
@@ -1578,7 +2789,7 @@ def home():
             padding: 0.85rem;
             display: flex;
             flex-direction: column;
-            gap: 0.6rem;
+            gap: var(--panel-gap);
             margin-top: 0.5rem;
         }
 
@@ -1586,6 +2797,89 @@ def home():
             display: flex;
             gap: 0.5rem;
             flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .probe-row.spread {
+            justify-content: space-between;
+        }
+
+        .probe-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: var(--panel-header-gap);
+            flex-wrap: wrap;
+            margin-bottom: 0.2rem;
+        }
+
+        .probe-header.split {
+            align-items: center;
+        }
+
+        .probe-header h4 {
+            margin: 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
+        }
+
+        .probe-header-actions {
+            display: flex;
+            gap: var(--panel-header-gap);
+            flex-wrap: wrap;
+        }
+
+        .probe-panel {
+            background: #0f0f0f;
+            border: 1px solid #1f1f1f;
+            border-radius: 10px;
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: var(--panel-gap);
+        }
+
+        .probe-select-grow {
+            flex: 1;
+        }
+
+        .probe-severity-wrap {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
+        .small-label-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            color: #bdbdbd;
+            font-size: 0.88rem;
+        }
+
+        .probe-short-input {
+            max-width: 84px;
+        }
+
+        .inline-check {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .probe-pairs-spacer {
+            text-align: center;
+        }
+
+        .probe-remove-btn {
+            width: 54px;
+        }
+
+        .probe-mini-main {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
         }
 
         .probe-row label {
@@ -1612,7 +2906,7 @@ def home():
 
         .probe-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
             gap: 0.75rem;
         }
 
@@ -1649,9 +2943,10 @@ def home():
         /* Monitoring mock-inspired layout */
         .monitor-grid {
             display: grid;
-            grid-template-columns: 35% 65%;
+            grid-template-columns: 1fr;
             gap: 1rem;
             margin-bottom: 1rem;
+            align-items: start;
         }
 
         .monitor-panel {
@@ -1659,10 +2954,87 @@ def home():
             border: 1px solid #222;
             border-radius: 10px;
             padding: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: var(--panel-gap);
         }
 
         .monitor-panel h4 {
-            margin: 0 0 0.6rem 0;
+            margin: 0 0 0.2rem 0;
+            line-height: 1.25;
+            letter-spacing: 0.01em;
+        }
+
+        .monitor-detections-panel .probe-nav {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .probe-nav-btn {
+            background: #1a1a1a;
+            border: 1px solid #2d2d2d;
+            color: #cfcfcf;
+            border-radius: 6px;
+            padding: 0.4rem 0.55rem;
+            min-width: 36px;
+        }
+
+        .probe-nav-btn:hover {
+            background: #232323;
+            border-color: #3a3a3a;
+        }
+
+        .probe-nav-btn:disabled {
+            opacity: 0.4;
+            cursor: default;
+        }
+
+        .monitor-detections-panel .probe-results {
+            grid-template-columns: repeat(5, minmax(118px, 1fr));
+            min-height: 190px;
+            max-height: none;
+            overflow: hidden;
+            padding-right: 0;
+        }
+
+        .monitor-detections-panel .probe-results .loading {
+            grid-column: 1 / -1;
+            padding: 1.4rem 0.3rem;
+        }
+
+        .monitor-detections-panel .probe-result {
+            padding: 0.42rem;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.28rem;
+            border-color: #262626;
+        }
+
+        .monitor-detections-panel .probe-result img {
+            margin-bottom: 0;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            object-fit: cover;
+            border-radius: 5px;
+            border: 1px solid #202020;
+        }
+
+        .probe-result-time {
+            font-size: 0.74rem;
+            color: #d8d8d8;
+            line-height: 1.25;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .probe-result-score {
+            font-size: 0.7rem;
+            color: #aaaaaa;
+            line-height: 1.3;
         }
 
         .monitor-stream-preview {
@@ -1712,7 +3084,7 @@ def home():
         .monitor-actions-row {
             display: flex;
             justify-content: space-between;
-            gap: 0.5rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
             align-items: center;
         }
@@ -1747,17 +3119,15 @@ def home():
             background: #0f0f0f;
             border: 1px solid #1f1f1f;
             border-radius: 10px;
-            padding: 0.7rem;
-            display: grid;
-            grid-template-columns: 1fr 120px;
-            gap: 0.6rem;
-            align-items: stretch;
-            min-height: 120px;
+            padding: 0;
+            display: block;
+            overflow: hidden;
+            min-height: 220px;
         }
 
         .probe-mini-card.active {
-            border-color: #3a6346;
-            box-shadow: 0 0 0 1px rgba(58, 99, 70, 0.35);
+            border-color: #4a7a58;
+            box-shadow: 0 0 0 1px rgba(74, 122, 88, 0.4), 0 12px 24px rgba(0, 0, 0, 0.35);
         }
 
         .probe-mini-head {
@@ -1768,8 +3138,13 @@ def home():
         }
 
         .probe-mini-name {
-            font-weight: 600;
-            color: #e5e5e5;
+            font-weight: 700;
+            color: #f5f5f5;
+            font-size: 0.98rem;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .probe-status-pill {
@@ -1787,24 +3162,67 @@ def home():
         .pill-disabled { background: rgba(110, 30, 30, 0.18); color: #e8a4a4; border-color: #8b0000; }
 
         .probe-mini-meta {
-            color: #b4b4b4;
-            font-size: 0.9rem;
+            color: #d4d4d4;
+            font-size: 0.82rem;
             line-height: 1.35;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
         }
 
         .probe-mini-actions {
             display: flex;
-            gap: 0.4rem;
-            flex-wrap: wrap;
+            gap: 0.35rem;
+            flex-wrap: nowrap;
+            justify-content: flex-end;
+            align-items: center;
+        }
+
+        .probe-action-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            background: rgba(8, 8, 8, 0.58);
+            color: #f0f0f0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            cursor: pointer;
+            backdrop-filter: blur(3px);
+            transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+        }
+
+        .probe-action-btn svg {
+            width: 17px;
+            height: 17px;
+            fill: currentColor;
+        }
+
+        .probe-action-btn:hover {
+            transform: translateY(-1px);
+            background: rgba(22, 22, 22, 0.8);
+            border-color: rgba(255, 255, 255, 0.55);
+        }
+
+        .probe-action-btn.delete {
+            border-color: rgba(255, 120, 120, 0.6);
+            color: #ffd1d1;
+            background: rgba(80, 18, 18, 0.45);
+        }
+
+        .probe-action-btn.delete:hover {
+            border-color: rgba(255, 150, 150, 0.85);
+            background: rgba(98, 26, 26, 0.65);
         }
 
         .probe-mini-thumb {
             position: relative;
-            border: 1px solid #222;
-            border-radius: 8px;
-            background: #0a0a0a;
+            border: 1px solid #121212;
+            border-radius: 10px;
+            background: #040404;
             overflow: hidden;
-            min-height: 80px;
+            min-height: 220px;
+            aspect-ratio: 16/10;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -1813,8 +3231,63 @@ def home():
         .probe-mini-thumb img {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: contain;
             display: block;
+        }
+
+        .probe-mini-thumb.is-empty::before {
+            content: "No preview";
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #a4a4a4;
+            font-size: 0.86rem;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            background: repeating-linear-gradient(135deg, #0d0d0d 0 12px, #131313 12px 24px);
+        }
+
+        .probe-mini-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 0.55rem;
+            background: linear-gradient(180deg, rgba(0, 0, 0, 0.35) 0%, rgba(0, 0, 0, 0.04) 38%, rgba(0, 0, 0, 0.78) 100%);
+            pointer-events: none;
+        }
+
+        .probe-mini-top,
+        .probe-mini-bottom {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+        }
+
+        .probe-mini-top {
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+
+        .probe-mini-bottom {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.18rem;
+        }
+
+        .probe-mini-overlay .probe-status-pill,
+        .probe-mini-overlay .probe-mini-actions {
+            pointer-events: auto;
+        }
+
+        .probe-mini-score {
+            color: #f0f0f0;
+            font-size: 0.79rem;
+            letter-spacing: 0.01em;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
         }
 
         .probe-thumb-pill {
@@ -1825,17 +3298,36 @@ def home():
 
         .new-probe-card {
             border: 1px dashed #2f5a3a;
-            background: #0b0b0b;
+            background: radial-gradient(circle at 20% 20%, #121b14, #070707);
             align-items: center;
             justify-content: center;
             text-align: center;
-            grid-template-columns: 1fr;
-            min-height: 120px;
+            min-height: 220px;
+            display: flex;
         }
 
-        .new-probe-card button {
-            padding: 0.75rem 1.25rem;
+        .probe-new-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            padding: 0.72rem 1.15rem;
+            border-radius: 999px;
+            border: 1px solid #3d6f4b;
+            background: rgba(23, 41, 28, 0.65);
+            color: #d7f0dc;
             font-weight: 600;
+            cursor: pointer;
+        }
+
+        .probe-new-btn:hover {
+            background: rgba(34, 57, 40, 0.9);
+            border-color: #4f8a5f;
+        }
+
+        .probe-new-btn svg {
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
         }
 
         .probe-pairs {
@@ -1892,6 +3384,14 @@ def home():
             align-items: center;
         }
 
+        .image-probe-panel.no-image {
+            grid-template-columns: 1fr;
+        }
+
+        .image-probe-panel.no-image .probe-preview.compact {
+            display: none;
+        }
+
         .image-probe-left {
             display: flex;
             flex-direction: column;
@@ -1902,6 +3402,10 @@ def home():
             display: flex;
             align-items: center;
             gap: 0.5rem;
+        }
+
+        .image-probe-row .file-upload {
+            width: 100%;
         }
 
         .image-probe-pos {
@@ -1951,12 +3455,38 @@ def home():
             padding: 0.5rem;
         }
 
+        .probe-preview.compact {
+            max-width: 220px;
+            min-height: 140px;
+            justify-self: end;
+        }
+
         .monitor-actions-bar {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 0.75rem;
+            gap: var(--panel-header-gap);
             flex-wrap: wrap;
+        }
+
+        .monitor-actions-main {
+            display: flex;
+            gap: var(--panel-header-gap);
+            flex-wrap: wrap;
+        }
+
+        .severity-row {
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+
+        .settings-short-input {
+            width: 110px;
+        }
+
+        .input-text {
+            min-width: 200px;
         }
         
         
@@ -1980,9 +3510,117 @@ def home():
         /* Expanded image display */
         .result-item.expanded .thumbnail {
             width: 100%;
-            min-width: 900px;
+            min-width: 0;
+            max-height: 70vh;
             height: auto;
             object-fit: contain;
+            background: #080808;
+        }
+
+        @media (max-width: 980px) {
+            .container {
+                padding: 1rem;
+            }
+
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.75rem;
+            }
+
+            .folder-select {
+                flex-direction: column;
+            }
+
+            .control-panel {
+                position: static;
+            }
+
+            .search-controls {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.75rem;
+            }
+
+            .archive-workspace {
+                grid-template-columns: 1fr;
+            }
+
+            .archive-search-shell {
+                position: static;
+            }
+
+            .archive-results-panel {
+                padding: 0.65rem;
+            }
+
+            .archive-filter-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .control-group {
+                width: 100%;
+                flex-wrap: wrap;
+                justify-content: flex-start;
+            }
+
+            .search-box {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .image-search-inputs {
+                margin-right: 0;
+            }
+
+            .file-upload {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 0.45rem;
+            }
+
+            .file-upload-btn {
+                text-align: center;
+            }
+
+            .image-query-actions .file-upload {
+                flex-direction: row;
+                align-items: center;
+            }
+
+            .probe-editor-layout {
+                grid-template-columns: 1fr;
+            }
+
+            .video-analysis-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .video-analysis-output {
+                min-height: 0;
+            }
+
+            .monitor-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .monitor-detections-panel .probe-results {
+                grid-template-columns: repeat(5, minmax(0, 1fr));
+                min-height: 0;
+            }
+
+            .image-probe-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .probe-preview.compact {
+                max-width: none;
+                justify-self: stretch;
+            }
+
+            .result-item.expanded .thumbnail {
+                max-height: 55vh;
+            }
         }
         
     </style>
@@ -1997,74 +3635,152 @@ def home():
                     <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
                 </div>
             </div>
-            <div class="settings-icon" id="settingsBtn">
-                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                    <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
-                </svg>
+            <div class="header-actions">
+                <div class="settings-icon" id="authTokenBtn" title="Set admin token">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="M240-160q-33 0-56.5-23.5T160-240v-480q0-33 23.5-56.5T240-800h360q33 0 56.5 23.5T680-720v160h40q33 0 56.5 23.5T800-480v240q0 33-23.5 56.5T720-160H240Zm0-80h480v-240H240v240Zm120-320h240v-160H360v160Zm120 200q17 0 28.5-11.5T520-400q0-17-11.5-28.5T480-440q-17 0-28.5 11.5T440-400q0 17 11.5 28.5T480-360Z"/>
+                    </svg>
+                </div>
+                <div class="settings-icon" id="settingsBtn">
+                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                        <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
+                    </svg>
+                </div>
             </div>
         </div>
         
         <div class="control-panel">
             <div class="folder-select">
                 <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                <button id="indexBtn">Index Folder</button>
+                <button id="indexBtn" class="feature-btn primary btn-md">Index Folder</button>
             </div>
             <div class="status" id="indexStatus"></div>
         </div>
         
             <div class="search-panel">
                 <div class="search-mode-tabs">
-                    <button id="textModeBtn" class="mode-tab active">Text Search</button>
-                    <button id="imageModeBtn" class="mode-tab">Image Search</button>
+                    <button id="archiveModeBtn" class="mode-tab active">Archive Research</button>
                     <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
                     <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
                 </div>
-            <div class="search-controls">
-                <div class="control-group">
-                    <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
-                </div>
-                <div class="control-group">
-                    <div class="sort-control">
-                        <label for="sortBy">Sort by:</label>
-                        <select id="sortBy">
-                            <option value="similarity" selected>Similarity</option>
-                            <option value="time">Time (Newest First)</option>
-                        </select>
+            <div id="archiveBox" class="archive-box">
+                <div class="search-controls">
+                    <div class="control-group">
+                        <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
                     </div>
-                    <div class="limit-control">
-                        <label for="resultLimit">Results:</label>
-                        <select id="resultLimit">
-                            {result_options_html}
-                        </select>
-                    </div>
-                    <div class="segment-controls">
-                        <label for="segmentThresholdSlider">Region threshold:</label>
-                        <div class="segment-threshold-control" id="segmentThresholdControl">
-                            <input type="range" id="segmentThresholdSlider" min="40" max="99" value="70" step="1">
-                            <span class="segment-threshold-value" id="segmentThresholdValue">70%</span>
+                    <div class="control-group">
+                        <div class="sort-control">
+                            <label for="sortBy">Sort by:</label>
+                            <select id="sortBy">
+                                <option value="similarity" selected>Similarity</option>
+                                <option value="time">Time (Newest First)</option>
+                            </select>
+                        </div>
+                        <div class="limit-control">
+                            <label for="resultLimit">Results:</label>
+                            <select id="resultLimit">
+                                {result_options_html}
+                            </select>
+                        </div>
+                        <div class="scope-control">
+                            <label for="searchScope">Scope:</label>
+                            <select id="searchScope">
+                                <option value="folder" selected>Indexed Folder</option>
+                                <option value="detections">Detections Archive</option>
+                            </select>
+                        </div>
+                        <div class="segment-controls">
+                            <label for="segmentThresholdSlider">Region threshold:</label>
+                            <div class="segment-threshold-control" id="segmentThresholdControl">
+                                <input type="range" id="segmentThresholdSlider" min="40" max="99" value="{segment_threshold_percent}" step="1">
+                                <span class="segment-threshold-value" id="segmentThresholdValue">{segment_threshold_percent}%</span>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </div>
-            <div id="textSearchBox" class="search-box">
-                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                <button id="searchBtn">Search</button>
-            </div>
-            <div id="imageSearchBox" class="search-box" style="display: none;">
-                <div class="image-search-inputs">
-                    <div class="input-group">
-                        <label for="imageUpload" class="input-label">Upload File:</label>
-                        <input type="file" id="imageUpload" accept="image/*" />
+                <div class="archive-workspace">
+                    <div id="archiveSearchBox" class="archive-search-shell">
+                        <div class="archive-section">
+                            <div class="archive-section-title">Detections Archive</div>
+                            <div class="section-help">Choose stream/probe/time filters, then run text or image search in current scope.</div>
+                            <div class="archive-filter-grid">
+                                <div class="input-group">
+                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
+                                    <select id="archiveChannelFilter">
+                                        <option value="">All streams</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveProbeFilter" class="input-label">Probe:</label>
+                                    <select id="archiveProbeFilter">
+                                        <option value="">All probes</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveTimeFilter" class="input-label">Time range:</label>
+                                    <select id="archiveTimeFilter">
+                                        <option value="1">Last 1h</option>
+                                        <option value="6">Last 6h</option>
+                                        <option value="24" selected>Last 24h</option>
+                                        <option value="72">Last 3d</option>
+                                        <option value="168">Last 7d</option>
+                                        <option value="0">All time</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
+                                    <select id="archiveDetectionsLimit">
+                                        <option value="12">12</option>
+                                        <option value="24" selected>24</option>
+                                        <option value="36">36</option>
+                                        <option value="48">48</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="archive-detections-actions">
+                                <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
+                                <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
+                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
+                                <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
+                            </div>
+                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
+                        </div>
+                        <div class="archive-section">
+                            <div class="archive-section-title">Text Query</div>
+                            <div class="section-help">Use natural language; scope and filters apply automatically.</div>
+                            <div id="textSearchBox" class="search-box">
+                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
+                                <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
+                            </div>
+                        </div>
+                        <div class="archive-section">
+                            <div class="archive-section-title">Image Query</div>
+                            <div class="section-help">Select an image and run visual similarity search.</div>
+                            <div id="imageSearchBox" class="search-box image-search-box">
+                                <div id="imageQueryPanel" class="image-query-panel">
+                                    <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
+                                        <img id="queryImageThumb" src="" alt="Selected query preview" />
+                                        <div class="archive-query-preview-overlay">No image selected</div>
+                                    </div>
+                                    <div class="image-query-actions">
+                                        <div class="file-upload inline">
+                                            <input type="file" id="imageUpload" class="file-upload-input" accept="image/*" />
+                                            <label for="imageUpload" class="feature-btn file-upload-btn btn-md">Choose Image</label>
+                                            <span id="imageUploadName" class="file-upload-name is-hidden">No file selected</span>
+                                        </div>
+                                        <button id="imageSearchBtn" class="feature-btn primary image-search-btn btn-md">Search by Image</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
-                    <div class="input-separator">OR</div>
-                    <div class="input-group">
-                        <label for="imagePath" class="input-label">Enter Image Path:</label>
-                        <input type="text" id="imagePath" placeholder="C:\\path\\to\\image.jpg" />
+                    <div class="archive-results-panel">
+                        <div class="archive-results-head">Search Results</div>
+                        <div id="results" class="results-grid"></div>
                     </div>
                 </div>
-                <button id="imageSearchBtn">Search by Image</button>
             </div>
-            <div id="videoBox" class="video-box" style="display: none;">
+            <div id="videoBox" class="video-box">
         <div class="luxriot-grid">
             <div class="luxriot-card">
                 <div class="luxriot-header">
@@ -2101,23 +3817,67 @@ def home():
                     <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
                 </div>
             </div>
-                    <div class="luxriot-card">
-                        <div class="luxriot-header">
-                            <h4>Live Summaries</h4>
-                    <div class="luxriot-actions">
-                        <button id="luxriotRefreshSummaries" class="feature-btn">Refresh</button>
+                    <div class="luxriot-card luxriot-stream-card">
+                <div class="luxriot-stream-manager">
+                    <div class="luxriot-stream-manager-head">
+                        <div class="video-block-title">Channel Runtime</div>
+                        <div class="luxriot-actions">
+                            <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
+                            <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
+                            <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
+                        </div>
                     </div>
-                </div>
-                <div id="luxriotSummaries" class="luxriot-summaries">
-                    <div class="loading">No summaries yet.</div>
+                    <div id="luxriotStreams" class="luxriot-stream-list">
+                        <div class="loading">No active channels.</div>
+                    </div>
                 </div>
             </div>
         </div>
-        <div class="video-row">
-            <div class="input-group">
-                <label for="videoPath" class="input-label">Video Path:</label>
-                <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+        <div class="luxriot-card luxriot-summaries-card">
+            <div class="luxriot-header">
+                <h4>Live/Summaries</h4>
+                <div class="luxriot-summary-toolbar">
+                    <div class="luxriot-summary-filters">
+                        <label for="luxriotSummaryChannelSelect">Channel:</label>
+                        <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
+                        <label for="luxriotSummaryRangeSelect">History:</label>
+                        <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
+                            <option value="6h" selected>last 6 hours</option>
+                            <option value="24h">last day</option>
+                            <option value="3d">last 3 days</option>
+                            <option value="7d">last week</option>
+                            <option value="30d">last month</option>
+                            <option value="all">all history</option>
+                        </select>
+                        <label for="luxriotSummaryLevelSelect">Depth:</label>
+                        <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
+                            <option value="L0" selected>Live</option>
+                            <option value="L1">Minutes</option>
+                            <option value="L2">Hours</option>
+                            <option value="L3">Days</option>
+                        </select>
+                    </div>
+                    <div class="luxriot-summary-actions-row">
+                        <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
+                        <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
+                        <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
+                        <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
+                        <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
+                    </div>
+                </div>
             </div>
+            <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
+            <div id="luxriotSummaries" class="luxriot-summaries">
+                <div class="loading">No summaries yet.</div>
+            </div>
+        </div>
+        <div class="video-analysis-grid">
+            <div class="video-analysis-form">
+                <div class="video-row">
+                    <div class="input-group">
+                        <label for="videoPath" class="input-label">Video Path:</label>
+                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
+                    </div>
                     <div class="input-group">
                         <label class="input-label" for="videoModel">Model ID:</label>
                         <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
@@ -2127,9 +3887,7 @@ def home():
                     <div class="input-group">
                         <label class="input-label" for="videoFrameCount">Frames to sample:</label>
                         <select id="videoFrameCount">
-                            <option value="16">16</option>
-                            <option value="32">32</option>
-                            <option value="64">64</option>
+                            {video_frame_options_html}
                         </select>
                     </div>
                     <div class="input-group">
@@ -2140,27 +3898,37 @@ def home():
                 <div class="input-group">
                     <label class="input-label" for="videoPrompt">Prompt:</label>
                     <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
-                    <label style="color: #aaa; font-size: 0.85rem;">
+                    <label class="video-prompt-note">
                         <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
                     </label>
                 </div>
                 <div class="video-controls">
                     <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
-                    <button id="saveSummaryBtn" class="feature-btn" style="display:none;">Save summary as comment</button>
+                    <button id="saveSummaryBtn" class="feature-btn is-hidden">Save summary as comment</button>
                     <div id="videoStatus" class="video-status"></div>
                 </div>
-                <div id="videoOutput" class="video-output" style="display: none;"></div>
-                <div id="videoFrames" class="video-frame-grid"></div>
             </div>
-                        <div id="monitorBox" class="video-box" style="display: none;">
+            <div class="video-analysis-output">
+                <div class="video-output-wrap">
+                    <div class="video-block-title">Summary</div>
+                    <div id="videoOutput" class="video-output is-hidden"></div>
+                </div>
+                <div class="video-frame-block">
+                    <div class="video-block-title">Sampled Frames</div>
+                    <div id="videoFrames" class="video-frame-grid"></div>
+                </div>
+            </div>
+        </div>
+            </div>
+                        <div id="monitorBox" class="monitor-box">
                 <div class="probe-shell">
                     <div class="probe-panel">
                         <div class="probe-header">
                             <div>
-                                <h4 style="margin:0;">Saved probes</h4>
+                                <h4>Saved probes</h4>
                                 <div class="probe-meta">Click to expand, run, or delete.</div>
                             </div>
-                            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+                            <div class="probe-header-actions">
                                 <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
                                 <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
                             </div>
@@ -2175,111 +3943,133 @@ def home():
                         <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
                     </div>
                     <div class="monitor-grid">
-                        <div class="monitor-panel">
-                            <div class="probe-header" style="justify-content: space-between;">
-                                <h4>Live stream</h4>
-                                <span id="probeStatus" class="luxriot-status">Idle</span>
+                        <div class="monitor-panel monitor-detections-panel">
+                            <div class="probe-header split">
+                                <h4>Latest Detections</h4>
+                                <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
                             </div>
-                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
-                                <label>Channel:</label>
-                                <select id="probeChannelSelect" class="luxriot-mini-input" style="flex:1;"></select>
-                            </div>
-                            <div class="monitor-stream-preview">
-                                <img id="probePreviewImg" src="" alt="" />
-                                <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
-                            </div>
-                            <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
-                            <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
-                            <div class="probe-meta" id="probeStreamState"></div>
-                            <div class="probe-row" style="align-items:center; gap:0.4rem;">
-                                <label>FPS:</label>
-                                <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
-                                <label>Buffer (sec):</label>
-                                <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
-                            </div>
-                            <div class="probe-row spread">
-                                <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
-                                <div style="margin-left:auto; display:flex; align-items:center; gap:0.35rem;">
-                                    <label>Severity:</label>
-                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
-                                        <option value="info">info</option>
-                                        <option value="low">low</option>
-                                        <option value="normal">normal</option>
-                                        <option value="high">high</option>
-                                        <option value="critical" selected>critical</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="monitor-btn-row">
-                                <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
-                                <button id="probeStopCapture" class="feature-btn">Pause</button>
-                                <button id="probeStopAll" class="feature-btn">Stop</button>
-                            </div>
-                        </div>
-                        <div class="monitor-panel">
-                            <div class="monitor-probe-header">
-                                <label>Probe name:</label>
-                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
-                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
-                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
-                                <label style="display:flex; align-items:center; gap:0.3rem;">
-                                    <input type="checkbox" id="probeEnableToggle" checked>
-                                    Enable probe
-                                </label>
-                            </div>
-                            <div class="probe-pairs" id="probePairs">
-                                <div class="probe-pairs-header">
-                                    <div></div>
-                                    <div>Positive Examples:</div>
-                                    <div>Negative Examples:</div>
-                                    <div style="text-align:center;">&nbsp;</div>
-                                </div>
-                            </div>
-                            <div class="probe-add-row">
-                                <span class="probe-pair-idx">+</span>
-                                <button id="probeAddPair" class="feature-btn">Add pair</button>
-                            </div>
-                            <div class="image-probe-panel">
-                                <div class="image-probe-left">
-                                    <div class="image-probe-row">
-                                        <input type="file" id="probeImageFile" class="settings-input" accept="image/*" />
-                                    </div>
-                                    <div class="image-probe-pos">
-                                        <label>Image Pos:</label>
-                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
-                                    </div>
-                                    <div class="image-probe-actions">
-                                        <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
-                                        <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
-                                    </div>
-                                </div>
-                                <div class="probe-preview" style="max-width:220px; min-height:140px; justify-self:end;">
-                                    <img id="probeImageThumb" src="" alt="" />
-                                    <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
-                                </div>
+                            <div class="probe-nav">
+                                <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+                                <div id="probeResults" class="probe-results"></div>
+                                <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
                             </div>
                         </div>
                     </div>
                     <div class="monitor-actions-bar">
-                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                        <div class="monitor-actions-main">
+                            <button id="probeEditBtn" class="feature-btn">Probe settings</button>
                             <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                            <button id="probeSaveBtn" class="feature-btn">Save Probe</button>
                         </div>
                         <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
                     </div>
-                    <div class="probe-panel">
-                        <div class="probe-header" style="justify-content: space-between; align-items:center;">
-                            <h4 style="margin:0;">Latest Detections</h4>
-                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+                </div>
+            </div>
+    </div>
+
+    <div id="probeEditorModal" class="settings-modal">
+        <div class="settings-modal-content probe-editor-modal-content">
+            <div class="settings-header">
+                <h2>Probe Settings</h2>
+                <button class="close-btn" id="closeProbeEditor">&times;</button>
+            </div>
+            <div class="probe-editor-modal-body">
+                <div class="probe-editor-layout">
+                    <div class="monitor-panel">
+                        <div class="probe-header split">
+                            <h4>Live stream</h4>
+                            <span id="probeStatus" class="luxriot-status">Idle</span>
                         </div>
-                        <div class="probe-nav">
-                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
-                            <div id="probeResults" class="probe-results"></div>
-                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+                        <div class="probe-row">
+                            <label>Channel:</label>
+                            <select id="probeChannelSelect" class="luxriot-mini-input probe-select-grow"></select>
+                        </div>
+                        <div class="monitor-stream-preview">
+                            <img id="probePreviewImg" src="" alt="" />
+                            <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                        </div>
+                        <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                        <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
+                        <div class="probe-meta" id="probeStreamState"></div>
+                        <div class="probe-row">
+                            <label>FPS:</label>
+                            <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
+                            <label>Buffer (sec):</label>
+                            <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
+                        </div>
+                        <div class="monitor-btn-row">
+                            <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
+                            <button id="probeStopCapture" class="feature-btn">Pause</button>
+                            <button id="probeStopAll" class="feature-btn">Stop</button>
+                        </div>
+                    </div>
+                    <div class="probe-editor-settings">
+                        <div class="monitor-probe-header">
+                            <label>Probe name:</label>
+                            <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+                            <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
+                            <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+                            <label class="inline-check">
+                                <input type="checkbox" id="probeEnableToggle" checked>
+                                Enable probe
+                            </label>
+                        </div>
+                        <div class="probe-row spread">
+                            <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
+                            <div class="probe-severity-wrap">
+                                <label>Severity:</label>
+                                <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                                    <option value="info">info</option>
+                                    <option value="low">low</option>
+                                    <option value="normal">normal</option>
+                                    <option value="high">high</option>
+                                    <option value="critical" selected>critical</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="probe-pairs" id="probePairs">
+                            <div class="probe-pairs-header">
+                                <div></div>
+                                <div>Positive Examples:</div>
+                                <div>Negative Examples:</div>
+                                <div class="probe-pairs-spacer">&nbsp;</div>
+                            </div>
+                        </div>
+                        <div class="probe-add-row">
+                            <span class="probe-pair-idx">+</span>
+                            <button id="probeAddPair" class="feature-btn">Add pair</button>
+                        </div>
+                        <div class="image-probe-panel no-image">
+                            <div class="image-probe-left">
+                                <div class="section-help">Optional: provide a reference image for CLIP-based probe matching.</div>
+                                <div class="image-probe-row">
+                                    <div class="file-upload inline">
+                                        <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
+                                        <label for="probeImageFile" class="feature-btn file-upload-btn btn-md">Choose Image</label>
+                                        <span id="probeImageFileName" class="file-upload-name">No file selected</span>
+                                    </div>
+                                </div>
+                                <div class="image-probe-pos">
+                                    <label>Image Pos:</label>
+                                    <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                </div>
+                                <div class="image-probe-actions">
+                                    <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
+                                    <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
+                                </div>
+                            </div>
+                            <div class="probe-preview compact">
+                                <img id="probeImageThumb" src="" alt="" />
+                                <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
+                            </div>
                         </div>
                     </div>
                 </div>
-        <div id="results" class="results-grid"></div>
+                <div class="settings-actions probe-editor-modal-actions">
+                    <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
+                    <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
+                </div>
+            </div>
+        </div>
     </div>
     
     <!-- Settings Modal -->
@@ -2359,6 +4149,8 @@ def home():
                         <option value="ViT-B/32">ViT-B/32</option>
                         <option value="ViT-B/16">ViT-B/16</option>
                         <option value="ViT-L/14">ViT-L/14</option>
+                        <option value="google/siglip2-base-patch16-224">SigLIP2 Base (patch16-224)</option>
+                        <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
                     </select>
                 </div>
                 <div class="settings-row">
@@ -2408,12 +4200,12 @@ def home():
                 </div>
                 <div class="settings-row">
                     <label class="settings-label">Severity Mapping:</label>
-                    <div style="display:flex; gap:0.4rem; flex-wrap: wrap;">
-                        <input type="text" id="luxriotSevInfo" class="settings-input" style="width:110px;" placeholder="info">
-                        <input type="text" id="luxriotSevLow" class="settings-input" style="width:110px;" placeholder="low">
-                        <input type="text" id="luxriotSevNormal" class="settings-input" style="width:110px;" placeholder="normal">
-                        <input type="text" id="luxriotSevHigh" class="settings-input" style="width:110px;" placeholder="high">
-                        <input type="text" id="luxriotSevCritical" class="settings-input" style="width:110px;" placeholder="critical">
+                    <div class="severity-row">
+                        <input type="text" id="luxriotSevInfo" class="settings-input settings-short-input" placeholder="info">
+                        <input type="text" id="luxriotSevLow" class="settings-input settings-short-input" placeholder="low">
+                        <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
+                        <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
+                        <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
                     </div>
                 </div>
             </div>
@@ -2450,11 +4242,30 @@ def home():
                 </div>
                 <div class="settings-row">
                     <label class="settings-label">Segment Embeddings:</label>
-                    <input type="checkbox" id="segmentsEnabled" class="settings-checkbox">
+                    <input type="checkbox" id="segmentsEnabled" class="settings-checkbox" {segments_enabled_checked}>
                 </div>
                 <div class="settings-row">
                     <label class="settings-label">Min Segment Patches:</label>
-                    <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3">
+                    <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3" value="{segment_min_patches_default}">
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Environment Variables</h3>
+                <div class="settings-row align-start">
+                    <label class="settings-label">`EVOSSEARCH_*` values:</label>
+                    <textarea id="envEditor" class="settings-input env-editor" spellcheck="false" placeholder="EVOSSEARCH_KEY=value"></textarea>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Env actions:</label>
+                    <div class="env-editor-actions">
+                        <button class="settings-btn" id="reloadEnvBtn">Reload Env</button>
+                        <button class="settings-btn primary" id="saveEnvBtn">Save Env</button>
+                    </div>
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Runtime:</label>
+                    <div class="settings-note">Env changes are saved to `.env`. Restart server to apply all values.</div>
                 </div>
             </div>
             
@@ -2474,13 +4285,14 @@ def home():
         const searchInput = document.getElementById('searchQuery');
         const searchBtn = document.getElementById('searchBtn');
         const imageUpload = document.getElementById('imageUpload');
-        const imagePath = document.getElementById('imagePath');
+        const imageUploadName = document.getElementById('imageUploadName');
+        const imageQueryPanel = document.getElementById('imageQueryPanel');
+        const queryImagePreview = document.getElementById('queryImagePreview');
+        const queryImageThumb = document.getElementById('queryImageThumb');
         const imageSearchBtn = document.getElementById('imageSearchBtn');
-        const textModeBtn = document.getElementById('textModeBtn');
-        const imageModeBtn = document.getElementById('imageModeBtn');
+        const archiveModeBtn = document.getElementById('archiveModeBtn');
         const videoModeBtn = document.getElementById('videoModeBtn');
-        const textSearchBox = document.getElementById('textSearchBox');
-        const imageSearchBox = document.getElementById('imageSearchBox');
+        const archiveBox = document.getElementById('archiveBox');
         const videoBox = document.getElementById('videoBox');
         const videoPathInput = document.getElementById('videoPath');
         const videoModelInput = document.getElementById('videoModel');
@@ -2506,7 +4318,26 @@ def home():
         const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
         const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
+        const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
+        const luxriotSummaryRunSelect = document.getElementById('luxriotSummaryRunSelect');
+        const luxriotSummaryRangeSelect = document.getElementById('luxriotSummaryRangeSelect');
+        const luxriotSummaryLevelSelect = document.getElementById('luxriotSummaryLevelSelect');
+        const luxriotSummaryCustomTime = document.getElementById('luxriotSummaryCustomTime');
+        const luxriotSummaryFromInput = document.getElementById('luxriotSummaryFromInput');
+        const luxriotSummaryToInput = document.getElementById('luxriotSummaryToInput');
+        const luxriotSummaryApplyFiltersBtn = document.getElementById('luxriotSummaryApplyFiltersBtn');
+        const luxriotSummaryBackBtn = document.getElementById('luxriotSummaryBackBtn');
+        const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
+        const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
+        const luxriotSummaryPauseBtn = document.getElementById('luxriotSummaryPauseBtn');
+        const luxriotSummaryViewBtn = document.getElementById('luxriotSummaryViewBtn');
+        const luxriotSummaryCollapseAllBtn = document.getElementById('luxriotSummaryCollapseAllBtn');
+        const luxriotSummaryJumpBtn = document.getElementById('luxriotSummaryJumpBtn');
         const luxriotSummaries = document.getElementById('luxriotSummaries');
+        const luxriotStreams = document.getElementById('luxriotStreams');
+        const luxriotRefreshStreamsBtn = document.getElementById('luxriotRefreshStreams');
+        const luxriotStopAllVideoBtn = document.getElementById('luxriotStopAllVideo');
+        const luxriotStopAllAnalyticsBtn = document.getElementById('luxriotStopAllAnalytics');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
         const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
         const probeChannelSelect = document.getElementById('probeChannelSelect');
@@ -2517,6 +4348,10 @@ def home():
         const probeRunBtn = document.getElementById('probeRunBtn');
         const probeSaveBtn = document.getElementById('probeSaveBtn');
         const probeDeleteBtn = document.getElementById('probeDeleteBtn');
+        const probeEditBtn = document.getElementById('probeEditBtn');
+        const probeEditorModal = document.getElementById('probeEditorModal');
+        const closeProbeEditorBtn = document.getElementById('closeProbeEditor');
+        const probeEditorCloseBtn = document.getElementById('probeEditorCloseBtn');
         const probeResults = document.getElementById('probeResults');
         const probeStatus = document.getElementById('probeStatus');
         const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
@@ -2534,17 +4369,29 @@ def home():
         const probePairsContainer = document.getElementById('probePairs');
         const probeAddPairBtn = document.getElementById('probeAddPair');
         const probeImageFile = document.getElementById('probeImageFile');
+        const probeImageFileName = document.getElementById('probeImageFileName');
         const probeImageEnableBtn = document.getElementById('probeImageEnable');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
         const probeImageOverlay = document.getElementById('probeImageOverlay');
+        const probeImagePanel = document.querySelector('.image-probe-panel');
         const probeImagePosInput = document.getElementById('probeImagePos');
         const probeDetLeftBtn = document.getElementById('probeDetLeft');
         const probeDetRightBtn = document.getElementById('probeDetRight');
         const resultLimitSelect = document.getElementById('resultLimit');
         const sortBySelect = document.getElementById('sortBy');
+        const searchScopeSelect = document.getElementById('searchScope');
         const showCommentedBtn = document.getElementById('showCommentedBtn');
         const resultsContainer = document.getElementById('results');
+        const archiveChannelFilter = document.getElementById('archiveChannelFilter');
+        const archiveProbeFilter = document.getElementById('archiveProbeFilter');
+        const archiveTimeFilter = document.getElementById('archiveTimeFilter');
+        const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
+        const loadDetectionsBtn = document.getElementById('loadDetectionsBtn');
+        const refreshDetectionsFiltersBtn = document.getElementById('refreshDetectionsFiltersBtn');
+        const archiveDetectionsPrevBtn = document.getElementById('archiveDetectionsPrev');
+        const archiveDetectionsNextBtn = document.getElementById('archiveDetectionsNext');
+        const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
         const probeStreamState = document.getElementById('probeStreamState');
         const probeEnableToggle = document.getElementById('probeEnableToggle');
@@ -2552,37 +4399,107 @@ def home():
         const probeBenchOutput = document.getElementById('probeBenchOutput');
         
         let currentFolder = '';
-        let currentMode = 'text';
+        let currentMode = 'archive';
         let videoTimerHandle = null;
         let videoRequestStarted = 0;
         let lastSummaryText = '';
         let lastSummaryTarget = null;
+        let segmentContextByIndex = {};
+        let luxriotSummaryLogCache = [];
+        const luxriotSummaryChannelCache = {};
+        const luxriotSummarySeenKeys = {};
+        let luxriotSummaryUnread = 0;
+        let luxriotSummaryChannel = null;
+        let luxriotSummaryRunFilter = 'latest';
+        let luxriotSummaryRangePreset = '6h';
+        let luxriotSummaryFromTs = null;
+        let luxriotSummaryToTs = null;
+        let luxriotSummaryLevel = 'L0';
+        let luxriotSummaryRollupStack = [];
+        let luxriotSummaryRollupRows = [];
+        const luxriotSummaryRollupCache = {};
+        let luxriotSummaryFollowLive = true;
+        let luxriotSummaryAutoRefresh = true;
+        let luxriotSummaryCompactMode = false;
+        const luxriotSummaryCollapsedByChannel = {};
         const luxriotDefaults = {
             channelId: {luxriot_default_channel},
             snapshotInterval: {luxriot_snapshot_interval},
             snapshotMaxEdge: {luxriot_snapshot_max_edge},
-            baseUrl: '{luxriot_base_url}',
+            baseUrl: {luxriot_base_url_json},
             batchSize: {luxriot_batch_default}
         };
         let luxriotActiveChannel = luxriotDefaults.channelId;
         let luxriotPreviewTimer = null;
         let luxriotSummaryTimer = null;
+        let luxriotSummaryRefreshInFlight = false;
+        let luxriotSummaryRefreshQueued = null;
+        let luxriotStreamsCache = [];
         let luxriotInitialized = false;
-        let probeHitsCache = [];
+        const probeHitsCacheByKey = {};
+        const probeHitsOffsetByKey = {};
+        const probeFramesByKey = {};
+        const probeHitsUpdatedByKey = {};
+        const probeWindowSecByKey = {};
         let probePairsState = [];
         let probeImageState = null;
         let imageProbeEnabled = false;
         let probeList = [];
+        let probeCatalog = [];
         let activeProbeId = null;
         const probeCaptureState = {};
+        const probeChannelRuntime = {};
         let probeRunTimer = null;
         let probeRunInFlight = false;
         let probePreviewTimer = null;
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
-        let probeHitsOffset = 0;
+        let archiveDetectionsOffset = 0;
+        let archiveDetectionsTotal = 0;
+        let archiveDetectionsHasMore = false;
         const channelCaptureConfig = {};
         const channelFpsDesired = {};
+        const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
+
+        function getAdminToken() {
+            return (localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '').trim();
+        }
+
+        function saveAdminToken(token) {
+            const clean = (token || '').trim();
+            if (clean) {
+                localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, clean);
+            } else {
+                localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+            }
+        }
+
+        (function seedAdminTokenFromQuery() {
+            try {
+                const url = new URL(window.location.href);
+                const qp = (url.searchParams.get('admin_token') || '').trim();
+                if (!qp) return;
+                saveAdminToken(qp);
+                url.searchParams.delete('admin_token');
+                window.history.replaceState({}, '', url.toString());
+            } catch (_) {
+                // no-op
+            }
+        })();
+
+        const rawFetch = window.fetch.bind(window);
+        window.fetch = (input, init = {}) => {
+            const options = init ? { ...init } : {};
+            const token = getAdminToken();
+            if (token) {
+                const headers = new Headers(options.headers || {});
+                if (!headers.has('X-Admin-Token') && !headers.has('Authorization')) {
+                    headers.set('X-Admin-Token', token);
+                }
+                options.headers = headers;
+            }
+            return rawFetch(input, options);
+        };
 
         function escapeHtml(text) {
             const div = document.createElement('div');
@@ -2603,6 +4520,26 @@ def home():
             const mins = Math.floor(seconds / 60);
             const secs = Math.floor(seconds % 60);
             return `${mins}m ${secs}s`;
+        }
+
+        const buttonBusyState = new WeakMap();
+
+        function setButtonBusy(button, busy) {
+            if (!(button instanceof HTMLButtonElement)) return;
+            if (busy) {
+                if (!buttonBusyState.has(button)) {
+                    buttonBusyState.set(button, Boolean(button.disabled));
+                }
+                button.disabled = true;
+                button.classList.add('is-loading');
+                button.setAttribute('aria-busy', 'true');
+                return;
+            }
+            const wasDisabled = buttonBusyState.has(button) ? Boolean(buttonBusyState.get(button)) : false;
+            buttonBusyState.delete(button);
+            button.classList.remove('is-loading');
+            button.removeAttribute('aria-busy');
+            button.disabled = wasDisabled;
         }
 
         function startVideoTimer() {
@@ -2630,18 +4567,20 @@ def home():
 
         function setMode(mode) {
             currentMode = mode;
-            textModeBtn.classList.toggle('active', mode === 'text');
-            imageModeBtn.classList.toggle('active', mode === 'image');
+            archiveModeBtn.classList.toggle('active', mode === 'archive');
             videoModeBtn.classList.toggle('active', mode === 'video');
             monitorModeBtn.classList.toggle('active', mode === 'monitor');
-            textSearchBox.style.display = mode === 'text' ? 'flex' : 'none';
-            imageSearchBox.style.display = mode === 'image' ? 'flex' : 'none';
+            if (archiveBox) {
+                archiveBox.style.display = mode === 'archive' ? 'flex' : 'none';
+            }
             videoBox.style.display = mode === 'video' ? 'flex' : 'none';
-            monitorBox.style.display = mode === 'monitor' ? 'flex' : 'none';
+            monitorBox.style.display = mode === 'monitor' ? 'block' : 'none';
             if (mode === 'video') {
                 ensureLuxriotInit();
                 startLuxriotPreview();
-                refreshLuxriotSummaries();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                refreshLuxriotStreams();
+                startLuxriotSummaryPoll();
                 syncProbeChannelSelect();
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
@@ -2656,6 +4595,10 @@ def home():
                 stopProbePreview();
                 stopProbeRunLoop();
                 stopProbeStatusPoll();
+                refreshArchiveFilters().catch(() => {});
+                if (probeEditorModal) {
+                    probeEditorModal.style.display = 'none';
+                }
             }
         }
 
@@ -2694,6 +4637,496 @@ def home():
             return luxriotDefaults.channelId;
         }
 
+        function getSelectedSummaryChannel() {
+            const raw = luxriotSummaryChannelSelect ? luxriotSummaryChannelSelect.value : '';
+            const fallback = luxriotSummaryChannel ?? getSelectedLuxriotChannel();
+            const parsed = parseInt(raw || String(fallback || ''), 10);
+            if (Number.isFinite(parsed)) {
+                luxriotSummaryChannel = parsed;
+                return parsed;
+            }
+            return getSelectedLuxriotChannel();
+        }
+
+        function normalizeSummaryRun(value) {
+            const text = String(value || '').trim();
+            if (!text) return 'latest';
+            const lowered = text.toLowerCase();
+            if (lowered === 'latest' || lowered === 'live' || lowered === 'all') {
+                return lowered;
+            }
+            return text;
+        }
+
+        function normalizeSummaryRangePreset(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (text === '6h' || text === '24h' || text === '3d' || text === '7d' || text === '30d' || text === 'all' || text === 'custom') {
+                return text;
+            }
+            return '24h';
+        }
+
+        function getSummaryRangeBounds(rangePreset, nowSec = null) {
+            const normalized = normalizeSummaryRangePreset(rangePreset);
+            const now = Number.isFinite(nowSec) ? Number(nowSec) : Math.floor(Date.now() / 1000);
+            const toTs = now;
+            if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
+            if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
+            if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
+            if (normalized === '7d') return { fromTs: toTs - 7 * 24 * 3600, toTs };
+            if (normalized === '30d') return { fromTs: toTs - 30 * 24 * 3600, toTs };
+            return { fromTs: null, toTs: null };
+        }
+
+        function getSummaryRangeLabel() {
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            if (preset === '6h') return '6h';
+            if (preset === '24h') return '1d';
+            if (preset === '3d') return '3d';
+            if (preset === '7d') return '7d';
+            if (preset === '30d') return '30d';
+            if (preset === 'all') return 'all';
+            if (Number.isFinite(luxriotSummaryFromTs) || Number.isFinite(luxriotSummaryToTs)) {
+                return `custom ${formatRollupRange(luxriotSummaryFromTs, luxriotSummaryToTs)}`;
+            }
+            return 'custom';
+        }
+
+        function syncSummaryRangeUI() {
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            if (luxriotSummaryRangeSelect) {
+                luxriotSummaryRangeSelect.value = preset;
+            }
+            if (luxriotSummaryCustomTime) {
+                luxriotSummaryCustomTime.classList.toggle('is-hidden', preset !== 'custom');
+            }
+        }
+
+        function parseSummaryDatetimeInput(value) {
+            const text = String(value || '').trim();
+            if (!text) return null;
+            const ms = Date.parse(text);
+            if (!Number.isFinite(ms)) return null;
+            return ms / 1000;
+        }
+
+        function formatSummaryDatetimeInput(ts) {
+            const sec = Number(ts);
+            if (!Number.isFinite(sec)) return '';
+            const d = new Date(sec * 1000);
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mi = String(d.getMinutes()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+        }
+
+        function readSummaryFiltersFromInputs() {
+            const run = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
+            const rangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect ? luxriotSummaryRangeSelect.value : luxriotSummaryRangePreset);
+            let fromTs = null;
+            let toTs = null;
+            if (rangePreset === 'custom') {
+                fromTs = parseSummaryDatetimeInput(luxriotSummaryFromInput ? luxriotSummaryFromInput.value : '');
+                toTs = parseSummaryDatetimeInput(luxriotSummaryToInput ? luxriotSummaryToInput.value : '');
+            } else if (rangePreset !== 'all') {
+                const bounds = getSummaryRangeBounds(rangePreset);
+                fromTs = bounds.fromTs;
+                toTs = bounds.toTs;
+            }
+            if (fromTs !== null && toTs !== null && fromTs > toTs) {
+                const tmp = fromTs;
+                fromTs = toTs;
+                toTs = tmp;
+            }
+            return { run, fromTs, toTs, rangePreset };
+        }
+
+        function applySummaryFiltersFromInputs() {
+            const filters = readSummaryFiltersFromInputs();
+            luxriotSummaryRunFilter = filters.run;
+            luxriotSummaryRangePreset = normalizeSummaryRangePreset(filters.rangePreset);
+            luxriotSummaryFromTs = filters.fromTs;
+            luxriotSummaryToTs = filters.toTs;
+            if (luxriotSummaryRunSelect) {
+                luxriotSummaryRunSelect.value = luxriotSummaryRunFilter;
+            }
+            syncSummaryRangeUI();
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+            }
+        }
+
+        function clearSummaryFilters() {
+            luxriotSummaryRunFilter = 'latest';
+            luxriotSummaryRangePreset = '6h';
+            luxriotSummaryFromTs = null;
+            luxriotSummaryToTs = null;
+            if (luxriotSummaryRunSelect) {
+                luxriotSummaryRunSelect.value = 'latest';
+            }
+            if (luxriotSummaryRangeSelect) {
+                luxriotSummaryRangeSelect.value = '6h';
+            }
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = '';
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = '';
+            }
+            syncSummaryRangeUI();
+        }
+
+        function buildSummaryQueryParams(channelId) {
+            const params = new URLSearchParams();
+            params.set('channel_id', String(channelId));
+            const run = normalizeSummaryRun(luxriotSummaryRunFilter);
+            if (run) params.set('run', run);
+            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+            let fromTs = luxriotSummaryFromTs;
+            let toTs = luxriotSummaryToTs;
+            if (preset !== 'custom') {
+                if (preset === 'all') {
+                    fromTs = null;
+                    toTs = null;
+                } else {
+                    const bounds = getSummaryRangeBounds(preset);
+                    fromTs = bounds.fromTs;
+                    toTs = bounds.toTs;
+                }
+                luxriotSummaryFromTs = fromTs;
+                luxriotSummaryToTs = toTs;
+            }
+            if (Number.isFinite(fromTs)) {
+                params.set('from_ts', String(fromTs));
+            }
+            if (Number.isFinite(toTs)) {
+                params.set('to_ts', String(toTs));
+            }
+            return params;
+        }
+
+        function syncSummaryRunSelectOptions(runs, selectedRun = null) {
+            if (!luxriotSummaryRunSelect) return;
+            const runItems = Array.isArray(runs) ? runs : [];
+            const currentValue = normalizeSummaryRun(
+                selectedRun || luxriotSummaryRunSelect.value || luxriotSummaryRunFilter || 'latest'
+            );
+            const baseOptions = [
+                { value: 'latest', label: 'Latest run' },
+                { value: 'live', label: 'Live run' },
+                { value: 'all', label: 'All runs' },
+            ];
+            const seen = new Set(baseOptions.map((item) => item.value));
+            const dynamicOptions = [];
+            runItems.forEach((run) => {
+                const runId = String(run?.run_id || '').trim();
+                if (!runId || seen.has(runId)) return;
+                seen.add(runId);
+                const logCount = Number(run?.log_count || 0);
+                const running = Boolean(run?.running);
+                const stateLabel = running ? 'live' : 'saved';
+                dynamicOptions.push({
+                    value: runId,
+                    label: `${runId} (${stateLabel}, ${logCount})`,
+                });
+            });
+            const optionsHtml = baseOptions
+                .concat(dynamicOptions)
+                .map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`)
+                .join('');
+            luxriotSummaryRunSelect.innerHTML = optionsHtml;
+            const hasCurrent = Array.from(luxriotSummaryRunSelect.options || [])
+                .some((opt) => String(opt.value) === currentValue);
+            luxriotSummaryRunSelect.value = hasCurrent ? currentValue : 'latest';
+            luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
+        }
+
+        function syncSummaryFiltersFromResponse(payload) {
+            const data = payload && typeof payload === 'object' ? payload : {};
+            if (Object.prototype.hasOwnProperty.call(data, 'selected_run')) {
+                luxriotSummaryRunFilter = normalizeSummaryRun(data.selected_run);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, 'from_ts')) {
+                const rawFrom = data.from_ts;
+                if (rawFrom === null || rawFrom === '' || typeof rawFrom === 'undefined') {
+                    luxriotSummaryFromTs = null;
+                } else {
+                    const fromTs = Number(rawFrom);
+                    luxriotSummaryFromTs = Number.isFinite(fromTs) && fromTs > 0 ? fromTs : null;
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(data, 'to_ts')) {
+                const rawTo = data.to_ts;
+                if (rawTo === null || rawTo === '' || typeof rawTo === 'undefined') {
+                    luxriotSummaryToTs = null;
+                } else {
+                    const toTs = Number(rawTo);
+                    luxriotSummaryToTs = Number.isFinite(toTs) && toTs > 0 ? toTs : null;
+                }
+            }
+            if (luxriotSummaryRunSelect) {
+                const hasRunValue = Array.from(luxriotSummaryRunSelect.options || [])
+                    .some((opt) => String(opt.value) === luxriotSummaryRunFilter);
+                luxriotSummaryRunSelect.value = hasRunValue ? luxriotSummaryRunFilter : 'latest';
+                luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
+            }
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+            }
+            syncSummaryRangeUI();
+        }
+
+        function normalizeSummaryLevel(value) {
+            const text = String(value || '').trim().toUpperCase();
+            if (text === 'L1' || text === 'L2' || text === 'L3') return text;
+            return 'L0';
+        }
+
+        function setSummaryBaseLevel(level) {
+            const normalized = normalizeSummaryLevel(level);
+            luxriotSummaryLevel = normalized;
+            luxriotSummaryRollupStack = [{ level: normalized, sourceIds: null, label: normalized }];
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = normalized;
+            }
+        }
+
+        function getCurrentSummaryRollupContext() {
+            if (!Array.isArray(luxriotSummaryRollupStack) || !luxriotSummaryRollupStack.length) {
+                setSummaryBaseLevel(luxriotSummaryLevel);
+            }
+            const last = luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1];
+            if (!last || typeof last !== 'object') {
+                setSummaryBaseLevel('L0');
+                return luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1] || null;
+            }
+            return last;
+        }
+
+        function isRollupViewActive() {
+            const ctx = getCurrentSummaryRollupContext();
+            if (!ctx) return false;
+            const hasFilter = Array.isArray(ctx.sourceIds) && ctx.sourceIds.length > 0;
+            return normalizeSummaryLevel(ctx.level) !== 'L0' || hasFilter;
+        }
+
+        function setSummaryUnread(count) {
+            luxriotSummaryUnread = Math.max(0, Number.isFinite(count) ? count : 0);
+            if (!luxriotSummaryJumpBtn) return;
+            if (luxriotSummaryUnread > 0) {
+                luxriotSummaryJumpBtn.classList.remove('is-hidden');
+                luxriotSummaryJumpBtn.textContent = `⬇ Jump to latest (${luxriotSummaryUnread})`;
+            } else {
+                luxriotSummaryJumpBtn.classList.add('is-hidden');
+                luxriotSummaryJumpBtn.textContent = '⬇ Jump to latest';
+            }
+        }
+
+        function getSummaryCollapsedMap(channelId = getSelectedSummaryChannel()) {
+            const key = String(channelId);
+            if (!luxriotSummaryCollapsedByChannel[key] || typeof luxriotSummaryCollapsedByChannel[key] !== 'object') {
+                luxriotSummaryCollapsedByChannel[key] = {};
+            }
+            return luxriotSummaryCollapsedByChannel[key];
+        }
+
+        function isSummaryCollapsed(channelId, logKey) {
+            if (!logKey) return false;
+            const map = getSummaryCollapsedMap(channelId);
+            return Boolean(map[logKey]);
+        }
+
+        function setSummaryCollapsed(channelId, logKey, collapsed) {
+            if (!logKey) return;
+            const map = getSummaryCollapsedMap(channelId);
+            if (collapsed) {
+                map[logKey] = true;
+            } else {
+                delete map[logKey];
+            }
+        }
+
+        function rollupSummaryKey(row, idx = 0) {
+            const level = normalizeSummaryLevel(row?.level || '');
+            const channelId = parseInt(String(row?.channel_id ?? ''), 10);
+            const windowStart = Number(row?.window_start);
+            const windowSecRaw = Number(row?.window_sec);
+            const windowEnd = Number(row?.window_end);
+            if (
+                level !== 'L0'
+                && Number.isFinite(channelId)
+                && Number.isFinite(windowStart)
+            ) {
+                const startBucket = Math.floor(windowStart);
+                let windowSec = Number.isFinite(windowSecRaw) ? Math.floor(windowSecRaw) : 0;
+                if (!(windowSec > 0) && Number.isFinite(windowEnd)) {
+                    windowSec = Math.max(1, Math.floor(windowEnd - windowStart));
+                }
+                return `rollup:${level}:ch${channelId}:w${windowSec}:t${startBucket}`;
+            }
+            const rid = String(row?.rollup_id || '').trim();
+            if (rid) return `rollup:${rid}`;
+            return `rollup:idx-${idx}`;
+        }
+
+        function areAllSummariesCollapsed(channelId = getSelectedSummaryChannel()) {
+            if (isRollupViewActive()) {
+                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
+                if (!rows.length) return false;
+                return rows.every((row, idx) => isSummaryCollapsed(channelId, rollupSummaryKey(row, idx)));
+            }
+            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
+            if (!logs.length) return false;
+            return logs.every((log, idx) => isSummaryCollapsed(channelId, luxriotSummaryLogKey(log, idx)));
+        }
+
+        function collapseAllSummariesForChannel(channelId = getSelectedSummaryChannel(), collapsed = true) {
+            const map = getSummaryCollapsedMap(channelId);
+            if (isRollupViewActive()) {
+                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
+                if (!rows.length) return;
+                if (collapsed) {
+                    rows.forEach((row, idx) => {
+                        map[rollupSummaryKey(row, idx)] = true;
+                    });
+                } else {
+                    rows.forEach((row, idx) => {
+                        delete map[rollupSummaryKey(row, idx)];
+                    });
+                }
+                return;
+            }
+            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
+            if (!logs.length) return;
+            if (collapsed) {
+                logs.forEach((log, idx) => {
+                    map[luxriotSummaryLogKey(log, idx)] = true;
+                });
+            } else {
+                Object.keys(map).forEach((key) => {
+                    delete map[key];
+                });
+            }
+        }
+
+        function setSummaryCompactMode(enabled) {
+            luxriotSummaryCompactMode = Boolean(enabled);
+            if (luxriotSummaries) {
+                luxriotSummaries.classList.toggle('compact', luxriotSummaryCompactMode);
+            }
+        }
+
+        function copyTextToClipboard(text) {
+            const value = String(text || '');
+            if (!value) return Promise.reject(new Error('Nothing to copy'));
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(value);
+            }
+            const textarea = document.createElement('textarea');
+            textarea.value = value;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                return Promise.resolve();
+            } catch (err) {
+                return Promise.reject(err);
+            } finally {
+                document.body.removeChild(textarea);
+            }
+        }
+
+        function downloadTextFile(filename, content) {
+            const blob = new Blob([String(content || '')], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = filename;
+            document.body.appendChild(anchor);
+            anchor.click();
+            document.body.removeChild(anchor);
+            URL.revokeObjectURL(url);
+        }
+
+        function updateSummaryControlsUI() {
+            const rollupMode = isRollupViewActive();
+            if (luxriotSummaryFollowBtn) {
+                const liveOn = !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
+                luxriotSummaryFollowBtn.classList.toggle('primary', liveOn);
+                luxriotSummaryFollowBtn.textContent = rollupMode
+                    ? '▶ Live n/a'
+                    : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
+                luxriotSummaryFollowBtn.disabled = rollupMode;
+            }
+            if (luxriotSummaryPauseBtn) {
+                luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
+                luxriotSummaryPauseBtn.textContent = luxriotSummaryAutoRefresh ? 'Pause updates' : 'Resume updates';
+            }
+            if (luxriotSummaryViewBtn) {
+                luxriotSummaryViewBtn.classList.toggle('primary', luxriotSummaryCompactMode);
+                luxriotSummaryViewBtn.textContent = luxriotSummaryCompactMode ? 'View: Compact' : 'View: Expanded';
+            }
+            if (luxriotSummaryCollapseAllBtn) {
+                const collapsed = areAllSummariesCollapsed();
+                luxriotSummaryCollapseAllBtn.classList.toggle('primary', collapsed);
+                luxriotSummaryCollapseAllBtn.textContent = collapsed ? '⇵ Expand all' : '⇵ Collapse all';
+                luxriotSummaryCollapseAllBtn.disabled = false;
+            }
+            if (luxriotSummaryBackBtn) {
+                luxriotSummaryBackBtn.disabled = !Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1;
+            }
+            if (luxriotSummaryJumpBtn) {
+                if (rollupMode) {
+                    luxriotSummaryJumpBtn.classList.add('is-hidden');
+                } else if (luxriotSummaryUnread > 0) {
+                    luxriotSummaryJumpBtn.classList.remove('is-hidden');
+                } else {
+                    luxriotSummaryJumpBtn.classList.add('is-hidden');
+                }
+            }
+            if (luxriotSummaryApplyFiltersBtn) {
+                luxriotSummaryApplyFiltersBtn.disabled = normalizeSummaryRangePreset(luxriotSummaryRangePreset) !== 'custom';
+            }
+        }
+
+        function syncLuxriotSummaryChannelSelect() {
+            if (!luxriotSummaryChannelSelect || !luxriotChannelSelect) return;
+            const options = Array.from(luxriotChannelSelect.options || [])
+                .map((opt) => {
+                    const value = String(opt.value || '').trim();
+                    const label = String(opt.textContent || '').trim();
+                    if (!value) return null;
+                    return `<option value="${value}">${escapeHtml(label)}</option>`;
+                })
+                .filter((opt) => Boolean(opt));
+            if (!options.length) {
+                luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
+                return;
+            }
+            const selected = Number.isFinite(luxriotSummaryChannel) ? luxriotSummaryChannel : getSelectedLuxriotChannel();
+            luxriotSummaryChannelSelect.innerHTML = options.join('');
+            const exists = Array.from(luxriotSummaryChannelSelect.options || [])
+                .some((opt) => parseInt(String(opt.value || ''), 10) === selected);
+            if (exists) {
+                luxriotSummaryChannelSelect.value = String(selected);
+            } else {
+                luxriotSummaryChannelSelect.selectedIndex = 0;
+                const first = parseInt(luxriotSummaryChannelSelect.value || '', 10);
+                luxriotSummaryChannel = Number.isFinite(first) ? first : getSelectedLuxriotChannel();
+            }
+        }
+
         async function fetchLuxriotChannels(force = false) {
             if (!luxriotChannelSelect) return;
             luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
@@ -2706,6 +5139,9 @@ def home():
                 const channels = data.channels || [];
                 if (!channels.length) {
                     luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    if (luxriotSummaryChannelSelect) {
+                        luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
+                    }
                     setLuxriotStatus('No channels available', true);
                     return;
                 }
@@ -2720,11 +5156,28 @@ def home():
                     luxriotActiveChannel = channels[0].id;
                     luxriotChannelSelect.value = luxriotActiveChannel;
                 }
+                if (!Number.isFinite(luxriotSummaryChannel)) {
+                    luxriotSummaryChannel = luxriotActiveChannel;
+                }
+                syncLuxriotSummaryChannelSelect();
                 setLuxriotStatus(`Loaded ${channels.length} channels`);
             } catch (err) {
                 luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                if (luxriotSummaryChannelSelect) {
+                    luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
+                }
                 setLuxriotStatus('Channel load failed: ' + err.message, true);
             }
+        }
+
+        function getLuxriotChannelLabel(channelId) {
+            if (!Number.isFinite(channelId)) return 'Unknown channel';
+            if (!luxriotChannelSelect) return `Channel #${channelId}`;
+            const options = Array.from(luxriotChannelSelect.options || []);
+            const match = options.find((opt) => parseInt(opt.value || '', 10) === channelId);
+            if (!match) return `Channel #${channelId}`;
+            const label = String(match.textContent || '').trim();
+            return label || `Channel #${channelId}`;
         }
 
         function startLuxriotPreview() {
@@ -2754,39 +5207,939 @@ def home():
             luxriotPreviewTimer = setInterval(refresh, intervalMs);
         }
 
-        function renderLuxriotSummaries(logs) {
+        function luxriotSummaryLogKey(log, idx = 0) {
+            const createdRaw = Number(log?.created_at);
+            const createdKey = Number.isFinite(createdRaw) ? createdRaw.toFixed(6) : `idx-${idx}`;
+            const frameKey = Number(log?.frame_count || 0);
+            const summaryKey = String(log?.summary || '').trim().slice(0, 160);
+            return `${createdKey}|${frameKey}|${summaryKey}`;
+        }
+
+        function isSummaryNearBottom(threshold = 48) {
+            if (!luxriotSummaries) return true;
+            return (luxriotSummaries.scrollTop + luxriotSummaries.clientHeight) >= (luxriotSummaries.scrollHeight - threshold);
+        }
+
+        function scrollSummaryToLatest() {
             if (!luxriotSummaries) return;
-            if (!logs || !logs.length) {
-                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet.</div>';
+            luxriotSummaries.scrollTop = luxriotSummaries.scrollHeight;
+        }
+
+        function setLuxriotSummaryMeta(text, isError = false) {
+            if (!luxriotSummaryMeta) return;
+            luxriotSummaryMeta.textContent = text;
+            luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
+        }
+
+        function withSummaryUpdatedMeta(text) {
+            const base = String(text || '').trim();
+            const stamp = new Date().toLocaleTimeString();
+            return `${base} · updated ${stamp}`;
+        }
+
+        function formatSummaryWindowLabel(seconds) {
+            const value = Number(seconds);
+            if (!Number.isFinite(value) || value <= 0) return 'n/a';
+            if (value % 86400 === 0) return `${Math.floor(value / 86400)}d`;
+            if (value % 3600 === 0) return `${Math.floor(value / 3600)}h`;
+            if (value % 60 === 0) return `${Math.floor(value / 60)}m`;
+            return `${Math.floor(value)}s`;
+        }
+
+        function setSummaryRefreshButtonState(state = 'idle') {
+            if (!luxriotRefreshSummariesBtn) return;
+            if (state === 'busy') {
+                luxriotRefreshSummariesBtn.disabled = true;
+                luxriotRefreshSummariesBtn.textContent = '⟳ Refreshing...';
                 return;
             }
-            const html = logs
-                .slice()
-                .reverse()
-                .map((log) => {
+            if (state === 'queued') {
+                luxriotRefreshSummariesBtn.disabled = true;
+                luxriotRefreshSummariesBtn.textContent = '⟳ Queued...';
+                return;
+            }
+            luxriotRefreshSummariesBtn.disabled = false;
+            luxriotRefreshSummariesBtn.textContent = '⟳ Refresh';
+        }
+
+        function renderLuxriotSummaries(logs, channelId = getSelectedSummaryChannel()) {
+            if (!luxriotSummaries) return;
+            const normalizedLogs = Array.isArray(logs) ? logs.slice() : [];
+            normalizedLogs.sort((a, b) => Number(a?.created_at || 0) - Number(b?.created_at || 0));
+            luxriotSummaryChannelCache[channelId] = normalizedLogs;
+            setSummaryCompactMode(luxriotSummaryCompactMode);
+
+            const prevKeys = Array.isArray(luxriotSummarySeenKeys[channelId]) ? luxriotSummarySeenKeys[channelId] : [];
+            const prevKeySet = new Set(prevKeys);
+            const newKeys = normalizedLogs.map((log, idx) => luxriotSummaryLogKey(log, idx));
+            luxriotSummarySeenKeys[channelId] = newKeys;
+            const newCount = newKeys.reduce((count, key) => count + (prevKeySet.has(key) ? 0 : 1), 0);
+            const shouldStickBottom = luxriotSummaryFollowLive && isSummaryNearBottom();
+            const prevScrollTop = luxriotSummaries.scrollTop;
+            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
+
+            if (!normalizedLogs.length) {
+                luxriotSummaryLogCache = [];
+                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet for this channel.</div>';
+                if (luxriotSummaryFollowLive) {
+                    setSummaryUnread(0);
+                }
+                luxriotSummaries.dataset.hasRender = '1';
+                updateSummaryControlsUI();
+                return;
+            }
+
+            luxriotSummaryLogCache = normalizedLogs;
+            const html = luxriotSummaryLogCache
+                .map((log, idx) => {
+                    const logKey = luxriotSummaryLogKey(log, idx);
                     const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
                     const tsLabel = ts ? ts.toLocaleString() : 'n/a';
                     const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
+                    const modelLabel = String(log.model || '').trim();
+                    const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
+                    const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
+                    const channelLabel = Number.isFinite(rowChannelId)
+                        ? getLuxriotChannelLabel(rowChannelId)
+                        : 'Unknown channel';
+                    const summary = String(log.summary || '').trim();
+                    const canBookmark = summary.length > 0;
+                    const collapsed = isSummaryCollapsed(channelId, logKey);
                     return `
-                        <div class="luxriot-summary">
-                            <div class="timestamp">${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}</div>
-                            <div class="summary-body">${renderMarkdown(log.summary || '')}</div>
+                        <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}">
+                            <div class="luxriot-summary-head">
+                                <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
+                                <div class="luxriot-summary-actions">
+                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
+                                        ${collapsed ? 'Expand' : 'Collapse'}
+                                    </button>
+                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-copy="${idx}" ${canBookmark ? '' : 'disabled'}>
+                                        Copy
+                                    </button>
+                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-export="${idx}" ${canBookmark ? '' : 'disabled'}>
+                                        Export
+                                    </button>
+                                    <button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${canBookmark ? '' : 'disabled'}>
+                                        Bookmark
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="summary-body">${renderMarkdown(summary)}</div>
                         </div>
                     `;
                 })
                 .join('');
             luxriotSummaries.innerHTML = html;
+
+            if (shouldStickBottom || !hasInitialRender) {
+                scrollSummaryToLatest();
+            } else {
+                luxriotSummaries.scrollTop = prevScrollTop;
+            }
+            luxriotSummaries.dataset.hasRender = '1';
+
+            if (luxriotSummaryFollowLive) {
+                setSummaryUnread(0);
+            } else if (newCount > 0) {
+                setSummaryUnread(luxriotSummaryUnread + newCount);
+            }
+            updateSummaryControlsUI();
         }
 
-        async function refreshLuxriotSummaries(channelId = getSelectedLuxriotChannel()) {
-            if (!channelId) return;
+        function formatRollupRange(windowStart, windowEnd) {
+            const start = Number(windowStart);
+            const end = Number(windowEnd);
+            const startLabel = Number.isFinite(start) ? new Date(start * 1000).toLocaleString() : 'n/a';
+            const endLabel = Number.isFinite(end) ? new Date(end * 1000).toLocaleString() : 'n/a';
+            return `${startLabel} -> ${endLabel}`;
+        }
+
+        function formatLuxriotRollupExport(row) {
+            const nl = String.fromCharCode(10);
+            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const level = normalizeSummaryLevel(row?.level || 'L0');
+            const sourceLevel = String(row?.source_level || '').trim() || 'n/a';
+            const rollupId = String(row?.rollup_id || '').trim() || 'n/a';
+            const itemCount = Number(row?.item_count || 0);
+            const frameCount = Number(row?.frame_count || 0);
+            const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
+            const range = formatRollupRange(row?.window_start, row?.window_end);
+            const summary = String(row?.summary || '').trim();
+            const header = [
+                `Channel: ${channelId}`,
+                `Level: ${level}`,
+                `Rollup ID: ${rollupId}`,
+                `Range: ${range}`,
+                `Items: ${itemCount}`,
+                `Frames: ${frameCount}`,
+                `Runs: ${runCount}`,
+                `Source level: ${sourceLevel}`,
+            ].join(nl);
+            return `${header}${nl}${nl}${summary}`;
+        }
+
+        async function copyLuxriotRollupFromRow(rowIndex, triggerBtn = null) {
+            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
+                setLuxriotStatus('Invalid rollup selection', true);
+                return;
+            }
+            const row = luxriotSummaryRollupRows[idx] || {};
             try {
-                const resp = await fetch(`/luxriot/session?channel_id=${channelId}`);
+                await copyTextToClipboard(formatLuxriotRollupExport(row));
+                setLuxriotStatus('Rollup copied');
+                if (triggerBtn) {
+                    const original = triggerBtn.textContent;
+                    triggerBtn.textContent = 'Copied';
+                    setTimeout(() => {
+                        if (triggerBtn) triggerBtn.textContent = original || 'Copy';
+                    }, 1200);
+                }
+            } catch (_) {
+                setLuxriotStatus('Failed to copy rollup', true);
+            }
+        }
+
+        function exportLuxriotRollupFromRow(rowIndex) {
+            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
+                setLuxriotStatus('Invalid rollup selection', true);
+                return;
+            }
+            const row = luxriotSummaryRollupRows[idx] || {};
+            const level = normalizeSummaryLevel(row?.level || 'L0');
+            const stamp = Number.isFinite(Number(row?.window_start))
+                ? new Date(Number(row.window_start) * 1000).toISOString().replace(/[:]/g, '-')
+                : `entry-${idx + 1}`;
+            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const filename = `luxriot_rollup_${level.toLowerCase()}_ch${channelId}_${stamp}.txt`;
+            downloadTextFile(filename, formatLuxriotRollupExport(row));
+            setLuxriotStatus(`Exported ${filename}`);
+        }
+
+        function pushSummaryRollupContext(level, sourceIds = null, label = '') {
+            const normalized = normalizeSummaryLevel(level);
+            const ids = Array.isArray(sourceIds)
+                ? sourceIds.map((id) => String(id || '').trim()).filter((id) => id.length > 0)
+                : null;
+            luxriotSummaryRollupStack.push({
+                level: normalized,
+                sourceIds: ids && ids.length ? ids : null,
+                label: String(label || normalized).trim() || normalized,
+            });
+            luxriotSummaryLevel = normalized;
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = normalized;
+            }
+        }
+
+        function popSummaryRollupContext() {
+            if (!Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1) {
+                return null;
+            }
+            luxriotSummaryRollupStack.pop();
+            const ctx = getCurrentSummaryRollupContext();
+            luxriotSummaryLevel = normalizeSummaryLevel(ctx?.level || 'L0');
+            if (luxriotSummaryLevelSelect) {
+                luxriotSummaryLevelSelect.value = luxriotSummaryLevel;
+            }
+            return ctx;
+        }
+
+        function renderLuxriotRollups(payload, channelId = getSelectedSummaryChannel()) {
+            if (!luxriotSummaries) return 0;
+            const data = payload && typeof payload === 'object' ? payload : {};
+            const levels = data.levels && typeof data.levels === 'object' ? data.levels : {};
+            const prevScrollTop = luxriotSummaries.scrollTop;
+            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
+            const shouldStickBottom = isSummaryNearBottom();
+            const ctx = getCurrentSummaryRollupContext();
+            const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
+            const sourceSet = Array.isArray(ctx?.sourceIds) && ctx.sourceIds.length
+                ? new Set(ctx.sourceIds.map((id) => String(id || '').trim()).filter((id) => id))
+                : null;
+            const levelRows = Array.isArray(levels[level]) ? levels[level] : [];
+            const rows = levelRows
+                .filter((row) => {
+                    if (!sourceSet) return true;
+                    const rowId = String(row?.rollup_id || '').trim();
+                    return rowId && sourceSet.has(rowId);
+                })
+                .sort((a, b) => Number(a?.window_start || 0) - Number(b?.window_start || 0));
+
+            luxriotSummaryRollupRows = rows;
+            luxriotSummaryLogCache = [];
+            if (!rows.length) {
+                luxriotSummaries.innerHTML = `<div class="loading">No ${level} rollups available for this selection.</div>`;
+                luxriotSummaries.dataset.hasRender = '1';
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                return 0;
+            }
+
+            const html = rows.map((row, idx) => {
+                const rowLevel = normalizeSummaryLevel(row?.level || level);
+                const rollupKey = rollupSummaryKey(row, idx);
+                const collapsed = isSummaryCollapsed(channelId, rollupKey);
+                const rangeLabel = formatRollupRange(row?.window_start, row?.window_end);
+                const rowChannelId = parseInt(String(row?.channel_id ?? channelId), 10);
+                const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
+                const channelLabel = Number.isFinite(rowChannelId)
+                    ? getLuxriotChannelLabel(rowChannelId)
+                    : 'Unknown channel';
+                const itemCount = Number(row?.item_count || 0);
+                const frameCount = Number(row?.frame_count || 0);
+                const sourceTokens = Number(row?.source_tokens || 0);
+                const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
+                const sourceLevel = String(row?.source_level || '').trim();
+                const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
+                const summary = String(row?.summary || '').trim();
+                const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
+                const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
+                const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
+                return `
+                    <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
+                        <div class="luxriot-summary-head">
+                            <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
+                            <div class="luxriot-summary-actions">
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-export="${idx}">Export</button>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
+                            </div>
+                        </div>
+                        <div class="summary-body">${renderMarkdown(summary)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            luxriotSummaries.innerHTML = html;
+            if (shouldStickBottom || !hasInitialRender) {
+                scrollSummaryToLatest();
+            } else {
+                luxriotSummaries.scrollTop = prevScrollTop;
+            }
+            luxriotSummaries.dataset.hasRender = '1';
+            setSummaryUnread(0);
+            updateSummaryControlsUI();
+            return rows.length;
+        }
+
+        async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+            if (!channelId) return;
+            if (!luxriotSummaryAutoRefresh && !force) return;
+            try {
+                const params = buildSummaryQueryParams(channelId);
+                params.set('level_limit', '240');
+                const resp = await fetch(`/luxriot/rollups?${params.toString()}`);
                 const data = await resp.json();
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                renderLuxriotSummaries(data.logs || []);
+                syncSummaryRunSelectOptions(data.runs, data.selected_run);
+                syncSummaryFiltersFromResponse(data);
+                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
+                if (
+                    allowRunFallback
+                    && !Boolean(data.running)
+                    && (selectedRun === 'live' || selectedRun === 'latest')
+                ) {
+                    luxriotSummaryRunFilter = 'all';
+                    if (luxriotSummaryRunSelect) {
+                        luxriotSummaryRunSelect.value = 'all';
+                    }
+                    refreshLuxriotSummaryView(channelId, true, false);
+                    return;
+                }
+                luxriotSummaryRollupCache[channelId] = data;
+                const renderedCount = renderLuxriotRollups(data, channelId);
+                const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
+                const ctx = getCurrentSummaryRollupContext();
+                const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
+                const drillLabel = ctx?.sourceIds ? ` · drill ${ctx.sourceIds.length}` : '';
+                const runLabel = luxriotSummaryRunFilter || 'latest';
+                const countsLabel = `L1 ${Number(counts.L1 || 0)} · L2 ${Number(counts.L2 || 0)} · L3 ${Number(counts.L3 || 0)}`;
+                const pendingCount = luxriotSummaryRollupRows
+                    .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
+                    .length;
+                const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
+                const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
+                const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
+                const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
+                const channelLabel = getLuxriotChannelLabel(channelId);
+                setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
+                setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
+            } catch (err) {
+                setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
+                setLuxriotStatus('Failed to fetch rollups: ' + err.message, true);
+            }
+        }
+
+        async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+            if (!channelId) return;
+            if (luxriotSummaryRefreshInFlight) {
+                const next = luxriotSummaryRefreshQueued || {};
+                luxriotSummaryRefreshQueued = {
+                    channelId,
+                    force: Boolean(force || next.force),
+                    allowRunFallback: Boolean((allowRunFallback !== false) || (next.allowRunFallback !== false)),
+                };
+                if (force) {
+                    setLuxriotStatus('Refresh queued...');
+                }
+                return false;
+            }
+            luxriotSummaryRefreshInFlight = true;
+            try {
+                if (isRollupViewActive()) {
+                    await refreshLuxriotRollups(channelId, force, allowRunFallback);
+                } else {
+                    await refreshLuxriotSummaries(channelId, force, allowRunFallback);
+                }
+                return true;
+            } finally {
+                luxriotSummaryRefreshInFlight = false;
+                if (luxriotSummaryRefreshQueued) {
+                    const next = luxriotSummaryRefreshQueued;
+                    luxriotSummaryRefreshQueued = null;
+                    void refreshLuxriotSummaryView(
+                        next.channelId || getSelectedSummaryChannel(),
+                        Boolean(next.force),
+                        next.allowRunFallback !== false,
+                    );
+                }
+            }
+        }
+
+        function updateProbeChannelRuntime(payload, rerender = false) {
+            const data = payload && typeof payload === 'object' ? payload : {};
+            const pausedChannels = new Set(
+                (Array.isArray(data.paused_analytics_channels) ? data.paused_analytics_channels : [])
+                    .map((val) => parseInt(String(val), 10))
+                    .filter((val) => Number.isFinite(val))
+            );
+            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
+            const nextState = {};
+            analyticsStreams.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                if (stream?.running) {
+                    nextState[channelId] = 'running';
+                } else if (pausedChannels.has(channelId)) {
+                    nextState[channelId] = 'paused';
+                } else {
+                    nextState[channelId] = 'idle';
+                }
+            });
+            pausedChannels.forEach((channelId) => {
+                if (!(channelId in nextState)) {
+                    nextState[channelId] = 'paused';
+                }
+            });
+            Object.keys(probeChannelRuntime).forEach((channelId) => {
+                delete probeChannelRuntime[channelId];
+            });
+            Object.assign(probeChannelRuntime, nextState);
+            Object.keys(probeCaptureState).forEach((channelId) => {
+                delete probeCaptureState[channelId];
+            });
+            Object.entries(probeChannelRuntime).forEach(([channelId, state]) => {
+                if (state === 'running') {
+                    probeCaptureState[channelId] = true;
+                }
+            });
+            if (rerender) {
+                renderProbeCards();
+            }
+        }
+
+        async function refreshProbeRuntimeState(rerender = false) {
+            try {
+                const resp = await fetch('/luxriot/streams');
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Failed to fetch runtime stream state');
+                }
+                updateProbeChannelRuntime(data, rerender);
+            } catch (_) {
+                // Keep previous runtime snapshot when stream endpoint is unavailable.
+            }
+        }
+
+        function renderLuxriotStreams(payload, probes = probeCatalog) {
+            if (!luxriotStreams) return;
+            const data = payload && typeof payload === 'object' ? payload : {};
+            const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
+            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
+            const pausedChannels = new Set(
+                (Array.isArray(data.paused_analytics_channels) ? data.paused_analytics_channels : [])
+                    .map((val) => parseInt(String(val), 10))
+                    .filter((val) => Number.isFinite(val))
+            );
+            const historyChannels = new Set(
+                (Array.isArray(data.video_history_channels) ? data.video_history_channels : [])
+                    .map((val) => parseInt(String(val), 10))
+                    .filter((val) => Number.isFinite(val))
+            );
+            updateProbeChannelRuntime(data, probeList.length > 0);
+            luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
+            const sortedVideo = videoStreams
+                .slice()
+                .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
+            const sortedAnalytics = analyticsStreams
+                .slice()
+                .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
+            const videoByChannel = new Map();
+            sortedVideo.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                videoByChannel.set(channelId, stream);
+            });
+            const analyticsByChannel = new Map();
+            sortedAnalytics.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                analyticsByChannel.set(channelId, stream);
+            });
+            const probeStatsByChannel = new Map();
+            (Array.isArray(probes) ? probes : []).forEach((probe) => {
+                const channelId = parseInt(String(probe?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                if (!probeStatsByChannel.has(channelId)) {
+                    probeStatsByChannel.set(channelId, { total: 0, enabled: 0, disabled: 0 });
+                }
+                const stats = probeStatsByChannel.get(channelId);
+                stats.total += 1;
+                if (probe?.enabled === false) stats.disabled += 1;
+                else stats.enabled += 1;
+            });
+            const channelIds = new Set();
+            sortedVideo.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (Number.isFinite(channelId)) channelIds.add(channelId);
+            });
+            sortedAnalytics.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (Number.isFinite(channelId)) channelIds.add(channelId);
+            });
+            pausedChannels.forEach((channelId) => channelIds.add(channelId));
+            historyChannels.forEach((channelId) => channelIds.add(channelId));
+            probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
+            if (!channelIds.size) {
+                luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
+                return;
+            }
+            const rows = Array.from(channelIds)
+                .sort((a, b) => a - b)
+                .map((channelId) => {
+                    const video = videoByChannel.get(channelId) || null;
+                    const analytics = analyticsByChannel.get(channelId) || null;
+                    const stats = probeStatsByChannel.get(channelId) || { total: 0, enabled: 0, disabled: 0 };
+                    const hasProbes = stats.total > 0;
+                    const enabledCount = stats.enabled || 0;
+                    const isVideoRunning = Boolean(video?.running);
+                    const isProbeRunning = Boolean(analytics?.running);
+                    const isProbePaused = pausedChannels.has(channelId);
+                    const hasVideoHistory = historyChannels.has(channelId);
+
+                    const videoParts = [];
+                    if (isVideoRunning) {
+                        const batch = Number(video?.batch_size) || 0;
+                        const queued = Number(video?.pending_frames) || 0;
+                        const flushes = Number(video?.flush_count) || 0;
+                        if (batch > 0) videoParts.push(`batch ${batch}`);
+                        videoParts.push(`${queued} queued`);
+                        if (flushes > 0) videoParts.push(`${flushes} flushes`);
+                        if (video?.last_error) videoParts.push('error');
+                    }
+                    const videoLine = isVideoRunning
+                        ? `Video summaries: active${videoParts.length ? ` · ${videoParts.join(' · ')}` : ''}`
+                        : hasVideoHistory
+                            ? 'Video summaries: stopped · history available'
+                            : 'Video summaries: idle';
+
+                    const probeParts = [];
+                    if (isProbeRunning) {
+                        const queued = Number(analytics?.pending_frames) || 0;
+                        const intervalSec = Number(analytics?.interval_sec);
+                        const fpsLabel = Number.isFinite(intervalSec) && intervalSec > 0 ? `${(1 / intervalSec).toFixed(2)} fps` : 'n/a fps';
+                        probeParts.push(fpsLabel, `${queued} buffered`);
+                        if (analytics?.last_error) probeParts.push('error');
+                    }
+                    const probeLine = isProbeRunning
+                        ? `Probe capture: active${probeParts.length ? ` · ${probeParts.join(' · ')}` : ''}`
+                        : isProbePaused
+                            ? 'Probe capture: paused'
+                            : enabledCount > 0
+                                ? 'Probe capture: idle'
+                                : hasProbes
+                                    ? 'Probe capture: all probes disabled'
+                                    : 'Probe capture: no probes configured';
+
+                    const probesLine = hasProbes
+                        ? `${stats.total} probes · ${enabledCount} enabled${stats.disabled ? ` · ${stats.disabled} disabled` : ''}`
+                        : 'No probes configured';
+                    const videoTag = isVideoRunning
+                        ? '<span class="luxriot-stream-tag">video active</span>'
+                        : '<span class="luxriot-stream-tag idle">video idle</span>';
+                    const probeTag = isProbeRunning
+                        ? '<span class="luxriot-stream-tag">probes active</span>'
+                        : isProbePaused
+                            ? '<span class="luxriot-stream-tag paused">probes paused</span>'
+                            : enabledCount > 0
+                                ? '<span class="luxriot-stream-tag idle">probes idle</span>'
+                                : hasProbes
+                                    ? '<span class="luxriot-stream-tag idle">probes disabled</span>'
+                                    : '<span class="luxriot-stream-tag idle">no probes</span>';
+                    const pauseLabel = isProbePaused ? 'Resume probes' : 'Pause probes';
+                    const pauseAction = isProbePaused ? 'resume' : 'pause';
+                    const canPauseProbes = !isProbePaused && (isProbeRunning || enabledCount > 0);
+                    const canResumeProbes = isProbePaused;
+                    const canProbeAction = canPauseProbes || canResumeProbes;
+                    const canStopAll = isVideoRunning || isProbeRunning;
+                    const channelLabel = getLuxriotChannelLabel(channelId);
+                    return `
+                        <div class="luxriot-stream-item">
+                            <div class="luxriot-stream-head">
+                                <div class="luxriot-stream-title-wrap">
+                                    <div class="luxriot-stream-kind">Channel</div>
+                                    <div class="luxriot-stream-title">${escapeHtml(channelLabel)}</div>
+                                </div>
+                                <div class="luxriot-stream-tags">${videoTag} ${probeTag}</div>
+                            </div>
+                            <div class="luxriot-stream-stats">
+                                <span class="luxriot-stream-stat">${escapeHtml(probesLine)}</span>
+                                <span class="luxriot-stream-stat">${escapeHtml(videoLine)}</span>
+                                <span class="luxriot-stream-stat">${escapeHtml(probeLine)}</span>
+                            </div>
+                            <div class="luxriot-stream-controls">
+                                <button class="feature-btn" data-summary-channel="${channelId}" title="Open this channel in summaries panel">View summaries</button>
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video" ${isVideoRunning ? '' : 'disabled'}>Stop video</button>
+                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>
+                            </div>
+                        </div>
+                    `;
+                });
+            luxriotStreams.innerHTML = rows.join('');
+        }
+
+        async function refreshLuxriotStreams() {
+            if (!luxriotStreams) return;
+            try {
+                const resp = await fetch('/luxriot/streams');
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || 'Failed to fetch stream state');
+                }
+                try {
+                    const probesResp = await fetch('/probes/list');
+                    const probesData = await probesResp.json();
+                    if (probesResp.ok && !probesData.error && Array.isArray(probesData.probes)) {
+                        probeCatalog = probesData.probes;
+                    }
+                } catch (_) {
+                    // Keep previous probe catalog if probe listing fails.
+                }
+                renderLuxriotStreams(data, probeCatalog);
+            } catch (err) {
+                luxriotStreams.innerHTML = `<div class="loading">Stream state unavailable: ${escapeHtml(err.message || 'Unknown error')}</div>`;
+            }
+        }
+
+        function guessProbeCaptureFps(channelId) {
+            const targetChannel = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(targetChannel)) return 0;
+            const fpsValues = (Array.isArray(probeCatalog) ? probeCatalog : [])
+                .filter((probe) => parseInt(String(probe?.channel_id ?? ''), 10) === targetChannel)
+                .map((probe) => Number.parseFloat(String(probe?.fps ?? '')))
+                .filter((fps) => Number.isFinite(fps) && fps > 0);
+            if (!fpsValues.length) return 0;
+            return Math.max(...fpsValues);
+        }
+
+        async function resumeLuxriotProbeCapture(channelId) {
+            const parsedChannelId = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsedChannelId)) {
+                setLuxriotStatus('Invalid channel id for probe resume', true);
+                return;
+            }
+            const fps = guessProbeCaptureFps(parsedChannelId);
+            setLuxriotStatus(`Resuming probe capture on channel ${parsedChannelId}...`);
+            try {
+                const response = await fetch('/probes/start_capture', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: parsedChannelId,
+                        fps,
+                        clear_pause: true,
+                    }),
+                });
+                await parseApiJson(response, 'Probe resume failed');
+                await refreshLuxriotStreams();
+                await refreshProbeStatus(parsedChannelId);
+                setLuxriotStatus(`Probe capture resumed on channel ${parsedChannelId}`);
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Failed to resume probe capture', true);
+            }
+        }
+
+        async function stopLuxriotStream(channelId, streamType) {
+            const parsedChannelId = parseInt(String(channelId || ''), 10);
+            const normalizedType = String(streamType || '').trim().toLowerCase();
+            if (!Number.isFinite(parsedChannelId)) {
+                setLuxriotStatus('Invalid channel id for stream stop', true);
+                return;
+            }
+            if (!['video', 'analytics', 'both'].includes(normalizedType)) {
+                setLuxriotStatus('Invalid stream type', true);
+                return;
+            }
+            const actionLabel = normalizedType === 'analytics'
+                ? 'Pausing probe capture'
+                : normalizedType === 'video'
+                    ? 'Stopping video summaries'
+                    : 'Stopping video and pausing probes';
+            setLuxriotStatus(`${actionLabel} on channel ${parsedChannelId}...`);
+            try {
+                const response = await fetch('/luxriot/streams/stop', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: parsedChannelId,
+                        stream_type: normalizedType,
+                        pause_analytics: true,
+                    }),
+                });
+                await parseApiJson(response, 'Stream stop failed');
+                await refreshLuxriotStreams();
+                if (normalizedType === 'video' || normalizedType === 'both') {
+                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                }
+                if (normalizedType === 'analytics' || normalizedType === 'both') {
+                    await refreshProbeStatus(parsedChannelId);
+                }
+                const doneLabel = normalizedType === 'analytics'
+                    ? 'Probe capture paused'
+                    : normalizedType === 'video'
+                        ? 'Video summaries stopped'
+                        : 'Video summaries stopped, probes paused';
+                setLuxriotStatus(`${doneLabel} on channel ${parsedChannelId}`);
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Failed to stop stream', true);
+            }
+        }
+
+        async function stopAllLuxriotStreams(streamType) {
+            const normalizedType = String(streamType || '').trim().toLowerCase();
+            const stopVideo = normalizedType === 'video' || normalizedType === 'both';
+            const stopAnalytics = normalizedType === 'analytics' || normalizedType === 'both';
+            if (!stopVideo && !stopAnalytics) return;
+            const actionLabel = stopVideo && stopAnalytics
+                ? 'Stopping video summaries and pausing probes'
+                : stopVideo
+                    ? 'Stopping all video summaries'
+                    : 'Pausing all probe capture streams';
+            setLuxriotStatus(`${actionLabel}...`);
+            try {
+                const response = await fetch('/luxriot/streams/stop_all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        stop_video: stopVideo,
+                        stop_analytics: stopAnalytics,
+                        pause_analytics: true,
+                    }),
+                });
+                await parseApiJson(response, 'Stop-all failed');
+                await refreshLuxriotStreams();
+                if (stopVideo) {
+                    stopLuxriotSummaryPoll();
+                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                }
+                if (stopAnalytics) {
+                    await refreshProbeStatus();
+                }
+                const doneLabel = stopVideo && stopAnalytics
+                    ? 'Stopped video summaries and paused probes'
+                    : stopVideo
+                        ? 'Stopped all video summaries'
+                        : 'Paused all probe capture streams';
+                setLuxriotStatus(doneLabel);
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Failed to stop streams', true);
+            }
+        }
+
+        async function sendLuxriotBookmarkFromLog(logIndex, triggerBtn = null) {
+            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
+                setLuxriotStatus('Invalid summary selection', true);
+                return;
+            }
+            const log = luxriotSummaryLogCache[idx] || {};
+            const summaryText = String(log.summary || '').trim();
+            if (!summaryText) {
+                setLuxriotStatus('No summary text to bookmark', true);
+                return;
+            }
+            const channelId = Number(log.channel_id) || getSelectedLuxriotChannel() || luxriotDefaults.channelId;
+            const firstLine = summaryText.split(/\\r?\\n/, 1)[0].trim();
+            const titleBase = firstLine || `Channel ${channelId} summary`;
+            const title = titleBase.length > 80 ? `${titleBase.slice(0, 77)}...` : titleBase;
+            const description = summaryText.length > 2400 ? `${summaryText.slice(0, 2397)}...` : summaryText;
+            const createdAtSec = Number(log.created_at);
+            const timestampMs = Number.isFinite(createdAtSec) ? Math.round(createdAtSec * 1000) : null;
+
+            const button = triggerBtn;
+            const originalLabel = button ? button.textContent : '';
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Saving...';
+            }
+
+            try {
+                const response = await fetch('/luxriot/bookmark', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        title: `Live summary: ${title}`,
+                        description,
+                        severity: 'normal',
+                        state: 'new',
+                        timestamp_ms: timestampMs
+                    }),
+                });
+                await parseApiJson(response, 'Bookmark failed');
+                setLuxriotStatus(`Bookmark sent for channel ${channelId}`);
+                if (button) {
+                    button.textContent = 'Bookmarked';
+                }
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Bookmark failed', true);
+                if (button) {
+                    button.textContent = originalLabel || 'Bookmark';
+                }
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                }
+            }
+        }
+
+        function formatLuxriotSummaryExport(log) {
+            const createdRaw = Number(log?.created_at);
+            const ts = Number.isFinite(createdRaw) ? new Date(createdRaw * 1000) : null;
+            const tsLabel = ts ? ts.toISOString() : 'n/a';
+            const channelId = Number(log?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const frameCount = Number(log?.frame_count || 0);
+            const model = String(log?.model || '').trim();
+            const summary = String(log?.summary || '').trim();
+            const nl = String.fromCharCode(10);
+            const header = [
+                `Channel: ${channelId}`,
+                `Timestamp: ${tsLabel}`,
+                `Frames: ${frameCount || 'n/a'}`,
+                `Model: ${model || 'n/a'}`,
+            ].join(nl);
+            return `${header}${nl}${nl}${summary}`;
+        }
+
+        async function copyLuxriotSummaryFromLog(logIndex, triggerBtn = null) {
+            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
+                setLuxriotStatus('Invalid summary selection', true);
+                return;
+            }
+            const log = luxriotSummaryLogCache[idx] || {};
+            const summary = String(log.summary || '').trim();
+            if (!summary) {
+                setLuxriotStatus('Summary is empty', true);
+                return;
+            }
+            try {
+                await copyTextToClipboard(formatLuxriotSummaryExport(log));
+                setLuxriotStatus('Summary copied');
+                if (triggerBtn) {
+                    const original = triggerBtn.textContent;
+                    triggerBtn.textContent = 'Copied';
+                    setTimeout(() => {
+                        if (triggerBtn) triggerBtn.textContent = original || 'Copy';
+                    }, 1200);
+                }
+            } catch (err) {
+                setLuxriotStatus('Failed to copy summary', true);
+            }
+        }
+
+        function exportLuxriotSummaryFromLog(logIndex) {
+            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
+                setLuxriotStatus('Invalid summary selection', true);
+                return;
+            }
+            const log = luxriotSummaryLogCache[idx] || {};
+            const createdRaw = Number(log?.created_at);
+            const stamp = Number.isFinite(createdRaw)
+                ? new Date(createdRaw * 1000).toISOString().replace(/[:]/g, '-')
+                : `entry-${idx + 1}`;
+            const channelId = Number(log?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
+            const filename = `luxriot_summary_ch${channelId}_${stamp}.txt`;
+            downloadTextFile(filename, formatLuxriotSummaryExport(log));
+            setLuxriotStatus(`Exported ${filename}`);
+        }
+
+        function toggleLuxriotSummaryCollapse(logIndex) {
+            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
+            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
+                return;
+            }
+            const channelId = getSelectedSummaryChannel();
+            const log = luxriotSummaryLogCache[idx] || {};
+            const key = luxriotSummaryLogKey(log, idx);
+            const nextState = !isSummaryCollapsed(channelId, key);
+            setSummaryCollapsed(channelId, key, nextState);
+            renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
+        }
+
+        async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+            if (!channelId) return;
+            if (!luxriotSummaryAutoRefresh && !force) return;
+            try {
+                const params = buildSummaryQueryParams(channelId);
+                params.set('limit', '240');
+                const resp = await fetch(`/luxriot/session?${params.toString()}`);
+                const data = await resp.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                syncSummaryRunSelectOptions(data.runs, data.selected_run);
+                syncSummaryFiltersFromResponse(data);
+                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
+                if (
+                    allowRunFallback
+                    && !Boolean(data.running)
+                    && (selectedRun === 'live' || selectedRun === 'latest')
+                ) {
+                    luxriotSummaryRunFilter = 'all';
+                    if (luxriotSummaryRunSelect) {
+                        luxriotSummaryRunSelect.value = 'all';
+                    }
+                    refreshLuxriotSummaryView(channelId, true, false);
+                    return;
+                }
+                renderLuxriotSummaries(data.logs || [], channelId);
+                const historyCount = Number(data.archived_log_count || 0);
+                const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
+                const stateLabel = data.running ? 'live' : 'stopped';
+                const channelLabel = getLuxriotChannelLabel(channelId);
+                const detailParts = [channelLabel, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
+                if (historyCount > 0) detailParts.push(`hist ${historyCount}`);
+                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) detailParts.push(`q ${data.pending_frames}`);
+                if (data.last_error) detailParts.push('err');
+                setLuxriotSummaryMeta(withSummaryUpdatedMeta(detailParts.join(' · ')), Boolean(data.last_error));
                 let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
                 if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
                     baseStatus += ` · ${data.pending_frames} frames queued`;
@@ -2796,13 +6149,18 @@ def home():
                     luxriotStatusLabel.title = data.last_error;
                 }
             } catch (err) {
+                setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
                 setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
             }
         }
 
-        function startLuxriotSummaryPoll(channelId = getSelectedLuxriotChannel()) {
+        function startLuxriotSummaryPoll() {
             stopLuxriotSummaryPoll();
-            luxriotSummaryTimer = setInterval(() => refreshLuxriotSummaries(channelId), 8000);
+            luxriotSummaryTimer = setInterval(() => {
+                const channelId = getSelectedSummaryChannel();
+                refreshLuxriotSummaryView(channelId);
+                refreshLuxriotStreams();
+            }, 8000);
         }
 
         async function startLuxriotCapture() {
@@ -2836,8 +6194,14 @@ def home():
                     throw new Error(data.error || 'Luxriot start failed');
                 }
                 setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
-                refreshLuxriotSummaries(channelId);
-                startLuxriotSummaryPoll(channelId);
+                luxriotSummaryChannel = channelId;
+                luxriotSummaryFollowLive = true;
+                syncLuxriotSummaryChannelSelect();
+                updateSummaryControlsUI();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(channelId, true);
+                refreshLuxriotStreams();
+                startLuxriotSummaryPoll();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             } finally {
@@ -2858,8 +6222,9 @@ def home():
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                stopLuxriotSummaryPoll();
                 setLuxriotStatus('Summaries stopped');
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             }
@@ -2880,8 +6245,15 @@ def home():
                 }
                 setLuxriotStatus('Buffer flushed');
                 if (data.status) {
-                    renderLuxriotSummaries(data.status.logs || []);
+                    if (getSelectedSummaryChannel() === channelId) {
+                        if (isRollupViewActive()) {
+                            await refreshLuxriotSummaryView(channelId, true);
+                        } else {
+                            renderLuxriotSummaries(data.status.logs || [], channelId);
+                        }
+                    }
                 }
+                refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             }
@@ -2891,8 +6263,13 @@ def home():
             if (luxriotInitialized) return;
             luxriotInitialized = true;
             await fetchLuxriotChannels();
+            updateSummaryControlsUI();
+            setSummaryUnread(0);
+            syncLuxriotSummaryChannelSelect();
             startLuxriotPreview();
-            refreshLuxriotSummaries();
+            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            refreshLuxriotStreams();
+            startLuxriotSummaryPoll();
         }
 
         const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
@@ -2912,16 +6289,23 @@ def home():
             }
         }
         syncProbeChannelSelect();
+        syncSummaryRunSelectOptions([], luxriotSummaryRunFilter);
+        applySummaryFiltersFromInputs();
+        setSummaryBaseLevel(luxriotSummaryLevel);
 
         setMode(currentMode);
         
         // Settings modal elements
+        const authTokenBtn = document.getElementById('authTokenBtn');
         const settingsBtn = document.getElementById('settingsBtn');
         const settingsModal = document.getElementById('settingsModal');
         const closeSettingsBtn = document.getElementById('closeSettings');
         const saveSettingsBtn = document.getElementById('saveSettings');
         const resetSettingsBtn = document.getElementById('resetSettings');
         const settingsStatus = document.getElementById('settingsStatus');
+        const envEditorInput = document.getElementById('envEditor');
+        const reloadEnvBtn = document.getElementById('reloadEnvBtn');
+        const saveEnvBtn = document.getElementById('saveEnvBtn');
         const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
         const qualityValue = document.getElementById('qualityValue');
         const embedderSelect = document.getElementById('embedder');
@@ -2954,6 +6338,18 @@ def home():
         const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
         
         let segmentThreshold = 0.7;
+
+        function toBool(value, fallback = false) {
+            if (typeof value === 'boolean') return value;
+            if (value === null || value === undefined) return fallback;
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+                if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+                return fallback;
+            }
+            return Boolean(value);
+        }
 
         function clampSegmentThreshold(value) {
             const numeric = Number.parseFloat(value);
@@ -2990,6 +6386,32 @@ def home():
                 return `<div class="metric-line"><span class="metric-label">Comments:</span> ${count}${trimmed ? ` <span class="metric-note">Latest: ${trimmed}</span>` : ''}</div>`;
             }
 
+            if (result && result.is_detection) {
+                const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
+                const channel = result.channel_id !== undefined && result.channel_id !== null ? String(result.channel_id) : 'n/a';
+                const sev = result.severity ? escapeHtml(String(result.severity)) : 'n/a';
+                const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
+                const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
+                const margin = Number.isFinite(result.margin) ? result.margin.toFixed(3) : 'n/a';
+                const similarity = Number.isFinite(result.similarity) ? formatPercent(result.similarity) : null;
+                const mode = String(result.search_mode || '').trim().toUpperCase();
+                const clipSearch = Number.isFinite(result?.fusion?.clip_similarity) ? formatPercent(result.fusion.clip_similarity) : null;
+                const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
+                const lines = [
+                    `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
+                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channel)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
+                    `<div class="metric-line"><span class="metric-label">Probe P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
+                ];
+                if (similarity) {
+                    const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
+                    lines.push(`<div class="metric-line"><span class="metric-label">Search:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
+                }
+                if (clipSearch || dinoSearch) {
+                    lines.push(`<div class="metric-line"><span class="metric-label">Search C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
+                }
+                return lines.join('');
+            }
+
             const lines = [];
             lines.push(`<div class="metric-line"><span class="metric-label">Final:</span> ${formatPercent(result.similarity)}</div>`);
 
@@ -3024,11 +6446,268 @@ def home():
 
             return lines.join('');
         }
+
+        function buildResultBadges(result) {
+            if (!result || typeof result !== 'object') return '';
+            const badges = [];
+            if (result.is_detection) {
+                badges.push({ label: 'Detection', classes: '' });
+            }
+
+            const modeRaw = String(result.search_mode || '').trim().toLowerCase();
+            if (modeRaw) {
+                if (modeRaw === 'clip') {
+                    badges.push({ label: 'CLIP', classes: 'mode-clip' });
+                } else if (modeRaw === 'fusion') {
+                    badges.push({ label: 'Fusion', classes: 'mode-fusion' });
+                } else if (modeRaw === 'dino') {
+                    badges.push({ label: 'DINO', classes: 'mode-dino' });
+                } else {
+                    badges.push({ label: modeRaw, classes: '' });
+                }
+            }
+
+            const dinoFallback = Boolean(result.dino_fallback || result?.fusion?.dino_fallback);
+            if (dinoFallback) {
+                badges.push({ label: 'DINO fallback', classes: 'warning' });
+            }
+
+            if (!badges.length) return '';
+            return `<div class="result-badges">${badges.map((badge) => {
+                const cls = badge.classes ? ` result-badge ${badge.classes}` : 'result-badge';
+                return `<span class="${cls}">${escapeHtml(String(badge.label || ''))}</span>`;
+            }).join('')}</div>`;
+        }
+
+        function decorateDetectionSearchResults(results, modeUsed = '', modeRequested = '') {
+            return (results || []).map((raw) => {
+                if (!raw || typeof raw !== 'object') return raw;
+                const item = { ...raw };
+                if (modeUsed && !item.search_mode) {
+                    item.search_mode = String(modeUsed).trim().toLowerCase();
+                }
+                if (modeRequested && !item.mode_requested) {
+                    item.mode_requested = String(modeRequested).trim().toLowerCase();
+                }
+                if (item.dino_fallback === undefined && item.fusion && typeof item.fusion === 'object') {
+                    item.dino_fallback = Boolean(item.fusion.dino_fallback);
+                }
+                return item;
+            });
+        }
+
+        function setArchiveDetectionsMeta(text, isError = false) {
+            if (!archiveDetectionsMeta) return;
+            archiveDetectionsMeta.textContent = text;
+            archiveDetectionsMeta.style.color = isError ? '#ff8e8e' : '#9aa0ad';
+        }
+
+        function updateArchiveDetectionsNav() {
+            if (archiveDetectionsPrevBtn) {
+                archiveDetectionsPrevBtn.disabled = archiveDetectionsOffset <= 0;
+            }
+            if (archiveDetectionsNextBtn) {
+                archiveDetectionsNextBtn.disabled = !archiveDetectionsHasMore;
+            }
+        }
+
+        function applySelectOptions(selectEl, options, selected = '') {
+            if (!selectEl) return;
+            const previous = selected || selectEl.value || '';
+            selectEl.innerHTML = options.map((opt) => `<option value="${escapeHtml(String(opt.value))}">${escapeHtml(String(opt.label))}</option>`).join('');
+            const hasPrevious = options.some((opt) => String(opt.value) === String(previous));
+            selectEl.value = hasPrevious ? String(previous) : String(options[0]?.value || '');
+        }
+
+        async function refreshArchiveChannelFilter() {
+            if (!archiveChannelFilter) return;
+            try {
+                const response = await fetch('/luxriot/channels');
+                const data = await parseApiJson(response, 'Failed to load channels');
+                const channels = Array.isArray(data.channels) ? data.channels : [];
+                const options = [{ value: '', label: 'All streams' }];
+                channels.forEach((channel) => {
+                    const id = channel.channel_id ?? channel.id;
+                    if (id === undefined || id === null) return;
+                    const label = channel.name ? `${id} · ${channel.name}` : String(id);
+                    options.push({ value: String(id), label });
+                });
+                applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
+            } catch (_) {
+                applySelectOptions(archiveChannelFilter, [{ value: '', label: 'All streams' }], '');
+            }
+        }
+
+        async function refreshArchiveProbeFilter() {
+            if (!archiveProbeFilter) return;
+            try {
+                const params = new URLSearchParams({ hours: '168', limit: '300' });
+                const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+                if (channelId) {
+                    params.set('channel_id', channelId);
+                }
+                const response = await fetch(`/detections/summary?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load detection probes');
+                const summary = Array.isArray(data.summary) ? data.summary : [];
+                const options = [{ value: '', label: 'All probes' }];
+                summary.forEach((item) => {
+                    const id = String(item.probe_id || '').trim();
+                    if (!id) return;
+                    const labelBase = item.probe_name ? String(item.probe_name) : id;
+                    const label = `${labelBase} (${item.hit_count || 0})`;
+                    options.push({ value: id, label });
+                });
+                applySelectOptions(archiveProbeFilter, options, archiveProbeFilter.value);
+            } catch (_) {
+                applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All probes' }], '');
+            }
+        }
+
+        async function refreshArchiveFilters() {
+            archiveDetectionsOffset = 0;
+            archiveDetectionsHasMore = false;
+            updateArchiveDetectionsNav();
+            await Promise.all([refreshArchiveChannelFilter(), refreshArchiveProbeFilter()]);
+        }
+
+        function normalizeDetectionResults(detections) {
+            return (detections || []).map((det, idx) => {
+                const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
+                const probeLabel = det?.probe_name || det?.probe_id || 'probe';
+                const tsLabel = ts ? new Date(ts).toLocaleString() : 'n/a';
+                return {
+                    filename: `${probeLabel} · ${tsLabel}`,
+                    path: det?.image_path || det?.payload?.image_path || '',
+                    thumbnail: det?.thumbnail || '',
+                    is_detection: true,
+                    detection_id: det?.id,
+                    timestamp_ms: ts,
+                    channel_id: det?.channel_id,
+                    probe_id: det?.probe_id,
+                    probe_name: det?.probe_name,
+                    severity: det?.severity,
+                    pos_score: Number.isFinite(det?.pos_score) ? det.pos_score : _coerceNumeric(det?.pos_score),
+                    neg_score: Number.isFinite(det?.neg_score) ? det.neg_score : _coerceNumeric(det?.neg_score),
+                    margin: Number.isFinite(det?.margin) ? det.margin : _coerceNumeric(det?.margin),
+                    source: det?.source || '',
+                    _raw_index: idx,
+                };
+            });
+        }
+
+        function _coerceNumeric(value) {
+            const parsed = Number.parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : 0;
+        }
+
+        async function loadDetectionsArchive(resetOffset = true) {
+            if (!resultsContainer) return;
+            if (resetOffset) {
+                archiveDetectionsOffset = 0;
+            }
+            archiveDetectionsHasMore = false;
+            updateArchiveDetectionsNav();
+            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
+            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+            const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
+            const params = new URLSearchParams();
+            const parsedHours = Number.parseFloat(hoursRaw);
+            if (Number.isFinite(parsedHours) && parsedHours > 0) {
+                params.set('hours', String(parsedHours));
+            } else {
+                params.set('hours', '0');
+            }
+            if (channelId) params.set('channel_id', channelId);
+            if (probeId) params.set('probe_id', probeId);
+            const limit = Number.parseInt(limitRaw, 10);
+            params.set('limit', String(Number.isFinite(limit) ? limit : 24));
+            params.set('offset', String(Math.max(0, archiveDetectionsOffset)));
+
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading detections archive...</div>';
+            setArchiveDetectionsMeta('Loading detections...');
+            try {
+                const response = await fetch(`/detections/list?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load detections archive');
+                const detections = Array.isArray(data.detections) ? data.detections : [];
+                archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
+                archiveDetectionsHasMore = Boolean(data.has_more);
+                const mapped = normalizeDetectionResults(detections);
+                if (!mapped.length) {
+                    resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
+                    setArchiveDetectionsMeta('No detections found for selected filters.');
+                    updateArchiveDetectionsNav();
+                    return;
+                }
+                displayResults(mapped);
+                const shownFrom = archiveDetectionsOffset + 1;
+                const shownTo = archiveDetectionsOffset + mapped.length;
+                setArchiveDetectionsMeta(`Showing detections ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}.`);
+                updateArchiveDetectionsNav();
+            } catch (err) {
+                resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
+                setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+            }
+        }
+
+        function buildDetectionSearchFilters() {
+            const payload = {};
+            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
+            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+            if (channelId) payload.channel_id = channelId;
+            if (probeId) payload.probe_id = probeId;
+            const parsedHours = Number.parseFloat(hoursRaw);
+            if (Number.isFinite(parsedHours)) {
+                payload.hours = parsedHours;
+            } else {
+                payload.hours = 24;
+            }
+            return payload;
+        }
+
+        function isDetectionsScope() {
+            return searchScopeSelect && searchScopeSelect.value === 'detections';
+        }
+
+        function updateSearchScopeUI() {
+            if (!searchScopeSelect) return;
+            if (isDetectionsScope()) {
+                if (searchInput) {
+                    searchInput.placeholder = 'Describe detection scene (filtered by stream/probe/time)...';
+                }
+                setArchiveDetectionsMeta('Detections scope active: text/image search runs over filtered detection shards.');
+            } else if (searchInput) {
+                searchInput.placeholder = "Describe what you're looking for...";
+            }
+        }
+
+        if (authTokenBtn) {
+            authTokenBtn.addEventListener('click', () => {
+                const existing = getAdminToken();
+                const entered = window.prompt(
+                    'Set admin token (stored in this browser for mutating API calls). Leave empty to clear.',
+                    existing
+                );
+                if (entered === null) {
+                    return;
+                }
+                saveAdminToken(entered);
+                const hasToken = !!getAdminToken();
+                authTokenBtn.style.opacity = hasToken ? '1' : '0.6';
+                indexStatus.textContent = hasToken ? 'Admin token saved in browser.' : 'Admin token cleared.';
+                indexStatus.className = hasToken ? 'status success' : 'status warning';
+            });
+            authTokenBtn.style.opacity = getAdminToken() ? '1' : '0.6';
+        }
         
         // Settings modal functionality
         settingsBtn.addEventListener('click', () => {
             settingsModal.style.display = 'block';
             loadSettings();
+            loadEnvEditor();
         });
         
         closeSettingsBtn.addEventListener('click', () => {
@@ -3041,6 +6720,29 @@ def home():
                 settingsModal.style.display = 'none';
             }
         });
+
+        if (probeEditBtn && probeEditorModal) {
+            probeEditBtn.addEventListener('click', () => {
+                probeEditorModal.style.display = 'block';
+            });
+        }
+        if (closeProbeEditorBtn && probeEditorModal) {
+            closeProbeEditorBtn.addEventListener('click', () => {
+                probeEditorModal.style.display = 'none';
+            });
+        }
+        if (probeEditorCloseBtn && probeEditorModal) {
+            probeEditorCloseBtn.addEventListener('click', () => {
+                probeEditorModal.style.display = 'none';
+            });
+        }
+        if (probeEditorModal) {
+            probeEditorModal.addEventListener('click', (e) => {
+                if (e.target === probeEditorModal) {
+                    probeEditorModal.style.display = 'none';
+                }
+            });
+        }
         
         // Thumbnail quality slider update
         thumbnailQualitySlider.addEventListener('input', (e) => {
@@ -3071,6 +6773,46 @@ def home():
             refreshSegmentsPanels();
         });
 
+        async function loadEnvEditor() {
+            if (!envEditorInput) return;
+            try {
+                const response = await fetch('/settings/env');
+                const data = await response.json();
+                if (data.success) {
+                    envEditorInput.value = String(data.envText || '');
+                } else {
+                    showSettingsStatus('Error loading environment variables: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showSettingsStatus('Error loading environment variables: ' + error.message, 'error');
+            }
+        }
+
+        async function saveEnvEditor() {
+            if (!envEditorInput || !saveEnvBtn) return;
+            setButtonBusy(saveEnvBtn, true);
+            try {
+                const response = await fetch('/settings/env', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        envText: envEditorInput.value || ''
+                    })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showSettingsStatus(data.message || 'Environment variables saved.', 'success');
+                    await loadEnvEditor();
+                } else {
+                    showSettingsStatus('Error saving environment variables: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showSettingsStatus('Error saving environment variables: ' + error.message, 'error');
+            } finally {
+                setButtonBusy(saveEnvBtn, false);
+            }
+        }
+
         // Load current settings
         async function loadSettings() {
             try {
@@ -3081,9 +6823,9 @@ def home():
                     const settings = data.settings;
                     document.getElementById('host').value = settings.host;
                     document.getElementById('port').value = settings.port;
-                    document.getElementById('debug').checked = settings.debug;
+                    document.getElementById('debug').checked = toBool(settings.debug, false);
                     embedderSelect.value = settings.embedder || 'clip';
-                    fusionEnabledInput.checked = Boolean(settings.fusionEnabled);
+                    fusionEnabledInput.checked = toBool(settings.fusionEnabled, false);
                     const parsedFusionAlpha = parseFloat(settings.fusionAlpha);
                     const fusionAlpha = Number.isFinite(parsedFusionAlpha) ? parsedFusionAlpha : 0.7;
                     fusionAlphaInput.value = fusionAlpha.toFixed(2);
@@ -3092,7 +6834,7 @@ def home():
                     dinoWeightsInput.value = settings.dinoWeightsPath || '';
                     indexModeSelect.value = settings.indexMode || 'clip';
                     updateFusionUI(fusionEnabledInput.checked);
-                    rerankEnabledInput.checked = Boolean(settings.rerankEnabled);
+                    rerankEnabledInput.checked = toBool(settings.rerankEnabled, false);
                     const parsedRerankTopK = parseInt(settings.rerankTopK, 10);
                     rerankTopKInput.value = Number.isFinite(parsedRerankTopK) ? parsedRerankTopK : 50;
                     updateRerankUI(rerankEnabledInput.checked);
@@ -3113,7 +6855,7 @@ def home():
                     if (luxriotSnapshotIntervalInput) luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
                     if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
                     if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
-                    if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = Boolean(settings.luxriotAutoBookmarks);
+                    if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = toBool(settings.luxriotAutoBookmarks, false);
                     if (settings.luxriotSeverityMap) {
                         if (luxriotSevInfoInput) luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
                         if (luxriotSevLowInput) luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
@@ -3122,7 +6864,7 @@ def home():
                         if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
                     }
                     applyEmbedderUI(embedderSelect.value);
-                    segmentsEnabledInput.checked = Boolean(settings.segmentsEnabled);
+                    segmentsEnabledInput.checked = toBool(settings.segmentsEnabled, segmentsEnabledInput.checked);
                     segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
                     const thresholdRaw = clampSegmentThreshold(settings.segmentThreshold);
                     const pctValue = Math.round(thresholdRaw * 100);
@@ -3228,8 +6970,7 @@ def home():
                     return;
                 }
                 
-                saveSettingsBtn.disabled = true;
-                saveSettingsBtn.textContent = 'Saving...';
+                setButtonBusy(saveSettingsBtn, true);
                 
                 const response = await fetch('/settings', {
                     method: 'POST',
@@ -3248,8 +6989,7 @@ def home():
             } catch (error) {
                 showSettingsStatus('Error saving settings: ' + error.message, 'error');
             } finally {
-                saveSettingsBtn.disabled = false;
-                saveSettingsBtn.textContent = 'Save Settings';
+                setButtonBusy(saveSettingsBtn, false);
             }
         });
         
@@ -3302,6 +7042,18 @@ def home():
                 applyEmbedderUI(embedderSelect.value);
             }
         });
+
+        if (reloadEnvBtn) {
+            reloadEnvBtn.addEventListener('click', () => {
+                loadEnvEditor();
+            });
+        }
+
+        if (saveEnvBtn) {
+            saveEnvBtn.addEventListener('click', () => {
+                saveEnvEditor();
+            });
+        }
 
         // Show settings status message
         function showSettingsStatus(message, type) {
@@ -3363,18 +7115,13 @@ def home():
                 row.style.display = embedder === 'dino' ? 'none' : 'flex';
             });
 
-            if (embedder === 'dino') {
-                textModeBtn.disabled = true;
-                textModeBtn.title = 'Text search is only available with the CLIP backend.';
-                textModeBtn.classList.remove('active');
-                setMode('image');
-            } else {
-                textModeBtn.disabled = false;
-                textModeBtn.title = '';
-                if (currentMode === 'text') {
-                    setMode('text');
-                }
-            }
+            const textSearchAvailable = embedder !== 'dino';
+            searchInput.disabled = !textSearchAvailable;
+            searchBtn.disabled = !textSearchAvailable;
+            searchInput.placeholder = textSearchAvailable
+                ? "Describe what you're looking for..."
+                : 'Text search requires CLIP or Fusion backend.';
+            searchBtn.title = textSearchAvailable ? '' : 'Text search is disabled when backend is DINO.';
         }
 
         embedderSelect.addEventListener('change', (event) => {
@@ -3403,14 +7150,316 @@ def home():
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
         }
         if (luxriotRefreshSummariesBtn) {
-            luxriotRefreshSummariesBtn.addEventListener('click', () => refreshLuxriotSummaries());
+            luxriotRefreshSummariesBtn.addEventListener('click', async () => {
+                setSummaryRefreshButtonState('busy');
+                setLuxriotStatus('Refreshing summaries...');
+                let queued = false;
+                try {
+                    const started = await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                    queued = started === false;
+                    if (queued) {
+                        setSummaryRefreshButtonState('queued');
+                    }
+                } finally {
+                    if (queued) {
+                        setTimeout(() => setSummaryRefreshButtonState('idle'), 800);
+                    } else {
+                        setSummaryRefreshButtonState('idle');
+                    }
+                }
+            });
+        }
+        if (luxriotSummaryChannelSelect) {
+            luxriotSummaryChannelSelect.addEventListener('change', () => {
+                luxriotSummaryChannel = getSelectedSummaryChannel();
+                setSummaryBaseLevel(luxriotSummaryLevel);
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(luxriotSummaryChannel, true);
+            });
+        }
+        if (luxriotSummaryRunSelect) {
+            luxriotSummaryRunSelect.addEventListener('change', () => {
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryRangeSelect) {
+            luxriotSummaryRangeSelect.addEventListener('change', () => {
+                luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
+                syncSummaryRangeUI();
+                if (luxriotSummaryRangePreset === 'custom') {
+                    updateSummaryControlsUI();
+                    return;
+                }
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryLevelSelect) {
+            luxriotSummaryLevelSelect.addEventListener('change', () => {
+                setSummaryBaseLevel(luxriotSummaryLevelSelect.value);
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryApplyFiltersBtn) {
+            luxriotSummaryApplyFiltersBtn.addEventListener('click', () => {
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryFromInput) {
+            luxriotSummaryFromInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryToInput) {
+            luxriotSummaryToInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                applySummaryFiltersFromInputs();
+                setSummaryUnread(0);
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            });
+        }
+        if (luxriotSummaryBackBtn) {
+            luxriotSummaryBackBtn.addEventListener('click', () => {
+                const ctx = popSummaryRollupContext();
+                if (!ctx) {
+                    updateSummaryControlsUI();
+                    return;
+                }
+                setSummaryUnread(0);
+                const channelId = getSelectedSummaryChannel();
+                const cached = luxriotSummaryRollupCache[channelId];
+                if (isRollupViewActive() && cached) {
+                    renderLuxriotRollups(cached, channelId);
+                    return;
+                }
+                refreshLuxriotSummaryView(channelId, true);
+            });
+        }
+        if (luxriotSummaryFollowBtn) {
+            luxriotSummaryFollowBtn.addEventListener('click', () => {
+                const enableLive = !(luxriotSummaryAutoRefresh && luxriotSummaryFollowLive);
+                luxriotSummaryAutoRefresh = enableLive;
+                luxriotSummaryFollowLive = enableLive;
+                updateSummaryControlsUI();
+                if (enableLive) {
+                    setSummaryUnread(0);
+                    scrollSummaryToLatest();
+                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                }
+            });
+        }
+        if (luxriotSummaryPauseBtn) {
+            luxriotSummaryPauseBtn.addEventListener('click', () => {
+                luxriotSummaryAutoRefresh = !luxriotSummaryAutoRefresh;
+                updateSummaryControlsUI();
+                if (luxriotSummaryAutoRefresh) {
+                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                }
+            });
+        }
+        if (luxriotSummaryViewBtn) {
+            luxriotSummaryViewBtn.addEventListener('click', () => {
+                setSummaryCompactMode(!luxriotSummaryCompactMode);
+                updateSummaryControlsUI();
+                if (isRollupViewActive()) {
+                    const channelId = getSelectedSummaryChannel();
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                } else {
+                    renderLuxriotSummaries(luxriotSummaryLogCache, getSelectedSummaryChannel());
+                }
+            });
+        }
+        if (luxriotSummaryCollapseAllBtn) {
+            luxriotSummaryCollapseAllBtn.addEventListener('click', () => {
+                const channelId = getSelectedSummaryChannel();
+                const allCollapsed = areAllSummariesCollapsed(channelId);
+                collapseAllSummariesForChannel(channelId, !allCollapsed);
+                if (isRollupViewActive()) {
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                } else {
+                    renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
+                }
+            });
+        }
+        if (luxriotSummaryJumpBtn) {
+            luxriotSummaryJumpBtn.addEventListener('click', () => {
+                if (isRollupViewActive()) return;
+                luxriotSummaryFollowLive = true;
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                scrollSummaryToLatest();
+            });
+        }
+        if (luxriotSummaries) {
+            luxriotSummaries.addEventListener('scroll', () => {
+                if (isRollupViewActive()) return;
+                if (!luxriotSummaryFollowLive) return;
+                if (!isSummaryNearBottom()) {
+                    luxriotSummaryFollowLive = false;
+                    updateSummaryControlsUI();
+                }
+            });
+        }
+        if (luxriotRefreshStreamsBtn) {
+            luxriotRefreshStreamsBtn.addEventListener('click', () => refreshLuxriotStreams());
+        }
+        if (luxriotStopAllVideoBtn) {
+            luxriotStopAllVideoBtn.addEventListener('click', () => stopAllLuxriotStreams('video'));
+        }
+        if (luxriotStopAllAnalyticsBtn) {
+            luxriotStopAllAnalyticsBtn.addEventListener('click', () => stopAllLuxriotStreams('analytics'));
+        }
+        if (luxriotSummaries) {
+            luxriotSummaries.addEventListener('click', (event) => {
+                const target = event.target;
+                if (!(target instanceof Element)) return;
+                const rollupCollapseBtn = target.closest('[data-luxriot-rollup-collapse]');
+                if (rollupCollapseBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupCollapseBtn.dataset.luxriotRollupCollapse || '', 10);
+                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+                    event.preventDefault();
+                    const row = luxriotSummaryRollupRows[idx] || {};
+                    const channelId = getSelectedSummaryChannel();
+                    const key = rollupSummaryKey(row, idx);
+                    const nextState = !isSummaryCollapsed(channelId, key);
+                    setSummaryCollapsed(channelId, key, nextState);
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    }
+                    return;
+                }
+                const rollupCopyBtn = target.closest('[data-luxriot-rollup-copy]');
+                if (rollupCopyBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupCopyBtn.dataset.luxriotRollupCopy || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    copyLuxriotRollupFromRow(idx, rollupCopyBtn);
+                    return;
+                }
+                const rollupExportBtn = target.closest('[data-luxriot-rollup-export]');
+                if (rollupExportBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupExportBtn.dataset.luxriotRollupExport || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    exportLuxriotRollupFromRow(idx);
+                    return;
+                }
+                const rollupDrillBtn = target.closest('[data-luxriot-rollup-drill]');
+                if (rollupDrillBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(rollupDrillBtn.dataset.luxriotRollupDrill || '', 10);
+                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+                    const row = luxriotSummaryRollupRows[idx] || {};
+                    const sourceLevel = String(row?.source_level || '').trim();
+                    const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
+                    if (!sourceLevel || !sourceIds.length) return;
+                    event.preventDefault();
+                    pushSummaryRollupContext(sourceLevel, sourceIds, formatRollupRange(row?.window_start, row?.window_end));
+                    setSummaryUnread(0);
+                    const channelId = getSelectedSummaryChannel();
+                    const cached = luxriotSummaryRollupCache[channelId];
+                    if (cached) {
+                        renderLuxriotRollups(cached, channelId);
+                    } else {
+                        refreshLuxriotSummaryView(channelId, true);
+                    }
+                    return;
+                }
+                const collapseBtn = target.closest('[data-luxriot-collapse]');
+                if (collapseBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(collapseBtn.dataset.luxriotCollapse || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    toggleLuxriotSummaryCollapse(idx);
+                    return;
+                }
+                const copyBtn = target.closest('[data-luxriot-copy]');
+                if (copyBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(copyBtn.dataset.luxriotCopy || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    copyLuxriotSummaryFromLog(idx, copyBtn);
+                    return;
+                }
+                const exportBtn = target.closest('[data-luxriot-export]');
+                if (exportBtn instanceof HTMLButtonElement) {
+                    const idx = parseInt(exportBtn.dataset.luxriotExport || '', 10);
+                    if (!Number.isFinite(idx)) return;
+                    event.preventDefault();
+                    exportLuxriotSummaryFromLog(idx);
+                    return;
+                }
+                const bookmarkBtn = target.closest('[data-luxriot-bookmark]');
+                if (!(bookmarkBtn instanceof HTMLButtonElement)) return;
+                const idx = parseInt(bookmarkBtn.dataset.luxriotBookmark || '', 10);
+                if (!Number.isFinite(idx)) return;
+                event.preventDefault();
+                sendLuxriotBookmarkFromLog(idx, bookmarkBtn);
+            });
+        }
+        if (luxriotStreams) {
+            luxriotStreams.addEventListener('click', (event) => {
+                const target = event.target;
+                if (!(target instanceof Element)) return;
+                const summaryBtn = target.closest('[data-summary-channel]');
+                if (summaryBtn instanceof HTMLButtonElement) {
+                    const summaryChannelId = parseInt(summaryBtn.dataset.summaryChannel || '', 10);
+                    if (Number.isFinite(summaryChannelId)) {
+                        luxriotSummaryChannel = summaryChannelId;
+                        syncLuxriotSummaryChannelSelect();
+                        setSummaryBaseLevel(luxriotSummaryLevel);
+                        setSummaryUnread(0);
+                        luxriotSummaryFollowLive = true;
+                        updateSummaryControlsUI();
+                        refreshLuxriotSummaryView(summaryChannelId, true);
+                        if (!isRollupViewActive()) {
+                            scrollSummaryToLatest();
+                        }
+                    }
+                    event.preventDefault();
+                    return;
+                }
+                const button = target.closest('[data-stream-stop]');
+                if (!(button instanceof HTMLButtonElement)) return;
+                const channelId = parseInt(button.dataset.streamStop || '', 10);
+                const streamType = (button.dataset.streamType || '').trim().toLowerCase();
+                const streamAction = (button.dataset.streamAction || '').trim().toLowerCase();
+                if (!Number.isFinite(channelId) || !streamType) return;
+                event.preventDefault();
+                if (streamType === 'analytics' && streamAction === 'resume') {
+                    resumeLuxriotProbeCapture(channelId);
+                } else {
+                    stopLuxriotStream(channelId, streamType);
+                }
+            });
         }
         if (luxriotChannelSelect) {
             luxriotChannelSelect.addEventListener('change', () => {
                 luxriotActiveChannel = getSelectedLuxriotChannel();
                 syncProbeChannelSelect();
+                syncLuxriotSummaryChannelSelect();
+                setSummaryBaseLevel(luxriotSummaryLevel);
                 startLuxriotPreview();
-                refreshLuxriotSummaries();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                refreshLuxriotStreams();
             });
         }
         
@@ -3472,7 +7521,7 @@ def home():
             ensurePairsSeed();
             const rows = probePairsState.map((row, idx) => {
                 const canRemove = probePairsState.length > 1;
-                const removeBtn = canRemove ? `<button class="feature-btn" data-remove="${idx}" style="width:54px;">×</button>` : '<div class="probe-pair-idx">–</div>';
+                const removeBtn = canRemove ? `<button class="feature-btn probe-remove-btn" data-remove="${idx}">×</button>` : '<div class="probe-pair-idx">–</div>';
                 return `
                     <div class="probe-pair-row" data-idx="${idx}">
                         <div class="probe-pair-idx">${idx + 1}.</div>
@@ -3487,7 +7536,7 @@ def home():
                     <div></div>
                     <div>Positive Examples:</div>
                     <div>Negative Examples:</div>
-                    <div style="text-align:center;">&nbsp;</div>
+                    <div class="probe-pairs-spacer">&nbsp;</div>
                 </div>
                 ${rows}
             `;
@@ -3502,6 +7551,55 @@ def home():
                 probeImageThumb.src = '';
                 probeImageOverlay.style.display = 'flex';
             }
+            if (probeImagePanel) {
+                probeImagePanel.classList.toggle('no-image', !base64);
+            }
+            if (probeImageFileName) {
+                const label = probeImageState?.name ? String(probeImageState.name) : 'No file selected';
+                probeImageFileName.textContent = label;
+                probeImageFileName.title = probeImageState?.name ? String(probeImageState.name) : '';
+            }
+        }
+
+        function setArchiveUploadName(file) {
+            if (!imageUploadName) return;
+            const label = file?.name ? String(file.name) : 'No file selected';
+            imageUploadName.textContent = label;
+            imageUploadName.title = file?.name ? String(file.name) : '';
+            imageUploadName.classList.toggle('is-hidden', !file?.name);
+        }
+
+        function setArchiveQueryPreview(file) {
+            if (!queryImagePreview || !queryImageThumb) return;
+            if (!file) {
+                queryImageThumb.src = '';
+                queryImagePreview.classList.add('is-empty');
+                queryImagePreview.classList.add('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = () => {
+                const result = typeof reader.result === 'string' ? reader.result : '';
+                if (!result) {
+                    queryImageThumb.src = '';
+                    queryImagePreview.classList.add('is-empty');
+                    queryImagePreview.classList.add('is-hidden');
+                    if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+                    return;
+                }
+                queryImageThumb.src = result;
+                queryImagePreview.classList.remove('is-empty');
+                queryImagePreview.classList.remove('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.add('has-image');
+            };
+            reader.onerror = () => {
+                queryImageThumb.src = '';
+                queryImagePreview.classList.add('is-empty');
+                queryImagePreview.classList.add('is-hidden');
+                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
+            };
+            reader.readAsDataURL(file);
         }
 
         function updateImageProbeStatus(enabled) {
@@ -3547,43 +7645,104 @@ def home():
             };
         }
 
-        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null) {
+        function probeHitsKey(probeId = activeProbeId) {
+            return probeId ? `probe:${probeId}` : 'probe:draft';
+        }
+
+        function renderProbeHitsSlice(hits) {
+            if (!hits || !hits.length) {
+                return '<div class="loading">No matches</div>';
+            }
+            return hits.map((hit) => {
+                const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
+                return `
+                    <div class="probe-result">
+                        ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" alt="probe hit" />` : ''}
+                        <div class="probe-result-time">${escapeHtml(ts)}</div>
+                        <div class="probe-result-score">P ${(hit.pos_score || 0).toFixed(3)} · N ${(hit.neg_score || 0).toFixed(3)} · M ${(hit.margin || 0).toFixed(3)}</div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderProbeHitsPage(key = probeHitsKey()) {
+            const pageSize = 5;
+            const allHits = probeHitsCacheByKey[key] || [];
+            const total = allHits.length;
+            if (!Number.isFinite(probeHitsOffsetByKey[key])) probeHitsOffsetByKey[key] = 0;
+            if (probeHitsOffsetByKey[key] > Math.max(0, total - 1)) {
+                probeHitsOffsetByKey[key] = 0;
+            }
+            const offset = probeHitsOffsetByKey[key];
+            const pageSlice = allHits.slice(offset, offset + pageSize);
+            if (probeResults) {
+                probeResults.innerHTML = renderProbeHitsSlice(pageSlice);
+            }
+            lastProbeRefresh = probeHitsUpdatedByKey[key] || Date.now();
+            if (probeHitsMeta) {
+                const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
+                const pageIdx = total ? Math.floor(offset / pageSize) + 1 : 1;
+                const pageCount = Math.max(1, Math.ceil(total / pageSize));
+                const frames = probeFramesByKey[key] || 0;
+                probeHitsMeta.textContent = `Frames: ${frames} · Hits: ${total} · Page: ${pageIdx}/${pageCount} · Updated: ${tsLabel}`;
+            }
+            if (probeDetLeftBtn) {
+                probeDetLeftBtn.disabled = offset <= 0;
+            }
+            if (probeDetRightBtn) {
+                probeDetRightBtn.disabled = offset + pageSize >= total;
+            }
+        }
+
+        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null, options = {}) {
+            const key = options.key || probeHitsKey();
+            const replace = options.replace === true;
             const now = Date.now();
-            const minTs = windowSec && windowSec > 0 ? now - windowSec * 1000 : null;
+            const parsedWindow = Number.parseFloat(windowSec);
+            const effectiveWindowSec = Number.isFinite(parsedWindow)
+                ? parsedWindow
+                : Number.parseFloat(probeWindowSecByKey[key]);
+            if (Number.isFinite(effectiveWindowSec) && effectiveWindowSec > 0) {
+                probeWindowSecByKey[key] = effectiveWindowSec;
+            }
+            const minTs = Number.isFinite(effectiveWindowSec) && effectiveWindowSec > 0
+                ? now - (effectiveWindowSec * 1000)
+                : null;
             const merged = new Map();
             const addHit = (hit) => {
                 if (!hit) return;
                 if (minTs && hit.timestamp_ms && hit.timestamp_ms < minTs) return;
-                const key = `${hit.timestamp_ms || 0}-${(hit.pos_score || 0).toFixed(3)}-${(hit.neg_score || 0).toFixed(3)}`;
-                merged.set(key, hit);
+                const dedupeKey = `${hit.timestamp_ms || 0}-${(hit.pos_score || 0).toFixed(3)}-${(hit.neg_score || 0).toFixed(3)}-${(hit.margin || 0).toFixed(3)}`;
+                merged.set(dedupeKey, hit);
             };
-            (probeHitsCache || []).forEach(addHit);
-            hits.forEach(addHit);
-            const combined = Array.from(merged.values()).sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0)).slice(0, 40);
-            probeHitsCache = combined;
-            lastProbeRefresh = Date.now();
-            if (probeHitsMeta) {
-                const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
-                probeHitsMeta.textContent = `Frames: ${framesIndexed || 0} · Hits: ${combined.length} · Updated: ${tsLabel}`;
+            if (!replace) {
+                (probeHitsCacheByKey[key] || []).forEach(addHit);
             }
-            probeHitsOffset = 0;
-            if (!probeResults) return;
-            if (!combined.length) {
-                probeResults.innerHTML = '<div class="loading">No matches</div>';
-                return;
+            (hits || []).forEach(addHit);
+            const combined = Array.from(merged.values())
+                .sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0))
+                .slice(0, 50);
+            probeHitsCacheByKey[key] = combined;
+            probeFramesByKey[key] = Number.isFinite(framesIndexed) ? framesIndexed : (probeFramesByKey[key] || 0);
+            probeHitsUpdatedByKey[key] = now;
+            if (options.resetOffset !== false) {
+                probeHitsOffsetByKey[key] = 0;
             }
-            const pageSize = 4;
-            const slice = combined.slice(probeHitsOffset, probeHitsOffset + pageSize);
-            probeResults.innerHTML = slice.map((hit) => {
-                const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
-                return `
-                    <div class="probe-result">
-                        ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
-                        <div><strong>${ts}</strong></div>
-                        <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
-                    </div>
-                `;
-            }).join('');
+            if (key === probeHitsKey()) {
+                renderProbeHitsPage(key);
+            }
+        }
+
+        function probeActionIcon(action) {
+            const icons = {
+                expand: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/></svg>',
+                run: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m380-300 280-180-280-180v360Z"/></svg>',
+                enable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m424-296 282-282-56-56-226 226-114-114-56 56 170 170Z"/></svg>',
+                disable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M520-200v-560h160v560H520Zm-240 0v-560h160v560H280Z"/></svg>',
+                delete: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360Z"/></svg>',
+                new: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>',
+            };
+            return icons[action] || '';
         }
 
         function renderProbeCards() {
@@ -3591,45 +7750,62 @@ def home():
             if (!probeList.length) {
                 probeCards.innerHTML = `
                     <div class="probe-mini-card new-probe-card">
-                        <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                        <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
+                            ${probeActionIcon('new')}
+                            <span>New Probe</span>
+                        </button>
                     </div>`;
                 return;
             }
             const cards = probeList.map((p) => {
                 const last = p.last_hit;
                 const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-                const status = p.enabled === false ? 'disabled' : (p.enabled ? 'running' : 'idle');
-                const pillClass = status === 'disabled' ? 'pill-disabled' : status === 'running' ? 'pill-running' : 'pill-idle';
+                const channelId = parseInt(String(p.channel_id || luxriotActiveChannel), 10);
+                const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
+                const status = p.enabled === false
+                    ? 'disabled'
+                    : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
+                const pillClass = status === 'disabled'
+                    ? 'pill-disabled'
+                    : status === 'running'
+                        ? 'pill-running'
+                        : status === 'paused'
+                            ? 'pill-paused'
+                            : 'pill-idle';
                 const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
+                const toggleAction = status === 'disabled' ? 'enable' : 'disable';
+                const toggleTitle = status === 'disabled' ? 'Enable probe' : 'Disable probe';
+                const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
                 return `
                     <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
-                        <div style="display:flex; flex-direction:column; gap:0.35rem;">
-                            <div class="probe-mini-head">
-                                <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
-                                <div class="probe-status-pill ${pillClass}">${status}</div>
+                        <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
+                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
+                            <div class="probe-mini-overlay">
+                                <div class="probe-mini-top">
+                                    <div class="probe-status-pill ${pillClass}">${status}</div>
+                                    <div class="probe-mini-actions">
+                                        <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Open probe" aria-label="Open probe">${probeActionIcon('expand')}</button>
+                                        <button class="probe-action-btn" data-action="run" data-id="${p.id}" title="Run probe" aria-label="Run probe">${probeActionIcon('run')}</button>
+                                        <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                                        <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
+                                    </div>
+                                </div>
+                                <div class="probe-mini-bottom">
+                                    <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
+                                    <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
+                                    <div class="probe-mini-score">${scores}</div>
+                                </div>
                             </div>
-                            <div class="probe-mini-meta">
-                                Channel: ${p.channel_id || luxriotActiveChannel}<br>
-                                Last: ${last ? ts : 'n/a'}<br>
-                                P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}
-                            </div>
-                            <div class="probe-mini-actions">
-                                <button class="feature-btn" data-action="expand" data-id="${p.id}">Expand</button>
-                                <button class="feature-btn" data-action="run" data-id="${p.id}">Run</button>
-                                <button class="feature-btn" data-action="${status === 'disabled' ? 'enable' : 'disable'}" data-id="${p.id}">${status === 'disabled' ? 'Enable' : 'Disable'}</button>
-                                <button class="feature-btn" data-action="delete" data-id="${p.id}">Delete</button>
-                            </div>
-                        </div>
-                        <div class="probe-mini-thumb">
-                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" />` : '<div class="loading">No preview</div>'}
-                            <div class="probe-status-pill ${pillClass} probe-thumb-pill">${status}</div>
                         </div>
                     </div>
                 `;
             });
             cards.push(`
                 <div class="probe-mini-card new-probe-card">
-                    <button class="feature-btn primary" data-action="new">+ New Probe</button>
+                    <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
+                        ${probeActionIcon('new')}
+                        <span>New Probe</span>
+                    </button>
                 </div>
             `);
             probeCards.innerHTML = cards.join('');
@@ -3662,7 +7838,16 @@ def home():
                 updateImageProbeStatus(false);
             }
             renderPairs();
-            renderProbeHits(probe?.last_hit ? [probe.last_hit] : [], probe?.last_hit ? 1 : 0);
+            const initialHits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
+                ? probe.recent_hits
+                : (probe?.last_hit ? [probe.last_hit] : []);
+            const key = probeHitsKey(activeProbeId);
+            renderProbeHits(
+                initialHits,
+                initialHits.length || (probe?.last_hit ? 1 : 0),
+                probe?.window_sec ?? null,
+                { key, replace: true, resetOffset: true }
+            );
             renderProbeCards();
             setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
         }
@@ -3707,6 +7892,8 @@ def home():
                 const resp = await fetch('/probes/list');
                 const data = await resp.json();
                 probeList = data.probes || [];
+                probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
+                await refreshProbeRuntimeState(false);
                 if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
                 const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
                 if (match) {
@@ -3714,6 +7901,7 @@ def home():
                 } else if (!activeProbeId && probeList.length) {
                     setActiveProbe(probeList[0]);
                 } else {
+                    renderProbeHits([], 0, null, { key: probeHitsKey(activeProbeId), replace: true, resetOffset: true });
                     renderProbeCards();
                 }
             } catch (err) {
@@ -3723,7 +7911,10 @@ def home():
 
         async function ensureProbeCapture(channelId, quiet = false) {
             if (!channelId && channelId !== 0) return;
-            if (probeCaptureState[channelId]) {
+            await refreshProbeRuntimeState(false);
+            const runtimeState = probeChannelRuntime[channelId];
+            if (runtimeState === 'running') {
+                probeCaptureState[channelId] = true;
                 if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
                 setPreviewState('');
                 startProbePreview(channelId);
@@ -3737,11 +7928,17 @@ def home():
                 const resp = await fetch('/probes/start_capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId, fps: channelCaptureConfig[channelId].fps })
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        fps: channelCaptureConfig[channelId].fps,
+                        clear_pause: true,
+                    })
                 });
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
                 probeCaptureState[channelId] = true;
+                probeChannelRuntime[channelId] = 'running';
+                renderProbeCards();
                 if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
                 setPreviewState('');
                 startProbePreview(channelId);
@@ -3757,18 +7954,24 @@ def home():
                 const resp = await fetch('/probes/stop_capture', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId })
+                    body: JSON.stringify({
+                        channel_id: channelId,
+                        pause: reason === 'paused',
+                    })
                 });
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
                 delete probeCaptureState[channelId];
                 if (reason === 'paused') {
+                    probeChannelRuntime[channelId] = 'paused';
                     setPreviewState('Paused');
                     if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
                 } else {
+                    probeChannelRuntime[channelId] = 'idle';
                     setPreviewState('Stopped', true);
                     if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
                 }
+                renderProbeCards();
                 if (reason !== 'paused') stopProbePreview();
             } catch (err) {
                 if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
@@ -3866,6 +8069,7 @@ def home():
                 if (!resp.ok || data.error) throw new Error(data.error || 'Probe failed');
                 const hits = data.results || [];
                 const framesCount = data.frames_indexed || data.status?.frames || 0;
+                const persistedCount = Number.isFinite(data.persisted_hits) ? data.persisted_hits : hits.length;
                 renderProbeHits(hits, framesCount, payload.window_sec);
                 if (data.probe) {
                     activeProbeId = data.probe.id || activeProbeId;
@@ -3873,7 +8077,7 @@ def home():
                 } else {
                     renderProbeCards();
                 }
-                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Frames: ${framesCount}`);
+                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Stored: ${persistedCount} · Frames: ${framesCount}`);
             } catch (err) {
                 renderProbeHits([], 0);
                 setProbeStatus(err.message, true);
@@ -3895,7 +8099,11 @@ def home():
         function startProbeStatusPoll() {
             if (probeStatusTimer) return;
             refreshProbeStatus();
-            probeStatusTimer = setInterval(() => refreshProbeStatus(), 8000);
+            void refreshProbeRuntimeState(true);
+            probeStatusTimer = setInterval(() => {
+                refreshProbeStatus();
+                void refreshProbeRuntimeState(true);
+            }, 8000);
         }
 
         function stopProbeStatusPoll() {
@@ -3936,6 +8144,9 @@ def home():
             if (!action) return;
             if (action === 'expand' && probe) {
                 setActiveProbe(probe);
+                if (probeEditorModal) {
+                    probeEditorModal.style.display = 'block';
+                }
             } else if (action === 'run' && probe) {
                 setActiveProbe(probe);
                 startProbeRunLoop();
@@ -3955,8 +8166,12 @@ def home():
                 probeImageState = null;
                 applyImageThumb('');
                 renderPairs();
+                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
                 if (probeEnableToggle) probeEnableToggle.checked = true;
                 setProbeStatus('New probe');
+                if (probeEditorModal) {
+                    probeEditorModal.style.display = 'block';
+                }
             }
         }
 
@@ -3974,7 +8189,14 @@ def home():
                 }
             });
         }
-        if (probeSaveBtn) probeSaveBtn.addEventListener('click', saveActiveProbe);
+        if (probeSaveBtn) {
+            probeSaveBtn.addEventListener('click', async () => {
+                const savedId = await saveActiveProbe();
+                if (savedId && probeEditorModal) {
+                    probeEditorModal.style.display = 'none';
+                }
+            });
+        }
         if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
             if (activeProbeId) deleteProbe(activeProbeId);
             else {
@@ -3982,6 +8204,7 @@ def home():
                 probeImageState = null;
                 applyImageThumb('');
                 renderPairs();
+                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
                 setProbeStatus('Cleared unsaved probe');
             }
         });
@@ -4013,17 +8236,33 @@ def home():
                 probeImageState = null;
                 applyImageThumb('');
                 renderPairs();
+                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
                 setProbeStatus('New probe');
                 if (probeEnableToggle) probeEnableToggle.checked = true;
+                if (probeEditorModal) {
+                    probeEditorModal.style.display = 'block';
+                }
             });
         }
         if (probeReloadBtn) {
             probeReloadBtn.addEventListener('click', () => loadProbeList(true));
         }
+        if (imageUpload) {
+            imageUpload.addEventListener('change', () => {
+                const file = imageUpload.files && imageUpload.files[0];
+                setArchiveUploadName(file || null);
+                setArchiveQueryPreview(file || null);
+            });
+        }
         if (probeImageFile) {
             probeImageFile.addEventListener('change', () => {
                 const file = probeImageFile.files && probeImageFile.files[0];
-                if (!file) return;
+                if (!file) {
+                    probeImageState = null;
+                    applyImageThumb('');
+                    updateImageProbeStatus(false);
+                    return;
+                }
                 const reader = new FileReader();
                 reader.onload = () => {
                     const base64 = reader.result.split(',')[1];
@@ -4060,42 +8299,26 @@ def home():
         }
         if (probeDetLeftBtn && probeResults) {
             probeDetLeftBtn.addEventListener('click', () => {
-                if (!probeHitsCache || !probeHitsCache.length) return;
-                const pageSize = 4;
-                probeHitsOffset = Math.max(0, probeHitsOffset - pageSize);
-                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
-                if (!slice.length) return;
-                probeResults.innerHTML = slice.map((hit) => {
-                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
-                    return `
-                        <div class="probe-result">
-                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
-                            <div><strong>${ts}</strong></div>
-                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
-                        </div>
-                    `;
-                }).join('');
+                const key = probeHitsKey();
+                const allHits = probeHitsCacheByKey[key] || [];
+                if (!allHits.length) return;
+                const pageSize = 5;
+                const currentOffset = Number.isFinite(probeHitsOffsetByKey[key]) ? probeHitsOffsetByKey[key] : 0;
+                probeHitsOffsetByKey[key] = Math.max(0, currentOffset - pageSize);
+                renderProbeHitsPage(key);
             });
         }
         if (probeDetRightBtn && probeResults) {
             probeDetRightBtn.addEventListener('click', () => {
-                if (!probeHitsCache || !probeHitsCache.length) return;
-                const pageSize = 4;
-                if (probeHitsOffset + pageSize < probeHitsCache.length) {
-                    probeHitsOffset += pageSize;
+                const key = probeHitsKey();
+                const allHits = probeHitsCacheByKey[key] || [];
+                if (!allHits.length) return;
+                const pageSize = 5;
+                const currentOffset = Number.isFinite(probeHitsOffsetByKey[key]) ? probeHitsOffsetByKey[key] : 0;
+                if (currentOffset + pageSize < allHits.length) {
+                    probeHitsOffsetByKey[key] = currentOffset + pageSize;
                 }
-                const slice = probeHitsCache.slice(probeHitsOffset, probeHitsOffset + pageSize);
-                if (!slice.length) return;
-                probeResults.innerHTML = slice.map((hit) => {
-                    const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
-                    return `
-                        <div class="probe-result">
-                            ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" />` : ''}
-                            <div><strong>${ts}</strong></div>
-                            <div>pos: ${(hit.pos_score || 0).toFixed(3)} · neg: ${(hit.neg_score || 0).toFixed(3)} · margin: ${(hit.margin || 0).toFixed(3)}</div>
-                        </div>
-                    `;
-                }).join('');
+                renderProbeHitsPage(key);
             });
         }
         if (probeEnableToggle) {
@@ -4121,7 +8344,7 @@ def home():
         }
         if (probeBenchBtn && probeBenchOutput) {
             probeBenchBtn.addEventListener('click', async () => {
-                probeBenchBtn.disabled = true;
+                setButtonBusy(probeBenchBtn, true);
                 probeBenchOutput.textContent = 'Benchmark running...';
                 try {
                     const resp = await fetch('/probes/bench');
@@ -4131,16 +8354,75 @@ def home():
                 } catch (err) {
                     probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
                 } finally {
-                    probeBenchBtn.disabled = false;
+                    setButtonBusy(probeBenchBtn, false);
                 }
             });
         }
 
         // Mode switching
-        if (textModeBtn) textModeBtn.addEventListener('click', () => setMode('text'));
-        if (imageModeBtn) imageModeBtn.addEventListener('click', () => setMode('image'));
+        if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
         if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
         if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+        if (loadDetectionsBtn) {
+            loadDetectionsBtn.addEventListener('click', () => {
+                setMode('archive');
+                loadDetectionsArchive(true);
+            });
+        }
+        if (refreshDetectionsFiltersBtn) {
+            refreshDetectionsFiltersBtn.addEventListener('click', () => refreshArchiveFilters());
+        }
+        if (archiveDetectionsPrevBtn) {
+            archiveDetectionsPrevBtn.addEventListener('click', () => {
+                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
+                const size = Number.isFinite(pageSize) ? pageSize : 24;
+                archiveDetectionsOffset = Math.max(0, archiveDetectionsOffset - size);
+                loadDetectionsArchive(false);
+            });
+        }
+        if (archiveDetectionsNextBtn) {
+            archiveDetectionsNextBtn.addEventListener('click', () => {
+                if (!archiveDetectionsHasMore) return;
+                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
+                const size = Number.isFinite(pageSize) ? pageSize : 24;
+                archiveDetectionsOffset += Math.max(1, size);
+                loadDetectionsArchive(false);
+            });
+        }
+        if (archiveChannelFilter) {
+            archiveChannelFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+                refreshArchiveProbeFilter();
+            });
+        }
+        if (archiveProbeFilter) {
+            archiveProbeFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+            });
+        }
+        if (archiveTimeFilter) {
+            archiveTimeFilter.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+            });
+        }
+        if (archiveDetectionsLimit) {
+            archiveDetectionsLimit.addEventListener('change', () => {
+                archiveDetectionsOffset = 0;
+                archiveDetectionsHasMore = false;
+                updateArchiveDetectionsNav();
+            });
+        }
+        if (searchScopeSelect) {
+            searchScopeSelect.addEventListener('change', () => {
+                updateSearchScopeUI();
+            });
+        }
         
         // Check index status
         async function checkIndexStatus(folder) {
@@ -4155,6 +8437,20 @@ def home():
                 return { indexed: false, available_modes: [] };
             }
         }
+
+        async function parseApiJson(response, fallbackMessage) {
+            let data = {};
+            try {
+                data = await response.json();
+            } catch (_) {
+                data = {};
+            }
+            if (!response.ok || data.error) {
+                const message = data.error || `${fallbackMessage} (${response.status})`;
+                throw new Error(message);
+            }
+            return data;
+        }
         
         // Index folder
         indexBtn.addEventListener('click', async () => {
@@ -4163,7 +8459,7 @@ def home():
             
             indexStatus.textContent = 'Indexing...';
             indexStatus.className = 'status';
-            indexBtn.disabled = true;
+            setButtonBusy(indexBtn, true);
             
             try {
                 const response = await fetch('/index', {
@@ -4194,83 +8490,125 @@ def home():
                 indexStatus.textContent = 'Error: ' + error.message;
                 indexStatus.className = 'status error';
             } finally {
-                indexBtn.disabled = false;
+                setButtonBusy(indexBtn, false);
             }
         });
         
         // Text search
         searchBtn.addEventListener('click', async () => {
+            setMode('archive');
             const query = searchInput.value.trim();
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionsScope = isDetectionsScope();
             
-            if (!query || !folder) return;
+            if (!query || (!detectionsScope && !folder)) return;
             
+            setButtonBusy(searchBtn, true);
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
             
             try {
-                const response = await fetch('/search', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
-                });
+                let response;
+                if (detectionsScope) {
+                    const payload = {
+                        query,
+                        limit,
+                        sort_by: sortBy,
+                        embedder: embedderSelect ? embedderSelect.value : 'clip',
+                        ...buildDetectionSearchFilters(),
+                    };
+                    response = await fetch('/detections/search_text', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                } else {
+                    response = await fetch('/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
+                    });
+                }
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Text search failed');
                 
                 if (data.results && data.results.length > 0) {
-                    displayResults(data.results);
+                    const renderedResults = detectionsScope
+                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
+                        : data.results;
+                    displayResults(renderedResults);
+                    if (detectionsScope && data.mode_requested && data.mode_used && data.mode_requested !== data.mode_used) {
+                        indexStatus.textContent = `Detections text search uses ${data.mode_used.toUpperCase()} backend.`;
+                        indexStatus.className = 'status warning';
+                    }
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 }
             } catch (error) {
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            } finally {
+                setButtonBusy(searchBtn, false);
             }
         });
         
         // Image search
         imageSearchBtn.addEventListener('click', async () => {
+            setMode('archive');
             const folder = folderInput.value.trim();
             const file = imageUpload.files[0];
-            const imagePathValue = imagePath.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionsScope = isDetectionsScope();
             
-            // Check if we have either a file or a path
-            if (!folder || (!file && !imagePathValue)) {
-                alert('Please select a folder and either upload an image file or enter an image path.');
+            if (!file) {
+                alert('Please upload an image file.');
+                return;
+            }
+            if (!detectionsScope && !folder) {
+                alert('Please select a folder and upload an image file.');
                 return;
             }
             
+            setButtonBusy(imageSearchBtn, true);
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
             
             try {
                 const formData = new FormData();
-                formData.append('folder', folder);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
-                
-                // Prioritize file upload over path
-                if (file) {
-                    formData.append('image', file);
-                } else if (imagePathValue) {
-                    formData.append('image_path', imagePathValue);
+                formData.append('image', file);
+                if (detectionsScope) {
+                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
+                    const filters = buildDetectionSearchFilters();
+                    Object.entries(filters).forEach(([key, value]) => {
+                        if (value !== undefined && value !== null && String(value).length > 0) {
+                            formData.append(key, String(value));
+                        }
+                    });
+                } else {
+                    formData.append('folder', folder);
                 }
                 
-                const response = await fetch('/search_by_image', {
+                const response = await fetch(detectionsScope ? '/detections/search_image' : '/search_by_image', {
                     method: 'POST',
                     body: formData
                 });
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Image search failed');
                 
                 if (data.results && data.results.length > 0) {
-                    displayResults(data.results);
+                    const renderedResults = detectionsScope
+                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
+                        : data.results;
+                    displayResults(renderedResults);
                 } else {
                     resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 }
             } catch (error) {
                 resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            } finally {
+                setButtonBusy(imageSearchBtn, false);
             }
         });
 
@@ -4306,7 +8644,7 @@ def home():
                 localStorage.removeItem('evs_video_prompt');
             }
 
-            videoRunBtn.disabled = true;
+            setButtonBusy(videoRunBtn, true);
             saveSummaryBtn.style.display = 'none';
             lastSummaryText = '';
             lastSummaryTarget = null;
@@ -4367,7 +8705,7 @@ def home():
                 videoStatus.className = 'video-status error';
                 stopVideoTimer(true);
             } finally {
-                videoRunBtn.disabled = false;
+                setButtonBusy(videoRunBtn, false);
             }
         }
 
@@ -4418,7 +8756,7 @@ def home():
                 alert('Please enter a folder path first');
                 return;
             }
-            setMode('text');
+            setMode('archive');
             
             resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
             
@@ -4429,7 +8767,7 @@ def home():
                     body: JSON.stringify({ folder })
                 });
                 
-                const data = await response.json();
+                const data = await parseApiJson(response, 'Loading commented images failed');
                 
                 if (data.results && data.results.length > 0) {
                     displayCommentedResults(data.results);
@@ -4444,51 +8782,75 @@ def home():
         // Generate common HTML structure for result items
         function generateResultItemHTML(result, index, isCommented = false) {
             const similarityMarkup = buildSimilarityMetrics(result, isCommented);
+            const badgesMarkup = buildResultBadges(result);
+            const safeFilename = escapeHtml(result.filename || 'unnamed');
+            const rawPath = String(result.path || '');
+            const hasPath = rawPath.length > 0;
+            const safePath = escapeHtml(rawPath);
+            const thumb = String(result.thumbnail || '').trim();
+            const fallbackSvg = encodeURIComponent(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="260">' +
+                '<rect width="100%" height="100%" fill="#1f2026"/>' +
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#9aa0ad" font-size="18">No thumbnail</text>' +
+                '</svg>'
+            );
+            const thumbnailSrc = thumb ? `data:image/jpeg;base64,${thumb}` : `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
                 
             return `
                 <div class="image-container">
-                    <img src="data:image/jpeg;base64,${result.thumbnail}" class="thumbnail" alt="" />
+                    <img src="${thumbnailSrc}" class="thumbnail" alt="" />
                     <div class="image-overlay">
-                        <div class="expand-collapse-icon" data-index="${index}">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                            </svg>
-                        </div>
+                        ${hasPath ? `
+                            <div class="expand-collapse-icon" data-index="${index}">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                </svg>
+                            </div>
+                        ` : ''}
                     </div>
                 </div>
                 <div class="result-info">
                     <div class="filename">
-                        ${result.filename}
+                        ${safeFilename}
                         <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
                             <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
                         </svg>
                     </div>
+                    ${badgesMarkup}
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
-                        <button class="action-icon describe-icon" data-index="${index}" data-path="${result.path || ''}" title="Describe with LM">
+                        <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
                             <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                                 <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
                             </svg>
                         </button>
-                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${result.path || ''}" title="Find similar">
+                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${safePath}" title="Find similar">
                             <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                                 <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
                             </svg>
                         </button>
                     </div>
                 </div>
-                <div class="segments-panel" id="segments-${index}">
-                    <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
-                </div>
-                <div class="comment-section">
-                    <div class="comments-list" id="comments-${index}">
-                        <div class="comment-loading">Loading comments...</div>
+                ${hasPath ? `
+                    <div class="segments-panel" id="segments-${index}">
+                        <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
                     </div>
-                    <div class="comment-form">
-                        <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                        <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                    <div class="comment-section">
+                        <div class="lm-description" id="lm-desc-${index}">
+                            <div class="no-comments">No LLM description yet.</div>
+                        </div>
+                        <div class="lm-description-actions">
+                            <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
+                        </div>
+                        <div class="comments-list" id="comments-${index}">
+                            <div class="comment-loading">Loading comments...</div>
+                        </div>
+                        <div class="comment-form">
+                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                        </div>
                     </div>
-                </div>
+                ` : ''}
             `;
         }
 
@@ -4496,10 +8858,12 @@ def home():
         function setupResultItemEventHandlers(item, result, index) {
             // Handle expand/collapse via overlay icon
             const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-            expandCollapseIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                toggleImageExpansion(item, result, index);
-            });
+            if (expandCollapseIcon && result.path) {
+                expandCollapseIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleImageExpansion(item, result, index);
+                });
+            }
             
             // Handle copy icon click
             const copyIcon = item.querySelector('.copy-icon');
@@ -4521,7 +8885,7 @@ def home():
                 if (result.path) {
                     findSimilarIcon.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        findSimilarImages(result.path);
+                        findSimilarImages(result.path, result);
                     });
                 } else {
                     findSimilarIcon.style.display = 'none';
@@ -4533,7 +8897,7 @@ def home():
                 if (result.path) {
                     describeIcon.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        describeImageWithLM(result.path);
+                        describeImageWithLM(index, result.path, item, result);
                     });
                 } else {
                     describeIcon.style.display = 'none';
@@ -4545,7 +8909,7 @@ def home():
             const commentInput = item.querySelector(`#comment-input-${index}`);
             
             if (saveBtn) {
-                if (result.path) {
+                if (result.path && !result.is_detection) {
                     saveBtn.addEventListener('click', () => {
                         saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
                     });
@@ -4554,8 +8918,19 @@ def home():
                 }
             }
 
+            const lmSaveBtn = item.querySelector(`#lm-save-btn-${index}`);
+            if (lmSaveBtn) {
+                if (result.path && !result.is_detection) {
+                    lmSaveBtn.addEventListener('click', () => {
+                        saveLmDescriptionAsComment(index, result.path);
+                    });
+                } else {
+                    lmSaveBtn.style.display = 'none';
+                }
+            }
+
             const img = item.querySelector('.thumbnail');
-            if (img) {
+            if (img && result.path && !result.is_detection) {
                 img.addEventListener('click', (e) => {
                     handleSegmentClick(e, result, index, item);
                 });
@@ -4565,6 +8940,7 @@ def home():
         // Display results
         function displayResults(results) {
             resultsContainer.innerHTML = '';
+            segmentContextByIndex = {};
             
             results.forEach((result, index) => {
                 const item = document.createElement('div');
@@ -4583,6 +8959,7 @@ def home():
         // Display commented results (similar to displayResults but with comment info)
         function displayCommentedResults(results) {
             resultsContainer.innerHTML = '';
+            segmentContextByIndex = {};
             
             results.forEach((result, index) => {
                 const item = document.createElement('div');
@@ -4638,6 +9015,64 @@ def home():
                 container.appendChild(commentDiv);
             });
         }
+
+        function renderLmDescription(index, summary, modelLabel = '') {
+            const descContainer = document.getElementById(`lm-desc-${index}`);
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!descContainer || !saveBtn) return;
+
+            const now = new Date().toLocaleString();
+            const modelSuffix = modelLabel ? ` · ${escapeHtml(modelLabel)}` : '';
+            descContainer.innerHTML = `
+                <div class="comment-item lm-comment">
+                    <div class="comment-timestamp">LLM Description${modelSuffix} · ${escapeHtml(now)}</div>
+                    <div class="comment-text">${renderMarkdown(summary || '')}</div>
+                </div>
+            `;
+            saveBtn.dataset.summary = summary || '';
+            saveBtn.style.display = 'inline-flex';
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save LLM as comment';
+        }
+
+        async function saveLmDescriptionAsComment(index, imagePath) {
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!saveBtn) return;
+            const summary = (saveBtn.dataset.summary || '').trim();
+            if (!summary) {
+                alert('No LLM description to save yet.');
+                return;
+            }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+
+            setButtonBusy(saveBtn, true);
+            try {
+                const response = await fetch('/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder,
+                        image_path: imagePath,
+                        comment: summary,
+                    }),
+                });
+                const data = await parseApiJson(response, 'Saving LLM description failed');
+                const commentsContainer = document.getElementById(`comments-${index}`);
+                if (commentsContainer && Array.isArray(data.comments)) {
+                    displayComments(commentsContainer, data.comments);
+                }
+                indexStatus.textContent = 'LLM description saved as comment.';
+                indexStatus.className = 'status success';
+            } catch (err) {
+                alert('Failed to save LLM description: ' + err.message);
+            } finally {
+                setButtonBusy(saveBtn, false);
+            }
+        }
         
         async function saveComment(index, imagePath, folder, comment) {
             if (!comment) return;
@@ -4645,9 +9080,7 @@ def home():
             const saveBtn = document.getElementById(`save-btn-${index}`);
             const commentInput = document.getElementById(`comment-input-${index}`);
             
-            // Disable button during save
-            saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
+            setButtonBusy(saveBtn, true);
             
             try {
                 const response = await fetch('/comments', {
@@ -4674,9 +9107,7 @@ def home():
                 console.error('Error saving comment:', error);
                 alert('Error saving comment: ' + error.message);
             } finally {
-                // Re-enable button
-                saveBtn.disabled = false;
-                saveBtn.textContent = 'Save';
+                setButtonBusy(saveBtn, false);
             }
         }
         
@@ -4690,6 +9121,7 @@ def home():
                 img.src = `data:image/jpeg;base64,${result.thumbnail}`;
                 item.classList.remove('expanded');
                 resetSegmentsPanel(item, index);
+                delete segmentContextByIndex[index];
                 img.classList.remove('segment-enabled');
                 // Update icon to expand
                 expandCollapseIcon.innerHTML = `
@@ -4699,12 +9131,24 @@ def home():
                 `;
             } else {
                 // Expand: show original image and load comments
-                const originalImageUrl = `/image/${encodeURIComponent(result.path)}`;
+                const activeFolder = folderInput.value.trim();
+                const originalImageUrl = buildImageFetchUrl(result.path || '', result);
                 img.src = originalImageUrl;
                 item.classList.add('expanded');
-                loadComments(index, result.path, folderInput.value.trim());
-                prepareSegmentsPanel(item, result, index);
-                if (segmentsEnabledInput.checked) {
+                if (!result.is_detection && activeFolder) {
+                    loadComments(index, result.path, activeFolder);
+                    prepareSegmentsPanel(item, result, index);
+                } else {
+                    const commentsContainer = document.getElementById(`comments-${index}`);
+                    if (commentsContainer) {
+                        commentsContainer.innerHTML = '<div class="no-comments">Comments are available for indexed-folder images only.</div>';
+                    }
+                    const panel = item.querySelector(`#segments-${index}`);
+                    if (panel) {
+                        panel.innerHTML = '<div class="segments-status warning">Segmentation is available for indexed-folder images only.</div>';
+                    }
+                }
+                if (segmentsEnabledInput.checked && !result.is_detection) {
                     img.classList.add('segment-enabled');
                 }
                 // Update icon to collapse
@@ -4767,6 +9211,199 @@ def home():
             return Math.min(1, Math.max(0, value));
         }
 
+        function stripBase64Payload(rawValue) {
+            const text = String(rawValue || '').trim();
+            if (!text) return '';
+            if (text.startsWith('data:')) {
+                const comma = text.indexOf(',');
+                return comma >= 0 ? text.slice(comma + 1) : '';
+            }
+            return text;
+        }
+
+        function extractSegmentMeta(segments) {
+            const ids = [];
+            const labels = {};
+            (segments || []).forEach((segment) => {
+                if (!segment || segment.segment_id === undefined || segment.segment_id === null) return;
+                const segId = String(segment.segment_id).trim();
+                if (!segId) return;
+                ids.push(segId);
+                if (segment.label !== undefined && segment.label !== null) {
+                    const label = String(segment.label).trim();
+                    if (label) {
+                        labels[segId] = label;
+                    }
+                }
+            });
+            return {
+                segmentIds: [...new Set(ids)],
+                segmentLabels: labels,
+            };
+        }
+
+        function showSegmentPanelNotice(panel, message, level = 'success') {
+            if (!panel) return;
+            const safeLevel = ['success', 'warning', 'error'].includes(level) ? level : 'success';
+            const notice = document.createElement('div');
+            notice.className = `segments-status ${safeLevel}`;
+            notice.textContent = message;
+            panel.prepend(notice);
+            setTimeout(() => {
+                notice.remove();
+            }, 5200);
+        }
+
+        function buildSegmentActionContext(result, data, xNorm, yNorm, baseImageSrc) {
+            if (!result || !result.path) {
+                return null;
+            }
+            const folder = folderInput.value.trim();
+            if (!folder) {
+                return null;
+            }
+            const overlay = data && data.overlay ? data.overlay : {};
+            const maskBase64 = stripBase64Payload(overlay.mask_raw_png || overlay.mask_png || '');
+            if (!maskBase64) {
+                return null;
+            }
+            const segments = Array.isArray(data && data.segments) ? data.segments : [];
+            const meta = extractSegmentMeta(segments);
+            return {
+                folder,
+                imagePath: String(result.path),
+                maskBase64,
+                segmentIds: meta.segmentIds,
+                segmentLabels: meta.segmentLabels,
+                overlay,
+                xNorm,
+                yNorm,
+                baseImageSrc: baseImageSrc || '',
+            };
+        }
+
+        async function runMaskSearchFromSegment(index, panel, triggerBtn = null) {
+            const context = segmentContextByIndex[index];
+            if (!context || !context.maskBase64) {
+                showSegmentPanelNotice(panel, 'Click the image to create a region mask first.', 'warning');
+                return;
+            }
+
+            const payload = {
+                folder: context.folder,
+                image_path: context.imagePath,
+                mask: context.maskBase64,
+                limit: parseInt(resultLimitSelect.value, 10) || 12,
+                sort_by: sortBySelect.value || 'similarity',
+                targets: ['images', 'segments'],
+            };
+            if (context.segmentLabels && Object.keys(context.segmentLabels).length) {
+                payload.segment_labels = context.segmentLabels;
+            }
+
+            const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
+            if (button) {
+                setButtonBusy(button, true);
+            }
+
+            try {
+                const response = await fetch('/search_by_mask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                let data = {};
+                try {
+                    data = await response.json();
+                } catch (_) {
+                    data = {};
+                }
+                if (!response.ok || data.error) {
+                    const hint = data.hint ? ` ${data.hint}` : '';
+                    throw new Error(`${data.error || 'Mask search failed'}${hint}`);
+                }
+                const segments = Array.isArray(data.segments) ? data.segments : [];
+                const meta = extractSegmentMeta(segments);
+                const refreshedContext = {
+                    ...context,
+                    segmentIds: meta.segmentIds,
+                    segmentLabels: meta.segmentLabels,
+                };
+                segmentContextByIndex[index] = refreshedContext;
+                renderSegmentResponse(
+                    panel,
+                    { ...data, overlay: context.overlay || {} },
+                    context.xNorm,
+                    context.yNorm,
+                    context.baseImageSrc || '',
+                    { index, actionContext: refreshedContext, sourceLabel: 'Mask search' },
+                );
+                indexStatus.textContent = segments.length
+                    ? `Mask search returned ${segments.length} region candidate(s).`
+                    : 'Mask search returned no region candidates.';
+                indexStatus.className = segments.length ? 'status success' : 'status warning';
+            } catch (err) {
+                showSegmentPanelNotice(panel, `Mask search failed: ${err.message || String(err)}`, 'error');
+            } finally {
+                if (button) {
+                    setButtonBusy(button, false);
+                }
+            }
+        }
+
+        async function indexSegmentsFromMask(index, panel, triggerBtn = null) {
+            const context = segmentContextByIndex[index];
+            if (!context || !context.maskBase64) {
+                showSegmentPanelNotice(panel, 'Click the image to create a region mask first.', 'warning');
+                return;
+            }
+
+            const payload = {
+                folder: context.folder,
+                image_path: context.imagePath,
+                mask: context.maskBase64,
+                segment_labels: context.segmentLabels || {},
+            };
+
+            const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
+            if (button) {
+                setButtonBusy(button, true);
+            }
+
+            try {
+                const response = await fetch('/index_segments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                let data = {};
+                try {
+                    data = await response.json();
+                } catch (_) {
+                    data = {};
+                }
+                if (!response.ok || data.error) {
+                    const hint = data.hint ? ` ${data.hint}` : '';
+                    throw new Error(`${data.error || 'Segment indexing failed'}${hint}`);
+                }
+                const count = Array.isArray(data.segments_indexed)
+                    ? data.segments_indexed.length
+                    : Number(data.segment_count || 0);
+                showSegmentPanelNotice(panel, `Indexed ${count} segment(s) for this image.`, 'success');
+                const relaxedNote = data.min_patches_relaxed ? ' (min patch fallback used)' : '';
+                indexStatus.textContent = `Segment index updated (${count} segment${count === 1 ? '' : 's'})${relaxedNote}.`;
+                indexStatus.className = 'status success';
+            } catch (err) {
+                showSegmentPanelNotice(panel, `Segment indexing failed: ${err.message || String(err)}`, 'error');
+                indexStatus.textContent = `Segment indexing failed: ${err.message || String(err)}`;
+                indexStatus.className = 'status error';
+            } finally {
+                if (button) {
+                    setButtonBusy(button, false);
+                }
+            }
+        }
+
         async function handleSegmentClick(event, result, index, item) {
             if (!segmentsEnabledInput.checked) return;
             if (!item.classList.contains('expanded')) return;
@@ -4819,7 +9456,17 @@ def home():
                 if (!response.ok || data.error) {
                     throw new Error(data.error || 'Region proposal failed');
                 }
-                renderSegmentResponse(panel, data, xNorm, yNorm, img.currentSrc || img.src);
+                const actionContext = buildSegmentActionContext(result, data, xNorm, yNorm, img.currentSrc || img.src);
+                if (actionContext) {
+                    segmentContextByIndex[index] = actionContext;
+                } else {
+                    delete segmentContextByIndex[index];
+                }
+                renderSegmentResponse(panel, data, xNorm, yNorm, img.currentSrc || img.src, {
+                    index,
+                    actionContext,
+                    sourceLabel: 'Region proposal',
+                });
             } catch (error) {
                 panel.innerHTML = `<div class="segments-status error">Segment error: ${escapeHtml(error.message || String(error))}</div>`;
             } finally {
@@ -4827,12 +9474,22 @@ def home():
             }
         }
 
-        function renderSegmentResponse(panel, data, xNorm, yNorm, baseImageSrc) {
+        function renderSegmentResponse(panel, data, xNorm, yNorm, baseImageSrc, options = {}) {
             const segments = Array.isArray(data && data.segments) ? data.segments : [];
             const overlay = data && data.overlay ? data.overlay : {};
             const pctX = (xNorm * 100).toFixed(1);
             const pctY = (yNorm * 100).toFixed(1);
             const safeBaseSrc = baseImageSrc ? escapeHtml(baseImageSrc) : '';
+            const sourceLabel = escapeHtml(String(options.sourceLabel || 'Region proposal'));
+            const parsedIndex = Number.isFinite(options.index)
+                ? Number(options.index)
+                : parseInt(String(options.index || ''), 10);
+            const actionContext = options.actionContext || null;
+            const hasActions = Number.isFinite(parsedIndex)
+                && actionContext
+                && actionContext.maskBase64
+                && actionContext.folder
+                && actionContext.imagePath;
 
             const baseOverlayFigure = safeBaseSrc ? `
                 <figure class="segment-overlay-figure">
@@ -4918,15 +9575,41 @@ def home():
             const resultsHtml = listItems
                 ? `<ul class="segment-results-list">${listItems}</ul>`
                 : '<div class="segments-status warning">Region proposals returned no matches.</div>';
+            const actionsHtml = hasActions ? `
+                <div class="segment-actions">
+                    <button class="segment-action-btn" data-segment-mask-search="${parsedIndex}">Search by mask</button>
+                    <button class="segment-action-btn primary" data-segment-index="${parsedIndex}">Index segments</button>
+                </div>
+            ` : '';
 
             panel.innerHTML = `
-                <div class="segments-status success">Regions proposed near (${pctX}%, ${pctY}%) · ${segments.length} candidate(s)</div>
+                <div class="segments-status success">${sourceLabel} near (${pctX}%, ${pctY}%) · ${segments.length} candidate(s)</div>
+                ${actionsHtml}
                 ${overlayHtml}
                 ${refinementNote}
                 ${typeof overlay.threshold === 'number' ? `<div class="segment-meta">Heatmap threshold: ${(overlay.threshold * 100).toFixed(1)}%</div>` : ''}
                 ${areaNote}
                 ${resultsHtml}
             `;
+
+            if (hasActions) {
+                const maskSearchBtn = panel.querySelector(`[data-segment-mask-search="${parsedIndex}"]`);
+                if (maskSearchBtn) {
+                    maskSearchBtn.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        runMaskSearchFromSegment(parsedIndex, panel, maskSearchBtn);
+                    });
+                }
+                const indexBtn = panel.querySelector(`[data-segment-index="${parsedIndex}"]`);
+                if (indexBtn) {
+                    indexBtn.addEventListener('click', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        indexSegmentsFromMask(parsedIndex, panel, indexBtn);
+                    });
+                }
+            }
         }
         
         async function copyImagePath(imagePath) {
@@ -4958,57 +9641,91 @@ def home():
             }
         }
         
-        async function findSimilarImages(imagePath) {
+        function buildImageFetchUrl(imagePath, result = null) {
+            const params = new URLSearchParams();
+            params.set('image_path', imagePath || '');
+            if (result && result.is_detection) {
+                const activeFolder = folderInput.value.trim();
+                if (activeFolder && String(imagePath || '').startsWith(activeFolder)) {
+                    params.set('folder', activeFolder);
+                    return `/image?${params.toString()}`;
+                }
+                return `/detections/image?${params.toString()}`;
+            }
+            const activeFolder = folderInput.value.trim();
+            if (activeFolder) {
+                params.set('folder', activeFolder);
+            }
+            return `/image?${params.toString()}`;
+        }
+
+        async function findSimilarImages(imagePath, result = null) {
             const folder = folderInput.value.trim();
             const limit = resultLimitSelect.value;
             const sortBy = sortBySelect.value;
+            const detectionResult = Boolean(result && result.is_detection);
             
-            if (!folder) {
+            if (!detectionResult && !folder) {
                 alert('Please enter a folder path first');
                 return;
             }
             
-            // Show loading state
             indexStatus.textContent = 'Finding similar images...';
             indexStatus.className = 'status';
             
             try {
-                // Fetch the image file from the server using existing image route
-                const imageResponse = await fetch(`/image/${encodeURIComponent(imagePath)}`);
+                const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
                 if (!imageResponse.ok) {
                     throw new Error('Failed to load image file');
                 }
                 
-                // Convert response to blob
                 const imageBlob = await imageResponse.blob();
-                
-                // Create FormData to match existing search_by_image endpoint
                 const formData = new FormData();
                 formData.append('image', imageBlob, 'reference_image.jpg');
-                formData.append('folder', folder);
                 formData.append('limit', limit);
                 formData.append('sort_by', sortBy);
-                
-                // Call existing search_by_image endpoint
+
+                if (detectionResult || isDetectionsScope()) {
+                    const filters = buildDetectionSearchFilters();
+                    Object.entries(filters).forEach(([key, value]) => {
+                        if (value !== undefined && value !== null && String(value).trim() !== '') {
+                            formData.append(key, String(value));
+                        }
+                    });
+                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
+
+                    const response = await fetch('/detections/search_image', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await parseApiJson(response, 'Detection image search failed');
+                    const rendered = decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested);
+                    if (!rendered.length) {
+                        indexStatus.textContent = 'No similar detections found';
+                        indexStatus.className = 'status warning';
+                        return;
+                    }
+                    indexStatus.textContent = `Found ${rendered.length} similar detections`;
+                    indexStatus.className = 'status success';
+                    displayResults(rendered);
+                    return;
+                }
+
+                formData.append('folder', folder);
                 const response = await fetch('/search_by_image', {
                     method: 'POST',
                     body: formData
                 });
-                
-                const data = await response.json();
-                
-                if (data.results) {
-                    if (data.results.length === 0) {
-                        indexStatus.textContent = 'No similar images found';
-                        indexStatus.className = 'status warning';
-                    } else {
-                        indexStatus.textContent = `Found ${data.results.length} similar images`;
-                        indexStatus.className = 'status success';
-                        displayResults(data.results);
-                    }
-                } else {
-                    throw new Error(data.error || 'Unknown error');
+                const data = await parseApiJson(response, 'Image search failed');
+                const results = Array.isArray(data.results) ? data.results : [];
+                if (!results.length) {
+                    indexStatus.textContent = 'No similar images found';
+                    indexStatus.className = 'status warning';
+                    return;
                 }
+                indexStatus.textContent = `Found ${results.length} similar images`;
+                indexStatus.className = 'status success';
+                displayResults(results);
             } catch (error) {
                 console.error('Find similar error:', error);
                 indexStatus.textContent = 'Error finding similar images: ' + error.message;
@@ -5016,60 +9733,77 @@ def home():
             }
         }
 
-        async function describeImageWithLM(imagePath) {
+        async function describeImageWithLM(index, imagePath, item = null, result = null) {
             if (!imagePath) {
                 alert('No filesystem path is available for this image.');
                 return;
             }
+            const detectionResult = Boolean(result && result.is_detection);
+            const folder = folderInput.value.trim();
+            const useFolderContext = !detectionResult || (folder && String(imagePath).startsWith(folder));
+            if (!useFolderContext && !detectionResult) {
+                alert('Please enter a folder path first.');
+                return;
+            }
+
             const prompt = videoPromptInput.value.trim();
             const modelId = videoModelInput ? videoModelInput.value.trim() : '';
-            setMode('video');
-            videoStatus.dataset.base = 'Querying model...';
-            videoStatus.textContent = videoStatus.dataset.base;
-            videoStatus.className = 'video-status';
-            videoRunBtn.disabled = true;
-            saveSummaryBtn.style.display = 'none';
-            videoOutput.style.display = 'none';
-            videoOutput.innerHTML = '';
-            renderVideoFrames([]);
-            startVideoTimer();
+
+            setMode('archive');
+            const targetItem = item || document.querySelector(`.result-item[data-result-index="${index}"]`);
+            if (targetItem && !targetItem.classList.contains('expanded') && result) {
+                toggleImageExpansion(targetItem, result, index);
+            }
+
+            const descContainer = document.getElementById(`lm-desc-${index}`);
+            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
+            if (!descContainer || !saveBtn) {
+                alert('Unable to render LLM description panel for this result.');
+                return;
+            }
+
+            descContainer.innerHTML = '<div class="comment-loading"><div class="spinner"></div> Generating LLM description...</div>';
+            saveBtn.style.display = 'none';
+            saveBtn.dataset.summary = '';
 
             try {
                 const response = await fetch('/describe_image', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image_path: imagePath, prompt, model: modelId }),
+                    body: JSON.stringify(
+                        useFolderContext
+                            ? {
+                                folder,
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                            : {
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                    ),
                 });
-                const data = await response.json();
-                if (!response.ok || data.error) {
-                    videoStatus.dataset.base = data.error || 'Describe request failed.';
-                    videoStatus.textContent = videoStatus.dataset.base;
-                    videoStatus.className = 'video-status error';
-                    stopVideoTimer();
+                const data = await parseApiJson(response, 'Describe request failed');
+                if (data.summary) {
+                    renderLmDescription(index, data.summary, data.model || modelId || 'LM Studio');
+                    if (detectionResult && !useFolderContext) {
+                        saveBtn.style.display = 'none';
+                    }
                     return;
                 }
-                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Image described`;
-                videoStatus.textContent = videoStatus.dataset.base;
-                if (data.summary) {
-                    videoOutput.style.display = 'block';
-                    videoOutput.innerHTML = renderMarkdown(data.summary);
-                    lastSummaryText = data.summary;
-                    lastSummaryTarget = { path: imagePath };
-                    saveSummaryBtn.style.display = 'inline-flex';
-                }
-                if (data.thumbnail) {
-                    videoFrames.innerHTML = `<div title="Image"><img src="data:image/jpeg;base64,${data.thumbnail}" alt="Image" /></div>`;
-                }
-                stopVideoTimer(true);
+                descContainer.innerHTML = '<div class="no-comments">(No description returned)</div>';
             } catch (err) {
-                videoStatus.dataset.base = 'Error: ' + err.message;
-                videoStatus.textContent = videoStatus.dataset.base;
-                videoStatus.className = 'video-status error';
-                stopVideoTimer(true);
-            } finally {
-                videoRunBtn.disabled = false;
+                descContainer.innerHTML = `<div class="no-comments">Error: ${escapeHtml(err.message || String(err))}</div>`;
             }
         }
+
+        updateArchiveDetectionsNav();
+        updateSearchScopeUI();
+        refreshArchiveFilters().catch(() => {
+            setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
+        });
         
         // Enter key support
         searchInput.addEventListener('keypress', (e) => {
@@ -5104,10 +9838,18 @@ def home():
     current_timestamp = str(int(time.time()))
     response_html = html_template.replace('{result_options_html}', result_options_html)
     response_html = response_html.replace('{luxriot_batch_options}', luxriot_batch_options_html)
+    response_html = response_html.replace('{video_frame_options_html}', video_frame_options_html)
+    response_html = response_html.replace('{segment_threshold_percent}', str(segment_threshold_percent))
+    response_html = response_html.replace('{segments_enabled_checked}', segments_enabled_checked)
+    response_html = response_html.replace('{segment_min_patches_default}', str(segment_min_patches_default))
     response_html = response_html.replace('{timestamp}', current_timestamp)
-    response_html = response_html.replace('{lm_model}', config.LM_MODEL)
+    response_html = response_html.replace('{lm_model}', html_lib.escape(str(config.LM_MODEL or ''), quote=True))
+    response_html = response_html.replace(
+        '{luxriot_system_prompt_default}',
+        html_lib.escape(str(LUXRIOT_SYSTEM_PROMPT_DEFAULT or ''), quote=False),
+    )
     response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
-    response_html = response_html.replace('{luxriot_base_url}', config.LUXRIOT_BASE_URL)
+    response_html = response_html.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
     response_html = response_html.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     response_html = response_html.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     response_html = response_html.replace('{luxriot_batch_default}', str(luxriot_default_batch))
@@ -5121,22 +9863,59 @@ def home():
     return response
 
 
-@app.route('/image/<path:filepath>')
-def serve_image(filepath):
-    """Serve original images from absolute paths."""
+@app.route('/favicon.ico')
+def favicon():
+    """Serve favicon if present; otherwise return no-content to avoid noisy 404 logs."""
+    icon_path = Path(__file__).resolve().parent / 'images' / 'favicon.ico'
+    if icon_path.exists():
+        return send_file(icon_path, mimetype='image/x-icon', max_age=86400)
+    return ('', 204)
+
+
+@app.route('/image', methods=['GET'])
+@app.route('/image/<path:filepath>', methods=['GET'])
+def serve_image(filepath: str = ""):
+    """Serve image files only from indexed folders."""
     try:
-        decoded = unquote(filepath)
+        folder_raw = request.args.get('folder')
+        if not folder_raw:
+            return "Missing folder parameter", 400
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+
+        source_path = request.args.get('image_path') or filepath
+        if not source_path:
+            return "Missing image path", 400
+
+        decoded = unquote(source_path)
         path_obj = Path(decoded)
-        if '..' in path_obj.parts:
-            return "Access denied", 403
         if not path_obj.is_absolute():
-            path_obj = Path('/') / path_obj
+            path_obj = folder_path / path_obj
         abs_path = path_obj.resolve()
+        if abs_path.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return "Unsupported file type", 403
+        if not _path_within(abs_path, folder_path):
+            return "Access denied", 403
         if not abs_path.exists() or not abs_path.is_file():
             return "Image not found", 404
         return send_file(str(abs_path))
+    except ValueError as exc:
+        return str(exc), 400
     except Exception as exc:
         return f"Error serving image: {exc}", 500
+
+
+@app.route('/detections/image', methods=['GET'])
+def serve_detection_image():
+    image_path = request.args.get('image_path')
+    try:
+        resolved = detection_archive.resolve_archive_image_path(image_path)
+        return send_file(str(resolved))
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if message.lower() == "image not found" else 400
+        return message, status
+    except Exception as exc:
+        return f"Error serving detection image: {exc}", 500
 
 
 def _index_directory(folder_path: Union[str, Path], embedder: str) -> Path:
@@ -5157,7 +9936,7 @@ def _image_to_base64(img: Image.Image) -> str:
 def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int = 85) -> str:
     if max_edge and max(img.size) > max_edge:
         scale = max_edge / float(max(img.size))
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), RESAMPLE_LANCZOS)
     buffer = BytesIO()
     img.save(buffer, format='JPEG', quality=quality)
     return base64.b64encode(buffer.getvalue()).decode()
@@ -5166,10 +9945,12 @@ def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int 
 def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
     alpha = alpha_image.convert('L')
     scale = float(opacity_scale)
+    alpha_arr = np.asarray(alpha, dtype=np.float32)
     if scale <= 0:
-        alpha = alpha.point(lambda _: 0)
+        alpha_arr.fill(0.0)
     elif scale < 0.999:
-        alpha = alpha.point(lambda v: int(max(0, min(255, v * scale))))
+        alpha_arr = np.clip(alpha_arr * scale, 0.0, 255.0)
+    alpha = Image.fromarray(alpha_arr.astype(np.uint8), mode='L')
     overlay = Image.new('RGBA', alpha.size, color + (0,))
     overlay.putalpha(alpha)
     return overlay
@@ -5452,7 +10233,7 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
 luxriot_manager = LuxriotManager(
     config=config,
     lm_callback=_call_video_understanding,
-    message_builder=_build_luxriot_messages,
+    message_builder=cast(Any, _build_luxriot_messages),
     jpeg_encoder=_encode_jpeg,
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
@@ -5486,52 +10267,544 @@ class ProbesStore:
     def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
         self.path = Path(path)
         self.data: Dict[str, Any] = {"probes": []}
+        self.lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text())
-            except Exception:
-                self.data = {"probes": []}
+        with self.lock:
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding='utf-8'))
+                    if isinstance(loaded, dict):
+                        self.data = loaded
+                    else:
+                        self.data = {"probes": []}
+                except Exception:
+                    self.data = {"probes": []}
 
-    def _save(self) -> None:
-        try:
-            self.path.write_text(json.dumps(self.data, indent=2))
-        except Exception:
-            pass
+    def _save_locked(self) -> None:
+        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(self.data, indent=2), encoding='utf-8')
+        tmp_path.replace(self.path)
 
     def list_probes(self) -> List[Dict[str, Any]]:
-        return list(self.data.get("probes", []))
+        with self.lock:
+            probes = self.data.get("probes", [])
+            return copy.deepcopy(probes if isinstance(probes, list) else [])
 
     def upsert_probe(self, probe: Dict[str, Any]) -> Dict[str, Any]:
-        self.data.setdefault("probes", [])
-        probe_list: List[Dict[str, Any]] = self.data["probes"]
-        if not probe.get("id"):
-            probe["id"] = f"probe-{int(time.time() * 1000)}"
-        existing = None
-        for idx, item in enumerate(probe_list):
-            if item.get("id") == probe["id"]:
-                existing = idx
-                break
-        if existing is None:
-            probe_list.append(probe)
-        else:
-            probe_list[existing] = probe
-        self._save()
-        return probe
+        with self.lock:
+            self.data.setdefault("probes", [])
+            probe_list: List[Dict[str, Any]] = self.data["probes"]
+            stored_probe = copy.deepcopy(probe)
+            if not stored_probe.get("id"):
+                stored_probe["id"] = f"probe-{uuid.uuid4().hex[:12]}"
+            existing = None
+            for idx, item in enumerate(probe_list):
+                if item.get("id") == stored_probe["id"]:
+                    existing = idx
+                    break
+            if existing is None:
+                probe_list.append(stored_probe)
+            else:
+                probe_list[existing] = stored_probe
+            self._save_locked()
+            return copy.deepcopy(stored_probe)
 
     def delete_probe(self, probe_id: str) -> bool:
-        probes = self.data.get("probes", [])
-        new_probes = [p for p in probes if p.get("id") != probe_id]
-        if len(new_probes) == len(probes):
-            return False
-        self.data["probes"] = new_probes
-        self._save()
-        return True
+        with self.lock:
+            probes = self.data.get("probes", [])
+            new_probes = [p for p in probes if p.get("id") != probe_id]
+            if len(new_probes) == len(probes):
+                return False
+            self.data["probes"] = new_probes
+            self._save_locked()
+            return True
 
 
 probes_store = ProbesStore()
+detections_store = DetectionsStore()
+
+DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
+DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
+DETECTIONS_SEARCH_SHARD_OVERFETCH = 200
+DETECTIONS_SEARCH_DINO_POOL_MIN = 64
+DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER = 8
+
+
+class _DetectionClipShardCache:
+    def __init__(self, store: DetectionsStore) -> None:
+        self.store = store
+        self.lock = threading.RLock()
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def clear(self) -> None:
+        with self.lock:
+            self._cache.clear()
+
+    def get(self, shard_key: str) -> Tuple[Optional[faiss.Index], Optional[np.ndarray]]:
+        shard = str(shard_key or "").strip()
+        if not shard:
+            return None, None
+        version = self.store.shard_version(shard, embedder="clip")
+        if version[0] <= 0:
+            with self.lock:
+                self._cache.pop(shard, None)
+            return None, None
+
+        with self.lock:
+            cached = self._cache.get(shard)
+            if cached and cached.get("version") == version:
+                return cached.get("index"), cached.get("ids")
+
+        ids, vectors = self.store.load_shard_vectors(shard, embedder="clip")
+        if not ids or vectors.size == 0:
+            with self.lock:
+                self._cache.pop(shard, None)
+            return None, None
+
+        index = faiss.IndexFlatIP(int(vectors.shape[1]))
+        _faiss_add_vectors(index, vectors)
+        ids_arr = np.asarray(ids, dtype=np.int64)
+
+        with self.lock:
+            self._cache[shard] = {
+                "version": version,
+                "index": index,
+                "ids": ids_arr,
+            }
+        return index, ids_arr
+
+
+detection_clip_shard_cache = _DetectionClipShardCache(detections_store)
+
+
+def _thumbnail_to_pil_image(thumbnail_b64: Any) -> Optional[Image.Image]:
+    raw_value = str(thumbnail_b64 or "").strip()
+    if not raw_value:
+        return None
+    try:
+        decoded = base64.b64decode(raw_value)
+        with Image.open(BytesIO(decoded)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            else:
+                img = img.copy()
+            return img
+    except Exception:
+        return None
+
+
+def _embed_thumbnail_b64(thumbnail_b64: Any, embedder: str) -> Optional[np.ndarray]:
+    pil_img = _thumbnail_to_pil_image(thumbnail_b64)
+    if pil_img is None:
+        return None
+    try:
+        return get_image_embedding_from_pil(pil_img, embedder=embedder)
+    except Exception:
+        return None
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _probe_identity(probe_like: Dict[str, Any]) -> str:
+    probe_id = str(probe_like.get("id") or "").strip()
+    if probe_id:
+        return probe_id
+    channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    name = str(probe_like.get("name") or "probe").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name).strip("-")
+    if not slug:
+        slug = "probe"
+    return f"adhoc:{channel_id}:{slug[:48]}"
+
+
+def _slug_token(value: Any, fallback: str) -> str:
+    token = str(value or "").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in token).strip("-")
+    return slug[:64] if slug else fallback
+
+
+class _AdaptiveDetectionArchive:
+    def __init__(self) -> None:
+        root_raw = str(getattr(config, "DETECTIONS_ARCHIVE_DIR", "detections_archive") or "detections_archive").strip()
+        root_path = Path(root_raw).expanduser()
+        if not root_path.is_absolute():
+            root_path = (Path.cwd() / root_path).resolve()
+        else:
+            root_path = root_path.resolve()
+
+        self.archive_enabled = bool(getattr(config, "DETECTIONS_ARCHIVE_ENABLED", True))
+        self.retention_enabled = bool(getattr(config, "DETECTIONS_RETENTION_ENABLED", True))
+        self.drop_skipped = bool(getattr(config, "DETECTIONS_RETENTION_DROP_SKIPPED", True))
+        self.root = root_path
+        self.window_ms = int(max(500.0, float(getattr(config, "DETECTIONS_RETENTION_WINDOW_SEC", 6.0)) * 1000.0))
+        self.force_keep_ms = int(max(1000.0, float(getattr(config, "DETECTIONS_RETENTION_FORCE_KEEP_SEC", 20.0)) * 1000.0))
+        self.sim_high = float(getattr(config, "DETECTIONS_RETENTION_SIMILARITY_HIGH", 0.985))
+        self.sim_low = float(getattr(config, "DETECTIONS_RETENTION_SIMILARITY_LOW", 0.94))
+        self.margin_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_MARGIN_DELTA", 0.08))
+        self.score_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_SCORE_DELTA", 0.08))
+        self.jpeg_quality = int(getattr(config, "DETECTIONS_ARCHIVE_JPEG_QUALITY", 88))
+
+        self._lock = threading.RLock()
+        self._state: Dict[str, Dict[str, Any]] = {}
+        if self.archive_enabled:
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                print(f"Detections archive disabled (cannot create root {self.root}): {exc}")
+                self.archive_enabled = False
+
+    @staticmethod
+    def _normalize_vec(vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if vec is None:
+            return None
+        try:
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        norm = float(np.linalg.norm(arr))
+        if norm <= 0:
+            return None
+        return (arr / norm).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _state_key(channel_id: int, probe_id: str, source: str) -> str:
+        return f"{int(channel_id)}:{str(probe_id)}:{str(source)}"
+
+    def _resolve_existing_path(self, image_path: Optional[str]) -> Optional[str]:
+        raw_path = str(image_path or "").strip()
+        if not raw_path:
+            return None
+        try:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (self.root / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            if candidate.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return None
+            if not candidate.exists() or not candidate.is_file():
+                return None
+            return str(candidate)
+        except Exception:
+            return None
+
+    def _write_snapshot(
+        self,
+        *,
+        channel_id: int,
+        probe_id: str,
+        source: str,
+        timestamp_ms: int,
+        thumbnail_b64: Any,
+    ) -> Optional[str]:
+        if not self.archive_enabled:
+            return None
+        pil_img = _thumbnail_to_pil_image(thumbnail_b64)
+        if pil_img is None:
+            return None
+        ts_sec = max(0.0, float(timestamp_ms) / 1000.0)
+        date_key = time.strftime("%Y%m%d", time.localtime(ts_sec))
+        probe_slug = _slug_token(probe_id, "probe")
+        source_slug = _slug_token(source, "probe")
+        out_dir = self.root / f"ch{int(channel_id)}" / date_key / probe_slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(timestamp_ms)}_{source_slug}_{uuid.uuid4().hex[:8]}.jpg"
+        out_path = out_dir / filename
+        pil_img.save(str(out_path), format="JPEG", quality=self.jpeg_quality)
+        return str(out_path)
+
+    def _update_state_locked(
+        self,
+        *,
+        key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+        image_path: Optional[str],
+    ) -> None:
+        self._state[key] = {
+            "timestamp_ms": int(timestamp_ms),
+            "clip_vec": clip_vec.copy() if clip_vec is not None else None,
+            "pos_score": float(pos_score),
+            "neg_score": float(neg_score),
+            "margin": float(margin),
+            "image_path": image_path,
+        }
+
+    def _decide_keep_locked(
+        self,
+        *,
+        key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+    ) -> Tuple[bool, str, Optional[float]]:
+        if not self.retention_enabled:
+            return True, "retention_disabled", None
+
+        prev = self._state.get(key)
+        if prev is None:
+            return True, "bootstrap", None
+
+        dt_ms = max(0, int(timestamp_ms) - int(prev.get("timestamp_ms") or 0))
+        if dt_ms >= self.force_keep_ms:
+            return True, "force_interval", None
+
+        prev_vec = prev.get("clip_vec")
+        sim: Optional[float] = None
+        if isinstance(prev_vec, np.ndarray) and clip_vec is not None and clip_vec.shape == prev_vec.shape:
+            sim = float(np.clip(np.dot(clip_vec, prev_vec), -1.0, 1.0))
+
+        margin_delta = abs(float(margin) - float(prev.get("margin") or 0.0))
+        pos_delta = abs(float(pos_score) - float(prev.get("pos_score") or 0.0))
+        neg_delta = abs(float(neg_score) - float(prev.get("neg_score") or 0.0))
+
+        if sim is not None and sim <= self.sim_low:
+            return True, "novel_scene", sim
+        if margin_delta >= self.margin_delta_thr or pos_delta >= self.score_delta_thr or neg_delta >= self.score_delta_thr:
+            return True, "score_shift", sim
+        if dt_ms >= self.window_ms:
+            return True, "window_anchor", sim
+        if sim is not None and sim >= self.sim_high:
+            return False, "high_similarity_skip", sim
+        return False, "within_window_skip", sim
+
+    def handle_hit(
+        self,
+        *,
+        probe_id: str,
+        channel_id: int,
+        source: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        thumbnail_b64: Any,
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+        image_path: Optional[str],
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        normalized_vec = self._normalize_vec(clip_vec)
+        resolved_path = self._resolve_existing_path(image_path)
+        key = self._state_key(channel_id, probe_id, source)
+
+        with self._lock:
+            previous = self._state.get(key)
+            previous_path = None
+            if isinstance(previous, dict):
+                previous_path = str(previous.get("image_path") or "").strip() or None
+            keep, reason, similarity = self._decide_keep_locked(
+                key=key,
+                timestamp_ms=timestamp_ms,
+                clip_vec=normalized_vec,
+                pos_score=pos_score,
+                neg_score=neg_score,
+                margin=margin,
+            )
+            if resolved_path:
+                # Existing source path already preserved on disk; do not drop it.
+                keep = True
+                reason = "external_path"
+            saved_path = resolved_path
+            if keep and not saved_path:
+                saved_path = self._write_snapshot(
+                    channel_id=channel_id,
+                    probe_id=probe_id,
+                    source=source,
+                    timestamp_ms=timestamp_ms,
+                    thumbnail_b64=thumbnail_b64,
+                )
+                if saved_path:
+                    reason = f"{reason}_snapshot_saved"
+            if not keep and not saved_path and previous_path:
+                # Reuse previous anchor snapshot so expanded view remains useful across dense hit sequences.
+                saved_path = previous_path
+                reason = f"{reason}_reuse_snapshot"
+            if keep:
+                self._update_state_locked(
+                    key=key,
+                    timestamp_ms=timestamp_ms,
+                    clip_vec=normalized_vec,
+                    pos_score=pos_score,
+                    neg_score=neg_score,
+                    margin=margin,
+                    image_path=saved_path,
+                )
+
+        keep_record = keep or (not self.drop_skipped)
+        meta = {
+            "decision": reason,
+            "kept": bool(keep),
+            "record_persisted": bool(keep_record),
+            "similarity_to_last_kept": similarity,
+        }
+        return keep_record, saved_path, meta
+
+    def resolve_archive_image_path(self, image_path: Any) -> Path:
+        if not self.archive_enabled:
+            raise ValueError("detections archive is disabled")
+        raw = str(image_path or "").strip()
+        if not raw:
+            raise ValueError("Missing image_path")
+        path_obj = Path(raw).expanduser()
+        if not path_obj.is_absolute():
+            path_obj = (self.root / path_obj).resolve()
+        else:
+            path_obj = path_obj.resolve()
+        if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            raise ValueError("Unsupported image file type")
+        if not _path_within(path_obj, self.root):
+            raise ValueError("image_path is outside detections archive")
+        if not path_obj.exists() or not path_obj.is_file():
+            raise ValueError("Image not found")
+        return path_obj
+
+
+detection_archive = _AdaptiveDetectionArchive()
+
+
+def _store_probe_hits(
+    probe_like: Dict[str, Any],
+    hits: Sequence[Dict[str, Any]],
+    *,
+    source: str,
+    bookmark_sent: bool = False,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> int:
+    if not hits:
+        return 0
+    probe_id = _probe_identity(probe_like)
+    channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    probe_name = str(probe_like.get("name") or "").strip() or probe_id
+    severity = str(probe_like.get("severity") or "normal").strip().lower() or "normal"
+    bookmark_enabled = bool(probe_like.get("bookmark", False))
+    now_ms = int(time.time() * 1000)
+    records: List[Dict[str, Any]] = []
+    def _resolve_archive_thumbnail(hit_thumb: Any, ts_ms: int) -> Any:
+        try:
+            hq_thumb = luxriot_manager.probe_frame_thumbnail(channel_id, ts_ms)
+            if hq_thumb:
+                return hq_thumb
+        except Exception:
+            pass
+        return hit_thumb
+
+    def _hit_sort_key(item: Tuple[int, Dict[str, Any]]) -> int:
+        return _to_int(item[1].get("timestamp_ms"), now_ms)
+    ordered_hits = sorted(
+        enumerate(hits),
+        key=_hit_sort_key,
+    )
+    for idx, hit in ordered_hits:
+        ts_raw = hit.get("timestamp_ms")
+        ts_ms = _to_int(ts_raw, now_ms)
+        pos_score = _to_float(hit.get("pos_score"), 0.0)
+        neg_score = _to_float(hit.get("neg_score"), 0.0)
+        margin = _to_float(hit.get("margin"), 0.0)
+        thumbnail_b64 = hit.get("thumbnail")
+        archive_thumbnail_b64 = _resolve_archive_thumbnail(thumbnail_b64, ts_ms)
+        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
+        raw_image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
+        keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            timestamp_ms=ts_ms,
+            clip_vec=clip_vec,
+            thumbnail_b64=archive_thumbnail_b64,
+            pos_score=pos_score,
+            neg_score=neg_score,
+            margin=margin,
+            image_path=raw_image_path,
+        )
+        if not keep_record:
+            continue
+        image_path = saved_image_path or raw_image_path
+        payload = {
+            "hit_index": idx,
+            "probe_window_sec": probe_like.get("window_sec"),
+            "probe_fps": probe_like.get("fps"),
+            "source": source,
+            "image_path": image_path,
+            "retention": retention_meta,
+            "hit": {
+                "timestamp_ms": ts_ms,
+                "channel_id": channel_id,
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "margin": margin,
+            },
+        }
+        if isinstance(extra_payload, dict) and extra_payload:
+            payload["context"] = extra_payload
+        records.append(
+            {
+                "dedupe_key": f"{probe_id}:{source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
+                "timestamp_ms": ts_ms,
+                "probe_id": probe_id,
+                "probe_name": probe_name,
+                "channel_id": channel_id,
+                "severity": severity,
+                "bookmark_enabled": bookmark_enabled,
+                "bookmark_sent": bookmark_sent,
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "margin": margin,
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "image_path": image_path,
+                "source": source,
+                "payload": payload,
+            }
+        )
+    if not records:
+        return 0
+    try:
+        return detections_store.add_detections(records)
+    except Exception as exc:
+        print(f"Detections store write failed for {probe_id}: {exc}")
+        return 0
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -5570,12 +10843,18 @@ def _probe_daemon() -> None:
                 by_channel.setdefault(ch, []).append(p)
             for ch, plist in by_channel.items():
                 try:
+                    if luxriot_manager.is_probe_capture_paused(ch):
+                        continue
                     # Ensure capture running for this channel
                     try:
                         fps_desired = max([p.get('fps') or 0 for p in plist] or [0])
-                        luxriot_manager.start_probe_capture(ch, fps=fps_desired if fps_desired > 0 else None)
-                    except Exception:
-                        pass
+                        luxriot_manager.start_probe_capture(
+                            ch,
+                            fps=fps_desired if fps_desired > 0 else None,
+                            clear_pause=False,
+                        )
+                    except Exception as exc:
+                        print(f"Probe daemon failed to start capture for channel {ch}: {exc}")
                     for probe in plist:
                         result = probe_manager.query(
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
@@ -5595,6 +10874,7 @@ def _probe_daemon() -> None:
                             recent = probe.get('recent_hits') or []
                             recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
                             probe['recent_hits'] = recent
+                            bookmark_sent = False
                             if probe.get('bookmark'):
                                 try:
                                     luxriot_manager.send_bookmark_event(
@@ -5605,13 +10885,22 @@ def _probe_daemon() -> None:
                                         state='new',
                                         timestamp_ms=hits[0].get('timestamp_ms'),
                                     )
-                                except Exception:
-                                    pass
+                                    bookmark_sent = True
+                                except Exception as exc:
+                                    print(f"Probe daemon failed to send bookmark for probe {probe.get('id')}: {exc}")
+                            _store_probe_hits(
+                                probe,
+                                hits,
+                                source='probe_daemon',
+                                bookmark_sent=bookmark_sent,
+                                extra_payload={'frames_indexed': result.get('frames_indexed')},
+                            )
                             probes_store.upsert_probe(probe)
-                except Exception:
+                except Exception as exc:
+                    print(f"Probe daemon channel loop error (channel {ch}): {exc}")
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Probe daemon loop error: {exc}")
         probe_daemon_stop.wait(PROBE_DAEMON_INTERVAL_SEC)
 
 def _render_segmentation_overlay(
@@ -5695,7 +10984,7 @@ def save_index(index_results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[
         meta_path.write_text(json.dumps(index_meta, indent=2), encoding='utf-8')
 
 
-def load_index(folder_path, embedder: Optional[str] = None):
+def load_index(folder_path: Union[str, Path], embedder: Optional[str] = None) -> FaissIndexBundle:
     """Load FAISS index, metadata, and embedder info for the requested backend."""
     target = embedder or active_embedder
     if target not in EMBEDDER_SUBDIRS:
@@ -5766,7 +11055,7 @@ def save_segment_index(
         index = faiss.IndexFlatIP(embeddings.shape[1])
         existing_meta = []
 
-    index.add(embeddings)
+    _faiss_add_vectors(index, embeddings)
     existing_meta.extend(segment_metadata)
 
     faiss.write_index(index, str(index_path))
@@ -5871,25 +11160,29 @@ def _prepare_metadata_map(image_paths: Optional[List[str]], image_metadata: Opti
 
 
 def _build_result_entry(img_path: str, similarity: float, metadata: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    result = {
+        'path': img_path,
+        'filename': os.path.basename(img_path),
+        'similarity': float(similarity),
+        'thumbnail': '',
+        'metadata': dict(metadata or {}),
+    }
     try:
-        img = Image.open(img_path)
-        img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-        buffer = BytesIO()
-        img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
-        img_base64 = base64.b64encode(buffer.getvalue()).decode()
-        result = {
-            'path': img_path,
-            'filename': os.path.basename(img_path),
-            'similarity': float(similarity),
-            'thumbnail': img_base64,
-            'metadata': metadata or {},
-        }
-        if extra:
-            result.update(extra)
-        return result
+        with Image.open(img_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.thumbnail(config.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=config.THUMBNAIL_QUALITY)
+            result['thumbnail'] = base64.b64encode(buffer.getvalue()).decode()
     except Exception as img_error:
-        print(f"Error processing image {img_path}: {img_error}")
-        return None
+        # Keep the result entry even if thumbnail creation fails so search never collapses to empty.
+        # Frontend can still show filename/path and let operators inspect the source image directly.
+        result['metadata']['thumbnail_error'] = str(img_error)
+        print(f"Warning: thumbnail generation failed for {img_path}: {img_error}")
+    if extra:
+        result.update(extra)
+    return result
 
 
 def _should_rerank(sort_by: str) -> bool:
@@ -5924,10 +11217,10 @@ def _reconstruct_vectors(index: faiss.Index, ids: Sequence[int]) -> Optional[np.
     vectors: List[np.ndarray] = []
     for idx in ids:
         try:
-            vec = index.reconstruct(int(idx))
+            vec = _faiss_reconstruct(index, int(idx))
         except (AttributeError, RuntimeError, IndexError, TypeError):
             return None
-        vectors.append(np.asarray(vec, dtype=np.float32))
+        vectors.append(vec)
     if not vectors:
         return None
     try:
@@ -6000,6 +11293,7 @@ def _build_ranked_results(
 
     results: List[Dict[str, Any]] = []
     max_results = min(limit, len(ranked)) if limit > 0 else len(ranked)
+    skipped = 0
 
     for idx, score, original_score, applied in ranked[:max_results]:
         path = image_paths[idx]
@@ -6015,11 +11309,16 @@ def _build_ranked_results(
         entry = _build_result_entry(path, float(score), metadata_map.get(path, {}), extra=extra)
         if entry:
             results.append(entry)
+        else:
+            skipped += 1
+
+    if skipped:
+        print(f"Warning: skipped {skipped}/{max_results} ranked entries while building results.")
 
     return results
 
 
-def _load_fusion_indexes(folder_path: Union[str, Path]):
+def _load_fusion_indexes(folder_path: Union[str, Path]) -> Tuple[FaissIndexBundle, FaissIndexBundle]:
     clip_data = load_index(folder_path, embedder='clip')
     dino_data = load_index(folder_path, embedder='dino')
     return clip_data, dino_data
@@ -6036,7 +11335,14 @@ def _merge_metadata_maps(primary: Dict[str, Dict[str, Any]], secondary: Dict[str
     return merged
 
 
-def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarray, limit: int, sort_by: str) -> List[Dict[str, Any]]:
+def _fuse_results(
+    clip_data: FaissIndexBundle,
+    dino_data: FaissIndexBundle,
+    clip_vec: np.ndarray,
+    dino_vec: np.ndarray,
+    limit: int,
+    sort_by: str,
+) -> List[Dict[str, Any]]:
     clip_index, clip_paths, clip_metadata, _ = clip_data
     dino_index, dino_paths, dino_metadata, _ = dino_data
     if clip_index is None or dino_index is None:
@@ -6049,15 +11355,16 @@ def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarr
     limit = max(1, limit)
     alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
 
-    def _search(index, vec, paths):
+    def _search(index: Optional[faiss.Index], vec: np.ndarray, paths: Optional[Sequence[str]]) -> Dict[str, float]:
         if index is None or not paths:
             return {}
         k = min(limit * 2, len(paths))
-        sims, inds = index.search(vec.reshape(1, -1), k)
-        scores = {}
+        sims, inds = _faiss_search(index, vec.reshape(1, -1), k)
+        scores: Dict[str, float] = {}
         for idx, sim in zip(inds[0], sims[0]):
-            if 0 <= idx < len(paths):
-                scores[paths[idx]] = float(sim)
+            idx_int = int(idx)
+            if 0 <= idx_int < len(paths):
+                scores[paths[idx_int]] = float(sim)
         return scores
 
     clip_scores = _search(clip_index, clip_vec, clip_paths)
@@ -6096,6 +11403,389 @@ def _fuse_results(clip_data, dino_data, clip_vec: np.ndarray, dino_vec: np.ndarr
     return results
 
 
+def _normalize_detection_search_mode(requested: Optional[str]) -> str:
+    mode = (requested or active_embedder or "clip").strip().lower()
+    if mode == "fusion" and not config.FUSION_ENABLED:
+        mode = "clip"
+    if mode not in {"clip", "dino", "fusion"}:
+        mode = "clip"
+    return mode
+
+
+def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DETECTIONS_SEARCH_DEFAULT_HOURS) -> Dict[str, Any]:
+    probe_raw = str(payload.get("probe_id") or "").strip()
+    probe_id = probe_raw or None
+
+    channel_raw = str(payload.get("channel_id") or "").strip()
+    channel_id: Optional[int] = None
+    if channel_raw:
+        channel_id = int(channel_raw)
+
+    since_raw = payload.get("since_ms")
+    until_raw = payload.get("until_ms")
+    since_ms = _to_optional_int(since_raw)
+    until_ms = _to_optional_int(until_raw)
+
+    if since_ms is None:
+        hours_raw = payload.get("hours")
+        parsed_hours = _to_optional_float(hours_raw)
+        hours = parsed_hours if parsed_hours is not None else float(default_hours)
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    return {
+        "probe_id": probe_id,
+        "channel_id": channel_id,
+        "since_ms": since_ms,
+        "until_ms": until_ms,
+    }
+
+
+def _backfill_clip_vectors_for_filters(
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    *,
+    expected_dim: Optional[int] = None,
+    max_backfill: int = 2000,
+) -> int:
+    detections, _ = detections_store.list_detections(
+        probe_id=probe_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=max_backfill,
+        offset=0,
+    )
+    vector_by_id: Dict[int, np.ndarray] = {}
+    if expected_dim is not None and detections:
+        det_ids = [_to_optional_int(item.get("id")) for item in detections]
+        rows = detections_store.fetch_detections_by_ids([det_id for det_id in det_ids if det_id is not None], include_vectors=True)
+        for row in rows:
+            det_id = _to_optional_int(row.get("id"))
+            clip_vec = row.get("clip_vec")
+            if det_id is None or not isinstance(clip_vec, np.ndarray):
+                continue
+            vector_by_id[det_id] = clip_vec
+    pending: List[Tuple[int, Sequence[float]]] = []
+    for item in detections:
+        det_id = _to_optional_int(item.get("id"))
+        if det_id is None:
+            continue
+        has_clip = bool(item.get("has_clip"))
+        if has_clip:
+            if expected_dim is None:
+                continue
+            existing = vector_by_id.get(det_id)
+            if isinstance(existing, np.ndarray) and existing.ndim == 1 and int(existing.shape[0]) == expected_dim:
+                continue
+        thumb = item.get("thumbnail")
+        if not thumb:
+            continue
+        vec = _embed_thumbnail_b64(thumb, "clip")
+        if vec is None:
+            continue
+        if expected_dim is not None and vec.ndim == 1 and int(vec.shape[0]) != expected_dim:
+            continue
+        pending.append((det_id, cast(Sequence[float], vec)))
+    if not pending:
+        return 0
+    updated = detections_store.update_clip_embeddings(pending)
+    if updated > 0:
+        detection_clip_shard_cache.clear()
+    return updated
+
+
+def _search_detection_clip_shards(
+    candidates: Sequence[Dict[str, Any]],
+    clip_query_vec: np.ndarray,
+    limit: int,
+) -> Tuple[List[Tuple[int, float]], Dict[int, Dict[str, Any]]]:
+    candidate_map: Dict[int, Dict[str, Any]] = {}
+    allowed_by_shard: Dict[str, Set[int]] = {}
+    for item in candidates:
+        det_id = _to_optional_int(item.get("id"))
+        if det_id is None:
+            continue
+        candidate_map[det_id] = item
+        shard = str(item.get("shard_key") or "").strip()
+        allowed_by_shard.setdefault(shard, set()).add(det_id)
+
+    ranked: List[Tuple[int, float]] = []
+    seen: Set[int] = set()
+    per_shard_k = max(DETECTIONS_SEARCH_SHARD_OVERFETCH, limit * 20)
+    query_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else 0
+
+    for shard_key, allowed_ids in allowed_by_shard.items():
+        if not shard_key:
+            continue
+        index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        if index_obj is None or shard_ids is None or shard_ids.size == 0:
+            continue
+        if query_dim > 0:
+            index_dim = _to_optional_int(getattr(index_obj, "d", None))
+            if index_dim is not None and index_dim != query_dim:
+                continue
+        k = min(int(shard_ids.size), per_shard_k)
+        if k <= 0:
+            continue
+        sims, inds = _faiss_search(index_obj, clip_query_vec.reshape(1, -1), k)
+        for local_idx, sim in zip(inds[0], sims[0]):
+            local_int = int(local_idx)
+            if local_int < 0 or local_int >= int(shard_ids.size):
+                continue
+            det_id = int(shard_ids[local_int])
+            if det_id not in allowed_ids or det_id in seen:
+                continue
+            seen.add(det_id)
+            ranked.append((det_id, float(sim)))
+
+    if len(seen) < len(candidate_map):
+        remaining = [det_id for det_id in candidate_map.keys() if det_id not in seen]
+        if remaining:
+            vec_rows = detections_store.fetch_detections_by_ids(remaining, include_vectors=True)
+            fallback_ranked: List[Tuple[int, float]] = []
+            for row in vec_rows:
+                clip_vec = row.get("clip_vec")
+                if not isinstance(clip_vec, np.ndarray):
+                    continue
+                if clip_vec.shape != clip_query_vec.shape:
+                    continue
+                det_id = _to_optional_int(row.get("id"))
+                if det_id is None:
+                    continue
+                fallback_ranked.append((det_id, float(np.dot(clip_query_vec, clip_vec))))
+            fallback_ranked.sort(key=lambda item: item[1], reverse=True)
+            for det_id, score in fallback_ranked:
+                if det_id in seen:
+                    continue
+                seen.add(det_id)
+                ranked.append((det_id, score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked, candidate_map
+
+
+def _ensure_dino_vectors_for_ids(detection_ids: Sequence[int]) -> Dict[int, np.ndarray]:
+    ids_clean = [int(det_id) for det_id in detection_ids if det_id is not None]
+    if not ids_clean:
+        return {}
+    rows = detections_store.fetch_detections_by_ids(ids_clean, include_vectors=True)
+    dino_map: Dict[int, np.ndarray] = {}
+    pending_updates: List[Tuple[int, Sequence[float]]] = []
+    for row in rows:
+        det_id = _to_optional_int(row.get("id"))
+        if det_id is None:
+            continue
+        existing = row.get("dino_vec")
+        if existing is not None:
+            dino_map[det_id] = existing
+            continue
+        thumb = row.get("thumbnail")
+        if not thumb:
+            continue
+        vec = _embed_thumbnail_b64(thumb, "dino")
+        if vec is None:
+            continue
+        dino_map[det_id] = vec
+        pending_updates.append((det_id, cast(Sequence[float], vec)))
+    if pending_updates:
+        detections_store.update_dino_embeddings(pending_updates)
+    return dino_map
+
+
+def _build_detection_search_result(
+    item: Dict[str, Any],
+    score: float,
+    clip_score: float,
+    dino_score: Optional[float],
+    mode: str,
+    alpha: float,
+    dino_fallback: bool,
+) -> Dict[str, Any]:
+    ts_ms = int(item.get("timestamp_ms") or 0)
+    ts_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000.0)) if ts_ms > 0 else "n/a"
+    probe_label = str(item.get("probe_name") or item.get("probe_id") or "probe")
+    image_path = str(item.get("image_path") or "").strip()
+    payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    if not image_path and isinstance(payload_obj, dict):
+        image_path = str(payload_obj.get("image_path") or "").strip()
+
+    result: Dict[str, Any] = {
+        "path": image_path,
+        "filename": f"{probe_label} · {ts_label}",
+        "similarity": float(score),
+        "thumbnail": item.get("thumbnail") or "",
+        "metadata": {
+            "mtime": ts_ms,
+            "detection_id": item.get("id"),
+            "source": item.get("source"),
+            "probe_id": item.get("probe_id"),
+            "probe_name": item.get("probe_name"),
+            "channel_id": item.get("channel_id"),
+        },
+        "is_detection": True,
+        "detection_id": item.get("id"),
+        "timestamp_ms": ts_ms,
+        "channel_id": item.get("channel_id"),
+        "probe_id": item.get("probe_id"),
+        "probe_name": item.get("probe_name"),
+        "severity": item.get("severity"),
+        "pos_score": float(item.get("pos_score") or 0.0),
+        "neg_score": float(item.get("neg_score") or 0.0),
+        "margin": float(item.get("margin") or 0.0),
+        "source": item.get("source"),
+        "shard_key": item.get("shard_key"),
+        "search_mode": mode,
+        "dino_fallback": bool(dino_fallback),
+    }
+    if mode in {"fusion", "dino"}:
+        result["fusion"] = {
+            "clip_similarity": float(clip_score),
+            "dino_similarity": float(dino_score if dino_score is not None else clip_score),
+            "alpha": float(alpha),
+            "dino_fallback": bool(dino_fallback),
+        }
+    return result
+
+
+def _search_detections_archive(
+    *,
+    clip_query_vec: np.ndarray,
+    dino_query_vec: Optional[np.ndarray],
+    mode: str,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    sort_by: str,
+    candidate_limit: int,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
+    candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
+    clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
+
+    candidates = detections_store.list_vector_candidates(
+        probe_id=probe_id,
+        channel_id=channel_id,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=candidate_limit,
+        only_with_clip=True,
+        include_vectors=False,
+    )
+    if not candidates:
+        updated = _backfill_clip_vectors_for_filters(
+            probe_id,
+            channel_id,
+            since_ms,
+            until_ms,
+            expected_dim=clip_dim,
+            max_backfill=min(candidate_limit, 2000),
+        )
+        if updated > 0:
+            candidates = detections_store.list_vector_candidates(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=candidate_limit,
+                only_with_clip=True,
+                include_vectors=False,
+            )
+    if not candidates:
+        return []
+
+    clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
+    if not clip_hits:
+        updated = _backfill_clip_vectors_for_filters(
+            probe_id,
+            channel_id,
+            since_ms,
+            until_ms,
+            expected_dim=clip_dim,
+            max_backfill=min(candidate_limit, 2000),
+        )
+        if updated > 0:
+            candidates = detections_store.list_vector_candidates(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=candidate_limit,
+                only_with_clip=True,
+                include_vectors=False,
+            )
+            clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
+    if not clip_hits:
+        return []
+
+    alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
+    if mode == "clip":
+        alpha = 0.0
+    elif mode == "dino":
+        alpha = 1.0
+
+    dino_scores: Dict[int, float] = {}
+    if mode in {"dino", "fusion"} and dino_query_vec is not None:
+        pool_size = min(len(clip_hits), max(DETECTIONS_SEARCH_DINO_POOL_MIN, limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER))
+        pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
+        dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
+        for det_id in pool_ids:
+            vec = dino_vectors.get(det_id)
+            if vec is None:
+                continue
+            dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
+
+    scored: List[Tuple[int, float, float, Optional[float], bool]] = []
+    for det_id, clip_score in clip_hits:
+        dino_score = dino_scores.get(det_id)
+        dino_fallback = False
+        if mode == "clip":
+            final_score = clip_score
+        elif dino_query_vec is None:
+            dino_fallback = True
+            final_score = clip_score
+        elif mode == "dino":
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = dino_score
+        else:
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = (1.0 - alpha) * clip_score + alpha * dino_score
+        scored.append((det_id, float(final_score), float(clip_score), dino_score, dino_fallback))
+
+    if sort_by == "time":
+        scored.sort(key=lambda row: int(candidate_map.get(row[0], {}).get("timestamp_ms") or 0), reverse=True)
+    else:
+        scored.sort(key=lambda row: row[1], reverse=True)
+
+    results: List[Dict[str, Any]] = []
+    for det_id, final_score, clip_score, dino_score, dino_fallback in scored[:limit]:
+        item = candidate_map.get(det_id)
+        if not item:
+            continue
+        results.append(
+            _build_detection_search_result(
+                item=item,
+                score=final_score,
+                clip_score=clip_score,
+                dino_score=dino_score,
+                mode=mode,
+                alpha=alpha,
+                dino_fallback=dino_fallback,
+            )
+        )
+    return results
+
+
 def _build_segment_search_results(
     segment_index: Optional[faiss.Index],
     segment_metadata: Sequence[Dict[str, Any]],
@@ -6112,7 +11802,7 @@ def _build_segment_search_results(
     if k == 0:
         return []
 
-    similarities, indices = segment_index.search(query_vec.reshape(1, -1), k)
+    similarities, indices = _faiss_search(segment_index, query_vec.reshape(1, -1), k)
 
     results: List[Dict[str, Any]] = []
     for idx, sim in zip(indices[0], similarities[0]):
@@ -6154,6 +11844,54 @@ def _parse_targets(raw_value: Optional[Union[str, Sequence[str]]]) -> Set[str]:
     return targets or {'images'}
 
 
+def _has_non_full_segments(segments: Dict[str, Any]) -> bool:
+    return any(str(seg_id) != 'full' for seg_id in segments.keys())
+
+
+def _encode_mask_segments_with_fallback(
+    image_input: Union[str, Path, Image.Image],
+    mask_image: Image.Image,
+    segment_ids: Optional[List[str]] = None,
+    min_patches: Optional[int] = None,
+) -> Tuple[Dict[str, Dict[str, Union[np.ndarray, float, int]]], int, bool]:
+    ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        raise RuntimeError('DINO encoder is not available')
+
+    requested_min = max(1, int(min_patches if min_patches is not None else config.DINO_SEGMENT_MIN_PATCHES))
+    segments = dino_encoder.encode_masked(
+        image_input,
+        mask_image,
+        segment_ids=segment_ids,
+        min_patches=requested_min,
+    )
+    if requested_min <= 1:
+        return segments, requested_min, False
+
+    require_non_full = True
+    if segment_ids is not None:
+        normalized_ids = {str(seg).strip().lower() for seg in segment_ids if str(seg).strip()}
+        require_non_full = bool(normalized_ids - {'full'})
+
+    if segments and (not require_non_full or _has_non_full_segments(segments)):
+        return segments, requested_min, False
+
+    relaxed = dino_encoder.encode_masked(
+        image_input,
+        mask_image,
+        segment_ids=segment_ids,
+        min_patches=1,
+    )
+    if relaxed and (not require_non_full or _has_non_full_segments(relaxed)):
+        print(
+            f"Mask encoding fallback: relaxed min_patches from {requested_min} to 1 "
+            f"(segment_ids={segment_ids if segment_ids is not None else 'auto'})"
+        )
+        return relaxed, 1, True
+
+    return segments or relaxed, requested_min, False
+
+
 def _mask_search_pipeline(
     image_input: Union[str, Path, Image.Image],
     mask_image: Image.Image,
@@ -6164,11 +11902,7 @@ def _mask_search_pipeline(
     segment_ids: Optional[List[str]] = None,
     label_map: Optional[Dict[str, Any]] = None,
 ):
-    ensure_embedder_loaded('dino')
-    if dino_encoder is None:
-        raise RuntimeError('DINO encoder is not available')
-
-    segments = dino_encoder.encode_masked(
+    segments, _, _ = _encode_mask_segments_with_fallback(
         image_input,
         mask_image,
         segment_ids=segment_ids,
@@ -6214,7 +11948,7 @@ def _mask_search_pipeline(
 
         if 'images' in target_modes:
             k = _candidate_pool_size(limit, len(image_paths), sort_by)
-            similarities, indices = image_index.search(embedding.reshape(1, -1), k)
+            similarities, indices = _faiss_search(image_index, embedding.reshape(1, -1), k)
             entry['image_results'] = _build_ranked_results(
                 image_index,
                 embedding,
@@ -6242,15 +11976,18 @@ def _mask_search_pipeline(
 @app.route('/comments', methods=['GET'])
 def get_comments():
     """Get comments for a specific image"""
-    folder = request.args.get('folder')
+    folder_raw = request.args.get('folder')
     image_path = request.args.get('image_path')
     
-    if not folder or not image_path:
+    if not folder_raw or not image_path:
         return jsonify({'error': 'Missing folder or image_path parameter'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         comments = get_image_comments(folder, image_path)
         return jsonify({'comments': comments})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as e:
         print(f"Error getting comments: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6258,12 +11995,15 @@ def get_comments():
 @app.route('/comments', methods=['POST'])
 def save_comment():
     """Save a new comment for an image"""
-    data = request.json
-    folder = data.get('folder')
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    folder_raw = data.get('folder')
     image_path = data.get('image_path')
     comment = data.get('comment', '').strip()
     
-    if not folder or not image_path or not comment:
+    if not folder_raw or not image_path or not comment:
         return jsonify({'error': 'Missing folder, image_path, or comment'}), 400
     
     # Basic input sanitization
@@ -6271,12 +12011,15 @@ def save_comment():
         return jsonify({'error': f'Comment too long (max {config.MAX_COMMENT_LENGTH} characters)'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         success = add_image_comment(folder, image_path, comment)
         if success:
             comments = get_image_comments(folder, image_path)
             return jsonify({'success': True, 'comments': comments})
         else:
             return jsonify({'error': 'Failed to save comment'}), 500
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as e:
         print(f"Error saving comment: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6284,12 +12027,13 @@ def save_comment():
 @app.route('/commented_images', methods=['POST'])
 def get_commented_images():
     """Get all images that have comments in the indexed folder"""
-    payload = request.json if request.is_json else None
-    folder = (payload or {}).get('folder')
-    if not folder:
+    payload = _json_body()
+    folder_raw = payload.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'No folder specified'}), 400
 
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         available = _available_indexes(folder)
         image_paths: List[str] = []
         image_metadata: List[Dict[str, Any]] = []
@@ -6333,9 +12077,14 @@ def get_commented_images():
 @app.route('/check_index', methods=['POST'])
 def check_index():
     """Check if folder is indexed"""
-    folder = request.json.get('folder')
-    if not folder:
+    data = _json_body()
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'No folder specified'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     
     available = _available_indexes(folder)
     if active_embedder == 'fusion':
@@ -6353,11 +12102,16 @@ def check_index():
 @app.route('/index', methods=['POST'])
 def index_folder():
     """Index a folder"""
-    folder = request.json.get('folder')
-    if not folder or not os.path.exists(folder):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Invalid folder path'}), 400
     
     try:
+        folder = str(_resolve_folder_path(folder_raw))
         index_results = create_index(folder)
         if not index_results:
             return jsonify({'error': 'No images found in folder'}), 400
@@ -6420,15 +12174,36 @@ def _parse_segment_labels(raw_value: Optional[Union[str, Dict[str, Any]]]) -> Di
     return {}
 
 
+def _normalize_mask_image(mask_img: Image.Image) -> Image.Image:
+    """Normalize uploaded/decoded mask images to a meaningful single-channel mask.
+
+    If an alpha channel exists and is informative (not fully opaque), use alpha because
+    UI overlays are RGBA with semantic mask stored in transparency.
+    """
+    bands = mask_img.getbands()
+    if "A" in bands:
+        try:
+            alpha = mask_img.getchannel("A")
+            alpha_np = np.asarray(alpha)
+            if alpha_np.size and np.any(alpha_np > 0) and np.any(alpha_np < 255):
+                return alpha.convert("L")
+        except Exception:
+            pass
+    if mask_img.mode != "L":
+        return mask_img.convert("L")
+    return mask_img
+
+
 def _load_mask_from_request() -> Optional[Image.Image]:
     mask_file = request.files.get('mask')
     if mask_file:
-        return Image.open(mask_file.stream).convert('L')
-    mask_base64 = request.form.get('mask') or (request.json or {}).get('mask') if request.is_json else None
+        return _normalize_mask_image(Image.open(mask_file.stream))
+    payload = _json_body()
+    mask_base64 = request.form.get('mask') or payload.get('mask')
     if mask_base64:
         try:
             mask_bytes = base64.b64decode(mask_base64)
-            return Image.open(BytesIO(mask_bytes)).convert('L')
+            return _normalize_mask_image(Image.open(BytesIO(mask_bytes)))
         except Exception as exc:
             raise ValueError(f"Invalid mask payload: {exc}")
     return None
@@ -6437,18 +12212,29 @@ def _load_mask_from_request() -> Optional[Image.Image]:
 @app.route('/index_segments', methods=['POST'])
 def index_segments():
     """Index DINO segment embeddings derived from a mask."""
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
     if not config.DINO_SEGMENTS_ENABLED:
         return jsonify({'error': 'Segment indexing is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
 
-    data = request.form if request.form else (request.json or {})
+    data = request.form if request.form else _json_body()
 
-    folder = data.get('folder')
+    folder_raw = data.get('folder')
     image_path = data.get('image_path')
-    if not folder or not image_path:
+    if not folder_raw or not image_path:
         return jsonify({'error': 'Both folder and image_path are required'}), 400
-
-    if not Path(image_path).exists():
+    try:
+        folder_path = _resolve_folder_path(folder_raw)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    image_obj = Path(image_path).expanduser().resolve()
+    if not image_obj.exists() or not image_obj.is_file():
         return jsonify({'error': f'Image file not found: {image_path}'}), 400
+    if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+        return jsonify({'error': 'Unsupported image file type'}), 400
+    if not _path_within(image_obj, folder_path):
+        return jsonify({'error': 'image_path must be inside folder'}), 400
 
     mask_image = _load_mask_from_request()
     if mask_image is None:
@@ -6457,13 +12243,15 @@ def index_segments():
     segment_ids = _parse_segment_ids(data.get('segment_ids'))
     label_map = _parse_segment_labels(data.get('segment_labels'))
 
-    ensure_embedder_loaded('dino')
-    segments = dino_encoder.encode_masked(
-        image_path,
-        mask_image,
-        segment_ids=segment_ids,
-        min_patches=config.DINO_SEGMENT_MIN_PATCHES,
-    )
+    try:
+        segments, min_patches_used, min_patches_relaxed = _encode_mask_segments_with_fallback(
+            str(image_obj),
+            mask_image,
+            segment_ids=segment_ids,
+            min_patches=config.DINO_SEGMENT_MIN_PATCHES,
+        )
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 500
 
     if not segments:
         return jsonify({'error': 'No valid segments were produced from the provided mask'}), 400
@@ -6490,10 +12278,22 @@ def index_segments():
         )
 
     if not embeddings:
-        return jsonify({'error': 'Mask did not yield any segments beyond the full image aggregate'}), 400
+        segment_keys = [str(key) for key in segments.keys()]
+        print(
+            "index_segments: no non-full segments "
+            f"(keys={segment_keys}, min_patches_used={min_patches_used}, relaxed={min_patches_relaxed})"
+        )
+        return jsonify(
+            {
+                'error': 'Mask did not yield any segments beyond the full image aggregate',
+                'min_patches_used': min_patches_used,
+                'min_patches_relaxed': min_patches_relaxed,
+                'hint': 'Select a larger region or lower Min Segment Patches in settings.',
+            }
+        ), 400
 
     embedding_matrix = np.stack(embeddings, axis=0)
-    save_segment_index(folder, embedding_matrix, entries)
+    save_segment_index(str(folder_path), embedding_matrix, entries)
 
     return jsonify(
         {
@@ -6507,16 +12307,25 @@ def index_segments():
                 }
                 for entry in entries
             ],
+            'min_patches_used': min_patches_used,
+            'min_patches_relaxed': min_patches_relaxed,
         }
     )
 
 
 @app.route('/video_understanding', methods=['POST'])
 def video_understanding():
-    data = request.json or {}
+    data = _json_body()
     video_path = (data.get('video') or '').strip()
     if not video_path:
         return jsonify({'error': 'Provide a video path.'}), 400
+    video_obj = Path(video_path).expanduser().resolve()
+    if not video_obj.exists() or not video_obj.is_file():
+        return jsonify({'error': f'Video file not found: {video_path}'}), 400
+    if config.ALLOWED_ROOTS:
+        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+        if not any(_path_within(video_obj, root) for root in allowed_roots):
+            return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
     max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
     try:
         max_frames_int = int(max_frames)
@@ -6539,14 +12348,14 @@ def video_understanding():
 
     try:
         frames, fps, duration = _sample_video_frames(
-            video_path,
+            str(video_obj),
             max_frames=max_frames_int,
             sample_fps=sample_fps_val,
             max_edge=config.LM_VIDEO_MAX_EDGE,
         )
         if not frames:
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
-        messages = _build_video_messages(video_path, frames, user_prompt)
+        messages = _build_video_messages(str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(messages, model_override=model_hint or None)
         return jsonify(
             {
@@ -6570,40 +12379,55 @@ def video_understanding():
 
 @app.route('/describe_image', methods=['POST'])
 def describe_image():
-    data = request.json or {}
+    data = _json_body()
+    folder_raw = data.get('folder')
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
     if not image_path:
         return jsonify({'error': 'image_path is required'}), 400
-    path_obj = Path(image_path)
-    if not path_obj.exists():
-        return jsonify({'error': f'Image not found: {image_path}'}), 400
     try:
-        messages = _build_image_messages(image_path, prompt)
+        if folder_raw:
+            folder_path = _resolve_folder_path(folder_raw, require_index=True)
+            path_obj = Path(image_path).expanduser().resolve()
+            if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return jsonify({'error': 'Unsupported image file type'}), 400
+            if not path_obj.exists() or not path_obj.is_file():
+                return jsonify({'error': f'Image not found: {image_path}'}), 400
+            if not _path_within(path_obj, folder_path):
+                return jsonify({'error': 'image_path must be inside folder'}), 400
+        else:
+            path_obj = detection_archive.resolve_archive_image_path(image_path)
+        messages = _build_image_messages(str(path_obj), prompt)
         summary = _call_lm_chat(messages, model_override=model_hint or None)
-        thumb = _encode_jpeg(Image.open(path_obj), max_edge=config.THUMBNAIL_SIZE[0])
+        with Image.open(path_obj) as src:
+            thumb = _encode_jpeg(src, max_edge=config.THUMBNAIL_SIZE[0])
         return jsonify(
             {
                 'summary': summary,
                 'thumbnail': thumb,
                 'model': model_hint or config.LM_MODEL,
-                'image_path': image_path,
+                'image_path': str(path_obj),
             }
         )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
-    folder = request.json.get('folder')
-    query = request.json.get('query')
-    limit = request.json.get('limit', 10)
-    sort_by = request.json.get('sort_by', 'similarity')  # 'similarity' or 'time'
-    print(f"Search request: folder={folder}, query={query}, limit={limit}, sort_by={sort_by}")
-
-    if not folder or not query:
+    data = _json_body()
+    folder_raw = data.get('folder')
+    query = data.get('query')
+    limit = data.get('limit', 10)
+    sort_by = data.get('sort_by', 'similarity')  # 'similarity' or 'time'
+    if not folder_raw or not query:
         return jsonify({'error': 'Missing folder or query'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw, require_index=True))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
     fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
     search_mode = 'clip' if fusion_active else active_embedder
@@ -6619,7 +12443,7 @@ def search():
         limit = config.DEFAULT_RESULTS
 
     index, image_paths, image_metadata, index_meta = load_index(folder, embedder=search_mode)
-    if index is None:
+    if index is None or not image_paths:
         message = 'Folder not indexed for the current backend'
         available = _available_indexes(folder)
         if available:
@@ -6634,10 +12458,12 @@ def search():
     try:
         k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
+            print(f"Text search: query='{query}' candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
-        similarities, indices = index.search(text_embedding.reshape(1, -1), k)
+        similarities, indices = _faiss_search(index, text_embedding.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
         results = _build_ranked_results(
             index,
             text_embedding,
@@ -6652,6 +12478,10 @@ def search():
         if sort_by == 'time':
             results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
 
+        print(
+            f"Text search: query='{query}' candidates={candidate_count} "
+            f"returned={len(results)} folder='{folder}'"
+        )
         return jsonify({'results': results})
     except Exception as e:
         print(f"Text search error: {e}")
@@ -6662,12 +12492,16 @@ def search():
 @app.route('/search_by_image', methods=['POST'])
 def search_by_image():
     """Search for images using an uploaded image"""
-    folder = request.form.get('folder')
+    folder_raw = request.form.get('folder')
     limit = request.form.get('limit', 12)
     sort_by = request.form.get('sort_by', 'similarity')  # 'similarity' or 'time'
 
-    if not folder:
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder = str(_resolve_folder_path(folder_raw, require_index=True))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
     try:
         limit = int(limit)
@@ -6687,6 +12521,12 @@ def search_by_image():
 
     fusion_active = active_embedder == 'fusion' and config.FUSION_ENABLED
 
+    clip_data: Optional[FaissIndexBundle] = None
+    dino_data: Optional[FaissIndexBundle] = None
+    index: Optional[faiss.Index] = None
+    image_paths: List[str] = []
+    image_metadata: List[Dict[str, Any]] = []
+
     if fusion_active:
         clip_data, dino_data = _load_fusion_indexes(folder)
         clip_index, clip_paths, clip_metadata, _ = clip_data
@@ -6698,15 +12538,18 @@ def search_by_image():
                 message += f" (available: {', '.join(available)})"
             return jsonify({'error': message}), 400
     else:
-        index, image_paths, image_metadata, index_meta = load_index(folder, embedder=active_embedder)
-        if index is None:
+        index, loaded_paths, loaded_metadata, index_meta = load_index(folder, embedder=active_embedder)
+        if index is None or not loaded_paths:
             message = 'Folder not indexed for the current backend'
             available = _available_indexes(folder)
             if available:
                 message += f" (available: {', '.join(available)})"
             return jsonify({'error': message}), 400
+        image_paths = loaded_paths
+        image_metadata = loaded_metadata or []
 
     try:
+        dino_vec: Optional[np.ndarray] = None
         if file:
             uploaded_image = Image.open(file.stream)
             if uploaded_image.mode != 'RGB':
@@ -6715,22 +12558,33 @@ def search_by_image():
             if fusion_active:
                 dino_vec = get_image_embedding_from_pil(uploaded_image, embedder='dino')
         else:
-            if not os.path.exists(image_path):
+            image_obj = Path(str(image_path)).expanduser().resolve()
+            if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+                return jsonify({'error': 'Unsupported image file type'}), 400
+            if not image_obj.exists() or not image_obj.is_file():
                 return jsonify({'error': f'Image file not found: {image_path}'}), 400
-            clip_vec = get_image_embedding(image_path, embedder='clip') if fusion_active else get_image_embedding(image_path, embedder=active_embedder)
+            if not _path_within(image_obj, Path(folder)):
+                return jsonify({'error': 'image_path must be inside folder'}), 400
+            clip_vec = get_image_embedding(image_obj, embedder='clip') if fusion_active else get_image_embedding(image_obj, embedder=active_embedder)
             if fusion_active:
-                dino_vec = get_image_embedding(image_path, embedder='dino')
+                dino_vec = get_image_embedding(image_obj, embedder='dino')
 
         if fusion_active:
+            if clip_data is None or dino_data is None or dino_vec is None:
+                return jsonify({'error': 'Fusion search requires both CLIP and DINO query embeddings'}), 500
             results = _fuse_results(clip_data, dino_data, clip_vec, dino_vec, limit, sort_by)
             return jsonify({'results': results})
 
+        if index is None or not image_paths:
+            return jsonify({'error': 'Backend index is unavailable for image search'}), 400
         k = _candidate_pool_size(limit, len(image_paths), sort_by)
         if k == 0:
+            print(f"Image search: candidates=0 returned=0 folder='{folder}'")
             return jsonify({'results': []})
-        similarities, indices = index.search(clip_vec.reshape(1, -1), k)
+        similarities, indices = _faiss_search(index, clip_vec.reshape(1, -1), k)
 
         metadata_map = _prepare_metadata_map(image_paths, image_metadata)
+        candidate_count = len(_collect_candidates(indices, similarities, len(image_paths)))
         results = _build_ranked_results(
             index,
             clip_vec,
@@ -6745,6 +12599,10 @@ def search_by_image():
         if sort_by == 'time':
             results.sort(key=lambda item: item['metadata'].get('mtime', 0), reverse=True)
 
+        print(
+            f"Image search: candidates={candidate_count} returned={len(results)} "
+            f"folder='{folder}'"
+        )
         return jsonify({'results': results})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -6753,14 +12611,19 @@ def search_by_image():
 @app.route('/search_by_mask', methods=['POST'])
 def search_by_mask():
     """Search using a masked region of an image leveraging DINO segment embeddings."""
-    data = request.form if request.form else (request.json or {})
+    data = request.form if request.form else _json_body()
 
     if not config.DINO_SEGMENTS_ENABLED:
         return jsonify({'error': 'Segment search is disabled. Enable EVOSSEARCH_DINO_SEGMENTS_ENABLED to use this feature.'}), 400
 
-    folder = data.get('folder')
-    if not folder:
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    folder = str(folder_path)
 
     limit = data.get('limit', config.DEFAULT_RESULTS)
     sort_by = data.get('sort_by', 'similarity')
@@ -6791,6 +12654,8 @@ def search_by_mask():
         return jsonify({'error': 'Mask is required for masked search'}), 400
 
     ensure_embedder_loaded('dino')
+    if dino_encoder is None:
+        return jsonify({'error': 'DINO encoder is not available'}), 500
 
     if uploaded_image:
         query_image = Image.open(uploaded_image.stream)
@@ -6798,9 +12663,14 @@ def search_by_mask():
             query_image = query_image.convert('RGB')
         image_input: Union[Image.Image, str] = query_image
     else:
-        if not Path(image_source).exists():
+        image_obj = Path(str(image_source)).expanduser().resolve()
+        if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return jsonify({'error': 'Unsupported image file type'}), 400
+        if not image_obj.exists():
             return jsonify({'error': f'Image file not found: {image_source}'}), 400
-        image_input = image_source
+        if not _path_within(image_obj, folder_path):
+            return jsonify({'error': 'image_path must be inside folder'}), 400
+        image_input = str(image_obj)
 
     try:
         segment_map = dino_encoder.encode_masked(
@@ -6844,22 +12714,31 @@ def search_by_mask():
 @app.route('/segment_from_point', methods=['POST'])
 def segment_from_point():
     """Derive a mask from a clicked point and run masked search."""
-    data = request.json if request.is_json else request.form
+    data = request.form if request.form else _json_body()
     if data is None:
         return jsonify({'error': 'No data provided'}), 400
 
-    folder = data.get('folder')
-    if not folder:
+    folder_raw = data.get('folder')
+    if not folder_raw:
         return jsonify({'error': 'Missing folder'}), 400
+    try:
+        folder_path = _resolve_folder_path(folder_raw, require_index=True)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    folder = str(folder_path)
 
     image_path = data.get('image_path')
     uploaded_image = request.files.get('image')
     if not image_path and uploaded_image is None:
         return jsonify({'error': 'Provide image_path or upload an image file'}), 400
 
+    x_raw = data.get('x')
+    y_raw = data.get('y')
+    if x_raw is None or y_raw is None:
+        return jsonify({'error': 'Invalid or missing x/y coordinates'}), 400
     try:
-        x_norm = float(data.get('x'))
-        y_norm = float(data.get('y'))
+        x_norm = float(x_raw)
+        y_norm = float(y_raw)
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid or missing x/y coordinates'}), 400
 
@@ -6896,9 +12775,14 @@ def segment_from_point():
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
     else:
-        if not os.path.exists(image_path):
+        image_obj = Path(str(image_path)).expanduser().resolve()
+        if image_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
+            return jsonify({'error': 'Unsupported image file type'}), 400
+        if not image_obj.exists() or not image_obj.is_file():
             return jsonify({'error': f'Image file not found: {image_path}'}), 400
-        with Image.open(image_path) as src:
+        if not _path_within(image_obj, folder_path):
+            return jsonify({'error': 'image_path must be inside folder'}), 400
+        with Image.open(image_obj) as src:
             pil_image = src.convert('RGB')
 
     assert pil_image is not None
@@ -6927,10 +12811,10 @@ def segment_from_point():
         heatmap_norm = heatmap_norm / heatmap_norm.max()
 
     crop_size = getattr(dino_encoder, 'crop_size', 224)
-    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=Image.NEAREST)
+    mask_img = Image.fromarray(coarse_mask_uint8).resize((crop_size, crop_size), resample=RESAMPLE_NEAREST)
 
     base_size = pil_image.size
-    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=Image.NEAREST)
+    overlay_mask_source = Image.fromarray(coarse_mask_uint8).resize(base_size, resample=RESAMPLE_NEAREST)
     refinement_source = 'dino_heatmap'
     refined_label: Optional[str] = None
     segment_value = 255
@@ -6949,8 +12833,8 @@ def segment_from_point():
                     segment_value = int(refine_result.get('segment_value', 255))
                     overlay_mask_source = Image.fromarray(refined_mask_arr.astype(np.uint8), mode='L')
                     if overlay_mask_source.size != base_size:
-                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=Image.NEAREST)
-                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=Image.NEAREST)
+                        overlay_mask_source = overlay_mask_source.resize(base_size, resample=RESAMPLE_NEAREST)
+                    mask_img = overlay_mask_source.resize((crop_size, crop_size), resample=RESAMPLE_NEAREST)
                     if refined_label:
                         label_map[str(segment_value)] = refined_label
         except Exception as exc:
@@ -6961,7 +12845,7 @@ def segment_from_point():
     if overlay_mask_np.size:
         mask_fraction = float(np.count_nonzero(overlay_mask_np)) / float(overlay_mask_np.size)
 
-    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=Image.BILINEAR)
+    heatmap_alpha = Image.fromarray((heatmap_norm * 255).astype(np.uint8)).resize(base_size, resample=RESAMPLE_BILINEAR)
     heatmap_overlay = _create_overlay_rgba(heatmap_alpha, (255, 155, 40), 0.9)
     mask_overlay = _create_overlay_rgba(overlay_mask_source, (94, 196, 255), 0.6)
     segmentation_overlay_img: Optional[Image.Image] = None
@@ -6973,10 +12857,16 @@ def segment_from_point():
         class_labels = {}
         if isinstance(class_labels_raw, dict):
             class_labels = {int(k): str(v) for k, v in class_labels_raw.items()}
-        seg_overlay, legend_entries = _render_segmentation_overlay(seg_map, class_labels, int(refine_result.get('class_id', segment_value)))
+        seg_overlay: Optional[Image.Image] = None
+        if isinstance(seg_map, np.ndarray):
+            seg_overlay, legend_entries = _render_segmentation_overlay(
+                seg_map,
+                class_labels,
+                int(refine_result.get('class_id', segment_value)),
+            )
         if seg_overlay is not None:
             if seg_overlay.size != base_size:
-                seg_overlay = seg_overlay.resize(base_size, resample=Image.NEAREST)
+                seg_overlay = seg_overlay.resize(base_size, resample=RESAMPLE_NEAREST)
             segmentation_overlay_img = seg_overlay
 
     try:
@@ -7005,6 +12895,7 @@ def segment_from_point():
         'threshold': threshold,
         'heatmap_png': _image_to_base64(heatmap_overlay),
         'mask_png': _image_to_base64(mask_overlay),
+        'mask_raw_png': _image_to_base64(overlay_mask_source.convert('L')),
         'mask_fraction': mask_fraction,
         'refinement': refinement_source,
         'refined_label': refined_label,
@@ -7056,7 +12947,10 @@ def luxriot_snapshot(channel_id: int):
 
 @app.route('/luxriot/start_capture', methods=['POST'])
 def luxriot_start_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7064,8 +12958,15 @@ def luxriot_start_capture():
     batch_size = data.get('batch_size')
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip() or None
+    system_prompt = (data.get('system_prompt') or '').strip() or None
     try:
-        status = luxriot_manager.start_session(channel_id, batch_size=batch_size, prompt=prompt, model_hint=model_hint)
+        status = luxriot_manager.start_session(
+            channel_id,
+            batch_size=batch_size,
+            prompt=prompt,
+            model_hint=model_hint,
+            system_prompt=system_prompt,
+        )
         return jsonify({'success': True, 'session': status})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -7073,7 +12974,10 @@ def luxriot_start_capture():
 
 @app.route('/luxriot/stop_capture', methods=['POST'])
 def luxriot_stop_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7087,7 +12991,10 @@ def luxriot_stop_capture():
 
 @app.route('/luxriot/flush_capture', methods=['POST'])
 def luxriot_flush_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7104,16 +13011,100 @@ def luxriot_flush_capture():
 @app.route('/luxriot/session', methods=['GET'])
 def luxriot_session_status():
     channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    run_selector = (request.args.get('run') or '').strip() or None
+    from_ts = request.args.get('from_ts', default=None, type=float)
+    to_ts = request.args.get('to_ts', default=None, type=float)
+    limit = request.args.get('limit', default=None, type=int)
     try:
-        status = luxriot_manager.session_status(channel_id)
+        status = luxriot_manager.session_status(
+            channel_id,
+            run_selector=run_selector,
+            start_ts=from_ts,
+            end_ts=to_ts,
+            limit=limit,
+        )
         return jsonify(status)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/rollups', methods=['GET'])
+def luxriot_summary_rollups():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    run_selector = (request.args.get('run') or '').strip() or None
+    from_ts = request.args.get('from_ts', default=None, type=float)
+    to_ts = request.args.get('to_ts', default=None, type=float)
+    level_limit = request.args.get('level_limit', default=60, type=int)
+    try:
+        rollups = luxriot_manager.summary_rollups(
+            channel_id=channel_id,
+            run_selector=run_selector,
+            start_ts=from_ts,
+            end_ts=to_ts,
+            level_limit=level_limit,
+        )
+        return jsonify(rollups)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/streams', methods=['GET'])
+def luxriot_streams_status():
+    try:
+        return jsonify(luxriot_manager.streams_status())
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/streams/stop', methods=['POST'])
+def luxriot_stop_stream():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+    stream_type = (data.get('stream_type') or 'both').strip().lower()
+    pause_analytics = _coerce_bool(data.get('pause_analytics'), True)
+    try:
+        result = luxriot_manager.stop_stream(channel_id, stream_type=stream_type, pause_analytics=pause_analytics)
+        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/streams/stop_all', methods=['POST'])
+def luxriot_stop_all_streams():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    stop_video = _coerce_bool(data.get('stop_video'), True)
+    stop_analytics = _coerce_bool(data.get('stop_analytics'), True)
+    pause_analytics = _coerce_bool(data.get('pause_analytics'), True)
+    if not stop_video and not stop_analytics:
+        return jsonify({'error': 'Select at least one stream type to stop'}), 400
+    try:
+        result = luxriot_manager.stop_all_streams(
+            stop_video=stop_video,
+            stop_analytics=stop_analytics,
+            pause_analytics=pause_analytics,
+        )
+        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/luxriot/bookmark', methods=['POST'])
 def luxriot_bookmark():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7144,7 +13135,10 @@ def luxriot_bookmark():
 
 @app.route('/probes/query', methods=['POST'])
 def probes_query():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or data.get('channel') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7167,9 +13161,28 @@ def probes_query():
         window_sec = float(data.get('window_sec', 0))
     except Exception:
         window_sec = 0
-    result = probe_manager.query(channel_id, positives, negatives, pos_floor, margin_thr, top_k, window_sec=window_sec, image_probe=data.get('image_probe'))
+    probe_like = {
+        "id": data.get('id'),
+        "name": (data.get('name') or 'probe'),
+        "channel_id": channel_id,
+        "severity": (data.get('severity') or 'critical'),
+        "bookmark": bool(data.get('bookmark')),
+        "window_sec": window_sec,
+        "fps": data.get('fps'),
+    }
+    result = probe_manager.query(
+        channel_id,
+        positives,
+        negatives,
+        pos_floor,
+        margin_thr,
+        top_k,
+        window_sec=window_sec,
+        image_probe=data.get('image_probe'),
+    )
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
+    bookmark_sent = False
     if hits and data.get('bookmark'):
         try:
             luxriot_manager.send_bookmark_event(
@@ -7180,6 +13193,7 @@ def probes_query():
                 state='new',
                 timestamp_ms=hits[0].get('timestamp_ms'),
             )
+            bookmark_sent = True
         except Exception:
             pass
     if hits:
@@ -7187,6 +13201,15 @@ def probes_query():
         recent_hits = data.get('recent_hits') or []
         recent_hits = (recent_hits + hits)[:PROBE_MAX_STORED_HITS]
         result['recent_hits'] = recent_hits
+        result['persisted_hits'] = _store_probe_hits(
+            probe_like,
+            hits,
+            source='probes_query',
+            bookmark_sent=bookmark_sent,
+            extra_payload={'frames_indexed': result.get('frames_indexed')},
+        )
+    else:
+        result['persisted_hits'] = 0
     return jsonify(result), status_code
 
 
@@ -7201,7 +13224,10 @@ def probes_status():
 
 @app.route('/probes/start_capture', methods=['POST'])
 def probes_start_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7214,7 +13240,8 @@ def probes_start_capture():
                 fps_val = float(fps)
         except Exception:
             fps_val = None
-        state = luxriot_manager.start_probe_capture(channel_id, fps=fps_val)
+        clear_pause = _coerce_bool(data.get('clear_pause'), True)
+        state = luxriot_manager.start_probe_capture(channel_id, fps=fps_val, clear_pause=clear_pause)
         return jsonify({'success': True, 'state': state})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -7222,13 +13249,17 @@ def probes_start_capture():
 
 @app.route('/probes/stop_capture', methods=['POST'])
 def probes_stop_capture():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     try:
-        state = luxriot_manager.stop_probe_capture(channel_id)
+        pause = _coerce_bool(data.get('pause'), True)
+        state = luxriot_manager.stop_probe_capture(channel_id, pause=pause)
         return jsonify({'success': True, 'state': state})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -7236,7 +13267,10 @@ def probes_stop_capture():
 
 @app.route('/probes/save', methods=['POST'])
 def probes_save():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     try:
         channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     except Exception:
@@ -7289,7 +13323,10 @@ def probes_list():
 
 @app.route('/probes/delete', methods=['POST'])
 def probes_delete():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     probe_id = data.get('id')
     if not probe_id:
         return jsonify({'error': 'Provide probe id'}), 400
@@ -7301,7 +13338,10 @@ def probes_delete():
 
 @app.route('/probes/run', methods=['POST'])
 def probes_run():
-    data = request.json or {}
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
     probe_id = data.get('id')
     if not probe_id:
         return jsonify({'error': 'Provide probe id'}), 400
@@ -7322,6 +13362,7 @@ def probes_run():
     if 'error' in result:
         return jsonify(result), 400
     hits = result.get('results') or []
+    bookmark_sent = False
     if hits:
         probe['last_hit'] = hits[0]
         # keep a short rolling history of hits for UI while capping thumbnails
@@ -7339,9 +13380,19 @@ def probes_run():
                     state='new',
                     timestamp_ms=hits[0].get('timestamp_ms'),
                 )
+                bookmark_sent = True
             except Exception:
                 pass
-    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe})
+        persisted_hits = _store_probe_hits(
+            probe,
+            hits,
+            source='probes_run',
+            bookmark_sent=bookmark_sent,
+            extra_payload={'frames_indexed': result.get('frames_indexed')},
+        )
+    else:
+        persisted_hits = 0
+    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe, 'persisted_hits': persisted_hits})
 
 
 @app.route('/probes/bench', methods=['GET'])
@@ -7357,28 +13408,531 @@ def probes_bench():
     batch = int(request.args.get('batch', PROBE_BENCH_BATCH))
     batch = max(4, min(64, batch))
     try:
-        # build random batch at 224x224
-        rnd = torch.randint(0, 255, (batch, 3, 224, 224), device=device, dtype=torch.uint8)
-        images = rnd.float() / 255.0
+        # Use a repeated random image batch so benchmark works across CLIP and SigLIP2 backends.
+        target_size = 224
+        if clip_backend_kind == "siglip2" and clip_processor is not None:
+            size_info = getattr(getattr(clip_processor, "image_processor", None), "size", None)
+            if isinstance(size_info, dict):
+                h = _to_optional_int(size_info.get("height")) or _to_optional_int(size_info.get("shortest_edge"))
+                w = _to_optional_int(size_info.get("width")) or h
+                if h is not None and w is not None:
+                    target_size = max(128, min(512, max(h, w)))
+        rnd = np.random.randint(0, 256, (target_size, target_size, 3), dtype=np.uint8)
+        probe_image = Image.fromarray(rnd, mode='RGB')
+        images = [probe_image] * batch
         started = time.time()
-        with torch.no_grad():
-            feats = clip_model.encode_image(images)  # type: ignore
-            _ = feats.cpu()
+        feats = _clip_image_embeddings_from_pils(images)
+        _ = feats.shape[0]
         elapsed = time.time() - started
         fps = batch / elapsed if elapsed > 0 else 0
         return jsonify({
             "batch": batch,
             "elapsed_sec": round(elapsed, 3),
             "approx_fps": round(fps, 1),
-            "device": device,
+            "device": clip_runtime_device,
+            "backend": clip_backend_kind,
+            "model": clip_runtime_model or config.CLIP_MODEL,
+            "resolution": target_size,
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route('/detections/search_text', methods=['POST'])
+def detections_search_text():
+    data = _json_body()
+    query = str(data.get('query') or '').strip()
+    if not query:
+        return jsonify({'error': 'query is required'}), 400
+
+    try:
+        filters = _parse_detection_filters(data)
+    except Exception as exc:
+        return jsonify({'error': f'Invalid detection filters: {exc}'}), 400
+
+    try:
+        limit = int(data.get('limit', config.DEFAULT_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+    if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+        limit = config.DEFAULT_RESULTS
+
+    try:
+        candidate_limit = int(data.get('candidate_limit', 20000))
+    except Exception:
+        candidate_limit = 20000
+
+    sort_by = str(data.get('sort_by') or 'similarity').strip().lower()
+    if sort_by not in {'similarity', 'time'}:
+        sort_by = 'similarity'
+
+    mode_requested = _normalize_detection_search_mode(str(data.get('embedder') or active_embedder))
+    # DINO/Fusion cannot encode text prompts; fallback to CLIP retrieval.
+    mode = 'clip'
+
+    try:
+        clip_query_vec = get_text_embedding(query)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'error': f'Failed to embed text query: {exc}'}), 500
+
+    try:
+        results = _search_detections_archive(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=None,
+            mode=mode,
+            probe_id=filters['probe_id'],
+            channel_id=filters['channel_id'],
+            since_ms=filters['since_ms'],
+            until_ms=filters['until_ms'],
+            limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+        )
+        return jsonify(
+            {
+                'results': results,
+                'mode_requested': mode_requested,
+                'mode_used': mode,
+                'filters': filters,
+                'query': query,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/detections/search_image', methods=['POST'])
+def detections_search_image():
+    mode = _normalize_detection_search_mode(request.form.get('embedder') or active_embedder)
+
+    filters_payload = {
+        'probe_id': request.form.get('probe_id'),
+        'channel_id': request.form.get('channel_id'),
+        'since_ms': request.form.get('since_ms'),
+        'until_ms': request.form.get('until_ms'),
+        'hours': request.form.get('hours'),
+    }
+    try:
+        filters = _parse_detection_filters(filters_payload)
+    except Exception as exc:
+        return jsonify({'error': f'Invalid detection filters: {exc}'}), 400
+
+    try:
+        limit = int(request.form.get('limit', config.DEFAULT_RESULTS))
+    except Exception:
+        limit = config.DEFAULT_RESULTS
+    if limit < config.MIN_RESULTS or limit > config.MAX_RESULTS:
+        limit = config.DEFAULT_RESULTS
+
+    try:
+        candidate_limit = int(request.form.get('candidate_limit', 20000))
+    except Exception:
+        candidate_limit = 20000
+
+    sort_by = str(request.form.get('sort_by') or 'similarity').strip().lower()
+    if sort_by not in {'similarity', 'time'}:
+        sort_by = 'similarity'
+
+    file = request.files.get('image')
+    if file is None or file.filename == '':
+        return jsonify({'error': 'image file is required'}), 400
+
+    try:
+        pil_image = Image.open(file.stream)
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+    except Exception as exc:
+        return jsonify({'error': f'Failed to read uploaded image: {exc}'}), 400
+
+    try:
+        clip_query_vec = get_image_embedding_from_pil(pil_image, embedder='clip')
+    except Exception as exc:
+        return jsonify({'error': f'Failed to embed image query with CLIP: {exc}'}), 500
+
+    dino_query_vec: Optional[np.ndarray] = None
+    if mode in {'dino', 'fusion'}:
+        try:
+            dino_query_vec = get_image_embedding_from_pil(pil_image, embedder='dino')
+        except Exception as exc:
+            print(f"Detections image search: DINO query embedding unavailable, fallback to CLIP only ({exc})")
+            dino_query_vec = None
+
+    try:
+        results = _search_detections_archive(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=dino_query_vec,
+            mode=mode,
+            probe_id=filters['probe_id'],
+            channel_id=filters['channel_id'],
+            since_ms=filters['since_ms'],
+            until_ms=filters['until_ms'],
+            limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+        )
+        return jsonify(
+            {
+                'results': results,
+                'mode_used': mode,
+                'filters': filters,
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/detections/list', methods=['GET'])
+def detections_list():
+    probe_id_raw = (request.args.get('probe_id') or '').strip()
+    probe_id = probe_id_raw or None
+
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms_raw = (request.args.get('since_ms') or '').strip()
+    since_ms: Optional[int] = None
+    if since_ms_raw:
+        try:
+            since_ms = int(since_ms_raw)
+        except Exception:
+            return jsonify({'error': 'since_ms must be an integer'}), 400
+
+    until_ms_raw = (request.args.get('until_ms') or '').strip()
+    until_ms: Optional[int] = None
+    if until_ms_raw:
+        try:
+            until_ms = int(until_ms_raw)
+        except Exception:
+            return jsonify({'error': 'until_ms must be an integer'}), 400
+
+    hours_raw = (request.args.get('hours') or '').strip()
+    if since_ms is None:
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        offset = int(request.args.get('offset', 0))
+    except Exception:
+        offset = 0
+
+    try:
+        detections, total = detections_store.list_detections(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify(
+            {
+                'detections': detections,
+                'total': total,
+                'limit': max(1, min(500, int(limit or 50))),
+                'offset': max(0, int(offset or 0)),
+                'has_more': max(0, int(offset or 0)) + len(detections) < total,
+                'filters': {
+                    'probe_id': probe_id,
+                    'channel_id': channel_id,
+                    'since_ms': since_ms,
+                    'until_ms': until_ms,
+                },
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/detections/summary', methods=['GET'])
+def detections_summary():
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms_raw = (request.args.get('since_ms') or '').strip()
+    since_ms: Optional[int] = None
+    if since_ms_raw:
+        try:
+            since_ms = int(since_ms_raw)
+        except Exception:
+            return jsonify({'error': 'since_ms must be an integer'}), 400
+    else:
+        hours_raw = (request.args.get('hours') or '').strip()
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 100))
+    except Exception:
+        limit = 100
+
+    try:
+        summary = detections_store.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, limit=limit)
+        return jsonify(
+            {
+                'summary': summary,
+                'count': len(summary),
+                'filters': {
+                    'channel_id': channel_id,
+                    'since_ms': since_ms,
+                },
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+ENV_PREFIX = "EVOSSEARCH_"
+
+
+def _bool_to_env(value: Any) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
+    env_map: Dict[str, str] = {}
+    env_path = Path(path)
+    if not env_path.exists():
+        return env_map
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return env_map
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in raw_line:
+            continue
+        key_raw, value_raw = raw_line.split("=", 1)
+        key = key_raw.strip()
+        if not key:
+            continue
+        env_map[key] = value_raw.strip()
+    return env_map
+
+
+def _parse_env_editor_text(raw_text: Any) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    text = str(raw_text or "")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in raw_line:
+            continue
+        key_raw, value_raw = raw_line.split("=", 1)
+        key = key_raw.strip()
+        if not key or not key.startswith(ENV_PREFIX):
+            continue
+        parsed[key] = value_raw.strip()
+    return parsed
+
+
+def _serialize_env_map(env_map: Dict[str, str]) -> str:
+    keys_sorted = sorted(env_map.keys())
+    return "\n".join(f"{key}={env_map[key]}" for key in keys_sorted)
+
+
+def _runtime_env_map() -> Dict[str, str]:
+    sev = config.LUXRIOT_SEVERITY_MAP or {}
+    env: Dict[str, str] = {
+        "EVOSSEARCH_HOST": str(config.HOST),
+        "EVOSSEARCH_PORT": str(config.PORT),
+        "EVOSSEARCH_DEBUG": _bool_to_env(config.DEBUG),
+        "EVOSSEARCH_EMBEDDER": str(config.EMBEDDER),
+        "EVOSSEARCH_CLIP_MODEL": str(config.CLIP_MODEL),
+        "EVOSSEARCH_DINO_MODEL": str(config.DINO_MODEL),
+        "EVOSSEARCH_EMB_DIM_DINO": str(config.EMB_DIM_DINO),
+        "EVOSSEARCH_DINO_WEIGHTS_PATH": str(config.DINO_WEIGHTS_PATH),
+        "EVOSSEARCH_DINO_DEVICE": str(config.DINO_DEVICE),
+        "EVOSSEARCH_INDEX_MODE": str(config.INDEX_MODE),
+        "EVOSSEARCH_FUSION_ENABLED": _bool_to_env(config.FUSION_ENABLED),
+        "EVOSSEARCH_FUSION_ALPHA": str(config.FUSION_ALPHA),
+        "EVOSSEARCH_RERANK_ENABLED": _bool_to_env(config.RERANK_ENABLED),
+        "EVOSSEARCH_RERANK_TOP_K": str(config.RERANK_TOP_K),
+        "EVOSSEARCH_DINO_SEGMENTS_ENABLED": _bool_to_env(config.DINO_SEGMENTS_ENABLED),
+        "EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES": str(config.DINO_SEGMENT_MIN_PATCHES),
+        "EVOSSEARCH_DINO_HEATMAP_THRESHOLD": str(config.DINO_HEATMAP_THRESHOLD),
+        "EVOSSEARCH_M2F_ENABLED": _bool_to_env(config.MASK2FORMER_ENABLED),
+        "EVOSSEARCH_M2F_MODEL": str(config.MASK2FORMER_MODEL),
+        "EVOSSEARCH_M2F_DEVICE": str(config.MASK2FORMER_DEVICE),
+        "EVOSSEARCH_M2F_MAX_SIZE": str(config.MASK2FORMER_MAX_SIZE),
+        "EVOSSEARCH_LM_BASE_URL": str(config.LM_BASE_URL),
+        "EVOSSEARCH_LM_MODEL": str(config.LM_MODEL),
+        "EVOSSEARCH_LM_API_KEY": str(config.LM_API_KEY),
+        "EVOSSEARCH_LM_TIMEOUT": str(config.LM_TIMEOUT),
+        "EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES": str(config.LM_VIDEO_DEFAULT_FRAMES),
+        "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
+        "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
+        "EVOSSEARCH_LM_VIDEO_MAX_TOKENS": str(config.LM_VIDEO_MAX_TOKENS),
+        "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
+        "EVOSSEARCH_LUXRIOT_BASE_URL": str(config.LUXRIOT_BASE_URL),
+        "EVOSSEARCH_LUXRIOT_USERNAME": str(config.LUXRIOT_USERNAME),
+        "EVOSSEARCH_LUXRIOT_PASSWORD": str(config.LUXRIOT_PASSWORD),
+        "EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID": str(config.LUXRIOT_DEFAULT_CHANNEL_ID),
+        "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": str(config.LUXRIOT_SNAPSHOT_INTERVAL),
+        "EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE": str(config.LUXRIOT_SNAPSHOT_MAX_EDGE),
+        "EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES": str(config.LUXRIOT_MAX_BUFFER_FRAMES),
+        "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
+        "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
+        "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
+        "EVOSSEARCH_LUXRIOT_SEV_NORMAL": str(sev.get("normal", "normal")),
+        "EVOSSEARCH_LUXRIOT_SEV_HIGH": str(sev.get("high", "high")),
+        "EVOSSEARCH_LUXRIOT_SEV_CRITICAL": str(sev.get("critical", "critical")),
+        "EVOSSEARCH_PROBE_MAX_FRAMES": str(config.PROBE_MAX_FRAMES),
+        "EVOSSEARCH_PROBE_THUMB_MAX_EDGE": str(config.PROBE_THUMB_MAX_EDGE),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED": _bool_to_env(config.DETECTIONS_ARCHIVE_ENABLED),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_DIR": str(config.DETECTIONS_ARCHIVE_DIR),
+        "EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY": str(config.DETECTIONS_ARCHIVE_JPEG_QUALITY),
+        "EVOSSEARCH_DETECTIONS_RETENTION_ENABLED": _bool_to_env(config.DETECTIONS_RETENTION_ENABLED),
+        "EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED": _bool_to_env(config.DETECTIONS_RETENTION_DROP_SKIPPED),
+        "EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC": str(config.DETECTIONS_RETENTION_WINDOW_SEC),
+        "EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC": str(config.DETECTIONS_RETENTION_FORCE_KEEP_SEC),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH": str(config.DETECTIONS_RETENTION_SIMILARITY_HIGH),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW": str(config.DETECTIONS_RETENTION_SIMILARITY_LOW),
+        "EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA": str(config.DETECTIONS_RETENTION_MARGIN_DELTA),
+        "EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA": str(config.DETECTIONS_RETENTION_SCORE_DELTA),
+        "EVOSSEARCH_MIN_RESULTS": str(config.MIN_RESULTS),
+        "EVOSSEARCH_MAX_RESULTS": str(config.MAX_RESULTS),
+        "EVOSSEARCH_DEFAULT_RESULTS": str(config.DEFAULT_RESULTS),
+        "EVOSSEARCH_BATCH_SIZE": str(config.BATCH_SIZE),
+        "EVOSSEARCH_THUMBNAIL_QUALITY": str(config.THUMBNAIL_QUALITY),
+        "EVOSSEARCH_INDEX_FOLDER": str(config.INDEX_FOLDER_NAME),
+        "EVOSSEARCH_MAX_COMMENT_LENGTH": str(config.MAX_COMMENT_LENGTH),
+        "EVOSSEARCH_MAX_FILE_SIZE_MB": str(config.MAX_FILE_SIZE_MB),
+        "EVOSSEARCH_ADMIN_TOKEN": str(config.ADMIN_TOKEN),
+        "EVOSSEARCH_SETTINGS_LOCAL_ONLY": _bool_to_env(config.SETTINGS_LOCAL_ONLY),
+        "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
+        "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
+    }
+    return env
+
+
+def _effective_env_map() -> Dict[str, str]:
+    runtime_map = _runtime_env_map()
+    file_map = _read_env_file_map(".env")
+    merged = dict(runtime_map)
+    for key, value in file_map.items():
+        if key.startswith(ENV_PREFIX) and key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
+    existing_map = _read_env_file_map(".env")
+    extra_evos = [
+        f"{key}={value}"
+        for key, value in sorted(existing_map.items())
+        if key.startswith(ENV_PREFIX) and key not in known_keys
+    ]
+    extra_other = [
+        f"{key}={value}"
+        for key, value in sorted(existing_map.items())
+        if not key.startswith(ENV_PREFIX)
+    ]
+    chunks: List[str] = []
+    if extra_evos:
+        chunks.append("# Additional EVOSSEARCH variables")
+        chunks.extend(extra_evos)
+    if extra_other:
+        if chunks:
+            chunks.append("")
+        chunks.append("# Preserved external variables")
+        chunks.extend(extra_other)
+    return ("\n" + "\n".join(chunks) + "\n") if chunks else ""
+
+
+@app.route('/settings/env', methods=['GET'])
+def get_settings_env():
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
+    try:
+        env_map = _effective_env_map()
+        return jsonify(
+            {
+                'success': True,
+                'envVariables': env_map,
+                'envText': _serialize_env_map(env_map),
+                'count': len(env_map),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/settings/env', methods=['POST'])
+def save_settings_env():
+    guard = _settings_guard(write=True)
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        parsed_from_text = _parse_env_editor_text(data.get('envText', ''))
+        if parsed_from_text:
+            target_env = parsed_from_text
+        else:
+            payload_obj = data.get('envVariables')
+            if not isinstance(payload_obj, dict):
+                return jsonify({'success': False, 'error': 'Provide envText or envVariables'}), 400
+            target_env = {
+                str(k).strip(): str(v).strip()
+                for k, v in payload_obj.items()
+                if str(k).strip().startswith(ENV_PREFIX)
+            }
+        if not target_env:
+            return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
+
+        existing_map = _read_env_file_map(".env")
+        preserved_other = {
+            key: value
+            for key, value in existing_map.items()
+            if not key.startswith(ENV_PREFIX)
+        }
+        merged_map = dict(preserved_other)
+        merged_map.update(target_env)
+
+        env_lines = [f"{key}={merged_map[key]}" for key in sorted(merged_map.keys())]
+        header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
+        Path(".env").write_text(header + "\n".join(env_lines) + "\n", encoding="utf-8")
+
+        return jsonify(
+            {
+                'success': True,
+                'message': 'Environment variables saved to .env. Restart the server to apply all changes.',
+                'count': len(target_env),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
 @app.route('/settings', methods=['GET'])
 def get_settings():
     """Get current configuration settings"""
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
     try:
         requested_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder
         settings = {
@@ -7400,7 +13954,8 @@ def get_settings():
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
             'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
             'luxriotUsername': config.LUXRIOT_USERNAME,
-            'luxriotPassword': config.LUXRIOT_PASSWORD,
+            'luxriotPassword': '',
+            'luxriotPasswordSet': bool(config.LUXRIOT_PASSWORD),
             'luxriotSnapshotInterval': config.LUXRIOT_SNAPSHOT_INTERVAL,
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
@@ -7415,7 +13970,12 @@ def get_settings():
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
             'maxCommentLength': config.MAX_COMMENT_LENGTH,
             'maxFileSize': config.MAX_FILE_SIZE_MB,
-            'indexFolderName': config.INDEX_FOLDER_NAME
+            'indexFolderName': config.INDEX_FOLDER_NAME,
+            'settingsLocalOnly': config.SETTINGS_LOCAL_ONLY,
+            'adminTokenSet': bool(config.ADMIN_TOKEN),
+            'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
+            'allowedRoots': list(config.ALLOWED_ROOTS),
+            'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
@@ -7424,17 +13984,21 @@ def get_settings():
 @app.route('/settings', methods=['POST'])
 def save_settings():
     """Save configuration settings to .env file"""
+    guard = _settings_guard(write=True)
+    if guard is not None:
+        return guard
     try:
-        data = request.json
+        data = _json_body()
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, dino_encoder
+        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
             if field not in data:
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+        debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
 
         try:
             port = int(data['port'])
@@ -7453,11 +14017,7 @@ def save_settings():
         except ValueError as e:
             return jsonify({'success': False, 'error': f'Invalid number format: {str(e)}'}), 400
 
-        fusion_enabled_raw = data.get('fusionEnabled', config.FUSION_ENABLED)
-        if isinstance(fusion_enabled_raw, str):
-            fusion_enabled = fusion_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
-        else:
-            fusion_enabled = bool(fusion_enabled_raw)
+        fusion_enabled = _coerce_bool(data.get('fusionEnabled', config.FUSION_ENABLED), config.FUSION_ENABLED)
 
         try:
             fusion_alpha = float(data.get('fusionAlpha', config.FUSION_ALPHA))
@@ -7465,11 +14025,7 @@ def save_settings():
             fusion_alpha = config.FUSION_ALPHA
         fusion_alpha = min(1.0, max(0.0, fusion_alpha))
 
-        rerank_enabled_raw = data.get('rerankEnabled', config.RERANK_ENABLED)
-        if isinstance(rerank_enabled_raw, str):
-            rerank_enabled = rerank_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
-        else:
-            rerank_enabled = bool(rerank_enabled_raw)
+        rerank_enabled = _coerce_bool(data.get('rerankEnabled', config.RERANK_ENABLED), config.RERANK_ENABLED)
 
         try:
             rerank_top_k = int(data.get('rerankTopK', config.RERANK_TOP_K))
@@ -7478,11 +14034,7 @@ def save_settings():
         if rerank_top_k < 1:
             rerank_top_k = 1
 
-        segments_enabled_raw = data.get('segmentsEnabled', config.DINO_SEGMENTS_ENABLED)
-        if isinstance(segments_enabled_raw, str):
-            segments_enabled = segments_enabled_raw.strip().lower() in {'true', '1', 'yes', 'on'}
-        else:
-            segments_enabled = bool(segments_enabled_raw)
+        segments_enabled = _coerce_bool(data.get('segmentsEnabled', config.DINO_SEGMENTS_ENABLED), config.DINO_SEGMENTS_ENABLED)
 
         try:
             segment_min_patches = int(data.get('segmentMinPatches', config.DINO_SEGMENT_MIN_PATCHES))
@@ -7499,7 +14051,11 @@ def save_settings():
 
         luxriot_base_url = str(data.get('luxriotBaseUrl', config.LUXRIOT_BASE_URL)).strip().rstrip('/')
         luxriot_username = str(data.get('luxriotUsername', config.LUXRIOT_USERNAME)).strip()
-        luxriot_password = str(data.get('luxriotPassword', config.LUXRIOT_PASSWORD)).strip()
+        luxriot_password_raw = data.get('luxriotPassword', None)
+        if luxriot_password_raw is None:
+            luxriot_password = config.LUXRIOT_PASSWORD
+        else:
+            luxriot_password = str(luxriot_password_raw).strip() or config.LUXRIOT_PASSWORD
         try:
             luxriot_snapshot_interval = int(data.get('luxriotSnapshotInterval', config.LUXRIOT_SNAPSHOT_INTERVAL))
         except (TypeError, ValueError):
@@ -7522,11 +14078,10 @@ def save_settings():
             luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
         if luxriot_max_buffer_frames < 12:
             luxriot_max_buffer_frames = 12
-        luxriot_auto_bookmarks_raw = data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS)
-        if isinstance(luxriot_auto_bookmarks_raw, str):
-            luxriot_auto_bookmarks = luxriot_auto_bookmarks_raw.strip().lower() in {'true', '1', 'yes', 'on'}
-        else:
-            luxriot_auto_bookmarks = bool(luxriot_auto_bookmarks_raw)
+        luxriot_auto_bookmarks = _coerce_bool(
+            data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS),
+            config.LUXRIOT_AUTO_BOOKMARKS,
+        )
         severity_map = data.get('luxriotSeverityMap', {}) or {}
         merged_sev = dict(config.LUXRIOT_SEVERITY_MAP)
         for key in ['info', 'low', 'normal', 'high', 'critical']:
@@ -7563,7 +14118,7 @@ def save_settings():
 # Server Configuration
 EVOSSEARCH_HOST={data['host']}
 EVOSSEARCH_PORT={port}
-EVOSSEARCH_DEBUG={str(data['debug']).lower()}
+EVOSSEARCH_DEBUG={str(debug_enabled).lower()}
 
 # Embedder configuration
 EVOSSEARCH_EMBEDDER={embedder}
@@ -7585,6 +14140,17 @@ EVOSSEARCH_M2F_MODEL={config.MASK2FORMER_MODEL}
 EVOSSEARCH_M2F_DEVICE={config.MASK2FORMER_DEVICE}
 EVOSSEARCH_M2F_MAX_SIZE={config.MASK2FORMER_MAX_SIZE}
 
+# LM Studio / video understanding
+EVOSSEARCH_LM_BASE_URL={config.LM_BASE_URL}
+EVOSSEARCH_LM_MODEL={config.LM_MODEL}
+EVOSSEARCH_LM_API_KEY={config.LM_API_KEY}
+EVOSSEARCH_LM_TIMEOUT={config.LM_TIMEOUT}
+EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES={config.LM_VIDEO_DEFAULT_FRAMES}
+EVOSSEARCH_LM_VIDEO_MAX_FRAMES={config.LM_VIDEO_MAX_FRAMES}
+EVOSSEARCH_LM_VIDEO_MAX_EDGE={config.LM_VIDEO_MAX_EDGE}
+EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
+EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
+
 # Luxriot Evo integration
 EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
 EVOSSEARCH_LUXRIOT_USERNAME={luxriot_username}
@@ -7599,6 +14165,23 @@ EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
 EVOSSEARCH_LUXRIOT_SEV_HIGH={merged_sev['high']}
 EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
+
+# Probe / monitoring
+EVOSSEARCH_PROBE_MAX_FRAMES={config.PROBE_MAX_FRAMES}
+EVOSSEARCH_PROBE_THUMB_MAX_EDGE={config.PROBE_THUMB_MAX_EDGE}
+
+# Detections archive / adaptive retention
+EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED={str(config.DETECTIONS_ARCHIVE_ENABLED).lower()}
+EVOSSEARCH_DETECTIONS_ARCHIVE_DIR={config.DETECTIONS_ARCHIVE_DIR}
+EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY={config.DETECTIONS_ARCHIVE_JPEG_QUALITY}
+EVOSSEARCH_DETECTIONS_RETENTION_ENABLED={str(config.DETECTIONS_RETENTION_ENABLED).lower()}
+EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED={str(config.DETECTIONS_RETENTION_DROP_SKIPPED).lower()}
+EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC={config.DETECTIONS_RETENTION_WINDOW_SEC}
+EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC={config.DETECTIONS_RETENTION_FORCE_KEEP_SEC}
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH={config.DETECTIONS_RETENTION_SIMILARITY_HIGH}
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW={config.DETECTIONS_RETENTION_SIMILARITY_LOW}
+EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA={config.DETECTIONS_RETENTION_MARGIN_DELTA}
+EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA={config.DETECTIONS_RETENTION_SCORE_DELTA}
 
 # Search result limits
 EVOSSEARCH_MIN_RESULTS={min_results}
@@ -7617,14 +14200,23 @@ EVOSSEARCH_MAX_COMMENT_LENGTH={max_comment_length}
 
 # Security configuration
 EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
+EVOSSEARCH_ADMIN_TOKEN={config.ADMIN_TOKEN}
+EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
+EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
+EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
+
+        known_env_keys = set(_parse_env_editor_text(env_content).keys())
+        env_content = env_content.rstrip() + _preserve_additional_env_lines(known_env_keys)
+        if not env_content.endswith("\n"):
+            env_content += "\n"
 
         with open('.env', 'w', encoding='utf-8') as f:
             f.write(env_content)
 
         config.HOST = data['host']
         config.PORT = port
-        config.DEBUG = bool(data['debug'])
+        config.DEBUG = debug_enabled
         config.EMBEDDER = embedder
         config.CLIP_MODEL = data['clipModel']
         config.DINO_MODEL = dino_model
@@ -7640,6 +14232,7 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         config.MAX_COMMENT_LENGTH = max_comment_length
         config.MAX_FILE_SIZE_MB = max_file_size
         config.INDEX_FOLDER_NAME = index_folder
+        app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
         config.FUSION_ENABLED = fusion_enabled
         config.FUSION_ALPHA = fusion_alpha
         config.RERANK_ENABLED = rerank_enabled
@@ -7660,19 +14253,68 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
             active_embedder = 'clip'
-        clip_model = None
-        clip_preprocess = None
-        dino_encoder = None
-        ensure_embedder_loaded()
-
-        return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server if issues persist.'})
+        reset_embedder_runtime_state()
+        warmup_warning = warm_start_embedder()
+        message = 'Settings saved successfully. Restart the server if issues persist.'
+        payload: Dict[str, Any] = {'success': True, 'message': message}
+        if warmup_warning:
+            payload['warning'] = warmup_warning
+        return jsonify(payload)
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _stop_probe_daemon_thread() -> None:
+    global probe_daemon_thread
+    probe_daemon_stop.set()
+    if probe_daemon_thread is not None and probe_daemon_thread.is_alive():
+        probe_daemon_thread.join(timeout=1.5)
+
+
+def _port_is_available(host: str, port: int) -> bool:
+    bind_host = (host or "").strip() or "0.0.0.0"
+    try:
+        port_num = int(port)
+    except Exception:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_host, port_num))
+            return True
+        except OSError:
+            return False
+
+
+@atexit.register
+def _shutdown_background_workers() -> None:
+    try:
+        luxriot_manager.stop_all_streams(stop_video=True, stop_analytics=True, pause_analytics=False)
+    except Exception:
+        pass
+    try:
+        luxriot_manager.persist_summary_state()
+    except Exception:
+        pass
+    try:
+        luxriot_manager.persist_rollup_cache()
+    except Exception:
+        pass
+    try:
+        _stop_probe_daemon_thread()
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
-    ensure_embedder_loaded()
+    if not _port_is_available(config.HOST, config.PORT):
+        print(f"Startup aborted: {config.HOST}:{config.PORT} is already in use.")
+        print("Stop the existing server process or change EVOSSEARCH_PORT before starting oldapp.py.")
+        raise SystemExit(1)
+    warmup_warning = warm_start_embedder()
+    if warmup_warning:
+        print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
     if probe_daemon_thread is None:
         probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)

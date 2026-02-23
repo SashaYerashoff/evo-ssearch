@@ -53,7 +53,9 @@ def _load_mask_image(mask_entry: dict) -> Image.Image:
 
 def _normalise_mask(mask_image: Image.Image) -> Image.Image:
     # Binarise mask to make segment label stable (0 background, 1 foreground)
-    return mask_image.point(lambda v: 255 if v > 0 else 0, mode="L")
+    mask_array = np.asarray(mask_image.convert("L"), dtype=np.uint8)
+    binary = (mask_array > 0).astype(np.uint8) * 255
+    return Image.fromarray(binary, mode="L")
 
 
 def _collect_existing_ids(folder: Path) -> set:

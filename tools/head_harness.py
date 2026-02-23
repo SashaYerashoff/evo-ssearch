@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import psutil
 
@@ -68,9 +68,11 @@ def load_model(model_name: str, device: torch.device) -> Dict[str, Any]:
     load_time = time.time() - t0
 
     model.eval()
-    model.to(device)
+    runtime_model = cast(torch.nn.Module, model)
+    runtime_model.to(device)
     if device.type == "cuda":
-        model = model.half()
+        runtime_model = runtime_model.half()
+    model = cast(Mask2FormerForUniversalSegmentation, runtime_model)
 
     return {
         "processor": processor,

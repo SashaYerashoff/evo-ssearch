@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, cast
 
 import numpy as np
 import torch
 from PIL import Image
 from transformers import Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
+
+if hasattr(Image, "Resampling"):
+    RESAMPLE_BILINEAR = Image.Resampling.BILINEAR
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
+else:  # pragma: no cover - Pillow compatibility fallback
+    RESAMPLE_BILINEAR = Image.BILINEAR  # type: ignore[attr-defined]
+    RESAMPLE_NEAREST = Image.NEAREST  # type: ignore[attr-defined]
 
 
 class Mask2FormerHead:
@@ -21,7 +28,7 @@ class Mask2FormerHead:
 
         self.processor = Mask2FormerImageProcessor.from_pretrained(model_name)
         self.model = Mask2FormerForUniversalSegmentation.from_pretrained(model_name)
-        self.model.to(self.device)
+        cast(torch.nn.Module, self.model).to(self.device)
         self.model.eval()
         self.use_autocast = self.device.type == "cuda"
 
@@ -48,7 +55,7 @@ class Mask2FormerHead:
                 max(32, int(round(original_size[0] * scale))),
                 max(32, int(round(original_size[1] * scale))),
             )
-            resized = image.resize(new_size, Image.BILINEAR)
+            resized = image.resize(new_size, RESAMPLE_BILINEAR)
             return resized, original_size
         return image, original_size
 
@@ -56,7 +63,7 @@ class Mask2FormerHead:
         seg_np = segmentation.cpu().numpy().astype(np.int32)
         if segmentation.shape[-2:] != (target_size[1], target_size[0]):
             seg_img = Image.fromarray(seg_np.astype(np.uint8), mode="L")
-            seg_img = seg_img.resize(target_size, resample=Image.NEAREST)
+            seg_img = seg_img.resize(target_size, resample=RESAMPLE_NEAREST)
             seg_np = np.asarray(seg_img, dtype=np.int32)
         return seg_np
 
@@ -100,7 +107,7 @@ class Mask2FormerHead:
             try:
                 coarse_array = np.asarray(coarse_mask)
                 coarse_img = Image.fromarray(coarse_array.astype(np.uint8), mode="L")
-                coarse_resized = coarse_img.resize((width, height), resample=Image.NEAREST)
+                coarse_resized = coarse_img.resize((width, height), resample=RESAMPLE_NEAREST)
                 coarse_bool = np.asarray(coarse_resized) > 0
                 region = np.logical_and(region, coarse_bool)
                 if not region.any():

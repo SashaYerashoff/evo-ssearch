@@ -24,7 +24,8 @@ MANIFEST
 
 # Virtual environments
 .venv/
-.env/
+.env
+.env.*
 env/
 venv/
 ENV/
@@ -55,4 +56,7 @@ Thumbs.db
 *.tmp
 .clip_index/
 probes_store.json
+luxriot_rollups_cache.json
+luxriot_summary_state.json
 video/
+node_modules

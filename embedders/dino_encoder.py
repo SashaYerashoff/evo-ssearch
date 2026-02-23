@@ -4,7 +4,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
 from urllib.error import HTTPError
 
 import numpy as np
@@ -25,6 +25,11 @@ from transformers import AutoImageProcessor, AutoModel
 ImageInput = Union[str, Path, Image.Image, np.ndarray]
 TransformType = Callable[[Image.Image], torch.Tensor]
 MaskInput = Union[np.ndarray, Image.Image]
+
+if hasattr(Image, "Resampling"):
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
+else:  # pragma: no cover - Pillow compatibility fallback
+    RESAMPLE_NEAREST = Image.NEAREST  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True)
@@ -231,7 +236,7 @@ class DINOEncoder:
             for start in range(0, len(batch), self.batch_size):
                 chunk = batch[start : start + self.batch_size]
                 pil_images = [self._to_pil(item) for item in chunk]
-                inputs = self.processor(images=pil_images, return_tensors="pt")
+                inputs = self._processor_call(pil_images)
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 outputs = self.hf_model(**inputs)
                 pooled = getattr(outputs, "pooler_output", None)
@@ -337,7 +342,7 @@ class DINOEncoder:
         assert self.processor is not None and self.hf_model is not None
 
         with torch.inference_mode():
-            inputs = self.processor(images=[image], return_tensors="pt")
+            inputs = self._processor_call([image])
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             outputs = self.hf_model(**inputs)
             hidden = outputs.last_hidden_state.detach().cpu()
@@ -367,7 +372,7 @@ class DINOEncoder:
                 mask_array = mask_array[..., 0]
             mask_img = Image.fromarray(mask_array.astype(np.int32))
         if mask_img.size != image_size:
-            mask_img = mask_img.resize(image_size, resample=Image.NEAREST)
+            mask_img = mask_img.resize(image_size, resample=RESAMPLE_NEAREST)
         mask_data = np.asarray(mask_img)
         if mask_data.ndim != 2:
             raise ValueError("Mask must be a single-channel array")
@@ -488,7 +493,7 @@ class DINOEncoder:
 
         if self.hf_model is not None and self.processor is not None:
             with torch.inference_mode():
-                inputs = self.processor(images=[pil_image], return_tensors="pt")
+                inputs = self._processor_call([pil_image])
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 outputs = self.hf_model(**inputs)
                 hidden = outputs.last_hidden_state.detach().cpu()
@@ -520,6 +525,11 @@ class DINOEncoder:
 
         normalized_patches, grid = self._square_patch_tokens(patch_tokens.squeeze(0), register_tokens)
         return cls_token.squeeze(0), normalized_patches, grid
+
+    def _processor_call(self, images: Sequence[Image.Image]) -> Dict[str, torch.Tensor]:
+        assert self.processor is not None
+        processed = cast(Any, self.processor)(images=list(images), return_tensors="pt")
+        return cast(Dict[str, torch.Tensor], dict(processed))
 
     def patch_similarity_map(
         self,

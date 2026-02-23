@@ -1,19 +1,25 @@
 flask==3.0.3
 flask-cors==4.0.0
+# CLIP setup.py imports pkg_resources; keep setuptools<81 where pkg_resources still exists.
+setuptools<81
 torch>=2.1.0
 torchvision>=0.16.0
 torchmetrics>=1.2.0
 termcolor>=2.4.0
 numpy>=1.26.0
 pillow>=10.0.0
+opencv-python-headless>=4.10.0
 faiss-cpu>=1.7.4
-git+https://github.com/openai/CLIP.git
+# Compatible wheel distribution of OpenAI CLIP for modern pip/python.
+clip-anytorch==2.6.0
 timm>=0.9.10
 einops>=0.7.0
-transformers>=4.40.0
+# SigLIP2 loading/processor path requires modern transformers.
+transformers>=4.52.0
 ftfy>=6.1.1
 regex>=2024.4.24
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 psutil>=5.9.0
 requests>=2.31.0
+gunicorn>=22.0.0

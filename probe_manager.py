@@ -2,13 +2,18 @@ import base64
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, cast
 
 import faiss  # type: ignore
 import numpy as np
 from PIL import Image
 
 from config import config
+
+
+def _faiss_add(index: faiss.IndexFlatIP, vectors: np.ndarray) -> None:
+    """FAISS Python API monkey-patches add(), but stubs may expose C++ signature."""
+    cast(Any, index).add(vectors)
 
 
 class ProbeBuffer:
@@ -25,7 +30,7 @@ class ProbeBuffer:
             return
         mat = np.stack(self.embeddings, axis=0).astype(np.float32)
         self.index = faiss.IndexFlatIP(mat.shape[1])
-        self.index.add(mat)
+        _faiss_add(self.index, mat)
 
     def add(self, embedding: np.ndarray, timestamp_ms: int, channel_id: int, thumb: str) -> None:
         if embedding.ndim != 1:

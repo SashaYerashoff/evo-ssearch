@@ -1,3 +1,5 @@
 """Segmentation heads for evo-ssearch."""
 
-__all__ = ["mask2former_head"]
+from .mask2former_head import Mask2FormerHead
+
+__all__ = ["Mask2FormerHead"]

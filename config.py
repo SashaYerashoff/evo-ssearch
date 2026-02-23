@@ -20,6 +20,29 @@ def _get_bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).lower() in ('true', '1', 'yes', 'on')
 
 
+def _get_list_env(name: str, separator: str = ',') -> tuple[str, ...]:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return ()
+    return tuple(item.strip() for item in raw.split(separator) if item.strip())
+
+
+def _get_path_list_env(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return ()
+    resolved: list[str] = []
+    for part in raw.split(os.pathsep):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            resolved.append(str(Path(token).expanduser().resolve()))
+        except Exception:
+            continue
+    return tuple(resolved)
+
+
 class Config:
     # Server configuration
     HOST = os.getenv('EVOSSEARCH_HOST', '0.0.0.0')  # 0.0.0.0 allows network access
@@ -101,6 +124,10 @@ class Config:
 
     # Security configuration
     MAX_FILE_SIZE_MB = int(os.getenv('EVOSSEARCH_MAX_FILE_SIZE_MB', '50'))
+    ADMIN_TOKEN = os.getenv('EVOSSEARCH_ADMIN_TOKEN', '').strip()
+    SETTINGS_LOCAL_ONLY = _get_bool_env('EVOSSEARCH_SETTINGS_LOCAL_ONLY', 'True')
+    CORS_ALLOWED_ORIGINS = _get_list_env('EVOSSEARCH_CORS_ALLOWED_ORIGINS')
+    ALLOWED_ROOTS = _get_path_list_env('EVOSSEARCH_ALLOWED_ROOTS')
 
     # LM Studio / Qwen video understanding
     LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://192.168.1.104:1234/v1').strip().rstrip('/')
@@ -138,8 +165,8 @@ class Config:
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
     # Luxriot Evo integration
     LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://192.168.1.102:8080').strip().rstrip('/')
-    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', 'admin').strip()
-    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '123').strip()
+    LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
+    LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '').strip()
     try:
         LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
     except (TypeError, ValueError):
@@ -169,6 +196,70 @@ class Config:
         'high': os.getenv('EVOSSEARCH_LUXRIOT_SEV_HIGH', 'high').lower(),
         'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
     }
+    LUXRIOT_ROLLUP_L1_LLM_ENABLED = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_L1_LLM_ENABLED', 'True')
+    try:
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_CHAR_BUDGET', '12000'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = 12000
+    if LUXRIOT_ROLLUP_L1_CHAR_BUDGET < 2000:
+        LUXRIOT_ROLLUP_L1_CHAR_BUDGET = 2000
+    try:
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL', '2'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = 2
+    if LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL < 1:
+        LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL = 1
+    try:
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT', '800'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = 800
+    if LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT < 100:
+        LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT = 100
+    LUXRIOT_ROLLUP_CACHE_FILE = (
+        os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_CACHE_FILE', 'luxriot_rollups_cache.json').strip()
+        or 'luxriot_rollups_cache.json'
+    )
+    LUXRIOT_SUMMARY_STATE_FILE = (
+        os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_STATE_FILE', 'luxriot_summary_state.json').strip()
+        or 'luxriot_summary_state.json'
+    )
+    LUXRIOT_ROLLUP_TIME_ONLY = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY', 'True')
+    LUXRIOT_ROLLUP_L1_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_MODEL', '').strip()
+    LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT',
+        (
+            "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
+            "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+        ),
+    ).strip()
+    LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'
+    try:
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS', '8000'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = 8000
+    if LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS < 512:
+        LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = 512
+    try:
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_CHAR_BUDGET', str(LUXRIOT_ROLLUP_L1_CHAR_BUDGET))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = LUXRIOT_ROLLUP_L1_CHAR_BUDGET
+    if LUXRIOT_ROLLUP_LLM_CHAR_BUDGET < 2000:
+        LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = 2000
+    try:
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL', str(LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL
+    if LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL < 1:
+        LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = 1
+    LUXRIOT_ROLLUP_LLM_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL', LUXRIOT_ROLLUP_L1_MODEL).strip()
+    LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT',
+        LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT,
+    ).strip()
 
     # Probe / CLIP monitoring
     try:
@@ -183,6 +274,51 @@ class Config:
         PROBE_THUMB_MAX_EDGE = 256
     if PROBE_THUMB_MAX_EDGE < 64:
         PROBE_THUMB_MAX_EDGE = 64
+
+    # Detection archive + adaptive retention
+    DETECTIONS_ARCHIVE_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED', 'True')
+    DETECTIONS_ARCHIVE_DIR = os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_DIR', 'detections_archive').strip() or 'detections_archive'
+    try:
+        DETECTIONS_ARCHIVE_JPEG_QUALITY = int(os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY', '88'))
+    except (TypeError, ValueError):
+        DETECTIONS_ARCHIVE_JPEG_QUALITY = 88
+    DETECTIONS_ARCHIVE_JPEG_QUALITY = max(60, min(95, DETECTIONS_ARCHIVE_JPEG_QUALITY))
+
+    DETECTIONS_RETENTION_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_ENABLED', 'True')
+    DETECTIONS_RETENTION_DROP_SKIPPED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED', 'False')
+    try:
+        DETECTIONS_RETENTION_WINDOW_SEC = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC', '6'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_WINDOW_SEC = 6.0
+    DETECTIONS_RETENTION_WINDOW_SEC = max(0.5, DETECTIONS_RETENTION_WINDOW_SEC)
+    try:
+        DETECTIONS_RETENTION_FORCE_KEEP_SEC = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC', '20'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_FORCE_KEEP_SEC = 20.0
+    DETECTIONS_RETENTION_FORCE_KEEP_SEC = max(1.0, DETECTIONS_RETENTION_FORCE_KEEP_SEC)
+    try:
+        DETECTIONS_RETENTION_SIMILARITY_HIGH = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH', '0.985'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SIMILARITY_HIGH = 0.985
+    DETECTIONS_RETENTION_SIMILARITY_HIGH = min(0.9999, max(0.5, DETECTIONS_RETENTION_SIMILARITY_HIGH))
+    try:
+        DETECTIONS_RETENTION_SIMILARITY_LOW = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW', '0.94'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SIMILARITY_LOW = 0.94
+    DETECTIONS_RETENTION_SIMILARITY_LOW = min(
+        DETECTIONS_RETENTION_SIMILARITY_HIGH - 0.001,
+        max(0.3, DETECTIONS_RETENTION_SIMILARITY_LOW),
+    )
+    try:
+        DETECTIONS_RETENTION_MARGIN_DELTA = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA', '0.08'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_MARGIN_DELTA = 0.08
+    DETECTIONS_RETENTION_MARGIN_DELTA = max(0.0, DETECTIONS_RETENTION_MARGIN_DELTA)
+    try:
+        DETECTIONS_RETENTION_SCORE_DELTA = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA', '0.08'))
+    except (TypeError, ValueError):
+        DETECTIONS_RETENTION_SCORE_DELTA = 0.08
+    DETECTIONS_RETENTION_SCORE_DELTA = max(0.0, DETECTIONS_RETENTION_SCORE_DELTA)
 
     @classmethod
     def get_server_urls(cls):
@@ -205,17 +341,19 @@ class Config:
             except Exception:
                 pass
 
-            # Try to get all network interfaces
-            try:
-                hostname = socket.gethostname()
-                for addr_info in socket.getaddrinfo(hostname, None):
-                    ip = addr_info[4][0]
-                    if ip not in ['127.0.0.1', '::1'] and not ip.startswith('169.254'):
-                        url = f"http://{ip}:{cls.PORT}"
-                        if url not in urls:
-                            urls.append(url)
-            except Exception:
-                pass
+                # Try to get all network interfaces
+                try:
+                    hostname = socket.gethostname()
+                    for addr_info in socket.getaddrinfo(hostname, None):
+                        ip = addr_info[4][0]
+                        if not isinstance(ip, str):
+                            continue
+                        if ip not in ['127.0.0.1', '::1'] and not ip.startswith('169.254'):
+                            url = f"http://{ip}:{cls.PORT}"
+                            if url not in urls:
+                                urls.append(url)
+                except Exception:
+                    pass
 
         return urls
 
@@ -265,6 +403,38 @@ class Config:
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
             f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
             f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
+        )
+        print(
+            "Rollups: levels={} mode={} min_tokens={} char_budget={} max_new={} cache_limit={} cache_file={} state_file={} model={}".format(
+                cls.LUXRIOT_ROLLUP_LLM_LEVELS,
+                'time-only' if cls.LUXRIOT_ROLLUP_TIME_ONLY else 'token-gated',
+                cls.LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS,
+                cls.LUXRIOT_ROLLUP_LLM_CHAR_BUDGET,
+                cls.LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL,
+                cls.LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT,
+                cls.LUXRIOT_ROLLUP_CACHE_FILE,
+                cls.LUXRIOT_SUMMARY_STATE_FILE,
+                cls.LUXRIOT_ROLLUP_LLM_MODEL or cls.LM_MODEL,
+            )
+        )
+        print(
+            "Detections archive: {} ({}, adaptive retention {}, keep_all_rows {}, window {}s, force {}s)".format(
+                'enabled' if cls.DETECTIONS_ARCHIVE_ENABLED else 'disabled',
+                cls.DETECTIONS_ARCHIVE_DIR,
+                'on' if cls.DETECTIONS_RETENTION_ENABLED else 'off',
+                'on' if not cls.DETECTIONS_RETENTION_DROP_SKIPPED else 'off',
+                cls.DETECTIONS_RETENTION_WINDOW_SEC,
+                cls.DETECTIONS_RETENTION_FORCE_KEEP_SEC,
+            )
+        )
+        print(
+            "Security: upload_limit={}MB, settings_local_only={}, admin_token={}, cors_origins={}, allowed_roots={}".format(
+                cls.MAX_FILE_SIZE_MB,
+                'on' if cls.SETTINGS_LOCAL_ONLY else 'off',
+                'set' if cls.ADMIN_TOKEN else 'unset',
+                len(cls.CORS_ALLOWED_ORIGINS),
+                len(cls.ALLOWED_ROOTS),
+            )
         )
         print()
         print("Server available at:")
