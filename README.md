@@ -255,7 +255,7 @@ EVOSSEARCH_DEBUG=false
 
 # Embedder/index
 EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion
-EVOSSEARCH_CLIP_MODEL=ViT-B/32        # OpenAI CLIP or HF SigLIP2 model id (e.g. google/siglip2-so400m-patch14-384)
+EVOSSEARCH_CLIP_MODEL=ViT-B/32        # OpenAI CLIP or HF SigLIP2 model id (e.g. google/siglip2-base-patch16-224)
 EVOSSEARCH_DINO_MODEL=dinov3_vith16plus
 EVOSSEARCH_EMB_DIM_DINO=1280
 EVOSSEARCH_DINO_WEIGHTS_PATH=/path/to/weights.pth

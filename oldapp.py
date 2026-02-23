@@ -3,6 +3,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import atexit
 import base64
 import copy
+import gc
 import html as html_lib
 import json
 import math
@@ -53,6 +54,7 @@ clip_preprocess = None
 clip_processor: Optional[Any] = None
 clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
+clip_runtime_device = device
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -191,22 +193,24 @@ def payload_too_large(_: Exception):
 
 def init_clip() -> None:
     """Load the CLIP-like model lazily for embedding extraction."""
-    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device
     if clip_model is not None:
         if clip_backend_kind == "openai_clip" and clip_preprocess is not None:
             return
         if clip_backend_kind == "siglip2" and clip_processor is not None:
             return
 
+    preferred_device = device
     requested_model = str(config.CLIP_MODEL or "").strip() or "ViT-B/32"
     if _is_siglip2_clip_model(requested_model):
         try:
-            model_obj, processor_obj = _load_siglip2_clip_model(requested_model)
+            model_obj, processor_obj = _load_siglip2_clip_model(requested_model, preferred_device)
             clip_model = model_obj
             clip_processor = processor_obj
             clip_preprocess = None
             clip_backend_kind = "siglip2"
             clip_runtime_model = requested_model
+            clip_runtime_device = preferred_device
             return
         except Exception as exc:
             fallback_model = "ViT-B/32"
@@ -214,20 +218,50 @@ def init_clip() -> None:
                 f"SigLIP2 model '{requested_model}' failed to load ({exc}). "
                 f"Falling back to CLIP '{fallback_model}'."
             )
-            model_obj, preprocess_obj = _load_openai_clip_model(fallback_model)
+            fallback_error: Optional[Exception] = None
+            fallback_device = preferred_device
+            if fallback_device.startswith("cuda"):
+                _release_cuda_memory()
+            try:
+                model_obj, preprocess_obj = _load_openai_clip_model(fallback_model, fallback_device)
+            except Exception as fallback_exc:
+                fallback_error = fallback_exc
+                if fallback_device.startswith("cuda"):
+                    _release_cuda_memory()
+                    fallback_device = "cpu"
+                    model_obj, preprocess_obj = _load_openai_clip_model(fallback_model, fallback_device)
+                else:
+                    raise
             clip_model = model_obj
             clip_preprocess = preprocess_obj
             clip_processor = None
             clip_backend_kind = "openai_clip"
             clip_runtime_model = fallback_model
+            clip_runtime_device = fallback_device
+            if fallback_error is not None:
+                print(f"CLIP fallback recovered on {fallback_device} after initial failure: {fallback_error}")
             return
 
-    model_obj, preprocess_obj = _load_openai_clip_model(requested_model)
+    fallback_device = preferred_device
+    initial_error: Optional[Exception] = None
+    try:
+        model_obj, preprocess_obj = _load_openai_clip_model(requested_model, fallback_device)
+    except Exception as exc:
+        initial_error = exc
+        if fallback_device.startswith("cuda"):
+            _release_cuda_memory()
+            fallback_device = "cpu"
+            model_obj, preprocess_obj = _load_openai_clip_model(requested_model, fallback_device)
+        else:
+            raise
     clip_model = model_obj
     clip_preprocess = preprocess_obj
     clip_processor = None
     clip_backend_kind = "openai_clip"
     clip_runtime_model = requested_model
+    clip_runtime_device = fallback_device
+    if initial_error is not None:
+        print(f"CLIP model '{requested_model}' loaded on {fallback_device} after retry: {initial_error}")
 
 
 def _is_siglip2_clip_model(model_name: str) -> bool:
@@ -235,17 +269,31 @@ def _is_siglip2_clip_model(model_name: str) -> bool:
     return "siglip2" in normalized
 
 
-def _load_openai_clip_model(model_name: str) -> Tuple[torch.nn.Module, Any]:
-    model, preprocess = clip.load(model_name, device=device)
+def _release_cuda_memory() -> None:
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
+    model, preprocess = clip.load(model_name, device=target_device)
     cast(torch.nn.Module, model).eval()
     return cast(torch.nn.Module, model), preprocess
 
 
-def _load_siglip2_clip_model(model_name: str) -> Tuple[torch.nn.Module, Any]:
+def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
     model = AutoModel.from_pretrained(model_name)
-    cast(torch.nn.Module, model).to(device)
+    cast(torch.nn.Module, model).to(target_device)
     cast(torch.nn.Module, model).eval()
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
     return cast(torch.nn.Module, model), processor
 
 
@@ -253,11 +301,11 @@ def _normalize_l2_embeddings(features: torch.Tensor) -> torch.Tensor:
     return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-def _processor_to_device(batch: Mapping[str, Any]) -> Dict[str, Any]:
+def _processor_to_device(batch: Mapping[str, Any], target_device: str) -> Dict[str, Any]:
     moved: Dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
+            moved[key] = value.to(target_device)
         else:
             moved[key] = value
     return moved
@@ -274,12 +322,12 @@ def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarra
             if clip_processor is None or clip_model is None:
                 raise RuntimeError("SigLIP2 clip backend is not initialized")
             processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
-            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs))
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
             image_features = cast(Any, clip_model).get_image_features(**model_inputs)
         else:
             if clip_preprocess is None or clip_model is None:
                 raise RuntimeError("CLIP backend is not initialized")
-            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(device)  # type: ignore[operator]
+            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
             image_features = cast(Any, clip_model).encode_image(image_batch)
         image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
     return image_features.cpu().numpy().astype(np.float32, copy=False)
@@ -304,12 +352,12 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
                 max_length=64,
                 return_tensors="pt",
             )
-            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs))
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
             text_features = cast(Any, clip_model).get_text_features(**model_inputs)
         else:
             if clip_model is None:
                 raise RuntimeError("CLIP backend is not initialized")
-            text_tokens = clip.tokenize(prepared).to(device)
+            text_tokens = clip.tokenize(prepared).to(clip_runtime_device)
             text_features = cast(Any, clip_model).encode_text(text_tokens)
         text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
     return text_features.cpu().numpy().astype(np.float32, copy=False)
@@ -359,6 +407,44 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         init_dino()
     else:
         raise ValueError(f"Unsupported embedder: {target}")
+
+
+def reset_embedder_runtime_state() -> None:
+    """Clear loaded embedding backends so they can be re-initialized."""
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device, dino_encoder
+    clip_model = None
+    clip_preprocess = None
+    clip_processor = None
+    clip_backend_kind = "openai_clip"
+    clip_runtime_model = ""
+    clip_runtime_device = device
+    dino_encoder = None
+
+
+def warm_start_embedder() -> Optional[str]:
+    """
+    Warm start embedding backend without aborting process on heavy model failures.
+
+    In fusion mode we intentionally warm only CLIP/SigLIP and defer DINO to first DINO/fusion call.
+    This prevents startup crashes when GPU memory is tight.
+    """
+    global active_embedder
+    requested = active_embedder
+    try:
+        if requested == "fusion":
+            ensure_embedder_loaded("clip")
+            return "Fusion warm-up loaded CLIP backend; DINO will load on demand."
+        ensure_embedder_loaded(requested)
+        return None
+    except Exception as exc:
+        if requested != "clip":
+            try:
+                ensure_embedder_loaded("clip")
+                active_embedder = "clip"
+                return f"{requested} warm-up failed ({exc}); fell back to CLIP backend."
+            except Exception as clip_exc:
+                return f"Embedder warm-up failed ({exc}); CLIP fallback also failed ({clip_exc})."
+        return f"Embedder warm-up failed: {exc}"
 
 
 def ensure_mask_head() -> Optional["Mask2FormerHead"]:
@@ -483,7 +569,7 @@ def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = 
             "embedding_dim": embed_dim,
             "library": library,
             "backend": clip_backend_kind,
-            "device": device,
+            "device": clip_runtime_device,
         }
     else:
         assert dino_encoder is not None
@@ -4063,6 +4149,7 @@ def home():
                         <option value="ViT-B/32">ViT-B/32</option>
                         <option value="ViT-B/16">ViT-B/16</option>
                         <option value="ViT-L/14">ViT-L/14</option>
+                        <option value="google/siglip2-base-patch16-224">SigLIP2 Base (patch16-224)</option>
                         <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
                     </select>
                 </div>
@@ -13342,7 +13429,7 @@ def probes_bench():
             "batch": batch,
             "elapsed_sec": round(elapsed, 3),
             "approx_fps": round(fps, 1),
-            "device": device,
+            "device": clip_runtime_device,
             "backend": clip_backend_kind,
             "model": clip_runtime_model or config.CLIP_MODEL,
             "resolution": target_size,
@@ -14166,15 +14253,13 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
             active_embedder = 'clip'
-        clip_model = None
-        clip_preprocess = None
-        clip_processor = None
-        clip_backend_kind = "openai_clip"
-        clip_runtime_model = ""
-        dino_encoder = None
-        ensure_embedder_loaded()
-
-        return jsonify({'success': True, 'message': 'Settings saved successfully. Restart the server if issues persist.'})
+        reset_embedder_runtime_state()
+        warmup_warning = warm_start_embedder()
+        message = 'Settings saved successfully. Restart the server if issues persist.'
+        payload: Dict[str, Any] = {'success': True, 'message': message}
+        if warmup_warning:
+            payload['warning'] = warmup_warning
+        return jsonify(payload)
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -14227,7 +14312,9 @@ if __name__ == '__main__':
         print(f"Startup aborted: {config.HOST}:{config.PORT} is already in use.")
         print("Stop the existing server process or change EVOSSEARCH_PORT before starting oldapp.py.")
         raise SystemExit(1)
-    ensure_embedder_loaded()
+    warmup_warning = warm_start_embedder()
+    if warmup_warning:
+        print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
     if probe_daemon_thread is None:
         probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)
