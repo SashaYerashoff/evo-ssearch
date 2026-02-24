@@ -2,7 +2,7 @@ import base64
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Sequence, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import faiss  # type: ignore
 import numpy as np
@@ -23,6 +23,10 @@ class ProbeBuffer:
         self.embeddings: List[np.ndarray] = []
         self.meta: List[Dict[str, Any]] = []
         self.index: Optional[faiss.IndexFlatIP] = None
+        self.next_uid = 1
+        self.roi_cache: Dict[str, Dict[int, np.ndarray]] = {}
+        self.roi_cache_order: List[str] = []
+        self.roi_cache_max_entries = 16
 
     def _rebuild_index(self) -> None:
         if not self.embeddings:
@@ -32,14 +36,49 @@ class ProbeBuffer:
         self.index = faiss.IndexFlatIP(mat.shape[1])
         _faiss_add(self.index, mat)
 
+    @staticmethod
+    def _normalize_vec(vec: np.ndarray) -> np.ndarray:
+        arr = vec.flatten().astype(np.float32) if vec.ndim != 1 else vec.astype(np.float32)
+        return arr / max(float(np.linalg.norm(arr)), 1e-8)
+
+    @staticmethod
+    def _roi_key(roi_norm: Tuple[float, float, float, float]) -> str:
+        x, y, w, h = roi_norm
+        return f"{x:.4f}:{y:.4f}:{w:.4f}:{h:.4f}"
+
+    def _remember_roi_key(self, key: str) -> None:
+        if key in self.roi_cache_order:
+            self.roi_cache_order = [item for item in self.roi_cache_order if item != key]
+        self.roi_cache_order.append(key)
+        while len(self.roi_cache_order) > self.roi_cache_max_entries:
+            evicted = self.roi_cache_order.pop(0)
+            self.roi_cache.pop(evicted, None)
+
+    def _prune_roi_cache_uids(self, removed_uids: Sequence[int]) -> None:
+        if not removed_uids or not self.roi_cache:
+            return
+        stale = set(int(uid) for uid in removed_uids)
+        if not stale:
+            return
+        empty_keys: List[str] = []
+        for key, cache_map in self.roi_cache.items():
+            for uid in stale:
+                cache_map.pop(uid, None)
+            if not cache_map:
+                empty_keys.append(key)
+        if empty_keys:
+            for key in empty_keys:
+                self.roi_cache.pop(key, None)
+            self.roi_cache_order = [key for key in self.roi_cache_order if key not in set(empty_keys)]
+
     def add(self, embedding: np.ndarray, timestamp_ms: int, channel_id: int, thumb: str) -> None:
-        if embedding.ndim != 1:
-            embedding = embedding.flatten()
-        emb = embedding.astype(np.float32)
-        emb = emb / max(np.linalg.norm(emb), 1e-8)
+        emb = self._normalize_vec(embedding)
+        frame_uid = int(self.next_uid)
+        self.next_uid += 1
         self.embeddings.append(emb)
         self.meta.append(
             {
+                "uid": frame_uid,
                 "timestamp_ms": timestamp_ms,
                 "channel_id": channel_id,
                 "thumb": thumb,
@@ -48,9 +87,95 @@ class ProbeBuffer:
         if len(self.embeddings) > self.max_frames:
             excess = len(self.embeddings) - self.max_frames
             if excess > 0:
+                removed = self.meta[:excess]
                 self.embeddings = self.embeddings[excess:]
                 self.meta = self.meta[excess:]
+                removed_uids = [int(item.get("uid")) for item in removed if item.get("uid") is not None]
+                self._prune_roi_cache_uids(removed_uids)
         self._rebuild_index()
+
+    def _embed_roi_thumb(
+        self,
+        thumb_b64: str,
+        roi_norm: Tuple[float, float, float, float],
+        embed_image_fn: Callable[[Image.Image], np.ndarray],
+        roi_padding: float,
+    ) -> Optional[np.ndarray]:
+        raw = str(thumb_b64 or "").strip()
+        if not raw:
+            return None
+        try:
+            data = base64.b64decode(raw)
+            with Image.open(BytesIO(data)) as img:
+                rgb = img.convert("RGB")
+        except Exception:
+            return None
+        width, height = rgb.size
+        if width < 2 or height < 2:
+            return None
+        x, y, w, h = roi_norm
+        pad = max(0.0, float(roi_padding))
+        x0 = max(0.0, x - w * pad)
+        y0 = max(0.0, y - h * pad)
+        x1 = min(1.0, x + w + w * pad)
+        y1 = min(1.0, y + h + h * pad)
+        left = int(round(x0 * width))
+        top = int(round(y0 * height))
+        right = int(round(x1 * width))
+        bottom = int(round(y1 * height))
+        right = min(width, max(left + 1, right))
+        bottom = min(height, max(top + 1, bottom))
+        if right - left < 2 or bottom - top < 2:
+            return None
+        crop = rgb.crop((left, top, right, bottom))
+        try:
+            return self._normalize_vec(embed_image_fn(crop))
+        except Exception:
+            return None
+
+    def _mat_for_query(
+        self,
+        min_ts_ms: Optional[int],
+        roi_norm: Optional[Tuple[float, float, float, float]],
+        embed_image_fn: Optional[Callable[[Image.Image], np.ndarray]],
+        roi_padding: float,
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+        if not self.embeddings:
+            return np.zeros((0, 0), dtype=np.float32), []
+        selected_idx: List[int] = []
+        for idx, row in enumerate(self.meta):
+            ts = row.get("timestamp_ms")
+            if min_ts_ms is not None and ts is not None and int(ts) < int(min_ts_ms):
+                continue
+            selected_idx.append(idx)
+        if not selected_idx:
+            return np.zeros((0, 0), dtype=np.float32), []
+        selected_meta = [self.meta[idx] for idx in selected_idx]
+        if roi_norm is None or embed_image_fn is None:
+            mat = np.stack([self.embeddings[idx] for idx in selected_idx], axis=0).astype(np.float32)
+            return mat, selected_meta
+
+        roi_key = self._roi_key(roi_norm)
+        cache = self.roi_cache.setdefault(roi_key, {})
+        self._remember_roi_key(roi_key)
+        vectors: List[np.ndarray] = []
+        for idx, row in zip(selected_idx, selected_meta):
+            uid = int(row.get("uid") or 0)
+            cached = cache.get(uid)
+            if cached is not None:
+                vectors.append(cached)
+                continue
+            embedded = self._embed_roi_thumb(
+                str(row.get("thumb") or ""),
+                roi_norm=roi_norm,
+                embed_image_fn=embed_image_fn,
+                roi_padding=roi_padding,
+            )
+            vec = embedded if embedded is not None else self.embeddings[idx]
+            cache[uid] = vec
+            vectors.append(vec)
+        mat = np.stack(vectors, axis=0).astype(np.float32)
+        return mat, selected_meta
 
     def query(
         self,
@@ -60,17 +185,20 @@ class ProbeBuffer:
         margin_thr: float,
         top_k: int,
         min_ts_ms: Optional[int] = None,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        embed_image_fn: Optional[Callable[[Image.Image], np.ndarray]] = None,
+        roi_padding: float = 0.05,
     ) -> List[Dict[str, Any]]:
-        if not self.embeddings or self.index is None:
+        if not self.embeddings:
             return []
-        mat = np.stack(self.embeddings, axis=0).astype(np.float32)
-        meta = list(self.meta)
-        if min_ts_ms is not None:
-            keep = [i for i, m in enumerate(meta) if m.get("timestamp_ms") and m["timestamp_ms"] >= min_ts_ms]
-            if not keep:
-                return []
-            mat = mat[keep]
-            meta = [meta[i] for i in keep]
+        mat, meta = self._mat_for_query(
+            min_ts_ms=min_ts_ms,
+            roi_norm=roi_norm,
+            embed_image_fn=embed_image_fn,
+            roi_padding=roi_padding,
+        )
+        if mat.size == 0 or not meta:
+            return []
         pos_scores = mat @ pos_embs.T
         pos_max = pos_scores.max(axis=1)
         if neg_embs.size > 0:
@@ -170,6 +298,8 @@ class ProbeManager:
         top_k: int,
         window_sec: Optional[float] = None,
         image_probe: Optional[Dict[str, Any]] = None,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        roi_padding: float = 0.05,
     ) -> Dict[str, Any]:
         pos_texts = [p.strip() for p in positives if str(p).strip()]
         neg_texts = [n.strip() for n in negatives if str(n).strip()]
@@ -202,7 +332,17 @@ class ProbeManager:
             buf = self.buffers.get(channel_id)
             if not buf:
                 return {"results": [], "frames_indexed": 0}
-            results = buf.query(pos_embs, neg_embs, pos_floor, margin_thr, top_k, min_ts_ms=min_ts_ms)
+            results = buf.query(
+                pos_embs,
+                neg_embs,
+                pos_floor,
+                margin_thr,
+                top_k,
+                min_ts_ms=min_ts_ms,
+                roi_norm=roi_norm,
+                embed_image_fn=self.embed_image_fn,
+                roi_padding=roi_padding,
+            )
             status = buf.status()
         return {"results": results, "status": status, "frames_indexed": status.get("frames", 0)}
 

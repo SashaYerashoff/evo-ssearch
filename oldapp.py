@@ -78,6 +78,8 @@ if active_embedder == "fusion" and not config.FUSION_ENABLED:
 LOCAL_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
 FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
+PROBE_ROI_MIN_SIDE = 0.02
+PROBE_ROI_PADDING = 0.05
 
 
 def _json_body() -> Dict[str, Any]:
@@ -98,6 +100,66 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
             return False
         return default
     return bool(value)
+
+
+def _normalize_probe_roi_norm(raw: Any, min_side: float = PROBE_ROI_MIN_SIDE) -> Optional[Tuple[float, float, float, float]]:
+    values: Optional[Tuple[float, float, float, float]] = None
+    try:
+        if isinstance(raw, dict):
+            values = (
+                float(raw.get("x")),
+                float(raw.get("y")),
+                float(raw.get("w")),
+                float(raw.get("h")),
+            )
+        elif isinstance(raw, (list, tuple)) and len(raw) == 4:
+            values = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+    except Exception:
+        return None
+    if values is None:
+        return None
+    if not all(math.isfinite(v) for v in values):
+        return None
+    x, y, w, h = values
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0, w))
+    h = max(0.0, min(1.0, h))
+    min_size = max(0.001, float(min_side))
+    if w < min_size or h < min_size:
+        return None
+    if x + w > 1.0:
+        x = max(0.0, 1.0 - w)
+    if y + h > 1.0:
+        y = max(0.0, 1.0 - h)
+    return (round(x, 6), round(y, 6), round(w, 6), round(h, 6))
+
+
+def _probe_roi_norm_to_payload(roi_norm: Optional[Tuple[float, float, float, float]]) -> Optional[Dict[str, float]]:
+    if roi_norm is None:
+        return None
+    x, y, w, h = roi_norm
+    return {"x": float(x), "y": float(y), "w": float(w), "h": float(h)}
+
+
+def _parse_probe_roi(payload: Mapping[str, Any]) -> Tuple[bool, Optional[Tuple[float, float, float, float]]]:
+    roi_enabled_explicit = "roi_enabled" in payload
+    enabled = _coerce_bool(payload.get("roi_enabled"), False)
+    roi_raw: Any = payload.get("roi_norm")
+    legacy = payload.get("roi")
+    if isinstance(legacy, dict):
+        if "enabled" in legacy and "roi_enabled" not in payload:
+            enabled = _coerce_bool(legacy.get("enabled"), enabled)
+        if roi_raw is None:
+            roi_raw = legacy.get("norm")
+            if roi_raw is None and all(key in legacy for key in ("x", "y", "w", "h")):
+                roi_raw = legacy
+    roi_norm = _normalize_probe_roi_norm(roi_raw)
+    if roi_norm is not None and not roi_enabled_explicit:
+        enabled = True
+    if not enabled or roi_norm is None:
+        return False, None
+    return True, roi_norm
 
 
 def _is_local_request() -> bool:
@@ -3091,6 +3153,41 @@ def home():
             letter-spacing: 0.03em;
             text-transform: uppercase;
             pointer-events: none;
+            z-index: 4;
+        }
+
+        .probe-roi-layer {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            cursor: crosshair;
+            pointer-events: none;
+            touch-action: none;
+        }
+
+        .probe-roi-layer.active {
+            pointer-events: auto;
+        }
+
+        .probe-roi-box {
+            position: absolute;
+            display: none;
+            border: 2px solid rgba(96, 220, 160, 0.95);
+            background: rgba(96, 220, 160, 0.18);
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55) inset;
+            border-radius: 3px;
+            pointer-events: none;
+            z-index: 3;
+        }
+
+        .probe-roi-box.active {
+            display: block;
+        }
+
+        .probe-meta-inline {
+            font-size: 0.82rem;
+            color: #9fd2b0;
+            letter-spacing: 0.01em;
         }
 
         .monitor-inline {
@@ -4012,6 +4109,8 @@ def home():
                         <div class="monitor-stream-preview">
                             <img id="probePreviewImg" src="" alt="" />
                             <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                            <div id="probeRoiLayer" class="probe-roi-layer" aria-label="Draw probe ROI"></div>
+                            <div id="probeRoiBox" class="probe-roi-box"></div>
                         </div>
                         <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
                         <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
@@ -4021,6 +4120,12 @@ def home():
                             <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
                             <label>Buffer (sec):</label>
                             <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
+                        </div>
+                        <div class="probe-row">
+                            <label>ROI:</label>
+                            <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
+                            <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
+                            <span id="probeRoiInfo" class="probe-meta-inline">Full frame matching</span>
                         </div>
                         <div class="monitor-btn-row">
                             <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
@@ -4391,7 +4496,13 @@ def home():
         const probeNewBtn = document.getElementById('probeNewBtn');
         const probeReloadBtn = document.getElementById('probeReloadBtn');
         const probePreviewImg = document.getElementById('probePreviewImg');
+        const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.monitor-stream-preview') : null;
         const probePreviewOverlay = document.getElementById('probePreviewOverlay');
+        const probeRoiLayer = document.getElementById('probeRoiLayer');
+        const probeRoiBox = document.getElementById('probeRoiBox');
+        const probeRoiToggleBtn = document.getElementById('probeRoiToggle');
+        const probeRoiClearBtn = document.getElementById('probeRoiClear');
+        const probeRoiInfo = document.getElementById('probeRoiInfo');
         const probePairsContainer = document.getElementById('probePairs');
         const probeAddPairBtn = document.getElementById('probeAddPair');
         const probeImageFile = document.getElementById('probeImageFile');
@@ -4470,6 +4581,10 @@ def home():
         const probeWindowSecByKey = {};
         let probePairsState = [];
         let probeImageState = null;
+        let probeRoiEnabled = false;
+        let probeRoiNorm = null;
+        let probeRoiDraftNorm = null;
+        let probeRoiDrawState = null;
         let imageProbeEnabled = false;
         let probeList = [];
         let probeCatalog = [];
@@ -7531,6 +7646,220 @@ def home():
             probeStatus.classList.toggle('error', Boolean(isError));
         }
 
+        function normalizeProbeRoiNorm(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            const x = Number.parseFloat(raw.x);
+            const y = Number.parseFloat(raw.y);
+            const w = Number.parseFloat(raw.w);
+            const h = Number.parseFloat(raw.h);
+            if (![x, y, w, h].every((value) => Number.isFinite(value))) return null;
+            const minSide = 0.02;
+            let nx = Math.min(1, Math.max(0, x));
+            let ny = Math.min(1, Math.max(0, y));
+            let nw = Math.min(1, Math.max(0, w));
+            let nh = Math.min(1, Math.max(0, h));
+            if (nw < minSide || nh < minSide) return null;
+            if (nx + nw > 1) nx = Math.max(0, 1 - nw);
+            if (ny + nh > 1) ny = Math.max(0, 1 - nh);
+            return {
+                x: Number(nx.toFixed(6)),
+                y: Number(ny.toFixed(6)),
+                w: Number(nw.toFixed(6)),
+                h: Number(nh.toFixed(6)),
+            };
+        }
+
+        function getProbePreviewGeometry() {
+            if (!probePreviewViewport || !probePreviewImg) return null;
+            const viewportRect = probePreviewViewport.getBoundingClientRect();
+            const viewportWidth = viewportRect.width;
+            const viewportHeight = viewportRect.height;
+            if (!(viewportWidth > 1) || !(viewportHeight > 1)) return null;
+            const naturalWidth = probePreviewImg.naturalWidth || 0;
+            const naturalHeight = probePreviewImg.naturalHeight || 0;
+            if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
+                return {
+                    viewportRect,
+                    viewportWidth,
+                    viewportHeight,
+                    imageWidth: viewportWidth,
+                    imageHeight: viewportHeight,
+                    imageOffsetX: 0,
+                    imageOffsetY: 0,
+                };
+            }
+            const scale = Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
+            const imageWidth = naturalWidth * scale;
+            const imageHeight = naturalHeight * scale;
+            return {
+                viewportRect,
+                viewportWidth,
+                viewportHeight,
+                imageWidth,
+                imageHeight,
+                imageOffsetX: (viewportWidth - imageWidth) / 2,
+                imageOffsetY: (viewportHeight - imageHeight) / 2,
+            };
+        }
+
+        function viewportPointToProbeNorm(clientX, clientY) {
+            const geom = getProbePreviewGeometry();
+            if (!geom) return null;
+            const px = clientX - geom.viewportRect.left;
+            const py = clientY - geom.viewportRect.top;
+            const nx = (px - geom.imageOffsetX) / geom.imageWidth;
+            const ny = (py - geom.imageOffsetY) / geom.imageHeight;
+            return {
+                x: Math.min(1, Math.max(0, nx)),
+                y: Math.min(1, Math.max(0, ny)),
+            };
+        }
+
+        function probeNormToViewportRect(roiNorm) {
+            const norm = normalizeProbeRoiNorm(roiNorm);
+            const geom = getProbePreviewGeometry();
+            if (!norm || !geom) return null;
+            const left = geom.imageOffsetX + (norm.x * geom.imageWidth);
+            const top = geom.imageOffsetY + (norm.y * geom.imageHeight);
+            const right = left + (norm.w * geom.imageWidth);
+            const bottom = top + (norm.h * geom.imageHeight);
+            const clampedLeft = Math.max(0, Math.min(geom.viewportWidth, left));
+            const clampedTop = Math.max(0, Math.min(geom.viewportHeight, top));
+            const clampedRight = Math.max(0, Math.min(geom.viewportWidth, right));
+            const clampedBottom = Math.max(0, Math.min(geom.viewportHeight, bottom));
+            if (clampedRight - clampedLeft < 2 || clampedBottom - clampedTop < 2) return null;
+            return {
+                left: clampedLeft,
+                top: clampedTop,
+                width: clampedRight - clampedLeft,
+                height: clampedBottom - clampedTop,
+            };
+        }
+
+        function renderProbeRoiBox() {
+            if (!probeRoiBox) return;
+            const candidate = probeRoiDraftNorm || probeRoiNorm;
+            if (!probeRoiEnabled || !candidate) {
+                probeRoiBox.classList.remove('active');
+                probeRoiBox.style.display = 'none';
+                return;
+            }
+            const rect = probeNormToViewportRect(candidate);
+            if (!rect) {
+                probeRoiBox.classList.remove('active');
+                probeRoiBox.style.display = 'none';
+                return;
+            }
+            probeRoiBox.style.display = 'block';
+            probeRoiBox.classList.add('active');
+            probeRoiBox.style.left = `${rect.left}px`;
+            probeRoiBox.style.top = `${rect.top}px`;
+            probeRoiBox.style.width = `${rect.width}px`;
+            probeRoiBox.style.height = `${rect.height}px`;
+        }
+
+        function updateProbeRoiUi() {
+            const normalized = normalizeProbeRoiNorm(probeRoiNorm);
+            if (probeRoiToggleBtn) {
+                probeRoiToggleBtn.textContent = probeRoiEnabled ? 'ROI ON' : 'ROI OFF';
+                probeRoiToggleBtn.classList.toggle('primary', probeRoiEnabled);
+            }
+            if (probeRoiClearBtn) {
+                probeRoiClearBtn.disabled = !normalized;
+            }
+            if (probeRoiLayer) {
+                probeRoiLayer.classList.toggle('active', probeRoiEnabled);
+            }
+            if (probeRoiInfo) {
+                if (!probeRoiEnabled) {
+                    probeRoiInfo.textContent = 'Full frame matching';
+                } else if (normalized) {
+                    const pct = (value) => `${Math.round(value * 100)}%`;
+                    probeRoiInfo.textContent = `ROI ${pct(normalized.w)} × ${pct(normalized.h)} @ ${pct(normalized.x)}, ${pct(normalized.y)}`;
+                } else {
+                    probeRoiInfo.textContent = 'ROI enabled, draw on preview';
+                }
+            }
+            renderProbeRoiBox();
+        }
+
+        function applyProbeRoiState(enabled, roiNorm) {
+            const normalized = normalizeProbeRoiNorm(roiNorm);
+            probeRoiEnabled = Boolean(enabled);
+            probeRoiNorm = normalized;
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            updateProbeRoiUi();
+        }
+
+        function clearProbeRoi(keepEnabled = true) {
+            probeRoiNorm = null;
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            probeRoiEnabled = Boolean(keepEnabled);
+            updateProbeRoiUi();
+        }
+
+        function stopProbeRoiDraw(commit) {
+            if (probeRoiLayer && probeRoiDrawState && Number.isFinite(probeRoiDrawState.pointerId)) {
+                try {
+                    probeRoiLayer.releasePointerCapture(probeRoiDrawState.pointerId);
+                } catch (_) {
+                    // ignore
+                }
+            }
+            if (commit) {
+                const normalized = normalizeProbeRoiNorm(probeRoiDraftNorm);
+                if (probeRoiEnabled && normalized) {
+                    probeRoiNorm = normalized;
+                }
+            }
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            updateProbeRoiUi();
+        }
+
+        function beginProbeRoiDraw(event) {
+            if (!probeRoiEnabled || !probeRoiLayer) return;
+            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
+            if (!point) return;
+            event.preventDefault();
+            probeRoiDrawState = {
+                pointerId: event.pointerId,
+                startX: point.x,
+                startY: point.y,
+                currentX: point.x,
+                currentY: point.y,
+            };
+            probeRoiDraftNorm = {
+                x: point.x,
+                y: point.y,
+                w: 0.001,
+                h: 0.001,
+            };
+            probeRoiLayer.setPointerCapture(event.pointerId);
+            renderProbeRoiBox();
+        }
+
+        function updateProbeRoiDraw(event) {
+            if (!probeRoiEnabled || !probeRoiDrawState) return;
+            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
+            if (!point) return;
+            probeRoiDrawState.currentX = point.x;
+            probeRoiDrawState.currentY = point.y;
+            const x0 = Math.min(probeRoiDrawState.startX, probeRoiDrawState.currentX);
+            const y0 = Math.min(probeRoiDrawState.startY, probeRoiDrawState.currentY);
+            const x1 = Math.max(probeRoiDrawState.startX, probeRoiDrawState.currentX);
+            const y1 = Math.max(probeRoiDrawState.startY, probeRoiDrawState.currentY);
+            probeRoiDraftNorm = {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            };
+            renderProbeRoiBox();
+        }
+
         function setPreviewState(text, clearImage = false) {
             if (probePreviewOverlay) {
                 probePreviewOverlay.style.display = text ? 'flex' : 'none';
@@ -7539,6 +7868,7 @@ def home():
             if (clearImage && probePreviewImg) {
                 probePreviewImg.src = '';
             }
+            renderProbeRoiBox();
         }
 
         function stopProbePreview() {
@@ -7560,7 +7890,10 @@ def home():
                 if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
                 probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
             };
-            probePreviewImg.onload = () => setPreviewState('');
+            probePreviewImg.onload = () => {
+                setPreviewState('');
+                renderProbeRoiBox();
+            };
             probePreviewImg.onerror = () => setPreviewState('Preview failed');
             refresh();
             const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
@@ -7676,6 +8009,8 @@ def home():
         function collectProbeForm() {
             const positives = [];
             const negatives = [];
+            const normalizedRoi = normalizeProbeRoiNorm(probeRoiNorm);
+            const roiActive = Boolean(probeRoiEnabled && normalizedRoi);
             ensurePairsSeed();
             probePairsState.forEach((row) => {
                 if (row.pos?.trim()) positives.push(row.pos.trim());
@@ -7703,6 +8038,8 @@ def home():
                     pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
                     enabled: imageProbeEnabled,
                 },
+                roi_enabled: roiActive,
+                roi_norm: roiActive ? normalizedRoi : null,
             };
         }
 
@@ -7898,6 +8235,13 @@ def home():
                 applyImageThumb('');
                 updateImageProbeStatus(false);
             }
+            const legacyRoi = probe && probe.roi && typeof probe.roi === 'object' ? probe.roi : null;
+            const savedRoiNorm = probe?.roi_norm || (legacyRoi ? (legacyRoi.norm || legacyRoi) : null);
+            const hasSavedRoiNorm = Boolean(normalizeProbeRoiNorm(savedRoiNorm));
+            const savedRoiEnabled = (probe?.roi_enabled === true)
+                || (legacyRoi && legacyRoi.enabled === true)
+                || (probe?.roi_enabled == null && (!legacyRoi || legacyRoi.enabled == null) && hasSavedRoiNorm);
+            applyProbeRoiState(savedRoiEnabled, savedRoiNorm);
             renderPairs();
             const initialHits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
                 ? probe.recent_hits
@@ -8225,6 +8569,7 @@ def home():
                 activeProbeId = null;
                 probePairsState = [];
                 probeImageState = null;
+                clearProbeRoi(false);
                 applyImageThumb('');
                 renderPairs();
                 renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
@@ -8263,6 +8608,7 @@ def home():
             else {
                 probePairsState = [];
                 probeImageState = null;
+                clearProbeRoi(false);
                 applyImageThumb('');
                 renderPairs();
                 renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
@@ -8285,8 +8631,41 @@ def home():
             probeChannelSelect.addEventListener('change', () => {
                 const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
                 startProbePreview(cid);
+                renderProbeRoiBox();
             });
         }
+        if (probeRoiToggleBtn) {
+            probeRoiToggleBtn.addEventListener('click', () => {
+                probeRoiEnabled = !probeRoiEnabled;
+                if (!probeRoiEnabled) {
+                    probeRoiDraftNorm = null;
+                    probeRoiDrawState = null;
+                }
+                updateProbeRoiUi();
+            });
+        }
+        if (probeRoiClearBtn) {
+            probeRoiClearBtn.addEventListener('click', () => {
+                clearProbeRoi(true);
+            });
+        }
+        if (probeRoiLayer) {
+            probeRoiLayer.addEventListener('pointerdown', (event) => {
+                beginProbeRoiDraw(event);
+            });
+            probeRoiLayer.addEventListener('pointermove', (event) => {
+                updateProbeRoiDraw(event);
+            });
+            probeRoiLayer.addEventListener('pointerup', () => {
+                stopProbeRoiDraw(true);
+            });
+            probeRoiLayer.addEventListener('pointercancel', () => {
+                stopProbeRoiDraw(false);
+            });
+        }
+        window.addEventListener('resize', () => {
+            renderProbeRoiBox();
+        });
         if (probeCards) {
             probeCards.addEventListener('click', handleProbeCardClick);
         }
@@ -8295,6 +8674,7 @@ def home():
                 activeProbeId = null;
                 probePairsState = [];
                 probeImageState = null;
+                clearProbeRoi(false);
                 applyImageThumb('');
                 renderPairs();
                 renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
@@ -8419,6 +8799,7 @@ def home():
                 }
             });
         }
+        applyProbeRoiState(false, null);
 
         // Mode switching
         if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
@@ -10930,6 +11311,7 @@ def _probe_daemon() -> None:
                     except Exception as exc:
                         print(f"Probe daemon failed to start capture for channel {ch}: {exc}")
                     for probe in plist:
+                        probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
                         result = probe_manager.query(
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
                             probe.get('positives', []),
@@ -10939,6 +11321,8 @@ def _probe_daemon() -> None:
                             probe.get('top_k', 6),
                             window_sec=probe.get('window_sec', 300.0),
                             image_probe=probe.get('image_probe'),
+                            roi_norm=probe_roi_norm if probe_roi_enabled else None,
+                            roi_padding=PROBE_ROI_PADDING,
                         )
                         if 'error' in result:
                             continue
@@ -10967,7 +11351,11 @@ def _probe_daemon() -> None:
                                 hits,
                                 source='probe_daemon',
                                 bookmark_sent=bookmark_sent,
-                                extra_payload={'frames_indexed': result.get('frames_indexed')},
+                                extra_payload={
+                                    'frames_indexed': result.get('frames_indexed'),
+                                    'roi_enabled': probe_roi_enabled,
+                                    'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+                                },
                             )
                             probes_store.upsert_probe(probe)
                 except Exception as exc:
@@ -13235,6 +13623,7 @@ def probes_query():
         window_sec = float(data.get('window_sec', 0))
     except Exception:
         window_sec = 0
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
     probe_like = {
         "id": data.get('id'),
         "name": (data.get('name') or 'probe'),
@@ -13243,6 +13632,8 @@ def probes_query():
         "bookmark": bool(data.get('bookmark')),
         "window_sec": window_sec,
         "fps": data.get('fps'),
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
     }
     result = probe_manager.query(
         channel_id,
@@ -13253,6 +13644,8 @@ def probes_query():
         top_k,
         window_sec=window_sec,
         image_probe=data.get('image_probe'),
+        roi_norm=probe_roi_norm if probe_roi_enabled else None,
+        roi_padding=PROBE_ROI_PADDING,
     )
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
@@ -13280,7 +13673,11 @@ def probes_query():
             hits,
             source='probes_query',
             bookmark_sent=bookmark_sent,
-            extra_payload={'frames_indexed': result.get('frames_indexed')},
+            extra_payload={
+                'frames_indexed': result.get('frames_indexed'),
+                'roi_enabled': probe_roi_enabled,
+                'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+            },
         )
     else:
         result['persisted_hits'] = 0
@@ -13367,6 +13764,8 @@ def probes_save():
         except Exception:
             return default
 
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
+
     probe = {
         "id": data.get('id') or None,
         "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
@@ -13381,6 +13780,8 @@ def probes_save():
         "bookmark": bool(data.get('bookmark', True)),
         "enabled": bool(data.get('enabled', True)),
         "image_probe": image_probe,
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
         "pairs": data.get('pairs') or [],
         "last_hit": data.get('last_hit'),
         "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
@@ -13423,6 +13824,7 @@ def probes_run():
     probe = probes.get(probe_id)
     if not probe:
         return jsonify({'error': 'Probe not found'}), 404
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
     result = probe_manager.query(
         probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
         probe.get('positives', []),
@@ -13432,6 +13834,8 @@ def probes_run():
         probe.get('top_k', 6),
         window_sec=probe.get('window_sec', 300.0),
         image_probe=probe.get('image_probe'),
+        roi_norm=probe_roi_norm if probe_roi_enabled else None,
+        roi_padding=PROBE_ROI_PADDING,
     )
     if 'error' in result:
         return jsonify(result), 400
@@ -13462,7 +13866,11 @@ def probes_run():
             hits,
             source='probes_run',
             bookmark_sent=bookmark_sent,
-            extra_payload={'frames_indexed': result.get('frames_indexed')},
+            extra_payload={
+                'frames_indexed': result.get('frames_indexed'),
+                'roi_enabled': probe_roi_enabled,
+                'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+            },
         )
     else:
         persisted_hits = 0
