@@ -4707,9 +4707,11 @@ def home():
         let activeProbeId = null;
         const probeCaptureState = {};
         const probeChannelRuntime = {};
+        const probeCaptureManualStop = {};
         let probeRunTimer = null;
         let probeRunInFlight = false;
         let probePreviewTimer = null;
+        let probePreviewChannelId = null;
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
         let archiveDetectionsOffset = 0;
@@ -4843,7 +4845,7 @@ def home():
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
                 syncProbeChannelSelect();
-                startProbePreview(getSelectedProbeChannelId());
+                syncProbePreview(getSelectedProbeChannelId());
                 refreshProbeStatus();
                 loadProbeList();
                 startProbeStatusPoll();
@@ -4855,8 +4857,18 @@ def home():
                 stopProbeStatusPoll();
                 refreshArchiveFilters().catch(() => {});
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
+            }
+        }
+
+        function setProbeEditorModalVisibility(visible) {
+            if (!probeEditorModal) return;
+            probeEditorModal.style.display = visible ? 'block' : 'none';
+            if (visible) {
+                syncProbePreview(getSelectedProbeChannelId());
+            } else {
+                stopProbePreview();
             }
         }
 
@@ -5929,9 +5941,11 @@ def home():
             Object.entries(probeChannelRuntime).forEach(([channelId, state]) => {
                 if (state === 'running') {
                     probeCaptureState[channelId] = true;
+                    delete probeCaptureManualStop[channelId];
                 }
             });
             updateProbeCaptureMeta(getSelectedProbeChannelId());
+            syncProbePreview(getSelectedProbeChannelId());
             if (rerender) {
                 renderProbeCards();
             }
@@ -7016,23 +7030,23 @@ def home():
 
         if (probeEditBtn && probeEditorModal) {
             probeEditBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'block';
+                setProbeEditorModalVisibility(true);
             });
         }
         if (closeProbeEditorBtn && probeEditorModal) {
             closeProbeEditorBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'none';
+                setProbeEditorModalVisibility(false);
             });
         }
         if (probeEditorCloseBtn && probeEditorModal) {
             probeEditorCloseBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'none';
+                setProbeEditorModalVisibility(false);
             });
         }
         if (probeEditorModal) {
             probeEditorModal.addEventListener('click', (e) => {
                 if (e.target === probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
             });
         }
@@ -8035,10 +8049,12 @@ def home():
                 clearInterval(probePreviewTimer);
                 probePreviewTimer = null;
             }
+            probePreviewChannelId = null;
         }
 
         function startProbePreview(channelId) {
             if (!probePreviewImg) return;
+            if (probePreviewTimer && probePreviewChannelId === channelId) return;
             stopProbePreview();
             if (!channelId && channelId !== 0) {
                 setPreviewState('No channel', true);
@@ -8053,9 +8069,40 @@ def home():
                 renderProbeRoiBox();
             };
             probePreviewImg.onerror = () => setPreviewState('Preview failed');
+            probePreviewChannelId = channelId;
             refresh();
             const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
             probePreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function syncProbePreview(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
+            if (!probeEditorModal || probeEditorModal.style.display !== 'block') {
+                stopProbePreview();
+                return;
+            }
+            if (!channelId && channelId !== 0) {
+                stopProbePreview();
+                setPreviewState('No channel', true);
+                return;
+            }
+            const runtimeState = getProbeRuntimeState(channelId);
+            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : true;
+            if (enabled && runtimeState === 'running') {
+                startProbePreview(channelId);
+                setPreviewState('');
+                return;
+            }
+            stopProbePreview();
+            if (!enabled) {
+                setPreviewState('Probe disabled');
+                return;
+            }
+            if (runtimeState === 'paused') {
+                setPreviewState('Paused');
+                return;
+            }
+            setPreviewState('No stream');
         }
 
         function ensurePairsSeed() {
@@ -8387,7 +8434,7 @@ def home():
             if (probeNameInput) probeNameInput.value = (probe && probe.name) || '';
             if (probeChannelSelect && probe && probe.channel_id) {
                 probeChannelSelect.value = probe.channel_id;
-                startProbePreview(probe.channel_id);
+                syncProbePreview(probe.channel_id);
             }
             if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
@@ -8486,19 +8533,30 @@ def home():
             }
         }
 
-        async function ensureProbeCapture(channelId, quiet = false) {
-            if (!channelId && channelId !== 0) return;
+        async function ensureProbeCapture(channelId, quiet = false, options = null) {
+            if (!channelId && channelId !== 0) return false;
+            const forceStart = Boolean(options && options.forceStart);
+            if (!forceStart && probeCaptureManualStop[channelId]) {
+                probeChannelRuntime[channelId] = 'idle';
+                updateProbeCaptureMeta(channelId);
+                syncProbePreview(channelId);
+                if (!quiet) {
+                    setProbeStatus('Stream stopped. Press Start Stream to resume.');
+                }
+                return false;
+            }
             await refreshProbeRuntimeState(false);
             const runtimeState = probeChannelRuntime[channelId];
             if (runtimeState === 'running') {
                 probeCaptureState[channelId] = true;
+                delete probeCaptureManualStop[channelId];
                 updateProbeCaptureMeta(channelId);
                 setPreviewState('');
-                startProbePreview(channelId);
+                syncProbePreview(channelId);
                 if (!quiet) {
                     await refreshProbeStatus(channelId);
                 }
-                return;
+                return true;
             }
             try {
                 channelCaptureConfig[channelId] = {
@@ -8518,17 +8576,20 @@ def home():
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
                 probeCaptureState[channelId] = true;
                 probeChannelRuntime[channelId] = 'running';
+                delete probeCaptureManualStop[channelId];
                 renderProbeCards();
                 updateProbeCaptureMeta(channelId);
                 setPreviewState('');
-                startProbePreview(channelId);
+                syncProbePreview(channelId);
                 if (!quiet) {
                     await refreshProbeStatus(channelId);
                 }
+                return true;
             } catch (err) {
                 if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
                 if (!quiet) setProbeStatus(err.message, true);
                 updateProbeStreamToggleButton(channelId);
+                return false;
             }
         }
 
@@ -8548,13 +8609,16 @@ def home():
                 delete probeCaptureState[channelId];
                 if (reason === 'paused') {
                     probeChannelRuntime[channelId] = 'paused';
+                    delete probeCaptureManualStop[channelId];
                     setPreviewState('Paused');
                 } else {
                     probeChannelRuntime[channelId] = 'idle';
-                    setPreviewState('Stopped', true);
+                    probeCaptureManualStop[channelId] = true;
+                    setPreviewState('No stream');
                 }
                 renderProbeCards();
-                if (reason !== 'paused') stopProbePreview();
+                stopProbePreview();
+                syncProbePreview(channelId);
                 updateProbeCaptureMeta(channelId);
                 await refreshProbeStatus(channelId);
             } catch (err) {
@@ -8603,9 +8667,13 @@ def home():
                 }
                 const saved = data.probe;
                 activeProbeId = saved.id || activeProbeId;
-            setProbeStatus(`Saved probe ${saved.name || saved.id}`);
-            await loadProbeList();
-            await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+                setProbeStatus(`Saved probe ${saved.name || saved.id}`);
+                await loadProbeList();
+                if (saved?.enabled !== false) {
+                    await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+                } else {
+                    syncProbePreview(saved.channel_id || payload.channel_id);
+                }
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
@@ -8622,7 +8690,11 @@ def home():
                 return;
             }
             const channelId = payload.channel_id;
-            await ensureProbeCapture(channelId, true);
+            const captureReady = await ensureProbeCapture(channelId, true);
+            if (!captureReady) {
+                if (!quiet) setProbeStatus('Stream stopped. Press Start Stream to resume.');
+                return;
+            }
             if (!quiet) setProbeStatus('Running...');
             probeRunInFlight = true;
             try {
@@ -8738,7 +8810,7 @@ def home():
             if (action === 'expand' && probe) {
                 setActiveProbe(probe);
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             } else if (action === 'run' && probe) {
                 setActiveProbe(probe);
@@ -8757,7 +8829,7 @@ def home():
                 resetProbeDraftEditor();
                 setProbeStatus('New probe');
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             }
         }
@@ -8780,7 +8852,7 @@ def home():
             probeSaveBtn.addEventListener('click', async () => {
                 const savedId = await saveActiveProbe();
                 if (savedId && probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
             });
         }
@@ -8798,14 +8870,14 @@ def home():
                 if (runtimeState === 'running') {
                     stopProbeCapture(channelId, 'stopped');
                 } else {
-                    ensureProbeCapture(channelId);
+                    ensureProbeCapture(channelId, false, { forceStart: true });
                 }
             });
         }
         if (probeChannelSelect) {
             probeChannelSelect.addEventListener('change', () => {
                 const cid = getSelectedProbeChannelId();
-                startProbePreview(cid);
+                syncProbePreview(cid);
                 updateProbeCaptureMeta(cid);
                 refreshProbeStatus(cid);
             });
@@ -8850,7 +8922,7 @@ def home():
                 resetProbeDraftEditor();
                 setProbeStatus('New probe');
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             });
         }
@@ -8946,6 +9018,7 @@ def home():
                 } else {
                     stopProbeRunLoop('Probe disabled');
                 }
+                syncProbePreview(getSelectedProbeChannelId());
             });
         }
         if (probeImageEnableToggle) {
