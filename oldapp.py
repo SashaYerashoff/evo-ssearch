@@ -3519,6 +3519,14 @@ def home():
             letter-spacing: 0.01em;
         }
 
+        .probe-pairs-threshold-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            padding-bottom: 0.15rem;
+        }
+
         .probe-meta {
             color: #9a9a9a;
             font-size: 0.9rem;
@@ -3569,6 +3577,10 @@ def home():
 
         .image-probe-row .file-upload {
             flex: 1;
+        }
+
+        .image-probe-clear-row {
+            justify-content: flex-start;
         }
 
         .image-probe-enable-check {
@@ -4197,18 +4209,19 @@ def home():
                                     </select>
                                 </div>
                             </div>
-                            <div class="probe-row probe-threshold-row">
+                        </div>
+                        <div class="probe-pairs" id="probePairs">
+                            <div class="probe-row probe-threshold-row probe-pairs-threshold-row">
                                 <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
                                 <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
                             </div>
-                        </div>
-                        <div class="probe-pairs" id="probePairs">
                             <div class="probe-pairs-header">
                                 <div></div>
                                 <div>Positive Examples:</div>
                                 <div>Negative Examples:</div>
                                 <div class="probe-pairs-spacer">&nbsp;</div>
                             </div>
+                            <div id="probePairRows"></div>
                         </div>
                         <div class="image-probe-panel no-image">
                             <div class="image-probe-left">
@@ -4223,6 +4236,9 @@ def home():
                                         <input type="checkbox" id="probeImageEnableToggle">
                                         Enabled
                                     </label>
+                                </div>
+                                <div class="image-probe-row image-probe-clear-row">
+                                    <button type="button" id="probeImageClear" class="feature-btn">Clear image</button>
                                 </div>
                                 <div class="image-probe-row image-probe-threshold-row">
                                     <div class="image-probe-min-wrap">
@@ -4548,8 +4564,10 @@ def home():
         const probeRoiClearBtn = document.getElementById('probeRoiClear');
         const probeRoiInfo = document.getElementById('probeRoiInfo');
         const probePairsContainer = document.getElementById('probePairs');
+        const probePairRows = document.getElementById('probePairRows');
         const probeImageFile = document.getElementById('probeImageFile');
         const probeImageFileName = document.getElementById('probeImageFileName');
+        const probeImageClearBtn = document.getElementById('probeImageClear');
         const probeImageEnableToggle = document.getElementById('probeImageEnableToggle');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
@@ -7994,7 +8012,7 @@ def home():
         }
 
         function renderPairs() {
-            if (!probePairsContainer) return;
+            if (!probePairRows) return;
             ensurePairsSeed();
             const rows = probePairsState.map((row, idx) => {
                 const canRemove = probePairsState.length > 1;
@@ -8008,13 +8026,7 @@ def home():
                     </div>
                 `;
             }).join('');
-            probePairsContainer.innerHTML = `
-                <div class="probe-pairs-header">
-                    <div></div>
-                    <div>Positive Examples:</div>
-                    <div>Negative Examples:</div>
-                    <div class="probe-pairs-spacer">&nbsp;</div>
-                </div>
+            probePairRows.innerHTML = `
                 ${rows}
                 <div class="probe-pair-row probe-pair-add-row">
                     <div class="probe-pair-idx">${probePairsState.length + 1}.</div>
@@ -8042,6 +8054,13 @@ def home():
                 probeImageFileName.textContent = label;
                 probeImageFileName.title = probeImageState?.name ? String(probeImageState.name) : '';
             }
+        }
+
+        function clearProbeImageSelection() {
+            probeImageState = null;
+            if (probeImageFile) probeImageFile.value = '';
+            applyImageThumb('');
+            updateImageProbeStatus(false);
         }
 
         function setArchiveUploadName(file) {
@@ -8091,6 +8110,9 @@ def home():
             if (probeImageEnableToggle) {
                 probeImageEnableToggle.checked = imageProbeEnabled;
                 probeImageEnableToggle.disabled = !hasImage;
+            }
+            if (probeImageClearBtn) {
+                probeImageClearBtn.disabled = !hasImage;
             }
             if (probeImageStatus) {
                 const imageState = hasImage ? 'Ok' : 'Missing';
@@ -8323,9 +8345,7 @@ def home():
                 const enabled = probe.image_probe.enabled !== false;
                 updateImageProbeStatus(enabled);
             } else {
-                probeImageState = null;
-                applyImageThumb('');
-                updateImageProbeStatus(false);
+                clearProbeImageSelection();
             }
             const legacyRoi = probe && probe.roi && typeof probe.roi === 'object' ? probe.roi : null;
             const savedRoiNorm = probe?.roi_norm || (legacyRoi ? (legacyRoi.norm || legacyRoi) : null);
@@ -8634,9 +8654,8 @@ def home():
         function resetProbeDraftEditor() {
             activeProbeId = null;
             probePairsState = [];
-            probeImageState = null;
             clearProbeRoi(false);
-            applyImageThumb('');
+            clearProbeImageSelection();
             renderPairs();
             renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
             if (probeNameInput) probeNameInput.value = '';
@@ -8790,9 +8809,7 @@ def home():
             probeImageFile.addEventListener('change', () => {
                 const file = probeImageFile.files && probeImageFile.files[0];
                 if (!file) {
-                    probeImageState = null;
-                    applyImageThumb('');
-                    updateImageProbeStatus(false);
+                    clearProbeImageSelection();
                     return;
                 }
                 const reader = new FileReader();
@@ -8803,6 +8820,11 @@ def home():
                     updateImageProbeStatus(imageProbeEnabled);
                 };
                 reader.readAsDataURL(file);
+            });
+        }
+        if (probeImageClearBtn) {
+            probeImageClearBtn.addEventListener('click', () => {
+                clearProbeImageSelection();
             });
         }
         if (probePairsContainer) {
