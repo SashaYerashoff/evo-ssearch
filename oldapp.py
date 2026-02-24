@@ -1748,11 +1748,29 @@ def home():
             gap: 0.3rem;
             align-items: baseline;
             color: #999;
+            min-width: 0;
+        }
+
+        .similarity .metric-line.metric-line-wrap {
+            align-items: center;
         }
 
         .metric-label {
             color: #e0e0e0;
             font-weight: 500;
+            flex: 0 0 auto;
+        }
+
+        .metric-value {
+            min-width: 0;
+        }
+
+        .metric-stream-name {
+            display: block;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .metric-note {
@@ -6421,6 +6439,7 @@ def home():
             }
 
             if (result && result.is_detection) {
+                const probeName = String(result.probe_name || result.probe_id || result.filename || 'n/a').trim() || 'n/a';
                 const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
                 const channelId = parseInt(String(result.channel_id ?? ''), 10);
                 const channelName = Number.isFinite(channelId) ? getLuxriotChannelLabel(channelId) : (
@@ -6434,10 +6453,14 @@ def home():
                 const mode = String(result.search_mode || '').trim().toUpperCase();
                 const clipSearch = Number.isFinite(result?.fusion?.clip_similarity) ? formatPercent(result.fusion.clip_similarity) : null;
                 const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
+                const safeChannelName = escapeHtml(channelName);
+                const safeProbeName = escapeHtml(probeName);
                 const lines = [
+                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Name:</span> <span class="metric-value metric-stream-name" title="${safeProbeName}">${safeProbeName}</span></div>`,
                     `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
-                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channelName)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
-                    `<div class="metric-line"><span class="metric-label">Probe P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
+                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Stream:</span> <span class="metric-value metric-stream-name" title="${safeChannelName}">${safeChannelName}</span></div>`,
+                    `<div class="metric-line"><span class="metric-label">Severity:</span> <span class="metric-value">${sev}</span></div>`,
+                    `<div class="metric-line"><span class="metric-label">Probe:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
                 ];
                 if (similarity) {
                     const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
@@ -6613,9 +6636,8 @@ def home():
             return (detections || []).map((det, idx) => {
                 const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
                 const probeLabel = det?.probe_name || det?.probe_id || 'probe';
-                const tsLabel = ts ? new Date(ts).toLocaleString() : 'n/a';
                 return {
-                    filename: `${probeLabel} · ${tsLabel}`,
+                    filename: String(probeLabel),
                     path: det?.image_path || det?.payload?.image_path || '',
                     thumbnail: det?.thumbnail || '',
                     is_detection: true,
@@ -8825,6 +8847,7 @@ def home():
             const safeFilename = escapeHtml(result.filename || 'unnamed');
             const rawPath = String(result.path || '');
             const hasPath = rawPath.length > 0;
+            const showFilenameRow = !(result && result.is_detection);
             const safePath = escapeHtml(rawPath);
             const thumb = String(result.thumbnail || '').trim();
             const fallbackSvg = encodeURIComponent(
@@ -8849,12 +8872,14 @@ def home():
                     </div>
                 </div>
                 <div class="result-info">
-                    <div class="filename">
-                        ${safeFilename}
-                        <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
-                            <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
-                        </svg>
-                    </div>
+                    ${showFilenameRow ? `
+                        <div class="filename">
+                            ${safeFilename}
+                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                            </svg>
+                        </div>
+                    ` : ''}
                     ${badgesMarkup}
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
