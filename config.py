@@ -43,11 +43,26 @@ def _get_path_list_env(name: str) -> tuple[str, ...]:
     return tuple(resolved)
 
 
+def _get_app_version(default: str = "α 0.4.2") -> str:
+    env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
+    if env_value:
+        return env_value
+    version_path = Path(__file__).resolve().parent / "VERSION"
+    try:
+        text = version_path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return default
+
+
 class Config:
     # Server configuration
     HOST = os.getenv('EVOSSEARCH_HOST', '0.0.0.0')  # 0.0.0.0 allows network access
     PORT = int(os.getenv('EVOSSEARCH_PORT', '5000'))
     DEBUG = _get_bool_env('EVOSSEARCH_DEBUG', 'False')
+    APP_VERSION = _get_app_version()
 
     # Embedder configuration
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()

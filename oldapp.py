@@ -724,6 +724,8 @@ def home():
     <title>Natural Language Image Search</title>
     <!-- Cache buster: {timestamp} -->
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Titillium+Web:wght@600;700&display=swap');
+
         :root {
             --bg: #0a0a0a;
             --panel: #161616;
@@ -782,14 +784,24 @@ def home():
 
         .brand {
             display: flex;
-            align-items: center;
+            flex-direction: column;
+            align-items: flex-start;
             gap: 0.9rem;
         }
 
-        .brand-title {
+        .brand-top {
             display: flex;
-            flex-direction: column;
-            gap: 0.2rem;
+            align-items: flex-end;
+            gap: 0.9rem;
+        }
+
+        .brand-logo {
+            height: 36px;
+            width: auto;
+            object-fit: contain;
+            display: block;
+            flex: 0 0 auto;
+            filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
         }
 
         .brand-main {
@@ -797,6 +809,9 @@ def home():
             font-weight: 700;
             letter-spacing: 0.02em;
             margin: 0;
+            line-height: 0.9;
+            transform: translateY(2px);
+            font-family: "Titillium Web", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
 
         .brand-sub {
@@ -805,13 +820,6 @@ def home():
             margin: 0;
         }
 
-        .brand-note {
-            color: #9c9c9c;
-            font-size: 0.9rem;
-            font-style: italic;
-            margin: 0;
-        }
-        
         .settings-icon {
             cursor: pointer;
             padding: 8px;
@@ -3629,11 +3637,11 @@ def home():
     <div class="container">
         <div class="header">
             <div class="brand">
-                <div class="brand-title">
-                    <div class="brand-main">SISU</div>
-                    <div class="brand-sub">Smart Image Search and Understanding.</div>
-                    <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
+                <div class="brand-top">
+                    <img class="brand-logo" src="/branding/logo" alt="Luxriot logo" />
+                    <div class="brand-main">EVA AI</div>
                 </div>
+                <div class="brand-sub">Smart Image Search and Understanding | version: {app_version}</div>
             </div>
             <div class="header-actions">
                 <div class="settings-icon" id="authTokenBtn" title="Set admin token">
@@ -4435,6 +4443,7 @@ def home():
         let luxriotSummaryRefreshInFlight = false;
         let luxriotSummaryRefreshQueued = null;
         let luxriotStreamsCache = [];
+        const luxriotChannelNameById = {};
         let luxriotInitialized = false;
         const probeHitsCacheByKey = {};
         const probeHitsOffsetByKey = {};
@@ -5127,6 +5136,19 @@ def home():
             }
         }
 
+        function normalizeLuxriotChannelName(channel, channelId) {
+            const raw = String(
+                channel?.title
+                || channel?.name
+                || channel?.channel_name
+                || channel?.label
+                || ''
+            ).trim();
+            if (raw) return raw;
+            if (Number.isFinite(channelId)) return `Channel #${channelId}`;
+            return 'Unknown channel';
+        }
+
         async function fetchLuxriotChannels(force = false) {
             if (!luxriotChannelSelect) return;
             luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
@@ -5137,6 +5159,7 @@ def home():
                     throw new Error(data.error);
                 }
                 const channels = data.channels || [];
+                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
                 if (!channels.length) {
                     luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
                     if (luxriotSummaryChannelSelect) {
@@ -5145,15 +5168,23 @@ def home():
                     setLuxriotStatus('No channels available', true);
                     return;
                 }
-                const options = channels.map((ch) => {
-                    const id = ch.id;
-                    const label = ch.title || `Channel ${id}`;
-                    const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
-                    return `<option value="${id}" ${selected}>${label} (#${id})</option>`;
-                });
+                const options = channels
+                    .map((ch) => {
+                        const rawId = ch.id ?? ch.channel_id;
+                        const id = parseInt(String(rawId || ''), 10);
+                        if (!Number.isFinite(id)) return '';
+                        const label = normalizeLuxriotChannelName(ch, id);
+                        luxriotChannelNameById[String(id)] = label;
+                        const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
+                        return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
+                    })
+                    .filter((item) => Boolean(item));
                 luxriotChannelSelect.innerHTML = options.join('');
-                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
-                    luxriotActiveChannel = channels[0].id;
+                const channelIds = channels
+                    .map((ch) => parseInt(String(ch.id ?? ch.channel_id ?? ''), 10))
+                    .filter((id) => Number.isFinite(id));
+                if (!channelIds.some((id) => String(id) === String(luxriotActiveChannel))) {
+                    luxriotActiveChannel = channelIds[0] || luxriotDefaults.channelId;
                     luxriotChannelSelect.value = luxriotActiveChannel;
                 }
                 if (!Number.isFinite(luxriotSummaryChannel)) {
@@ -5162,6 +5193,7 @@ def home():
                 syncLuxriotSummaryChannelSelect();
                 setLuxriotStatus(`Loaded ${channels.length} channels`);
             } catch (err) {
+                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
                 luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
                 if (luxriotSummaryChannelSelect) {
                     luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
@@ -5172,6 +5204,8 @@ def home():
 
         function getLuxriotChannelLabel(channelId) {
             if (!Number.isFinite(channelId)) return 'Unknown channel';
+            const known = luxriotChannelNameById[String(channelId)];
+            if (known) return known;
             if (!luxriotChannelSelect) return `Channel #${channelId}`;
             const options = Array.from(luxriotChannelSelect.options || []);
             const match = options.find((opt) => parseInt(opt.value || '', 10) === channelId);
@@ -6388,7 +6422,10 @@ def home():
 
             if (result && result.is_detection) {
                 const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
-                const channel = result.channel_id !== undefined && result.channel_id !== null ? String(result.channel_id) : 'n/a';
+                const channelId = parseInt(String(result.channel_id ?? ''), 10);
+                const channelName = Number.isFinite(channelId) ? getLuxriotChannelLabel(channelId) : (
+                    String(result.channel_name || result.channel_title || '').trim() || 'n/a'
+                );
                 const sev = result.severity ? escapeHtml(String(result.severity)) : 'n/a';
                 const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
                 const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
@@ -6399,15 +6436,15 @@ def home():
                 const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
                 const lines = [
                     `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
-                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channel)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
+                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channelName)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
                     `<div class="metric-line"><span class="metric-label">Probe P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
                 ];
                 if (similarity) {
                     const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
-                    lines.push(`<div class="metric-line"><span class="metric-label">Search:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
+                    lines.push(`<div class="metric-line"><span class="metric-label">Match:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
                 }
                 if (clipSearch || dinoSearch) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">Search C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
+                    lines.push(`<div class="metric-line"><span class="metric-label">Match C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
                 }
                 return lines.join('');
             }
@@ -6527,9 +6564,11 @@ def home():
                 const channels = Array.isArray(data.channels) ? data.channels : [];
                 const options = [{ value: '', label: 'All streams' }];
                 channels.forEach((channel) => {
-                    const id = channel.channel_id ?? channel.id;
-                    if (id === undefined || id === null) return;
-                    const label = channel.name ? `${id} · ${channel.name}` : String(id);
+                    const rawId = channel.channel_id ?? channel.id;
+                    const id = parseInt(String(rawId || ''), 10);
+                    if (!Number.isFinite(id)) return;
+                    const label = normalizeLuxriotChannelName(channel, id);
+                    luxriotChannelNameById[String(id)] = label;
                     options.push({ value: String(id), label });
                 });
                 applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
@@ -9843,6 +9882,7 @@ def home():
     response_html = response_html.replace('{segments_enabled_checked}', segments_enabled_checked)
     response_html = response_html.replace('{segment_min_patches_default}', str(segment_min_patches_default))
     response_html = response_html.replace('{timestamp}', current_timestamp)
+    response_html = response_html.replace('{app_version}', html_lib.escape(str(config.APP_VERSION or ''), quote=False))
     response_html = response_html.replace('{lm_model}', html_lib.escape(str(config.LM_MODEL or ''), quote=True))
     response_html = response_html.replace(
         '{luxriot_system_prompt_default}',
@@ -9869,6 +9909,15 @@ def favicon():
     icon_path = Path(__file__).resolve().parent / 'images' / 'favicon.ico'
     if icon_path.exists():
         return send_file(icon_path, mimetype='image/x-icon', max_age=86400)
+    return ('', 204)
+
+
+@app.route('/branding/logo')
+def branding_logo():
+    """Serve application branding logo."""
+    logo_path = Path(__file__).resolve().parent / 'images' / 'lxrt-logo-darktheme.png'
+    if logo_path.exists():
+        return send_file(logo_path, mimetype='image/png', max_age=86400)
     return ('', 204)
 
 
@@ -13939,6 +13988,7 @@ def get_settings():
             'host': config.HOST,
             'port': config.PORT,
             'debug': config.DEBUG,
+            'appVersion': config.APP_VERSION,
             'embedder': requested_embedder,
             'clipModel': config.CLIP_MODEL,
             'dinoModel': config.DINO_MODEL,
@@ -14119,6 +14169,7 @@ def save_settings():
 EVOSSEARCH_HOST={data['host']}
 EVOSSEARCH_PORT={port}
 EVOSSEARCH_DEBUG={str(debug_enabled).lower()}
+EVOSSEARCH_APP_VERSION="{config.APP_VERSION}"
 
 # Embedder configuration
 EVOSSEARCH_EMBEDDER={embedder}
