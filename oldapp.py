@@ -3508,11 +3508,15 @@ def home():
             text-align: center;
         }
 
-        .probe-add-row {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-            margin-top: 0.25rem;
+        .probe-pair-add-row .probe-add-pair-btn {
+            justify-self: start;
+            min-width: 112px;
+        }
+
+        .probe-pair-add-row .probe-add-empty {
+            color: #6f6f6f;
+            font-size: 0.83rem;
+            letter-spacing: 0.01em;
         }
 
         .probe-meta {
@@ -3528,7 +3532,7 @@ def home():
             display: grid;
             grid-template-columns: 65% 35%;
             gap: 0.75rem;
-            align-items: center;
+            align-items: stretch;
         }
 
         .image-probe-panel.no-image {
@@ -3545,27 +3549,50 @@ def home():
             gap: 0.5rem;
         }
 
+        .image-probe-title {
+            color: #d7e6da;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+
         .image-probe-row {
             display: flex;
             align-items: center;
             gap: 0.5rem;
         }
 
-        .image-probe-row .file-upload {
-            width: 100%;
+        .image-probe-top-row {
+            justify-content: space-between;
+            gap: 0.75rem;
+            flex-wrap: wrap;
         }
 
-        .image-probe-pos {
+        .image-probe-row .file-upload {
+            flex: 1;
+        }
+
+        .image-probe-enable-check {
+            min-width: 96px;
+            justify-content: flex-end;
+        }
+
+        .image-probe-threshold-row {
+            justify-content: flex-end;
+        }
+
+        .image-probe-min-wrap {
             display: flex;
             align-items: center;
             gap: 0.4rem;
         }
 
-        .image-probe-actions {
-            display: flex;
-            gap: 0.6rem;
-            align-items: center;
-            flex-wrap: wrap;
+        .image-probe-status {
+            color: #94b39b;
+            text-align: center;
+            font-size: 0.86rem;
+            letter-spacing: 0.01em;
+            border-top: 1px solid rgba(61, 94, 69, 0.35);
+            padding-top: 0.4rem;
         }
 
         .probe-preview {
@@ -4183,28 +4210,27 @@ def home():
                                 <div class="probe-pairs-spacer">&nbsp;</div>
                             </div>
                         </div>
-                        <div class="probe-add-row">
-                            <span class="probe-pair-idx">+</span>
-                            <button id="probeAddPair" class="feature-btn">Add pair</button>
-                        </div>
                         <div class="image-probe-panel no-image">
                             <div class="image-probe-left">
-                                <div class="section-help">Optional: provide a reference image for CLIP-based probe matching.</div>
-                                <div class="image-probe-row">
+                                <div class="image-probe-title">Image Probe Settings:</div>
+                                <div class="image-probe-row image-probe-top-row">
                                     <div class="file-upload inline">
                                         <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
                                         <label for="probeImageFile" class="feature-btn file-upload-btn btn-md">Choose Image</label>
                                         <span id="probeImageFileName" class="file-upload-name">No file selected</span>
                                     </div>
+                                    <label class="inline-check image-probe-enable-check">
+                                        <input type="checkbox" id="probeImageEnableToggle">
+                                        Enabled
+                                    </label>
                                 </div>
-                                <div class="image-probe-pos">
-                                    <label>Image Pos:</label>
-                                    <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                <div class="image-probe-row image-probe-threshold-row">
+                                    <div class="image-probe-min-wrap">
+                                        <label>Minimal match:</label>
+                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                    </div>
                                 </div>
-                                <div class="image-probe-actions">
-                                    <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
-                                    <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
-                                </div>
+                                <div class="image-probe-status" id="probeImageStatus">Probe status: Disabled; Image: Missing.</div>
                             </div>
                             <div class="probe-preview compact">
                                 <img id="probeImageThumb" src="" alt="" />
@@ -4522,10 +4548,9 @@ def home():
         const probeRoiClearBtn = document.getElementById('probeRoiClear');
         const probeRoiInfo = document.getElementById('probeRoiInfo');
         const probePairsContainer = document.getElementById('probePairs');
-        const probeAddPairBtn = document.getElementById('probeAddPair');
         const probeImageFile = document.getElementById('probeImageFile');
         const probeImageFileName = document.getElementById('probeImageFileName');
-        const probeImageEnableBtn = document.getElementById('probeImageEnable');
+        const probeImageEnableToggle = document.getElementById('probeImageEnableToggle');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
         const probeImageOverlay = document.getElementById('probeImageOverlay');
@@ -7964,7 +7989,6 @@ def home():
                 probePairsState = [
                     { pos: '', neg: '' },
                     { pos: '', neg: '' },
-                    { pos: '', neg: '' },
                 ];
             }
         }
@@ -7992,6 +8016,12 @@ def home():
                     <div class="probe-pairs-spacer">&nbsp;</div>
                 </div>
                 ${rows}
+                <div class="probe-pair-row probe-pair-add-row">
+                    <div class="probe-pair-idx">${probePairsState.length + 1}.</div>
+                    <button type="button" class="feature-btn probe-add-pair-btn" data-add-pair="1">Add pair</button>
+                    <div class="probe-add-empty"></div>
+                    <div class="probe-pairs-spacer">&nbsp;</div>
+                </div>
             `;
         }
 
@@ -8056,12 +8086,15 @@ def home():
         }
 
         function updateImageProbeStatus(enabled) {
-            imageProbeEnabled = enabled && Boolean(probeImageState?.data);
-            if (probeImageEnableBtn) {
-                probeImageEnableBtn.textContent = imageProbeEnabled ? 'Disable Image Probe' : 'Enable Image Probe';
+            const hasImage = Boolean(probeImageState?.data);
+            imageProbeEnabled = Boolean(enabled && hasImage);
+            if (probeImageEnableToggle) {
+                probeImageEnableToggle.checked = imageProbeEnabled;
+                probeImageEnableToggle.disabled = !hasImage;
             }
             if (probeImageStatus) {
-                probeImageStatus.textContent = `Status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}`;
+                const imageState = hasImage ? 'Ok' : 'Missing';
+                probeImageStatus.textContent = `Probe status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}; Image: ${imageState}.`;
             }
         }
 
@@ -8772,11 +8805,7 @@ def home():
                 reader.readAsDataURL(file);
             });
         }
-        if (probeAddPairBtn && probePairsContainer) {
-            probeAddPairBtn.addEventListener('click', () => {
-                probePairsState.push({ pos: '', neg: '' });
-                renderPairs();
-            });
+        if (probePairsContainer) {
             probePairsContainer.addEventListener('input', (e) => {
                 const target = e.target;
                 const idx = parseInt(target.getAttribute('data-idx') || '-1', 10);
@@ -8788,6 +8817,12 @@ def home():
                 }
             });
             probePairsContainer.addEventListener('click', (e) => {
+                const addBtn = e.target.closest('button[data-add-pair]');
+                if (addBtn) {
+                    probePairsState.push({ pos: '', neg: '' });
+                    renderPairs();
+                    return;
+                }
                 const btn = e.target.closest('button[data-remove]');
                 if (!btn) return;
                 const idx = parseInt(btn.getAttribute('data-remove') || '-1', 10);
@@ -8832,13 +8867,14 @@ def home():
                 }
             });
         }
-        if (probeImageEnableBtn) {
-            probeImageEnableBtn.addEventListener('click', () => {
+        if (probeImageEnableToggle) {
+            probeImageEnableToggle.addEventListener('change', () => {
                 if (!probeImageState?.data) {
+                    updateImageProbeStatus(false);
                     setProbeStatus('Select an image first.', true);
                     return;
                 }
-                updateImageProbeStatus(!imageProbeEnabled);
+                updateImageProbeStatus(Boolean(probeImageEnableToggle.checked));
             });
         }
         if (probeBenchBtn && probeBenchOutput) {
