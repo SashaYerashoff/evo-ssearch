@@ -1395,6 +1395,10 @@ def home():
             transform: none;
         }
 
+        .feature-btn.auto-hide-disabled:disabled {
+            display: none;
+        }
+
         button.is-loading,
         .feature-btn.is-loading,
         .settings-btn.is-loading,
@@ -2866,7 +2870,7 @@ def home():
         }
 
         .luxriot-mini-input {
-            min-width: 120px;
+            min-width: 70px;
         }
 
         /* Probes */
@@ -3492,8 +3496,16 @@ def home():
             grid-template-columns: 40px 1fr 1fr 60px;
             gap: 0.35rem;
             align-items: center;
-            color: #bdbdbd;
-            font-weight: 600;
+            color: #919991;
+            font-size: 0.8rem;
+            font-weight: 500;
+            letter-spacing: 0.01em;
+        }
+
+        #probePairRows {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
 
         .probe-pair-row {
@@ -3522,9 +3534,47 @@ def home():
         .probe-pairs-threshold-row {
             display: flex;
             align-items: center;
-            gap: 0.75rem;
+            justify-content: space-between;
+            gap: 0.9rem;
             flex-wrap: wrap;
-            padding-bottom: 0.15rem;
+            padding-bottom: 0.35rem;
+        }
+
+        .probe-pairs-threshold-title {
+            color: #bdbdbd;
+            font-size: 0.9rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+
+        .probe-panel-heading-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            border-bottom: 1px solid rgba(63, 96, 74, 0.5);
+            padding-bottom: 6px;
+        }
+
+        .probe-panel-heading {
+            margin: 0;
+            color: #d7e6da;
+            font-size: 1rem;
+            font-weight: 700;
+            line-height: 1.2;
+            letter-spacing: 0.015em;
+        }
+
+        .probe-pairs-threshold-controls {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-left: auto;
+        }
+
+        .probe-threshold-input {
+            min-width: 70px;
+            max-width: 70px;
         }
 
         .probe-meta {
@@ -3558,9 +3608,9 @@ def home():
         }
 
         .image-probe-title {
-            color: #d7e6da;
-            font-weight: 600;
-            letter-spacing: 0.01em;
+            color: inherit;
+            font-weight: inherit;
+            letter-spacing: inherit;
         }
 
         .image-probe-row {
@@ -4161,8 +4211,8 @@ def home():
             <div class="probe-editor-modal-body">
                 <div class="probe-editor-layout">
                     <div class="monitor-panel">
-                        <div class="probe-header split">
-                            <h4>Live stream</h4>
+                        <div class="probe-header split probe-panel-heading-row">
+                            <h4 class="probe-panel-heading">Live stream</h4>
                             <span id="probeStatus" class="luxriot-status">Idle</span>
                         </div>
                         <div class="probe-row">
@@ -4211,9 +4261,12 @@ def home():
                             </div>
                         </div>
                         <div class="probe-pairs" id="probePairs">
-                            <div class="probe-row probe-threshold-row probe-pairs-threshold-row">
-                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
-                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
+                            <div class="probe-row probe-threshold-row probe-pairs-threshold-row probe-panel-heading-row">
+                                <div class="probe-pairs-threshold-title probe-panel-heading">Text Probe Settings:</div>
+                                <div class="probe-pairs-threshold-controls">
+                                    <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.2" /></div>
+                                    <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.05" /></div>
+                                </div>
                             </div>
                             <div class="probe-pairs-header">
                                 <div></div>
@@ -4225,7 +4278,9 @@ def home():
                         </div>
                         <div class="image-probe-panel no-image">
                             <div class="image-probe-left">
-                                <div class="image-probe-title">Image Probe Settings:</div>
+                                <div class="probe-panel-heading-row">
+                                    <div class="image-probe-title probe-panel-heading">Image Probe Settings:</div>
+                                </div>
                                 <div class="image-probe-row image-probe-top-row">
                                     <div class="file-upload inline">
                                         <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
@@ -4237,8 +4292,8 @@ def home():
                                         Enabled
                                     </label>
                                 </div>
-                                <div class="image-probe-row image-probe-clear-row">
-                                    <button type="button" id="probeImageClear" class="feature-btn">Clear image</button>
+                                <div class="image-probe-row image-probe-clear-row is-hidden">
+                                    <button type="button" id="probeImageClear" class="feature-btn auto-hide-disabled">Clear image</button>
                                 </div>
                                 <div class="image-probe-row image-probe-threshold-row">
                                     <div class="image-probe-min-wrap">
@@ -4568,6 +4623,7 @@ def home():
         const probeImageFile = document.getElementById('probeImageFile');
         const probeImageFileName = document.getElementById('probeImageFileName');
         const probeImageClearBtn = document.getElementById('probeImageClear');
+        const probeImageClearRow = probeImageClearBtn ? probeImageClearBtn.closest('.image-probe-clear-row') : null;
         const probeImageEnableToggle = document.getElementById('probeImageEnableToggle');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
@@ -8113,6 +8169,9 @@ def home():
             }
             if (probeImageClearBtn) {
                 probeImageClearBtn.disabled = !hasImage;
+            }
+            if (probeImageClearRow) {
+                probeImageClearRow.classList.toggle('is-hidden', !hasImage);
             }
             if (probeImageStatus) {
                 const imageState = hasImage ? 'Ok' : 'Missing';
