@@ -3219,6 +3219,30 @@ def home():
             flex-wrap: wrap;
         }
 
+        .monitor-probe-form {
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+
+        .probe-name-row .input-text {
+            flex: 1 1 320px;
+            min-width: 220px;
+        }
+
+        .probe-bookmark-row {
+            align-items: center;
+        }
+
+        .probe-threshold-row {
+            align-items: center;
+        }
+
+        .probe-stream-actions {
+            gap: 0.55rem;
+            align-items: center;
+        }
+
         .monitor-probe-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -4112,49 +4136,43 @@ def home():
                             <div id="probeRoiLayer" class="probe-roi-layer" aria-label="Draw probe ROI"></div>
                             <div id="probeRoiBox" class="probe-roi-box"></div>
                         </div>
-                        <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                        <div class="probe-meta" id="probeCaptureStatus">Stream: idle | Capture: idle</div>
                         <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
-                        <div class="probe-meta" id="probeStreamState"></div>
-                        <div class="probe-row">
-                            <label>FPS:</label>
-                            <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
-                            <label>Buffer (sec):</label>
-                            <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
-                        </div>
-                        <div class="probe-row">
-                            <label>ROI:</label>
+                        <input type="hidden" id="probeFps" value="0" />
+                        <input type="hidden" id="probeWindowSec" value="300" />
+                        <div class="probe-row probe-stream-actions">
                             <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
                             <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
-                            <span id="probeRoiInfo" class="probe-meta-inline">Full frame matching</span>
+                            <button id="probeStreamToggle" type="button" class="feature-btn primary">Start Stream</button>
                         </div>
-                        <div class="monitor-btn-row">
-                            <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
-                            <button id="probeStopCapture" class="feature-btn">Pause</button>
-                            <button id="probeStopAll" class="feature-btn">Stop</button>
-                        </div>
+                        <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
                     </div>
                     <div class="probe-editor-settings">
-                        <div class="monitor-probe-header">
-                            <label>Probe name:</label>
-                            <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
-                            <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
-                            <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
-                            <label class="inline-check">
-                                <input type="checkbox" id="probeEnableToggle" checked>
-                                Enable probe
-                            </label>
-                        </div>
-                        <div class="probe-row spread">
-                            <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
-                            <div class="probe-severity-wrap">
-                                <label>Severity:</label>
-                                <select id="probeBookmarkSeverity" class="luxriot-mini-input">
-                                    <option value="info">info</option>
-                                    <option value="low">low</option>
-                                    <option value="normal">normal</option>
-                                    <option value="high">high</option>
-                                    <option value="critical" selected>critical</option>
-                                </select>
+                        <div class="monitor-probe-form">
+                            <div class="probe-row probe-name-row">
+                                <label>Probe name:</label>
+                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+                                <label class="inline-check">
+                                    <input type="checkbox" id="probeEnableToggle" checked>
+                                    Enabled
+                                </label>
+                            </div>
+                            <div class="probe-row probe-bookmark-row">
+                                <label class="inline-check"><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
+                                <div class="probe-severity-wrap">
+                                    <label>Severity:</label>
+                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                                        <option value="info" selected>info</option>
+                                        <option value="low">low</option>
+                                        <option value="normal">normal</option>
+                                        <option value="high">high</option>
+                                        <option value="critical">critical</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="probe-row probe-threshold-row">
+                                <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
+                                <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
                             </div>
                         </div>
                         <div class="probe-pairs" id="probePairs">
@@ -4487,9 +4505,9 @@ def home():
         const probeStatus = document.getElementById('probeStatus');
         const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
         const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
-        const probeStartCaptureBtn = document.getElementById('probeStartCapture');
-        const probeStopCaptureBtn = document.getElementById('probeStopCapture');
-        const probeStopAllBtn = document.getElementById('probeStopAll');
+        const probeFpsInput = document.getElementById('probeFps');
+        const probeWindowSecInput = document.getElementById('probeWindowSec');
+        const probeStreamToggleBtn = document.getElementById('probeStreamToggle');
         const probeCaptureStatus = document.getElementById('probeCaptureStatus');
         const probeHitsMeta = document.getElementById('probeHitsMeta');
         const probeCards = document.getElementById('probeCards');
@@ -4530,7 +4548,6 @@ def home():
         const archiveDetectionsNextBtn = document.getElementById('archiveDetectionsNext');
         const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
-        const probeStreamState = document.getElementById('probeStreamState');
         const probeEnableToggle = document.getElementById('probeEnableToggle');
         const probeBenchBtn = document.getElementById('probeBenchBtn');
         const probeBenchOutput = document.getElementById('probeBenchOutput');
@@ -4727,7 +4744,7 @@ def home():
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
                 syncProbeChannelSelect();
-                startProbePreview(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10));
+                startProbePreview(getSelectedProbeChannelId());
                 refreshProbeStatus();
                 loadProbeList();
                 startProbeStatusPoll();
@@ -5815,6 +5832,7 @@ def home():
                     probeCaptureState[channelId] = true;
                 }
             });
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
             if (rerender) {
                 renderProbeCards();
             }
@@ -7646,6 +7664,48 @@ def home():
             probeStatus.classList.toggle('error', Boolean(isError));
         }
 
+        function getSelectedProbeChannelId() {
+            const parsed = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            return Number.isFinite(parsed) ? parsed : luxriotActiveChannel;
+        }
+
+        function getProbeRuntimeState(channelId) {
+            const state = probeChannelRuntime[channelId];
+            if (state === 'running' || state === 'paused' || state === 'idle') {
+                return state;
+            }
+            return 'idle';
+        }
+
+        function updateProbeStreamToggleButton(channelIdOverride = null) {
+            if (!probeStreamToggleBtn) return;
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
+            const runtimeState = getProbeRuntimeState(channelId);
+            const running = runtimeState === 'running';
+            probeStreamToggleBtn.textContent = running ? 'Stop Stream' : 'Start Stream';
+            probeStreamToggleBtn.classList.toggle('primary', !running);
+        }
+
+        function updateProbeCaptureMeta(channelId, statusData = null) {
+            const runtimeState = getProbeRuntimeState(channelId);
+            const streamLabel = runtimeState === 'running' ? 'ok' : (runtimeState === 'paused' ? 'paused' : 'idle');
+            let captureLabel = 'idle';
+            const frameCount = Number(statusData?.frames);
+            if (runtimeState === 'running') {
+                captureLabel = Number.isFinite(frameCount) && frameCount > 0 ? 'ok' : 'warming';
+            } else if (runtimeState === 'paused') {
+                captureLabel = 'paused';
+            }
+            if (probeCaptureStatus) {
+                probeCaptureStatus.textContent = `Stream: ${streamLabel} | Capture: ${captureLabel}`;
+            }
+            if (probeBufferInfo && statusData) {
+                const lastTs = statusData.last_timestamp_ms ? new Date(statusData.last_timestamp_ms).toLocaleString() : 'n/a';
+                probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
+            }
+            updateProbeStreamToggleButton(channelId);
+        }
+
         function normalizeProbeRoiNorm(raw) {
             if (!raw || typeof raw !== 'object') return null;
             const x = Number.parseFloat(raw.x);
@@ -7885,7 +7945,6 @@ def home():
                 setPreviewState('No channel', true);
                 return;
             }
-            if (probeStreamState) probeStreamState.textContent = `Streaming channel ${channelId}`;
             const refresh = () => {
                 if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
                 probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
@@ -8016,7 +8075,7 @@ def home():
                 if (row.pos?.trim()) positives.push(row.pos.trim());
                 if (row.neg?.trim()) negatives.push(row.neg.trim());
             });
-            const channelId = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            const channelId = getSelectedProbeChannelId();
             return {
                 id: activeProbeId,
                 name: (probeNameInput?.value || '').trim(),
@@ -8027,9 +8086,9 @@ def home():
                 pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
                 margin: parseFloat(probeMarginInput?.value) || 0.05,
                 top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
-                window_sec: parseFloat(probeWindowSec?.value) || 300,
-                fps: parseFloat(probeFps?.value) || 0,
-                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
+                window_sec: parseFloat(probeWindowSecInput?.value) || 300,
+                fps: parseFloat(probeFpsInput?.value) || 0,
+                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'info',
                 bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
                 enabled: probeEnableToggle ? probeEnableToggle.checked : true,
                 image_probe: {
@@ -8218,9 +8277,9 @@ def home():
             }
             if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
-            if (probeFps) probeFps.value = probe?.fps ?? 0;
-            if (probeWindowSec) probeWindowSec.value = probe?.window_sec ?? 300;
-            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
+            if (probeFpsInput) probeFpsInput.value = probe?.fps ?? 0;
+            if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
             if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
             if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
             probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
@@ -8253,6 +8312,7 @@ def home():
                 probe?.window_sec ?? null,
                 { key, replace: true, resetOffset: true }
             );
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
             renderProbeCards();
             setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
         }
@@ -8320,15 +8380,18 @@ def home():
             const runtimeState = probeChannelRuntime[channelId];
             if (runtimeState === 'running') {
                 probeCaptureState[channelId] = true;
-                if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                updateProbeCaptureMeta(channelId);
                 setPreviewState('');
                 startProbePreview(channelId);
+                if (!quiet) {
+                    await refreshProbeStatus(channelId);
+                }
                 return;
             }
             try {
                 channelCaptureConfig[channelId] = {
-                    fps: parseFloat(probeFps?.value) || 0,
-                    windowSec: parseFloat(probeWindowSec?.value) || 300,
+                    fps: parseFloat(probeFpsInput?.value) || 0,
+                    windowSec: parseFloat(probeWindowSecInput?.value) || 300,
                 };
                 const resp = await fetch('/probes/start_capture', {
                     method: 'POST',
@@ -8344,12 +8407,16 @@ def home():
                 probeCaptureState[channelId] = true;
                 probeChannelRuntime[channelId] = 'running';
                 renderProbeCards();
-                if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                updateProbeCaptureMeta(channelId);
                 setPreviewState('');
                 startProbePreview(channelId);
+                if (!quiet) {
+                    await refreshProbeStatus(channelId);
+                }
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
                 if (!quiet) setProbeStatus(err.message, true);
+                updateProbeStreamToggleButton(channelId);
             }
         }
 
@@ -8370,22 +8437,23 @@ def home():
                 if (reason === 'paused') {
                     probeChannelRuntime[channelId] = 'paused';
                     setPreviewState('Paused');
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
                 } else {
                     probeChannelRuntime[channelId] = 'idle';
                     setPreviewState('Stopped', true);
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
                 }
                 renderProbeCards();
                 if (reason !== 'paused') stopProbePreview();
+                updateProbeCaptureMeta(channelId);
+                await refreshProbeStatus(channelId);
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
                 setProbeStatus(err.message, true);
+                updateProbeStreamToggleButton(channelId);
             }
         }
 
         async function refreshProbeStatus(channelIdOverride) {
-            const channelId = channelIdOverride || parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            const channelId = channelIdOverride || getSelectedProbeChannelId();
             try {
                 const resp = await fetch(`/probes/status?channel_id=${channelId}`);
                 const data = await resp.json();
@@ -8397,17 +8465,7 @@ def home():
                     ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
                     : 'n/a';
                 setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
-                if (probeCaptureStatus) {
-                    probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
-                }
-                if (probeBufferInfo) {
-                    const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
-                    probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
-                }
-                if (probeStreamState) {
-                    const pill = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
-                    probeStreamState.textContent = pill;
-                }
+                updateProbeCaptureMeta(channelId, data);
             } catch (err) {
                 setProbeStatus('Status error: ' + err.message, true);
             }
@@ -8495,7 +8553,7 @@ def home():
             stopProbeRunLoop();
             updateRunButton(true);
             runActiveProbe(quiet);
-            const windowSec = parseFloat(probeWindowSec?.value) || 30;
+            const windowSec = parseFloat(probeWindowSecInput?.value) || 30;
             const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
             probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
             persistProbeEnabled(true);
@@ -8540,6 +8598,25 @@ def home():
             }
         }
 
+        function resetProbeDraftEditor() {
+            activeProbeId = null;
+            probePairsState = [];
+            probeImageState = null;
+            clearProbeRoi(false);
+            applyImageThumb('');
+            renderPairs();
+            renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+            if (probeNameInput) probeNameInput.value = '';
+            if (probeEnableToggle) probeEnableToggle.checked = true;
+            if (probeBookmarkToggle) probeBookmarkToggle.checked = true;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
+            if (probePosFloorInput) probePosFloorInput.value = '0.2';
+            if (probeMarginInput) probeMarginInput.value = '0.05';
+            if (probeFpsInput) probeFpsInput.value = '0';
+            if (probeWindowSecInput) probeWindowSecInput.value = '300';
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
+        }
+
         function handleProbeCardClick(event) {
             const btn = event.target.closest('button[data-action]');
             if (!btn) return;
@@ -8566,14 +8643,7 @@ def home():
                 persistProbeEnabled(false);
                 stopProbeRunLoop();
             } else if (action === 'new') {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                clearProbeRoi(false);
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
-                if (probeEnableToggle) probeEnableToggle.checked = true;
+                resetProbeDraftEditor();
                 setProbeStatus('New probe');
                 if (probeEditorModal) {
                     probeEditorModal.style.display = 'block';
@@ -8606,32 +8676,27 @@ def home():
         if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
             if (activeProbeId) deleteProbe(activeProbeId);
             else {
-                probePairsState = [];
-                probeImageState = null;
-                clearProbeRoi(false);
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+                resetProbeDraftEditor();
                 setProbeStatus('Cleared unsaved probe');
             }
         });
-        if (probeStartCaptureBtn) {
-            probeStartCaptureBtn.addEventListener('click', () => ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10)));
-        }
-        if (probeStopCaptureBtn) {
-            probeStopCaptureBtn.addEventListener('click', () => stopProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), 'paused'));
-        }
-        if (probeStopAllBtn) {
-            probeStopAllBtn.addEventListener('click', () => {
-                Object.keys(probeCaptureState).forEach((cid) => stopProbeCapture(parseInt(cid, 10), 'stopped'));
-                stopProbeRunLoop();
+        if (probeStreamToggleBtn) {
+            probeStreamToggleBtn.addEventListener('click', () => {
+                const channelId = getSelectedProbeChannelId();
+                const runtimeState = getProbeRuntimeState(channelId);
+                if (runtimeState === 'running') {
+                    stopProbeCapture(channelId, 'stopped');
+                } else {
+                    ensureProbeCapture(channelId);
+                }
             });
         }
         if (probeChannelSelect) {
             probeChannelSelect.addEventListener('change', () => {
-                const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
+                const cid = getSelectedProbeChannelId();
                 startProbePreview(cid);
-                renderProbeRoiBox();
+                updateProbeCaptureMeta(cid);
+                refreshProbeStatus(cid);
             });
         }
         if (probeRoiToggleBtn) {
@@ -8671,15 +8736,8 @@ def home():
         }
         if (probeNewBtn) {
             probeNewBtn.addEventListener('click', () => {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                clearProbeRoi(false);
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+                resetProbeDraftEditor();
                 setProbeStatus('New probe');
-                if (probeEnableToggle) probeEnableToggle.checked = true;
                 if (probeEditorModal) {
                     probeEditorModal.style.display = 'block';
                 }
@@ -8767,7 +8825,7 @@ def home():
                 const enabled = e.target.checked;
                 persistProbeEnabled(enabled);
                 if (enabled) {
-                    ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), true);
+                    ensureProbeCapture(getSelectedProbeChannelId(), true);
                     runActiveProbe(true);
                 } else {
                     stopProbeRunLoop('Probe disabled');
