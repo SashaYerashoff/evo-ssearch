@@ -243,8 +243,42 @@ class Config:
     LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
-            "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+            "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
+            "Return Markdown using exactly these sections:\n"
+            "### Window snapshot\n"
+            "### Scene baseline\n"
+            "### Key changes\n"
+            "### Alerts/signals\n"
+            "### Operator notes\n"
+            "Rules: keep factual language; deduplicate repeated observations; include timestamps when available; "
+            "avoid phrases like 'L1 rollup from L0'."
+        ),
+    ).strip()
+    LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT',
+        (
+            "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
+            "Return Markdown using exactly these sections:\n"
+            "### Window snapshot\n"
+            "### Routine baseline\n"
+            "### Significant changes\n"
+            "### Alerts/signals\n"
+            "### Operator notes\n"
+            "Rules: preserve meaningful deviations from routine; avoid repeating unchanged background details; "
+            "keep concise, operator-facing language."
+        ),
+    ).strip()
+    LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT',
+        (
+            "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
+            "Return Markdown using exactly these sections:\n"
+            "### Window snapshot\n"
+            "### Persistent patterns\n"
+            "### Notable events\n"
+            "### Risks and follow-ups\n"
+            "### Operator notes\n"
+            "Rules: emphasize trend shifts and durable signals; remove duplicate wording; focus on actionable context."
         ),
     ).strip()
     LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'

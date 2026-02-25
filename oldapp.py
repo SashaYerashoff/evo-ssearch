@@ -11490,6 +11490,10 @@ LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
     "  ]\n"
     "}"
 )
+LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT = (
+    "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
+    "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+)
 LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
     "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
     "- If no trigger match: emit no JSON block.\n"
@@ -11547,6 +11551,27 @@ try:
         if str(luxriot_manager.default_json_alert_prompt or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
             luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
             changed_prompt_defaults = True
+        desired_rollup_prompts = {
+            'L1': str(getattr(config, 'LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT', '') or '').strip(),
+            'L2': str(getattr(config, 'LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT', '') or '').strip(),
+            'L3': str(getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', '') or '').strip(),
+        }
+        legacy_rollup_prompt = LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT.strip()
+        if (
+            not str(luxriot_manager.rollup_llm_system_prompt or '').strip()
+            or str(luxriot_manager.rollup_llm_system_prompt or '').strip() == legacy_rollup_prompt
+        ):
+            base_rollup_prompt = str(getattr(config, 'LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT', '') or '').strip()
+            if not base_rollup_prompt:
+                base_rollup_prompt = desired_rollup_prompts.get('L1') or legacy_rollup_prompt
+            luxriot_manager.rollup_llm_system_prompt = base_rollup_prompt
+            changed_prompt_defaults = True
+        for level in ('L1', 'L2', 'L3'):
+            current_level_prompt = str(luxriot_manager.rollup_llm_system_prompts.get(level) or '').strip()
+            default_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompt
+            if not current_level_prompt or current_level_prompt == legacy_rollup_prompt:
+                luxriot_manager.rollup_llm_system_prompts[level] = default_level_prompt
+                changed_prompt_defaults = True
         for channel_id, raw_overrides in list(luxriot_manager.channel_prompt_overrides.items()):
             if not isinstance(raw_overrides, Mapping):
                 continue
@@ -11555,6 +11580,20 @@ try:
             if str(channel_overrides.get('json_alert_prompt') or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
                 channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
                 channel_changed = True
+            rollup_overrides_raw = channel_overrides.get('rollup_prompts')
+            if isinstance(rollup_overrides_raw, Mapping):
+                rollup_overrides = dict(rollup_overrides_raw)
+                rollup_changed = False
+                for level in ('L1', 'L2', 'L3'):
+                    raw_level_prompt = str(rollup_overrides.get(level) or '').strip()
+                    if (not raw_level_prompt) or raw_level_prompt == legacy_rollup_prompt:
+                        fallback_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompts.get(level, '')
+                        if fallback_level_prompt:
+                            rollup_overrides[level] = fallback_level_prompt
+                            rollup_changed = True
+                if rollup_changed:
+                    channel_overrides['rollup_prompts'] = rollup_overrides
+                    channel_changed = True
             if channel_changed:
                 luxriot_manager.channel_prompt_overrides[int(channel_id)] = channel_overrides
                 changed_prompt_defaults = True

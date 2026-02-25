@@ -507,8 +507,8 @@ class LuxriotManager:
             or None
         )
         default_rollup_system_prompt = (
-            "You are a CCTV operations summarizer. Consolidate lower-level summaries into a clear higher-level batch summary. "
-            "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+            "You are a CCTV operations analyst. Summarize lower-level notes into operator-facing window reports. "
+            "Use structured Markdown sections, keep concrete timestamps/events, and avoid repetitive rollup wording."
         )
         self.rollup_llm_system_prompt = str(
             getattr(
