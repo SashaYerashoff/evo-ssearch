@@ -78,6 +78,8 @@ if active_embedder == "fusion" and not config.FUSION_ENABLED:
 LOCAL_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
 FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
+PROBE_ROI_MIN_SIDE = 0.02
+PROBE_ROI_PADDING = 0.05
 
 
 def _json_body() -> Dict[str, Any]:
@@ -98,6 +100,66 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
             return False
         return default
     return bool(value)
+
+
+def _normalize_probe_roi_norm(raw: Any, min_side: float = PROBE_ROI_MIN_SIDE) -> Optional[Tuple[float, float, float, float]]:
+    values: Optional[Tuple[float, float, float, float]] = None
+    try:
+        if isinstance(raw, dict):
+            values = (
+                float(raw.get("x")),
+                float(raw.get("y")),
+                float(raw.get("w")),
+                float(raw.get("h")),
+            )
+        elif isinstance(raw, (list, tuple)) and len(raw) == 4:
+            values = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+    except Exception:
+        return None
+    if values is None:
+        return None
+    if not all(math.isfinite(v) for v in values):
+        return None
+    x, y, w, h = values
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0, w))
+    h = max(0.0, min(1.0, h))
+    min_size = max(0.001, float(min_side))
+    if w < min_size or h < min_size:
+        return None
+    if x + w > 1.0:
+        x = max(0.0, 1.0 - w)
+    if y + h > 1.0:
+        y = max(0.0, 1.0 - h)
+    return (round(x, 6), round(y, 6), round(w, 6), round(h, 6))
+
+
+def _probe_roi_norm_to_payload(roi_norm: Optional[Tuple[float, float, float, float]]) -> Optional[Dict[str, float]]:
+    if roi_norm is None:
+        return None
+    x, y, w, h = roi_norm
+    return {"x": float(x), "y": float(y), "w": float(w), "h": float(h)}
+
+
+def _parse_probe_roi(payload: Mapping[str, Any]) -> Tuple[bool, Optional[Tuple[float, float, float, float]]]:
+    roi_enabled_explicit = "roi_enabled" in payload
+    enabled = _coerce_bool(payload.get("roi_enabled"), False)
+    roi_raw: Any = payload.get("roi_norm")
+    legacy = payload.get("roi")
+    if isinstance(legacy, dict):
+        if "enabled" in legacy and "roi_enabled" not in payload:
+            enabled = _coerce_bool(legacy.get("enabled"), enabled)
+        if roi_raw is None:
+            roi_raw = legacy.get("norm")
+            if roi_raw is None and all(key in legacy for key in ("x", "y", "w", "h")):
+                roi_raw = legacy
+    roi_norm = _normalize_probe_roi_norm(roi_raw)
+    if roi_norm is not None and not roi_enabled_explicit:
+        enabled = True
+    if not enabled or roi_norm is None:
+        return False, None
+    return True, roi_norm
 
 
 def _is_local_request() -> bool:
@@ -724,6 +786,8 @@ def home():
     <title>Natural Language Image Search</title>
     <!-- Cache buster: {timestamp} -->
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Titillium+Web:wght@600;700&display=swap');
+
         :root {
             --bg: #0a0a0a;
             --panel: #161616;
@@ -782,14 +846,24 @@ def home():
 
         .brand {
             display: flex;
-            align-items: center;
+            flex-direction: column;
+            align-items: flex-start;
             gap: 0.9rem;
         }
 
-        .brand-title {
+        .brand-top {
             display: flex;
-            flex-direction: column;
-            gap: 0.2rem;
+            align-items: flex-end;
+            gap: 0.9rem;
+        }
+
+        .brand-logo {
+            height: 36px;
+            width: auto;
+            object-fit: contain;
+            display: block;
+            flex: 0 0 auto;
+            filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
         }
 
         .brand-main {
@@ -797,6 +871,9 @@ def home():
             font-weight: 700;
             letter-spacing: 0.02em;
             margin: 0;
+            line-height: 0.9;
+            transform: translateY(2px);
+            font-family: "Titillium Web", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
 
         .brand-sub {
@@ -805,13 +882,6 @@ def home():
             margin: 0;
         }
 
-        .brand-note {
-            color: #9c9c9c;
-            font-size: 0.9rem;
-            font-style: italic;
-            margin: 0;
-        }
-        
         .settings-icon {
             cursor: pointer;
             padding: 8px;
@@ -1325,6 +1395,10 @@ def home():
             transform: none;
         }
 
+        .feature-btn.auto-hide-disabled:disabled {
+            display: none;
+        }
+
         button.is-loading,
         .feature-btn.is-loading,
         .settings-btn.is-loading,
@@ -1740,11 +1814,29 @@ def home():
             gap: 0.3rem;
             align-items: baseline;
             color: #999;
+            min-width: 0;
+        }
+
+        .similarity .metric-line.metric-line-wrap {
+            align-items: center;
         }
 
         .metric-label {
             color: #e0e0e0;
             font-weight: 500;
+            flex: 0 0 auto;
+        }
+
+        .metric-value {
+            min-width: 0;
+        }
+
+        .metric-stream-name {
+            display: block;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .metric-note {
@@ -2451,6 +2543,14 @@ def home():
             flex-wrap: wrap;
         }
 
+        .luxriot-live-controls-row {
+            justify-content: space-between;
+        }
+
+        .luxriot-live-footer-actions {
+            justify-content: flex-start;
+        }
+
         .luxriot-prompt {
             width: 100%;
             min-height: 80px;
@@ -2460,6 +2560,70 @@ def home():
             color: #eaeaea;
             padding: 0.65rem;
             resize: vertical;
+        }
+
+        .luxriot-hidden-prompts {
+            display: none;
+        }
+
+        .prompt-modal-content {
+            max-width: min(940px, 96vw);
+        }
+
+        .prompt-modal-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+        }
+
+        .prompt-modal-tabs {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+        }
+
+        .prompt-tab {
+            min-width: 120px;
+        }
+
+        .prompt-tab.active {
+            border-color: #4db58f;
+            box-shadow: 0 0 0 1px rgba(77, 181, 143, 0.25);
+        }
+
+        .prompt-modal-editor {
+            min-height: 300px;
+        }
+
+        .prompt-modal-meta {
+            color: #9ea4a3;
+            font-size: 0.88rem;
+            min-height: 1.05rem;
+        }
+
+        .prompt-bookmark-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+            flex-wrap: wrap;
+            margin-top: -0.15rem;
+        }
+
+        .prompt-bookmark-controls .small-label-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: #c3c7c6;
+            font-size: 0.9rem;
+        }
+
+        .summary-json-muted {
+            margin-top: 0.55rem;
+            border-left: 2px solid #2e3338;
+            padding-left: 0.65rem;
+            color: #8f98a3;
+            opacity: 0.9;
         }
 
         .luxriot-summaries {
@@ -2752,6 +2916,67 @@ def home():
             border-radius: 4px;
         }
 
+        .summary-body p {
+            margin: 0.15rem 0;
+        }
+
+        .summary-body h1,
+        .summary-body h2,
+        .summary-body h3,
+        .summary-body h4,
+        .summary-body h5,
+        .summary-body h6 {
+            margin: 0.42rem 0 0.22rem;
+            line-height: 1.35;
+            color: #f0f0f0;
+            font-weight: 650;
+        }
+
+        .summary-body h1 { font-size: 1.12rem; }
+        .summary-body h2 { font-size: 1.06rem; }
+        .summary-body h3 { font-size: 1rem; }
+        .summary-body h4,
+        .summary-body h5,
+        .summary-body h6 { font-size: 0.95rem; }
+
+        .summary-body ul,
+        .summary-body ol {
+            margin: 0.24rem 0 0.22rem 1.15rem;
+            padding: 0;
+        }
+
+        .summary-body li {
+            margin: 0.12rem 0;
+        }
+
+        .summary-body pre {
+            margin: 0.3rem 0;
+            padding: 0.48rem 0.56rem;
+            border-radius: 6px;
+            border: 1px solid #2a2a2a;
+            background: #101214;
+            color: #dce7dc;
+            overflow-x: auto;
+            white-space: pre;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.84rem;
+            line-height: 1.35;
+        }
+
+        .summary-body pre code {
+            border: none;
+            background: transparent;
+            padding: 0;
+            color: inherit;
+        }
+
+        .summary-body blockquote {
+            margin: 0.25rem 0;
+            padding: 0.08rem 0 0.08rem 0.65rem;
+            border-left: 2px solid #345243;
+            color: #c5d6c8;
+        }
+
         .luxriot-summaries.compact .summary-body {
             display: -webkit-box;
             -webkit-line-clamp: 4;
@@ -2778,7 +3003,7 @@ def home():
         }
 
         .luxriot-mini-input {
-            min-width: 120px;
+            min-width: 70px;
         }
 
         /* Probes */
@@ -3065,6 +3290,41 @@ def home():
             letter-spacing: 0.03em;
             text-transform: uppercase;
             pointer-events: none;
+            z-index: 4;
+        }
+
+        .probe-roi-layer {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            cursor: crosshair;
+            pointer-events: none;
+            touch-action: none;
+        }
+
+        .probe-roi-layer.active {
+            pointer-events: auto;
+        }
+
+        .probe-roi-box {
+            position: absolute;
+            display: none;
+            border: 2px solid rgba(96, 220, 160, 0.95);
+            background: rgba(96, 220, 160, 0.18);
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55) inset;
+            border-radius: 3px;
+            pointer-events: none;
+            z-index: 3;
+        }
+
+        .probe-roi-box.active {
+            display: block;
+        }
+
+        .probe-meta-inline {
+            font-size: 0.82rem;
+            color: #9fd2b0;
+            letter-spacing: 0.01em;
         }
 
         .monitor-inline {
@@ -3094,6 +3354,30 @@ def home():
             align-items: center;
             gap: 0.5rem;
             flex-wrap: wrap;
+        }
+
+        .monitor-probe-form {
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+
+        .probe-name-row .input-text {
+            flex: 1 1 320px;
+            min-width: 220px;
+        }
+
+        .probe-bookmark-row {
+            align-items: center;
+        }
+
+        .probe-threshold-row {
+            align-items: center;
+        }
+
+        .probe-stream-actions {
+            gap: 0.55rem;
+            align-items: center;
         }
 
         .monitor-probe-grid {
@@ -3345,8 +3629,16 @@ def home():
             grid-template-columns: 40px 1fr 1fr 60px;
             gap: 0.35rem;
             align-items: center;
-            color: #bdbdbd;
-            font-weight: 600;
+            color: #919991;
+            font-size: 0.8rem;
+            font-weight: 500;
+            letter-spacing: 0.01em;
+        }
+
+        #probePairRows {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
 
         .probe-pair-row {
@@ -3361,11 +3653,61 @@ def home():
             text-align: center;
         }
 
-        .probe-add-row {
+        .probe-pair-add-row .probe-add-pair-btn {
+            justify-self: start;
+            min-width: 112px;
+        }
+
+        .probe-pair-add-row .probe-add-empty {
+            color: #6f6f6f;
+            font-size: 0.83rem;
+            letter-spacing: 0.01em;
+        }
+
+        .probe-pairs-threshold-row {
             display: flex;
             align-items: center;
-            gap: 0.4rem;
-            margin-top: 0.25rem;
+            justify-content: space-between;
+            gap: 0.9rem;
+            flex-wrap: wrap;
+            padding-bottom: 0.35rem;
+        }
+
+        .probe-pairs-threshold-title {
+            color: #bdbdbd;
+            font-size: 0.9rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+
+        .probe-panel-heading-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            border-bottom: 1px solid rgba(63, 96, 74, 0.5);
+            padding-bottom: 6px;
+        }
+
+        .probe-panel-heading {
+            margin: 0;
+            color: #d7e6da;
+            font-size: 1rem;
+            font-weight: 700;
+            line-height: 1.2;
+            letter-spacing: 0.015em;
+        }
+
+        .probe-pairs-threshold-controls {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-left: auto;
+        }
+
+        .probe-threshold-input {
+            min-width: 70px;
+            max-width: 70px;
         }
 
         .probe-meta {
@@ -3381,7 +3723,7 @@ def home():
             display: grid;
             grid-template-columns: 65% 35%;
             gap: 0.75rem;
-            align-items: center;
+            align-items: stretch;
         }
 
         .image-probe-panel.no-image {
@@ -3398,27 +3740,54 @@ def home():
             gap: 0.5rem;
         }
 
+        .image-probe-title {
+            color: inherit;
+            font-weight: inherit;
+            letter-spacing: inherit;
+        }
+
         .image-probe-row {
             display: flex;
             align-items: center;
             gap: 0.5rem;
         }
 
-        .image-probe-row .file-upload {
-            width: 100%;
+        .image-probe-top-row {
+            justify-content: space-between;
+            gap: 0.75rem;
+            flex-wrap: wrap;
         }
 
-        .image-probe-pos {
+        .image-probe-row .file-upload {
+            flex: 1;
+        }
+
+        .image-probe-clear-row {
+            justify-content: flex-start;
+        }
+
+        .image-probe-enable-check {
+            min-width: 96px;
+            justify-content: flex-end;
+        }
+
+        .image-probe-threshold-row {
+            justify-content: flex-end;
+        }
+
+        .image-probe-min-wrap {
             display: flex;
             align-items: center;
             gap: 0.4rem;
         }
 
-        .image-probe-actions {
-            display: flex;
-            gap: 0.6rem;
-            align-items: center;
-            flex-wrap: wrap;
+        .image-probe-status {
+            color: #94b39b;
+            text-align: center;
+            font-size: 0.86rem;
+            letter-spacing: 0.01em;
+            border-top: 1px solid rgba(61, 94, 69, 0.35);
+            padding-top: 0.4rem;
         }
 
         .probe-preview {
@@ -3629,11 +3998,11 @@ def home():
     <div class="container">
         <div class="header">
             <div class="brand">
-                <div class="brand-title">
-                    <div class="brand-main">SISU</div>
-                    <div class="brand-sub">Smart Image Search and Understanding.</div>
-                    <div class="brand-note">Also a Finnish word for a unique combination of courage, resilience, grit, and tenacious determination.</div>
+                <div class="brand-top">
+                    <img class="brand-logo" src="/branding/logo" alt="Luxriot logo" />
+                    <div class="brand-main">EVA AI</div>
                 </div>
+                <div class="brand-sub">Smart Image Search and Understanding | version: {app_version}</div>
             </div>
             <div class="header-actions">
                 <div class="settings-icon" id="authTokenBtn" title="Set admin token">
@@ -3784,37 +4153,40 @@ def home():
         <div class="luxriot-grid">
             <div class="luxriot-card">
                 <div class="luxriot-header">
-                    <h4>Luxriot Live Preview</h4>
+                    <h4>Luxriot Live Streams</h4>
                     <div id="luxriotStatus" class="luxriot-status">Not connected</div>
-                        </div>
-                        <div class="luxriot-row">
-                            <label for="luxriotChannelSelect">Channel:</label>
-                            <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
-                            <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
-                            <span class="luxriot-pill">Batch:
-                                <select id="luxriotBatchSize" class="luxriot-mini-input">
-                                    {luxriot_batch_options}
-                                </select>
-                            </span>
-                            <span class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
-                        </div>
-                        <div class="luxriot-actions">
-                            <button id="luxriotPreviewBtn" class="feature-btn">Preview</button>
-                            <button id="luxriotStartCapture" class="feature-btn primary">Start summaries</button>
-                            <button id="luxriotStopCapture" class="feature-btn">Stop</button>
-                            <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
-                        </div>
-                <div class="luxriot-row">
-                    <label for="luxriotPrompt">Prompt:</label>
                 </div>
-                <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
                 <div class="luxriot-row">
-                    <label for="luxriotSystemPrompt">System prompt (LLM role):</label>
+                    <label for="luxriotChannelSelect">Channel:</label>
+                    <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
+                    <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
                 </div>
-                <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for summaries">{luxriot_system_prompt_default}</textarea>
+                <div class="luxriot-row luxriot-live-controls-row">
+                    <span class="luxriot-pill">Batch:
+                        <select id="luxriotBatchSize" class="luxriot-mini-input">
+                            {luxriot_batch_options}
+                        </select>
+                    </span>
+                    <span id="luxriotBatchInfo" class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
+                    <div class="luxriot-actions">
+                        <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
+                        <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
+                    </div>
+                </div>
                 <div class="luxriot-viewport" id="luxriotViewport">
                     <img id="luxriotPreview" src="" alt="Luxriot live preview" />
                     <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                </div>
+                <div class="luxriot-actions luxriot-live-footer-actions">
+                    <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
+                </div>
+                <div class="luxriot-hidden-prompts">
+                    <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                    <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{luxriot_system_prompt_default}</textarea>
+                    <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{luxriot_rollup_prompt_l1}</textarea>
+                    <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{luxriot_rollup_prompt_l2}</textarea>
+                    <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{luxriot_rollup_prompt_l3}</textarea>
+                    <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{luxriot_json_alert_prompt}</textarea>
                 </div>
             </div>
                     <div class="luxriot-card luxriot-stream-card">
@@ -3975,8 +4347,8 @@ def home():
             <div class="probe-editor-modal-body">
                 <div class="probe-editor-layout">
                     <div class="monitor-panel">
-                        <div class="probe-header split">
-                            <h4>Live stream</h4>
+                        <div class="probe-header split probe-panel-heading-row">
+                            <h4 class="probe-panel-heading">Live stream</h4>
                             <span id="probeStatus" class="luxriot-status">Idle</span>
                         </div>
                         <div class="probe-row">
@@ -3986,76 +4358,86 @@ def home():
                         <div class="monitor-stream-preview">
                             <img id="probePreviewImg" src="" alt="" />
                             <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                            <div id="probeRoiLayer" class="probe-roi-layer" aria-label="Draw probe ROI"></div>
+                            <div id="probeRoiBox" class="probe-roi-box"></div>
                         </div>
-                        <div class="probe-meta" id="probeCaptureStatus">Frames: 0 · Range: n/a</div>
+                        <div class="probe-meta" id="probeCaptureStatus">Stream: idle | Capture: idle</div>
                         <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
-                        <div class="probe-meta" id="probeStreamState"></div>
-                        <div class="probe-row">
-                            <label>FPS:</label>
-                            <input type="number" id="probeFps" class="settings-input luxriot-mini-input" min="0" step="1" value="0" />
-                            <label>Buffer (sec):</label>
-                            <input type="number" id="probeWindowSec" class="settings-input luxriot-mini-input" min="0" value="300" />
+                        <input type="hidden" id="probeFps" value="0" />
+                        <input type="hidden" id="probeWindowSec" value="300" />
+                        <div class="probe-row probe-stream-actions">
+                            <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
+                            <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
+                            <button id="probeStreamToggle" type="button" class="feature-btn primary">Start Stream</button>
                         </div>
-                        <div class="monitor-btn-row">
-                            <button id="probeStartCapture" class="feature-btn primary">Start Stream</button>
-                            <button id="probeStopCapture" class="feature-btn">Pause</button>
-                            <button id="probeStopAll" class="feature-btn">Stop</button>
-                        </div>
+                        <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
                     </div>
                     <div class="probe-editor-settings">
-                        <div class="monitor-probe-header">
-                            <label>Probe name:</label>
-                            <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
-                            <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.2" /></div>
-                            <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input" step="0.01" value="0.05" /></div>
-                            <label class="inline-check">
-                                <input type="checkbox" id="probeEnableToggle" checked>
-                                Enable probe
-                            </label>
-                        </div>
-                        <div class="probe-row spread">
-                            <label><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
-                            <div class="probe-severity-wrap">
-                                <label>Severity:</label>
-                                <select id="probeBookmarkSeverity" class="luxriot-mini-input">
-                                    <option value="info">info</option>
-                                    <option value="low">low</option>
-                                    <option value="normal">normal</option>
-                                    <option value="high">high</option>
-                                    <option value="critical" selected>critical</option>
-                                </select>
+                        <div class="monitor-probe-form">
+                            <div class="probe-row probe-name-row">
+                                <label>Probe name:</label>
+                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
+                                <label class="inline-check">
+                                    <input type="checkbox" id="probeEnableToggle" checked>
+                                    Enabled
+                                </label>
+                            </div>
+                            <div class="probe-row probe-bookmark-row">
+                                <label class="inline-check"><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
+                                <div class="probe-severity-wrap">
+                                    <label>Severity:</label>
+                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
+                                        <option value="info" selected>info</option>
+                                        <option value="low">low</option>
+                                        <option value="normal">normal</option>
+                                        <option value="high">high</option>
+                                        <option value="critical">critical</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                         <div class="probe-pairs" id="probePairs">
+                            <div class="probe-row probe-threshold-row probe-pairs-threshold-row probe-panel-heading-row">
+                                <div class="probe-pairs-threshold-title probe-panel-heading">Text Probe Settings:</div>
+                                <div class="probe-pairs-threshold-controls">
+                                    <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.2" /></div>
+                                    <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.05" /></div>
+                                </div>
+                            </div>
                             <div class="probe-pairs-header">
                                 <div></div>
                                 <div>Positive Examples:</div>
                                 <div>Negative Examples:</div>
                                 <div class="probe-pairs-spacer">&nbsp;</div>
                             </div>
-                        </div>
-                        <div class="probe-add-row">
-                            <span class="probe-pair-idx">+</span>
-                            <button id="probeAddPair" class="feature-btn">Add pair</button>
+                            <div id="probePairRows"></div>
                         </div>
                         <div class="image-probe-panel no-image">
                             <div class="image-probe-left">
-                                <div class="section-help">Optional: provide a reference image for CLIP-based probe matching.</div>
-                                <div class="image-probe-row">
+                                <div class="probe-panel-heading-row">
+                                    <div class="image-probe-title probe-panel-heading">Image Probe Settings:</div>
+                                </div>
+                                <div class="image-probe-row image-probe-top-row">
                                     <div class="file-upload inline">
                                         <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
                                         <label for="probeImageFile" class="feature-btn file-upload-btn btn-md">Choose Image</label>
                                         <span id="probeImageFileName" class="file-upload-name">No file selected</span>
                                     </div>
+                                    <label class="inline-check image-probe-enable-check">
+                                        <input type="checkbox" id="probeImageEnableToggle">
+                                        Enabled
+                                    </label>
                                 </div>
-                                <div class="image-probe-pos">
-                                    <label>Image Pos:</label>
-                                    <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                <div class="image-probe-row image-probe-clear-row is-hidden">
+                                    <button type="button" id="probeImageClear" class="feature-btn auto-hide-disabled">Clear image</button>
                                 </div>
-                                <div class="image-probe-actions">
-                                    <button id="probeImageEnable" class="feature-btn">Enable Image Probe</button>
-                                    <span class="luxriot-status" id="probeImageStatus">Status: Disabled</span>
+                                <div class="image-probe-row image-probe-threshold-row">
+                                    <div class="image-probe-min-wrap">
+                                        <label>Minimal match:</label>
+                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
+                                    </div>
                                 </div>
+                                <div class="image-probe-status" id="probeImageStatus">Probe status: Disabled; Image: Missing.</div>
                             </div>
                             <div class="probe-preview compact">
                                 <img id="probeImageThumb" src="" alt="" />
@@ -4067,6 +4449,40 @@ def home():
                 <div class="settings-actions probe-editor-modal-actions">
                     <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
                     <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="luxriotPromptModal" class="settings-modal">
+        <div class="settings-modal-content prompt-modal-content">
+            <div class="settings-header">
+                <h2>System Prompt Settings</h2>
+                <button class="close-btn" id="closeLuxriotPromptModal">&times;</button>
+            </div>
+            <div class="prompt-modal-body">
+                <div class="prompt-modal-tabs">
+                    <button type="button" class="feature-btn prompt-tab active" data-luxriot-prompt-tab="stream">Stream System Prompt</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L1">L1</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L2">L2</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L3">L3</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="json">JSON</button>
+                </div>
+                <textarea id="luxriotPromptModalInput" class="luxriot-prompt prompt-modal-editor" placeholder="Set prompt for selected summary depth..."></textarea>
+                <div class="prompt-bookmark-controls">
+                    <label class="inline-check">
+                        <input type="checkbox" id="luxriotBookmarkEnabled">
+                        Enable bookmarks
+                    </label>
+                    <label class="small-label-group">
+                        Dedup cooldown (sec):
+                        <input type="number" id="luxriotBookmarkCooldown" class="settings-input luxriot-mini-input" min="0" step="1" />
+                    </label>
+                </div>
+                <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>
+                <div class="settings-actions">
+                    <button id="luxriotPromptApplyBtn" class="settings-btn primary">Apply</button>
+                    <button id="luxriotPromptCloseBtn" class="settings-btn">Close</button>
                 </div>
             </div>
         </div>
@@ -4310,13 +4726,20 @@ def home():
         const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
         const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
         const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
+        const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
         const luxriotStatusLabel = document.getElementById('luxriotStatus');
         const luxriotPreviewImg = document.getElementById('luxriotPreview');
         const luxriotOverlay = document.getElementById('luxriotOverlay');
-        const luxriotPreviewBtn = document.getElementById('luxriotPreviewBtn');
-        const luxriotStartCaptureBtn = document.getElementById('luxriotStartCapture');
-        const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
+        const luxriotToggleCaptureBtn = document.getElementById('luxriotToggleCapture');
         const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
+        const luxriotPromptSettingsBtn = document.getElementById('luxriotPromptSettingsBtn');
+        const luxriotPromptModal = document.getElementById('luxriotPromptModal');
+        const closeLuxriotPromptModalBtn = document.getElementById('closeLuxriotPromptModal');
+        const luxriotPromptCloseBtn = document.getElementById('luxriotPromptCloseBtn');
+        const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
+        const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
+        const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
+        const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
         const luxriotSummaryRunSelect = document.getElementById('luxriotSummaryRunSelect');
@@ -4340,6 +4763,12 @@ def home():
         const luxriotStopAllAnalyticsBtn = document.getElementById('luxriotStopAllAnalytics');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
         const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
+        const luxriotRollupPromptL1Input = document.getElementById('luxriotRollupPromptL1');
+        const luxriotRollupPromptL2Input = document.getElementById('luxriotRollupPromptL2');
+        const luxriotRollupPromptL3Input = document.getElementById('luxriotRollupPromptL3');
+        const luxriotJsonAlertPromptInput = document.getElementById('luxriotJsonAlertPrompt');
+        const luxriotBookmarkEnabledInput = document.getElementById('luxriotBookmarkEnabled');
+        const luxriotBookmarkCooldownInput = document.getElementById('luxriotBookmarkCooldown');
         const probeChannelSelect = document.getElementById('probeChannelSelect');
         const probeTopKInput = document.getElementById('probeTopK');
         const probePosFloorInput = document.getElementById('probePosFloor');
@@ -4356,21 +4785,29 @@ def home():
         const probeStatus = document.getElementById('probeStatus');
         const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
         const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
-        const probeStartCaptureBtn = document.getElementById('probeStartCapture');
-        const probeStopCaptureBtn = document.getElementById('probeStopCapture');
-        const probeStopAllBtn = document.getElementById('probeStopAll');
+        const probeFpsInput = document.getElementById('probeFps');
+        const probeWindowSecInput = document.getElementById('probeWindowSec');
+        const probeStreamToggleBtn = document.getElementById('probeStreamToggle');
         const probeCaptureStatus = document.getElementById('probeCaptureStatus');
         const probeHitsMeta = document.getElementById('probeHitsMeta');
         const probeCards = document.getElementById('probeCards');
         const probeNewBtn = document.getElementById('probeNewBtn');
         const probeReloadBtn = document.getElementById('probeReloadBtn');
         const probePreviewImg = document.getElementById('probePreviewImg');
+        const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.monitor-stream-preview') : null;
         const probePreviewOverlay = document.getElementById('probePreviewOverlay');
+        const probeRoiLayer = document.getElementById('probeRoiLayer');
+        const probeRoiBox = document.getElementById('probeRoiBox');
+        const probeRoiToggleBtn = document.getElementById('probeRoiToggle');
+        const probeRoiClearBtn = document.getElementById('probeRoiClear');
+        const probeRoiInfo = document.getElementById('probeRoiInfo');
         const probePairsContainer = document.getElementById('probePairs');
-        const probeAddPairBtn = document.getElementById('probeAddPair');
+        const probePairRows = document.getElementById('probePairRows');
         const probeImageFile = document.getElementById('probeImageFile');
         const probeImageFileName = document.getElementById('probeImageFileName');
-        const probeImageEnableBtn = document.getElementById('probeImageEnable');
+        const probeImageClearBtn = document.getElementById('probeImageClear');
+        const probeImageClearRow = probeImageClearBtn ? probeImageClearBtn.closest('.image-probe-clear-row') : null;
+        const probeImageEnableToggle = document.getElementById('probeImageEnableToggle');
         const probeImageStatus = document.getElementById('probeImageStatus');
         const probeImageThumb = document.getElementById('probeImageThumb');
         const probeImageOverlay = document.getElementById('probeImageOverlay');
@@ -4393,7 +4830,6 @@ def home():
         const archiveDetectionsNextBtn = document.getElementById('archiveDetectionsNext');
         const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
         const probeBufferInfo = document.getElementById('probeBufferInfo');
-        const probeStreamState = document.getElementById('probeStreamState');
         const probeEnableToggle = document.getElementById('probeEnableToggle');
         const probeBenchBtn = document.getElementById('probeBenchBtn');
         const probeBenchOutput = document.getElementById('probeBenchOutput');
@@ -4435,6 +4871,9 @@ def home():
         let luxriotSummaryRefreshInFlight = false;
         let luxriotSummaryRefreshQueued = null;
         let luxriotStreamsCache = [];
+        const luxriotChannelNameById = {};
+        const luxriotCaptureRunningByChannel = {};
+        let luxriotPromptModalTab = 'stream';
         let luxriotInitialized = false;
         const probeHitsCacheByKey = {};
         const probeHitsOffsetByKey = {};
@@ -4443,15 +4882,21 @@ def home():
         const probeWindowSecByKey = {};
         let probePairsState = [];
         let probeImageState = null;
+        let probeRoiEnabled = false;
+        let probeRoiNorm = null;
+        let probeRoiDraftNorm = null;
+        let probeRoiDrawState = null;
         let imageProbeEnabled = false;
         let probeList = [];
         let probeCatalog = [];
         let activeProbeId = null;
         const probeCaptureState = {};
         const probeChannelRuntime = {};
+        const probeCaptureManualStop = {};
         let probeRunTimer = null;
         let probeRunInFlight = false;
         let probePreviewTimer = null;
+        let probePreviewChannelId = null;
         let lastProbeRefresh = 0;
         let probeStatusTimer = null;
         let archiveDetectionsOffset = 0;
@@ -4507,12 +4952,174 @@ def home():
             return div.innerHTML;
         }
 
-        function renderMarkdown(text) {
-            const safe = escapeHtml(text || '');
-            return safe
+        function renderMarkdownInline(text) {
+            const source = String(text || '');
+            const inlineCode = [];
+            const placeholder = source.replace(/`([^`\\n]+)`/g, (_, codeText) => {
+                const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
+                return `@@INLINE_CODE_${idx}@@`;
+            });
+            let out = escapeHtml(placeholder);
+            out = out
                 .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/`([^`]+)`/g, '<code>$1</code>')
-                .replace(/\\n/g, '<br>');
+                .replace(/__(.+?)__/g, '<strong>$1</strong>')
+                .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
+                .replace(/_(.+?)_/g, '<em>$1</em>');
+            out = out.replace(/@@INLINE_CODE_(\\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
+            return out;
+        }
+
+        function renderMarkdown(text) {
+            const source = String(text || '').replace(/\\r\\n?/g, '\\n').trim();
+            if (!source) return '';
+
+            const lines = source.split('\\n');
+            const htmlParts = [];
+            let paragraphLines = [];
+            let ulItems = [];
+            let olItems = [];
+            let inCodeFence = false;
+            let codeFenceLang = '';
+            let codeFenceLines = [];
+
+            const flushParagraph = () => {
+                if (!paragraphLines.length) return;
+                const body = paragraphLines.map((line) => renderMarkdownInline(line)).join('<br>');
+                htmlParts.push(`<p>${body}</p>`);
+                paragraphLines = [];
+            };
+
+            const flushLists = () => {
+                if (ulItems.length) {
+                    htmlParts.push(`<ul>${ulItems.map((item) => `<li>${item}</li>`).join('')}</ul>`);
+                    ulItems = [];
+                }
+                if (olItems.length) {
+                    htmlParts.push(`<ol>${olItems.map((item) => `<li>${item}</li>`).join('')}</ol>`);
+                    olItems = [];
+                }
+            };
+
+            const flushCodeFence = () => {
+                if (!inCodeFence) return;
+                const classAttr = codeFenceLang ? ` class="language-${escapeHtml(codeFenceLang)}"` : '';
+                htmlParts.push(
+                    `<pre><code${classAttr}>${escapeHtml(codeFenceLines.join('\\n'))}</code></pre>`
+                );
+                inCodeFence = false;
+                codeFenceLang = '';
+                codeFenceLines = [];
+            };
+
+            for (const rawLine of lines) {
+                const line = String(rawLine || '');
+                const trimmed = line.trim();
+                const fenceMatch = trimmed.match(/^```\\s*([\\w-]+)?\\s*$/);
+                if (fenceMatch) {
+                    if (inCodeFence) {
+                        flushCodeFence();
+                    } else {
+                        flushParagraph();
+                        flushLists();
+                        inCodeFence = true;
+                        codeFenceLang = String(fenceMatch[1] || '').trim();
+                        codeFenceLines = [];
+                    }
+                    continue;
+                }
+
+                if (inCodeFence) {
+                    codeFenceLines.push(line);
+                    continue;
+                }
+
+                if (!trimmed) {
+                    flushParagraph();
+                    flushLists();
+                    continue;
+                }
+
+                const headingMatch = trimmed.match(/^(#{1,6})\\s+(.+)$/);
+                if (headingMatch) {
+                    flushParagraph();
+                    flushLists();
+                    const level = Math.min(6, Math.max(1, headingMatch[1].length));
+                    htmlParts.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`);
+                    continue;
+                }
+
+                const quoteMatch = trimmed.match(/^>\\s?(.*)$/);
+                if (quoteMatch) {
+                    flushParagraph();
+                    flushLists();
+                    htmlParts.push(`<blockquote>${renderMarkdownInline(quoteMatch[1] || '')}</blockquote>`);
+                    continue;
+                }
+
+                const ulMatch = trimmed.match(/^[-*]\\s+(.+)$/);
+                if (ulMatch) {
+                    flushParagraph();
+                    if (olItems.length) {
+                        flushLists();
+                    }
+                    ulItems.push(renderMarkdownInline(ulMatch[1]));
+                    continue;
+                }
+
+                const olMatch = trimmed.match(/^\\d+\\.\\s+(.+)$/);
+                if (olMatch) {
+                    flushParagraph();
+                    if (ulItems.length) {
+                        flushLists();
+                    }
+                    olItems.push(renderMarkdownInline(olMatch[1]));
+                    continue;
+                }
+
+                paragraphLines.push(line);
+            }
+
+            flushParagraph();
+            flushLists();
+            flushCodeFence();
+            return htmlParts.join('');
+        }
+
+        function splitSummaryAndJson(text) {
+            const full = String(text || '').trim();
+            if (!full) {
+                return { main: '', json: '' };
+            }
+
+            const fenced = full.match(/```json\\s*([\\s\\S]*?)```/i);
+            if (fenced && fenced[1]) {
+                const jsonBlock = String(fenced[1] || '').trim();
+                const mainText = full.replace(fenced[0], '').trim();
+                return { main: mainText, json: jsonBlock };
+            }
+
+            const marker = 'ALERTS_JSON:';
+            const markerIndex = full.toUpperCase().indexOf(marker);
+            if (markerIndex >= 0) {
+                const mainText = full.slice(0, markerIndex).trim();
+                const jsonBlock = full.slice(markerIndex + marker.length).trim();
+                if (jsonBlock) {
+                    return { main: mainText, json: jsonBlock };
+                }
+            }
+
+            const trailingStart = full.lastIndexOf('\\n{');
+            const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
+            if (startIndex >= 0) {
+                const jsonCandidate = full.slice(startIndex).trim();
+                const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
+                if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+                    const mainText = full.slice(0, startIndex).trim();
+                    return { main: mainText, json: jsonCandidate };
+                }
+            }
+
+            return { main: full, json: '' };
         }
 
         function formatDuration(seconds) {
@@ -4585,7 +5192,7 @@ def home():
             } else if (mode === 'monitor') {
                 ensureLuxriotInit();
                 syncProbeChannelSelect();
-                startProbePreview(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10));
+                syncProbePreview(getSelectedProbeChannelId());
                 refreshProbeStatus();
                 loadProbeList();
                 startProbeStatusPoll();
@@ -4597,8 +5204,18 @@ def home():
                 stopProbeStatusPoll();
                 refreshArchiveFilters().catch(() => {});
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
+            }
+        }
+
+        function setProbeEditorModalVisibility(visible) {
+            if (!probeEditorModal) return;
+            probeEditorModal.style.display = visible ? 'block' : 'none';
+            if (visible) {
+                syncProbePreview(getSelectedProbeChannelId());
+            } else {
+                stopProbePreview();
             }
         }
 
@@ -4611,6 +5228,14 @@ def home():
             } else {
                 luxriotStatusLabel.removeAttribute('title');
             }
+        }
+
+        function updateLuxriotBatchInfo() {
+            if (!luxriotBatchInfo) return;
+            const intervalSec = Number(luxriotDefaults.snapshotInterval) || 1;
+            const fps = intervalSec > 0 ? (1 / intervalSec) : 0;
+            const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
+            luxriotBatchInfo.textContent = `~${fpsLabel} fps, ${luxriotDefaults.snapshotMaxEdge}px`;
         }
 
         function stopLuxriotPreview() {
@@ -5127,6 +5752,19 @@ def home():
             }
         }
 
+        function normalizeLuxriotChannelName(channel, channelId) {
+            const raw = String(
+                channel?.title
+                || channel?.name
+                || channel?.channel_name
+                || channel?.label
+                || ''
+            ).trim();
+            if (raw) return raw;
+            if (Number.isFinite(channelId)) return `Channel #${channelId}`;
+            return 'Unknown channel';
+        }
+
         async function fetchLuxriotChannels(force = false) {
             if (!luxriotChannelSelect) return;
             luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
@@ -5137,6 +5775,7 @@ def home():
                     throw new Error(data.error);
                 }
                 const channels = data.channels || [];
+                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
                 if (!channels.length) {
                     luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
                     if (luxriotSummaryChannelSelect) {
@@ -5145,39 +5784,246 @@ def home():
                     setLuxriotStatus('No channels available', true);
                     return;
                 }
-                const options = channels.map((ch) => {
-                    const id = ch.id;
-                    const label = ch.title || `Channel ${id}`;
-                    const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
-                    return `<option value="${id}" ${selected}>${label} (#${id})</option>`;
-                });
+                const options = channels
+                    .map((ch) => {
+                        const rawId = ch.id ?? ch.channel_id;
+                        const id = parseInt(String(rawId || ''), 10);
+                        if (!Number.isFinite(id)) return '';
+                        const label = normalizeLuxriotChannelName(ch, id);
+                        luxriotChannelNameById[String(id)] = label;
+                        const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
+                        return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
+                    })
+                    .filter((item) => Boolean(item));
                 luxriotChannelSelect.innerHTML = options.join('');
-                if (!channels.some((ch) => String(ch.id) === String(luxriotActiveChannel))) {
-                    luxriotActiveChannel = channels[0].id;
+                const channelIds = channels
+                    .map((ch) => parseInt(String(ch.id ?? ch.channel_id ?? ''), 10))
+                    .filter((id) => Number.isFinite(id));
+                if (!channelIds.some((id) => String(id) === String(luxriotActiveChannel))) {
+                    luxriotActiveChannel = channelIds[0] || luxriotDefaults.channelId;
                     luxriotChannelSelect.value = luxriotActiveChannel;
                 }
                 if (!Number.isFinite(luxriotSummaryChannel)) {
                     luxriotSummaryChannel = luxriotActiveChannel;
                 }
                 syncLuxriotSummaryChannelSelect();
+                if (!(String(luxriotActiveChannel) in luxriotCaptureRunningByChannel)) {
+                    luxriotCaptureRunningByChannel[String(luxriotActiveChannel)] = false;
+                }
+                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
                 setLuxriotStatus(`Loaded ${channels.length} channels`);
             } catch (err) {
+                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
                 luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
                 if (luxriotSummaryChannelSelect) {
                     luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
                 }
+                updateLuxriotCaptureToggleButton();
                 setLuxriotStatus('Channel load failed: ' + err.message, true);
             }
         }
 
         function getLuxriotChannelLabel(channelId) {
             if (!Number.isFinite(channelId)) return 'Unknown channel';
+            const known = luxriotChannelNameById[String(channelId)];
+            if (known) return known;
             if (!luxriotChannelSelect) return `Channel #${channelId}`;
             const options = Array.from(luxriotChannelSelect.options || []);
             const match = options.find((opt) => parseInt(opt.value || '', 10) === channelId);
             if (!match) return `Channel #${channelId}`;
             const label = String(match.textContent || '').trim();
             return label || `Channel #${channelId}`;
+        }
+
+        function setLuxriotCaptureRunning(channelId, running) {
+            const parsed = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsed)) return;
+            luxriotCaptureRunningByChannel[String(parsed)] = Boolean(running);
+        }
+
+        function isLuxriotCaptureRunning(channelId) {
+            const parsed = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsed)) return false;
+            return Boolean(luxriotCaptureRunningByChannel[String(parsed)]);
+        }
+
+        function updateLuxriotCaptureToggleButton(channelIdOverride = null) {
+            if (!luxriotToggleCaptureBtn) return;
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
+            const running = isLuxriotCaptureRunning(channelId);
+            luxriotToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
+            luxriotToggleCaptureBtn.classList.toggle('primary', !running);
+        }
+
+        function getLuxriotPromptInputByTab(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') return luxriotSystemPromptInput;
+            if (normalized === 'l1') return luxriotRollupPromptL1Input;
+            if (normalized === 'l2') return luxriotRollupPromptL2Input;
+            if (normalized === 'l3') return luxriotRollupPromptL3Input;
+            if (normalized === 'json') return luxriotJsonAlertPromptInput;
+            return luxriotSystemPromptInput;
+        }
+
+        function getLuxriotPromptTabLabel(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') return 'Stream system prompt';
+            if (normalized === 'l1') return 'L1 rollup prompt';
+            if (normalized === 'l2') return 'L2 rollup prompt';
+            if (normalized === 'l3') return 'L3 rollup prompt';
+            if (normalized === 'json') return 'JSON alert prompt';
+            return 'System prompt';
+        }
+
+        function getLuxriotPromptTabMeta(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') {
+                return 'Editing stream system prompt used for live summaries.';
+            }
+            if (normalized === 'l1') {
+                return 'Editing L1 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'l2') {
+                return 'Editing L2 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'l3') {
+                return 'Editing L3 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'json') {
+                return 'Editing optional bookmark JSON block. It should only be emitted when a Task-defined trigger is observed.';
+            }
+            return 'Editing system prompt.';
+        }
+
+        function collectLuxriotPromptSettings() {
+            return {
+                stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
+                rollup_prompts: {
+                    L1: luxriotRollupPromptL1Input ? String(luxriotRollupPromptL1Input.value || '') : '',
+                    L2: luxriotRollupPromptL2Input ? String(luxriotRollupPromptL2Input.value || '') : '',
+                    L3: luxriotRollupPromptL3Input ? String(luxriotRollupPromptL3Input.value || '') : '',
+                },
+                json_alert_prompt: luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '',
+                bookmark_enabled: luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false,
+                bookmark_cooldown_sec: luxriotBookmarkCooldownInput
+                    ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
+                    : 0,
+            };
+        }
+
+        function applyLuxriotPromptSettingsFromPayload(payload) {
+            const settings = payload && typeof payload === 'object' ? payload : {};
+            if (luxriotSystemPromptInput && Object.prototype.hasOwnProperty.call(settings, 'stream_system_prompt')) {
+                luxriotSystemPromptInput.value = String(settings.stream_system_prompt || '');
+            }
+            const rollupPrompts = settings.rollup_prompts && typeof settings.rollup_prompts === 'object'
+                ? settings.rollup_prompts
+                : {};
+            if (luxriotRollupPromptL1Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L1')) {
+                luxriotRollupPromptL1Input.value = String(rollupPrompts.L1 || '');
+            }
+            if (luxriotRollupPromptL2Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L2')) {
+                luxriotRollupPromptL2Input.value = String(rollupPrompts.L2 || '');
+            }
+            if (luxriotRollupPromptL3Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L3')) {
+                luxriotRollupPromptL3Input.value = String(rollupPrompts.L3 || '');
+            }
+            if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
+                luxriotJsonAlertPromptInput.value = String(settings.json_alert_prompt || '');
+            }
+            if (luxriotBookmarkEnabledInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_enabled')) {
+                luxriotBookmarkEnabledInput.checked = Boolean(settings.bookmark_enabled);
+            }
+            if (luxriotBookmarkCooldownInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_cooldown_sec')) {
+                const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
+                luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
+            }
+            const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (luxriotPromptModalInput && activeInput) {
+                luxriotPromptModalInput.value = String(activeInput.value || '');
+            }
+        }
+
+        async function refreshLuxriotPromptSettings(showError = false, channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride)
+                ? channelIdOverride
+                : getSelectedLuxriotChannel();
+            if (!Number.isFinite(channelId)) {
+                return;
+            }
+            try {
+                const params = new URLSearchParams();
+                params.set('channel_id', String(channelId));
+                const response = await fetch(`/luxriot/prompt_settings?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load prompt settings');
+                applyLuxriotPromptSettingsFromPayload(data);
+            } catch (err) {
+                if (showError) {
+                    setLuxriotStatus(err.message || 'Failed to load prompt settings', true);
+                }
+            }
+        }
+
+        async function persistLuxriotPromptSettings(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride)
+                ? channelIdOverride
+                : getSelectedLuxriotChannel();
+            if (!Number.isFinite(channelId)) {
+                throw new Error('Select a channel first');
+            }
+            const payload = collectLuxriotPromptSettings();
+            payload.channel_id = channelId;
+            const response = await fetch('/luxriot/prompt_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await parseApiJson(response, 'Failed to save prompt settings');
+            applyLuxriotPromptSettingsFromPayload(data);
+        }
+
+        function setLuxriotPromptModalTab(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            const previousInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (luxriotPromptModalInput && previousInput) {
+                previousInput.value = luxriotPromptModalInput.value || '';
+            }
+            const tabValue = normalized === 'stream' ? 'stream' : normalized.toUpperCase();
+            luxriotPromptModalTab = tabValue;
+            luxriotPromptTabButtons.forEach((button) => {
+                const buttonTab = String(button.dataset.luxriotPromptTab || '').trim();
+                button.classList.toggle('active', buttonTab.toLowerCase() === String(tabValue).toLowerCase());
+            });
+            if (luxriotPromptModalInput) {
+                const sourceInput = getLuxriotPromptInputByTab(tabValue);
+                luxriotPromptModalInput.value = sourceInput ? String(sourceInput.value || '') : '';
+            }
+            if (luxriotPromptModalMeta) {
+                const channelLabel = getLuxriotChannelLabel(getSelectedLuxriotChannel());
+                luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`;
+            }
+        }
+
+        function openLuxriotPromptModal() {
+            if (!luxriotPromptModal) return;
+            luxriotPromptModal.style.display = 'block';
+            void refreshLuxriotPromptSettings(true);
+            setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+        }
+
+        function closeLuxriotPromptModal() {
+            if (!luxriotPromptModal) return;
+            luxriotPromptModal.style.display = 'none';
+        }
+
+        async function applyLuxriotPromptModal() {
+            const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (targetInput && luxriotPromptModalInput) {
+                targetInput.value = luxriotPromptModalInput.value || '';
+            }
+            const channelId = getSelectedLuxriotChannel();
+            await persistLuxriotPromptSettings(channelId);
+            setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(channelId)}`);
         }
 
         function startLuxriotPreview() {
@@ -5303,6 +6149,9 @@ def home():
                         ? getLuxriotChannelLabel(rowChannelId)
                         : 'Unknown channel';
                     const summary = String(log.summary || '').trim();
+                    const summaryParts = splitSummaryAndJson(summary);
+                    const summaryMain = summaryParts.main || summary;
+                    const summaryJson = summaryParts.json;
                     const canBookmark = summary.length > 0;
                     const collapsed = isSummaryCollapsed(channelId, logKey);
                     return `
@@ -5324,7 +6173,7 @@ def home():
                                     </button>
                                 </div>
                             </div>
-                            <div class="summary-body">${renderMarkdown(summary)}</div>
+                            <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
                         </div>
                     `;
                 })
@@ -5494,6 +6343,9 @@ def home():
                 const sourceLevel = String(row?.source_level || '').trim();
                 const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
                 const summary = String(row?.summary || '').trim();
+                const summaryParts = splitSummaryAndJson(summary);
+                const summaryMain = summaryParts.main || summary;
+                const summaryJson = summaryParts.json;
                 const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
                 const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
                 const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
@@ -5508,7 +6360,7 @@ def home():
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                             </div>
                         </div>
-                        <div class="summary-body">${renderMarkdown(summary)}</div>
+                        <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
                     </div>
                 `;
             }).join('');
@@ -5646,8 +6498,11 @@ def home():
             Object.entries(probeChannelRuntime).forEach(([channelId, state]) => {
                 if (state === 'running') {
                     probeCaptureState[channelId] = true;
+                    delete probeCaptureManualStop[channelId];
                 }
             });
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
+            syncProbePreview(getSelectedProbeChannelId());
             if (rerender) {
                 renderProbeCards();
             }
@@ -5832,6 +6687,22 @@ def home():
                 if (!resp.ok || data.error) {
                     throw new Error(data.error || 'Failed to fetch stream state');
                 }
+                const nextCaptureState = {};
+                const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
+                videoStreams.forEach((stream) => {
+                    const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                    if (!Number.isFinite(channelId)) return;
+                    nextCaptureState[String(channelId)] = Boolean(stream?.running);
+                });
+                Object.keys(luxriotCaptureRunningByChannel).forEach((key) => {
+                    delete luxriotCaptureRunningByChannel[key];
+                });
+                Object.assign(luxriotCaptureRunningByChannel, nextCaptureState);
+                const selectedChannelId = getSelectedLuxriotChannel();
+                if (!(String(selectedChannelId) in luxriotCaptureRunningByChannel)) {
+                    luxriotCaptureRunningByChannel[String(selectedChannelId)] = false;
+                }
+                updateLuxriotCaptureToggleButton(selectedChannelId);
                 try {
                     const probesResp = await fetch('/probes/list');
                     const probesData = await probesResp.json();
@@ -6131,6 +7002,10 @@ def home():
                     return;
                 }
                 renderLuxriotSummaries(data.logs || [], channelId);
+                setLuxriotCaptureRunning(channelId, Boolean(data.running));
+                if (channelId === getSelectedLuxriotChannel()) {
+                    updateLuxriotCaptureToggleButton(channelId);
+                }
                 const historyCount = Number(data.archived_log_count || 0);
                 const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
                 const stateLabel = data.running ? 'live' : 'stopped';
@@ -6163,19 +7038,22 @@ def home():
             }, 8000);
         }
 
-        async function startLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
+        async function startLuxriotCapture(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
             if (!channelId) {
                 setLuxriotStatus('Select a channel first', true);
                 return;
             }
+            await refreshLuxriotPromptSettings(false, channelId);
             const batchSize = luxriotBatchSizeSelect
                 ? parseInt(luxriotBatchSizeSelect.value, 10)
                 : luxriotDefaults.batchSize || 12;
             const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
             const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
             const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
-            luxriotStartCaptureBtn.disabled = true;
+            if (luxriotToggleCaptureBtn) {
+                luxriotToggleCaptureBtn.disabled = true;
+            }
             setLuxriotStatus('Starting summaries...');
             try {
                 const resp = await fetch('/luxriot/start_capture', {
@@ -6193,6 +7071,8 @@ def home():
                 if (!resp.ok || data.error) {
                     throw new Error(data.error || 'Luxriot start failed');
                 }
+                setLuxriotCaptureRunning(channelId, true);
+                updateLuxriotCaptureToggleButton(channelId);
                 setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
                 luxriotSummaryChannel = channelId;
                 luxriotSummaryFollowLive = true;
@@ -6205,12 +7085,17 @@ def home():
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             } finally {
-                luxriotStartCaptureBtn.disabled = false;
+                if (luxriotToggleCaptureBtn) {
+                    luxriotToggleCaptureBtn.disabled = false;
+                }
             }
         }
 
-        async function stopLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
+        async function stopLuxriotCapture(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
+            if (luxriotToggleCaptureBtn) {
+                luxriotToggleCaptureBtn.disabled = true;
+            }
             setLuxriotStatus('Stopping...');
             try {
                 const resp = await fetch('/luxriot/stop_capture', {
@@ -6222,11 +7107,30 @@ def home():
                 if (data.error) {
                     throw new Error(data.error);
                 }
+                setLuxriotCaptureRunning(channelId, false);
+                updateLuxriotCaptureToggleButton(channelId);
                 setLuxriotStatus('Summaries stopped');
                 refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
+            } finally {
+                if (luxriotToggleCaptureBtn) {
+                    luxriotToggleCaptureBtn.disabled = false;
+                }
+            }
+        }
+
+        async function toggleLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel first', true);
+                return;
+            }
+            if (isLuxriotCaptureRunning(channelId)) {
+                await stopLuxriotCapture(channelId);
+            } else {
+                await startLuxriotCapture(channelId);
             }
         }
 
@@ -6263,6 +7167,8 @@ def home():
             if (luxriotInitialized) return;
             luxriotInitialized = true;
             await fetchLuxriotChannels();
+            await refreshLuxriotPromptSettings();
+            updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
             updateSummaryControlsUI();
             setSummaryUnread(0);
             syncLuxriotSummaryChannelSelect();
@@ -6282,6 +7188,9 @@ def home():
         if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
             luxriotPromptInput.value = videoPromptInput.value;
         }
+        updateLuxriotBatchInfo();
+        setLuxriotPromptModalTab('stream');
+        updateLuxriotCaptureToggleButton(luxriotActiveChannel);
         function syncProbeChannelSelect() {
             if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
                 probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
@@ -6387,8 +7296,12 @@ def home():
             }
 
             if (result && result.is_detection) {
+                const probeName = String(result.probe_name || result.probe_id || result.filename || 'n/a').trim() || 'n/a';
                 const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
-                const channel = result.channel_id !== undefined && result.channel_id !== null ? String(result.channel_id) : 'n/a';
+                const channelId = parseInt(String(result.channel_id ?? ''), 10);
+                const channelName = Number.isFinite(channelId) ? getLuxriotChannelLabel(channelId) : (
+                    String(result.channel_name || result.channel_title || '').trim() || 'n/a'
+                );
                 const sev = result.severity ? escapeHtml(String(result.severity)) : 'n/a';
                 const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
                 const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
@@ -6397,17 +7310,21 @@ def home():
                 const mode = String(result.search_mode || '').trim().toUpperCase();
                 const clipSearch = Number.isFinite(result?.fusion?.clip_similarity) ? formatPercent(result.fusion.clip_similarity) : null;
                 const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
+                const safeChannelName = escapeHtml(channelName);
+                const safeProbeName = escapeHtml(probeName);
                 const lines = [
+                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Name:</span> <span class="metric-value metric-stream-name" title="${safeProbeName}">${safeProbeName}</span></div>`,
                     `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
-                    `<div class="metric-line"><span class="metric-label">Stream:</span> ${escapeHtml(channel)} · <span class="metric-label">Severity:</span> ${sev}</div>`,
-                    `<div class="metric-line"><span class="metric-label">Probe P/N/M:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
+                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Stream:</span> <span class="metric-value metric-stream-name" title="${safeChannelName}">${safeChannelName}</span></div>`,
+                    `<div class="metric-line"><span class="metric-label">Severity:</span> <span class="metric-value">${sev}</span></div>`,
+                    `<div class="metric-line"><span class="metric-label">Probe:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
                 ];
                 if (similarity) {
                     const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
-                    lines.push(`<div class="metric-line"><span class="metric-label">Search:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
+                    lines.push(`<div class="metric-line"><span class="metric-label">Match:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
                 }
                 if (clipSearch || dinoSearch) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">Search C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
+                    lines.push(`<div class="metric-line"><span class="metric-label">Match C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
                 }
                 return lines.join('');
             }
@@ -6527,9 +7444,11 @@ def home():
                 const channels = Array.isArray(data.channels) ? data.channels : [];
                 const options = [{ value: '', label: 'All streams' }];
                 channels.forEach((channel) => {
-                    const id = channel.channel_id ?? channel.id;
-                    if (id === undefined || id === null) return;
-                    const label = channel.name ? `${id} · ${channel.name}` : String(id);
+                    const rawId = channel.channel_id ?? channel.id;
+                    const id = parseInt(String(rawId || ''), 10);
+                    if (!Number.isFinite(id)) return;
+                    const label = normalizeLuxriotChannelName(channel, id);
+                    luxriotChannelNameById[String(id)] = label;
                     options.push({ value: String(id), label });
                 });
                 applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
@@ -6574,9 +7493,8 @@ def home():
             return (detections || []).map((det, idx) => {
                 const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
                 const probeLabel = det?.probe_name || det?.probe_id || 'probe';
-                const tsLabel = ts ? new Date(ts).toLocaleString() : 'n/a';
                 return {
-                    filename: `${probeLabel} · ${tsLabel}`,
+                    filename: String(probeLabel),
                     path: det?.image_path || det?.payload?.image_path || '',
                     thumbnail: det?.thumbnail || '',
                     is_detection: true,
@@ -6723,23 +7641,23 @@ def home():
 
         if (probeEditBtn && probeEditorModal) {
             probeEditBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'block';
+                setProbeEditorModalVisibility(true);
             });
         }
         if (closeProbeEditorBtn && probeEditorModal) {
             closeProbeEditorBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'none';
+                setProbeEditorModalVisibility(false);
             });
         }
         if (probeEditorCloseBtn && probeEditorModal) {
             probeEditorCloseBtn.addEventListener('click', () => {
-                probeEditorModal.style.display = 'none';
+                setProbeEditorModalVisibility(false);
             });
         }
         if (probeEditorModal) {
             probeEditorModal.addEventListener('click', (e) => {
                 if (e.target === probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
             });
         }
@@ -7133,21 +8051,56 @@ def home():
                 fetchLuxriotChannels(true).then(syncProbeChannelSelect);
             });
         }
-        if (luxriotPreviewBtn) {
-            luxriotPreviewBtn.addEventListener('click', () => {
-                fetchLuxriotChannels();
-                syncProbeChannelSelect();
-                startLuxriotPreview();
-            });
-        }
-        if (luxriotStartCaptureBtn) {
-            luxriotStartCaptureBtn.addEventListener('click', startLuxriotCapture);
-        }
-        if (luxriotStopCaptureBtn) {
-            luxriotStopCaptureBtn.addEventListener('click', stopLuxriotCapture);
+        if (luxriotToggleCaptureBtn) {
+            luxriotToggleCaptureBtn.addEventListener('click', toggleLuxriotCapture);
         }
         if (luxriotFlushCaptureBtn) {
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
+        }
+        if (luxriotPromptSettingsBtn) {
+            luxriotPromptSettingsBtn.addEventListener('click', openLuxriotPromptModal);
+        }
+        if (closeLuxriotPromptModalBtn) {
+            closeLuxriotPromptModalBtn.addEventListener('click', closeLuxriotPromptModal);
+        }
+        if (luxriotPromptCloseBtn) {
+            luxriotPromptCloseBtn.addEventListener('click', closeLuxriotPromptModal);
+        }
+        if (luxriotPromptApplyBtn) {
+            luxriotPromptApplyBtn.addEventListener('click', async () => {
+                try {
+                    await applyLuxriotPromptModal();
+                    closeLuxriotPromptModal();
+                } catch (err) {
+                    setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                }
+            });
+        }
+        if (luxriotPromptModalInput) {
+            luxriotPromptModalInput.addEventListener('keydown', async (event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'enter') {
+                    event.preventDefault();
+                    try {
+                        await applyLuxriotPromptModal();
+                        closeLuxriotPromptModal();
+                    } catch (err) {
+                        setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                    }
+                }
+            });
+        }
+        luxriotPromptTabButtons.forEach((button) => {
+            button.addEventListener('click', () => {
+                const tab = button.dataset.luxriotPromptTab || 'stream';
+                setLuxriotPromptModalTab(tab);
+            });
+        });
+        if (luxriotPromptModal) {
+            luxriotPromptModal.addEventListener('click', (event) => {
+                if (event.target === luxriotPromptModal) {
+                    closeLuxriotPromptModal();
+                }
+            });
         }
         if (luxriotRefreshSummariesBtn) {
             luxriotRefreshSummariesBtn.addEventListener('click', async () => {
@@ -7457,6 +8410,8 @@ def home():
                 syncProbeChannelSelect();
                 syncLuxriotSummaryChannelSelect();
                 setSummaryBaseLevel(luxriotSummaryLevel);
+                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
+                void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
                 startLuxriotPreview();
                 refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
@@ -7470,6 +8425,262 @@ def home():
             probeStatus.classList.toggle('error', Boolean(isError));
         }
 
+        function getSelectedProbeChannelId() {
+            const parsed = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            return Number.isFinite(parsed) ? parsed : luxriotActiveChannel;
+        }
+
+        function getProbeRuntimeState(channelId) {
+            const state = probeChannelRuntime[channelId];
+            if (state === 'running' || state === 'paused' || state === 'idle') {
+                return state;
+            }
+            return 'idle';
+        }
+
+        function updateProbeStreamToggleButton(channelIdOverride = null) {
+            if (!probeStreamToggleBtn) return;
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
+            const runtimeState = getProbeRuntimeState(channelId);
+            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : (runtimeState === 'running');
+            probeStreamToggleBtn.textContent = enabled ? 'Stop Stream' : 'Start Stream';
+            probeStreamToggleBtn.classList.toggle('primary', !enabled);
+        }
+
+        function updateProbeCaptureMeta(channelId, statusData = null) {
+            const runtimeState = getProbeRuntimeState(channelId);
+            const streamLabel = runtimeState === 'running' ? 'ok' : (runtimeState === 'paused' ? 'paused' : 'idle');
+            let captureLabel = 'idle';
+            const frameCount = Number(statusData?.frames);
+            if (runtimeState === 'running') {
+                captureLabel = Number.isFinite(frameCount) && frameCount > 0 ? 'ok' : 'warming';
+            } else if (runtimeState === 'paused') {
+                captureLabel = 'paused';
+            }
+            if (probeCaptureStatus) {
+                probeCaptureStatus.textContent = `Stream: ${streamLabel} | Capture: ${captureLabel}`;
+            }
+            if (probeBufferInfo && statusData) {
+                const lastTs = statusData.last_timestamp_ms ? new Date(statusData.last_timestamp_ms).toLocaleString() : 'n/a';
+                probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
+            }
+            updateProbeStreamToggleButton(channelId);
+        }
+
+        function normalizeProbeRoiNorm(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+            const x = Number.parseFloat(raw.x);
+            const y = Number.parseFloat(raw.y);
+            const w = Number.parseFloat(raw.w);
+            const h = Number.parseFloat(raw.h);
+            if (![x, y, w, h].every((value) => Number.isFinite(value))) return null;
+            const minSide = 0.02;
+            let nx = Math.min(1, Math.max(0, x));
+            let ny = Math.min(1, Math.max(0, y));
+            let nw = Math.min(1, Math.max(0, w));
+            let nh = Math.min(1, Math.max(0, h));
+            if (nw < minSide || nh < minSide) return null;
+            if (nx + nw > 1) nx = Math.max(0, 1 - nw);
+            if (ny + nh > 1) ny = Math.max(0, 1 - nh);
+            return {
+                x: Number(nx.toFixed(6)),
+                y: Number(ny.toFixed(6)),
+                w: Number(nw.toFixed(6)),
+                h: Number(nh.toFixed(6)),
+            };
+        }
+
+        function getProbePreviewGeometry() {
+            if (!probePreviewViewport || !probePreviewImg) return null;
+            const viewportRect = probePreviewViewport.getBoundingClientRect();
+            const viewportWidth = viewportRect.width;
+            const viewportHeight = viewportRect.height;
+            if (!(viewportWidth > 1) || !(viewportHeight > 1)) return null;
+            const naturalWidth = probePreviewImg.naturalWidth || 0;
+            const naturalHeight = probePreviewImg.naturalHeight || 0;
+            if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
+                return {
+                    viewportRect,
+                    viewportWidth,
+                    viewportHeight,
+                    imageWidth: viewportWidth,
+                    imageHeight: viewportHeight,
+                    imageOffsetX: 0,
+                    imageOffsetY: 0,
+                };
+            }
+            const scale = Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
+            const imageWidth = naturalWidth * scale;
+            const imageHeight = naturalHeight * scale;
+            return {
+                viewportRect,
+                viewportWidth,
+                viewportHeight,
+                imageWidth,
+                imageHeight,
+                imageOffsetX: (viewportWidth - imageWidth) / 2,
+                imageOffsetY: (viewportHeight - imageHeight) / 2,
+            };
+        }
+
+        function viewportPointToProbeNorm(clientX, clientY) {
+            const geom = getProbePreviewGeometry();
+            if (!geom) return null;
+            const px = clientX - geom.viewportRect.left;
+            const py = clientY - geom.viewportRect.top;
+            const nx = (px - geom.imageOffsetX) / geom.imageWidth;
+            const ny = (py - geom.imageOffsetY) / geom.imageHeight;
+            return {
+                x: Math.min(1, Math.max(0, nx)),
+                y: Math.min(1, Math.max(0, ny)),
+            };
+        }
+
+        function probeNormToViewportRect(roiNorm) {
+            const norm = normalizeProbeRoiNorm(roiNorm);
+            const geom = getProbePreviewGeometry();
+            if (!norm || !geom) return null;
+            const left = geom.imageOffsetX + (norm.x * geom.imageWidth);
+            const top = geom.imageOffsetY + (norm.y * geom.imageHeight);
+            const right = left + (norm.w * geom.imageWidth);
+            const bottom = top + (norm.h * geom.imageHeight);
+            const clampedLeft = Math.max(0, Math.min(geom.viewportWidth, left));
+            const clampedTop = Math.max(0, Math.min(geom.viewportHeight, top));
+            const clampedRight = Math.max(0, Math.min(geom.viewportWidth, right));
+            const clampedBottom = Math.max(0, Math.min(geom.viewportHeight, bottom));
+            if (clampedRight - clampedLeft < 2 || clampedBottom - clampedTop < 2) return null;
+            return {
+                left: clampedLeft,
+                top: clampedTop,
+                width: clampedRight - clampedLeft,
+                height: clampedBottom - clampedTop,
+            };
+        }
+
+        function renderProbeRoiBox() {
+            if (!probeRoiBox) return;
+            const candidate = probeRoiDraftNorm || probeRoiNorm;
+            if (!probeRoiEnabled || !candidate) {
+                probeRoiBox.classList.remove('active');
+                probeRoiBox.style.display = 'none';
+                return;
+            }
+            const rect = probeNormToViewportRect(candidate);
+            if (!rect) {
+                probeRoiBox.classList.remove('active');
+                probeRoiBox.style.display = 'none';
+                return;
+            }
+            probeRoiBox.style.display = 'block';
+            probeRoiBox.classList.add('active');
+            probeRoiBox.style.left = `${rect.left}px`;
+            probeRoiBox.style.top = `${rect.top}px`;
+            probeRoiBox.style.width = `${rect.width}px`;
+            probeRoiBox.style.height = `${rect.height}px`;
+        }
+
+        function updateProbeRoiUi() {
+            const normalized = normalizeProbeRoiNorm(probeRoiNorm);
+            if (probeRoiToggleBtn) {
+                probeRoiToggleBtn.textContent = probeRoiEnabled ? 'ROI ON' : 'ROI OFF';
+                probeRoiToggleBtn.classList.toggle('primary', probeRoiEnabled);
+            }
+            if (probeRoiClearBtn) {
+                probeRoiClearBtn.disabled = !normalized;
+            }
+            if (probeRoiLayer) {
+                probeRoiLayer.classList.toggle('active', probeRoiEnabled);
+            }
+            if (probeRoiInfo) {
+                if (!probeRoiEnabled) {
+                    probeRoiInfo.textContent = 'Full frame matching';
+                } else if (normalized) {
+                    const pct = (value) => `${Math.round(value * 100)}%`;
+                    probeRoiInfo.textContent = `ROI ${pct(normalized.w)} × ${pct(normalized.h)} @ ${pct(normalized.x)}, ${pct(normalized.y)}`;
+                } else {
+                    probeRoiInfo.textContent = 'ROI enabled, draw on preview';
+                }
+            }
+            renderProbeRoiBox();
+        }
+
+        function applyProbeRoiState(enabled, roiNorm) {
+            const normalized = normalizeProbeRoiNorm(roiNorm);
+            probeRoiEnabled = Boolean(enabled);
+            probeRoiNorm = normalized;
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            updateProbeRoiUi();
+        }
+
+        function clearProbeRoi(keepEnabled = true) {
+            probeRoiNorm = null;
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            probeRoiEnabled = Boolean(keepEnabled);
+            updateProbeRoiUi();
+        }
+
+        function stopProbeRoiDraw(commit) {
+            if (probeRoiLayer && probeRoiDrawState && Number.isFinite(probeRoiDrawState.pointerId)) {
+                try {
+                    probeRoiLayer.releasePointerCapture(probeRoiDrawState.pointerId);
+                } catch (_) {
+                    // ignore
+                }
+            }
+            if (commit) {
+                const normalized = normalizeProbeRoiNorm(probeRoiDraftNorm);
+                if (probeRoiEnabled && normalized) {
+                    probeRoiNorm = normalized;
+                }
+            }
+            probeRoiDraftNorm = null;
+            probeRoiDrawState = null;
+            updateProbeRoiUi();
+        }
+
+        function beginProbeRoiDraw(event) {
+            if (!probeRoiEnabled || !probeRoiLayer) return;
+            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
+            if (!point) return;
+            event.preventDefault();
+            probeRoiDrawState = {
+                pointerId: event.pointerId,
+                startX: point.x,
+                startY: point.y,
+                currentX: point.x,
+                currentY: point.y,
+            };
+            probeRoiDraftNorm = {
+                x: point.x,
+                y: point.y,
+                w: 0.001,
+                h: 0.001,
+            };
+            probeRoiLayer.setPointerCapture(event.pointerId);
+            renderProbeRoiBox();
+        }
+
+        function updateProbeRoiDraw(event) {
+            if (!probeRoiEnabled || !probeRoiDrawState) return;
+            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
+            if (!point) return;
+            probeRoiDrawState.currentX = point.x;
+            probeRoiDrawState.currentY = point.y;
+            const x0 = Math.min(probeRoiDrawState.startX, probeRoiDrawState.currentX);
+            const y0 = Math.min(probeRoiDrawState.startY, probeRoiDrawState.currentY);
+            const x1 = Math.max(probeRoiDrawState.startX, probeRoiDrawState.currentX);
+            const y1 = Math.max(probeRoiDrawState.startY, probeRoiDrawState.currentY);
+            probeRoiDraftNorm = {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            };
+            renderProbeRoiBox();
+        }
+
         function setPreviewState(text, clearImage = false) {
             if (probePreviewOverlay) {
                 probePreviewOverlay.style.display = text ? 'flex' : 'none';
@@ -7478,6 +8689,7 @@ def home():
             if (clearImage && probePreviewImg) {
                 probePreviewImg.src = '';
             }
+            renderProbeRoiBox();
         }
 
         function stopProbePreview() {
@@ -7485,25 +8697,60 @@ def home():
                 clearInterval(probePreviewTimer);
                 probePreviewTimer = null;
             }
+            probePreviewChannelId = null;
         }
 
         function startProbePreview(channelId) {
             if (!probePreviewImg) return;
+            if (probePreviewTimer && probePreviewChannelId === channelId) return;
             stopProbePreview();
             if (!channelId && channelId !== 0) {
                 setPreviewState('No channel', true);
                 return;
             }
-            if (probeStreamState) probeStreamState.textContent = `Streaming channel ${channelId}`;
             const refresh = () => {
                 if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
                 probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
             };
-            probePreviewImg.onload = () => setPreviewState('');
+            probePreviewImg.onload = () => {
+                setPreviewState('');
+                renderProbeRoiBox();
+            };
             probePreviewImg.onerror = () => setPreviewState('Preview failed');
+            probePreviewChannelId = channelId;
             refresh();
             const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
             probePreviewTimer = setInterval(refresh, intervalMs);
+        }
+
+        function syncProbePreview(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
+            if (!probeEditorModal || probeEditorModal.style.display !== 'block') {
+                stopProbePreview();
+                return;
+            }
+            if (!channelId && channelId !== 0) {
+                stopProbePreview();
+                setPreviewState('No channel', true);
+                return;
+            }
+            const runtimeState = getProbeRuntimeState(channelId);
+            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : true;
+            if (enabled && runtimeState === 'running') {
+                startProbePreview(channelId);
+                setPreviewState('');
+                return;
+            }
+            stopProbePreview();
+            if (!enabled) {
+                setPreviewState('Probe disabled');
+                return;
+            }
+            if (runtimeState === 'paused') {
+                setPreviewState('Paused');
+                return;
+            }
+            setPreviewState('No stream');
         }
 
         function ensurePairsSeed() {
@@ -7511,13 +8758,12 @@ def home():
                 probePairsState = [
                     { pos: '', neg: '' },
                     { pos: '', neg: '' },
-                    { pos: '', neg: '' },
                 ];
             }
         }
 
         function renderPairs() {
-            if (!probePairsContainer) return;
+            if (!probePairRows) return;
             ensurePairsSeed();
             const rows = probePairsState.map((row, idx) => {
                 const canRemove = probePairsState.length > 1;
@@ -7531,14 +8777,14 @@ def home():
                     </div>
                 `;
             }).join('');
-            probePairsContainer.innerHTML = `
-                <div class="probe-pairs-header">
-                    <div></div>
-                    <div>Positive Examples:</div>
-                    <div>Negative Examples:</div>
+            probePairRows.innerHTML = `
+                ${rows}
+                <div class="probe-pair-row probe-pair-add-row">
+                    <div class="probe-pair-idx">${probePairsState.length + 1}.</div>
+                    <button type="button" class="feature-btn probe-add-pair-btn" data-add-pair="1">Add pair</button>
+                    <div class="probe-add-empty"></div>
                     <div class="probe-pairs-spacer">&nbsp;</div>
                 </div>
-                ${rows}
             `;
         }
 
@@ -7559,6 +8805,13 @@ def home():
                 probeImageFileName.textContent = label;
                 probeImageFileName.title = probeImageState?.name ? String(probeImageState.name) : '';
             }
+        }
+
+        function clearProbeImageSelection() {
+            probeImageState = null;
+            if (probeImageFile) probeImageFile.value = '';
+            applyImageThumb('');
+            updateImageProbeStatus(false);
         }
 
         function setArchiveUploadName(file) {
@@ -7603,24 +8856,35 @@ def home():
         }
 
         function updateImageProbeStatus(enabled) {
-            imageProbeEnabled = enabled && Boolean(probeImageState?.data);
-            if (probeImageEnableBtn) {
-                probeImageEnableBtn.textContent = imageProbeEnabled ? 'Disable Image Probe' : 'Enable Image Probe';
+            const hasImage = Boolean(probeImageState?.data);
+            imageProbeEnabled = Boolean(enabled && hasImage);
+            if (probeImageEnableToggle) {
+                probeImageEnableToggle.checked = imageProbeEnabled;
+                probeImageEnableToggle.disabled = !hasImage;
+            }
+            if (probeImageClearBtn) {
+                probeImageClearBtn.disabled = !hasImage;
+            }
+            if (probeImageClearRow) {
+                probeImageClearRow.classList.toggle('is-hidden', !hasImage);
             }
             if (probeImageStatus) {
-                probeImageStatus.textContent = `Status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}`;
+                const imageState = hasImage ? 'Ok' : 'Missing';
+                probeImageStatus.textContent = `Probe status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}; Image: ${imageState}.`;
             }
         }
 
         function collectProbeForm() {
             const positives = [];
             const negatives = [];
+            const normalizedRoi = normalizeProbeRoiNorm(probeRoiNorm);
+            const roiActive = Boolean(probeRoiEnabled && normalizedRoi);
             ensurePairsSeed();
             probePairsState.forEach((row) => {
                 if (row.pos?.trim()) positives.push(row.pos.trim());
                 if (row.neg?.trim()) negatives.push(row.neg.trim());
             });
-            const channelId = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            const channelId = getSelectedProbeChannelId();
             return {
                 id: activeProbeId,
                 name: (probeNameInput?.value || '').trim(),
@@ -7631,9 +8895,9 @@ def home():
                 pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
                 margin: parseFloat(probeMarginInput?.value) || 0.05,
                 top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
-                window_sec: parseFloat(probeWindowSec?.value) || 300,
-                fps: parseFloat(probeFps?.value) || 0,
-                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'critical',
+                window_sec: parseFloat(probeWindowSecInput?.value) || 300,
+                fps: parseFloat(probeFpsInput?.value) || 0,
+                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'info',
                 bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
                 enabled: probeEnableToggle ? probeEnableToggle.checked : true,
                 image_probe: {
@@ -7642,6 +8906,8 @@ def home():
                     pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
                     enabled: imageProbeEnabled,
                 },
+                roi_enabled: roiActive,
+                roi_norm: roiActive ? normalizedRoi : null,
             };
         }
 
@@ -7816,13 +9082,13 @@ def home():
             if (probeNameInput) probeNameInput.value = (probe && probe.name) || '';
             if (probeChannelSelect && probe && probe.channel_id) {
                 probeChannelSelect.value = probe.channel_id;
-                startProbePreview(probe.channel_id);
+                syncProbePreview(probe.channel_id);
             }
             if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
             if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
-            if (probeFps) probeFps.value = probe?.fps ?? 0;
-            if (probeWindowSec) probeWindowSec.value = probe?.window_sec ?? 300;
-            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'critical';
+            if (probeFpsInput) probeFpsInput.value = probe?.fps ?? 0;
+            if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
             if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
             if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
             probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
@@ -7833,10 +9099,15 @@ def home():
                 const enabled = probe.image_probe.enabled !== false;
                 updateImageProbeStatus(enabled);
             } else {
-                probeImageState = null;
-                applyImageThumb('');
-                updateImageProbeStatus(false);
+                clearProbeImageSelection();
             }
+            const legacyRoi = probe && probe.roi && typeof probe.roi === 'object' ? probe.roi : null;
+            const savedRoiNorm = probe?.roi_norm || (legacyRoi ? (legacyRoi.norm || legacyRoi) : null);
+            const hasSavedRoiNorm = Boolean(normalizeProbeRoiNorm(savedRoiNorm));
+            const savedRoiEnabled = (probe?.roi_enabled === true)
+                || (legacyRoi && legacyRoi.enabled === true)
+                || (probe?.roi_enabled == null && (!legacyRoi || legacyRoi.enabled == null) && hasSavedRoiNorm);
+            applyProbeRoiState(savedRoiEnabled, savedRoiNorm);
             renderPairs();
             const initialHits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
                 ? probe.recent_hits
@@ -7848,6 +9119,7 @@ def home():
                 probe?.window_sec ?? null,
                 { key, replace: true, resetOffset: true }
             );
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
             renderProbeCards();
             setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
         }
@@ -7909,21 +9181,35 @@ def home():
             }
         }
 
-        async function ensureProbeCapture(channelId, quiet = false) {
-            if (!channelId && channelId !== 0) return;
+        async function ensureProbeCapture(channelId, quiet = false, options = null) {
+            if (!channelId && channelId !== 0) return false;
+            const forceStart = Boolean(options && options.forceStart);
+            if (!forceStart && probeCaptureManualStop[channelId]) {
+                probeChannelRuntime[channelId] = 'idle';
+                updateProbeCaptureMeta(channelId);
+                syncProbePreview(channelId);
+                if (!quiet) {
+                    setProbeStatus('Stream stopped. Press Start Stream to resume.');
+                }
+                return false;
+            }
             await refreshProbeRuntimeState(false);
             const runtimeState = probeChannelRuntime[channelId];
             if (runtimeState === 'running') {
                 probeCaptureState[channelId] = true;
-                if (probeCaptureStatus && !quiet) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                delete probeCaptureManualStop[channelId];
+                updateProbeCaptureMeta(channelId);
                 setPreviewState('');
-                startProbePreview(channelId);
-                return;
+                syncProbePreview(channelId);
+                if (!quiet) {
+                    await refreshProbeStatus(channelId);
+                }
+                return true;
             }
             try {
                 channelCaptureConfig[channelId] = {
-                    fps: parseFloat(probeFps?.value) || 0,
-                    windowSec: parseFloat(probeWindowSec?.value) || 300,
+                    fps: parseFloat(probeFpsInput?.value) || 0,
+                    windowSec: parseFloat(probeWindowSecInput?.value) || 300,
                 };
                 const resp = await fetch('/probes/start_capture', {
                     method: 'POST',
@@ -7938,13 +9224,20 @@ def home():
                 if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
                 probeCaptureState[channelId] = true;
                 probeChannelRuntime[channelId] = 'running';
+                delete probeCaptureManualStop[channelId];
                 renderProbeCards();
-                if (probeCaptureStatus) probeCaptureStatus.textContent = `Streaming channel ${channelId}`;
+                updateProbeCaptureMeta(channelId);
                 setPreviewState('');
-                startProbePreview(channelId);
+                syncProbePreview(channelId);
+                if (!quiet) {
+                    await refreshProbeStatus(channelId);
+                }
+                return true;
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
                 if (!quiet) setProbeStatus(err.message, true);
+                updateProbeStreamToggleButton(channelId);
+                return false;
             }
         }
 
@@ -7964,23 +9257,27 @@ def home():
                 delete probeCaptureState[channelId];
                 if (reason === 'paused') {
                     probeChannelRuntime[channelId] = 'paused';
+                    delete probeCaptureManualStop[channelId];
                     setPreviewState('Paused');
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Paused';
                 } else {
                     probeChannelRuntime[channelId] = 'idle';
-                    setPreviewState('Stopped', true);
-                    if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream stopped';
+                    probeCaptureManualStop[channelId] = true;
+                    setPreviewState('No stream');
                 }
                 renderProbeCards();
-                if (reason !== 'paused') stopProbePreview();
+                stopProbePreview();
+                syncProbePreview(channelId);
+                updateProbeCaptureMeta(channelId);
+                await refreshProbeStatus(channelId);
             } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = err.message;
+                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
                 setProbeStatus(err.message, true);
+                updateProbeStreamToggleButton(channelId);
             }
         }
 
         async function refreshProbeStatus(channelIdOverride) {
-            const channelId = channelIdOverride || parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
+            const channelId = channelIdOverride || getSelectedProbeChannelId();
             try {
                 const resp = await fetch(`/probes/status?channel_id=${channelId}`);
                 const data = await resp.json();
@@ -7992,17 +9289,7 @@ def home():
                     ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
                     : 'n/a';
                 setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
-                if (probeCaptureStatus) {
-                    probeCaptureStatus.textContent = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
-                }
-                if (probeBufferInfo) {
-                    const lastTs = data.last_timestamp_ms ? new Date(data.last_timestamp_ms).toLocaleTimeString() : 'n/a';
-                    probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
-                }
-                if (probeStreamState) {
-                    const pill = data.frames ? `Streaming channel ${channelId}` : 'Stream idle';
-                    probeStreamState.textContent = pill;
-                }
+                updateProbeCaptureMeta(channelId, data);
             } catch (err) {
                 setProbeStatus('Status error: ' + err.message, true);
             }
@@ -8028,9 +9315,13 @@ def home():
                 }
                 const saved = data.probe;
                 activeProbeId = saved.id || activeProbeId;
-            setProbeStatus(`Saved probe ${saved.name || saved.id}`);
-            await loadProbeList();
-            await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+                setProbeStatus(`Saved probe ${saved.name || saved.id}`);
+                await loadProbeList();
+                if (saved?.enabled !== false) {
+                    await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
+                } else {
+                    syncProbePreview(saved.channel_id || payload.channel_id);
+                }
             } catch (err) {
                 setProbeStatus(err.message, true);
             }
@@ -8047,7 +9338,11 @@ def home():
                 return;
             }
             const channelId = payload.channel_id;
-            await ensureProbeCapture(channelId, true);
+            const captureReady = await ensureProbeCapture(channelId, true);
+            if (!captureReady) {
+                if (!quiet) setProbeStatus('Stream stopped. Press Start Stream to resume.');
+                return;
+            }
             if (!quiet) setProbeStatus('Running...');
             probeRunInFlight = true;
             try {
@@ -8090,7 +9385,7 @@ def home():
             stopProbeRunLoop();
             updateRunButton(true);
             runActiveProbe(quiet);
-            const windowSec = parseFloat(probeWindowSec?.value) || 30;
+            const windowSec = parseFloat(probeWindowSecInput?.value) || 30;
             const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
             probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
             persistProbeEnabled(true);
@@ -8135,6 +9430,24 @@ def home():
             }
         }
 
+        function resetProbeDraftEditor() {
+            activeProbeId = null;
+            probePairsState = [];
+            clearProbeRoi(false);
+            clearProbeImageSelection();
+            renderPairs();
+            renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+            if (probeNameInput) probeNameInput.value = '';
+            if (probeEnableToggle) probeEnableToggle.checked = true;
+            if (probeBookmarkToggle) probeBookmarkToggle.checked = true;
+            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
+            if (probePosFloorInput) probePosFloorInput.value = '0.2';
+            if (probeMarginInput) probeMarginInput.value = '0.05';
+            if (probeFpsInput) probeFpsInput.value = '0';
+            if (probeWindowSecInput) probeWindowSecInput.value = '300';
+            updateProbeCaptureMeta(getSelectedProbeChannelId());
+        }
+
         function handleProbeCardClick(event) {
             const btn = event.target.closest('button[data-action]');
             if (!btn) return;
@@ -8145,7 +9458,7 @@ def home():
             if (action === 'expand' && probe) {
                 setActiveProbe(probe);
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             } else if (action === 'run' && probe) {
                 setActiveProbe(probe);
@@ -8161,16 +9474,10 @@ def home():
                 persistProbeEnabled(false);
                 stopProbeRunLoop();
             } else if (action === 'new') {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
-                if (probeEnableToggle) probeEnableToggle.checked = true;
+                resetProbeDraftEditor();
                 setProbeStatus('New probe');
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             }
         }
@@ -8193,54 +9500,77 @@ def home():
             probeSaveBtn.addEventListener('click', async () => {
                 const savedId = await saveActiveProbe();
                 if (savedId && probeEditorModal) {
-                    probeEditorModal.style.display = 'none';
+                    setProbeEditorModalVisibility(false);
                 }
             });
         }
         if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
             if (activeProbeId) deleteProbe(activeProbeId);
             else {
-                probePairsState = [];
-                probeImageState = null;
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+                resetProbeDraftEditor();
                 setProbeStatus('Cleared unsaved probe');
             }
         });
-        if (probeStartCaptureBtn) {
-            probeStartCaptureBtn.addEventListener('click', () => ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10)));
-        }
-        if (probeStopCaptureBtn) {
-            probeStopCaptureBtn.addEventListener('click', () => stopProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), 'paused'));
-        }
-        if (probeStopAllBtn) {
-            probeStopAllBtn.addEventListener('click', () => {
-                Object.keys(probeCaptureState).forEach((cid) => stopProbeCapture(parseInt(cid, 10), 'stopped'));
-                stopProbeRunLoop();
+        if (probeStreamToggleBtn) {
+            probeStreamToggleBtn.addEventListener('click', () => {
+                if (probeEnableToggle) {
+                    probeEnableToggle.checked = !probeEnableToggle.checked;
+                    probeEnableToggle.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                }
+                const channelId = getSelectedProbeChannelId();
+                ensureProbeCapture(channelId, false, { forceStart: true });
             });
         }
         if (probeChannelSelect) {
             probeChannelSelect.addEventListener('change', () => {
-                const cid = parseInt(probeChannelSelect.value || luxriotActiveChannel, 10);
-                startProbePreview(cid);
+                const cid = getSelectedProbeChannelId();
+                syncProbePreview(cid);
+                updateProbeCaptureMeta(cid);
+                refreshProbeStatus(cid);
             });
         }
+        if (probeRoiToggleBtn) {
+            probeRoiToggleBtn.addEventListener('click', () => {
+                probeRoiEnabled = !probeRoiEnabled;
+                if (!probeRoiEnabled) {
+                    probeRoiDraftNorm = null;
+                    probeRoiDrawState = null;
+                }
+                updateProbeRoiUi();
+            });
+        }
+        if (probeRoiClearBtn) {
+            probeRoiClearBtn.addEventListener('click', () => {
+                clearProbeRoi(true);
+            });
+        }
+        if (probeRoiLayer) {
+            probeRoiLayer.addEventListener('pointerdown', (event) => {
+                beginProbeRoiDraw(event);
+            });
+            probeRoiLayer.addEventListener('pointermove', (event) => {
+                updateProbeRoiDraw(event);
+            });
+            probeRoiLayer.addEventListener('pointerup', () => {
+                stopProbeRoiDraw(true);
+            });
+            probeRoiLayer.addEventListener('pointercancel', () => {
+                stopProbeRoiDraw(false);
+            });
+        }
+        window.addEventListener('resize', () => {
+            renderProbeRoiBox();
+        });
         if (probeCards) {
             probeCards.addEventListener('click', handleProbeCardClick);
         }
         if (probeNewBtn) {
             probeNewBtn.addEventListener('click', () => {
-                activeProbeId = null;
-                probePairsState = [];
-                probeImageState = null;
-                applyImageThumb('');
-                renderPairs();
-                renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
+                resetProbeDraftEditor();
                 setProbeStatus('New probe');
-                if (probeEnableToggle) probeEnableToggle.checked = true;
                 if (probeEditorModal) {
-                    probeEditorModal.style.display = 'block';
+                    setProbeEditorModalVisibility(true);
                 }
             });
         }
@@ -8258,9 +9588,7 @@ def home():
             probeImageFile.addEventListener('change', () => {
                 const file = probeImageFile.files && probeImageFile.files[0];
                 if (!file) {
-                    probeImageState = null;
-                    applyImageThumb('');
-                    updateImageProbeStatus(false);
+                    clearProbeImageSelection();
                     return;
                 }
                 const reader = new FileReader();
@@ -8273,11 +9601,12 @@ def home():
                 reader.readAsDataURL(file);
             });
         }
-        if (probeAddPairBtn && probePairsContainer) {
-            probeAddPairBtn.addEventListener('click', () => {
-                probePairsState.push({ pos: '', neg: '' });
-                renderPairs();
+        if (probeImageClearBtn) {
+            probeImageClearBtn.addEventListener('click', () => {
+                clearProbeImageSelection();
             });
+        }
+        if (probePairsContainer) {
             probePairsContainer.addEventListener('input', (e) => {
                 const target = e.target;
                 const idx = parseInt(target.getAttribute('data-idx') || '-1', 10);
@@ -8289,6 +9618,12 @@ def home():
                 }
             });
             probePairsContainer.addEventListener('click', (e) => {
+                const addBtn = e.target.closest('button[data-add-pair]');
+                if (addBtn) {
+                    probePairsState.push({ pos: '', neg: '' });
+                    renderPairs();
+                    return;
+                }
                 const btn = e.target.closest('button[data-remove]');
                 if (!btn) return;
                 const idx = parseInt(btn.getAttribute('data-remove') || '-1', 10);
@@ -8326,20 +9661,23 @@ def home():
                 const enabled = e.target.checked;
                 persistProbeEnabled(enabled);
                 if (enabled) {
-                    ensureProbeCapture(parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10), true);
+                    ensureProbeCapture(getSelectedProbeChannelId(), true);
                     runActiveProbe(true);
                 } else {
                     stopProbeRunLoop('Probe disabled');
                 }
+                syncProbePreview(getSelectedProbeChannelId());
+                updateProbeStreamToggleButton(getSelectedProbeChannelId());
             });
         }
-        if (probeImageEnableBtn) {
-            probeImageEnableBtn.addEventListener('click', () => {
+        if (probeImageEnableToggle) {
+            probeImageEnableToggle.addEventListener('change', () => {
                 if (!probeImageState?.data) {
+                    updateImageProbeStatus(false);
                     setProbeStatus('Select an image first.', true);
                     return;
                 }
-                updateImageProbeStatus(!imageProbeEnabled);
+                updateImageProbeStatus(Boolean(probeImageEnableToggle.checked));
             });
         }
         if (probeBenchBtn && probeBenchOutput) {
@@ -8358,6 +9696,7 @@ def home():
                 }
             });
         }
+        applyProbeRoiState(false, null);
 
         // Mode switching
         if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
@@ -8786,6 +10125,7 @@ def home():
             const safeFilename = escapeHtml(result.filename || 'unnamed');
             const rawPath = String(result.path || '');
             const hasPath = rawPath.length > 0;
+            const showFilenameRow = !(result && result.is_detection);
             const safePath = escapeHtml(rawPath);
             const thumb = String(result.thumbnail || '').trim();
             const fallbackSvg = encodeURIComponent(
@@ -8810,12 +10150,14 @@ def home():
                     </div>
                 </div>
                 <div class="result-info">
-                    <div class="filename">
-                        ${safeFilename}
-                        <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
-                            <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
-                        </svg>
-                    </div>
+                    ${showFilenameRow ? `
+                        <div class="filename">
+                            ${safeFilename}
+                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                            </svg>
+                        </div>
+                    ` : ''}
                     ${badgesMarkup}
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
@@ -9843,10 +11185,47 @@ def home():
     response_html = response_html.replace('{segments_enabled_checked}', segments_enabled_checked)
     response_html = response_html.replace('{segment_min_patches_default}', str(segment_min_patches_default))
     response_html = response_html.replace('{timestamp}', current_timestamp)
+    response_html = response_html.replace('{app_version}', html_lib.escape(str(config.APP_VERSION or ''), quote=False))
     response_html = response_html.replace('{lm_model}', html_lib.escape(str(config.LM_MODEL or ''), quote=True))
+    rollup_prompt_default = str(
+        getattr(
+            config,
+            "LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT",
+            getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", ""),
+        )
+        or ""
+    )
     response_html = response_html.replace(
         '{luxriot_system_prompt_default}',
         html_lib.escape(str(LUXRIOT_SYSTEM_PROMPT_DEFAULT or ''), quote=False),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l1}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l2}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l3}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_json_alert_prompt}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT),
+            quote=False,
+        ),
     )
     response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
     response_html = response_html.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
@@ -9869,6 +11248,15 @@ def favicon():
     icon_path = Path(__file__).resolve().parent / 'images' / 'favicon.ico'
     if icon_path.exists():
         return send_file(icon_path, mimetype='image/x-icon', max_age=86400)
+    return ('', 204)
+
+
+@app.route('/branding/logo')
+def branding_logo():
+    """Serve application branding logo."""
+    logo_path = Path(__file__).resolve().parent / 'images' / 'lxrt-logo-darktheme.png'
+    if logo_path.exists():
+        return send_file(logo_path, mimetype='image/png', max_age=86400)
     return ('', 204)
 
 
@@ -10167,23 +11555,95 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             'timestamp_ms': timestamp_ms,
         }
 
+    def _extract_balanced_json(blob: str, start_idx: int) -> Optional[Tuple[str, int]]:
+        if not isinstance(blob, str) or start_idx < 0 or start_idx >= len(blob):
+            return None
+        idx = start_idx
+        while idx < len(blob) and blob[idx] != '{':
+            idx += 1
+        if idx >= len(blob) or blob[idx] != '{':
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        end_idx = idx
+        while end_idx < len(blob):
+            ch = blob[end_idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return blob[idx:end_idx + 1], end_idx + 1
+            end_idx += 1
+        return None
+
     def _extract_candidates(blob: str) -> List[Any]:
         candidates: List[Any] = []
+        seen: Set[str] = set()
+
+        def _add_candidate(raw: Any) -> None:
+            try:
+                key = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                key = repr(raw)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(raw)
+
         try:
             parsed = json.loads(blob)
-            candidates.append(parsed)
+            _add_candidate(parsed)
         except Exception:
             pass
+
         for match in re.finditer(r"```json(.*?)```", blob, flags=re.DOTALL | re.IGNORECASE):
             try:
-                candidates.append(json.loads(match.group(1)))
+                _add_candidate(json.loads(match.group(1)))
             except Exception:
                 continue
-        for match in re.finditer(r"ALERTS_JSON:(\{.*?\})", blob, flags=re.DOTALL | re.IGNORECASE):
+
+        marker = "ALERTS_JSON:"
+        lowered = blob.lower()
+        marker_lower = marker.lower()
+        search_pos = 0
+        while True:
+            marker_idx = lowered.find(marker_lower, search_pos)
+            if marker_idx < 0:
+                break
+            start_idx = marker_idx + len(marker)
+            chunk = _extract_balanced_json(blob, start_idx)
+            if chunk:
+                json_blob, next_idx = chunk
+                try:
+                    _add_candidate(json.loads(json_blob))
+                except Exception:
+                    pass
+                search_pos = max(next_idx, marker_idx + 1)
+            else:
+                search_pos = marker_idx + 1
+
+        for match in re.finditer(r"\{\s*\"alerts\"\s*:", blob, flags=re.IGNORECASE):
+            chunk = _extract_balanced_json(blob, match.start())
+            if not chunk:
+                continue
+            json_blob, _ = chunk
             try:
-                candidates.append(json.loads(match.group(1)))
+                _add_candidate(json.loads(json_blob))
             except Exception:
                 continue
+
         return candidates
 
     alerts: List[Dict[str, Any]] = []
@@ -10196,39 +11656,69 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             if alerts:
                 break
 
-    if not alerts:
-        # Heuristic fallbacks
-        lowered = (text or '').lower()
-        threat_keywords = [
-            'weapon', 'gun', 'handgun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
-            'оружие', 'пистолет', 'револьвер', 'винтовк', 'нож', 'стрел', 'выстрел', 'агресс', 'драк', 'насили'
-        ]
-        phone_keywords = ['phone', 'call', 'talking on phone', 'звон', 'телефон', 'разговаривает по телефону']
-        pet_keywords = ['orl', 'orland', 'maz', 'cat', 'кот', 'кошка', 'питом']
-
-        def add_fallback(title: str, severity: str, reason: str) -> None:
-            val = _validate_alert(
-                {
-                    'title': title,
-                    'description': f"Heuristic trigger: {reason}. Summary snippet: {text.strip()[:200]}",
-                    'severity': severity,
-                    'state': 'new',
-                    'channel_id': default_channel_id,
-                    'timestamp_ms': now_ms,
-                }
-            )
-            if val:
-                alerts.append(val)
-
-        if any(k in lowered for k in threat_keywords):
-            add_fallback('Possible weapon or aggression detected', 'critical', 'weapon/aggression keywords')
-        elif any(k in lowered for k in phone_keywords):
-            add_fallback('Phone call detected', 'info', 'phone keywords')
-        elif any(k in lowered for k in pet_keywords):
-            add_fallback('Pet interaction detected', 'low', 'pet keywords')
-
     return alerts
 
+
+PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
+PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
+PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
+LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Event title\",\n"
+    "      \"description\": \"twitter-sized event description\",\n"
+    "      \"severity\": \"info\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": \"channel ID\",\n"
+    "      \"timestamp_ms\": 1772202050000\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT = (
+    "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
+    "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+)
+LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
+    "- If no trigger match: emit no JSON block.\n"
+    "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 1772202050000\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; timestamp_ms should be batch time in ms."
+)
+LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+    "You are a CCTV operator assistant for Luxriot.\n"
+    "Return Markdown with exactly these sections and order:\n"
+    "### Scene description\n"
+    "1-2 short paragraphs describing stable scene context.\n"
+    "### Activity description\n"
+    "1-2 short paragraphs describing what changed in this batch; reference snapshot numbers or timestamps when possible.\n"
+    "### Worth to remember\n"
+    "2-6 concise bullet points with context useful for future rollups.\n"
+    "Rules: separate routine baseline from deviations; keep it factual and concise; avoid repetition; "
+    "emit alerts JSON only when a Task-defined trigger is observed in this batch."
+)
+
+current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()
+if not current_stream_prompt:
+    config.LUXRIOT_SYSTEM_PROMPT_DEFAULT = LUXRIOT_SYSTEM_PROMPT_DEFAULT
+
+current_json_prompt = str(getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', '') or '').strip()
+if (not current_json_prompt) or (current_json_prompt == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip()):
+    config.LUXRIOT_ALERTS_JSON_PROMPT = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
 
 luxriot_manager = LuxriotManager(
     config=config,
@@ -10238,20 +11728,65 @@ luxriot_manager = LuxriotManager(
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
 )
-
-PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
-PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
-PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
-LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
-    "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
-    "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
-    "Always append a JSON block in this form (alerts may be empty, but must be present): "
-    "{ 'alerts': [ { 'title': 'short alert title', 'description': '1-2 sentence description with any time/frame hints', "
-    "'severity': 'info|low|normal|high|critical', 'state': 'new|inprogress|closed|hidden|none', "
-    "'channel_id': <channel id>, 'timestamp_ms': <milliseconds since epoch> } ] }. "
-    "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
-    "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
-)
+try:
+    with luxriot_manager.cache_lock:
+        changed_prompt_defaults = False
+        if not str(luxriot_manager.system_prompt or '').strip():
+            luxriot_manager.system_prompt = LUXRIOT_SYSTEM_PROMPT_DEFAULT
+            changed_prompt_defaults = True
+        if str(luxriot_manager.default_json_alert_prompt or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+            luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
+            changed_prompt_defaults = True
+        desired_rollup_prompts = {
+            'L1': str(getattr(config, 'LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT', '') or '').strip(),
+            'L2': str(getattr(config, 'LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT', '') or '').strip(),
+            'L3': str(getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', '') or '').strip(),
+        }
+        legacy_rollup_prompt = LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT.strip()
+        if (
+            not str(luxriot_manager.rollup_llm_system_prompt or '').strip()
+            or str(luxriot_manager.rollup_llm_system_prompt or '').strip() == legacy_rollup_prompt
+        ):
+            base_rollup_prompt = str(getattr(config, 'LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT', '') or '').strip()
+            if not base_rollup_prompt:
+                base_rollup_prompt = desired_rollup_prompts.get('L1') or legacy_rollup_prompt
+            luxriot_manager.rollup_llm_system_prompt = base_rollup_prompt
+            changed_prompt_defaults = True
+        for level in ('L1', 'L2', 'L3'):
+            current_level_prompt = str(luxriot_manager.rollup_llm_system_prompts.get(level) or '').strip()
+            default_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompt
+            if not current_level_prompt or current_level_prompt == legacy_rollup_prompt:
+                luxriot_manager.rollup_llm_system_prompts[level] = default_level_prompt
+                changed_prompt_defaults = True
+        for channel_id, raw_overrides in list(luxriot_manager.channel_prompt_overrides.items()):
+            if not isinstance(raw_overrides, Mapping):
+                continue
+            channel_overrides = dict(raw_overrides)
+            channel_changed = False
+            if str(channel_overrides.get('json_alert_prompt') or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+                channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
+                channel_changed = True
+            rollup_overrides_raw = channel_overrides.get('rollup_prompts')
+            if isinstance(rollup_overrides_raw, Mapping):
+                rollup_overrides = dict(rollup_overrides_raw)
+                rollup_changed = False
+                for level in ('L1', 'L2', 'L3'):
+                    raw_level_prompt = str(rollup_overrides.get(level) or '').strip()
+                    if (not raw_level_prompt) or raw_level_prompt == legacy_rollup_prompt:
+                        fallback_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompts.get(level, '')
+                        if fallback_level_prompt:
+                            rollup_overrides[level] = fallback_level_prompt
+                            rollup_changed = True
+                if rollup_changed:
+                    channel_overrides['rollup_prompts'] = rollup_overrides
+                    channel_changed = True
+            if channel_changed:
+                luxriot_manager.channel_prompt_overrides[int(channel_id)] = channel_overrides
+                changed_prompt_defaults = True
+        if changed_prompt_defaults:
+            luxriot_manager._persist_summary_state_locked()
+except Exception:
+    pass
 
 probe_manager = ProbeManager(
     embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
@@ -10856,6 +12391,7 @@ def _probe_daemon() -> None:
                     except Exception as exc:
                         print(f"Probe daemon failed to start capture for channel {ch}: {exc}")
                     for probe in plist:
+                        probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
                         result = probe_manager.query(
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
                             probe.get('positives', []),
@@ -10865,6 +12401,8 @@ def _probe_daemon() -> None:
                             probe.get('top_k', 6),
                             window_sec=probe.get('window_sec', 300.0),
                             image_probe=probe.get('image_probe'),
+                            roi_norm=probe_roi_norm if probe_roi_enabled else None,
+                            roi_padding=PROBE_ROI_PADDING,
                         )
                         if 'error' in result:
                             continue
@@ -10893,7 +12431,11 @@ def _probe_daemon() -> None:
                                 hits,
                                 source='probe_daemon',
                                 bookmark_sent=bookmark_sent,
-                                extra_payload={'frames_indexed': result.get('frames_indexed')},
+                                extra_payload={
+                                    'frames_indexed': result.get('frames_indexed'),
+                                    'roi_enabled': probe_roi_enabled,
+                                    'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+                                },
                             )
                             probes_store.upsert_probe(probe)
                 except Exception as exc:
@@ -12972,6 +14514,88 @@ def luxriot_start_capture():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/prompt_settings', methods=['GET', 'POST'])
+def luxriot_prompt_settings():
+    if request.method == 'GET':
+        channel_id = request.args.get('channel_id', default=None, type=int)
+        try:
+            return jsonify(luxriot_manager.get_prompt_settings(channel_id=channel_id))
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id'))
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+
+    stream_system_prompt: Optional[str] = None
+    if 'stream_system_prompt' in data:
+        raw_stream_prompt = data.get('stream_system_prompt')
+        stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
+    elif 'system_prompt' in data:
+        raw_stream_prompt = data.get('system_prompt')
+        stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
+
+    json_alert_prompt: Optional[str] = None
+    if 'json_alert_prompt' in data:
+        raw_json_prompt = data.get('json_alert_prompt')
+        json_alert_prompt = '' if raw_json_prompt is None else str(raw_json_prompt)
+    elif 'json_prompt' in data:
+        raw_json_prompt = data.get('json_prompt')
+        json_alert_prompt = '' if raw_json_prompt is None else str(raw_json_prompt)
+
+    bookmark_enabled: Optional[bool] = None
+    if 'bookmark_enabled' in data:
+        bookmark_enabled = _coerce_bool(data.get('bookmark_enabled'), default=False)
+    elif 'enable_bookmarks' in data:
+        bookmark_enabled = _coerce_bool(data.get('enable_bookmarks'), default=False)
+
+    bookmark_cooldown_sec: Optional[float] = None
+    if 'bookmark_cooldown_sec' in data:
+        try:
+            bookmark_cooldown_sec = max(0.0, float(data.get('bookmark_cooldown_sec')))
+        except Exception:
+            bookmark_cooldown_sec = 0.0
+    elif 'cooldown_sec' in data:
+        try:
+            bookmark_cooldown_sec = max(0.0, float(data.get('cooldown_sec')))
+        except Exception:
+            bookmark_cooldown_sec = 0.0
+
+    rollup_prompt_updates: Optional[Dict[str, Any]] = None
+    rollup_prompts_raw = data.get('rollup_prompts')
+    if isinstance(rollup_prompts_raw, Mapping):
+        rollup_prompt_updates = {
+            str(level): value
+            for level, value in rollup_prompts_raw.items()
+        }
+    else:
+        inline_updates: Dict[str, Any] = {}
+        for level in ('L1', 'L2', 'L3'):
+            field_name = f'rollup_prompt_{level.lower()}'
+            if field_name in data:
+                inline_updates[level] = data.get(field_name)
+        if inline_updates:
+            rollup_prompt_updates = inline_updates
+
+    try:
+        settings = luxriot_manager.update_prompt_settings(
+            channel_id=channel_id,
+            stream_system_prompt=stream_system_prompt,
+            rollup_prompts=rollup_prompt_updates,
+            json_alert_prompt=json_alert_prompt,
+            bookmark_enabled=bookmark_enabled,
+            bookmark_cooldown_sec=bookmark_cooldown_sec,
+        )
+        return jsonify({'success': True, **settings})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/luxriot/stop_capture', methods=['POST'])
 def luxriot_stop_capture():
     guard = _mutation_guard_error()
@@ -13161,6 +14785,7 @@ def probes_query():
         window_sec = float(data.get('window_sec', 0))
     except Exception:
         window_sec = 0
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
     probe_like = {
         "id": data.get('id'),
         "name": (data.get('name') or 'probe'),
@@ -13169,6 +14794,8 @@ def probes_query():
         "bookmark": bool(data.get('bookmark')),
         "window_sec": window_sec,
         "fps": data.get('fps'),
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
     }
     result = probe_manager.query(
         channel_id,
@@ -13179,6 +14806,8 @@ def probes_query():
         top_k,
         window_sec=window_sec,
         image_probe=data.get('image_probe'),
+        roi_norm=probe_roi_norm if probe_roi_enabled else None,
+        roi_padding=PROBE_ROI_PADDING,
     )
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
@@ -13206,7 +14835,11 @@ def probes_query():
             hits,
             source='probes_query',
             bookmark_sent=bookmark_sent,
-            extra_payload={'frames_indexed': result.get('frames_indexed')},
+            extra_payload={
+                'frames_indexed': result.get('frames_indexed'),
+                'roi_enabled': probe_roi_enabled,
+                'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+            },
         )
     else:
         result['persisted_hits'] = 0
@@ -13293,6 +14926,8 @@ def probes_save():
         except Exception:
             return default
 
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
+
     probe = {
         "id": data.get('id') or None,
         "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
@@ -13307,6 +14942,8 @@ def probes_save():
         "bookmark": bool(data.get('bookmark', True)),
         "enabled": bool(data.get('enabled', True)),
         "image_probe": image_probe,
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
         "pairs": data.get('pairs') or [],
         "last_hit": data.get('last_hit'),
         "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
@@ -13349,6 +14986,7 @@ def probes_run():
     probe = probes.get(probe_id)
     if not probe:
         return jsonify({'error': 'Probe not found'}), 404
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
     result = probe_manager.query(
         probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
         probe.get('positives', []),
@@ -13358,6 +14996,8 @@ def probes_run():
         probe.get('top_k', 6),
         window_sec=probe.get('window_sec', 300.0),
         image_probe=probe.get('image_probe'),
+        roi_norm=probe_roi_norm if probe_roi_enabled else None,
+        roi_padding=PROBE_ROI_PADDING,
     )
     if 'error' in result:
         return jsonify(result), 400
@@ -13388,7 +15028,11 @@ def probes_run():
             hits,
             source='probes_run',
             bookmark_sent=bookmark_sent,
-            extra_payload={'frames_indexed': result.get('frames_indexed')},
+            extra_payload={
+                'frames_indexed': result.get('frames_indexed'),
+                'roi_enabled': probe_roi_enabled,
+                'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+            },
         )
     else:
         persisted_hits = 0
@@ -13939,6 +15583,7 @@ def get_settings():
             'host': config.HOST,
             'port': config.PORT,
             'debug': config.DEBUG,
+            'appVersion': config.APP_VERSION,
             'embedder': requested_embedder,
             'clipModel': config.CLIP_MODEL,
             'dinoModel': config.DINO_MODEL,
@@ -14119,6 +15764,7 @@ def save_settings():
 EVOSSEARCH_HOST={data['host']}
 EVOSSEARCH_PORT={port}
 EVOSSEARCH_DEBUG={str(debug_enabled).lower()}
+EVOSSEARCH_APP_VERSION="{config.APP_VERSION}"
 
 # Embedder configuration
 EVOSSEARCH_EMBEDDER={embedder}

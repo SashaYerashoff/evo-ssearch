@@ -1,10 +1,22 @@
-# SISU (Smart Image Search and Understanding)
+# Luxriot EVA AI (Smart Image Search and Understanding)
 
-SISU is a CLIP/DINO visual search and monitoring PoC for Luxriot-integrated workflows. It combines:
+Luxriot EVA AI is a CLIP/DINO visual search and monitoring PoC for Luxriot-integrated workflows. It combines:
 
 - Archive research over indexed folders and detections archive
 - Video understanding via OpenAI-compatible vision models (LM Studio/vLLM)
 - Live monitoring with probe-based tracking and bookmark actions
+
+## Version
+
+- Current version: `α 0.4.2`
+- Source of truth: `VERSION` (UI reads it at runtime; optional override via `EVOSSEARCH_APP_VERSION`)
+
+### Versioning Policy
+
+- `major.minor.patch` (shown in UI with alpha prefix, e.g. `α 0.4.2`)
+- New feature branch work: increment `minor`
+- Minor adjustments inside a branch: increment `patch`
+- Merge to `main`: increment `major`, reset `minor` and `patch` to `0`
 
 ## Current Scope
 
@@ -118,7 +130,7 @@ EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
 EVOSSEARCH_M2F_ENABLED=false
 ```
 
-5. Start SISU.
+5. Start Luxriot EVA AI.
 
 ```powershell
 python oldapp.py
@@ -193,15 +205,15 @@ UI convenience:
 
 ### Luxriot Evo Bookmark Setup (Integration)
 
-Use this checklist to ensure bookmarks sent by SISU are accepted and visible in Luxriot Evo.
+Use this checklist to ensure bookmarks sent by Luxriot EVA AI are accepted and visible in Luxriot Evo.
 
 1. Prepare Luxriot API access.
-   - Confirm Luxriot base URL is reachable from SISU host (example: `http://<luxriot-host>:8080`).
+   - Confirm Luxriot base URL is reachable from Luxriot EVA AI host (example: `http://<luxriot-host>:8080`).
    - Use a Luxriot user that has permissions to:
      - read channels/snapshots
      - create bookmarks/events
-   - SISU uses HTTP Digest auth for Luxriot API calls.
-2. Configure SISU connection values.
+   - Luxriot EVA AI uses HTTP Digest auth for Luxriot API calls.
+2. Configure Luxriot EVA AI connection values.
    - Set `EVOSSEARCH_LUXRIOT_BASE_URL`
    - Set `EVOSSEARCH_LUXRIOT_USERNAME`
    - Set `EVOSSEARCH_LUXRIOT_PASSWORD`
@@ -212,12 +224,12 @@ Use this checklist to ensure bookmarks sent by SISU are accepted and visible in 
      - `EVOSSEARCH_LUXRIOT_SEV_NORMAL`
      - `EVOSSEARCH_LUXRIOT_SEV_HIGH`
      - `EVOSSEARCH_LUXRIOT_SEV_CRITICAL`
-3. Restart SISU after config/env changes.
+3. Restart Luxriot EVA AI after config/env changes.
 4. Verify Luxriot connectivity in UI.
    - Open `Video Understanding` or `Monitoring`.
    - Click channel reload and preview.
    - If channels/snapshots fail, fix connection/auth first.
-5. Send a direct test bookmark through SISU.
+5. Send a direct test bookmark through Luxriot EVA AI.
 
 ```bash
 curl -X POST "http://localhost:5000/luxriot/bookmark" \
@@ -225,8 +237,8 @@ curl -X POST "http://localhost:5000/luxriot/bookmark" \
   -H "X-Admin-Token: <your-admin-token>" \
   -d '{
     "channel_id": 103,
-    "title": "SISU integration test",
-    "description": "Bookmark created by SISU /luxriot/bookmark",
+    "title": "Luxriot EVA AI integration test",
+    "description": "Bookmark created by Luxriot EVA AI /luxriot/bookmark",
     "severity": "normal",
     "state": "new"
   }'
@@ -252,6 +264,7 @@ Effective variables currently used by app/config:
 EVOSSEARCH_HOST=0.0.0.0
 EVOSSEARCH_PORT=5000
 EVOSSEARCH_DEBUG=false
+EVOSSEARCH_APP_VERSION="α 0.4.2"
 
 # Embedder/index
 EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion
@@ -340,7 +353,7 @@ Notes:
 - CORS is not globally open by default; set `EVOSSEARCH_CORS_ALLOWED_ORIGINS` explicitly.
 - `.env` edits require restart for full consistency.
 - `EVOSSEARCH_CLIP_MODEL` supports OpenAI CLIP names and SigLIP2 HF IDs.
-- If a SigLIP2 model fails to load, SISU auto-falls back to `ViT-B/32` so startup can continue.
+- If a SigLIP2 model fails to load, Luxriot EVA AI auto-falls back to `ViT-B/32` so startup can continue.
 
 ## Typical Workflows
 
