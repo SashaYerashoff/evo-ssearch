@@ -2916,6 +2916,67 @@ def home():
             border-radius: 4px;
         }
 
+        .summary-body p {
+            margin: 0.15rem 0;
+        }
+
+        .summary-body h1,
+        .summary-body h2,
+        .summary-body h3,
+        .summary-body h4,
+        .summary-body h5,
+        .summary-body h6 {
+            margin: 0.42rem 0 0.22rem;
+            line-height: 1.35;
+            color: #f0f0f0;
+            font-weight: 650;
+        }
+
+        .summary-body h1 { font-size: 1.12rem; }
+        .summary-body h2 { font-size: 1.06rem; }
+        .summary-body h3 { font-size: 1rem; }
+        .summary-body h4,
+        .summary-body h5,
+        .summary-body h6 { font-size: 0.95rem; }
+
+        .summary-body ul,
+        .summary-body ol {
+            margin: 0.24rem 0 0.22rem 1.15rem;
+            padding: 0;
+        }
+
+        .summary-body li {
+            margin: 0.12rem 0;
+        }
+
+        .summary-body pre {
+            margin: 0.3rem 0;
+            padding: 0.48rem 0.56rem;
+            border-radius: 6px;
+            border: 1px solid #2a2a2a;
+            background: #101214;
+            color: #dce7dc;
+            overflow-x: auto;
+            white-space: pre;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.84rem;
+            line-height: 1.35;
+        }
+
+        .summary-body pre code {
+            border: none;
+            background: transparent;
+            padding: 0;
+            color: inherit;
+        }
+
+        .summary-body blockquote {
+            margin: 0.25rem 0;
+            padding: 0.08rem 0 0.08rem 0.65rem;
+            border-left: 2px solid #345243;
+            color: #c5d6c8;
+        }
+
         .luxriot-summaries.compact .summary-body {
             display: -webkit-box;
             -webkit-line-clamp: 4;
@@ -4891,12 +4952,137 @@ def home():
             return div.innerHTML;
         }
 
-        function renderMarkdown(text) {
-            const safe = escapeHtml(text || '');
-            return safe
+        function renderMarkdownInline(text) {
+            const source = String(text || '');
+            const inlineCode = [];
+            const placeholder = source.replace(/`([^`\\n]+)`/g, (_, codeText) => {
+                const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
+                return `@@INLINE_CODE_${idx}@@`;
+            });
+            let out = escapeHtml(placeholder);
+            out = out
                 .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/`([^`]+)`/g, '<code>$1</code>')
-                .replace(/\\n/g, '<br>');
+                .replace(/__(.+?)__/g, '<strong>$1</strong>')
+                .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
+                .replace(/_(.+?)_/g, '<em>$1</em>');
+            out = out.replace(/@@INLINE_CODE_(\\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
+            return out;
+        }
+
+        function renderMarkdown(text) {
+            const source = String(text || '').replace(/\\r\\n?/g, '\\n').trim();
+            if (!source) return '';
+
+            const lines = source.split('\\n');
+            const htmlParts = [];
+            let paragraphLines = [];
+            let ulItems = [];
+            let olItems = [];
+            let inCodeFence = false;
+            let codeFenceLang = '';
+            let codeFenceLines = [];
+
+            const flushParagraph = () => {
+                if (!paragraphLines.length) return;
+                const body = paragraphLines.map((line) => renderMarkdownInline(line)).join('<br>');
+                htmlParts.push(`<p>${body}</p>`);
+                paragraphLines = [];
+            };
+
+            const flushLists = () => {
+                if (ulItems.length) {
+                    htmlParts.push(`<ul>${ulItems.map((item) => `<li>${item}</li>`).join('')}</ul>`);
+                    ulItems = [];
+                }
+                if (olItems.length) {
+                    htmlParts.push(`<ol>${olItems.map((item) => `<li>${item}</li>`).join('')}</ol>`);
+                    olItems = [];
+                }
+            };
+
+            const flushCodeFence = () => {
+                if (!inCodeFence) return;
+                const classAttr = codeFenceLang ? ` class="language-${escapeHtml(codeFenceLang)}"` : '';
+                htmlParts.push(
+                    `<pre><code${classAttr}>${escapeHtml(codeFenceLines.join('\\n'))}</code></pre>`
+                );
+                inCodeFence = false;
+                codeFenceLang = '';
+                codeFenceLines = [];
+            };
+
+            for (const rawLine of lines) {
+                const line = String(rawLine || '');
+                const trimmed = line.trim();
+                const fenceMatch = trimmed.match(/^```\\s*([\\w-]+)?\\s*$/);
+                if (fenceMatch) {
+                    if (inCodeFence) {
+                        flushCodeFence();
+                    } else {
+                        flushParagraph();
+                        flushLists();
+                        inCodeFence = true;
+                        codeFenceLang = String(fenceMatch[1] || '').trim();
+                        codeFenceLines = [];
+                    }
+                    continue;
+                }
+
+                if (inCodeFence) {
+                    codeFenceLines.push(line);
+                    continue;
+                }
+
+                if (!trimmed) {
+                    flushParagraph();
+                    flushLists();
+                    continue;
+                }
+
+                const headingMatch = trimmed.match(/^(#{1,6})\\s+(.+)$/);
+                if (headingMatch) {
+                    flushParagraph();
+                    flushLists();
+                    const level = Math.min(6, Math.max(1, headingMatch[1].length));
+                    htmlParts.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`);
+                    continue;
+                }
+
+                const quoteMatch = trimmed.match(/^>\\s?(.*)$/);
+                if (quoteMatch) {
+                    flushParagraph();
+                    flushLists();
+                    htmlParts.push(`<blockquote>${renderMarkdownInline(quoteMatch[1] || '')}</blockquote>`);
+                    continue;
+                }
+
+                const ulMatch = trimmed.match(/^[-*]\\s+(.+)$/);
+                if (ulMatch) {
+                    flushParagraph();
+                    if (olItems.length) {
+                        flushLists();
+                    }
+                    ulItems.push(renderMarkdownInline(ulMatch[1]));
+                    continue;
+                }
+
+                const olMatch = trimmed.match(/^\\d+\\.\\s+(.+)$/);
+                if (olMatch) {
+                    flushParagraph();
+                    if (ulItems.length) {
+                        flushLists();
+                    }
+                    olItems.push(renderMarkdownInline(olMatch[1]));
+                    continue;
+                }
+
+                paragraphLines.push(line);
+            }
+
+            flushParagraph();
+            flushLists();
+            flushCodeFence();
+            return htmlParts.join('');
         }
 
         function splitSummaryAndJson(text) {
