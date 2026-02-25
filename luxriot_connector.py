@@ -12,6 +12,26 @@ import requests
 from PIL import Image
 from requests.auth import HTTPDigestAuth
 
+DEFAULT_ALERTS_JSON_PROMPT = (
+    "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
+    "- If no trigger match: emit no JSON block.\n"
+    "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 1772202050000\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; timestamp_ms should be batch time in ms."
+)
+
 
 class ProbeManagerLike(Protocol):
     def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> Any: ...
@@ -270,22 +290,27 @@ class LuxriotCaptureSession:
             return
         started = time.time()
         try:
-            base_system_prompt = getattr(self.manager, "system_prompt", "") or ""
+            base_system_prompt = self.manager.get_effective_stream_system_prompt(self.channel_id)
             system_prompt = self.manager.compose_live_system_prompt(self.channel_id, base_system_prompt)
             messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
             summary = self.manager.lm_callback(messages, self.model_hint)
             duration = time.time() - started
+            created_at = time.time()
             entry = {
                 "channel_id": self.channel_id,
                 "run_id": self.run_id,
                 "summary": summary,
                 "frame_count": len(frames_copy),
                 "batch_size": self.batch_size,
-                "created_at": time.time(),
+                "created_at": created_at,
                 "duration_sec": duration,
                 "prompt": self.prompt,
             }
-            # Bookmarks from video understanding are disabled (hidden automation)
+            try:
+                sent_alerts = int(self.manager.process_summary_alerts(self.channel_id, summary, int(created_at * 1000)))
+            except Exception:
+                sent_alerts = 0
+            entry["bookmarks_sent"] = sent_alerts
             with self.lock:
                 self.logs.append(entry)
                 self.total_flushes += 1
@@ -390,6 +415,17 @@ class LuxriotManager:
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
         self.channel_routine_context: Dict[int, Dict[str, Any]] = {}
+        self.channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
+        self.channel_bookmark_fingerprints: Dict[int, Dict[str, int]] = {}
+        self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
+        try:
+            cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 60.0))
+        except Exception:
+            cooldown_value = 60.0
+        self.default_bookmark_cooldown_sec = max(0.0, cooldown_value)
+        self.default_json_alert_prompt = str(
+            getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", DEFAULT_ALERTS_JSON_PROMPT) or DEFAULT_ALERTS_JSON_PROMPT
+        ).strip() or DEFAULT_ALERTS_JSON_PROMPT
         self.rollup_time_only = bool(getattr(config, "LUXRIOT_ROLLUP_TIME_ONLY", True))
         summary_state_raw = str(getattr(config, "LUXRIOT_SUMMARY_STATE_FILE", "luxriot_summary_state.json") or "").strip()
         if not summary_state_raw:
@@ -470,6 +506,10 @@ class LuxriotManager:
             ).strip()
             or None
         )
+        default_rollup_system_prompt = (
+            "You are a CCTV operations summarizer. Consolidate lower-level summaries into a clear higher-level batch summary. "
+            "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+        )
         self.rollup_llm_system_prompt = str(
             getattr(
                 config,
@@ -479,14 +519,16 @@ class LuxriotManager:
                     "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT",
                     "",
                 )
-                or
-                (
-                    "You are a CCTV operations summarizer. Consolidate lower-level summaries into a clear higher-level batch summary. "
-                    "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
-                ),
+                or default_rollup_system_prompt,
             )
             or ""
         ).strip()
+        if not self.rollup_llm_system_prompt:
+            self.rollup_llm_system_prompt = default_rollup_system_prompt
+        self.rollup_llm_system_prompts: Dict[str, str] = {}
+        for level in ("L1", "L2", "L3"):
+            configured = str(getattr(config, f"LUXRIOT_ROLLUP_{level}_SYSTEM_PROMPT", "") or "").strip()
+            self.rollup_llm_system_prompts[level] = configured or self.rollup_llm_system_prompt
         self.rollup_summary_cache: Dict[str, Dict[str, Any]] = {}
         cache_file_raw = str(getattr(config, "LUXRIOT_ROLLUP_CACHE_FILE", "luxriot_rollups_cache.json") or "").strip()
         if not cache_file_raw:
@@ -587,12 +629,29 @@ class LuxriotManager:
             if not isinstance(routine, Mapping):
                 continue
             routine_payload[str(channel_id)] = dict(routine)
+        prompt_payload = {
+            "stream_system_prompt": str(self.system_prompt or ""),
+            "rollup_prompts": {
+                "L1": str(self.rollup_llm_system_prompts.get("L1") or ""),
+                "L2": str(self.rollup_llm_system_prompts.get("L2") or ""),
+                "L3": str(self.rollup_llm_system_prompts.get("L3") or ""),
+            },
+            "bookmark_enabled": bool(self.default_bookmark_enabled),
+            "bookmark_cooldown_sec": float(self.default_bookmark_cooldown_sec),
+            "json_alert_prompt": str(self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT),
+            "channel_overrides": {
+                str(channel_id): dict(settings)
+                for channel_id, settings in self.channel_prompt_overrides.items()
+                if isinstance(settings, Mapping)
+            },
+        }
         payload = {
-            "version": 1,
+            "version": 2,
             "updated_at": time.time(),
             "summary_history": history_payload,
             "summary_runs": runs_payload,
             "channel_routines": routine_payload,
+            "prompt_settings": prompt_payload,
         }
         path = self.summary_state_file
         try:
@@ -614,6 +673,7 @@ class LuxriotManager:
         history_raw = payload.get("summary_history") if isinstance(payload, Mapping) else None
         runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
         routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
+        prompt_settings_raw = payload.get("prompt_settings") if isinstance(payload, Mapping) else None
         loaded_history: Dict[int, List[Dict[str, Any]]] = {}
         if isinstance(history_raw, Mapping):
             for channel_key, logs_value in history_raw.items():
@@ -673,11 +733,91 @@ class LuxriotManager:
                     "routine": routine_text,
                     "updated_at": float(self._coerce_float(routine_value.get("updated_at")) or time.time()),
                 }
+        loaded_stream_system_prompt: Optional[str] = None
+        loaded_rollup_prompts: Dict[str, str] = {}
+        loaded_channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
+        loaded_default_bookmark_enabled: Optional[bool] = None
+        loaded_default_bookmark_cooldown_sec: Optional[float] = None
+        loaded_default_json_alert_prompt: Optional[str] = None
+        if isinstance(prompt_settings_raw, Mapping):
+            if "stream_system_prompt" in prompt_settings_raw:
+                loaded_stream_system_prompt = str(prompt_settings_raw.get("stream_system_prompt") or "")
+            elif "system_prompt" in prompt_settings_raw:
+                loaded_stream_system_prompt = str(prompt_settings_raw.get("system_prompt") or "")
+            if "bookmark_enabled" in prompt_settings_raw:
+                loaded_default_bookmark_enabled = bool(prompt_settings_raw.get("bookmark_enabled"))
+            if "bookmark_cooldown_sec" in prompt_settings_raw:
+                try:
+                    loaded_default_bookmark_cooldown_sec = max(0.0, float(prompt_settings_raw.get("bookmark_cooldown_sec")))
+                except Exception:
+                    loaded_default_bookmark_cooldown_sec = 0.0
+            if "json_alert_prompt" in prompt_settings_raw:
+                loaded_default_json_alert_prompt = str(prompt_settings_raw.get("json_alert_prompt") or "").strip()
+            rollup_prompts_raw = prompt_settings_raw.get("rollup_prompts")
+            if isinstance(rollup_prompts_raw, Mapping):
+                for raw_level, raw_prompt in rollup_prompts_raw.items():
+                    level = self._normalize_rollup_level(raw_level)
+                    if level in {"L1", "L2", "L3"}:
+                        loaded_rollup_prompts[level] = str(raw_prompt or "").strip()
+            # Backward-compatibility for flat keys.
+            for level in ("L1", "L2", "L3"):
+                flat_key = f"rollup_{level.lower()}_system_prompt"
+                if level in loaded_rollup_prompts:
+                    continue
+                if flat_key in prompt_settings_raw:
+                    loaded_rollup_prompts[level] = str(prompt_settings_raw.get(flat_key) or "").strip()
+            channel_overrides_raw = prompt_settings_raw.get("channel_overrides")
+            if isinstance(channel_overrides_raw, Mapping):
+                for channel_key, channel_payload in channel_overrides_raw.items():
+                    channel_id = _parse_optional_int(channel_key)
+                    if channel_id is None or not isinstance(channel_payload, Mapping):
+                        continue
+                    parsed_channel_payload: Dict[str, Any] = {}
+                    if "stream_system_prompt" in channel_payload:
+                        parsed_channel_payload["stream_system_prompt"] = str(channel_payload.get("stream_system_prompt") or "")
+                    if "bookmark_enabled" in channel_payload:
+                        parsed_channel_payload["bookmark_enabled"] = bool(channel_payload.get("bookmark_enabled"))
+                    if "bookmark_cooldown_sec" in channel_payload:
+                        try:
+                            parsed_channel_payload["bookmark_cooldown_sec"] = max(0.0, float(channel_payload.get("bookmark_cooldown_sec")))
+                        except Exception:
+                            parsed_channel_payload["bookmark_cooldown_sec"] = 0.0
+                    if "json_alert_prompt" in channel_payload:
+                        parsed_channel_payload["json_alert_prompt"] = str(channel_payload.get("json_alert_prompt") or "")
+                    channel_rollup_prompts_raw = channel_payload.get("rollup_prompts")
+                    if isinstance(channel_rollup_prompts_raw, Mapping):
+                        parsed_rollup_prompts: Dict[str, str] = {}
+                        for raw_level, raw_prompt in channel_rollup_prompts_raw.items():
+                            level = self._normalize_rollup_level(raw_level)
+                            if level in {"L1", "L2", "L3"}:
+                                parsed_rollup_prompts[level] = str(raw_prompt or "").strip()
+                        if parsed_rollup_prompts:
+                            parsed_channel_payload["rollup_prompts"] = parsed_rollup_prompts
+                    for level in ("L1", "L2", "L3"):
+                        flat_key = f"rollup_{level.lower()}_system_prompt"
+                        if flat_key not in channel_payload:
+                            continue
+                        rollup_payload = parsed_channel_payload.setdefault("rollup_prompts", {})
+                        if isinstance(rollup_payload, dict):
+                            rollup_payload[level] = str(channel_payload.get(flat_key) or "").strip()
+                    if parsed_channel_payload:
+                        loaded_channel_prompt_overrides[int(channel_id)] = parsed_channel_payload
         with self.cache_lock:
             self.summary_history = loaded_history
             self.summary_runs = loaded_runs
             self.channel_routine_context = loaded_routines
             self.active_summary_runs = {}
+            self.channel_prompt_overrides = loaded_channel_prompt_overrides
+            if loaded_stream_system_prompt is not None:
+                self.system_prompt = loaded_stream_system_prompt
+            if loaded_default_bookmark_enabled is not None:
+                self.default_bookmark_enabled = loaded_default_bookmark_enabled
+            if loaded_default_bookmark_cooldown_sec is not None:
+                self.default_bookmark_cooldown_sec = loaded_default_bookmark_cooldown_sec
+            if loaded_default_json_alert_prompt is not None:
+                self.default_json_alert_prompt = loaded_default_json_alert_prompt or self.default_json_alert_prompt
+            for level, prompt_text in loaded_rollup_prompts.items():
+                self.rollup_llm_system_prompts[level] = prompt_text
 
     def persist_summary_state(self) -> None:
         with self.cache_lock:
@@ -959,6 +1099,195 @@ class LuxriotManager:
         if routine:
             return f"{base}\n\n{routine}" if base else routine
         return base
+
+    def _default_rollup_prompt_for_level_locked(self, level: str) -> str:
+        normalized_level = self._normalize_rollup_level(level)
+        by_level = str(self.rollup_llm_system_prompts.get(normalized_level) or "").strip()
+        fallback = str(self.rollup_llm_system_prompt or "").strip()
+        return by_level or fallback
+
+    def _get_stream_system_prompt_locked(self, channel_id: Optional[int] = None) -> str:
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping) and "stream_system_prompt" in overrides:
+                return str(overrides.get("stream_system_prompt") or "")
+        return str(self.system_prompt or "")
+
+    def _get_channel_bookmark_settings_locked(self, channel_id: Optional[int] = None) -> Dict[str, Any]:
+        enabled = bool(self.default_bookmark_enabled)
+        cooldown_sec = float(max(0.0, self.default_bookmark_cooldown_sec))
+        json_prompt = str(self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT)
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping):
+                if "bookmark_enabled" in overrides:
+                    enabled = bool(overrides.get("bookmark_enabled"))
+                if "bookmark_cooldown_sec" in overrides:
+                    try:
+                        cooldown_sec = max(0.0, float(overrides.get("bookmark_cooldown_sec")))
+                    except Exception:
+                        cooldown_sec = 0.0
+                if "json_alert_prompt" in overrides:
+                    json_prompt = str(overrides.get("json_alert_prompt") or "")
+        return {
+            "bookmark_enabled": enabled,
+            "bookmark_cooldown_sec": cooldown_sec,
+            "json_alert_prompt": json_prompt or DEFAULT_ALERTS_JSON_PROMPT,
+        }
+
+    @staticmethod
+    def _render_json_alert_prompt(prompt_text: str, channel_id: int) -> str:
+        rendered = str(prompt_text or "")
+        replacement = str(int(channel_id))
+        return (
+            rendered
+            .replace("{channel_id}", replacement)
+            .replace("{CHANNEL_ID}", replacement)
+            .replace("<CHANNEL_ID>", replacement)
+        )
+
+    def _get_rollup_system_prompt_locked(self, level: str, channel_id: Optional[int] = None) -> str:
+        normalized_level = self._normalize_rollup_level(level)
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping):
+                rollup_prompts = overrides.get("rollup_prompts")
+                if isinstance(rollup_prompts, Mapping) and normalized_level in rollup_prompts:
+                    return str(rollup_prompts.get(normalized_level) or "")
+        return self._default_rollup_prompt_for_level_locked(normalized_level)
+
+    def get_stream_system_prompt(self, channel_id: Optional[int] = None) -> str:
+        with self.cache_lock:
+            return self._get_stream_system_prompt_locked(channel_id)
+
+    def get_effective_stream_system_prompt(self, channel_id: int) -> str:
+        with self.cache_lock:
+            base_prompt = self._get_stream_system_prompt_locked(channel_id)
+            bookmark_settings = self._get_channel_bookmark_settings_locked(channel_id)
+        if bool(bookmark_settings.get("bookmark_enabled")):
+            json_prompt = str(bookmark_settings.get("json_alert_prompt") or "").strip()
+            if json_prompt:
+                json_prompt = self._render_json_alert_prompt(json_prompt, int(channel_id))
+                return f"{base_prompt}\n\n{json_prompt}" if base_prompt else json_prompt
+        return base_prompt
+
+    def get_prompt_settings(self, channel_id: Optional[int] = None) -> Dict[str, Any]:
+        with self.cache_lock:
+            defaults_bookmark = self._get_channel_bookmark_settings_locked(None)
+            defaults = {
+                "stream_system_prompt": str(self.system_prompt or ""),
+                "rollup_prompts": {
+                    "L1": self._default_rollup_prompt_for_level_locked("L1"),
+                    "L2": self._default_rollup_prompt_for_level_locked("L2"),
+                    "L3": self._default_rollup_prompt_for_level_locked("L3"),
+                },
+                "bookmark_enabled": bool(defaults_bookmark.get("bookmark_enabled")),
+                "bookmark_cooldown_sec": float(defaults_bookmark.get("bookmark_cooldown_sec") or 0.0),
+                "json_alert_prompt": str(defaults_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
+            }
+            effective_stream_prompt = self._get_stream_system_prompt_locked(channel_id)
+            effective_rollup_prompts = {
+                "L1": self._get_rollup_system_prompt_locked("L1", channel_id),
+                "L2": self._get_rollup_system_prompt_locked("L2", channel_id),
+                "L3": self._get_rollup_system_prompt_locked("L3", channel_id),
+            }
+            effective_bookmark = self._get_channel_bookmark_settings_locked(channel_id)
+            has_channel_override = bool(
+                channel_id is not None and isinstance(self.channel_prompt_overrides.get(int(channel_id)), Mapping)
+            )
+        return {
+            "channel_id": int(channel_id) if channel_id is not None else None,
+            "stream_system_prompt": effective_stream_prompt,
+            "rollup_prompts": effective_rollup_prompts,
+            "bookmark_enabled": bool(effective_bookmark.get("bookmark_enabled")),
+            "bookmark_cooldown_sec": float(effective_bookmark.get("bookmark_cooldown_sec") or 0.0),
+            "json_alert_prompt": str(effective_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
+            "defaults": defaults,
+            "has_channel_override": has_channel_override,
+        }
+
+    def update_prompt_settings(
+        self,
+        channel_id: Optional[int] = None,
+        stream_system_prompt: Optional[str] = None,
+        rollup_prompts: Optional[Mapping[str, Any]] = None,
+        json_alert_prompt: Optional[str] = None,
+        bookmark_enabled: Optional[bool] = None,
+        bookmark_cooldown_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        changed = False
+        target_channel_id = int(channel_id) if channel_id is not None else None
+        with self.cache_lock:
+            if target_channel_id is None:
+                if stream_system_prompt is not None:
+                    next_stream_prompt = str(stream_system_prompt)
+                    if next_stream_prompt != str(self.system_prompt or ""):
+                        self.system_prompt = next_stream_prompt
+                        changed = True
+                if json_alert_prompt is not None:
+                    next_json_prompt = str(json_alert_prompt)
+                    if next_json_prompt != str(self.default_json_alert_prompt):
+                        self.default_json_alert_prompt = next_json_prompt
+                        changed = True
+                if bookmark_enabled is not None:
+                    next_enabled = bool(bookmark_enabled)
+                    if next_enabled != bool(self.default_bookmark_enabled):
+                        self.default_bookmark_enabled = next_enabled
+                        changed = True
+                if bookmark_cooldown_sec is not None:
+                    next_cooldown = max(0.0, float(bookmark_cooldown_sec))
+                    if next_cooldown != float(self.default_bookmark_cooldown_sec):
+                        self.default_bookmark_cooldown_sec = next_cooldown
+                        changed = True
+            else:
+                current_overrides_raw = self.channel_prompt_overrides.get(target_channel_id)
+                channel_overrides = dict(current_overrides_raw) if isinstance(current_overrides_raw, Mapping) else {}
+                if stream_system_prompt is not None:
+                    next_stream_prompt = str(stream_system_prompt)
+                    if next_stream_prompt != str(channel_overrides.get("stream_system_prompt") or ""):
+                        channel_overrides["stream_system_prompt"] = next_stream_prompt
+                        changed = True
+                if json_alert_prompt is not None:
+                    next_json_prompt = str(json_alert_prompt)
+                    if next_json_prompt != str(channel_overrides.get("json_alert_prompt") or ""):
+                        channel_overrides["json_alert_prompt"] = next_json_prompt
+                        changed = True
+                if bookmark_enabled is not None:
+                    next_enabled = bool(bookmark_enabled)
+                    if next_enabled != bool(channel_overrides.get("bookmark_enabled", False)):
+                        channel_overrides["bookmark_enabled"] = next_enabled
+                        changed = True
+                if bookmark_cooldown_sec is not None:
+                    next_cooldown = max(0.0, float(bookmark_cooldown_sec))
+                    if next_cooldown != float(channel_overrides.get("bookmark_cooldown_sec", 0.0) or 0.0):
+                        channel_overrides["bookmark_cooldown_sec"] = next_cooldown
+                        changed = True
+            if isinstance(rollup_prompts, Mapping):
+                for raw_level, raw_prompt in rollup_prompts.items():
+                    level = self._normalize_rollup_level(raw_level)
+                    if level not in {"L1", "L2", "L3"}:
+                        continue
+                    next_prompt = str(raw_prompt or "").strip()
+                    if target_channel_id is None:
+                        if next_prompt != str(self.rollup_llm_system_prompts.get(level) or ""):
+                            self.rollup_llm_system_prompts[level] = next_prompt
+                            changed = True
+                    else:
+                        existing_rollups_raw = channel_overrides.get("rollup_prompts")
+                        channel_rollups = dict(existing_rollups_raw) if isinstance(existing_rollups_raw, Mapping) else {}
+                        if next_prompt != str(channel_rollups.get(level) or ""):
+                            channel_rollups[level] = next_prompt
+                            channel_overrides["rollup_prompts"] = channel_rollups
+                            changed = True
+            if target_channel_id is not None and changed:
+                self.channel_prompt_overrides[target_channel_id] = channel_overrides
+            if changed:
+                self._persist_summary_state_locked()
+        return self.get_prompt_settings(channel_id=target_channel_id)
+
+    def _get_rollup_system_prompt(self, level: str, channel_id: Optional[int] = None) -> str:
+        with self.cache_lock:
+            return self._get_rollup_system_prompt_locked(level, channel_id)
 
     @staticmethod
     def _bucket_start(ts: float, window_sec: int) -> int:
@@ -1388,7 +1717,7 @@ class LuxriotManager:
         node: Mapping[str, Any],
         children: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
-        system_msg = self.rollup_llm_system_prompt or (
+        system_msg = self._get_rollup_system_prompt(level, channel_id=channel_id) or (
             "You summarize CCTV batches into concise operator-facing rollups."
         )
         window_start = float(self._coerce_float(node.get("window_start")) or 0.0)
@@ -1759,6 +2088,106 @@ class LuxriotManager:
         )
         return {"success": True, "channel_id": channel_id, "severity": severity, "state": state}
 
+    @staticmethod
+    def _normalize_alert_timestamp_ms(raw_value: Any, fallback_ts_ms: int) -> int:
+        try:
+            ts_ms = int(raw_value)
+        except Exception:
+            ts_ms = int(fallback_ts_ms)
+        return ts_ms if ts_ms > 0 else int(fallback_ts_ms)
+
+    @staticmethod
+    def _bookmark_fingerprint(alert: Mapping[str, Any]) -> str:
+        title = str(alert.get("title") or "").strip().lower()
+        description = str(alert.get("description") or "").strip().lower()[:180]
+        severity = str(alert.get("severity") or "").strip().lower()
+        state = str(alert.get("state") or "").strip().lower()
+        payload = f"{title}|{description}|{severity}|{state}"
+        return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+    @staticmethod
+    def _contains_alerts_json(summary_text: str) -> bool:
+        text = str(summary_text or "")
+        lowered = text.lower()
+        if "```json" in lowered or "alerts_json:" in lowered:
+            return True
+        if re.search(r'^\s*\{\s*["\']alerts["\']\s*:', text, flags=re.IGNORECASE | re.MULTILINE):
+            return True
+        return False
+
+    def _bookmark_recently_sent_locked(self, channel_id: int, fingerprint: str, now_ms: int, cooldown_sec: float) -> bool:
+        if cooldown_sec <= 0:
+            return False
+        channel_key = int(channel_id)
+        channel_cache = self.channel_bookmark_fingerprints.get(channel_key) or {}
+        last_ts = channel_cache.get(fingerprint)
+        if isinstance(last_ts, int) and (now_ms - last_ts) < int(cooldown_sec * 1000):
+            return True
+        return False
+
+    def _mark_bookmark_sent_locked(self, channel_id: int, fingerprint: str, ts_ms: int) -> None:
+        channel_key = int(channel_id)
+        channel_cache = self.channel_bookmark_fingerprints.setdefault(channel_key, {})
+        channel_cache[fingerprint] = int(ts_ms)
+        # Prevent unbounded growth.
+        prune_before = int(ts_ms) - 86400000
+        stale_keys = [key for key, value in channel_cache.items() if isinstance(value, int) and value < prune_before]
+        for key in stale_keys:
+            channel_cache.pop(key, None)
+        if len(channel_cache) > 2000:
+            newest = sorted(channel_cache.items(), key=lambda item: item[1], reverse=True)[:1200]
+            self.channel_bookmark_fingerprints[channel_key] = dict(newest)
+
+    def process_summary_alerts(self, channel_id: int, summary_text: str, default_ts_ms: Optional[int] = None) -> int:
+        if not self.alert_parser:
+            return 0
+        base_ts_ms = self._normalize_alert_timestamp_ms(default_ts_ms, int(time.time() * 1000))
+        with self.cache_lock:
+            settings = self._get_channel_bookmark_settings_locked(channel_id)
+        if not bool(settings.get("bookmark_enabled")):
+            return 0
+        cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
+        if not self._contains_alerts_json(summary_text):
+            return 0
+        parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
+        if not isinstance(parsed_alerts, list) or not parsed_alerts:
+            return 0
+
+        sent_count = 0
+        for raw_alert in parsed_alerts:
+            if sent_count >= 3:
+                break
+            if not isinstance(raw_alert, Mapping):
+                continue
+            alert = {
+                "title": str(raw_alert.get("title") or "Event"),
+                "description": str(raw_alert.get("description") or ""),
+                "severity": str(raw_alert.get("severity") or "normal"),
+                "state": str(raw_alert.get("state") or "new"),
+                "channel_id": int(channel_id),  # force observed stream channel
+                "timestamp_ms": self._normalize_alert_timestamp_ms(raw_alert.get("timestamp_ms"), base_ts_ms),
+            }
+            fingerprint = self._bookmark_fingerprint(alert)
+            now_ms = int(time.time() * 1000)
+            with self.cache_lock:
+                if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, cooldown_sec):
+                    continue
+            try:
+                self.send_bookmark_event(
+                    channel_id=int(channel_id),
+                    title=str(alert["title"]),
+                    description=str(alert["description"]),
+                    severity=str(alert["severity"]),
+                    state=str(alert["state"]),
+                    timestamp_ms=int(alert["timestamp_ms"]),
+                )
+            except Exception:
+                continue
+            with self.cache_lock:
+                self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
+            sent_count += 1
+        return sent_count
+
     def start_session(
         self,
         channel_id: int,
@@ -1787,14 +2216,21 @@ class LuxriotManager:
                     self._merge_summary_history_locked(channel_id, existing_logs)
                 self._close_run_locked(channel_id, existing_status.get("run_id"))
                 existing.stop()
-            if system_prompt:
-                self.system_prompt = system_prompt
+            if system_prompt is not None:
+                overrides_raw = self.channel_prompt_overrides.get(channel_id)
+                channel_overrides = dict(overrides_raw) if isinstance(overrides_raw, Mapping) else {}
+                next_stream_prompt = str(system_prompt)
+                if next_stream_prompt != str(channel_overrides.get("stream_system_prompt") or ""):
+                    channel_overrides["stream_system_prompt"] = next_stream_prompt
+                    self.channel_prompt_overrides[channel_id] = channel_overrides
+                    self._persist_summary_state_locked()
+            effective_system_prompt = self._get_stream_system_prompt_locked(channel_id)
             run = self._open_run_locked(
                 channel_id=channel_id,
                 batch_size=batch,
                 prompt=prompt,
                 model_hint=model_hint,
-                system_prompt=self.system_prompt,
+                system_prompt=effective_system_prompt,
             )
             session = LuxriotCaptureSession(
                 self,

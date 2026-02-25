@@ -2543,6 +2543,14 @@ def home():
             flex-wrap: wrap;
         }
 
+        .luxriot-live-controls-row {
+            justify-content: space-between;
+        }
+
+        .luxriot-live-footer-actions {
+            justify-content: flex-start;
+        }
+
         .luxriot-prompt {
             width: 100%;
             min-height: 80px;
@@ -2552,6 +2560,70 @@ def home():
             color: #eaeaea;
             padding: 0.65rem;
             resize: vertical;
+        }
+
+        .luxriot-hidden-prompts {
+            display: none;
+        }
+
+        .prompt-modal-content {
+            max-width: min(940px, 96vw);
+        }
+
+        .prompt-modal-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+        }
+
+        .prompt-modal-tabs {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+        }
+
+        .prompt-tab {
+            min-width: 120px;
+        }
+
+        .prompt-tab.active {
+            border-color: #4db58f;
+            box-shadow: 0 0 0 1px rgba(77, 181, 143, 0.25);
+        }
+
+        .prompt-modal-editor {
+            min-height: 300px;
+        }
+
+        .prompt-modal-meta {
+            color: #9ea4a3;
+            font-size: 0.88rem;
+            min-height: 1.05rem;
+        }
+
+        .prompt-bookmark-controls {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+            flex-wrap: wrap;
+            margin-top: -0.15rem;
+        }
+
+        .prompt-bookmark-controls .small-label-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: #c3c7c6;
+            font-size: 0.9rem;
+        }
+
+        .summary-json-muted {
+            margin-top: 0.55rem;
+            border-left: 2px solid #2e3338;
+            padding-left: 0.65rem;
+            color: #8f98a3;
+            opacity: 0.9;
         }
 
         .luxriot-summaries {
@@ -4020,37 +4092,40 @@ def home():
         <div class="luxriot-grid">
             <div class="luxriot-card">
                 <div class="luxriot-header">
-                    <h4>Luxriot Live Preview</h4>
+                    <h4>Luxriot Live Streams</h4>
                     <div id="luxriotStatus" class="luxriot-status">Not connected</div>
-                        </div>
-                        <div class="luxriot-row">
-                            <label for="luxriotChannelSelect">Channel:</label>
-                            <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
-                            <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
-                            <span class="luxriot-pill">Batch:
-                                <select id="luxriotBatchSize" class="luxriot-mini-input">
-                                    {luxriot_batch_options}
-                                </select>
-                            </span>
-                            <span class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
-                        </div>
-                        <div class="luxriot-actions">
-                            <button id="luxriotPreviewBtn" class="feature-btn">Preview</button>
-                            <button id="luxriotStartCapture" class="feature-btn primary">Start summaries</button>
-                            <button id="luxriotStopCapture" class="feature-btn">Stop</button>
-                            <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
-                        </div>
-                <div class="luxriot-row">
-                    <label for="luxriotPrompt">Prompt:</label>
                 </div>
-                <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
                 <div class="luxriot-row">
-                    <label for="luxriotSystemPrompt">System prompt (LLM role):</label>
+                    <label for="luxriotChannelSelect">Channel:</label>
+                    <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
+                    <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
                 </div>
-                <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for summaries">{luxriot_system_prompt_default}</textarea>
+                <div class="luxriot-row luxriot-live-controls-row">
+                    <span class="luxriot-pill">Batch:
+                        <select id="luxriotBatchSize" class="luxriot-mini-input">
+                            {luxriot_batch_options}
+                        </select>
+                    </span>
+                    <span id="luxriotBatchInfo" class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
+                    <div class="luxriot-actions">
+                        <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
+                        <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
+                    </div>
+                </div>
                 <div class="luxriot-viewport" id="luxriotViewport">
                     <img id="luxriotPreview" src="" alt="Luxriot live preview" />
                     <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                </div>
+                <div class="luxriot-actions luxriot-live-footer-actions">
+                    <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
+                </div>
+                <div class="luxriot-hidden-prompts">
+                    <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                    <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{luxriot_system_prompt_default}</textarea>
+                    <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{luxriot_rollup_prompt_l1}</textarea>
+                    <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{luxriot_rollup_prompt_l2}</textarea>
+                    <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{luxriot_rollup_prompt_l3}</textarea>
+                    <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{luxriot_json_alert_prompt}</textarea>
                 </div>
             </div>
                     <div class="luxriot-card luxriot-stream-card">
@@ -4317,6 +4392,40 @@ def home():
             </div>
         </div>
     </div>
+
+    <div id="luxriotPromptModal" class="settings-modal">
+        <div class="settings-modal-content prompt-modal-content">
+            <div class="settings-header">
+                <h2>System Prompt Settings</h2>
+                <button class="close-btn" id="closeLuxriotPromptModal">&times;</button>
+            </div>
+            <div class="prompt-modal-body">
+                <div class="prompt-modal-tabs">
+                    <button type="button" class="feature-btn prompt-tab active" data-luxriot-prompt-tab="stream">Stream System Prompt</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L1">L1</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L2">L2</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L3">L3</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="json">JSON</button>
+                </div>
+                <textarea id="luxriotPromptModalInput" class="luxriot-prompt prompt-modal-editor" placeholder="Set prompt for selected summary depth..."></textarea>
+                <div class="prompt-bookmark-controls">
+                    <label class="inline-check">
+                        <input type="checkbox" id="luxriotBookmarkEnabled">
+                        Enable bookmarks
+                    </label>
+                    <label class="small-label-group">
+                        Dedup cooldown (sec):
+                        <input type="number" id="luxriotBookmarkCooldown" class="settings-input luxriot-mini-input" min="0" step="1" />
+                    </label>
+                </div>
+                <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>
+                <div class="settings-actions">
+                    <button id="luxriotPromptApplyBtn" class="settings-btn primary">Apply</button>
+                    <button id="luxriotPromptCloseBtn" class="settings-btn">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
     
     <!-- Settings Modal -->
     <div id="settingsModal" class="settings-modal">
@@ -4556,13 +4665,20 @@ def home():
         const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
         const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
         const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
+        const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
         const luxriotStatusLabel = document.getElementById('luxriotStatus');
         const luxriotPreviewImg = document.getElementById('luxriotPreview');
         const luxriotOverlay = document.getElementById('luxriotOverlay');
-        const luxriotPreviewBtn = document.getElementById('luxriotPreviewBtn');
-        const luxriotStartCaptureBtn = document.getElementById('luxriotStartCapture');
-        const luxriotStopCaptureBtn = document.getElementById('luxriotStopCapture');
+        const luxriotToggleCaptureBtn = document.getElementById('luxriotToggleCapture');
         const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
+        const luxriotPromptSettingsBtn = document.getElementById('luxriotPromptSettingsBtn');
+        const luxriotPromptModal = document.getElementById('luxriotPromptModal');
+        const closeLuxriotPromptModalBtn = document.getElementById('closeLuxriotPromptModal');
+        const luxriotPromptCloseBtn = document.getElementById('luxriotPromptCloseBtn');
+        const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
+        const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
+        const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
+        const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
         const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
         const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
         const luxriotSummaryRunSelect = document.getElementById('luxriotSummaryRunSelect');
@@ -4586,6 +4702,12 @@ def home():
         const luxriotStopAllAnalyticsBtn = document.getElementById('luxriotStopAllAnalytics');
         const luxriotPromptInput = document.getElementById('luxriotPrompt');
         const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
+        const luxriotRollupPromptL1Input = document.getElementById('luxriotRollupPromptL1');
+        const luxriotRollupPromptL2Input = document.getElementById('luxriotRollupPromptL2');
+        const luxriotRollupPromptL3Input = document.getElementById('luxriotRollupPromptL3');
+        const luxriotJsonAlertPromptInput = document.getElementById('luxriotJsonAlertPrompt');
+        const luxriotBookmarkEnabledInput = document.getElementById('luxriotBookmarkEnabled');
+        const luxriotBookmarkCooldownInput = document.getElementById('luxriotBookmarkCooldown');
         const probeChannelSelect = document.getElementById('probeChannelSelect');
         const probeTopKInput = document.getElementById('probeTopK');
         const probePosFloorInput = document.getElementById('probePosFloor');
@@ -4689,6 +4811,8 @@ def home():
         let luxriotSummaryRefreshQueued = null;
         let luxriotStreamsCache = [];
         const luxriotChannelNameById = {};
+        const luxriotCaptureRunningByChannel = {};
+        let luxriotPromptModalTab = 'stream';
         let luxriotInitialized = false;
         const probeHitsCacheByKey = {};
         const probeHitsOffsetByKey = {};
@@ -4773,6 +4897,43 @@ def home():
                 .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
                 .replace(/`([^`]+)`/g, '<code>$1</code>')
                 .replace(/\\n/g, '<br>');
+        }
+
+        function splitSummaryAndJson(text) {
+            const full = String(text || '').trim();
+            if (!full) {
+                return { main: '', json: '' };
+            }
+
+            const fenced = full.match(/```json\\s*([\\s\\S]*?)```/i);
+            if (fenced && fenced[1]) {
+                const jsonBlock = String(fenced[1] || '').trim();
+                const mainText = full.replace(fenced[0], '').trim();
+                return { main: mainText, json: jsonBlock };
+            }
+
+            const marker = 'ALERTS_JSON:';
+            const markerIndex = full.toUpperCase().indexOf(marker);
+            if (markerIndex >= 0) {
+                const mainText = full.slice(0, markerIndex).trim();
+                const jsonBlock = full.slice(markerIndex + marker.length).trim();
+                if (jsonBlock) {
+                    return { main: mainText, json: jsonBlock };
+                }
+            }
+
+            const trailingStart = full.lastIndexOf('\\n{');
+            const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
+            if (startIndex >= 0) {
+                const jsonCandidate = full.slice(startIndex).trim();
+                const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
+                if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+                    const mainText = full.slice(0, startIndex).trim();
+                    return { main: mainText, json: jsonCandidate };
+                }
+            }
+
+            return { main: full, json: '' };
         }
 
         function formatDuration(seconds) {
@@ -4881,6 +5042,14 @@ def home():
             } else {
                 luxriotStatusLabel.removeAttribute('title');
             }
+        }
+
+        function updateLuxriotBatchInfo() {
+            if (!luxriotBatchInfo) return;
+            const intervalSec = Number(luxriotDefaults.snapshotInterval) || 1;
+            const fps = intervalSec > 0 ? (1 / intervalSec) : 0;
+            const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
+            luxriotBatchInfo.textContent = `~${fpsLabel} fps, ${luxriotDefaults.snapshotMaxEdge}px`;
         }
 
         function stopLuxriotPreview() {
@@ -5452,6 +5621,10 @@ def home():
                     luxriotSummaryChannel = luxriotActiveChannel;
                 }
                 syncLuxriotSummaryChannelSelect();
+                if (!(String(luxriotActiveChannel) in luxriotCaptureRunningByChannel)) {
+                    luxriotCaptureRunningByChannel[String(luxriotActiveChannel)] = false;
+                }
+                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
                 setLuxriotStatus(`Loaded ${channels.length} channels`);
             } catch (err) {
                 Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
@@ -5459,6 +5632,7 @@ def home():
                 if (luxriotSummaryChannelSelect) {
                     luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
                 }
+                updateLuxriotCaptureToggleButton();
                 setLuxriotStatus('Channel load failed: ' + err.message, true);
             }
         }
@@ -5473,6 +5647,197 @@ def home():
             if (!match) return `Channel #${channelId}`;
             const label = String(match.textContent || '').trim();
             return label || `Channel #${channelId}`;
+        }
+
+        function setLuxriotCaptureRunning(channelId, running) {
+            const parsed = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsed)) return;
+            luxriotCaptureRunningByChannel[String(parsed)] = Boolean(running);
+        }
+
+        function isLuxriotCaptureRunning(channelId) {
+            const parsed = parseInt(String(channelId || ''), 10);
+            if (!Number.isFinite(parsed)) return false;
+            return Boolean(luxriotCaptureRunningByChannel[String(parsed)]);
+        }
+
+        function updateLuxriotCaptureToggleButton(channelIdOverride = null) {
+            if (!luxriotToggleCaptureBtn) return;
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
+            const running = isLuxriotCaptureRunning(channelId);
+            luxriotToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
+            luxriotToggleCaptureBtn.classList.toggle('primary', !running);
+        }
+
+        function getLuxriotPromptInputByTab(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') return luxriotSystemPromptInput;
+            if (normalized === 'l1') return luxriotRollupPromptL1Input;
+            if (normalized === 'l2') return luxriotRollupPromptL2Input;
+            if (normalized === 'l3') return luxriotRollupPromptL3Input;
+            if (normalized === 'json') return luxriotJsonAlertPromptInput;
+            return luxriotSystemPromptInput;
+        }
+
+        function getLuxriotPromptTabLabel(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') return 'Stream system prompt';
+            if (normalized === 'l1') return 'L1 rollup prompt';
+            if (normalized === 'l2') return 'L2 rollup prompt';
+            if (normalized === 'l3') return 'L3 rollup prompt';
+            if (normalized === 'json') return 'JSON alert prompt';
+            return 'System prompt';
+        }
+
+        function getLuxriotPromptTabMeta(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            if (normalized === 'stream') {
+                return 'Editing stream system prompt used for live summaries.';
+            }
+            if (normalized === 'l1') {
+                return 'Editing L1 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'l2') {
+                return 'Editing L2 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'l3') {
+                return 'Editing L3 rollup prompt (stored for rollup workflow tuning).';
+            }
+            if (normalized === 'json') {
+                return 'Editing optional bookmark JSON block. It should only be emitted when a Task-defined trigger is observed.';
+            }
+            return 'Editing system prompt.';
+        }
+
+        function collectLuxriotPromptSettings() {
+            return {
+                stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
+                rollup_prompts: {
+                    L1: luxriotRollupPromptL1Input ? String(luxriotRollupPromptL1Input.value || '') : '',
+                    L2: luxriotRollupPromptL2Input ? String(luxriotRollupPromptL2Input.value || '') : '',
+                    L3: luxriotRollupPromptL3Input ? String(luxriotRollupPromptL3Input.value || '') : '',
+                },
+                json_alert_prompt: luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '',
+                bookmark_enabled: luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false,
+                bookmark_cooldown_sec: luxriotBookmarkCooldownInput
+                    ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
+                    : 0,
+            };
+        }
+
+        function applyLuxriotPromptSettingsFromPayload(payload) {
+            const settings = payload && typeof payload === 'object' ? payload : {};
+            if (luxriotSystemPromptInput && Object.prototype.hasOwnProperty.call(settings, 'stream_system_prompt')) {
+                luxriotSystemPromptInput.value = String(settings.stream_system_prompt || '');
+            }
+            const rollupPrompts = settings.rollup_prompts && typeof settings.rollup_prompts === 'object'
+                ? settings.rollup_prompts
+                : {};
+            if (luxriotRollupPromptL1Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L1')) {
+                luxriotRollupPromptL1Input.value = String(rollupPrompts.L1 || '');
+            }
+            if (luxriotRollupPromptL2Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L2')) {
+                luxriotRollupPromptL2Input.value = String(rollupPrompts.L2 || '');
+            }
+            if (luxriotRollupPromptL3Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L3')) {
+                luxriotRollupPromptL3Input.value = String(rollupPrompts.L3 || '');
+            }
+            if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
+                luxriotJsonAlertPromptInput.value = String(settings.json_alert_prompt || '');
+            }
+            if (luxriotBookmarkEnabledInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_enabled')) {
+                luxriotBookmarkEnabledInput.checked = Boolean(settings.bookmark_enabled);
+            }
+            if (luxriotBookmarkCooldownInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_cooldown_sec')) {
+                const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
+                luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
+            }
+            const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (luxriotPromptModalInput && activeInput) {
+                luxriotPromptModalInput.value = String(activeInput.value || '');
+            }
+        }
+
+        async function refreshLuxriotPromptSettings(showError = false, channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride)
+                ? channelIdOverride
+                : getSelectedLuxriotChannel();
+            if (!Number.isFinite(channelId)) {
+                return;
+            }
+            try {
+                const params = new URLSearchParams();
+                params.set('channel_id', String(channelId));
+                const response = await fetch(`/luxriot/prompt_settings?${params.toString()}`);
+                const data = await parseApiJson(response, 'Failed to load prompt settings');
+                applyLuxriotPromptSettingsFromPayload(data);
+            } catch (err) {
+                if (showError) {
+                    setLuxriotStatus(err.message || 'Failed to load prompt settings', true);
+                }
+            }
+        }
+
+        async function persistLuxriotPromptSettings(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride)
+                ? channelIdOverride
+                : getSelectedLuxriotChannel();
+            if (!Number.isFinite(channelId)) {
+                throw new Error('Select a channel first');
+            }
+            const payload = collectLuxriotPromptSettings();
+            payload.channel_id = channelId;
+            const response = await fetch('/luxriot/prompt_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await parseApiJson(response, 'Failed to save prompt settings');
+            applyLuxriotPromptSettingsFromPayload(data);
+        }
+
+        function setLuxriotPromptModalTab(tab) {
+            const normalized = String(tab || '').trim().toLowerCase();
+            const previousInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (luxriotPromptModalInput && previousInput) {
+                previousInput.value = luxriotPromptModalInput.value || '';
+            }
+            const tabValue = normalized === 'stream' ? 'stream' : normalized.toUpperCase();
+            luxriotPromptModalTab = tabValue;
+            luxriotPromptTabButtons.forEach((button) => {
+                const buttonTab = String(button.dataset.luxriotPromptTab || '').trim();
+                button.classList.toggle('active', buttonTab.toLowerCase() === String(tabValue).toLowerCase());
+            });
+            if (luxriotPromptModalInput) {
+                const sourceInput = getLuxriotPromptInputByTab(tabValue);
+                luxriotPromptModalInput.value = sourceInput ? String(sourceInput.value || '') : '';
+            }
+            if (luxriotPromptModalMeta) {
+                const channelLabel = getLuxriotChannelLabel(getSelectedLuxriotChannel());
+                luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`;
+            }
+        }
+
+        function openLuxriotPromptModal() {
+            if (!luxriotPromptModal) return;
+            luxriotPromptModal.style.display = 'block';
+            void refreshLuxriotPromptSettings(true);
+            setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+        }
+
+        function closeLuxriotPromptModal() {
+            if (!luxriotPromptModal) return;
+            luxriotPromptModal.style.display = 'none';
+        }
+
+        async function applyLuxriotPromptModal() {
+            const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+            if (targetInput && luxriotPromptModalInput) {
+                targetInput.value = luxriotPromptModalInput.value || '';
+            }
+            const channelId = getSelectedLuxriotChannel();
+            await persistLuxriotPromptSettings(channelId);
+            setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(channelId)}`);
         }
 
         function startLuxriotPreview() {
@@ -5598,6 +5963,9 @@ def home():
                         ? getLuxriotChannelLabel(rowChannelId)
                         : 'Unknown channel';
                     const summary = String(log.summary || '').trim();
+                    const summaryParts = splitSummaryAndJson(summary);
+                    const summaryMain = summaryParts.main || summary;
+                    const summaryJson = summaryParts.json;
                     const canBookmark = summary.length > 0;
                     const collapsed = isSummaryCollapsed(channelId, logKey);
                     return `
@@ -5619,7 +5987,7 @@ def home():
                                     </button>
                                 </div>
                             </div>
-                            <div class="summary-body">${renderMarkdown(summary)}</div>
+                            <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
                         </div>
                     `;
                 })
@@ -5789,6 +6157,9 @@ def home():
                 const sourceLevel = String(row?.source_level || '').trim();
                 const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
                 const summary = String(row?.summary || '').trim();
+                const summaryParts = splitSummaryAndJson(summary);
+                const summaryMain = summaryParts.main || summary;
+                const summaryJson = summaryParts.json;
                 const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
                 const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
                 const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
@@ -5803,7 +6174,7 @@ def home():
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                             </div>
                         </div>
-                        <div class="summary-body">${renderMarkdown(summary)}</div>
+                        <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
                     </div>
                 `;
             }).join('');
@@ -6130,6 +6501,22 @@ def home():
                 if (!resp.ok || data.error) {
                     throw new Error(data.error || 'Failed to fetch stream state');
                 }
+                const nextCaptureState = {};
+                const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
+                videoStreams.forEach((stream) => {
+                    const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                    if (!Number.isFinite(channelId)) return;
+                    nextCaptureState[String(channelId)] = Boolean(stream?.running);
+                });
+                Object.keys(luxriotCaptureRunningByChannel).forEach((key) => {
+                    delete luxriotCaptureRunningByChannel[key];
+                });
+                Object.assign(luxriotCaptureRunningByChannel, nextCaptureState);
+                const selectedChannelId = getSelectedLuxriotChannel();
+                if (!(String(selectedChannelId) in luxriotCaptureRunningByChannel)) {
+                    luxriotCaptureRunningByChannel[String(selectedChannelId)] = false;
+                }
+                updateLuxriotCaptureToggleButton(selectedChannelId);
                 try {
                     const probesResp = await fetch('/probes/list');
                     const probesData = await probesResp.json();
@@ -6429,6 +6816,10 @@ def home():
                     return;
                 }
                 renderLuxriotSummaries(data.logs || [], channelId);
+                setLuxriotCaptureRunning(channelId, Boolean(data.running));
+                if (channelId === getSelectedLuxriotChannel()) {
+                    updateLuxriotCaptureToggleButton(channelId);
+                }
                 const historyCount = Number(data.archived_log_count || 0);
                 const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
                 const stateLabel = data.running ? 'live' : 'stopped';
@@ -6461,19 +6852,22 @@ def home():
             }, 8000);
         }
 
-        async function startLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
+        async function startLuxriotCapture(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
             if (!channelId) {
                 setLuxriotStatus('Select a channel first', true);
                 return;
             }
+            await refreshLuxriotPromptSettings(false, channelId);
             const batchSize = luxriotBatchSizeSelect
                 ? parseInt(luxriotBatchSizeSelect.value, 10)
                 : luxriotDefaults.batchSize || 12;
             const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
             const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
             const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
-            luxriotStartCaptureBtn.disabled = true;
+            if (luxriotToggleCaptureBtn) {
+                luxriotToggleCaptureBtn.disabled = true;
+            }
             setLuxriotStatus('Starting summaries...');
             try {
                 const resp = await fetch('/luxriot/start_capture', {
@@ -6491,6 +6885,8 @@ def home():
                 if (!resp.ok || data.error) {
                     throw new Error(data.error || 'Luxriot start failed');
                 }
+                setLuxriotCaptureRunning(channelId, true);
+                updateLuxriotCaptureToggleButton(channelId);
                 setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
                 luxriotSummaryChannel = channelId;
                 luxriotSummaryFollowLive = true;
@@ -6503,12 +6899,17 @@ def home():
             } catch (err) {
                 setLuxriotStatus(err.message, true);
             } finally {
-                luxriotStartCaptureBtn.disabled = false;
+                if (luxriotToggleCaptureBtn) {
+                    luxriotToggleCaptureBtn.disabled = false;
+                }
             }
         }
 
-        async function stopLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
+        async function stopLuxriotCapture(channelIdOverride = null) {
+            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
+            if (luxriotToggleCaptureBtn) {
+                luxriotToggleCaptureBtn.disabled = true;
+            }
             setLuxriotStatus('Stopping...');
             try {
                 const resp = await fetch('/luxriot/stop_capture', {
@@ -6520,11 +6921,30 @@ def home():
                 if (data.error) {
                     throw new Error(data.error);
                 }
+                setLuxriotCaptureRunning(channelId, false);
+                updateLuxriotCaptureToggleButton(channelId);
                 setLuxriotStatus('Summaries stopped');
                 refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
             } catch (err) {
                 setLuxriotStatus(err.message, true);
+            } finally {
+                if (luxriotToggleCaptureBtn) {
+                    luxriotToggleCaptureBtn.disabled = false;
+                }
+            }
+        }
+
+        async function toggleLuxriotCapture() {
+            const channelId = getSelectedLuxriotChannel();
+            if (!channelId) {
+                setLuxriotStatus('Select a channel first', true);
+                return;
+            }
+            if (isLuxriotCaptureRunning(channelId)) {
+                await stopLuxriotCapture(channelId);
+            } else {
+                await startLuxriotCapture(channelId);
             }
         }
 
@@ -6561,6 +6981,8 @@ def home():
             if (luxriotInitialized) return;
             luxriotInitialized = true;
             await fetchLuxriotChannels();
+            await refreshLuxriotPromptSettings();
+            updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
             updateSummaryControlsUI();
             setSummaryUnread(0);
             syncLuxriotSummaryChannelSelect();
@@ -6580,6 +7002,9 @@ def home():
         if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
             luxriotPromptInput.value = videoPromptInput.value;
         }
+        updateLuxriotBatchInfo();
+        setLuxriotPromptModalTab('stream');
+        updateLuxriotCaptureToggleButton(luxriotActiveChannel);
         function syncProbeChannelSelect() {
             if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
                 probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
@@ -7440,21 +7865,56 @@ def home():
                 fetchLuxriotChannels(true).then(syncProbeChannelSelect);
             });
         }
-        if (luxriotPreviewBtn) {
-            luxriotPreviewBtn.addEventListener('click', () => {
-                fetchLuxriotChannels();
-                syncProbeChannelSelect();
-                startLuxriotPreview();
-            });
-        }
-        if (luxriotStartCaptureBtn) {
-            luxriotStartCaptureBtn.addEventListener('click', startLuxriotCapture);
-        }
-        if (luxriotStopCaptureBtn) {
-            luxriotStopCaptureBtn.addEventListener('click', stopLuxriotCapture);
+        if (luxriotToggleCaptureBtn) {
+            luxriotToggleCaptureBtn.addEventListener('click', toggleLuxriotCapture);
         }
         if (luxriotFlushCaptureBtn) {
             luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
+        }
+        if (luxriotPromptSettingsBtn) {
+            luxriotPromptSettingsBtn.addEventListener('click', openLuxriotPromptModal);
+        }
+        if (closeLuxriotPromptModalBtn) {
+            closeLuxriotPromptModalBtn.addEventListener('click', closeLuxriotPromptModal);
+        }
+        if (luxriotPromptCloseBtn) {
+            luxriotPromptCloseBtn.addEventListener('click', closeLuxriotPromptModal);
+        }
+        if (luxriotPromptApplyBtn) {
+            luxriotPromptApplyBtn.addEventListener('click', async () => {
+                try {
+                    await applyLuxriotPromptModal();
+                    closeLuxriotPromptModal();
+                } catch (err) {
+                    setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                }
+            });
+        }
+        if (luxriotPromptModalInput) {
+            luxriotPromptModalInput.addEventListener('keydown', async (event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'enter') {
+                    event.preventDefault();
+                    try {
+                        await applyLuxriotPromptModal();
+                        closeLuxriotPromptModal();
+                    } catch (err) {
+                        setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                    }
+                }
+            });
+        }
+        luxriotPromptTabButtons.forEach((button) => {
+            button.addEventListener('click', () => {
+                const tab = button.dataset.luxriotPromptTab || 'stream';
+                setLuxriotPromptModalTab(tab);
+            });
+        });
+        if (luxriotPromptModal) {
+            luxriotPromptModal.addEventListener('click', (event) => {
+                if (event.target === luxriotPromptModal) {
+                    closeLuxriotPromptModal();
+                }
+            });
         }
         if (luxriotRefreshSummariesBtn) {
             luxriotRefreshSummariesBtn.addEventListener('click', async () => {
@@ -7764,6 +8224,8 @@ def home():
                 syncProbeChannelSelect();
                 syncLuxriotSummaryChannelSelect();
                 setSummaryBaseLevel(luxriotSummaryLevel);
+                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
+                void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
                 startLuxriotPreview();
                 refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
                 refreshLuxriotStreams();
@@ -7794,9 +8256,9 @@ def home():
             if (!probeStreamToggleBtn) return;
             const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
             const runtimeState = getProbeRuntimeState(channelId);
-            const running = runtimeState === 'running';
-            probeStreamToggleBtn.textContent = running ? 'Stop Stream' : 'Start Stream';
-            probeStreamToggleBtn.classList.toggle('primary', !running);
+            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : (runtimeState === 'running');
+            probeStreamToggleBtn.textContent = enabled ? 'Stop Stream' : 'Start Stream';
+            probeStreamToggleBtn.classList.toggle('primary', !enabled);
         }
 
         function updateProbeCaptureMeta(channelId, statusData = null) {
@@ -8865,13 +9327,13 @@ def home():
         });
         if (probeStreamToggleBtn) {
             probeStreamToggleBtn.addEventListener('click', () => {
-                const channelId = getSelectedProbeChannelId();
-                const runtimeState = getProbeRuntimeState(channelId);
-                if (runtimeState === 'running') {
-                    stopProbeCapture(channelId, 'stopped');
-                } else {
-                    ensureProbeCapture(channelId, false, { forceStart: true });
+                if (probeEnableToggle) {
+                    probeEnableToggle.checked = !probeEnableToggle.checked;
+                    probeEnableToggle.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
                 }
+                const channelId = getSelectedProbeChannelId();
+                ensureProbeCapture(channelId, false, { forceStart: true });
             });
         }
         if (probeChannelSelect) {
@@ -9019,6 +9481,7 @@ def home():
                     stopProbeRunLoop('Probe disabled');
                 }
                 syncProbePreview(getSelectedProbeChannelId());
+                updateProbeStreamToggleButton(getSelectedProbeChannelId());
             });
         }
         if (probeImageEnableToggle) {
@@ -10538,9 +11001,45 @@ def home():
     response_html = response_html.replace('{timestamp}', current_timestamp)
     response_html = response_html.replace('{app_version}', html_lib.escape(str(config.APP_VERSION or ''), quote=False))
     response_html = response_html.replace('{lm_model}', html_lib.escape(str(config.LM_MODEL or ''), quote=True))
+    rollup_prompt_default = str(
+        getattr(
+            config,
+            "LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT",
+            getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", ""),
+        )
+        or ""
+    )
     response_html = response_html.replace(
         '{luxriot_system_prompt_default}',
         html_lib.escape(str(LUXRIOT_SYSTEM_PROMPT_DEFAULT or ''), quote=False),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l1}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l2}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_rollup_prompt_l3}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
+            quote=False,
+        ),
+    )
+    response_html = response_html.replace(
+        '{luxriot_json_alert_prompt}',
+        html_lib.escape(
+            str(getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT),
+            quote=False,
+        ),
     )
     response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
     response_html = response_html.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
@@ -10870,23 +11369,95 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             'timestamp_ms': timestamp_ms,
         }
 
+    def _extract_balanced_json(blob: str, start_idx: int) -> Optional[Tuple[str, int]]:
+        if not isinstance(blob, str) or start_idx < 0 or start_idx >= len(blob):
+            return None
+        idx = start_idx
+        while idx < len(blob) and blob[idx] != '{':
+            idx += 1
+        if idx >= len(blob) or blob[idx] != '{':
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        end_idx = idx
+        while end_idx < len(blob):
+            ch = blob[end_idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return blob[idx:end_idx + 1], end_idx + 1
+            end_idx += 1
+        return None
+
     def _extract_candidates(blob: str) -> List[Any]:
         candidates: List[Any] = []
+        seen: Set[str] = set()
+
+        def _add_candidate(raw: Any) -> None:
+            try:
+                key = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                key = repr(raw)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(raw)
+
         try:
             parsed = json.loads(blob)
-            candidates.append(parsed)
+            _add_candidate(parsed)
         except Exception:
             pass
+
         for match in re.finditer(r"```json(.*?)```", blob, flags=re.DOTALL | re.IGNORECASE):
             try:
-                candidates.append(json.loads(match.group(1)))
+                _add_candidate(json.loads(match.group(1)))
             except Exception:
                 continue
-        for match in re.finditer(r"ALERTS_JSON:(\{.*?\})", blob, flags=re.DOTALL | re.IGNORECASE):
+
+        marker = "ALERTS_JSON:"
+        lowered = blob.lower()
+        marker_lower = marker.lower()
+        search_pos = 0
+        while True:
+            marker_idx = lowered.find(marker_lower, search_pos)
+            if marker_idx < 0:
+                break
+            start_idx = marker_idx + len(marker)
+            chunk = _extract_balanced_json(blob, start_idx)
+            if chunk:
+                json_blob, next_idx = chunk
+                try:
+                    _add_candidate(json.loads(json_blob))
+                except Exception:
+                    pass
+                search_pos = max(next_idx, marker_idx + 1)
+            else:
+                search_pos = marker_idx + 1
+
+        for match in re.finditer(r"\{\s*\"alerts\"\s*:", blob, flags=re.IGNORECASE):
+            chunk = _extract_balanced_json(blob, match.start())
+            if not chunk:
+                continue
+            json_blob, _ = chunk
             try:
-                candidates.append(json.loads(match.group(1)))
+                _add_candidate(json.loads(json_blob))
             except Exception:
                 continue
+
         return candidates
 
     alerts: List[Dict[str, Any]] = []
@@ -10899,39 +11470,65 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             if alerts:
                 break
 
-    if not alerts:
-        # Heuristic fallbacks
-        lowered = (text or '').lower()
-        threat_keywords = [
-            'weapon', 'gun', 'handgun', 'pistol', 'rifle', 'knife', 'shoot', 'shot', 'firearm', 'aggression', 'fight', 'violence',
-            'оружие', 'пистолет', 'револьвер', 'винтовк', 'нож', 'стрел', 'выстрел', 'агресс', 'драк', 'насили'
-        ]
-        phone_keywords = ['phone', 'call', 'talking on phone', 'звон', 'телефон', 'разговаривает по телефону']
-        pet_keywords = ['orl', 'orland', 'maz', 'cat', 'кот', 'кошка', 'питом']
-
-        def add_fallback(title: str, severity: str, reason: str) -> None:
-            val = _validate_alert(
-                {
-                    'title': title,
-                    'description': f"Heuristic trigger: {reason}. Summary snippet: {text.strip()[:200]}",
-                    'severity': severity,
-                    'state': 'new',
-                    'channel_id': default_channel_id,
-                    'timestamp_ms': now_ms,
-                }
-            )
-            if val:
-                alerts.append(val)
-
-        if any(k in lowered for k in threat_keywords):
-            add_fallback('Possible weapon or aggression detected', 'critical', 'weapon/aggression keywords')
-        elif any(k in lowered for k in phone_keywords):
-            add_fallback('Phone call detected', 'info', 'phone keywords')
-        elif any(k in lowered for k in pet_keywords):
-            add_fallback('Pet interaction detected', 'low', 'pet keywords')
-
     return alerts
 
+
+PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
+PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
+PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
+LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Event title\",\n"
+    "      \"description\": \"twitter-sized event description\",\n"
+    "      \"severity\": \"info\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": \"channel ID\",\n"
+    "      \"timestamp_ms\": 1772202050000\n"
+    "    }\n"
+    "  ]\n"
+    "}"
+)
+LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
+    "- If no trigger match: emit no JSON block.\n"
+    "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 1772202050000\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; timestamp_ms should be batch time in ms."
+)
+LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+    "You are a CCTV operator assistant for Luxriot.\n"
+    "Return Markdown with exactly these sections and order:\n"
+    "### Scene description\n"
+    "1-2 short paragraphs describing stable scene context.\n"
+    "### Activity description\n"
+    "1-2 short paragraphs describing what changed in this batch; reference snapshot numbers or timestamps when possible.\n"
+    "### Worth to remember\n"
+    "2-6 concise bullet points with context useful for future rollups.\n"
+    "Rules: separate routine baseline from deviations; keep it factual and concise; avoid repetition; "
+    "emit alerts JSON only when a Task-defined trigger is observed in this batch."
+)
+
+current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()
+if not current_stream_prompt:
+    config.LUXRIOT_SYSTEM_PROMPT_DEFAULT = LUXRIOT_SYSTEM_PROMPT_DEFAULT
+
+current_json_prompt = str(getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', '') or '').strip()
+if (not current_json_prompt) or (current_json_prompt == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip()):
+    config.LUXRIOT_ALERTS_JSON_PROMPT = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
 
 luxriot_manager = LuxriotManager(
     config=config,
@@ -10941,20 +11538,30 @@ luxriot_manager = LuxriotManager(
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
 )
-
-PROBE_MAX_STORED_HITS = getattr(config, 'PROBE_MAX_STORED_HITS', 30)
-PROBE_DAEMON_INTERVAL_SEC = getattr(config, 'PROBE_DAEMON_INTERVAL_SEC', 5)
-PROBE_BENCH_BATCH = getattr(config, 'PROBE_BENCH_BATCH', 16)
-LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
-    "You summarize real-time CCTV snapshots. Focus on key actions, people, vehicles, time of day, and any risks. "
-    "Keep it concise and avoid repetition across frames. Provide a free-form summary first. "
-    "Always append a JSON block in this form (alerts may be empty, but must be present): "
-    "{ 'alerts': [ { 'title': 'short alert title', 'description': '1-2 sentence description with any time/frame hints', "
-    "'severity': 'info|low|normal|high|critical', 'state': 'new|inprogress|closed|hidden|none', "
-    "'channel_id': <channel id>, 'timestamp_ms': <milliseconds since epoch> } ] }. "
-    "Rules: mark weapons, fights, or aggression as critical; calm phone use as info; holding pets (Orlandina or Maz) as low; "
-    "other notable but mild changes as normal/high as appropriate. If nothing notable, alerts is an empty array."
-)
+try:
+    with luxriot_manager.cache_lock:
+        changed_prompt_defaults = False
+        if not str(luxriot_manager.system_prompt or '').strip():
+            luxriot_manager.system_prompt = LUXRIOT_SYSTEM_PROMPT_DEFAULT
+            changed_prompt_defaults = True
+        if str(luxriot_manager.default_json_alert_prompt or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+            luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
+            changed_prompt_defaults = True
+        for channel_id, raw_overrides in list(luxriot_manager.channel_prompt_overrides.items()):
+            if not isinstance(raw_overrides, Mapping):
+                continue
+            channel_overrides = dict(raw_overrides)
+            channel_changed = False
+            if str(channel_overrides.get('json_alert_prompt') or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+                channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
+                channel_changed = True
+            if channel_changed:
+                luxriot_manager.channel_prompt_overrides[int(channel_id)] = channel_overrides
+                changed_prompt_defaults = True
+        if changed_prompt_defaults:
+            luxriot_manager._persist_summary_state_locked()
+except Exception:
+    pass
 
 probe_manager = ProbeManager(
     embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
@@ -13678,6 +14285,88 @@ def luxriot_start_capture():
             system_prompt=system_prompt,
         )
         return jsonify({'success': True, 'session': status})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/prompt_settings', methods=['GET', 'POST'])
+def luxriot_prompt_settings():
+    if request.method == 'GET':
+        channel_id = request.args.get('channel_id', default=None, type=int)
+        try:
+            return jsonify(luxriot_manager.get_prompt_settings(channel_id=channel_id))
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id'))
+    except Exception:
+        return jsonify({'error': 'Provide a valid channel_id'}), 400
+
+    stream_system_prompt: Optional[str] = None
+    if 'stream_system_prompt' in data:
+        raw_stream_prompt = data.get('stream_system_prompt')
+        stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
+    elif 'system_prompt' in data:
+        raw_stream_prompt = data.get('system_prompt')
+        stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
+
+    json_alert_prompt: Optional[str] = None
+    if 'json_alert_prompt' in data:
+        raw_json_prompt = data.get('json_alert_prompt')
+        json_alert_prompt = '' if raw_json_prompt is None else str(raw_json_prompt)
+    elif 'json_prompt' in data:
+        raw_json_prompt = data.get('json_prompt')
+        json_alert_prompt = '' if raw_json_prompt is None else str(raw_json_prompt)
+
+    bookmark_enabled: Optional[bool] = None
+    if 'bookmark_enabled' in data:
+        bookmark_enabled = _coerce_bool(data.get('bookmark_enabled'), default=False)
+    elif 'enable_bookmarks' in data:
+        bookmark_enabled = _coerce_bool(data.get('enable_bookmarks'), default=False)
+
+    bookmark_cooldown_sec: Optional[float] = None
+    if 'bookmark_cooldown_sec' in data:
+        try:
+            bookmark_cooldown_sec = max(0.0, float(data.get('bookmark_cooldown_sec')))
+        except Exception:
+            bookmark_cooldown_sec = 0.0
+    elif 'cooldown_sec' in data:
+        try:
+            bookmark_cooldown_sec = max(0.0, float(data.get('cooldown_sec')))
+        except Exception:
+            bookmark_cooldown_sec = 0.0
+
+    rollup_prompt_updates: Optional[Dict[str, Any]] = None
+    rollup_prompts_raw = data.get('rollup_prompts')
+    if isinstance(rollup_prompts_raw, Mapping):
+        rollup_prompt_updates = {
+            str(level): value
+            for level, value in rollup_prompts_raw.items()
+        }
+    else:
+        inline_updates: Dict[str, Any] = {}
+        for level in ('L1', 'L2', 'L3'):
+            field_name = f'rollup_prompt_{level.lower()}'
+            if field_name in data:
+                inline_updates[level] = data.get(field_name)
+        if inline_updates:
+            rollup_prompt_updates = inline_updates
+
+    try:
+        settings = luxriot_manager.update_prompt_settings(
+            channel_id=channel_id,
+            stream_system_prompt=stream_system_prompt,
+            rollup_prompts=rollup_prompt_updates,
+            json_alert_prompt=json_alert_prompt,
+            bookmark_enabled=bookmark_enabled,
+            bookmark_cooldown_sec=bookmark_cooldown_sec,
+        )
+        return jsonify({'success': True, **settings})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
