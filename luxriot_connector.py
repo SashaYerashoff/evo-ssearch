@@ -25,16 +25,20 @@ DEFAULT_ALERTS_JSON_PROMPT = (
     "      \"severity\": \"info|low|normal|high|critical\",\n"
     "      \"state\": \"new\",\n"
     "      \"channel_id\": {channel_id},\n"
-    "      \"timestamp_ms\": 1772202050000\n"
+    "      \"timestamp_ms\": 0\n"
     "    }\n"
     "  ]\n"
     "}\n"
-    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; timestamp_ms should be batch time in ms."
+    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; "
+    "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
 )
 
 
 class ProbeManagerLike(Protocol):
     def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> Any: ...
+
+
+AlertParserFn = Callable[[str, int, Optional[int]], List[Dict[str, Any]]]
 
 
 def _parse_optional_int(value: object) -> Optional[int]:
@@ -290,12 +294,24 @@ class LuxriotCaptureSession:
             return
         started = time.time()
         try:
+            frame_ts_ms: List[int] = []
+            for frame in frames_copy:
+                raw_ts = frame.get("captured_at") or frame.get("time_sec")
+                if isinstance(raw_ts, (int, float)):
+                    try:
+                        frame_ts_ms.append(int(float(raw_ts) * 1000.0))
+                    except Exception:
+                        continue
             base_system_prompt = self.manager.get_effective_stream_system_prompt(self.channel_id)
             system_prompt = self.manager.compose_live_system_prompt(self.channel_id, base_system_prompt)
             messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
             summary = self.manager.lm_callback(messages, self.model_hint)
             duration = time.time() - started
             created_at = time.time()
+            created_at_ms = int(created_at * 1000.0)
+            batch_start_ms = min(frame_ts_ms) if frame_ts_ms else created_at_ms
+            batch_end_ms = max(frame_ts_ms) if frame_ts_ms else created_at_ms
+            ts_tolerance_ms = max(1000, int(max(0.2, float(self.interval)) * 1000.0))
             entry = {
                 "channel_id": self.channel_id,
                 "run_id": self.run_id,
@@ -303,11 +319,21 @@ class LuxriotCaptureSession:
                 "frame_count": len(frames_copy),
                 "batch_size": self.batch_size,
                 "created_at": created_at,
+                "batch_start_ms": batch_start_ms,
+                "batch_end_ms": batch_end_ms,
                 "duration_sec": duration,
                 "prompt": self.prompt,
             }
             try:
-                sent_alerts = int(self.manager.process_summary_alerts(self.channel_id, summary, int(created_at * 1000)))
+                sent_alerts = int(
+                    self.manager.process_summary_alerts(
+                        self.channel_id,
+                        summary,
+                        default_ts_ms=batch_end_ms,
+                        min_ts_ms=batch_start_ms - ts_tolerance_ms,
+                        max_ts_ms=batch_end_ms + ts_tolerance_ms,
+                    )
+                )
             except Exception:
                 sent_alerts = 0
             entry["bookmarks_sent"] = sent_alerts
@@ -390,7 +416,7 @@ class LuxriotManager:
         lm_callback: Callable[[List[Dict[str, Any]], Optional[str]], str],
         message_builder: Callable[[str, List[Dict[str, Any]], str, str], List[Dict[str, Any]]],
         jpeg_encoder: Callable[..., str],
-        alert_parser: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        alert_parser: Optional[AlertParserFn] = None,
         probe_manager: Optional[ProbeManagerLike] = None,
     ) -> None:
         self.config = config
@@ -747,10 +773,8 @@ class LuxriotManager:
             if "bookmark_enabled" in prompt_settings_raw:
                 loaded_default_bookmark_enabled = bool(prompt_settings_raw.get("bookmark_enabled"))
             if "bookmark_cooldown_sec" in prompt_settings_raw:
-                try:
-                    loaded_default_bookmark_cooldown_sec = max(0.0, float(prompt_settings_raw.get("bookmark_cooldown_sec")))
-                except Exception:
-                    loaded_default_bookmark_cooldown_sec = 0.0
+                raw_cooldown = self._coerce_float(prompt_settings_raw.get("bookmark_cooldown_sec"))
+                loaded_default_bookmark_cooldown_sec = max(0.0, raw_cooldown if raw_cooldown is not None else 0.0)
             if "json_alert_prompt" in prompt_settings_raw:
                 loaded_default_json_alert_prompt = str(prompt_settings_raw.get("json_alert_prompt") or "").strip()
             rollup_prompts_raw = prompt_settings_raw.get("rollup_prompts")
@@ -778,10 +802,10 @@ class LuxriotManager:
                     if "bookmark_enabled" in channel_payload:
                         parsed_channel_payload["bookmark_enabled"] = bool(channel_payload.get("bookmark_enabled"))
                     if "bookmark_cooldown_sec" in channel_payload:
-                        try:
-                            parsed_channel_payload["bookmark_cooldown_sec"] = max(0.0, float(channel_payload.get("bookmark_cooldown_sec")))
-                        except Exception:
-                            parsed_channel_payload["bookmark_cooldown_sec"] = 0.0
+                        raw_channel_cooldown = self._coerce_float(channel_payload.get("bookmark_cooldown_sec"))
+                        parsed_channel_payload["bookmark_cooldown_sec"] = max(
+                            0.0, raw_channel_cooldown if raw_channel_cooldown is not None else 0.0
+                        )
                     if "json_alert_prompt" in channel_payload:
                         parsed_channel_payload["json_alert_prompt"] = str(channel_payload.get("json_alert_prompt") or "")
                     channel_rollup_prompts_raw = channel_payload.get("rollup_prompts")
@@ -1123,10 +1147,8 @@ class LuxriotManager:
                 if "bookmark_enabled" in overrides:
                     enabled = bool(overrides.get("bookmark_enabled"))
                 if "bookmark_cooldown_sec" in overrides:
-                    try:
-                        cooldown_sec = max(0.0, float(overrides.get("bookmark_cooldown_sec")))
-                    except Exception:
-                        cooldown_sec = 0.0
+                    raw_cooldown = self._coerce_float(overrides.get("bookmark_cooldown_sec"))
+                    cooldown_sec = max(0.0, raw_cooldown if raw_cooldown is not None else 0.0)
                 if "json_alert_prompt" in overrides:
                     json_prompt = str(overrides.get("json_alert_prompt") or "")
         return {
@@ -1217,6 +1239,7 @@ class LuxriotManager:
     ) -> Dict[str, Any]:
         changed = False
         target_channel_id = int(channel_id) if channel_id is not None else None
+        channel_overrides: Dict[str, Any] = {}
         with self.cache_lock:
             if target_channel_id is None:
                 if stream_system_prompt is not None:
@@ -2097,6 +2120,66 @@ class LuxriotManager:
         return ts_ms if ts_ms > 0 else int(fallback_ts_ms)
 
     @staticmethod
+    def _normalize_alert_timestamp_ms_bounded(
+        raw_value: Any,
+        fallback_ts_ms: int,
+        min_ts_ms: Optional[int] = None,
+        max_ts_ms: Optional[int] = None,
+    ) -> int:
+        fallback = int(fallback_ts_ms) if int(fallback_ts_ms) > 0 else int(time.time() * 1000)
+
+        # Default timestamp from prompt examples; ignore and use observed batch time instead.
+        DEFAULT_PROMPT_TS_MS = 1772202050000
+
+        parsed_ts_ms: Optional[int] = None
+        if raw_value is not None:
+            try:
+                numeric = float(raw_value)
+                if numeric > 0:
+                    # If model returns unix seconds (10 digits), convert to milliseconds.
+                    if numeric < 1_000_000_000_000:
+                        numeric *= 1000.0
+                    parsed_ts_ms = int(numeric)
+            except Exception:
+                parsed_ts_ms = None
+
+        min_bound: Optional[int] = None
+        max_bound: Optional[int] = None
+        if min_ts_ms is not None:
+            try:
+                min_bound = int(min_ts_ms)
+            except Exception:
+                min_bound = None
+        if max_ts_ms is not None:
+            try:
+                max_bound = int(max_ts_ms)
+            except Exception:
+                max_bound = None
+
+        ts_ms = parsed_ts_ms if parsed_ts_ms is not None else fallback
+        if ts_ms == DEFAULT_PROMPT_TS_MS:
+            # Treat the baked-in template literal as invalid unless it actually
+            # falls inside the observed batch window.
+            in_window = True
+            if min_bound is not None and ts_ms < min_bound:
+                in_window = False
+            if max_bound is not None and ts_ms > max_bound:
+                in_window = False
+            if not in_window:
+                ts_ms = fallback
+
+        # Reject obviously implausible epochs for runtime events.
+        if ts_ms < 946684800000 or ts_ms > 4102444800000:  # 2000-01-01 .. 2100-01-01
+            ts_ms = fallback
+        if min_bound is not None and max_bound is not None and min_bound > max_bound:
+            min_bound, max_bound = max_bound, min_bound
+        if min_bound is not None and ts_ms < min_bound:
+            ts_ms = min_bound
+        if max_bound is not None and ts_ms > max_bound:
+            ts_ms = max_bound
+        return ts_ms if ts_ms > 0 else fallback
+
+    @staticmethod
     def _bookmark_fingerprint(alert: Mapping[str, Any]) -> str:
         title = str(alert.get("title") or "").strip().lower()
         description = str(alert.get("description") or "").strip().lower()[:180]
@@ -2138,10 +2221,22 @@ class LuxriotManager:
             newest = sorted(channel_cache.items(), key=lambda item: item[1], reverse=True)[:1200]
             self.channel_bookmark_fingerprints[channel_key] = dict(newest)
 
-    def process_summary_alerts(self, channel_id: int, summary_text: str, default_ts_ms: Optional[int] = None) -> int:
+    def process_summary_alerts(
+        self,
+        channel_id: int,
+        summary_text: str,
+        default_ts_ms: Optional[int] = None,
+        min_ts_ms: Optional[int] = None,
+        max_ts_ms: Optional[int] = None,
+    ) -> int:
         if not self.alert_parser:
             return 0
-        base_ts_ms = self._normalize_alert_timestamp_ms(default_ts_ms, int(time.time() * 1000))
+        base_ts_ms = self._normalize_alert_timestamp_ms_bounded(
+            default_ts_ms,
+            int(time.time() * 1000),
+            min_ts_ms=min_ts_ms,
+            max_ts_ms=max_ts_ms,
+        )
         with self.cache_lock:
             settings = self._get_channel_bookmark_settings_locked(channel_id)
         if not bool(settings.get("bookmark_enabled")):
@@ -2149,7 +2244,10 @@ class LuxriotManager:
         cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
         if not self._contains_alerts_json(summary_text):
             return 0
-        parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
+        try:
+            parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
+        except TypeError:
+            parsed_alerts = cast(Any, self.alert_parser)(summary_text, int(channel_id))
         if not isinstance(parsed_alerts, list) or not parsed_alerts:
             return 0
 
@@ -2165,7 +2263,12 @@ class LuxriotManager:
                 "severity": str(raw_alert.get("severity") or "normal"),
                 "state": str(raw_alert.get("state") or "new"),
                 "channel_id": int(channel_id),  # force observed stream channel
-                "timestamp_ms": self._normalize_alert_timestamp_ms(raw_alert.get("timestamp_ms"), base_ts_ms),
+                "timestamp_ms": self._normalize_alert_timestamp_ms_bounded(
+                    raw_alert.get("timestamp_ms"),
+                    base_ts_ms,
+                    min_ts_ms=min_ts_ms,
+                    max_ts_ms=max_ts_ms,
+                ),
             }
             fingerprint = self._bookmark_fingerprint(alert)
             now_ms = int(time.time() * 1000)
