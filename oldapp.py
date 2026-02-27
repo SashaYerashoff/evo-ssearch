@@ -107,13 +107,18 @@ def _normalize_probe_roi_norm(raw: Any, min_side: float = PROBE_ROI_MIN_SIDE) ->
     try:
         if isinstance(raw, dict):
             values = (
-                float(raw.get("x")),
-                float(raw.get("y")),
-                float(raw.get("w")),
-                float(raw.get("h")),
+                _to_float(raw.get("x"), default=math.nan),
+                _to_float(raw.get("y"), default=math.nan),
+                _to_float(raw.get("w"), default=math.nan),
+                _to_float(raw.get("h"), default=math.nan),
             )
         elif isinstance(raw, (list, tuple)) and len(raw) == 4:
-            values = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+            values = (
+                _to_float(raw[0], default=math.nan),
+                _to_float(raw[1], default=math.nan),
+                _to_float(raw[2], default=math.nan),
+                _to_float(raw[3], default=math.nan),
+            )
     except Exception:
         return None
     if values is None:
@@ -3574,6 +3579,14 @@ def home():
             text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
         }
 
+        .probe-mini-gate {
+            color: #b7c1b9;
+            font-size: 0.74rem;
+            letter-spacing: 0.01em;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+            opacity: 0.92;
+        }
+
         .probe-thumb-pill {
             position: absolute;
             top: 6px;
@@ -4613,6 +4626,30 @@ def home():
                 <div class="settings-row">
                     <label class="settings-label">Auto Bookmark Alerts:</label>
                     <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Bookmark Cooldown (s):</label>
+                    <input type="number" id="probeBookmarkCooldownSec" class="settings-input" min="0" step="0.5" placeholder="8.0">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Dedupe Window (s):</label>
+                    <input type="number" id="probeBookmarkDedupeWindowSec" class="settings-input" min="0.5" step="0.5" placeholder="20.0">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Similarity High:</label>
+                    <input type="number" id="probeBookmarkSimHigh" class="settings-input" min="0.5" max="0.9999" step="0.0001" placeholder="0.985">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Margin Delta:</label>
+                    <input type="number" id="probeBookmarkMarginDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Score Delta:</label>
+                    <input type="number" id="probeBookmarkScoreDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
+                </div>
+                <div class="settings-row">
+                    <label class="settings-label">Probe Max Frame Gap:</label>
+                    <input type="number" id="probeBookmarkMaxFrameGap" class="settings-input" min="1" step="1" placeholder="8">
                 </div>
                 <div class="settings-row">
                     <label class="settings-label">Severity Mapping:</label>
@@ -7240,6 +7277,12 @@ def home():
         const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
         const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
         const luxriotAutoBookmarksInput = document.getElementById('luxriotAutoBookmarks');
+        const probeBookmarkCooldownSecInput = document.getElementById('probeBookmarkCooldownSec');
+        const probeBookmarkDedupeWindowSecInput = document.getElementById('probeBookmarkDedupeWindowSec');
+        const probeBookmarkSimHighInput = document.getElementById('probeBookmarkSimHigh');
+        const probeBookmarkMarginDeltaInput = document.getElementById('probeBookmarkMarginDelta');
+        const probeBookmarkScoreDeltaInput = document.getElementById('probeBookmarkScoreDelta');
+        const probeBookmarkMaxFrameGapInput = document.getElementById('probeBookmarkMaxFrameGap');
         const luxriotSevInfoInput = document.getElementById('luxriotSevInfo');
         const luxriotSevLowInput = document.getElementById('luxriotSevLow');
         const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
@@ -7774,6 +7817,12 @@ def home():
                     if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
                     if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
                     if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = toBool(settings.luxriotAutoBookmarks, false);
+                    if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = settings.probeBookmarkCooldownSec ?? 8.0;
+                    if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = settings.probeBookmarkDedupeWindowSec ?? 20.0;
+                    if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = settings.probeBookmarkSimHigh ?? 0.985;
+                    if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = settings.probeBookmarkMarginDelta ?? 0.08;
+                    if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = settings.probeBookmarkScoreDelta ?? 0.08;
+                    if (probeBookmarkMaxFrameGapInput) probeBookmarkMaxFrameGapInput.value = settings.probeBookmarkMaxFrameGap ?? 8;
                     if (settings.luxriotSeverityMap) {
                         if (luxriotSevInfoInput) luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
                         if (luxriotSevLowInput) luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
@@ -7833,6 +7882,12 @@ def home():
                     luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput ? luxriotSnapshotMaxEdgeInput.value : config.LUXRIOT_SNAPSHOT_MAX_EDGE),
                     luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput ? luxriotMaxBufferFramesInput.value : config.LUXRIOT_MAX_BUFFER_FRAMES),
                     luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
+                    probeBookmarkCooldownSec: parseFloat(probeBookmarkCooldownSecInput ? probeBookmarkCooldownSecInput.value : '8'),
+                    probeBookmarkDedupeWindowSec: parseFloat(probeBookmarkDedupeWindowSecInput ? probeBookmarkDedupeWindowSecInput.value : '20'),
+                    probeBookmarkSimHigh: parseFloat(probeBookmarkSimHighInput ? probeBookmarkSimHighInput.value : '0.985'),
+                    probeBookmarkMarginDelta: parseFloat(probeBookmarkMarginDeltaInput ? probeBookmarkMarginDeltaInput.value : '0.08'),
+                    probeBookmarkScoreDelta: parseFloat(probeBookmarkScoreDeltaInput ? probeBookmarkScoreDeltaInput.value : '0.08'),
+                    probeBookmarkMaxFrameGap: parseInt(probeBookmarkMaxFrameGapInput ? probeBookmarkMaxFrameGapInput.value : '8'),
                     luxriotSeverityMap: {
                         info: luxriotSevInfoInput ? (luxriotSevInfoInput.value.trim() || 'info') : 'info',
                         low: luxriotSevLowInput ? (luxriotSevLowInput.value.trim() || 'low') : 'low',
@@ -7879,6 +7934,26 @@ def home():
                 if (!Number.isFinite(settings.segmentMinPatches) || settings.segmentMinPatches < 1) {
                     const defaultSegments = parseInt(segmentMinPatchesInput.placeholder) || 3;
                     settings.segmentMinPatches = Number.isFinite(defaultSegments) && defaultSegments > 0 ? defaultSegments : 3;
+                }
+
+                if (!Number.isFinite(settings.probeBookmarkCooldownSec) || settings.probeBookmarkCooldownSec < 0) {
+                    settings.probeBookmarkCooldownSec = 8.0;
+                }
+                if (!Number.isFinite(settings.probeBookmarkDedupeWindowSec) || settings.probeBookmarkDedupeWindowSec < 0.5) {
+                    settings.probeBookmarkDedupeWindowSec = 20.0;
+                }
+                if (!Number.isFinite(settings.probeBookmarkSimHigh)) {
+                    settings.probeBookmarkSimHigh = 0.985;
+                }
+                settings.probeBookmarkSimHigh = Math.min(0.9999, Math.max(0.5, settings.probeBookmarkSimHigh));
+                if (!Number.isFinite(settings.probeBookmarkMarginDelta) || settings.probeBookmarkMarginDelta < 0) {
+                    settings.probeBookmarkMarginDelta = 0.08;
+                }
+                if (!Number.isFinite(settings.probeBookmarkScoreDelta) || settings.probeBookmarkScoreDelta < 0) {
+                    settings.probeBookmarkScoreDelta = 0.08;
+                }
+                if (!Number.isFinite(settings.probeBookmarkMaxFrameGap) || settings.probeBookmarkMaxFrameGap < 1) {
+                    settings.probeBookmarkMaxFrameGap = 8;
                 }
 
                 settings.segmentThreshold = clampSegmentThreshold(settings.segmentThreshold);
@@ -7948,6 +8023,12 @@ def home():
                 luxriotSnapshotMaxEdgeInput.value = '800';
                 luxriotMaxBufferFramesInput.value = '180';
                 if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
+                if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = '8.0';
+                if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = '20.0';
+                if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = '0.985';
+                if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = '0.08';
+                if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = '0.08';
+                if (probeBookmarkMaxFrameGapInput) probeBookmarkMaxFrameGapInput.value = '8';
                 if (luxriotSevInfoInput) luxriotSevInfoInput.value = 'info';
                 if (luxriotSevLowInput) luxriotSevLowInput.value = 'low';
                 if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
@@ -9011,6 +9092,44 @@ def home():
             return icons[action] || '';
         }
 
+        function describeProbeBookmarkGate(rawGate, bookmarkEnabled) {
+            if (bookmarkEnabled === false) {
+                return { text: 'Gate: off', title: 'Bookmarks disabled for this probe' };
+            }
+            const gate = rawGate && typeof rawGate === 'object' ? rawGate : null;
+            if (!gate) {
+                return { text: 'Gate: n/a', title: 'No bookmark gate result yet' };
+            }
+            const reason = String(gate.reason || '').trim().toLowerCase();
+            const dtMs = Number(gate.dt_ms);
+            const sim = Number(gate.similarity);
+            const frameGap = Number(gate.frame_gap);
+            let text = 'Gate: n/a';
+            if (reason === 'sent') {
+                text = 'Gate: sent';
+            } else if (reason === 'cooldown') {
+                text = `Gate: cooldown${Number.isFinite(dtMs) ? ` (${(dtMs / 1000).toFixed(1)}s)` : ''}`;
+            } else if (reason === 'similar_recent_hit') {
+                text = `Gate: deduped${Number.isFinite(sim) ? ` (${(sim * 100).toFixed(1)}%)` : ''}`;
+            } else if (reason === 'send_error') {
+                text = 'Gate: send error';
+            } else if (reason === 'bookmark_disabled') {
+                text = 'Gate: off';
+            } else if (reason) {
+                text = `Gate: ${reason.replace(/_/g, ' ')}`;
+            }
+            const titleParts = [];
+            if (reason) titleParts.push(`reason: ${reason}`);
+            if (Number.isFinite(dtMs)) titleParts.push(`dt: ${(dtMs / 1000).toFixed(2)}s`);
+            if (Number.isFinite(sim)) titleParts.push(`sim: ${sim.toFixed(4)}`);
+            if (Number.isFinite(frameGap)) titleParts.push(`frame gap: ${frameGap.toFixed(2)}`);
+            if (gate.error) titleParts.push(`error: ${String(gate.error)}`);
+            return {
+                text,
+                title: titleParts.join(' · ') || 'No bookmark gate result yet',
+            };
+        }
+
         function renderProbeCards() {
             if (!probeCards) return;
             if (!probeList.length) {
@@ -9042,6 +9161,7 @@ def home():
                 const toggleAction = status === 'disabled' ? 'enable' : 'disable';
                 const toggleTitle = status === 'disabled' ? 'Enable probe' : 'Disable probe';
                 const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
+                const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
                 return `
                     <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
                         <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
@@ -9060,6 +9180,7 @@ def home():
                                     <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
                                     <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
                                     <div class="probe-mini-score">${scores}</div>
+                                    <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
                                 </div>
                             </div>
                         </div>
@@ -11693,12 +11814,36 @@ LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
     "      \"severity\": \"info|low|normal|high|critical\",\n"
     "      \"state\": \"new\",\n"
     "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 0\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; "
+    "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
+)
+PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
+    "- If no trigger match: emit no JSON block.\n"
+    "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
     "      \"timestamp_ms\": 1772202050000\n"
     "    }\n"
     "  ]\n"
     "}\n"
     "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; timestamp_ms should be batch time in ms."
 )
+OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS = {
+    LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
+    PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
+}
 LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "You are a CCTV operator assistant for Luxriot.\n"
     "Return Markdown with exactly these sections and order:\n"
@@ -11717,7 +11862,7 @@ if not current_stream_prompt:
     config.LUXRIOT_SYSTEM_PROMPT_DEFAULT = LUXRIOT_SYSTEM_PROMPT_DEFAULT
 
 current_json_prompt = str(getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', '') or '').strip()
-if (not current_json_prompt) or (current_json_prompt == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip()):
+if (not current_json_prompt) or (current_json_prompt in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS):
     config.LUXRIOT_ALERTS_JSON_PROMPT = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
 
 luxriot_manager = LuxriotManager(
@@ -11734,7 +11879,7 @@ try:
         if not str(luxriot_manager.system_prompt or '').strip():
             luxriot_manager.system_prompt = LUXRIOT_SYSTEM_PROMPT_DEFAULT
             changed_prompt_defaults = True
-        if str(luxriot_manager.default_json_alert_prompt or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+        if str(luxriot_manager.default_json_alert_prompt or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
             luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
             changed_prompt_defaults = True
         desired_rollup_prompts = {
@@ -11763,7 +11908,7 @@ try:
                 continue
             channel_overrides = dict(raw_overrides)
             channel_changed = False
-            if str(channel_overrides.get('json_alert_prompt') or '').strip() == LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip():
+            if str(channel_overrides.get('json_alert_prompt') or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
                 channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
                 channel_changed = True
             rollup_overrides_raw = channel_overrides.get('rollup_prompts')
@@ -11976,7 +12121,7 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _probe_identity(probe_like: Dict[str, Any]) -> str:
+def _probe_identity(probe_like: Mapping[str, Any]) -> str:
     probe_id = str(probe_like.get("id") or "").strip()
     if probe_id:
         return probe_id
@@ -11986,6 +12131,15 @@ def _probe_identity(probe_like: Dict[str, Any]) -> str:
     if not slug:
         slug = "probe"
     return f"adhoc:{channel_id}:{slug[:48]}"
+
+
+def _probe_bookmark_identity(probe_like: Mapping[str, Any]) -> str:
+    base = _probe_identity(probe_like)
+    roi_enabled, roi_norm = _parse_probe_roi(probe_like)
+    if roi_enabled and roi_norm is not None:
+        x, y, w, h = roi_norm
+        return f"{base}:roi:{x:.4f}:{y:.4f}:{w:.4f}:{h:.4f}"
+    return base
 
 
 def _slug_token(value: Any, fallback: str) -> str:
@@ -12239,6 +12393,243 @@ class _AdaptiveDetectionArchive:
 detection_archive = _AdaptiveDetectionArchive()
 
 
+class _ProbeBookmarkGate:
+    def __init__(self) -> None:
+        self.cooldown_ms = int(max(0.0, float(getattr(config, "PROBE_BOOKMARK_COOLDOWN_SEC", 8.0)) * 1000.0))
+        self.dedupe_window_ms = int(
+            max(500.0, float(getattr(config, "PROBE_BOOKMARK_DEDUPE_WINDOW_SEC", 20.0)) * 1000.0)
+        )
+        self.sim_high = float(getattr(config, "PROBE_BOOKMARK_SIM_HIGH", 0.985))
+        self.margin_delta_thr = float(getattr(config, "PROBE_BOOKMARK_MARGIN_DELTA", 0.08))
+        self.score_delta_thr = float(getattr(config, "PROBE_BOOKMARK_SCORE_DELTA", 0.08))
+        self.max_frame_gap = int(max(1, int(getattr(config, "PROBE_BOOKMARK_MAX_FRAME_GAP", 8))))
+        self.max_states = 4096
+        self.keep_states = 2500
+        self._lock = threading.RLock()
+        self._state: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _normalize_vec(vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if vec is None:
+            return None
+        try:
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        norm = float(np.linalg.norm(arr))
+        if norm <= 0:
+            return None
+        return (arr / norm).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _state_key(channel_id: int, probe_key: str) -> str:
+        return f"{int(channel_id)}:{probe_key}"
+
+    @staticmethod
+    def _estimate_frame_interval_ms(fps_hint: Optional[float]) -> int:
+        if fps_hint is not None and fps_hint > 0:
+            return max(1, int(round(1000.0 / fps_hint)))
+        snapshot_interval = max(1, int(getattr(config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
+        return snapshot_interval * 1000
+
+    def _prune_locked(self) -> None:
+        if len(self._state) <= self.max_states:
+            return
+        newest = sorted(
+            self._state.items(),
+            key=lambda item: int(item[1].get("timestamp_ms") or 0),
+            reverse=True,
+        )[: self.keep_states]
+        self._state = dict(newest)
+
+    def evaluate(
+        self,
+        *,
+        channel_id: int,
+        probe_key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+        fps_hint: Optional[float],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        key = self._state_key(channel_id, probe_key)
+        ts_ms = int(timestamp_ms) if int(timestamp_ms) > 0 else int(time.time() * 1000)
+        frame_interval_ms = self._estimate_frame_interval_ms(fps_hint)
+        normalized_vec = self._normalize_vec(clip_vec)
+
+        with self._lock:
+            prev = self._state.get(key)
+            if prev is None:
+                return True, {
+                    "reason": "bootstrap",
+                    "timestamp_ms": ts_ms,
+                    "dt_ms": None,
+                    "similarity": None,
+                    "frame_gap": None,
+                }
+
+            prev_ts = int(prev.get("timestamp_ms") or 0)
+            dt_ms = max(0, ts_ms - prev_ts)
+            frame_gap = float(dt_ms) / float(frame_interval_ms)
+            similarity: Optional[float] = None
+
+            prev_vec = prev.get("clip_vec")
+            if (
+                isinstance(prev_vec, np.ndarray)
+                and normalized_vec is not None
+                and prev_vec.shape == normalized_vec.shape
+            ):
+                similarity = float(np.clip(np.dot(prev_vec, normalized_vec), -1.0, 1.0))
+
+            margin_delta = abs(float(margin) - float(prev.get("margin") or 0.0))
+            pos_delta = abs(float(pos_score) - float(prev.get("pos_score") or 0.0))
+            neg_delta = abs(float(neg_score) - float(prev.get("neg_score") or 0.0))
+
+            if self.cooldown_ms > 0 and dt_ms < self.cooldown_ms:
+                return False, {
+                    "reason": "cooldown",
+                    "timestamp_ms": ts_ms,
+                    "dt_ms": dt_ms,
+                    "similarity": similarity,
+                    "frame_gap": frame_gap,
+                }
+
+            stable_scores = (
+                margin_delta < self.margin_delta_thr
+                and pos_delta < self.score_delta_thr
+                and neg_delta < self.score_delta_thr
+            )
+            if (
+                dt_ms < self.dedupe_window_ms
+                and similarity is not None
+                and similarity >= self.sim_high
+                and stable_scores
+                and frame_gap <= float(self.max_frame_gap)
+            ):
+                return False, {
+                    "reason": "similar_recent_hit",
+                    "timestamp_ms": ts_ms,
+                    "dt_ms": dt_ms,
+                    "similarity": similarity,
+                    "frame_gap": frame_gap,
+                }
+
+            return True, {
+                "reason": "novel_or_spaced",
+                "timestamp_ms": ts_ms,
+                "dt_ms": dt_ms,
+                "similarity": similarity,
+                "frame_gap": frame_gap,
+            }
+
+    def mark_sent(
+        self,
+        *,
+        channel_id: int,
+        probe_key: str,
+        timestamp_ms: int,
+        clip_vec: Optional[np.ndarray],
+        pos_score: float,
+        neg_score: float,
+        margin: float,
+    ) -> None:
+        key = self._state_key(channel_id, probe_key)
+        normalized_vec = self._normalize_vec(clip_vec)
+        with self._lock:
+            self._state[key] = {
+                "timestamp_ms": int(timestamp_ms),
+                "clip_vec": normalized_vec.copy() if normalized_vec is not None else None,
+                "pos_score": float(pos_score),
+                "neg_score": float(neg_score),
+                "margin": float(margin),
+            }
+            self._prune_locked()
+
+
+probe_bookmark_gate = _ProbeBookmarkGate()
+
+
+def _select_probe_bookmark_hit(hits: Sequence[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    best_hit: Optional[Mapping[str, Any]] = None
+    best_key: Optional[Tuple[int, float]] = None
+    for hit in hits:
+        ts_ms = _to_int(hit.get("timestamp_ms"), 0)
+        margin = _to_float(hit.get("margin"), -1.0)
+        key = (ts_ms, margin)
+        if best_key is None or key > best_key:
+            best_hit = hit
+            best_key = key
+    return best_hit
+
+
+def _maybe_send_probe_bookmark(
+    probe_like: Mapping[str, Any],
+    hit: Mapping[str, Any],
+    *,
+    source: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    if not bool(probe_like.get("bookmark", False)):
+        return False, {"reason": "bookmark_disabled", "source": source}
+
+    channel_id = _to_int(probe_like.get("channel_id"), config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    probe_key = _probe_bookmark_identity(probe_like)
+    probe_name = str(probe_like.get("name") or "probe")
+    severity = str(probe_like.get("severity") or "critical")
+    ts_ms = _to_int(hit.get("timestamp_ms"), int(time.time() * 1000))
+    pos_score = _to_float(hit.get("pos_score"), 0.0)
+    neg_score = _to_float(hit.get("neg_score"), 0.0)
+    margin = _to_float(hit.get("margin"), 0.0)
+    fps_hint = _to_optional_float(probe_like.get("fps"))
+    clip_vec = _embed_thumbnail_b64(hit.get("thumbnail"), "clip")
+
+    allow, gate_meta = probe_bookmark_gate.evaluate(
+        channel_id=channel_id,
+        probe_key=probe_key,
+        timestamp_ms=ts_ms,
+        clip_vec=clip_vec,
+        pos_score=pos_score,
+        neg_score=neg_score,
+        margin=margin,
+        fps_hint=fps_hint,
+    )
+    gate_meta["source"] = source
+    if not allow:
+        gate_meta["sent"] = False
+        return False, gate_meta
+
+    try:
+        luxriot_manager.send_bookmark_event(
+            channel_id=channel_id,
+            title=f"Probe hit: {probe_name}",
+            description=f"pos {pos_score:.3f} / neg {neg_score:.3f} · margin {margin:.3f}",
+            severity=severity,
+            state="new",
+            timestamp_ms=ts_ms,
+        )
+    except Exception as exc:
+        gate_meta["sent"] = False
+        gate_meta["reason"] = "send_error"
+        gate_meta["error"] = str(exc)
+        return False, gate_meta
+
+    probe_bookmark_gate.mark_sent(
+        channel_id=channel_id,
+        probe_key=probe_key,
+        timestamp_ms=ts_ms,
+        clip_vec=clip_vec,
+        pos_score=pos_score,
+        neg_score=neg_score,
+        margin=margin,
+    )
+    gate_meta["sent"] = True
+    gate_meta["reason"] = "sent"
+    return True, gate_meta
+
+
 def _store_probe_hits(
     probe_like: Dict[str, Any],
     hits: Sequence[Dict[str, Any]],
@@ -12413,19 +12804,24 @@ def _probe_daemon() -> None:
                             recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
                             probe['recent_hits'] = recent
                             bookmark_sent = False
+                            bookmark_gate: Dict[str, Any] = {"reason": "bookmark_disabled", "source": "probe_daemon"}
                             if probe.get('bookmark'):
-                                try:
-                                    luxriot_manager.send_bookmark_event(
-                                        channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
-                                        title=f"Probe hit: {probe.get('name', 'probe')}",
-                                        description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
-                                        severity=probe.get('severity', 'critical'),
-                                        state='new',
-                                        timestamp_ms=hits[0].get('timestamp_ms'),
+                                bookmark_hit = _select_probe_bookmark_hit(cast(Sequence[Mapping[str, Any]], hits))
+                                if bookmark_hit is not None:
+                                    bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
+                                        probe,
+                                        bookmark_hit,
+                                        source='probe_daemon',
                                     )
-                                    bookmark_sent = True
-                                except Exception as exc:
-                                    print(f"Probe daemon failed to send bookmark for probe {probe.get('id')}: {exc}")
+                                    if (not bookmark_sent) and str(bookmark_gate.get("reason") or "") == "send_error":
+                                        print(
+                                            "Probe daemon failed to send bookmark for probe {}: {}".format(
+                                                probe.get('id'),
+                                                bookmark_gate.get("error") or "unknown error",
+                                            )
+                                        )
+                            probe['bookmark_gate'] = bookmark_gate
+                            probe['bookmark_gate_updated_at_ms'] = int(time.time() * 1000)
                             _store_probe_hits(
                                 probe,
                                 hits,
@@ -12435,6 +12831,7 @@ def _probe_daemon() -> None:
                                     'frames_indexed': result.get('frames_indexed'),
                                     'roi_enabled': probe_roi_enabled,
                                     'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+                                    'bookmark_gate': bookmark_gate,
                                 },
                             )
                             probes_store.upsert_probe(probe)
@@ -14527,9 +14924,12 @@ def luxriot_prompt_settings():
     if guard is not None:
         return guard
     data = _json_body()
-    try:
-        channel_id = int(data.get('channel_id') or data.get('channel') or data.get('id'))
-    except Exception:
+    channel_id = _to_optional_int(data.get('channel_id'))
+    if channel_id is None:
+        channel_id = _to_optional_int(data.get('channel'))
+    if channel_id is None:
+        channel_id = _to_optional_int(data.get('id'))
+    if channel_id is None:
         return jsonify({'error': 'Provide a valid channel_id'}), 400
 
     stream_system_prompt: Optional[str] = None
@@ -14556,15 +14956,9 @@ def luxriot_prompt_settings():
 
     bookmark_cooldown_sec: Optional[float] = None
     if 'bookmark_cooldown_sec' in data:
-        try:
-            bookmark_cooldown_sec = max(0.0, float(data.get('bookmark_cooldown_sec')))
-        except Exception:
-            bookmark_cooldown_sec = 0.0
+        bookmark_cooldown_sec = max(0.0, _to_float(data.get('bookmark_cooldown_sec'), default=0.0))
     elif 'cooldown_sec' in data:
-        try:
-            bookmark_cooldown_sec = max(0.0, float(data.get('cooldown_sec')))
-        except Exception:
-            bookmark_cooldown_sec = 0.0
+        bookmark_cooldown_sec = max(0.0, _to_float(data.get('cooldown_sec'), default=0.0))
 
     rollup_prompt_updates: Optional[Dict[str, Any]] = None
     rollup_prompts_raw = data.get('rollup_prompts')
@@ -14812,19 +15206,16 @@ def probes_query():
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
     bookmark_sent = False
+    bookmark_gate: Dict[str, Any] = {"reason": "bookmark_disabled", "source": "probes_query"}
     if hits and data.get('bookmark'):
-        try:
-            luxriot_manager.send_bookmark_event(
-                channel_id=channel_id,
-                title=f"Probe hit: {data.get('name') or 'probe'}",
-                description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
-                severity=(data.get('severity') or 'critical'),
-                state='new',
-                timestamp_ms=hits[0].get('timestamp_ms'),
+        bookmark_hit = _select_probe_bookmark_hit(cast(Sequence[Mapping[str, Any]], hits))
+        if bookmark_hit is not None:
+            bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
+                probe_like,
+                bookmark_hit,
+                source='probes_query',
             )
-            bookmark_sent = True
-        except Exception:
-            pass
+    result['bookmark_gate'] = bookmark_gate
     if hits:
         # trim recent hits (kept in request payload only; not persisted unless saved)
         recent_hits = data.get('recent_hits') or []
@@ -14839,6 +15230,7 @@ def probes_query():
                 'frames_indexed': result.get('frames_indexed'),
                 'roi_enabled': probe_roi_enabled,
                 'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+                'bookmark_gate': bookmark_gate,
             },
         )
     else:
@@ -14928,6 +15320,17 @@ def probes_save():
 
     probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
 
+    existing_probe: Dict[str, Any] = {}
+    probe_id_raw = data.get('id')
+    if probe_id_raw:
+        try:
+            existing_probe = next(
+                (p for p in probes_store.list_probes() if str(p.get('id')) == str(probe_id_raw)),
+                {},
+            )
+        except Exception:
+            existing_probe = {}
+
     probe = {
         "id": data.get('id') or None,
         "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
@@ -14947,6 +15350,8 @@ def probes_save():
         "pairs": data.get('pairs') or [],
         "last_hit": data.get('last_hit'),
         "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
+        "bookmark_gate": existing_probe.get("bookmark_gate"),
+        "bookmark_gate_updated_at_ms": existing_probe.get("bookmark_gate_updated_at_ms"),
     }
     saved = probes_store.upsert_probe(probe)
     return jsonify({'success': True, 'probe': saved})
@@ -15003,26 +15408,24 @@ def probes_run():
         return jsonify(result), 400
     hits = result.get('results') or []
     bookmark_sent = False
+    bookmark_gate: Dict[str, Any] = {"reason": "bookmark_disabled", "source": "probes_run"}
     if hits:
         probe['last_hit'] = hits[0]
         # keep a short rolling history of hits for UI while capping thumbnails
         recent = probe.get('recent_hits') or []
         recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
         probe['recent_hits'] = recent
-        probes_store.upsert_probe(probe)
         if probe.get('bookmark'):
-            try:
-                luxriot_manager.send_bookmark_event(
-                    channel_id=probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
-                    title=f"Probe hit: {probe.get('name', 'probe')}",
-                    description=f"pos {hits[0].get('pos_score'):.3f} / neg {hits[0].get('neg_score'):.3f} · margin {hits[0].get('margin'):.3f}",
-                    severity=probe.get('severity', 'critical'),
-                    state='new',
-                    timestamp_ms=hits[0].get('timestamp_ms'),
+            bookmark_hit = _select_probe_bookmark_hit(cast(Sequence[Mapping[str, Any]], hits))
+            if bookmark_hit is not None:
+                bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
+                    probe,
+                    bookmark_hit,
+                    source='probes_run',
                 )
-                bookmark_sent = True
-            except Exception:
-                pass
+        probe['bookmark_gate'] = bookmark_gate
+        probe['bookmark_gate_updated_at_ms'] = int(time.time() * 1000)
+        probes_store.upsert_probe(probe)
         persisted_hits = _store_probe_hits(
             probe,
             hits,
@@ -15032,11 +15435,20 @@ def probes_run():
                 'frames_indexed': result.get('frames_indexed'),
                 'roi_enabled': probe_roi_enabled,
                 'roi_norm': _probe_roi_norm_to_payload(probe_roi_norm),
+                'bookmark_gate': bookmark_gate,
             },
         )
     else:
         persisted_hits = 0
-    return jsonify({'results': hits, 'status': result.get('status'), 'probe': probe, 'persisted_hits': persisted_hits})
+    return jsonify(
+        {
+            'results': hits,
+            'status': result.get('status'),
+            'probe': probe,
+            'persisted_hits': persisted_hits,
+            'bookmark_gate': bookmark_gate,
+        }
+    )
 
 
 @app.route('/probes/bench', methods=['GET'])
@@ -15445,6 +15857,12 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LUXRIOT_SEV_CRITICAL": str(sev.get("critical", "critical")),
         "EVOSSEARCH_PROBE_MAX_FRAMES": str(config.PROBE_MAX_FRAMES),
         "EVOSSEARCH_PROBE_THUMB_MAX_EDGE": str(config.PROBE_THUMB_MAX_EDGE),
+        "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC": str(config.PROBE_BOOKMARK_COOLDOWN_SEC),
+        "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC": str(config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC),
+        "EVOSSEARCH_PROBE_BOOKMARK_SIM_HIGH": str(config.PROBE_BOOKMARK_SIM_HIGH),
+        "EVOSSEARCH_PROBE_BOOKMARK_MARGIN_DELTA": str(config.PROBE_BOOKMARK_MARGIN_DELTA),
+        "EVOSSEARCH_PROBE_BOOKMARK_SCORE_DELTA": str(config.PROBE_BOOKMARK_SCORE_DELTA),
+        "EVOSSEARCH_PROBE_BOOKMARK_MAX_FRAME_GAP": str(config.PROBE_BOOKMARK_MAX_FRAME_GAP),
         "EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED": _bool_to_env(config.DETECTIONS_ARCHIVE_ENABLED),
         "EVOSSEARCH_DETECTIONS_ARCHIVE_DIR": str(config.DETECTIONS_ARCHIVE_DIR),
         "EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY": str(config.DETECTIONS_ARCHIVE_JPEG_QUALITY),
@@ -15607,6 +16025,12 @@ def get_settings():
             'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
             'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
             'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
+            'probeBookmarkCooldownSec': config.PROBE_BOOKMARK_COOLDOWN_SEC,
+            'probeBookmarkDedupeWindowSec': config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC,
+            'probeBookmarkSimHigh': config.PROBE_BOOKMARK_SIM_HIGH,
+            'probeBookmarkMarginDelta': config.PROBE_BOOKMARK_MARGIN_DELTA,
+            'probeBookmarkScoreDelta': config.PROBE_BOOKMARK_SCORE_DELTA,
+            'probeBookmarkMaxFrameGap': config.PROBE_BOOKMARK_MAX_FRAME_GAP,
             'luxriotBatchSizes': list(config.LUXRIOT_BATCH_SIZES),
             'minResults': config.MIN_RESULTS,
             'maxResults': config.MAX_RESULTS,
@@ -15637,7 +16061,7 @@ def save_settings():
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder
+        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
@@ -15727,6 +16151,39 @@ def save_settings():
             data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS),
             config.LUXRIOT_AUTO_BOOKMARKS,
         )
+        try:
+            probe_bookmark_cooldown_sec = float(data.get('probeBookmarkCooldownSec', config.PROBE_BOOKMARK_COOLDOWN_SEC))
+        except (TypeError, ValueError):
+            probe_bookmark_cooldown_sec = config.PROBE_BOOKMARK_COOLDOWN_SEC
+        probe_bookmark_cooldown_sec = max(0.0, probe_bookmark_cooldown_sec)
+        try:
+            probe_bookmark_dedupe_window_sec = float(
+                data.get('probeBookmarkDedupeWindowSec', config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC)
+            )
+        except (TypeError, ValueError):
+            probe_bookmark_dedupe_window_sec = config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC
+        probe_bookmark_dedupe_window_sec = max(0.5, probe_bookmark_dedupe_window_sec)
+        try:
+            probe_bookmark_sim_high = float(data.get('probeBookmarkSimHigh', config.PROBE_BOOKMARK_SIM_HIGH))
+        except (TypeError, ValueError):
+            probe_bookmark_sim_high = config.PROBE_BOOKMARK_SIM_HIGH
+        probe_bookmark_sim_high = min(0.9999, max(0.5, probe_bookmark_sim_high))
+        try:
+            probe_bookmark_margin_delta = float(data.get('probeBookmarkMarginDelta', config.PROBE_BOOKMARK_MARGIN_DELTA))
+        except (TypeError, ValueError):
+            probe_bookmark_margin_delta = config.PROBE_BOOKMARK_MARGIN_DELTA
+        probe_bookmark_margin_delta = max(0.0, probe_bookmark_margin_delta)
+        try:
+            probe_bookmark_score_delta = float(data.get('probeBookmarkScoreDelta', config.PROBE_BOOKMARK_SCORE_DELTA))
+        except (TypeError, ValueError):
+            probe_bookmark_score_delta = config.PROBE_BOOKMARK_SCORE_DELTA
+        probe_bookmark_score_delta = max(0.0, probe_bookmark_score_delta)
+        try:
+            probe_bookmark_max_frame_gap = int(data.get('probeBookmarkMaxFrameGap', config.PROBE_BOOKMARK_MAX_FRAME_GAP))
+        except (TypeError, ValueError):
+            probe_bookmark_max_frame_gap = config.PROBE_BOOKMARK_MAX_FRAME_GAP
+        if probe_bookmark_max_frame_gap < 1:
+            probe_bookmark_max_frame_gap = 1
         severity_map = data.get('luxriotSeverityMap', {}) or {}
         merged_sev = dict(config.LUXRIOT_SEVERITY_MAP)
         for key in ['info', 'low', 'normal', 'high', 'critical']:
@@ -15815,6 +16272,12 @@ EVOSSEARCH_LUXRIOT_SEV_CRITICAL={merged_sev['critical']}
 # Probe / monitoring
 EVOSSEARCH_PROBE_MAX_FRAMES={config.PROBE_MAX_FRAMES}
 EVOSSEARCH_PROBE_THUMB_MAX_EDGE={config.PROBE_THUMB_MAX_EDGE}
+EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC={probe_bookmark_cooldown_sec}
+EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC={probe_bookmark_dedupe_window_sec}
+EVOSSEARCH_PROBE_BOOKMARK_SIM_HIGH={probe_bookmark_sim_high}
+EVOSSEARCH_PROBE_BOOKMARK_MARGIN_DELTA={probe_bookmark_margin_delta}
+EVOSSEARCH_PROBE_BOOKMARK_SCORE_DELTA={probe_bookmark_score_delta}
+EVOSSEARCH_PROBE_BOOKMARK_MAX_FRAME_GAP={probe_bookmark_max_frame_gap}
 
 # Detections archive / adaptive retention
 EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED={str(config.DETECTIONS_ARCHIVE_ENABLED).lower()}
@@ -15895,6 +16358,13 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
         config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
         config.LUXRIOT_SEVERITY_MAP = merged_sev
+        config.PROBE_BOOKMARK_COOLDOWN_SEC = probe_bookmark_cooldown_sec
+        config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC = probe_bookmark_dedupe_window_sec
+        config.PROBE_BOOKMARK_SIM_HIGH = probe_bookmark_sim_high
+        config.PROBE_BOOKMARK_MARGIN_DELTA = probe_bookmark_margin_delta
+        config.PROBE_BOOKMARK_SCORE_DELTA = probe_bookmark_score_delta
+        config.PROBE_BOOKMARK_MAX_FRAME_GAP = probe_bookmark_max_frame_gap
+        probe_bookmark_gate = _ProbeBookmarkGate()
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:

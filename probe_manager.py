@@ -16,6 +16,29 @@ def _faiss_add(index: faiss.IndexFlatIP, vectors: np.ndarray) -> None:
     cast(Any, index).add(vectors)
 
 
+def _to_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    try:
+        return int(cast(Any, value))
+    except Exception:
+        return None
+
+
 class ProbeBuffer:
     def __init__(self, max_frames: int, thumb_edge: int) -> None:
         self.max_frames = max_frames
@@ -90,7 +113,7 @@ class ProbeBuffer:
                 removed = self.meta[:excess]
                 self.embeddings = self.embeddings[excess:]
                 self.meta = self.meta[excess:]
-                removed_uids = [int(item.get("uid")) for item in removed if item.get("uid") is not None]
+                removed_uids = [uid for uid in (_to_optional_int(item.get("uid")) for item in removed) if uid is not None]
                 self._prune_roi_cache_uids(removed_uids)
         self._rebuild_index()
 
