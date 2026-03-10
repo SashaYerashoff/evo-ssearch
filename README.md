@@ -1,210 +1,419 @@
-# evo-ssearch
+# Luxriot EVA AI (Smart Image Search and Understanding)
 
-A CLIP-powered natural language image search application with semantic similarity using OpenAI's CLIP model and FAISS indexing.
+Luxriot EVA AI is a CLIP/DINO visual search and monitoring PoC for Luxriot-integrated workflows. It combines:
 
-## Features
+- Archive research over indexed folders and detections archive
+- Video understanding via OpenAI-compatible vision models (LM Studio/vLLM)
+- Live monitoring with probe-based tracking and bookmark actions
 
-**Modern Dark UI with SVG Overlay Controls:**
-- Clean, minimal dark interface optimized for image browsing
-- SVG overlay icons for intuitive image interaction
-- Network-accessible with automatic IP detection
+## Version
 
-**Dual Search Modes:**
-- **Text Search**: Natural language descriptions (e.g., "red car", "sunset over mountains")
-- **Image Search**: Upload an image file OR enter an image path to find visually similar images
+- Current version: `α 0.4.2`
+- Source of truth: `VERSION` (UI reads it at runtime; optional override via `EVOSSEARCH_APP_VERSION`)
 
-**Advanced Image Management:**
-- **Expand/Collapse**: Click overlay icon (bottom-right) to toggle between thumbnail and full view
-- **Full-Width Expanded View**: Expanded images take the complete row with 900px minimum width and no cropping
-- **Find Similar**: Click search icon on expanded images to find visually similar images
-- **Quick Copy**: Click copy icon next to filename to copy full file path to clipboard
-- **Comment System**: Add timestamped comments to any image with persistent storage
+### Versioning Policy
 
-**Configurable & Accessible:**
-- Dynamic result limits (3-48 images, configurable via environment variables)
-- Sort by similarity or modification time (newest first)
-- Network access - server accessible from any device on local network
-- Comprehensive configuration via `config.py` and environment variables
+- `major.minor.patch` (shown in UI with alpha prefix, e.g. `α 0.4.2`)
+- New feature branch work: increment `minor`
+- Minor adjustments inside a branch: increment `patch`
+- Merge to `main`: increment `major`, reset `minor` and `patch` to `0`
+
+## Current Scope
+
+This branch (`lxrt-inntegration`) is a working exhibition PoC focused on:
+
+- Stable end-to-end UX in 3 tabs: `Archive Research`, `Video Understanding`, `Monitoring`
+- Secure mutation paths via admin token
+- Runtime configuration through Settings + `.env` editor
+- Detection retention to reduce redundant archive frames while keeping useful snapshots
+
+## Core Features
+
+### Archive Research
+
+- Text and image query in one workspace
+- Search scope switch:
+  - `Indexed Folder`: FAISS search over local `.clip_index`
+  - `Detections Archive`: search over persisted probe detections
+- Search modes: CLIP, DINO, or fusion (when enabled)
+- Sort by similarity or time
+- Expand result, copy path, and run "find similar"
+- Comments and interactive segmentation for indexed-folder images
+- LLM image description from expanded image, with save-as-comment
+
+Note: Comments and segmentation are intentionally limited to indexed-folder images.
+
+### Video Understanding
+
+- Offline video analysis (`/video_understanding`) with sampled frames
+- Configurable frames, sample FPS, prompt, and model id
+- Luxriot live summaries panel with visible system prompt
+- Active stream manager:
+  - stop individual stream channels
+  - stop all video streams
+  - stop all analytics streams
+
+### Monitoring (Luxriot + Probes)
+
+- Live Luxriot preview by channel
+- Saved probe cards with latest detections strip and stream controls
+- Probe editor modal:
+  - text pairs (positive/negative)
+  - optional image probe
+  - per-probe thresholds, severity, and bookmark behavior
+- Background probe daemon over active channels
+- CLIP throughput benchmark (`/probes/bench`)
+
+### Detections Archive + Retention
+
+- Probe hits are persisted in SQLite (`detections_store.sqlite3`)
+- Optional adaptive retention keeps high-value snapshots and drops near-duplicates
+- Archive search returns probe metadata plus search similarity signals
 
 ## Prerequisites
-- Windows 10/11 or Ubuntu 20.04+
-- Python 3.10 or newer (64-bit recommended)
+
+- Python 3.10+ (3.13 is supported in current branch)
 - Git
-- (Optional) CUDA-capable GPU for faster search (NVIDIA, with drivers installed)
+- CUDA GPU recommended for DINO/Mask2Former/probe-heavy workloads
+- LM Studio or vLLM (optional, for video understanding)
+- Luxriot Evo S (optional, for live monitoring/bookmarks)
 
-## Installation & Setup
+## Installation
 
-### 1. Open Terminal
-- **Windows**: Press `Win + S`, type `PowerShell`, and open it.
-- **Ubuntu**: Press `Ctrl + Alt + T`.
-
-### 2. Clone the Repository
-```sh
+```bash
 git clone https://github.com/SashaYerashoff/evo-ssearch.git
 cd evo-ssearch
-```
+git checkout lxrt-inntegration
 
-### 3. Create a Virtual Environment
-```sh
 python -m venv .venv
-```
+source .venv/bin/activate  # Windows: .venv\\Scripts\\Activate.ps1
 
-### 4. Activate the Virtual Environment
-- **Windows**:
-  ```sh
-  .venv\Scripts\Activate.ps1
-  ```
-- **Ubuntu**:
-  ```sh
-  source .venv/bin/activate
-  ```
-
-### 5. Install Dependencies
-```sh
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Running the Application
+### DINO Weights
 
-```sh
+DINO requires local weights if you use DINO/fusion paths:
+
+```bash
+# example only; choose the weight file that matches EVOSSEARCH_DINO_MODEL
+wget -O /path/to/dinov3_weights.pth <weights-url>
+```
+
+Then set `EVOSSEARCH_DINO_WEIGHTS_PATH`.
+
+### Windows 11 Quickstart
+
+Use this for the fastest first run on a demo laptop.
+
+1. Open PowerShell in the repo folder.
+2. Create and activate venv.
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+```
+
+3. Install dependencies.
+
+```powershell
+pip install -r requirements.txt
+```
+
+4. Optional stability-first `.env` profile (recommended if GPU/CUDA is limited):
+
+```env
+EVOSSEARCH_EMBEDDER=clip
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_M2F_ENABLED=false
+```
+
+5. Start Luxriot EVA AI.
+
+```powershell
 python oldapp.py
 ```
 
-The server will display available URLs on startup:
-- **Local**: [http://localhost:5000](http://localhost:5000)
-- **Network**: http://[your-ip]:5000 (accessible from other devices on your network)
+6. Open:
+
+```text
+http://localhost:5000
+```
+
+Windows notes:
+
+- `run_prod.sh` is Linux-oriented; use `python oldapp.py` on Windows.
+- If DINO/fusion is enabled, set a valid Windows path for `EVOSSEARCH_DINO_WEIGHTS_PATH`.
+- If execution policy blocks activation, run:
+  - `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
+## Running
+
+### Dev
+
+```bash
+python oldapp.py
+```
+
+Startup now validates port availability. If occupied, startup aborts with a clear message.
+
+Default URL:
+
+- `http://localhost:5000`
+
+### Production (Gunicorn)
+
+```bash
+./run_prod.sh
+```
+
+Optional `run_prod.sh` knobs:
+
+```bash
+EVOSSEARCH_GUNICORN_WORKERS=2
+EVOSSEARCH_GUNICORN_THREADS=4
+EVOSSEARCH_GUNICORN_TIMEOUT=180
+EVOSSEARCH_GUNICORN_BIN=/path/to/gunicorn
+```
 
 ## Configuration
 
-### Frontend Settings Panel (Recommended)
+### Settings UI (Recommended)
 
-**Easy Configuration via Web UI:**
-- Click the settings gear icon (⚙️) in the top-right corner of the application
-- Modify settings in the organized modal panel
-- Click "Save Settings" to persist changes to `.env` file
-- Restart the server to apply new configuration
+- Click lock icon to set admin token in browser (`localStorage`)
+- Click gear icon to open settings modal
+- Save settings to `.env`
+- Use Environment Variables section to view/edit all `EVOSSEARCH_*` keys
+- Restart server for full env application
 
-**Available Settings:**
-- **Server**: Host, Port, Debug Mode
-- **Search**: Min/Max/Default result limits  
-- **Model**: CLIP model variant, batch size, thumbnail quality
-- **Advanced**: Comment length limits, file size limits, index folder name
+### Admin Token
 
-Settings are automatically saved to `.env` file and persist across restarts.
+Mutating endpoints require `EVOSSEARCH_ADMIN_TOKEN` when set.
 
-### Environment Variables (Advanced)
+Accepted headers:
 
-For command-line configuration or CI/CD environments:
+```text
+X-Admin-Token: <token>
+Authorization: Bearer <token>
+```
+
+UI convenience:
+
+- Open once with `?admin_token=<token>` to seed browser storage
+
+### Luxriot Evo Bookmark Setup (Integration)
+
+Use this checklist to ensure bookmarks sent by Luxriot EVA AI are accepted and visible in Luxriot Evo.
+
+1. Prepare Luxriot API access.
+   - Confirm Luxriot base URL is reachable from Luxriot EVA AI host (example: `http://<luxriot-host>:8080`).
+   - Use a Luxriot user that has permissions to:
+     - read channels/snapshots
+     - create bookmarks/events
+   - Luxriot EVA AI uses HTTP Digest auth for Luxriot API calls.
+2. Configure Luxriot EVA AI connection values.
+   - Set `EVOSSEARCH_LUXRIOT_BASE_URL`
+   - Set `EVOSSEARCH_LUXRIOT_USERNAME`
+   - Set `EVOSSEARCH_LUXRIOT_PASSWORD`
+   - Set `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID`
+   - Optionally align severity mapping:
+     - `EVOSSEARCH_LUXRIOT_SEV_INFO`
+     - `EVOSSEARCH_LUXRIOT_SEV_LOW`
+     - `EVOSSEARCH_LUXRIOT_SEV_NORMAL`
+     - `EVOSSEARCH_LUXRIOT_SEV_HIGH`
+     - `EVOSSEARCH_LUXRIOT_SEV_CRITICAL`
+3. Restart Luxriot EVA AI after config/env changes.
+4. Verify Luxriot connectivity in UI.
+   - Open `Video Understanding` or `Monitoring`.
+   - Click channel reload and preview.
+   - If channels/snapshots fail, fix connection/auth first.
+5. Send a direct test bookmark through Luxriot EVA AI.
 
 ```bash
-# Server settings
-EVOSSEARCH_HOST=0.0.0.0          # Server host (0.0.0.0 for network access)
-EVOSSEARCH_PORT=5000             # Server port
-EVOSSEARCH_DEBUG=False           # Debug mode
-
-# Search limits
-EVOSSEARCH_MIN_RESULTS=3         # Minimum search results  
-EVOSSEARCH_MAX_RESULTS=48        # Maximum search results
-EVOSSEARCH_DEFAULT_RESULTS=12    # Default search results
-
-# Model configuration
-EVOSSEARCH_CLIP_MODEL=ViT-B/32   # CLIP model variant
-EVOSSEARCH_BATCH_SIZE=32         # Processing batch size
-EVOSSEARCH_THUMBNAIL_QUALITY=85  # JPEG quality (50-100)
-
-# Advanced settings
-EVOSSEARCH_MAX_COMMENT_LENGTH=500 # Max comment characters
-EVOSSEARCH_MAX_FILE_SIZE_MB=50   # Max upload file size
-EVOSSEARCH_INDEX_FOLDER=.clip_index # Index folder name
+curl -X POST "http://localhost:5000/luxriot/bookmark" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Token: <your-admin-token>" \
+  -d '{
+    "channel_id": 103,
+    "title": "Luxriot EVA AI integration test",
+    "description": "Bookmark created by Luxriot EVA AI /luxriot/bookmark",
+    "severity": "normal",
+    "state": "new"
+  }'
 ```
 
-### Example Usage
+Expected response contains `"success": true`.
+
+6. Verify automatic bookmark sources.
+   - Probe path: in `Monitoring` -> probe editor, keep `Make bookmarks` enabled, set severity, run/save probe.
+   - Manual summary path: in `Video Understanding` live summaries, click bookmark on a summary row.
+7. Confirm in Luxriot.
+   - Open Luxriot bookmarks/events for the target channel.
+   - Check event title, description, severity, and timestamp near the trigger time.
+
+If direct test works but probe bookmarks do not, verify the probe has bookmarks enabled and returns hits.
+
+### Environment Variables
+
+Effective variables currently used by app/config:
+
 ```bash
-# Run on different port
-EVOSSEARCH_PORT=8080 python oldapp.py
+# Server
+EVOSSEARCH_HOST=0.0.0.0
+EVOSSEARCH_PORT=5000
+EVOSSEARCH_DEBUG=false
+EVOSSEARCH_APP_VERSION="α 0.4.2"
 
-# Use different CLIP model  
-EVOSSEARCH_CLIP_MODEL=ViT-L/14 python oldapp.py
+# Embedder/index
+EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion
+EVOSSEARCH_CLIP_MODEL=ViT-B/32        # OpenAI CLIP or HF SigLIP2 model id (e.g. google/siglip2-base-patch16-224)
+EVOSSEARCH_DINO_MODEL=dinov3_vith16plus
+EVOSSEARCH_EMB_DIM_DINO=1280
+EVOSSEARCH_DINO_WEIGHTS_PATH=/path/to/weights.pth
+EVOSSEARCH_DINO_DEVICE=cuda:0
+EVOSSEARCH_INDEX_MODE=clip            # clip|dino|dual
+EVOSSEARCH_FUSION_ENABLED=false
+EVOSSEARCH_FUSION_ALPHA=0.7
+EVOSSEARCH_RERANK_ENABLED=false
+EVOSSEARCH_RERANK_TOP_K=50
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES=3
+EVOSSEARCH_DINO_HEATMAP_THRESHOLD=0.7
 
-# Change result limits
-EVOSSEARCH_MIN_RESULTS=5 EVOSSEARCH_MAX_RESULTS=60 python oldapp.py
+# Mask2Former
+EVOSSEARCH_M2F_ENABLED=true
+EVOSSEARCH_M2F_MODEL=facebook/mask2former-swin-base-ade-semantic
+EVOSSEARCH_M2F_DEVICE=cuda:0
+EVOSSEARCH_M2F_MAX_SIZE=1024
+
+# Video LM
+EVOSSEARCH_LM_BASE_URL=http://127.0.0.1:1234/v1
+EVOSSEARCH_LM_MODEL=qwen/qwen3-vl-4b
+EVOSSEARCH_LM_API_KEY=
+EVOSSEARCH_LM_TIMEOUT=120
+EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES=16
+EVOSSEARCH_LM_VIDEO_MAX_FRAMES=64
+EVOSSEARCH_LM_VIDEO_MAX_EDGE=960
+EVOSSEARCH_LM_VIDEO_MAX_TOKENS=1536
+EVOSSEARCH_LM_VIDEO_TEMPERATURE=0.2
+
+# Luxriot
+EVOSSEARCH_LUXRIOT_BASE_URL=http://192.168.1.102:8080
+EVOSSEARCH_LUXRIOT_USERNAME=
+EVOSSEARCH_LUXRIOT_PASSWORD=
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=103
+EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=5
+EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
+EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES=180
+EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS=false
+EVOSSEARCH_LUXRIOT_SEV_INFO=info
+EVOSSEARCH_LUXRIOT_SEV_LOW=low
+EVOSSEARCH_LUXRIOT_SEV_NORMAL=normal
+EVOSSEARCH_LUXRIOT_SEV_HIGH=high
+EVOSSEARCH_LUXRIOT_SEV_CRITICAL=critical
+
+# Probe capture
+EVOSSEARCH_PROBE_MAX_FRAMES=2000
+EVOSSEARCH_PROBE_THUMB_MAX_EDGE=256
+
+# Detections archive + retention
+EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED=true
+EVOSSEARCH_DETECTIONS_ARCHIVE_DIR=detections_archive
+EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY=88
+EVOSSEARCH_DETECTIONS_RETENTION_ENABLED=true
+EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED=false
+EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC=6
+EVOSSEARCH_DETECTIONS_RETENTION_FORCE_KEEP_SEC=20
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_HIGH=0.985
+EVOSSEARCH_DETECTIONS_RETENTION_SIMILARITY_LOW=0.94
+EVOSSEARCH_DETECTIONS_RETENTION_MARGIN_DELTA=0.08
+EVOSSEARCH_DETECTIONS_RETENTION_SCORE_DELTA=0.08
+
+# Search limits and processing
+EVOSSEARCH_MIN_RESULTS=3
+EVOSSEARCH_MAX_RESULTS=48
+EVOSSEARCH_DEFAULT_RESULTS=12
+EVOSSEARCH_BATCH_SIZE=32
+EVOSSEARCH_THUMBNAIL_QUALITY=85
+EVOSSEARCH_INDEX_FOLDER=.clip_index
+EVOSSEARCH_MAX_COMMENT_LENGTH=100
+EVOSSEARCH_MAX_FILE_SIZE_MB=50
+
+# Security/network
+EVOSSEARCH_ADMIN_TOKEN=
+EVOSSEARCH_SETTINGS_LOCAL_ONLY=true
+EVOSSEARCH_CORS_ALLOWED_ORIGINS=
+EVOSSEARCH_ALLOWED_ROOTS=
 ```
 
-## How to Use
+Notes:
 
-1. **Index a Folder**: Enter the path to your image folder and click "Index Folder"
-2. **Search Images**: 
-   - **Text Mode**: Type a natural language description
-   - **Image Mode**: Upload an image file OR enter an image path for similarity search
-3. **Configure Search**: 
-   - Choose sorting by similarity or time (newest first)
-   - Adjust the number of results using the dropdown
-4. **Interact with Results**: 
-   - **Expand**: Click the expand icon (⤢) in bottom-right corner of any image
-   - **Find Similar**: Click the search icon (🔍) on expanded images to find similar images
-   - **Copy Path**: Click the copy icon (📋) next to the filename
-   - **Add Comments**: In expanded view, add comments that persist across searches
-5. **View Commented Images**: Click "Show Commented Images" to see only images with comments
+- CORS is not globally open by default; set `EVOSSEARCH_CORS_ALLOWED_ORIGINS` explicitly.
+- `.env` edits require restart for full consistency.
+- `EVOSSEARCH_CLIP_MODEL` supports OpenAI CLIP names and SigLIP2 HF IDs.
+- If a SigLIP2 model fails to load, Luxriot EVA AI auto-falls back to `ViT-B/32` so startup can continue.
 
-## UI Controls
+## Typical Workflows
 
-| Icon | Location | Function |
-|------|----------|----------|
-| ⚙️ (settings) | Top-right of header | Open settings panel for configuration |
-| ⤢ (expand) | Bottom-right of thumbnail | Expand to full view (takes full row, 900px min-width) |
-| ⤡ (collapse) | Bottom-right of expanded image | Collapse to thumbnail |
-| 🔍 (find similar) | Top-right of expanded image | Find visually similar images |
-| 📋 (copy) | Next to filename | Copy full file path to clipboard |
+### 1) Index + Search Folder
 
-## Technical Features
+1. Set folder path in top panel.
+2. Click `Index Folder`.
+3. In `Archive Research`, keep scope = `Indexed Folder`.
+4. Run text query or image upload query.
 
-**CLIP & FAISS Integration:**
-- Semantic similarity matching using OpenAI's CLIP
-- Fast similarity search with persistent FAISS indexes
-- Configurable CLIP model variants
+### 2) Search Probe Detections
 
-**Data Management:**
-- File metadata tracking (modification times, file sizes)
-- Persistent comment storage with timestamps
-- Robust error handling for corrupted or missing images
+1. In `Archive Research`, set scope = `Detections Archive`.
+2. Filter by stream, probe, and time range.
+3. Load detections and run text/image search over filtered pool.
 
-**Network & Security:**
-- CORS enabled for cross-origin requests  
-- Input validation and XSS protection
-- Network accessibility with automatic IP detection
-- Cross-platform compatibility (Windows/Linux)
+### 3) Monitoring + Probes
 
-## File Structure
+1. Open `Monitoring`.
+2. Start stream capture for the target channel.
+3. Create probe in modal and save.
+4. Run probe manually or leave background daemon active.
+5. Review latest detections and optional bookmarks.
 
-```
+## Project Layout
+
+```text
 evo-ssearch/
-├── oldapp.py              # Main application
-├── config.py              # Configuration with environment variable support
-├── .env                   # Settings file (created by settings panel)
-├── requirements.txt       # Python dependencies
-├── images/                # SVG icons for UI controls
-│   ├── expand_content_*.svg
-│   ├── collapse_content_*.svg
-│   ├── content_copy_*.svg
-│   └── settings_*.svg
-└── [indexed-folder]/
-    └── .clip_index/       # Created automatically
-        ├── index.faiss    # FAISS vector index
-        ├── paths.pkl      # Image file paths
-        ├── metadata.pkl   # File metadata
-        └── comments.json  # User comments
+├── oldapp.py
+├── config.py
+├── detection_store.py
+├── luxriot_connector.py
+├── probe_manager.py
+├── embedders/
+├── heads/
+├── tools/
+├── tests/
+├── run_prod.sh
+├── wsgi.py
+└── [indexed-folder]/.clip_index/
 ```
 
-**Supported Image Formats**: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`
+Runtime artifacts:
+
+- `detections_store.sqlite3` (SQLite detections DB)
+- `detections_archive/` (retained snapshots)
 
 ## Troubleshooting
-- **OpenMP Errors**: The application automatically handles OpenMP runtime issues on Windows
-- **Dependencies**: Try upgrading pip and reinstalling requirements if you encounter issues
-- **Fewer Results**: Check that images are in supported formats and properly indexed
-- **Comments Not Saving**: Ensure write permissions to the indexed folder
-- **Network Access**: Make sure firewall allows connections on the configured port
 
----
+- `Startup aborted: host:port is already in use`
+  - stop previous process or change `EVOSSEARCH_PORT`
+- CUDA `CUBLAS_STATUS_ALLOC_FAILED`
+  - reduce concurrent streams/probes, lower frame sizes, or restart stale GPU processes
+- DINO/fusion returns errors
+  - verify `EVOSSEARCH_DINO_WEIGHTS_PATH` and CUDA device
+- Remote settings blocked
+  - expected when `EVOSSEARCH_SETTINGS_LOCAL_ONLY=true` and no valid admin token
+- Mutating calls return `401/503`
+  - verify admin token in lock panel or request headers
 
-**Enjoy fast, natural language image search with modern SVG overlay controls and comprehensive image management!**
+## Supported Image Formats
+
+`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`
