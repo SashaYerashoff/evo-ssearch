@@ -958,6 +958,46 @@ def home():
         .probe-editor-modal-actions {
             margin-top: 0.25rem;
         }
+
+        .probe-snap-modal-content {
+            max-width: 980px;
+            width: min(96vw, 980px);
+            max-height: 88vh;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .probe-snap-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        .probe-snap-preview {
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            background: #0a0a0a;
+            padding: 0.5rem;
+            overflow: auto;
+            max-height: min(62vh, 640px);
+        }
+
+        .probe-snap-preview img {
+            display: block;
+            max-width: 100%;
+            width: 100%;
+            height: auto;
+            margin: 0 auto;
+            border-radius: 4px;
+        }
+
+        .probe-snap-preview.actual-size img {
+            width: auto;
+            max-width: none;
+        }
         
         .settings-header {
             display: flex;
@@ -4382,6 +4422,7 @@ def home():
                             <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
                             <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
                             <button id="probeStreamToggle" type="button" class="feature-btn primary">Start Stream</button>
+                            <button id="probeSnapBtn" type="button" class="feature-btn">Snap</button>
                         </div>
                         <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
                     </div>
@@ -4463,6 +4504,30 @@ def home():
                     <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
                     <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="probeSnapModal" class="settings-modal">
+        <div class="settings-modal-content probe-snap-modal-content">
+            <div class="settings-header">
+                <h2>Probe Snapshot</h2>
+                <button class="close-btn" id="closeProbeSnap">&times;</button>
+            </div>
+            <div class="probe-snap-toolbar">
+                <label class="inline-check">
+                    <input type="checkbox" id="probeSnapActualSize">
+                    Show actual resolution
+                </label>
+                <div id="probeSnapMeta" class="probe-meta">No snapshot captured.</div>
+            </div>
+            <div id="probeSnapPreview" class="probe-snap-preview">
+                <img id="probeSnapImg" src="" alt="Probe snapshot preview" />
+            </div>
+            <div class="settings-actions probe-editor-modal-actions">
+                <button id="probeSnapCloseBtn" class="settings-btn">Close</button>
+                <button id="probeSnapExportBtn" class="settings-btn">Export</button>
+                <button id="probeSnapUseBtn" class="settings-btn primary">Set as image probe</button>
             </div>
         </div>
     </div>
@@ -4837,7 +4902,17 @@ def home():
         const probeRoiBox = document.getElementById('probeRoiBox');
         const probeRoiToggleBtn = document.getElementById('probeRoiToggle');
         const probeRoiClearBtn = document.getElementById('probeRoiClear');
+        const probeSnapBtn = document.getElementById('probeSnapBtn');
         const probeRoiInfo = document.getElementById('probeRoiInfo');
+        const probeSnapModal = document.getElementById('probeSnapModal');
+        const closeProbeSnapBtn = document.getElementById('closeProbeSnap');
+        const probeSnapCloseBtn = document.getElementById('probeSnapCloseBtn');
+        const probeSnapExportBtn = document.getElementById('probeSnapExportBtn');
+        const probeSnapUseBtn = document.getElementById('probeSnapUseBtn');
+        const probeSnapActualSizeInput = document.getElementById('probeSnapActualSize');
+        const probeSnapMeta = document.getElementById('probeSnapMeta');
+        const probeSnapPreview = document.getElementById('probeSnapPreview');
+        const probeSnapImg = document.getElementById('probeSnapImg');
         const probePairsContainer = document.getElementById('probePairs');
         const probePairRows = document.getElementById('probePairRows');
         const probeImageFile = document.getElementById('probeImageFile');
@@ -4923,6 +4998,7 @@ def home():
         let probeRoiNorm = null;
         let probeRoiDraftNorm = null;
         let probeRoiDrawState = null;
+        let probeSnapState = null;
         let imageProbeEnabled = false;
         let probeList = [];
         let probeCatalog = [];
@@ -5253,6 +5329,23 @@ def home():
                 syncProbePreview(getSelectedProbeChannelId());
             } else {
                 stopProbePreview();
+                setProbeSnapModalVisibility(false);
+            }
+        }
+
+        function setProbeSnapModalVisibility(visible) {
+            if (!probeSnapModal) return;
+            probeSnapModal.style.display = visible ? 'block' : 'none';
+            if (!visible) {
+                probeSnapState = null;
+                if (probeSnapImg) probeSnapImg.src = '';
+                if (probeSnapMeta) probeSnapMeta.textContent = 'No snapshot captured.';
+                if (probeSnapPreview) {
+                    probeSnapPreview.classList.remove('actual-size');
+                }
+                if (probeSnapActualSizeInput) {
+                    probeSnapActualSizeInput.checked = false;
+                }
             }
         }
 
@@ -7704,7 +7797,44 @@ def home():
                 }
             });
         }
-        
+        if (probeSnapBtn) {
+            probeSnapBtn.addEventListener('click', () => {
+                openProbeSnapModalFromPreview();
+            });
+        }
+        if (closeProbeSnapBtn) {
+            closeProbeSnapBtn.addEventListener('click', () => {
+                setProbeSnapModalVisibility(false);
+            });
+        }
+        if (probeSnapCloseBtn) {
+            probeSnapCloseBtn.addEventListener('click', () => {
+                setProbeSnapModalVisibility(false);
+            });
+        }
+        if (probeSnapExportBtn) {
+            probeSnapExportBtn.addEventListener('click', () => {
+                exportProbeSnapshot();
+            });
+        }
+        if (probeSnapUseBtn) {
+            probeSnapUseBtn.addEventListener('click', () => {
+                setProbeSnapshotAsImageProbe();
+            });
+        }
+        if (probeSnapActualSizeInput) {
+            probeSnapActualSizeInput.addEventListener('change', () => {
+                updateProbeSnapScaleMode();
+            });
+        }
+        if (probeSnapModal) {
+            probeSnapModal.addEventListener('click', (e) => {
+                if (e.target === probeSnapModal) {
+                    setProbeSnapModalVisibility(false);
+                }
+            });
+        }
+
         // Thumbnail quality slider update
         thumbnailQualitySlider.addEventListener('input', (e) => {
             qualityValue.textContent = e.target.value;
@@ -8832,6 +8962,124 @@ def home():
                 return;
             }
             setPreviewState('No stream');
+        }
+
+        function updateProbeSnapScaleMode() {
+            if (!probeSnapPreview) return;
+            const useActualSize = Boolean(probeSnapActualSizeInput?.checked);
+            probeSnapPreview.classList.toggle('actual-size', useActualSize);
+        }
+
+        function _buildProbeSnapFilename(channelId, timestampMs, isRoi) {
+            const dt = new Date(Number(timestampMs) || Date.now());
+            const yyyy = dt.getFullYear();
+            const mm = String(dt.getMonth() + 1).padStart(2, '0');
+            const dd = String(dt.getDate()).padStart(2, '0');
+            const hh = String(dt.getHours()).padStart(2, '0');
+            const mi = String(dt.getMinutes()).padStart(2, '0');
+            const ss = String(dt.getSeconds()).padStart(2, '0');
+            const modeSuffix = isRoi ? '_roi' : '_full';
+            return `probe_snap_ch${channelId}_${yyyy}${mm}${dd}_${hh}${mi}${ss}${modeSuffix}.jpg`;
+        }
+
+        function captureProbeSnapshotFromPreview() {
+            if (!probePreviewImg || !probePreviewImg.complete) {
+                throw new Error('Preview frame is not ready yet.');
+            }
+            const naturalWidth = probePreviewImg.naturalWidth || 0;
+            const naturalHeight = probePreviewImg.naturalHeight || 0;
+            if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
+                throw new Error('No preview frame available to capture.');
+            }
+            const roiNorm = probeRoiEnabled ? normalizeProbeRoiNorm(probeRoiNorm) : null;
+            if (probeRoiEnabled && !roiNorm) {
+                throw new Error('ROI is enabled. Draw ROI before snapping.');
+            }
+            const sx = roiNorm ? Math.max(0, Math.min(naturalWidth - 1, Math.round(roiNorm.x * naturalWidth))) : 0;
+            const sy = roiNorm ? Math.max(0, Math.min(naturalHeight - 1, Math.round(roiNorm.y * naturalHeight))) : 0;
+            const swRaw = roiNorm ? Math.round(roiNorm.w * naturalWidth) : naturalWidth;
+            const shRaw = roiNorm ? Math.round(roiNorm.h * naturalHeight) : naturalHeight;
+            const sw = Math.max(1, Math.min(naturalWidth - sx, swRaw));
+            const sh = Math.max(1, Math.min(naturalHeight - sy, shRaw));
+            if (sw < 2 || sh < 2) {
+                throw new Error('Selected ROI is too small for a snapshot.');
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = sw;
+            canvas.height = sh;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                throw new Error('Failed to initialize snapshot buffer.');
+            }
+            ctx.drawImage(probePreviewImg, sx, sy, sw, sh, 0, 0, sw, sh);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+            const commaIdx = dataUrl.indexOf(',');
+            const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : '';
+            if (!base64) {
+                throw new Error('Failed to encode snapshot.');
+            }
+            const timestampMs = Date.now();
+            const channelId = getSelectedProbeChannelId();
+            return {
+                dataUrl,
+                base64,
+                width: sw,
+                height: sh,
+                timestampMs,
+                channelId,
+                roi: Boolean(roiNorm),
+                filename: _buildProbeSnapFilename(channelId, timestampMs, Boolean(roiNorm)),
+            };
+        }
+
+        function openProbeSnapModalFromPreview() {
+            try {
+                const snap = captureProbeSnapshotFromPreview();
+                probeSnapState = snap;
+                if (probeSnapImg) {
+                    probeSnapImg.src = snap.dataUrl;
+                }
+                if (probeSnapMeta) {
+                    const mode = snap.roi ? 'ROI snapshot' : 'Full-frame snapshot';
+                    probeSnapMeta.textContent = `${mode} · ${snap.width}×${snap.height} · Channel #${snap.channelId}`;
+                }
+                if (probeSnapActualSizeInput) {
+                    probeSnapActualSizeInput.checked = false;
+                }
+                updateProbeSnapScaleMode();
+                setProbeSnapModalVisibility(true);
+            } catch (err) {
+                setProbeStatus(err.message || 'Failed to capture snapshot.', true);
+            }
+        }
+
+        function exportProbeSnapshot() {
+            if (!probeSnapState?.dataUrl) {
+                setProbeStatus('No snapshot to export.', true);
+                return;
+            }
+            const anchor = document.createElement('a');
+            anchor.href = probeSnapState.dataUrl;
+            anchor.download = probeSnapState.filename || 'probe_snapshot.jpg';
+            document.body.appendChild(anchor);
+            anchor.click();
+            document.body.removeChild(anchor);
+            setProbeStatus('Snapshot exported.');
+        }
+
+        function setProbeSnapshotAsImageProbe() {
+            if (!probeSnapState?.base64) {
+                setProbeStatus('No snapshot to apply.', true);
+                return;
+            }
+            probeImageState = {
+                name: probeSnapState.filename || 'probe_snapshot.jpg',
+                data: probeSnapState.base64,
+            };
+            applyImageThumb(probeSnapState.base64);
+            updateImageProbeStatus(true);
+            setProbeStatus('Snapshot set as image probe.');
+            setProbeSnapModalVisibility(false);
         }
 
         function ensurePairsSeed() {
