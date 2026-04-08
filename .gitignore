@@ -60,3 +60,5 @@ luxriot_rollups_cache.json
 luxriot_summary_state.json
 video/
 node_modules
+detections_archive/
+detections_store.sqlite3

@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Luxriot EVA AI — Full UI Concept</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-primary: #0a0c0e;
+    --bg-secondary: #0f1215;
+    --bg-panel: #131920;
+    --bg-card: #171e27;
+    --bg-hover: #1c2530;
+    --bg-input: #111820;
+    --border: #1e2a36;
+    --border-active: #2a3a4a;
+    --text-primary: #cdd8e4;
+    --text-secondary: #7b8d9d;
+    --text-muted: #3d4f5f;
+    --accent-green: #00d68f;
+    --accent-green-dim: rgba(0,214,143,0.25);
+    --accent-green-bg: rgba(0,214,143,0.08);
+    --accent-amber: #f0a030;
+    --accent-amber-bg: rgba(240,160,48,0.08);
+    --accent-red: #ff4757;
+    --accent-red-bg: rgba(255,71,87,0.08);
+    --accent-blue: #4facfe;
+    --accent-blue-bg: rgba(79,172,254,0.08);
+    --accent-cyan: #00e5ff;
+    --accent-cyan-bg: rgba(0,229,255,0.08);
+    --scanline: rgba(0,214,143,0.02);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'IBM Plex Sans',sans-serif; background:var(--bg-primary); color:var(--text-primary); min-height:100vh; overflow:hidden; font-size:15px; }
+  body::after { content:''; position:fixed; inset:0; background:repeating-linear-gradient(0deg,transparent,transparent 3px,var(--scanline) 3px,var(--scanline) 6px); pointer-events:none; z-index:9999; }
+  .app { display:grid; grid-template-rows:52px 1fr; height:100vh; }
+
+  /* TOP BAR */
+  .top-bar { display:flex; align-items:center; background:var(--bg-secondary); border-bottom:1px solid var(--border); padding:0 20px; gap:20px; z-index:10; }
+  .logo-block { display:flex; align-items:center; gap:10px; flex-shrink:0; }
+  .logo-icon { width:30px; height:30px; background:var(--accent-green); clip-path:polygon(15% 0%,85% 0%,100% 15%,100% 85%,85% 100%,15% 100%,0% 85%,0% 15%); display:flex; align-items:center; justify-content:center; }
+  .logo-icon::after { content:''; width:10px; height:10px; background:var(--bg-primary); border-radius:50%; }
+  .logo-text { font-family:'JetBrains Mono',monospace; font-size:15px; font-weight:700; letter-spacing:2px; }
+  .logo-ver { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); border:1px solid var(--border); padding:2px 8px; border-radius:3px; }
+  .nav-tabs { display:flex; height:100%; margin-left:8px; }
+  .nav-tab { display:flex; align-items:center; gap:8px; padding:0 22px; font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:500; letter-spacing:1px; text-transform:uppercase; color:var(--text-secondary); cursor:pointer; position:relative; transition:all 0.2s; border:none; background:none; }
+  .nav-tab:hover { color:var(--text-primary); background:var(--bg-hover); }
+  .nav-tab.active { color:var(--accent-green); }
+  .nav-tab.active::after { content:''; position:absolute; bottom:0; left:14px; right:14px; height:2px; background:var(--accent-green); box-shadow:0 0 8px var(--accent-green-dim); }
+  .tab-dot { width:7px; height:7px; border-radius:50%; background:var(--text-muted); }
+  .nav-tab.active .tab-dot { background:var(--accent-green); box-shadow:0 0 6px var(--accent-green); }
+  .nav-tab.chat-tab { color:var(--accent-cyan); border-left:1px solid var(--border); margin-left:6px; }
+  .nav-tab.chat-tab .tab-dot { background:var(--accent-cyan); animation:blinker 2s infinite; }
+  @keyframes blinker { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .top-right { margin-left:auto; display:flex; align-items:center; gap:12px; }
+  .status-ind { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent-green); display:flex; align-items:center; gap:6px; }
+  .status-ind::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--accent-green); box-shadow:0 0 6px var(--accent-green); }
+  .icon-btn { width:34px; height:34px; background:none; border:1px solid var(--border); border-radius:4px; color:var(--text-secondary); cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:15px; transition:all 0.2s; }
+  .icon-btn:hover { border-color:var(--border-active); color:var(--text-primary); }
+
+  /* SHARED */
+  .tab-panel { display:none; overflow:hidden; height:100%; }
+  .tab-panel.visible { display:flex; flex-direction:column; }
+  .mono { font-family:'JetBrains Mono',monospace; }
+  .section-title { font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:600; letter-spacing:2px; text-transform:uppercase; color:var(--text-secondary); margin-bottom:14px; }
+  .btn-primary { padding:10px 20px; background:var(--accent-green-dim); border:1px solid var(--accent-green); color:var(--accent-green); font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:500; cursor:pointer; border-radius:4px; transition:all 0.2s; letter-spacing:1px; }
+  .btn-primary:hover { background:var(--accent-green); color:var(--bg-primary); }
+  .btn-secondary { padding:8px 16px; background:var(--bg-card); border:1px solid var(--border); color:var(--text-secondary); font-family:'JetBrains Mono',monospace; font-size:12px; cursor:pointer; border-radius:4px; transition:all 0.2s; }
+  .btn-secondary:hover { border-color:var(--border-active); color:var(--text-primary); }
+  .btn-danger { padding:8px 16px; background:var(--accent-red-bg); border:1px solid var(--accent-red); color:var(--accent-red); font-family:'JetBrains Mono',monospace; font-size:12px; cursor:pointer; border-radius:4px; }
+  .btn-amber { padding:8px 16px; background:var(--accent-amber-bg); border:1px solid var(--accent-amber); color:var(--accent-amber); font-family:'JetBrains Mono',monospace; font-size:12px; cursor:pointer; border-radius:4px; }
+  .badge { font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; padding:3px 10px; border-radius:3px; letter-spacing:1px; }
+  .badge-running { background:var(--accent-green-bg); color:var(--accent-green); border:1px solid var(--accent-green); }
+  .badge-disabled { background:var(--accent-red-bg); color:var(--accent-red); border:1px solid rgba(255,71,87,0.3); }
+  .badge-idle { background:var(--accent-amber-bg); color:var(--accent-amber); border:1px solid rgba(240,160,48,0.3); }
+  .badge-ch { background:var(--accent-cyan-bg); color:var(--accent-cyan); border:1px solid rgba(0,229,255,0.3); font-size:11px; padding:4px 10px; }
+  .input-field { padding:10px 14px; background:var(--bg-input); border:1px solid var(--border); border-radius:4px; color:var(--text-primary); font-family:'IBM Plex Sans',sans-serif; font-size:15px; outline:none; transition:border-color 0.2s; width:100%; }
+  .input-field:focus { border-color:var(--accent-green); box-shadow:0 0 0 2px var(--accent-green-dim); }
+  .input-field::placeholder { color:var(--text-muted); }
+  select.input-field { cursor:pointer; appearance:auto; }
+  .input-sm { font-size:13px; padding:8px 12px; }
+  ::-webkit-scrollbar { width:6px; }
+  ::-webkit-scrollbar-track { background:var(--bg-secondary); }
+  ::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+  /* 1. ARCHIVE */
+  #tab-archive.visible { display:grid; grid-template-columns:320px 1fr; }
+  .archive-sidebar { background:var(--bg-secondary); border-right:1px solid var(--border); padding:24px 20px; overflow-y:auto; display:flex; flex-direction:column; gap:24px; }
+  .folder-bar { display:flex; gap:8px; }
+  .folder-bar .input-field { flex:1; font-size:13px; }
+  .search-section { display:flex; flex-direction:column; gap:12px; }
+  .filter-group { display:flex; flex-direction:column; gap:6px; }
+  .filter-label { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); letter-spacing:1px; text-transform:uppercase; }
+  .filter-row { display:flex; gap:8px; }
+  .scope-toggle { display:grid; grid-template-columns:1fr 1fr; border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+  .scope-btn { padding:10px; text-align:center; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-secondary); background:var(--bg-card); border:none; cursor:pointer; }
+  .scope-btn.active { background:var(--accent-green-bg); color:var(--accent-green); }
+  .text-query-box { display:flex; gap:8px; }
+  .text-query-box .input-field { flex:1; }
+  .archive-results { padding:24px; overflow-y:auto; }
+  .results-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
+  .results-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:14px; }
+  .result-card { background:var(--bg-card); border:1px solid var(--border); border-radius:4px; overflow:hidden; transition:all 0.2s; cursor:pointer; }
+  .result-card:hover { border-color:var(--border-active); transform:translateY(-2px); }
+  .result-thumb { width:100%; aspect-ratio:4/3; background:var(--bg-secondary); display:flex; align-items:center; justify-content:center; font-size:13px; color:var(--text-muted); position:relative; }
+  .result-thumb .sim { position:absolute; top:8px; right:8px; font-family:'JetBrains Mono',monospace; font-size:11px; background:var(--bg-primary); padding:3px 8px; border-radius:3px; color:var(--accent-green); }
+  .result-info { padding:12px 14px; }
+  .result-info .filename { font-size:13px; font-weight:500; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .result-info .r-meta { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); }
+
+  /* 2. VIDEO */
+  #tab-video.visible { display:grid; grid-template-columns:1fr 360px; }
+  .video-main { padding:24px; overflow-y:auto; display:flex; flex-direction:column; gap:24px; }
+  .stream-header { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  .stream-preview { width:100%; max-width:800px; aspect-ratio:16/9; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; display:flex; align-items:center; justify-content:center; position:relative; }
+  .stream-preview .ch-label { font-family:'JetBrains Mono',monospace; font-size:14px; color:var(--text-muted); }
+  .stream-preview .live-pill { position:absolute; top:12px; left:12px; font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; background:var(--accent-red); color:white; padding:4px 12px; border-radius:3px; animation:blinker 1.5s infinite; }
+  .stream-preview .time-pill { position:absolute; bottom:12px; right:12px; font-family:'JetBrains Mono',monospace; font-size:11px; background:rgba(0,0,0,0.6); color:var(--text-secondary); padding:4px 10px; border-radius:3px; }
+  .batch-controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .summaries-section { border-top:1px solid var(--border); padding-top:20px; }
+  .summaries-toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+  .summaries-status { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); margin-bottom:12px; }
+  .summary-list { display:flex; flex-direction:column; gap:6px; max-height:380px; overflow-y:auto; }
+  .summary-entry { display:flex; align-items:center; gap:14px; padding:12px 16px; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; transition:all 0.15s; }
+  .summary-entry:hover { border-color:var(--border-active); background:var(--bg-hover); }
+  .se-info { flex:1; display:flex; align-items:center; gap:12px; }
+  .se-time { font-family:'JetBrains Mono',monospace; font-size:13px; }
+  .se-frames { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); }
+  .se-actions { display:flex; gap:6px; flex-shrink:0; }
+  .se-btn { padding:6px 14px; font-family:'JetBrains Mono',monospace; font-size:11px; border:1px solid var(--border); background:var(--bg-panel); color:var(--text-secondary); border-radius:3px; cursor:pointer; transition:all 0.15s; }
+  .se-btn:hover { border-color:var(--accent-green); color:var(--accent-green); }
+  .video-analysis { border-top:1px solid var(--border); padding-top:24px; }
+  .va-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .va-grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; align-items:end; }
+  .va-result-panel { background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:16px; }
+  .va-tab { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); padding:8px 0; cursor:pointer; border-bottom:1px solid var(--border); }
+  .va-tab.active { color:var(--accent-green); }
+  .video-sidebar { background:var(--bg-secondary); border-left:1px solid var(--border); padding:24px 20px; overflow-y:auto; display:flex; flex-direction:column; gap:20px; }
+  .channel-card { background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:14px; display:flex; flex-direction:column; gap:8px; }
+  .channel-name { font-size:15px; font-weight:600; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .channel-meta { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); line-height:1.7; }
+  .channel-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+
+  /* 3. MONITORING */
+  #tab-monitoring.visible { display:flex; flex-direction:column; }
+  .monitoring-toolbar { display:flex; align-items:center; gap:12px; padding:16px 24px; background:var(--bg-secondary); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  .probes-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; padding:24px; overflow-y:auto; flex:1; }
+  .probe-card { background:var(--bg-card); border:1px solid var(--border); border-radius:4px; overflow:hidden; transition:all 0.2s; cursor:pointer; }
+  .probe-card:hover { border-color:var(--border-active); }
+  .probe-card-preview { width:100%; aspect-ratio:16/10; background:var(--bg-secondary); display:flex; align-items:center; justify-content:center; position:relative; font-size:14px; color:var(--text-muted); }
+  .probe-card-preview .badge { position:absolute; top:10px; left:10px; }
+  .probe-card-preview .controls { position:absolute; top:10px; right:10px; display:flex; gap:4px; }
+  .ctrl-btn { width:30px; height:30px; border-radius:4px; border:1px solid var(--border); background:rgba(0,0,0,0.5); color:var(--text-secondary); cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:12px; transition:all 0.15s; }
+  .ctrl-btn:hover { border-color:var(--accent-green); color:var(--accent-green); }
+  .probe-card-body { padding:14px 16px; }
+  .probe-card-body h4 { font-size:16px; font-weight:600; margin-bottom:4px; }
+  .probe-card-body .meta-row { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); line-height:1.7; }
+  .scores { margin-top:6px; font-family:'JetBrains Mono',monospace; font-size:12px; display:flex; gap:12px; }
+  .scores .s-label { color:var(--text-muted); }
+  .scores .s-val { color:var(--accent-green); }
+
+  /* MODAL */
+  .modal-overlay { display:none; position:fixed; inset:0; z-index:100; background:rgba(0,0,0,0.7); backdrop-filter:blur(6px); align-items:center; justify-content:center; }
+  .modal-overlay.open { display:flex; }
+  .modal { width:980px; max-width:95vw; max-height:92vh; overflow-y:auto; background:var(--bg-panel); border:1px solid var(--border); border-radius:6px; box-shadow:0 24px 80px rgba(0,0,0,0.5); animation:modalIn 0.25s ease; }
+  @keyframes modalIn { from{opacity:0;transform:scale(0.96)} to{opacity:1;transform:scale(1)} }
+  .modal-header { display:flex; align-items:center; justify-content:space-between; padding:20px 28px; border-bottom:1px solid var(--border); }
+  .modal-header h2 { font-size:20px; font-weight:600; }
+  .modal-close { width:36px; height:36px; border-radius:4px; border:1px solid var(--border); background:none; color:var(--text-secondary); cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; }
+  .modal-close:hover { border-color:var(--accent-red); color:var(--accent-red); }
+  .modal-body { display:grid; grid-template-columns:1fr 1fr; }
+  .modal-left { padding:24px 28px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:16px; }
+  .modal-right { padding:24px 28px; display:flex; flex-direction:column; gap:20px; }
+  .ml-stream-preview { width:100%; aspect-ratio:16/10; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; display:flex; align-items:center; justify-content:center; position:relative; font-size:14px; color:var(--text-muted); }
+  .ml-stream-preview .roi-box { position:absolute; top:10%; right:5%; width:50%; height:80%; border:2px solid var(--accent-cyan); background:rgba(0,229,255,0.05); border-radius:2px; }
+  .ml-stream-info { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); line-height:1.8; }
+  .ml-stream-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .psb { background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:18px; }
+  .psb-title { font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:600; letter-spacing:1px; text-transform:uppercase; color:var(--text-secondary); margin-bottom:14px; }
+  .psb-thresholds { display:flex; gap:16px; margin-bottom:16px; }
+  .thr-group { display:flex; flex-direction:column; gap:4px; }
+  .thr-label { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); }
+  .pair-header { display:grid; grid-template-columns:30px 1fr 1fr 36px; gap:8px; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); margin-bottom:6px; }
+  .pair-row { display:grid; grid-template-columns:30px 1fr 1fr 36px; gap:8px; align-items:center; margin-bottom:6px; }
+  .pair-num { font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-muted); text-align:center; }
+  .pair-del { width:32px; height:32px; border-radius:4px; border:1px solid var(--border); background:none; color:var(--text-muted); cursor:pointer; font-size:13px; display:flex; align-items:center; justify-content:center; }
+  .pair-del:hover { border-color:var(--accent-red); color:var(--accent-red); }
+  .modal-footer { display:flex; justify-content:flex-end; gap:12px; padding:18px 28px; border-top:1px solid var(--border); }
+
+  /* 4. AGENT */
+  #tab-agent.visible { display:grid; grid-template-columns:280px 1fr 320px; }
+  .agent-left { background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
+  .agent-left-header { padding:18px 16px; border-bottom:1px solid var(--border); }
+  .chat-list { flex:1; overflow-y:auto; padding:8px; }
+  .chat-list-item { padding:14px; border-radius:4px; cursor:pointer; margin-bottom:2px; border-left:3px solid transparent; }
+  .chat-list-item:hover { background:var(--bg-hover); }
+  .chat-list-item.active { background:var(--bg-card); border-left-color:var(--accent-green); }
+  .cl-title { font-size:14px; font-weight:500; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cl-meta { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-muted); }
+  .agent-chat { display:flex; flex-direction:column; background:var(--bg-primary); }
+  .chat-messages { flex:1; overflow-y:auto; padding:32px; display:flex; flex-direction:column; gap:28px; }
+  .message { max-width:720px; animation:msgIn 0.3s ease; }
+  @keyframes msgIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  .message.user { align-self:flex-end; }
+  .message.agent { align-self:flex-start; }
+  .msg-header { font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:500; letter-spacing:1px; text-transform:uppercase; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+  .message.user .msg-header { color:var(--accent-blue); justify-content:flex-end; }
+  .message.agent .msg-header { color:var(--accent-green); }
+  .ts { color:var(--text-muted); text-transform:none; letter-spacing:0; }
+  .msg-body { padding:18px 22px; border-radius:3px; font-size:15px; line-height:1.75; }
+  .message.user .msg-body { background:var(--accent-blue-bg); border:1px solid rgba(79,172,254,0.2); border-right:3px solid var(--accent-blue); }
+  .message.agent .msg-body { background:var(--bg-panel); border:1px solid var(--border); border-left:3px solid var(--accent-green); }
+  .action-card { margin-top:14px; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+  .action-card-head { padding:10px 14px; background:var(--bg-hover); font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent-amber); letter-spacing:1px; }
+  .action-card-body { padding:14px; }
+  .det-row { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .det-thumb { aspect-ratio:16/10; background:var(--bg-secondary); border:1px solid var(--border); border-radius:3px; display:flex; align-items:center; justify-content:center; position:relative; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); }
+  .det-thumb .sc { position:absolute; top:4px; right:4px; background:var(--bg-primary); padding:2px 6px; border-radius:2px; font-size:11px; color:var(--accent-green); }
+  .report-line { font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-secondary); line-height:2; }
+  .agent-input-area { padding:20px 32px; border-top:1px solid var(--border); background:var(--bg-secondary); }
+  .input-wrap { display:flex; align-items:flex-end; gap:12px; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:14px; transition:border-color 0.2s; }
+  .input-wrap:focus-within { border-color:var(--accent-green); box-shadow:0 0 0 2px var(--accent-green-dim); }
+  .chat-ta { flex:1; background:none; border:none; color:var(--text-primary); font-family:'IBM Plex Sans',sans-serif; font-size:15px; resize:none; outline:none; line-height:1.5; min-height:26px; max-height:120px; }
+  .chat-ta::placeholder { color:var(--text-muted); }
+  .send-btn { width:40px; height:40px; background:var(--accent-green); border:none; border-radius:4px; color:var(--bg-primary); cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; }
+  .send-btn:hover { filter:brightness(1.2); box-shadow:0 0 14px var(--accent-green-dim); }
+  .input-chips { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
+  .chip { font-family:'JetBrains Mono',monospace; font-size:11px; padding:6px 12px; border:1px solid var(--border); border-radius:3px; color:var(--text-secondary); background:none; cursor:pointer; }
+  .chip:hover { border-color:var(--accent-green); color:var(--accent-green); }
+  .agent-right { background:var(--bg-secondary); border-left:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto; }
+  .ctx-section { padding:18px 16px; border-bottom:1px solid var(--border); }
+  .ctx-stream { width:100%; aspect-ratio:16/10; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; display:flex; align-items:center; justify-content:center; position:relative; margin-bottom:8px; font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-muted); }
+  .ctx-stream .live-tag { position:absolute; top:8px; left:8px; font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; background:var(--accent-red); color:white; padding:3px 10px; border-radius:3px; animation:blinker 1.5s infinite; }
+  .probe-mini-list { display:flex; flex-direction:column; gap:6px; }
+  .probe-mini { display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:3px; font-size:14px; }
+  .pm-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+  .pm-dot.on { background:var(--accent-green); box-shadow:0 0 4px var(--accent-green); }
+  .pm-dot.off { background:var(--text-muted); }
+  .pm-name { flex:1; }
+  .pm-score { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--accent-green); }
+  .cap-list { display:flex; flex-direction:column; gap:3px; }
+  .cap-item { font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--text-muted); padding:7px 10px; border-left:2px solid var(--border); }
+  .cap-item:hover { border-left-color:var(--accent-green); color:var(--text-secondary); }
+  .concept-tag { position:fixed; bottom:12px; right:12px; z-index:10000; font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-muted); letter-spacing:2px; text-transform:uppercase; background:var(--bg-primary); padding:5px 12px; border:1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top-bar">
+    <div class="logo-block"><div class="logo-icon"></div><span class="logo-text">EVA AI</span><span class="logo-ver">α 0.5</span></div>
+    <nav class="nav-tabs">
+      <button class="nav-tab active" data-tab="archive"><span class="tab-dot"></span>Archive</button>
+      <button class="nav-tab" data-tab="video"><span class="tab-dot"></span>Video</button>
+      <button class="nav-tab" data-tab="monitoring"><span class="tab-dot"></span>Monitoring</button>
+      <button class="nav-tab chat-tab" data-tab="agent"><span class="tab-dot"></span>Agent</button>
+    </nav>
+    <div class="top-right"><div class="status-ind">2 STREAMS ACTIVE</div><button class="icon-btn">⚙</button><button class="icon-btn">🔒</button></div>
+  </div>
+
+  <!-- 1. ARCHIVE -->
+  <div id="tab-archive" class="tab-panel visible">
+    <div class="archive-sidebar">
+      <div><div class="section-title">Index Folder</div><div class="folder-bar"><input class="input-field" value="/home/sasha/Projects/workflowdemo/static/screenshots" style="font-size:13px"/><button class="btn-primary" style="white-space:nowrap">Index</button></div><div class="mono" style="font-size:12px;color:var(--accent-green);margin-top:8px;">✓ Folder indexed (clip, dino, fusion)</div></div>
+      <div class="search-section"><div class="section-title">Scope</div><div class="scope-toggle"><button class="scope-btn active">Indexed Folder</button><button class="scope-btn">Detections</button></div></div>
+      <div class="search-section"><div class="section-title">Filters</div><div class="filter-group"><span class="filter-label">Sort</span><select class="input-field input-sm"><option>Similarity</option><option>Time</option></select></div><div class="filter-row" style="margin-top:8px"><div class="filter-group" style="flex:1"><span class="filter-label">Results</span><select class="input-field input-sm"><option>12</option><option>24</option><option>48</option></select></div><div class="filter-group" style="flex:1"><span class="filter-label">Threshold</span><input class="input-field input-sm" value="70%"/></div></div></div>
+      <div class="search-section"><div class="section-title">Text Query</div><div class="text-query-box"><input class="input-field" placeholder="Describe what you're looking for..."/><button class="btn-primary">Search</button></div></div>
+      <div class="search-section"><div class="section-title">Image Query</div><button class="btn-secondary" style="width:100%">Choose Image</button></div>
+      <div class="search-section"><div class="section-title">Detections Archive</div><div class="filter-group"><span class="filter-label">Stream</span><select class="input-field input-sm"><option>All streams</option></select></div><div class="filter-row" style="margin-top:8px"><div class="filter-group" style="flex:1"><span class="filter-label">Probe</span><select class="input-field input-sm"><option>All probes</option></select></div><div class="filter-group" style="flex:1"><span class="filter-label">Time</span><select class="input-field input-sm"><option>Last 24h</option></select></div></div><button class="btn-secondary" style="width:100%;margin-top:10px">Load Detections</button></div>
+    </div>
+    <div class="archive-results">
+      <div class="results-header"><div class="section-title" style="margin:0">Search Results</div><span class="mono" style="font-size:12px;color:var(--text-muted);">6 results</span></div>
+      <div class="results-grid">
+        <div class="result-card"><div class="result-thumb">📷 PXL_20250809...<span class="sim">0.94</span></div><div class="result-info"><div class="filename">PXL_20250809_131604116.jpg</div><div class="r-meta">Comments: 5 · 2026-03-17</div></div></div>
+        <div class="result-card"><div class="result-thumb">📷 PXL_20250809...<span class="sim">0.89</span></div><div class="result-info"><div class="filename">PXL_20250809_133501595.jpg</div><div class="r-meta">Comments: 1</div></div></div>
+        <div class="result-card"><div class="result-thumb">📷 20250710_per...<span class="sim">0.87</span></div><div class="result-info"><div class="filename">20250710_170204_person.jpg</div><div class="r-meta">Comments: 3</div></div></div>
+        <div class="result-card"><div class="result-thumb">📷 20250710_lap...<span class="sim">0.84</span></div><div class="result-info"><div class="filename">20250710_162050_laptop.jpg</div><div class="r-meta">Comments: 1</div></div></div>
+        <div class="result-card"><div class="result-thumb">📷 20250710_lap...<span class="sim">0.81</span></div><div class="result-info"><div class="filename">20250710_161507_laptop.jpg</div><div class="r-meta">Comments: 2</div></div></div>
+        <div class="result-card"><div class="result-thumb">📷 20250706_per...<span class="sim">0.78</span></div><div class="result-info"><div class="filename">20250706_135618_person.jpg</div><div class="r-meta">Comments: 1</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. VIDEO -->
+  <div id="tab-video" class="tab-panel">
+    <div class="video-main">
+      <div><div class="section-title">Luxriot Live Streams</div><div class="stream-header"><span class="mono" style="font-size:13px;color:var(--text-secondary);">Channel:</span><select class="input-field" style="width:220px;font-size:14px"><option>Zenbook webcam</option><option>pixel9a</option></select><button class="btn-secondary">Reload</button><span class="mono" style="font-size:13px;color:var(--accent-blue);">Previewing channel 112</span></div></div>
+      <div class="stream-preview"><span class="live-pill">● LIVE</span><span class="ch-label">CH 112 — Zenbook webcam</span><span class="time-pill">8:14:14 PM</span></div>
+      <div class="batch-controls"><span class="mono" style="font-size:13px;color:var(--text-secondary);">Batch:</span><select class="input-field" style="width:80px;font-size:13px"><option>12</option></select><span class="mono" style="font-size:13px;color:var(--text-muted);">~1 fps, 800px</span><button class="btn-primary">Start summaries</button><button class="btn-secondary">Flush now</button><button class="btn-secondary">System prompt settings</button></div>
+
+      <!-- SUMMARIES LIST -->
+      <div class="summaries-section">
+        <div class="section-title">Live / Summaries</div>
+        <div class="summaries-toolbar">
+          <span class="mono" style="font-size:13px;color:var(--text-secondary);">Channel:</span><select class="input-field input-sm" style="width:180px;"><option>Zenbook webcam</option></select>
+          <span class="mono" style="font-size:13px;color:var(--text-secondary);">History:</span><select class="input-field input-sm" style="width:140px;"><option>all history</option><option>last 6 hours</option></select>
+          <span class="mono" style="font-size:13px;color:var(--text-secondary);">Depth:</span><select class="input-field input-sm" style="width:100px;"><option>Live</option><option>Deep</option></select>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+          <button class="btn-secondary">↻ Refresh</button><button class="btn-amber">▶ Live OFF</button><button class="btn-secondary">⇕ Expand all</button><button class="btn-secondary">↩ Back</button>
+        </div>
+        <div class="summaries-status">Zenbook webcam · stopped · 240 entries · run all · all · hist 600 · updated 8:30:47 PM</div>
+        <div class="summary-list">
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:52:12 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:52:32 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:52:54 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:53:15 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:53:36 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 12:53:57 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 1:22:36 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+          <div class="summary-entry"><span class="badge badge-ch">#112</span><div class="se-info"><span class="se-time">3/18/2026, 1:49:37 PM</span><span class="se-frames">12 frames</span></div><div class="se-actions"><button class="se-btn">Expand</button><button class="se-btn">Copy</button><button class="se-btn">Export</button><button class="se-btn">Bookmark</button></div></div>
+        </div>
+      </div>
+
+      <!-- OFFLINE VIDEO ANALYSIS -->
+      <div class="video-analysis">
+        <div class="section-title">Offline Video Analysis</div>
+        <div class="va-grid" style="margin-bottom:16px"><div class="filter-group"><span class="filter-label">Video Path</span><input class="input-field" placeholder="/home/user/video.mp4"/></div><div class="filter-group"><span class="filter-label">Model ID</span><input class="input-field" value="qwen/qwen3-vl-4b"/></div></div>
+        <div class="va-grid-3" style="margin-bottom:16px"><div class="filter-group"><span class="filter-label">Frames to sample</span><select class="input-field input-sm"><option>16</option><option>8</option><option>32</option><option>64</option></select></div><div class="filter-group"><span class="filter-label">Target sample FPS</span><input class="input-field input-sm" value="auto"/></div><div><button class="btn-primary" style="width:100%">Analyze Video</button></div></div>
+        <div class="filter-group" style="margin-bottom:16px"><span class="filter-label">Prompt</span><textarea class="input-field" rows="3" placeholder="Describe what you want the model to analyze..." style="resize:vertical;"></textarea></div>
+        <div class="va-result-panel"><div class="va-tab active">SUMMARY</div><div class="va-tab">SAMPLED FRAMES</div><div style="padding:16px 0;font-size:14px;color:var(--text-muted);">Run analysis to see results here.</div></div>
+      </div>
+    </div>
+    <div class="video-sidebar">
+      <div class="section-title">Channel Runtime</div>
+      <div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;"><button class="btn-secondary">Refresh</button><button class="btn-danger">Stop video</button><button class="btn-secondary">Pause probes</button></div>
+      <div class="channel-card"><div class="channel-name"><span class="badge badge-idle">CHANNEL</span> pixel9a <span class="badge badge-disabled" style="margin-left:auto;font-size:9px;">probes disabled</span></div><div class="channel-meta">1 probe · 0 enabled · 1 disabled<br>Video summaries: idle<br>Probe capture: all probes disabled</div><div class="channel-actions"><button class="btn-secondary" style="font-size:11px;padding:6px 10px;">View summaries</button><button class="btn-secondary" style="font-size:11px;padding:6px 10px;">Stop video</button></div></div>
+      <div class="channel-card"><div class="channel-name"><span class="badge badge-idle">CHANNEL</span> Zenbook webcam <span class="badge badge-running" style="margin-left:auto;font-size:9px;">probes active</span></div><div class="channel-meta">8 probes · 7 enabled · 1 disabled<br>Video summaries: stopped · history available<br>Probe capture: active · 1.00 fps · 61 buffered</div><div class="channel-actions"><button class="btn-secondary" style="font-size:11px;padding:6px 10px;">View summaries</button><button class="btn-secondary" style="font-size:11px;padding:6px 10px;">Pause probes</button><button class="btn-danger" style="font-size:11px;padding:6px 10px;">Stop all</button></div></div>
+    </div>
+  </div>
+
+  <!-- 3. MONITORING -->
+  <div id="tab-monitoring" class="tab-panel">
+    <div class="monitoring-toolbar"><div class="section-title" style="margin:0">Saved Probes</div><span class="mono" style="font-size:13px;color:var(--text-muted);">Click to expand, run, or delete.</span><div style="margin-left:auto;display:flex;gap:8px;"><button class="btn-secondary">Refresh list</button><button class="btn-primary" onclick="openModal()">+ New Probe</button></div></div>
+    <div class="probes-grid">
+      <div class="probe-card" onclick="openModal()"><div class="probe-card-preview"><span class="badge badge-running">RUNNING</span>📷 Sasha<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">⏸</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>Sasha</h4><div class="meta-row">Ch 112 · Last 8:13:45 PM · Gate: off</div><div class="scores"><span class="s-label">P:</span><span class="s-val">0.255</span> <span class="s-label">N:</span><span class="s-val">0.200</span> <span class="s-label">M:</span><span class="s-val">0.054</span></div></div></div>
+      <div class="probe-card"><div class="probe-card-preview"><span class="badge badge-running">RUNNING</span>📷 Orlandina<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">⏸</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>Orlandina</h4><div class="meta-row">Ch 112 · Last 8:13:27 PM · Gate: cooldown</div><div class="scores"><span class="s-label">P:</span><span class="s-val">0.253</span> <span class="s-label">N:</span><span class="s-val">0.226</span> <span class="s-label">M:</span><span class="s-val">0.027</span></div></div></div>
+      <div class="probe-card"><div class="probe-card-preview"><span class="badge badge-disabled">DISABLED</span>NO PREVIEW<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">✓</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>Maz Kanata</h4><div class="meta-row">Ch 106 · Last n/a · Gate: off</div><div class="scores"><span class="s-label">P:</span><span>—</span> <span class="s-label">N:</span><span>—</span> <span class="s-label">M:</span><span>—</span></div></div></div>
+      <div class="probe-card"><div class="probe-card-preview"><span class="badge badge-running">RUNNING</span>📷 Image probe<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">⏸</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>Image probe</h4><div class="meta-row">Ch 112 · Last 8:13:41 PM · Gate: off</div><div class="scores"><span class="s-label">P:</span><span class="s-val">0.816</span> <span class="s-label">N:</span><span class="s-val">0.000</span> <span class="s-label">M:</span><span class="s-val">0.816</span></div></div></div>
+      <div class="probe-card"><div class="probe-card-preview"><span class="badge badge-running">RUNNING</span>📷 thumbs up<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">⏸</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>thumbs up</h4><div class="meta-row">Ch 112 · Last 12:26:30 PM · Gate: cooldown (6.3s)</div><div class="scores"><span class="s-label">P:</span><span class="s-val">0.266</span> <span class="s-label">N:</span><span class="s-val">0.232</span> <span class="s-label">M:</span><span class="s-val">0.034</span></div></div></div>
+      <div class="probe-card"><div class="probe-card-preview"><span class="badge badge-running">RUNNING</span>📷 british flag<div class="controls"><button class="ctrl-btn">↻</button><button class="ctrl-btn">▶</button><button class="ctrl-btn">⏸</button><button class="ctrl-btn" style="color:var(--accent-red)">🗑</button></div></div><div class="probe-card-body"><h4>british flag</h4><div class="meta-row">Ch 112 · Last 7:27:40 PM · Gate: cooldown</div><div class="scores"><span class="s-label">P:</span><span class="s-val">0.263</span> <span class="s-label">N:</span><span class="s-val">0.230</span> <span class="s-label">M:</span><span class="s-val">0.033</span></div></div></div>
+    </div>
+  </div>
+
+  <!-- 4. AGENT -->
+  <div id="tab-agent" class="tab-panel">
+    <div class="agent-left"><div class="agent-left-header"><div class="section-title" style="margin-bottom:12px;">Sessions</div><button class="btn-primary" style="width:100%;">+ NEW SESSION</button></div><div class="chat-list"><div class="chat-list-item active"><div class="cl-title">Sasha probe anomaly check</div><div class="cl-meta">Today, 20:14 · 12 msgs</div></div><div class="chat-list-item"><div class="cl-title">British flag detections report</div><div class="cl-meta">Today, 19:30 · 8 msgs</div></div><div class="chat-list-item"><div class="cl-title">Fire on phone — false positive?</div><div class="cl-meta">Yesterday · 5 msgs</div></div><div class="chat-list-item"><div class="cl-title">Weekly summary: ch112</div><div class="cl-meta">Mar 18 · 23 msgs</div></div></div></div>
+    <div class="agent-chat">
+      <div class="chat-messages">
+        <div class="message user"><div class="msg-header"><span class="ts">20:12</span> Operator</div><div class="msg-body">Покажи последние детекции пробы "Sasha" за сегодня и оцени — были ли ложные срабатывания?</div></div>
+        <div class="message agent"><div class="msg-header">EVA Agent <span class="ts">20:12</span></div><div class="msg-body">За последние 24 часа проба <strong>Sasha</strong> на канале 112 зафиксировала <strong>47 срабатываний</strong>, из них 3 подозрительных (confidence &lt; 0.22).<div class="action-card"><div class="action-card-head">◆ DETECTIONS — Sasha · ch112 · 24h</div><div class="action-card-body"><div class="det-row"><div class="det-thumb">DET #041<span class="sc">0.31</span></div><div class="det-thumb">DET #038<span class="sc">0.28</span></div><div class="det-thumb">DET #012<span class="sc" style="color:var(--accent-amber)">0.19</span></div></div></div></div>Кадр #012 — вероятно ложный (тень). Рекомендую threshold <strong>0.23</strong>.</div></div>
+        <div class="message user"><div class="msg-header"><span class="ts">20:13</span> Operator</div><div class="msg-body">Подними threshold и подготовь рапорт за сегодня по всем пробам.</div></div>
+        <div class="message agent"><div class="msg-header">EVA Agent <span class="ts">20:13</span></div><div class="msg-body">✓ Threshold: 0.20 → <strong>0.23</strong><div class="action-card"><div class="action-card-head">◆ DAILY REPORT — 20.03.2026</div><div class="action-card-body"><div class="report-line">Sasha ........... 47 det / 3 false / thresh ↑ 0.23<br>Orlandina ....... 32 det / 0 false<br>Image probe ..... 18 det / 1 false<br>thumbs up ....... 5 det / 0 false<br>british flag .... 12 det / 2 false<br>Fire on phone ... 8 det / 4 false ⚠</div></div></div>"Fire on phone" — 50% ложных, рекомендую ревизию. Сохранить как PDF?</div></div>
+      </div>
+      <div class="agent-input-area"><div class="input-wrap"><textarea class="chat-ta" rows="1" placeholder="Спросить агента..."></textarea><button class="send-btn">↑</button></div><div class="input-chips"><button class="chip">📎 Image</button><button class="chip">🔍 Archive</button><button class="chip">📊 Report</button><button class="chip">⚙ Probes</button><button class="chip">📑 Bookmark</button></div></div>
+    </div>
+    <div class="agent-right">
+      <div class="ctx-section"><div class="section-title">Live Feed</div><div class="ctx-stream"><span class="live-tag">● LIVE</span>CH 112 — Zenbook webcam</div><div class="mono" style="font-size:12px;color:var(--text-muted);">1.00 fps · 61 buffered · probes active</div></div>
+      <div class="ctx-section"><div class="section-title">Active Probes</div><div class="probe-mini-list"><div class="probe-mini"><div class="pm-dot on"></div><span class="pm-name">Sasha</span><span class="pm-score">0.255</span></div><div class="probe-mini"><div class="pm-dot on"></div><span class="pm-name">Orlandina</span><span class="pm-score">0.253</span></div><div class="probe-mini"><div class="pm-dot on"></div><span class="pm-name">Image probe</span><span class="pm-score">0.816</span></div><div class="probe-mini"><div class="pm-dot on"></div><span class="pm-name">thumbs up</span><span class="pm-score">0.266</span></div><div class="probe-mini"><div class="pm-dot off"></div><span class="pm-name">Maz Kanata</span><span class="pm-score">—</span></div></div></div>
+      <div class="ctx-section"><div class="section-title">Agent Can</div><div class="cap-list"><div class="cap-item">↳ search archive by text/image</div><div class="cap-item">↳ view &amp; analyze detections</div><div class="cap-item">↳ tune probe thresholds</div><div class="cap-item">↳ generate daily reports</div><div class="cap-item">↳ create Luxriot bookmarks</div><div class="cap-item">↳ describe frames (VLM)</div></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- PROBE SETTINGS MODAL -->
+<div class="modal-overlay" id="probeModal">
+  <div class="modal">
+    <div class="modal-header"><h2>Probe Settings</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="modal-left">
+        <div class="section-title">Live Stream</div>
+        <div class="mono" style="font-size:13px;color:var(--accent-green);margin-bottom:8px;">Frames: 109 · Range: 8:12:20 PM – 8:14:14 PM</div>
+        <div class="filter-group" style="margin-bottom:12px;"><span class="filter-label">Channel</span><select class="input-field input-sm"><option>Zenbook webcam</option><option>pixel9a</option></select></div>
+        <div class="ml-stream-preview">📷 Live stream feed<div class="roi-box"></div></div>
+        <div class="ml-stream-info">Stream: ok | Capture: warming<br>Last snapshot: 3/20/2026, 8:14:14 PM<br>ROI 56% × 99% @ 29%, 0%</div>
+        <div class="ml-stream-actions">
+          <button class="btn-primary" style="padding:8px 14px;font-size:11px;">ROI ON</button>
+          <button class="btn-secondary" style="font-size:11px;padding:8px 14px;">Clear ROI</button>
+          <button class="btn-danger" style="font-size:11px;padding:8px 14px;">Stop Stream</button>
+          <button class="btn-secondary" style="font-size:11px;padding:8px 14px;">Snap</button>
+        </div>
+      </div>
+      <div class="modal-right">
+        <div style="display:flex;gap:12px;align-items:end;">
+          <div class="filter-group" style="flex:1;"><span class="filter-label">Probe Name</span><input class="input-field" value="Sasha"/></div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer;padding-bottom:10px;"><input type="checkbox" checked style="width:18px;height:18px;accent-color:var(--accent-green);cursor:pointer;"/>Enabled</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;font-size:14px;">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" style="width:18px;height:18px;accent-color:var(--accent-green);cursor:pointer;"/>Make bookmarks</label>
+          <div style="display:flex;align-items:center;gap:8px;margin-left:auto;"><span class="filter-label" style="margin:0;">Severity:</span><select class="input-field input-sm" style="width:120px;"><option>critical</option><option>high</option><option>normal</option><option>low</option><option>info</option></select></div>
+        </div>
+        <div class="psb">
+          <div class="psb-title">Text Probe Settings</div>
+          <div class="psb-thresholds"><div class="thr-group"><span class="thr-label">Positive</span><input class="input-field input-sm" value="0.2" style="width:100px;"/></div><div class="thr-group"><span class="thr-label">Margin</span><input class="input-field input-sm" value="0.02" style="width:100px;"/></div></div>
+          <div class="pair-header"><span></span><span>Positive Examples</span><span>Negative Examples</span><span></span></div>
+          <div class="pair-row"><span class="pair-num">1.</span><input class="input-field input-sm" value="person with brown hair"/><input class="input-field input-sm" value="blonde"/><button class="pair-del">✕</button></div>
+          <div class="pair-row"><span class="pair-num">2.</span><input class="input-field input-sm" value="scarf"/><input class="input-field input-sm" placeholder="Negative probe 2"/><button class="pair-del">✕</button></div>
+          <div class="pair-row"><span class="pair-num">3.</span><button class="btn-secondary" style="grid-column:2/4;font-size:11px;padding:8px;">Add pair</button><span></span></div>
+        </div>
+        <div class="psb">
+          <div class="psb-title">Image Probe Settings</div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <button class="btn-primary" style="padding:8px 16px;font-size:11px;">Choose Image</button>
+            <span class="mono" style="font-size:13px;color:var(--text-muted);">No file selected</span>
+            <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer;"><input type="checkbox" style="width:18px;height:18px;accent-color:var(--accent-green);cursor:pointer;"/>Enabled</label>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:12px;"><span class="filter-label" style="margin:0;">Minimal match:</span><input class="input-field input-sm" value="0.7" style="width:100px;"/></div>
+          <div class="mono" style="font-size:12px;color:var(--text-muted);margin-top:10px;">Probe status: Disabled; Image: Missing.</div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer"><button class="btn-secondary" onclick="closeModal()">Close</button><button class="btn-primary">Save Probe</button></div>
+  </div>
+</div>
+
+<div class="concept-tag">EVA AI · Command Center · Full UI</div>
+
+<script>
+document.querySelectorAll('.nav-tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.nav-tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('visible'));document.getElementById('tab-'+t.dataset.tab).classList.add('visible');});});
+document.querySelectorAll('.scope-btn').forEach(b=>{b.addEventListener('click',()=>{b.parentElement.querySelectorAll('.scope-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');});});
+document.querySelectorAll('.chat-list-item').forEach(i=>{i.addEventListener('click',()=>{document.querySelectorAll('.chat-list-item').forEach(x=>x.classList.remove('active'));i.classList.add('active');});});
+function openModal(){document.getElementById('probeModal').classList.add('open');}
+function closeModal(){document.getElementById('probeModal').classList.remove('open');}
+document.getElementById('probeModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal();});
+</script>
+</body>
+</html>
