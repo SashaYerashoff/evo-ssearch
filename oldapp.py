@@ -42,7 +42,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _Mask2FormerHeadRuntime = None  # type: ignore[misc]
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
 if config.CORS_ALLOWED_ORIGINS:
     CORS(app, resources={r"/*": {"origins": list(config.CORS_ALLOWED_ORIGINS)}})
@@ -11614,7 +11614,7 @@ def home():
 @app.route('/favicon.ico')
 def favicon():
     """Serve favicon if present; otherwise return no-content to avoid noisy 404 logs."""
-    icon_path = Path(__file__).resolve().parent / 'images' / 'favicon.ico'
+    icon_path = Path(__file__).resolve().parent / 'static' / 'images' / 'favicon.ico'
     if icon_path.exists():
         return send_file(icon_path, mimetype='image/x-icon', max_age=86400)
     return ('', 204)
@@ -11623,7 +11623,7 @@ def favicon():
 @app.route('/branding/logo')
 def branding_logo():
     """Serve application branding logo."""
-    logo_path = Path(__file__).resolve().parent / 'images' / 'lxrt-logo-darktheme.png'
+    logo_path = Path(__file__).resolve().parent / 'static' / 'images' / 'lxrt-logo-darktheme.png'
     if logo_path.exists():
         return send_file(logo_path, mimetype='image/png', max_age=86400)
     return ('', 204)
