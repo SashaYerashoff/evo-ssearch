@@ -269,25 +269,25 @@
     function renderMarkdownInline(text) {
         const source = String(text || '');
         const inlineCode = [];
-        const placeholder = source.replace(/`([^`\\n]+)`/g, (_, codeText) => {
+        const placeholder = source.replace(/`([^`\n]+)`/g, (_, codeText) => {
             const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
             return `@@INLINE_CODE_${idx}@@`;
         });
         let out = escapeHtml(placeholder);
         out = out
-            .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
             .replace(/__(.+?)__/g, '<strong>$1</strong>')
-            .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
+            .replace(/\*(.+?)\*/g, '<em>$1</em>')
             .replace(/_(.+?)_/g, '<em>$1</em>');
-        out = out.replace(/@@INLINE_CODE_(\\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
+        out = out.replace(/@@INLINE_CODE_(\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
         return out;
     }
 
     function renderMarkdown(text) {
-        const source = String(text || '').replace(/\\r\\n?/g, '\\n').trim();
+        const source = String(text || '').replace(/\r\n?/g, '\n').trim();
         if (!source) return '';
 
-        const lines = source.split('\\n');
+        const lines = source.split('\n');
         const htmlParts = [];
         let paragraphLines = [];
         let ulItems = [];
@@ -318,7 +318,7 @@
             if (!inCodeFence) return;
             const classAttr = codeFenceLang ? ` class="language-${escapeHtml(codeFenceLang)}"` : '';
             htmlParts.push(
-                `<pre><code${classAttr}>${escapeHtml(codeFenceLines.join('\\n'))}</code></pre>`
+                `<pre><code${classAttr}>${escapeHtml(codeFenceLines.join('\n'))}</code></pre>`
             );
             inCodeFence = false;
             codeFenceLang = '';
@@ -328,7 +328,7 @@
         for (const rawLine of lines) {
             const line = String(rawLine || '');
             const trimmed = line.trim();
-            const fenceMatch = trimmed.match(/^```\\s*([\\w-]+)?\\s*$/);
+            const fenceMatch = trimmed.match(/^```\s*([\w-]+)?\s*$/);
             if (fenceMatch) {
                 if (inCodeFence) {
                     flushCodeFence();
@@ -353,7 +353,7 @@
                 continue;
             }
 
-            const headingMatch = trimmed.match(/^(#{1,6})\\s+(.+)$/);
+            const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
             if (headingMatch) {
                 flushParagraph();
                 flushLists();
@@ -362,7 +362,7 @@
                 continue;
             }
 
-            const quoteMatch = trimmed.match(/^>\\s?(.*)$/);
+            const quoteMatch = trimmed.match(/^>\s?(.*)$/);
             if (quoteMatch) {
                 flushParagraph();
                 flushLists();
@@ -370,7 +370,7 @@
                 continue;
             }
 
-            const ulMatch = trimmed.match(/^[-*]\\s+(.+)$/);
+            const ulMatch = trimmed.match(/^[-*]\s+(.+)$/);
             if (ulMatch) {
                 flushParagraph();
                 if (olItems.length) {
@@ -380,7 +380,7 @@
                 continue;
             }
 
-            const olMatch = trimmed.match(/^\\d+\\.\\s+(.+)$/);
+            const olMatch = trimmed.match(/^\d+\.\s+(.+)$/);
             if (olMatch) {
                 flushParagraph();
                 if (ulItems.length) {
@@ -405,7 +405,7 @@
             return { main: '', json: '' };
         }
 
-        const fenced = full.match(/```json\\s*([\\s\\S]*?)```/i);
+        const fenced = full.match(/```json\s*([\s\S]*?)```/i);
         if (fenced && fenced[1]) {
             const jsonBlock = String(fenced[1] || '').trim();
             const mainText = full.replace(fenced[0], '').trim();
@@ -422,7 +422,7 @@
             }
         }
 
-        const trailingStart = full.lastIndexOf('\\n{');
+        const trailingStart = full.lastIndexOf('\n{');
         const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
         if (startIndex >= 0) {
             const jsonCandidate = full.slice(startIndex).trim();
@@ -2187,7 +2187,7 @@
             return;
         }
         const channelId = Number(log.channel_id) || getSelectedLuxriotChannel() || luxriotDefaults.channelId;
-        const firstLine = summaryText.split(/\\r?\\n/, 1)[0].trim();
+        const firstLine = summaryText.split(/\r?\n/, 1)[0].trim();
         const titleBase = firstLine || `Channel ${channelId} summary`;
         const title = titleBase.length > 80 ? `${titleBase.slice(0, 77)}...` : titleBase;
         const description = summaryText.length > 2400 ? `${summaryText.slice(0, 2397)}...` : summaryText;
@@ -5913,7 +5913,7 @@
             commentDiv.className = 'comment-item';
             
             // Parse timestamp and comment text
-            const timestampMatch = comment.match(/^\\[(.*?)\\] (.*)$/);
+            const timestampMatch = comment.match(/^\[(.*?)\] (.*)$/);
             if (timestampMatch) {
                 const [, timestamp, text] = timestampMatch;
                 commentDiv.innerHTML = `
