@@ -27,7 +27,7 @@ import clip
 import faiss
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
-from flask import Flask, request, jsonify, send_file, make_response, render_template
+from flask import Flask, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 
 from config import config
@@ -1441,6 +1441,79 @@ class ProbesStore:
 
 probes_store = ProbesStore()
 detections_store = DetectionsStore()
+
+# Agent runner — instantiated lazily on first /agent/chat request so that
+# all helper functions (get_text_embedding, _search_detections_archive, etc.)
+# are fully defined before the runner captures them as callables.
+_agent_runner: Optional[Any] = None
+_agent_runner_lock = threading.Lock()
+
+
+def _get_agent_runner() -> Any:
+    """Return (creating if needed) the singleton AgentRunner."""
+    global _agent_runner
+    if _agent_runner is not None:
+        return _agent_runner
+    with _agent_runner_lock:
+        if _agent_runner is not None:
+            return _agent_runner
+        from agent import AgentRunner
+
+        def _agent_search_folder(
+            *, query: str, folder: str, limit: int = 12
+        ) -> List[Dict[str, Any]]:
+            idx_bundle = load_index(folder, embedder='clip')
+            index, image_paths, image_metadata, _ = idx_bundle
+            if index is None or not image_paths:
+                return []
+            vec = get_text_embedding(query)
+            from agent import _strip_thumbnails  # local import is fine here
+            results = _build_ranked_results(
+                index=index,
+                image_paths=image_paths,
+                image_metadata=image_metadata,
+                query_vec=vec,
+                limit=limit,
+                sort_by='similarity',
+            )
+            return results
+
+        def _agent_search_detections(
+            *, query: str, probe_id: Optional[str] = None,
+            channel_id: Optional[int] = None,
+            since_ms: Optional[int] = None, limit: int = 12
+        ) -> List[Dict[str, Any]]:
+            vec = get_text_embedding(query)
+            return _search_detections_archive(
+                clip_query_vec=vec,
+                dino_query_vec=None,
+                mode='clip',
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=None,
+                limit=limit,
+                sort_by='similarity',
+                candidate_limit=20000,
+            )
+
+        _agent_runner = AgentRunner(
+            embed_text_fn=lambda text: get_text_embedding(text),
+            embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder='clip'),
+            call_lm_fn=_call_lm_chat,
+            encode_jpeg_fn=_encode_jpeg,
+            probes_store=probes_store,
+            detections_store=detections_store,
+            luxriot_manager=luxriot_manager,
+            search_indexed_folder_fn=_agent_search_folder,
+            search_detections_fn=_agent_search_detections,
+            lm_base_url=config.LM_BASE_URL,
+            lm_model=config.LM_MODEL,
+            lm_api_key=config.LM_API_KEY,
+            lm_timeout=config.LM_TIMEOUT,
+        )
+        return _agent_runner
+
 
 DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
 DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
@@ -5838,6 +5911,70 @@ def _port_is_available(host: str, port: int) -> bool:
             return True
         except OSError:
             return False
+
+
+@app.route('/agent/chat', methods=['POST'])
+def agent_chat():
+    """SSE streaming agent chat endpoint."""
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    message = str(data.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'message is required'}), 400
+    session_id = str(data.get('session_id') or '').strip() or None
+    image_b64  = str(data.get('image_b64') or '').strip() or None
+
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+
+    def _generate():
+        yield from runner.stream_chat(
+            session_id=session_id,
+            message=message,
+            image_b64=image_b64,
+        )
+
+    response = Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+    )
+    response.headers['Cache-Control']     = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection']        = 'keep-alive'
+    return response
+
+
+@app.route('/agent/sessions', methods=['GET'])
+def agent_sessions():
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+    return jsonify({'sessions': runner.store.list_sessions()})
+
+
+@app.route('/agent/session/<session_id>', methods=['GET', 'DELETE'])
+def agent_session(session_id: str):
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+    if request.method == 'DELETE':
+        guard = _mutation_guard_error()
+        if guard is not None:
+            return guard
+        ok = runner.store.delete_session(session_id)
+        if not ok:
+            return jsonify({'error': 'Session not found'}), 404
+        return jsonify({'status': 'deleted'})
+    session = runner.store.get_session(session_id)
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+    return jsonify(session)
 
 
 @atexit.register
