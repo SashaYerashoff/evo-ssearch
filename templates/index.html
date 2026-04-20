@@ -44,6 +44,7 @@
                     <button id="archiveModeBtn" class="mode-tab active">Archive Research</button>
                     <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
                     <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
+                    <button id="agentModeBtn" class="mode-tab agent-tab-btn">Agent</button>
                 </div>
             <div id="archiveBox" class="archive-box">
                 <div class="search-controls">
@@ -349,6 +350,65 @@
                     </div>
                 </div>
             </div>
+    </div>
+
+    <!-- Agent Tab -->
+    <div id="agentBox" class="agent-box" style="display:none;">
+        <!-- Sessions sidebar -->
+        <div class="agent-sessions">
+            <div class="agent-sessions-header">
+                <div class="agent-sessions-title">Sessions</div>
+                <button id="agentNewSessionBtn" class="feature-btn primary agent-new-session-btn">+ New</button>
+            </div>
+            <div id="agentSessionList" class="agent-session-list">
+                <div class="agent-session-empty">No sessions yet</div>
+            </div>
+        </div>
+        <!-- Chat area -->
+        <div class="agent-chat-area">
+            <div id="agentMessages" class="agent-messages"></div>
+            <div class="agent-input-wrap">
+                <div id="agentImagePreview" class="agent-image-preview is-hidden">
+                    <img id="agentImageThumb" src="" alt="attached image" />
+                    <button id="agentImageClear" class="agent-image-clear" title="Remove image">&#x2715;</button>
+                </div>
+                <div class="agent-input-bar">
+                    <textarea id="agentInput" class="agent-textarea" rows="1" placeholder="Ask the agent..."></textarea>
+                    <button id="agentSendBtn" class="agent-send-btn" title="Send">&#8593;</button>
+                </div>
+                <div class="agent-chips">
+                    <label class="agent-chip agent-chip-file" title="Attach image">
+                        &#128247; Image
+                        <input type="file" id="agentImageFile" accept="image/*" style="display:none" />
+                    </label>
+                    <button class="agent-chip" data-prompt="Show latest detections">Latest detections</button>
+                    <button class="agent-chip" data-prompt="List all probes and their status">Probe status</button>
+                    <button class="agent-chip" data-prompt="Generate a daily report for all probes">Daily report</button>
+                    <button class="agent-chip" data-prompt="Search the archive for">Archive search</button>
+                    <button class="agent-chip" data-prompt="Describe the current frame from channel">Describe frame</button>
+                </div>
+            </div>
+        </div>
+        <!-- Context sidebar -->
+        <div class="agent-context">
+            <div class="agent-ctx-section">
+                <div class="agent-ctx-title">Active Probes</div>
+                <div id="agentProbeList" class="agent-probe-list">
+                    <div class="agent-probe-empty">Loading probes...</div>
+                </div>
+            </div>
+            <div class="agent-ctx-section">
+                <div class="agent-ctx-title">Agent Can</div>
+                <div class="agent-cap-list">
+                    <div class="agent-cap-item">&#8627; search archive by text/image</div>
+                    <div class="agent-cap-item">&#8627; view &amp; analyze detections</div>
+                    <div class="agent-cap-item">&#8627; tune probe thresholds</div>
+                    <div class="agent-cap-item">&#8627; generate daily reports</div>
+                    <div class="agent-cap-item">&#8627; create Luxriot bookmarks</div>
+                    <div class="agent-cap-item">&#8627; describe frames (VLM)</div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div id="probeEditorModal" class="settings-modal">

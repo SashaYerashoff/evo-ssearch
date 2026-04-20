@@ -26,6 +26,8 @@
     const saveSummaryBtn = document.getElementById('saveSummaryBtn');
     const monitorModeBtn = document.getElementById('monitorModeBtn');
     const monitorBox = document.getElementById('monitorBox');
+    const agentModeBtn = document.getElementById('agentModeBtn');
+    const agentBox = document.getElementById('agentBox');
     const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
     const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
     const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
@@ -271,7 +273,7 @@
         const inlineCode = [];
         const placeholder = source.replace(/`([^`\n]+)`/g, (_, codeText) => {
             const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
-            return `@@INLINE_CODE_${idx}@@`;
+            return `\x00IC${idx}\x00`;
         });
         let out = escapeHtml(placeholder);
         out = out
@@ -279,7 +281,7 @@
             .replace(/__(.+?)__/g, '<strong>$1</strong>')
             .replace(/\*(.+?)\*/g, '<em>$1</em>')
             .replace(/_(.+?)_/g, '<em>$1</em>');
-        out = out.replace(/@@INLINE_CODE_(\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
+        out = out.replace(/\x00IC(\d+)\x00/g, (_, idx) => inlineCode[Number(idx)] || '');
         return out;
     }
 
@@ -491,11 +493,13 @@
         archiveModeBtn.classList.toggle('active', mode === 'archive');
         videoModeBtn.classList.toggle('active', mode === 'video');
         monitorModeBtn.classList.toggle('active', mode === 'monitor');
+        if (agentModeBtn) agentModeBtn.classList.toggle('active', mode === 'agent');
         if (archiveBox) {
             archiveBox.style.display = mode === 'archive' ? 'flex' : 'none';
         }
         videoBox.style.display = mode === 'video' ? 'flex' : 'none';
         monitorBox.style.display = mode === 'monitor' ? 'block' : 'none';
+        if (agentBox) agentBox.style.display = mode === 'agent' ? 'grid' : 'none';
         if (mode === 'video') {
             ensureLuxriotInit();
             startLuxriotPreview();
@@ -5272,6 +5276,7 @@
     if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
     if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
     if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+    if (agentModeBtn) agentModeBtn.addEventListener('click', () => { setMode('agent'); agentInit(); });
     if (loadDetectionsBtn) {
         loadDetectionsBtn.addEventListener('click', () => {
             setMode('archive');
@@ -6741,3 +6746,694 @@
             }
         }
     });
+
+    // =====================================================================
+    // AGENT TAB
+    // =====================================================================
+    (function() {
+        const AGENT_LS_SESSION = 'evs_agent_session_id';
+        let _agentInitDone = false;
+        let _agentCurrentSession = null;    // session_id string or null
+        let _agentStreaming = false;
+        let _agentPendingBubble = null;     // { el, bodyEl } for the current streaming bubble
+        let _agentPendingImageB64 = null;   // base64 string of attached image
+
+        // ---- DOM refs (safe — these are inside the IIFE scope) ----
+        function q(id) { return document.getElementById(id); }
+        const elSessionList = () => q('agentSessionList');
+        const elMessages    = () => q('agentMessages');
+        const elInput       = () => q('agentInput');
+        const elSendBtn     = () => q('agentSendBtn');
+        const elNewSession  = () => q('agentNewSessionBtn');
+        const elProbeList   = () => q('agentProbeList');
+
+        // ---- Helpers ----
+        function fmtTime(isoOrTs) {
+            try {
+                const d = new Date(typeof isoOrTs === 'number' ? isoOrTs * 1000 : isoOrTs);
+                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } catch(_) { return ''; }
+        }
+
+        function fmtDate(isoOrTs) {
+            try {
+                const d = new Date(typeof isoOrTs === 'number' ? isoOrTs * 1000 : isoOrTs);
+                const today = new Date();
+                if (d.toDateString() === today.toDateString()) return 'Today';
+                const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+                if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+                return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+            } catch(_) { return ''; }
+        }
+
+        // ---- Session list ----
+        async function agentLoadSessions() {
+            try {
+                const r = await fetch('/agent/sessions');
+                if (!r.ok) return;
+                const data = await r.json();
+                renderSessionList(data.sessions || []);
+            } catch(e) {
+                console.warn('agent: failed to load sessions', e);
+            }
+        }
+
+        function renderSessionList(sessions) {
+            const el = elSessionList();
+            if (!el) return;
+            if (!sessions.length) {
+                el.innerHTML = '<div class="agent-session-empty">No sessions yet</div>';
+                return;
+            }
+            el.innerHTML = sessions.map(s => {
+                const active = s.id === _agentCurrentSession ? ' active' : '';
+                const title = escapeHtml(s.title || 'Untitled session');
+                const meta = `${fmtDate(s.updated_at)} · ${s.message_count || 0} msg`;
+                return `<div class="agent-session-item${active}" data-sid="${escapeHtml(s.id)}">
+                    <div class="si-title">${title}</div>
+                    <div class="si-meta">
+                        <span>${meta}</span>
+                        <button class="si-delete" data-sid="${escapeHtml(s.id)}" title="Delete">&#x2715;</button>
+                    </div>
+                </div>`;
+            }).join('');
+
+            el.querySelectorAll('.agent-session-item').forEach(item => {
+                item.addEventListener('click', (e) => {
+                    if (e.target.closest('.si-delete')) return;
+                    agentOpenSession(item.dataset.sid);
+                });
+            });
+            el.querySelectorAll('.si-delete').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    agentDeleteSession(btn.dataset.sid);
+                });
+            });
+        }
+
+        async function agentOpenSession(sessionId) {
+            if (_agentStreaming) return;
+            try {
+                const r = await fetch(`/agent/session/${sessionId}`);
+                if (!r.ok) return;
+                const data = await r.json();
+                _agentCurrentSession = sessionId;
+                localStorage.setItem(AGENT_LS_SESSION, sessionId);
+                renderMessages(data.messages || []);
+                highlightActiveSession(sessionId);
+            } catch(e) {
+                console.warn('agent: failed to open session', e);
+            }
+        }
+
+        async function agentDeleteSession(sessionId) {
+            try {
+                const r = await fetch(`/agent/session/${sessionId}`, { method: 'DELETE' });
+                if (!r.ok) return;
+                if (_agentCurrentSession === sessionId) {
+                    _agentCurrentSession = null;
+                    localStorage.removeItem(AGENT_LS_SESSION);
+                    showWelcome();
+                }
+                await agentLoadSessions();
+            } catch(e) {
+                console.warn('agent: failed to delete session', e);
+            }
+        }
+
+        function highlightActiveSession(sessionId) {
+            const el = elSessionList();
+            if (!el) return;
+            el.querySelectorAll('.agent-session-item').forEach(item => {
+                item.classList.toggle('active', item.dataset.sid === sessionId);
+            });
+        }
+
+        // ---- Messages ----
+        function showWelcome() {
+            const el = elMessages();
+            if (!el) return;
+            el.innerHTML = `<div class="agent-msg-welcome">
+                <div class="agent-msg-welcome-title">EVA Agent</div>
+                <div class="agent-msg-welcome-sub">Ask me about your camera streams, detections, and probes. I can search archives, analyze detections, and tune probe settings.</div>
+            </div>`;
+        }
+
+        function renderMessages(messages) {
+            const el = elMessages();
+            if (!el) return;
+            el.innerHTML = '';
+            for (const msg of messages) {
+                if (msg.role === 'user') {
+                    appendUserBubble(msg.content, msg.created_at);
+                } else if (msg.role === 'assistant') {
+                    appendAssistantBubble(msg.content, msg.created_at);
+                }
+            }
+            scrollToBottom();
+        }
+
+        function appendUserBubble(text, ts, imageB64) {
+            const el = elMessages();
+            if (!el) return;
+            const div = document.createElement('div');
+            div.className = 'agent-message user';
+            let bodyContent = '';
+            if (imageB64) {
+                bodyContent += `<img class="agent-msg-image" src="data:image/jpeg;base64,${imageB64}" alt="attached image" />`;
+            }
+            bodyContent += escapeHtml(text);
+            div.innerHTML = `<div class="agent-msg-header"><span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span> Operator</div>
+                <div class="agent-msg-body">${bodyContent}</div>`;
+            el.appendChild(div);
+            scrollToBottom();
+        }
+
+        function appendAssistantBubble(text, ts) {
+            const el = elMessages();
+            if (!el) return;
+            const div = document.createElement('div');
+            div.className = 'agent-message assistant';
+            const bodyEl = document.createElement('div');
+            bodyEl.className = 'agent-msg-body';
+            if (text) bodyEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+            div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
+            div.appendChild(bodyEl);
+            el.appendChild(div);
+            scrollToBottom();
+            return { el: div, bodyEl };
+        }
+
+        function startStreamingBubble() {
+            const el = elMessages();
+            if (!el) return null;
+            // Remove welcome if present
+            const welcome = el.querySelector('.agent-msg-welcome');
+            if (welcome) welcome.remove();
+
+            const div = document.createElement('div');
+            div.className = 'agent-message assistant';
+            const bodyEl = document.createElement('div');
+            bodyEl.className = 'agent-msg-body';
+            bodyEl.innerHTML = '<span class="agent-typing-indicator"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span></span>';
+            div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
+            div.appendChild(bodyEl);
+            el.appendChild(div);
+            scrollToBottom();
+            return { el: div, bodyEl, text: '' };
+        }
+
+        function appendTokenToBubble(bubble, token) {
+            bubble.text = (bubble.text || '') + token;
+            const rendered = renderMarkdown ? renderMarkdown(bubble.text) : escapeHtml(bubble.text);
+            bubble.bodyEl.innerHTML = rendered;
+            scrollToBottom();
+        }
+
+        function appendActionCard(bubble, name, result) {
+            const card = buildActionCard(name, result);
+            if (card) bubble.bodyEl.appendChild(card);
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
+            const el = elMessages();
+            if (el) el.scrollTop = el.scrollHeight;
+        }
+
+        // ---- Action card builders ----
+        // Helper: build a thumbnail element using image_url (backend-provided) or fallback
+        function _makeThumb(item, cls, scoreVal) {
+            const div = document.createElement('div');
+            div.className = cls;
+            const url = item.image_url || null;
+            const score = scoreVal != null ? String(scoreVal) : '';
+            if (url) {
+                div.innerHTML = `<img src="${escapeHtml(url)}" alt="" loading="lazy" />${score ? `<div class="${cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score'}">${escapeHtml(score)}</div>` : ''}`;
+            } else {
+                div.textContent = item.id ? `#${item.id}` : '—';
+                if (score) {
+                    const badge = document.createElement('div');
+                    badge.className = cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score';
+                    badge.textContent = score;
+                    div.appendChild(badge);
+                }
+            }
+            return div;
+        }
+
+        function buildActionCard(toolName, result) {
+            const card = document.createElement('div');
+            card.className = 'agent-action-card';
+
+            if (toolName === 'search_archive') {
+                // backend returns result.results (not result.hits)
+                const hits = (result && (result.results || result.hits)) || [];
+                const count = result && result.count != null ? result.count : hits.length;
+                const scope = (result && result.scope) || '';
+                const label = `SEARCH — ${count} result${count !== 1 ? 's' : ''}${scope ? ' · ' + scope : ''}`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                if (hits.length) {
+                    const grid = document.createElement('div');
+                    grid.className = 'agent-search-results-grid';
+                    hits.slice(0, 8).forEach(h => {
+                        const score = h.score != null ? (h.score * 100).toFixed(0) + '%' : '';
+                        grid.appendChild(_makeThumb(h, 'agent-search-thumb', score || null));
+                    });
+                    body.appendChild(grid);
+                    if (hits.length > 8) {
+                        const more = document.createElement('div');
+                        more.style.cssText = 'margin-top:6px;font-size:12px;color:var(--muted)';
+                        more.textContent = `+${hits.length - 8} more results`;
+                        body.appendChild(more);
+                    }
+                } else {
+                    body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No results found.</div>';
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'get_detections') {
+                const detections = (result && result.detections) || [];
+                const total = result && result.total_in_window;
+                const label = total != null
+                    ? `DETECTIONS — ${detections.length} shown of ${total} total`
+                    : `DETECTIONS — ${detections.length} found`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                if (detections.length) {
+                    const grid = document.createElement('div');
+                    grid.className = 'agent-det-grid';
+                    detections.slice(0, 8).forEach(d => {
+                        const score = d.score != null ? d.score.toFixed(3) : (d.margin != null ? d.margin.toFixed(3) : null);
+                        grid.appendChild(_makeThumb(d, 'agent-det-thumb', score));
+                    });
+                    body.appendChild(grid);
+                    if (detections.length > 8) {
+                        const more = document.createElement('div');
+                        more.style.cssText = 'margin-top:6px;font-size:12px;color:var(--muted)';
+                        more.textContent = `+${detections.length - 8} more`;
+                        body.appendChild(more);
+                    }
+                } else {
+                    body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No detections found.</div>';
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'get_detection_summary') {
+                const byProbe = (result && result.by_probe) || [];
+                const total = (result && result.total_detections) || 0;
+                const label = `DETECTIONS SUMMARY — ${total} total`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                if (byProbe.length) {
+                    let rows = byProbe.map(p => {
+                        const name = escapeHtml(p.probe_name || p.probe_id || '?');
+                        const hits = p.hit_count || 0;
+                        return `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${name}</span><span class="agent-probe-update-val">${hits} hits</span></div>`;
+                    }).join('');
+                    body.innerHTML = `<div class="agent-probe-update-row">${rows}</div>`;
+                } else {
+                    body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No data.</div>';
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'update_probe') {
+                const isPreview = result && result.status === 'preview';
+                const label = isPreview ? 'PROBE UPDATE PREVIEW' : 'PROBE UPDATED';
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${label}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const probeName = (result && result.probe_name) || 'unknown';
+                const diff = (result && result.diff) || {};
+                let html = `<div class="agent-probe-update-row"><div class="agent-probe-update-field"><span class="agent-probe-update-key">Probe:</span><span class="agent-probe-update-val">${escapeHtml(probeName)}</span></div>`;
+                for (const [k, v] of Object.entries(diff)) {
+                    const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
+                    html += `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${escapeHtml(k)}:</span><span class="agent-probe-update-val">${escapeHtml(val)}</span></div>`;
+                }
+                html += '</div>';
+                if (isPreview) {
+                    html += `<div style="margin-top:8px;font-size:12px;color:var(--muted)">Preview only — confirm to apply.</div>`;
+                }
+                body.innerHTML = html;
+                card.appendChild(body);
+
+            } else if (toolName === 'describe_frame') {
+                const source = (result && result.source) || '';
+                const chId = result && result.channel_id;
+                const headLabel = chId != null
+                    ? `FRAME — CH ${chId} (LIVE)`
+                    : 'FRAME DESCRIPTION';
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(headLabel)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body agent-describe-layout';
+                const b64 = result && result.snapshot_b64;
+                const imgPath = result && result.image_path;
+                let imgSrc = null;
+                if (b64) {
+                    imgSrc = `data:image/jpeg;base64,${b64}`;
+                } else if (imgPath) {
+                    imgSrc = `/detections/image?image_path=${encodeURIComponent(imgPath)}`;
+                }
+                const desc = (result && result.description) || '';
+                if (imgSrc) {
+                    body.innerHTML = `<div class="agent-frame-img-wrap"><img class="agent-frame-img" src="${escapeHtml(imgSrc)}" alt="analyzed frame" /></div><div class="agent-describe-block">${escapeHtml(desc)}</div>`;
+                } else {
+                    body.innerHTML = `<div class="agent-describe-block">${escapeHtml(desc)}</div>`;
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'get_video_summaries') {
+                const entries = (result && result.entries) || [];
+                const depth = (result && result.depth) || '';
+                const ch = (result && result.channel_id) || '';
+                const label = `VIDEO SUMMARIES — CH ${ch} · ${depth} · ${entries.length} entries`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                if (entries.length) {
+                    body.innerHTML = entries.map(e => {
+                        const t = escapeHtml(e.time || '');
+                        const s = escapeHtml(e.summary || '');
+                        return `<div class="agent-summary-entry"><span class="agent-summary-ts">${t}</span><span class="agent-summary-text">${s}</span></div>`;
+                    }).join('');
+                } else {
+                    body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No summaries in this time range.</div>';
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'create_bookmark') {
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; BOOKMARK CREATED</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const bname = (result && (result.title || result.name || result.id)) || 'Bookmark';
+                const bsev = (result && result.severity) || '';
+                const bch = (result && result.channel_id) != null ? ` · CH ${result.channel_id}` : '';
+                body.innerHTML = `<div class="agent-bookmark-row">
+                    <span class="agent-bookmark-badge">${escapeHtml(bsev || 'bookmark')}</span>
+                    <span>${escapeHtml(String(bname))}${escapeHtml(bch)}</span>
+                </div>`;
+                card.appendChild(body);
+
+            } else if (toolName === 'generate_report') {
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; REPORT</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const text = (result && (result.report || result.text || result.content)) || JSON.stringify(result, null, 2);
+                body.innerHTML = `<div class="agent-report-block">${escapeHtml(text)}</div>`;
+                card.appendChild(body);
+
+            } else {
+                // Generic fallback
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(toolName.toUpperCase())}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                body.innerHTML = `<div style="font-size:12px;color:var(--muted);white-space:pre-wrap;font-family:monospace">${escapeHtml(JSON.stringify(result, null, 2))}</div>`;
+                card.appendChild(body);
+            }
+
+            return card;
+        }
+
+        // ---- SSE chat ----
+        async function agentSend(message) {
+            if (_agentStreaming || !message.trim()) return;
+            _agentStreaming = true;
+
+            // Capture and clear pending image
+            const imageB64 = _agentPendingImageB64 || null;
+            _agentPendingImageB64 = null;
+            clearImageAttachment();
+
+            const sendBtn = elSendBtn();
+            const inputEl = elInput();
+            if (sendBtn) sendBtn.disabled = true;
+            if (inputEl) { inputEl.disabled = true; inputEl.style.height = ''; }
+
+            // Remove welcome screen and show user bubble
+            const msgEl = elMessages();
+            if (msgEl) {
+                const welcome = msgEl.querySelector('.agent-msg-welcome');
+                if (welcome) welcome.remove();
+            }
+            appendUserBubble(message, null, imageB64);
+
+            // Start streaming assistant bubble
+            _agentPendingBubble = startStreamingBubble();
+
+            try {
+                const body = { message };
+                if (_agentCurrentSession) body.session_id = _agentCurrentSession;
+                if (imageB64) body.image_b64 = imageB64;
+
+                const r = await fetch('/agent/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+
+                if (!r.ok) {
+                    const errText = await r.text().catch(() => r.statusText);
+                    finishStreamingBubble(_agentPendingBubble, null);
+                    appendErrorToMessages(`Server error ${r.status}: ${errText}`);
+                    return;
+                }
+
+                const reader = r.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                let newSessionId = null;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    // Parse SSE lines
+                    const lines = buf.split('\n');
+                    buf = lines.pop(); // keep incomplete last line
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const raw = line.slice(6).trim();
+                        if (!raw) continue;
+                        let evt;
+                        try { evt = JSON.parse(raw); } catch(_) { continue; }
+                        handleAgentEvent(evt, _agentPendingBubble);
+                        if (evt.type === 'done' && evt.session_id) {
+                            newSessionId = evt.session_id;
+                        }
+                    }
+                }
+
+                finishStreamingBubble(_agentPendingBubble);
+                if (newSessionId) {
+                    _agentCurrentSession = newSessionId;
+                    localStorage.setItem(AGENT_LS_SESSION, newSessionId);
+                    await agentLoadSessions();
+                    highlightActiveSession(newSessionId);
+                }
+
+            } catch(e) {
+                console.error('agent: stream error', e);
+                finishStreamingBubble(_agentPendingBubble, null);
+                appendErrorToMessages(`Connection error: ${e.message}`);
+            } finally {
+                _agentStreaming = false;
+                _agentPendingBubble = null;
+                if (sendBtn) sendBtn.disabled = false;
+                if (inputEl) { inputEl.disabled = false; inputEl.focus(); }
+            }
+        }
+
+        function handleAgentEvent(evt, bubble) {
+            if (!bubble) return;
+            switch (evt.type) {
+                case 'token':
+                case 'text':
+                    if (evt.content) appendTokenToBubble(bubble, evt.content);
+                    break;
+                case 'tool_result':
+                    appendActionCard(bubble, evt.name, evt.result);
+                    break;
+                case 'error':
+                    appendErrorToMessages(evt.message || 'Unknown error');
+                    break;
+                case 'heartbeat':
+                case 'tool_start':
+                case 'done':
+                    break;
+            }
+        }
+
+        function finishStreamingBubble(bubble) {
+            if (!bubble) return;
+            // Remove typing indicator if still present (no tokens came)
+            const indicator = bubble.bodyEl.querySelector('.agent-typing-indicator');
+            if (indicator) indicator.remove();
+        }
+
+        function appendErrorToMessages(msg) {
+            const el = elMessages();
+            if (!el) return;
+            const div = document.createElement('div');
+            div.className = 'agent-error-msg';
+            div.textContent = msg;
+            el.appendChild(div);
+            scrollToBottom();
+        }
+
+        // ---- Probe list (context sidebar) ----
+        async function agentLoadProbes() {
+            const el = elProbeList();
+            if (!el) return;
+            try {
+                const r = await fetch('/probes/list');
+                if (!r.ok) return;
+                const data = await r.json();
+                const probes = data.probes || [];
+                if (!probes.length) {
+                    el.innerHTML = '<div class="agent-probe-empty">No probes configured</div>';
+                    return;
+                }
+                el.innerHTML = probes.map(p => {
+                    const running = p.status === 'running' || p.enabled !== false;
+                    const dotCls = running ? 'on' : 'off';
+                    const score = p.last_score != null ? p.last_score.toFixed(3) : '—';
+                    return `<div class="agent-probe-mini">
+                        <div class="agent-probe-dot ${dotCls}"></div>
+                        <span class="agent-probe-name">${escapeHtml(p.name || 'unnamed')}</span>
+                        <span class="agent-probe-score">${score}</span>
+                    </div>`;
+                }).join('');
+            } catch(e) {
+                el.innerHTML = '<div class="agent-probe-empty">Failed to load probes</div>';
+            }
+        }
+
+        function clearImageAttachment() {
+            _agentPendingImageB64 = null;
+            const preview = document.getElementById('agentImagePreview');
+            const thumb = document.getElementById('agentImageThumb');
+            if (preview) preview.classList.add('is-hidden');
+            if (thumb) thumb.src = '';
+        }
+
+        // ---- Textarea auto-resize ----
+        function setupTextarea() {
+            const ta = elInput();
+            if (!ta) return;
+            function resize() {
+                ta.style.height = 'auto';
+                ta.style.height = Math.min(ta.scrollHeight, 110) + 'px';
+            }
+            ta.addEventListener('input', resize);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    const msg = ta.value.trim();
+                    if (msg) {
+                        ta.value = '';
+                        resize();
+                        agentSend(msg);
+                    }
+                }
+            });
+        }
+
+        // ---- Init ----
+        function agentInit() {
+            if (_agentInitDone) return;
+            _agentInitDone = true;
+
+            setupTextarea();
+
+            const sendBtn = elSendBtn();
+            if (sendBtn) {
+                sendBtn.addEventListener('click', () => {
+                    const ta = elInput();
+                    const msg = ta ? ta.value.trim() : '';
+                    if (msg) {
+                        ta.value = '';
+                        agentSend(msg);
+                    }
+                });
+            }
+
+            const newBtn = elNewSession();
+            if (newBtn) {
+                newBtn.addEventListener('click', () => {
+                    if (_agentStreaming) return;
+                    _agentCurrentSession = null;
+                    localStorage.removeItem(AGENT_LS_SESSION);
+                    showWelcome();
+                    highlightActiveSession(null);
+                });
+            }
+
+            // Chip buttons (skip the file label)
+            const box = document.getElementById('agentBox');
+            if (box) {
+                box.querySelectorAll('.agent-chip[data-prompt]').forEach(chip => {
+                    chip.addEventListener('click', () => {
+                        const ta = elInput();
+                        if (ta && !_agentStreaming) {
+                            ta.value = chip.dataset.prompt || chip.textContent;
+                            ta.focus();
+                        }
+                    });
+                });
+            }
+
+            // Image attachment
+            const imageFileInput = q('agentImageFile');
+            if (imageFileInput) {
+                imageFileInput.addEventListener('change', () => {
+                    const file = imageFileInput.files && imageFileInput.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        // Strip data URI prefix, keep base64 only
+                        const dataUrl = e.target.result || '';
+                        const b64 = dataUrl.split(',')[1] || '';
+                        if (b64) {
+                            _agentPendingImageB64 = b64;
+                            const preview = q('agentImagePreview');
+                            const thumb = q('agentImageThumb');
+                            if (preview) preview.classList.remove('is-hidden');
+                            if (thumb) thumb.src = dataUrl;
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                    // Reset so same file can be re-selected
+                    imageFileInput.value = '';
+                });
+            }
+            const imageClearBtn = q('agentImageClear');
+            if (imageClearBtn) {
+                imageClearBtn.addEventListener('click', clearImageAttachment);
+            }
+
+            // Try to restore last session
+            const savedSession = localStorage.getItem(AGENT_LS_SESSION);
+
+            agentLoadSessions().then(() => {
+                if (savedSession) {
+                    agentOpenSession(savedSession).catch(() => showWelcome());
+                } else {
+                    showWelcome();
+                }
+            });
+
+            agentLoadProbes();
+        }
+
+        // Expose agentInit to outer scope
+        window._agentInit = agentInit;
+    })();
+
+    function agentInit() {
+        if (window._agentInit) window._agentInit();
+    }

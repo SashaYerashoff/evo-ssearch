@@ -229,15 +229,24 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "describe_frame",
             "description": (
-                "Send a specific image frame to the vision language model for a detailed description. "
-                "Use to understand what happened in a detection, or to analyze a specific image."
+                "Send an image frame to the vision language model for a detailed description. "
+                "Accepts a live camera snapshot (channel_id), a detection record (detection_id), "
+                "or a filesystem path (image_path). "
+                "Use to understand what is happening on camera right now, or to analyze a past detection."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "channel_id": {
+                        "type": "integer",
+                        "description": (
+                            "Luxriot channel ID. Captures a live snapshot from the camera right now "
+                            "and describes it. Use when the operator asks about the current scene."
+                        ),
+                    },
                     "image_path": {
                         "type": "string",
-                        "description": "Absolute filesystem path to the image.",
+                        "description": "Absolute filesystem path to an image file.",
                     },
                     "detection_id": {
                         "type": "integer",
@@ -289,6 +298,45 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["channel_id", "title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_video_summaries",
+            "description": (
+                "Retrieve VLM-generated video summaries for a Luxriot channel. "
+                "Returns narrative text summaries at different depths: "
+                "live (L0, per-batch captions), L1 (minute-level), L2 (hour-level), L3 (day-level). "
+                "Use to answer 'what happened on camera X in the last hour?' without re-analyzing frames."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "integer",
+                        "description": "Luxriot channel ID to query.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["live", "L1", "L2", "L3"],
+                        "description": (
+                            "live: raw per-batch captions (most detail, most entries). "
+                            "L1: minute-window rollups. L2: hour rollups. L3: day rollups. "
+                            "Default: L1."
+                        ),
+                    },
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Return summaries from the past N hours. Default: 6.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max summary entries to return. Default: 20.",
+                    },
+                },
+                "required": ["channel_id"],
             },
         },
     },
@@ -750,6 +798,7 @@ class AgentTools:
             "get_detection_summary": self._get_detection_summary,
             "update_probe":         self._update_probe,
             "describe_frame":       self._describe_frame,
+            "get_video_summaries":  self._get_video_summaries,
             "create_bookmark":      self._create_bookmark,
             "generate_report":      self._generate_report,
         }
@@ -891,6 +940,7 @@ class AgentTools:
     # ── describe_frame ──────────────────────────────────────────────────────
 
     def _describe_frame(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        channel_id   = _opt_int(args.get("channel_id"))
         image_path   = str(args.get("image_path") or "").strip() or None
         detection_id = _opt_int(args.get("detection_id"))
         prompt = str(args.get("prompt") or "").strip() or (
@@ -898,8 +948,35 @@ class AgentTools:
             "Note any people, vehicles, objects, or unusual activity."
         )
 
+        # Live snapshot path
+        if channel_id is not None:
+            if not hasattr(self._lxm, "get_snapshot_base64"):
+                raise ToolError("Luxriot manager is not available or not configured.")
+            try:
+                encoded, meta = self._lxm.get_snapshot_base64(channel_id)
+            except Exception as exc:
+                raise ToolError(f"Could not capture snapshot from channel {channel_id}: {exc}") from exc
+            messages = [
+                {"role": "system", "content": "You are an expert visual analyst. Be concise and factual."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"Live feed from channel {channel_id}.\n\nTask: {prompt}"},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{encoded}",
+                        "detail": "high",
+                    }},
+                ]},
+            ]
+            description = self._lm(messages)
+            return {
+                "description": description,
+                "source": "live_snapshot",
+                "channel_id": channel_id,
+                "image_path": None,
+                "snapshot_b64": encoded,
+            }
+
         if image_path is None and detection_id is None:
-            raise ToolError("Provide either 'image_path' or 'detection_id'.")
+            raise ToolError("Provide 'channel_id', 'image_path', or 'detection_id'.")
 
         # Resolve image from detection record if needed
         resolved_path: Optional[str] = image_path
@@ -936,7 +1013,12 @@ class AgentTools:
             ]},
         ]
         description = self._lm(messages)
-        return {"description": description, "image_path": resolved_path}
+        return {
+            "description": description,
+            "source": "image_path",
+            "image_path": resolved_path,
+            "snapshot_b64": encoded,
+        }
 
     def _describe_from_thumb_b64(self, thumb_b64: str, prompt: str) -> Dict[str, Any]:
         messages = [
@@ -950,7 +1032,65 @@ class AgentTools:
             ]},
         ]
         description = self._lm(messages)
-        return {"description": description, "image_path": None, "note": "low-res thumbnail used"}
+        return {
+            "description": description,
+            "source": "thumbnail",
+            "image_path": None,
+            "snapshot_b64": thumb_b64,
+            "note": "low-res thumbnail used",
+        }
+
+    # ── get_video_summaries ─────────────────────────────────────────────────
+
+    def _get_video_summaries(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        channel_id  = _opt_int(args.get("channel_id"))
+        if channel_id is None:
+            raise ToolError("'channel_id' is required.")
+        depth       = str(args.get("depth") or "L1").strip().upper()
+        if depth == "LIVE":
+            depth = "L0"
+        since_hours = float(args.get("since_hours") or 6)
+        limit       = max(1, min(100, int(args.get("limit") or 20)))
+
+        if not hasattr(self._lxm, "summary_rollups"):
+            raise ToolError("Luxriot manager is not available or not configured.")
+
+        now_ts = time.time()
+        start_ts = now_ts - since_hours * 3600.0
+
+        try:
+            rollups = self._lxm.summary_rollups(
+                channel_id=channel_id,
+                start_ts=start_ts,
+                end_ts=now_ts,
+                level_limit=limit,
+            )
+        except Exception as exc:
+            raise ToolError(f"Could not fetch summaries: {exc}") from exc
+
+        nodes = (rollups.get("levels") or {}).get(depth) or []
+
+        # Flatten to a clean list for the LLM
+        import datetime as _dt
+        entries = []
+        for node in nodes[-limit:]:
+            entry: Dict[str, Any] = {}
+            ts = node.get("window_start") or node.get("created_at")
+            if ts:
+                entry["time"] = _dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+            text = str(node.get("summary") or "").strip()
+            if text:
+                entry["summary"] = text[:800]
+            if entry.get("summary"):
+                entries.append(entry)
+
+        return {
+            "channel_id": channel_id,
+            "depth": depth,
+            "since_hours": since_hours,
+            "count": len(entries),
+            "entries": entries,
+        }
 
     # ── create_bookmark ─────────────────────────────────────────────────────
 
@@ -1535,19 +1675,47 @@ def _opt_float(v: Any) -> Optional[float]:
         return None
 
 
+def _detection_image_url(r: Dict[str, Any]) -> Optional[str]:
+    """Return a URL the frontend can use to load the detection's image."""
+    ip = str(r.get("image_path") or "").strip()
+    if ip:
+        from urllib.parse import quote
+        return f"/detections/image?image_path={quote(ip, safe='')}"
+    if r.get("thumbnail"):
+        # inline data-URI from stored thumbnail
+        return f"data:image/jpeg;base64,{r['thumbnail']}"
+    return None
+
+
+def _archive_result_image_url(r: Dict[str, Any]) -> Optional[str]:
+    """Return a URL the frontend can use to load an archive search result image."""
+    fp = str(r.get("filepath") or r.get("path") or "").strip()
+    if fp:
+        from urllib.parse import quote
+        return f"/image/{quote(fp, safe='/')}"
+    return None
+
+
 def _safe_detection(r: Dict[str, Any]) -> Dict[str, Any]:
-    """Return detection dict with thumbnail stripped (use image_path instead)."""
+    """Return detection dict with thumbnail stripped, plus a serveable image_url."""
     out = {k: v for k, v in r.items() if k not in ("thumbnail", "clip_vec", "dino_vec")}
     out["has_thumbnail"] = bool(r.get("thumbnail"))
+    url = _detection_image_url(r)
+    if url:
+        out["image_url"] = url
     return out
 
 
 def _strip_thumbnails(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {k: v for k, v in r.items()
-         if k not in ("thumbnail", "thumbnail_b64", "clip_vec", "dino_vec")}
-        for r in results
-    ]
+    out = []
+    for r in results:
+        row = {k: v for k, v in r.items()
+               if k not in ("thumbnail", "thumbnail_b64", "clip_vec", "dino_vec")}
+        url = _archive_result_image_url(r)
+        if url:
+            row["image_url"] = url
+        out.append(row)
+    return out
 
 
 def _strip_thumbnails_deep(obj: Any) -> Any:
