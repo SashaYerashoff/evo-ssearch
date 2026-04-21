@@ -209,6 +209,73 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_channels",
+            "description": "List available Luxriot channels with IDs and titles. Use before deployment, survey, or prompt tuning.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true, refresh channel list from Luxriot instead of relying on cache.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_probes",
+            "description": "List configured probes with their IDs, channels, thresholds, and recent hit counts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Recent window used for hit counts. Default: 24.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "survey_channels",
+            "description": (
+                "Capture a short batch of snapshots from one or more channels over 10-15 seconds "
+                "and summarize what each camera is looking at."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional explicit list of channel IDs. Omit to survey all available channels.",
+                    },
+                    "duration_sec": {
+                        "type": "number",
+                        "description": "Approximate capture duration per channel. Default: 12 seconds.",
+                    },
+                    "sample_count": {
+                        "type": "integer",
+                        "description": "How many snapshots to collect per channel. Default: 4.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Optional instruction for the VLM summarizer.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "build_research_batch",
             "description": (
                 "Assemble a representative batch of detections for agent research across multiple time windows "
@@ -294,6 +361,66 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Max raw detections to scan per period before sampling. Default: 1000.",
                     }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_probe",
+            "description": (
+                "Create a new probe with text pairs and thresholds. "
+                "IMPORTANT: call with preview=true first unless the operator explicitly authorized direct deployment."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "channel_id": {"type": "integer"},
+                    "positives": {"type": "array", "items": {"type": "string"}},
+                    "negatives": {"type": "array", "items": {"type": "string"}},
+                    "pos_floor": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "margin_thr": {"type": "number", "minimum": 0.0},
+                    "top_k": {"type": "integer", "minimum": 1},
+                    "window_sec": {"type": "number", "minimum": 0.0},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["info", "low", "normal", "high", "critical"],
+                    },
+                    "bookmark_enabled": {"type": "boolean"},
+                    "enabled": {"type": "boolean"},
+                    "preview": {"type": "boolean"},
+                },
+                "required": ["name", "channel_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_probes",
+            "description": (
+                "Delete one or more probes, or all probes. "
+                "IMPORTANT: call with preview=true first unless the operator explicitly authorized destructive deployment."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "probe_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional explicit probe IDs to delete.",
+                    },
+                    "delete_all": {
+                        "type": "boolean",
+                        "description": "If true, delete all configured probes.",
+                    },
+                    "preview": {
+                        "type": "boolean",
+                        "description": "If true, return a deletion plan without applying. Default: true.",
+                    },
                 },
                 "required": [],
             },
@@ -1043,7 +1170,12 @@ class AgentTools:
             "search_archive":       self._search_archive,
             "get_detections":       self._get_detections,
             "get_detection_summary": self._get_detection_summary,
+            "list_channels":        self._list_channels,
+            "list_probes":          self._list_probes,
+            "survey_channels":      self._survey_channels,
             "build_research_batch": self._build_research_batch,
+            "create_probe":         self._create_probe,
+            "delete_probes":        self._delete_probes,
             "update_probe":         self._update_probe,
             "describe_frame":       self._describe_frame,
             "get_prompt_settings":  self._get_prompt_settings,
@@ -1193,6 +1325,153 @@ class AgentTools:
             "by_probe": rows,
         }
 
+    # ── list_channels ──────────────────────────────────────────────────────
+
+    def _list_channels(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "get_channels"):
+            raise ToolError("Luxriot manager is not available or not configured.")
+        force = bool(args.get("force", False))
+        try:
+            channels = self._lxm.get_channels(force=force)
+        except Exception as exc:
+            raise ToolError(f"Could not fetch channels: {exc}") from exc
+        clean_channels: List[Dict[str, Any]] = []
+        for channel in channels if isinstance(channels, list) else []:
+            if not isinstance(channel, dict):
+                continue
+            clean_channels.append({
+                "id": channel.get("id"),
+                "title": channel.get("title") or channel.get("name") or channel.get("label") or f"channel-{channel.get('id')}",
+                "enabled": channel.get("enabled"),
+                "status": channel.get("status"),
+            })
+        return {
+            "count": len(clean_channels),
+            "channels": clean_channels,
+        }
+
+    # ── list_probes ────────────────────────────────────────────────────────
+
+    def _list_probes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        since_hours = float(args.get("since_hours") or 24)
+        since_ms = int(time.time() * 1000 - since_hours * 3_600_000)
+        probes = self._ps.list_probes()
+        summary_rows = self._ds.summarize_by_probe(since_ms=since_ms)
+        summary_by_probe = {str(row.get("probe_id") or ""): row for row in summary_rows}
+        items: List[Dict[str, Any]] = []
+        for probe in probes:
+            probe_id = str(probe.get("id") or "")
+            summary = summary_by_probe.get(probe_id, {})
+            items.append({
+                "id": probe.get("id"),
+                "name": probe.get("name"),
+                "channel_id": probe.get("channel_id"),
+                "enabled": probe.get("enabled", True),
+                "severity": probe.get("severity"),
+                "bookmark": probe.get("bookmark"),
+                "pos_floor": probe.get("pos_floor"),
+                "margin": probe.get("margin"),
+                "hit_count_24h": int(summary.get("hit_count") or 0),
+                "latest_timestamp_ms": int(summary.get("latest_timestamp_ms") or 0),
+            })
+        return {
+            "count": len(items),
+            "since_hours": since_hours,
+            "probes": items,
+        }
+
+    # ── survey_channels ────────────────────────────────────────────────────
+
+    def _survey_channels(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "get_channels") or not hasattr(self._lxm, "get_snapshot_base64"):
+            raise ToolError("Luxriot manager is not available or not configured.")
+        requested_ids = args.get("channel_ids") if isinstance(args.get("channel_ids"), list) else None
+        requested_ids_set = {
+            int(item) for item in (requested_ids or [])
+            if _opt_int(item) is not None
+        }
+        duration_sec = max(2.0, min(20.0, float(args.get("duration_sec") or 12.0)))
+        sample_count = max(2, min(6, int(args.get("sample_count") or 4)))
+        prompt = str(args.get("prompt") or "").strip() or (
+            "You are surveying CCTV channels during deployment. "
+            "Summarize what this camera is pointed at, what usually occupies the scene, "
+            "whether it is indoor or outdoor, and 2-4 plausible monitoring scenarios."
+        )
+        try:
+            channels = self._lxm.get_channels(force=False)
+        except Exception as exc:
+            raise ToolError(f"Could not fetch channels for survey: {exc}") from exc
+
+        survey_items: List[Dict[str, Any]] = []
+        target_channels = []
+        for channel in channels if isinstance(channels, list) else []:
+            if not isinstance(channel, dict):
+                continue
+            channel_id = _opt_int(channel.get("id"))
+            if channel_id is None:
+                continue
+            if requested_ids_set and channel_id not in requested_ids_set:
+                continue
+            target_channels.append(channel)
+
+        interval_sec = duration_sec / max(1, sample_count - 1)
+        for channel in target_channels:
+            channel_id = int(channel.get("id"))
+            channel_title = str(channel.get("title") or channel.get("name") or f"channel-{channel_id}")
+            snapshots: List[str] = []
+            capture_errors: List[str] = []
+            for idx in range(sample_count):
+                try:
+                    encoded, _meta = self._lxm.get_snapshot_base64(channel_id)
+                    snapshots.append(encoded)
+                except Exception as exc:
+                    capture_errors.append(str(exc))
+                if idx < sample_count - 1:
+                    time.sleep(interval_sec)
+            if not snapshots:
+                survey_items.append({
+                    "channel_id": channel_id,
+                    "title": channel_title,
+                    "sample_count": 0,
+                    "survey": "",
+                    "error": capture_errors[-1] if capture_errors else "No snapshots captured.",
+                })
+                continue
+
+            user_content: List[Dict[str, Any]] = [
+                {"type": "text", "text": f"Channel {channel_id} ({channel_title}).\nTask: {prompt}"}
+            ]
+            for snap in snapshots:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{snap}",
+                        "detail": "low",
+                    },
+                })
+            messages = [
+                {"role": "system", "content": "You are an expert CCTV deployment analyst. Be concise and operational."},
+                {"role": "user", "content": user_content},
+            ]
+            try:
+                survey = self._lm(messages)
+            except Exception as exc:
+                raise ToolError(f"Could not analyze channel {channel_id}: {exc}") from exc
+            survey_items.append({
+                "channel_id": channel_id,
+                "title": channel_title,
+                "sample_count": len(snapshots),
+                "duration_sec": duration_sec,
+                "survey": survey,
+                "errors": capture_errors,
+            })
+
+        return {
+            "duration_sec": duration_sec,
+            "sample_count": sample_count,
+            "channels": survey_items,
+        }
+
     # ── build_research_batch ───────────────────────────────────────────────
 
     def _build_research_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1313,6 +1592,105 @@ class AgentTools:
             "bands": band_reports,
             "batch_size": len(selected),
             "detections": [_safe_detection(row) for row in selected],
+        }
+
+    # ── create_probe ───────────────────────────────────────────────────────
+
+    def _create_probe(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(args.get("name") or "").strip()
+        channel_id = _opt_int(args.get("channel_id"))
+        preview = bool(args.get("preview", True))
+        if not name:
+            raise ToolError("'name' is required.")
+        if channel_id is None:
+            raise ToolError("'channel_id' is required.")
+
+        positives = [str(item).strip() for item in (args.get("positives") or []) if str(item).strip()]
+        negatives = [str(item).strip() for item in (args.get("negatives") or []) if str(item).strip()]
+        probe = {
+            "name": name,
+            "channel_id": channel_id,
+            "positives": positives,
+            "negatives": negatives,
+            "pos_floor": _opt_float(args.get("pos_floor")) if args.get("pos_floor") is not None else 0.2,
+            "margin": _opt_float(args.get("margin_thr")) if args.get("margin_thr") is not None else 0.05,
+            "top_k": max(1, int(args.get("top_k") or 6)),
+            "window_sec": max(0.0, float(args.get("window_sec") or 300.0)),
+            "severity": str(args.get("severity") or "critical").strip().lower(),
+            "bookmark": bool(args.get("bookmark_enabled", True)),
+            "enabled": bool(args.get("enabled", True)),
+            "image_probe": {"enabled": False, "data": None, "name": None, "pos_floor": 0.7},
+            "roi_enabled": False,
+            "roi_norm": None,
+            "pairs": _probe_pairs_from_lists(positives, negatives),
+            "last_hit": None,
+            "recent_hits": [],
+            "bookmark_gate": None,
+            "bookmark_gate_updated_at_ms": None,
+        }
+        errors = _validate_probe(probe)
+        if errors:
+            raise ToolError("Validation failed: " + "; ".join(errors))
+        existing = [
+            p for p in self._ps.list_probes()
+            if str(p.get("name") or "").strip().lower() == name.lower() and _opt_int(p.get("channel_id")) == channel_id
+        ]
+        if preview:
+            return {
+                "status": "preview",
+                "exists": bool(existing),
+                "conflicts": [_probe_summary(p) for p in existing],
+                "proposed": _probe_summary(probe),
+            }
+        saved = self._ps.upsert_probe(probe)
+        return {
+            "status": "applied",
+            "probe_id": saved.get("id"),
+            "probe_name": saved.get("name"),
+            "probe": _probe_summary(saved),
+        }
+
+    # ── delete_probes ──────────────────────────────────────────────────────
+
+    def _delete_probes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        preview = bool(args.get("preview", True))
+        delete_all = bool(args.get("delete_all", False))
+        probe_ids = [
+            str(item).strip() for item in (args.get("probe_ids") or [])
+            if str(item).strip()
+        ]
+        probes = self._ps.list_probes()
+        if delete_all:
+            targets = probes
+        else:
+            wanted = set(probe_ids)
+            targets = [probe for probe in probes if str(probe.get("id") or "") in wanted]
+        if not targets:
+            raise ToolError("No probes selected for deletion.")
+        summary = [
+            {
+                "id": probe.get("id"),
+                "name": probe.get("name"),
+                "channel_id": probe.get("channel_id"),
+            }
+            for probe in targets
+        ]
+        if preview:
+            return {
+                "status": "preview",
+                "delete_all": delete_all,
+                "count": len(summary),
+                "targets": summary,
+            }
+        deleted = 0
+        for probe in targets:
+            if self._ps.delete_probe(str(probe.get("id") or "")):
+                deleted += 1
+        return {
+            "status": "applied",
+            "delete_all": delete_all,
+            "deleted": deleted,
+            "targets": summary,
         }
 
     # ── update_probe ────────────────────────────────────────────────────────
@@ -1898,7 +2276,9 @@ def _probe_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]
 
 def _probe_summary(probe: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "id":          probe.get("id"),
         "name":        probe.get("name"),
+        "channel_id":  probe.get("channel_id"),
         "enabled":     probe.get("enabled"),
         "positives":   probe.get("positives"),
         "negatives":   probe.get("negatives"),
@@ -1909,6 +2289,17 @@ def _probe_summary(probe: Dict[str, Any]) -> Dict[str, Any]:
         "severity":    probe.get("severity"),
         "bookmark":    probe.get("bookmark"),
     }
+
+
+def _probe_pairs_from_lists(positives: Sequence[str], negatives: Sequence[str]) -> List[Dict[str, str]]:
+    pairs: List[Dict[str, str]] = []
+    max_len = max(len(positives), len(negatives))
+    for idx in range(max_len):
+        pos = str(positives[idx]).strip() if idx < len(positives) else ""
+        neg = str(negatives[idx]).strip() if idx < len(negatives) else ""
+        if pos or neg:
+            pairs.append({"positive": pos, "negative": neg})
+    return pairs
 
 
 def _merge_prompt_settings_snapshot(current: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:
