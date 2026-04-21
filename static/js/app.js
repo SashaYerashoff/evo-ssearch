@@ -7710,6 +7710,9 @@
                     break;
                 case 'tool_result':
                     appendActionCard(bubble, evt.name, evt.result);
+                    if (evt.name === 'update_probe' && evt.result && evt.result.status === 'applied') {
+                        void loadProbeList();
+                    }
                     break;
                 case 'error':
                     appendErrorToMessages(evt.message || 'Unknown error');
