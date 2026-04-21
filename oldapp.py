@@ -1467,7 +1467,7 @@ def _get_agent_runner() -> Any:
         from agent import AgentRunner
 
         def _agent_search_folder(
-            *, query: str, folder: str, limit: int = 12
+            *, query: str, folder: str, limit: int = 12, sort_by: str = "similarity"
         ) -> List[Dict[str, Any]]:
             idx_bundle = load_index(folder, embedder='clip')
             index, image_paths, image_metadata, _ = idx_bundle
@@ -1481,27 +1481,32 @@ def _get_agent_runner() -> Any:
                 image_metadata=image_metadata,
                 query_vec=vec,
                 limit=limit,
-                sort_by='similarity',
+                sort_by=sort_by,
             )
             return results
 
         def _agent_search_detections(
             *, query: str, probe_id: Optional[str] = None,
             channel_id: Optional[int] = None,
-            since_ms: Optional[int] = None, limit: int = 12
+            since_ms: Optional[int] = None,
+            until_ms: Optional[int] = None,
+            limit: int = 12,
+            sort_by: str = "similarity",
+            candidate_limit: int = 20000,
+            mode: str = "clip",
         ) -> List[Dict[str, Any]]:
             vec = get_text_embedding(query)
             return _search_detections_archive(
                 clip_query_vec=vec,
                 dino_query_vec=None,
-                mode='clip',
+                mode=mode,
                 probe_id=probe_id,
                 channel_id=channel_id,
                 since_ms=since_ms,
-                until_ms=None,
+                until_ms=until_ms,
                 limit=limit,
-                sort_by='similarity',
-                candidate_limit=20000,
+                sort_by=sort_by,
+                candidate_limit=candidate_limit,
             )
 
         _agent_runner = AgentRunner(

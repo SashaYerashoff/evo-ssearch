@@ -41,6 +41,7 @@ AGENT_HEARTBEAT_INTERVAL   = 15       # seconds between SSE heartbeats
 AGENT_SESSION_TTL_DAYS     = 30       # sessions older than this are GC'd
 AGENT_MAX_SESSIONS         = 100      # sessions kept per store (GC oldest)
 AGENT_MAX_MESSAGES_PER_SESSION = 200  # messages kept per session (prune oldest)
+AGENT_MAX_RUNTIME_SKILLS_CHARS = 12_000
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
@@ -84,6 +85,28 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "number",
                         "description": "Only include results from the past N hours. Default: 24.",
                     },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound in Unix milliseconds.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound in Unix milliseconds.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["similarity", "time"],
+                        "description": "similarity: semantic relevance. time: newest first.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["clip", "dino", "fusion"],
+                        "description": "Detections search only. clip: fast/default. dino/fusion: richer visual matching when available.",
+                    },
+                    "candidate_limit": {
+                        "type": "integer",
+                        "description": "Detections search only. Candidate pool before final ranking. Default: 20000.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results to return. Default: 12, max: 48.",
@@ -125,6 +148,23 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "number",
                         "description": "Optional upper bound: detections older than N hours ago.",
                     },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound in Unix milliseconds.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound in Unix milliseconds.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Pagination offset within the selected time window.",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["newest", "oldest"],
+                        "description": "Order detections by event time. Default: newest.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max detections to return. Default: 20, max: 100.",
@@ -153,6 +193,107 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Optional. Restrict summary to one channel.",
                     },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound in Unix milliseconds.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound in Unix milliseconds.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "build_research_batch",
+            "description": (
+                "Assemble a representative batch of detections for agent research across multiple time windows "
+                "and confidence bands. Use before probe tuning, archive investigations, or prompt refinement."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "probe_id": {
+                        "type": "string",
+                        "description": "Optional probe ID to restrict the batch.",
+                    },
+                    "probe_name": {
+                        "type": "string",
+                        "description": "Optional human-readable probe name, resolved to probe_id internally.",
+                    },
+                    "channel_id": {
+                        "type": "integer",
+                        "description": "Optional channel to restrict the batch.",
+                    },
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Default window lower bound if periods are not provided. Default: 24.",
+                    },
+                    "until_hours": {
+                        "type": "number",
+                        "description": "Optional relative upper bound if periods are not provided.",
+                    },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound if periods are not provided.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound if periods are not provided.",
+                    },
+                    "periods": {
+                        "type": "array",
+                        "description": "Optional named time slices to sample independently.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "since_hours": {"type": "number"},
+                                "until_hours": {"type": "number"},
+                                "since_ms": {"type": "integer"},
+                                "until_ms": {"type": "integer"}
+                            },
+                            "additionalProperties": False
+                        },
+                    },
+                    "bands": {
+                        "type": "array",
+                        "description": "Optional confidence bands for stratified sampling.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "score_field": {
+                                    "type": "string",
+                                    "enum": ["pos_score", "margin", "neg_score"]
+                                },
+                                "min": {"type": "number"},
+                                "max": {"type": "number"}
+                            },
+                            "additionalProperties": False
+                        },
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["newest", "oldest", "highest_pos", "lowest_pos", "highest_margin", "lowest_margin"],
+                        "description": "How to rank candidates before sampling within each period/band.",
+                    },
+                    "per_period_limit": {
+                        "type": "integer",
+                        "description": "Max detections to keep per period before the final merge. Default: 24.",
+                    },
+                    "per_band_limit": {
+                        "type": "integer",
+                        "description": "Max detections to keep per band inside each period. Default: 6.",
+                    },
+                    "max_candidates": {
+                        "type": "integer",
+                        "description": "Max raw detections to scan per period before sampling. Default: 1000.",
+                    }
                 },
                 "required": [],
             },
@@ -264,6 +405,71 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_prompt_settings",
+            "description": (
+                "Read the effective Luxriot VLM prompt settings. "
+                "Without channel_id returns global defaults. With channel_id returns the effective per-channel view."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "integer",
+                        "description": "Optional Luxriot channel ID. Omit to read global defaults.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_prompt_settings",
+            "description": (
+                "Modify Luxriot VLM prompt settings for either global defaults or a single channel. "
+                "IMPORTANT: always call with preview=true first and apply only after explicit confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "integer",
+                        "description": "Optional Luxriot channel ID. Omit to update global defaults.",
+                    },
+                    "changes": {
+                        "type": "object",
+                        "description": "Partial prompt/settings update.",
+                        "properties": {
+                            "stream_system_prompt": {"type": "string"},
+                            "json_alert_prompt": {"type": "string"},
+                            "bookmark_enabled": {"type": "boolean"},
+                            "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
+                            "rollup_prompts": {
+                                "type": "object",
+                                "description": "Partial L1/L2/L3 prompt overrides.",
+                                "properties": {
+                                    "L1": {"type": "string"},
+                                    "L2": {"type": "string"},
+                                    "L3": {"type": "string"}
+                                },
+                                "additionalProperties": False
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                    "preview": {
+                        "type": "boolean",
+                        "description": "If true, return a diff without applying. If false, apply the changes. Default: true.",
+                    },
+                },
+                "required": ["changes"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_bookmark",
             "description": (
                 "Create a bookmark in Luxriot EVA on a camera channel, visible in the Luxriot client. "
@@ -330,6 +536,22 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "since_hours": {
                         "type": "number",
                         "description": "Return summaries from the past N hours. Default: 6.",
+                    },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower timestamp bound in Unix seconds.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper timestamp bound in Unix seconds.",
+                    },
+                    "run": {
+                        "type": "string",
+                        "description": "Optional run selector: latest, running, or a concrete run id.",
+                    },
+                    "level_limit": {
+                        "type": "integer",
+                        "description": "Max nodes per rollup level to inspect before slicing the requested depth. Defaults to limit.",
                     },
                     "limit": {
                         "type": "integer",
@@ -821,8 +1043,11 @@ class AgentTools:
             "search_archive":       self._search_archive,
             "get_detections":       self._get_detections,
             "get_detection_summary": self._get_detection_summary,
+            "build_research_batch": self._build_research_batch,
             "update_probe":         self._update_probe,
             "describe_frame":       self._describe_frame,
+            "get_prompt_settings":  self._get_prompt_settings,
+            "update_prompt_settings": self._update_prompt_settings,
             "get_video_summaries":  self._get_video_summaries,
             "create_bookmark":      self._create_bookmark,
             "generate_report":      self._generate_report,
@@ -838,6 +1063,7 @@ class AgentTools:
         query  = str(args.get("query") or "").strip()
         scope  = str(args.get("scope") or "detections")
         limit  = max(1, min(48, int(args.get("limit") or 12)))
+        sort_by = str(args.get("sort_by") or "similarity").strip().lower()
 
         if not query:
             raise ToolError("'query' is required.")
@@ -846,21 +1072,32 @@ class AgentTools:
             folder = str(args.get("folder") or "").strip()
             if not folder:
                 raise ToolError("'folder' is required when scope='indexed_folder'.")
-            results = self._search_folder(query=query, folder=folder, limit=limit)
+            if sort_by not in {"similarity", "time"}:
+                sort_by = "similarity"
+            results = self._search_folder(query=query, folder=folder, limit=limit, sort_by=sort_by)
             return {"scope": scope, "count": len(results), "results": _strip_thumbnails(results, folder=folder)}
 
         # scope == "detections"
-        since_hours = float(args.get("since_hours") or 24)
-        since_ms    = int(time.time() * 1000 - since_hours * 3_600_000)
+        since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
         probe_id    = str(args.get("probe_id") or "").strip() or None
         channel_id  = _opt_int(args.get("channel_id"))
+        mode = str(args.get("mode") or "clip").strip().lower()
+        if mode not in {"clip", "dino", "fusion"}:
+            mode = "clip"
+        if sort_by not in {"similarity", "time"}:
+            sort_by = "similarity"
+        candidate_limit = max(limit, min(100_000, int(args.get("candidate_limit") or 20_000)))
 
         results = self._search_det(
             query=query,
             probe_id=probe_id,
             channel_id=channel_id,
             since_ms=since_ms,
+            until_ms=until_ms,
             limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+            mode=mode,
         )
         return {"scope": scope, "count": len(results), "results": _strip_thumbnails(results)}
 
@@ -875,42 +1112,207 @@ class AgentTools:
             probe_id = self._resolve_probe_id_by_name(probe_name_raw)
 
         channel_id  = _opt_int(args.get("channel_id"))
-        since_hours = float(args.get("since_hours") or 24)
-        until_hours = _opt_float(args.get("until_hours"))
+        since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
         limit       = max(1, min(100, int(args.get("limit") or 20)))
+        offset      = max(0, int(args.get("offset") or 0))
+        sort_by     = str(args.get("sort_by") or "newest").strip().lower()
+        if sort_by not in {"newest", "oldest"}:
+            sort_by = "newest"
 
-        now_ms   = int(time.time() * 1000)
-        since_ms = int(now_ms - since_hours * 3_600_000)
-        until_ms = int(now_ms - until_hours * 3_600_000) if until_hours is not None else None
-
-        rows, total = self._ds.list_detections(
+        rows, total = self._list_detection_window(
             probe_id=probe_id,
             channel_id=channel_id,
             since_ms=since_ms,
             until_ms=until_ms,
             limit=limit,
-            offset=0,
+            offset=offset,
+            sort_by=sort_by,
         )
 
         return {
+            "probe_id": probe_id,
+            "channel_id": channel_id,
+            "since_ms": since_ms,
+            "until_ms": until_ms,
             "total_in_window": total,
             "returned": len(rows),
+            "offset": offset,
+            "sort_by": sort_by,
             "detections": [_safe_detection(r) for r in rows],
         }
 
     # ── get_detection_summary ───────────────────────────────────────────────
 
     def _get_detection_summary(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        since_hours = float(args.get("since_hours") or 24)
         channel_id  = _opt_int(args.get("channel_id"))
-        since_ms    = int(time.time() * 1000 - since_hours * 3_600_000)
+        since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
 
-        rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id)
+        if until_ms is None:
+            rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id)
+        else:
+            grouped: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            offset = 0
+            while True:
+                batch, _total = self._ds.list_detections(
+                    probe_id=None,
+                    channel_id=channel_id,
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                    limit=500,
+                    offset=offset,
+                )
+                if not batch:
+                    break
+                for row in batch:
+                    key = (str(row.get("probe_id") or ""), int(row.get("channel_id") or 0))
+                    slot = grouped.setdefault(key, {
+                        "probe_id": row.get("probe_id"),
+                        "probe_name": row.get("probe_name"),
+                        "channel_id": row.get("channel_id"),
+                        "hit_count": 0,
+                        "latest_timestamp_ms": 0,
+                    })
+                    slot["hit_count"] += 1
+                    slot["latest_timestamp_ms"] = max(
+                        int(slot["latest_timestamp_ms"] or 0),
+                        int(row.get("event_timestamp_ms") or 0),
+                    )
+                offset += len(batch)
+                if len(batch) < 500:
+                    break
+            rows = sorted(
+                grouped.values(),
+                key=lambda row: int(row.get("latest_timestamp_ms") or 0),
+                reverse=True,
+            )
         return {
-            "since_hours": since_hours,
+            "since_ms": since_ms,
+            "until_ms": until_ms,
             "probe_count": len(rows),
             "total_detections": sum(r.get("hit_count", 0) for r in rows),
             "by_probe": rows,
+        }
+
+    # ── build_research_batch ───────────────────────────────────────────────
+
+    def _build_research_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        probe_id = str(args.get("probe_id") or "").strip() or None
+        probe_name_raw = str(args.get("probe_name") or "").strip()
+        if not probe_id and probe_name_raw:
+            probe_id = self._resolve_probe_id_by_name(probe_name_raw)
+
+        channel_id = _opt_int(args.get("channel_id"))
+        sort_by = str(args.get("sort_by") or "highest_margin").strip().lower()
+        if sort_by not in {
+            "newest", "oldest", "highest_pos", "lowest_pos", "highest_margin", "lowest_margin"
+        }:
+            sort_by = "highest_margin"
+        per_period_limit = max(1, min(100, int(args.get("per_period_limit") or 24)))
+        per_band_limit = max(1, min(per_period_limit, int(args.get("per_band_limit") or 6)))
+        max_candidates = max(per_period_limit, min(5_000, int(args.get("max_candidates") or 1_000)))
+
+        raw_periods = args.get("periods") if isinstance(args.get("periods"), list) else None
+        periods: List[Dict[str, Any]] = []
+        if raw_periods:
+            for idx, raw_period in enumerate(raw_periods, start=1):
+                if not isinstance(raw_period, dict):
+                    continue
+                since_ms, until_ms = self._resolve_time_window(raw_period, default_since_hours=24.0)
+                periods.append({
+                    "label": str(raw_period.get("label") or f"period_{idx}").strip() or f"period_{idx}",
+                    "since_ms": since_ms,
+                    "until_ms": until_ms,
+                })
+        if not periods:
+            since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
+            periods = [{"label": "primary_window", "since_ms": since_ms, "until_ms": until_ms}]
+
+        raw_bands = args.get("bands") if isinstance(args.get("bands"), list) else None
+        bands: List[Dict[str, Any]] = []
+        if raw_bands:
+            for idx, raw_band in enumerate(raw_bands, start=1):
+                if not isinstance(raw_band, dict):
+                    continue
+                score_field = str(raw_band.get("score_field") or "margin").strip().lower()
+                if score_field not in {"pos_score", "margin", "neg_score"}:
+                    score_field = "margin"
+                bands.append({
+                    "label": str(raw_band.get("label") or f"band_{idx}").strip() or f"band_{idx}",
+                    "score_field": score_field,
+                    "min": _opt_float(raw_band.get("min")),
+                    "max": _opt_float(raw_band.get("max")),
+                })
+
+        selected: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        period_reports: List[Dict[str, Any]] = []
+        band_reports: List[Dict[str, Any]] = []
+
+        for period in periods:
+            window_rows, total = self._list_detection_window(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=period["since_ms"],
+                until_ms=period["until_ms"],
+                limit=max_candidates,
+                offset=0,
+                sort_by=sort_by,
+                max_scan=max_candidates,
+            )
+            kept_for_period = 0
+            if bands:
+                for band in bands:
+                    band_rows = self._filter_detection_band(window_rows, band)
+                    band_take = 0
+                    for row in band_rows:
+                        det_id = int(row.get("id") or 0)
+                        if det_id <= 0 or det_id in seen_ids:
+                            continue
+                        selected.append(row)
+                        seen_ids.add(det_id)
+                        kept_for_period += 1
+                        band_take += 1
+                        if band_take >= per_band_limit or kept_for_period >= per_period_limit:
+                            break
+                    band_reports.append({
+                        "period": period["label"],
+                        "label": band["label"],
+                        "score_field": band["score_field"],
+                        "min": band["min"],
+                        "max": band["max"],
+                        "matched": len(band_rows),
+                        "selected": band_take,
+                    })
+                    if kept_for_period >= per_period_limit:
+                        break
+            else:
+                for row in window_rows:
+                    det_id = int(row.get("id") or 0)
+                    if det_id <= 0 or det_id in seen_ids:
+                        continue
+                    selected.append(row)
+                    seen_ids.add(det_id)
+                    kept_for_period += 1
+                    if kept_for_period >= per_period_limit:
+                        break
+
+            period_reports.append({
+                "label": period["label"],
+                "since_ms": period["since_ms"],
+                "until_ms": period["until_ms"],
+                "total_candidates": total,
+                "scanned": len(window_rows),
+                "selected": kept_for_period,
+            })
+
+        return {
+            "probe_id": probe_id,
+            "channel_id": channel_id,
+            "sort_by": sort_by,
+            "periods": period_reports,
+            "bands": band_reports,
+            "batch_size": len(selected),
+            "detections": [_safe_detection(row) for row in selected],
         }
 
     # ── update_probe ────────────────────────────────────────────────────────
@@ -1065,6 +1467,71 @@ class AgentTools:
             "note": "low-res thumbnail used",
         }
 
+    # ── prompt settings ────────────────────────────────────────────────────
+
+    def _get_prompt_settings(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "get_prompt_settings"):
+            raise ToolError("Luxriot manager prompt settings are not available.")
+        channel_id = _opt_int(args.get("channel_id"))
+        try:
+            return self._lxm.get_prompt_settings(channel_id=channel_id)
+        except Exception as exc:
+            raise ToolError(f"Could not fetch prompt settings: {exc}") from exc
+
+    def _update_prompt_settings(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        changes = args.get("changes") or {}
+        preview = bool(args.get("preview", True))
+        channel_id = _opt_int(args.get("channel_id"))
+
+        if not changes:
+            raise ToolError("'changes' must contain at least one field to modify.")
+        if not hasattr(self._lxm, "get_prompt_settings") or not hasattr(self._lxm, "update_prompt_settings"):
+            raise ToolError("Luxriot manager prompt settings are not available.")
+
+        try:
+            current = self._lxm.get_prompt_settings(channel_id=channel_id)
+        except Exception as exc:
+            raise ToolError(f"Could not fetch current prompt settings: {exc}") from exc
+
+        proposed = _merge_prompt_settings_snapshot(current, changes)
+        diff = _prompt_settings_diff(current, proposed)
+        if not diff:
+            return {
+                "status": "noop",
+                "channel_id": channel_id,
+                "current": current,
+                "proposed": proposed,
+                "diff": {},
+            }
+
+        if preview:
+            return {
+                "status": "preview",
+                "channel_id": channel_id,
+                "diff": diff,
+                "current": current,
+                "proposed": proposed,
+            }
+
+        try:
+            applied = self._lxm.update_prompt_settings(
+                channel_id=channel_id,
+                stream_system_prompt=changes.get("stream_system_prompt"),
+                rollup_prompts=changes.get("rollup_prompts"),
+                json_alert_prompt=changes.get("json_alert_prompt"),
+                bookmark_enabled=changes.get("bookmark_enabled"),
+                bookmark_cooldown_sec=changes.get("bookmark_cooldown_sec"),
+            )
+        except Exception as exc:
+            raise ToolError(f"Could not update prompt settings: {exc}") from exc
+
+        return {
+            "status": "applied",
+            "channel_id": channel_id,
+            "diff": diff,
+            "effective": applied,
+        }
+
     # ── get_video_summaries ─────────────────────────────────────────────────
 
     def _get_video_summaries(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1074,21 +1541,32 @@ class AgentTools:
         depth       = str(args.get("depth") or "L1").strip().upper()
         if depth == "LIVE":
             depth = "L0"
-        since_hours = float(args.get("since_hours") or 6)
         limit       = max(1, min(100, int(args.get("limit") or 20)))
+        level_limit = max(limit, min(500, int(args.get("level_limit") or limit)))
+        run_selector = str(args.get("run") or "").strip() or None
 
         if not hasattr(self._lxm, "summary_rollups"):
             raise ToolError("Luxriot manager is not available or not configured.")
 
-        now_ts = time.time()
-        start_ts = now_ts - since_hours * 3600.0
+        from_ts = _opt_float(args.get("from_ts"))
+        to_ts = _opt_float(args.get("to_ts"))
+        if from_ts is None and to_ts is None:
+            since_hours = float(args.get("since_hours") or 6)
+            to_ts = time.time()
+            from_ts = to_ts - since_hours * 3600.0
+        else:
+            if to_ts is None:
+                to_ts = time.time()
+            if from_ts is None:
+                from_ts = max(0.0, float(to_ts) - 6 * 3600.0)
 
         try:
             rollups = self._lxm.summary_rollups(
                 channel_id=channel_id,
-                start_ts=start_ts,
-                end_ts=now_ts,
-                level_limit=limit,
+                run_selector=run_selector,
+                start_ts=from_ts,
+                end_ts=to_ts,
+                level_limit=level_limit,
             )
         except Exception as exc:
             raise ToolError(f"Could not fetch summaries: {exc}") from exc
@@ -1112,8 +1590,13 @@ class AgentTools:
         return {
             "channel_id": channel_id,
             "depth": depth,
-            "since_hours": since_hours,
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "run": run_selector,
             "count": len(entries),
+            "selected_run": rollups.get("selected_run"),
+            "run_filter_id": rollups.get("run_filter_id"),
+            "running": bool(rollups.get("running")),
             "entries": entries,
         }
 
@@ -1229,6 +1712,81 @@ class AgentTools:
         }
 
     # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _resolve_time_window(
+        self,
+        args: Dict[str, Any],
+        *,
+        default_since_hours: float,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        since_ms = _opt_int(args.get("since_ms"))
+        until_ms = _opt_int(args.get("until_ms"))
+        if since_ms is None:
+            since_hours = _opt_float(args.get("since_hours"))
+            if since_hours is None:
+                since_hours = default_since_hours
+            since_ms = int(time.time() * 1000 - since_hours * 3_600_000)
+        if until_ms is None:
+            until_hours = _opt_float(args.get("until_hours"))
+            if until_hours is not None:
+                until_ms = int(time.time() * 1000 - until_hours * 3_600_000)
+        return since_ms, until_ms
+
+    def _list_detection_window(
+        self,
+        *,
+        probe_id: Optional[str],
+        channel_id: Optional[int],
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        limit: int,
+        offset: int,
+        sort_by: str,
+        max_scan: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        max_scan = max(limit + offset, max_scan or (limit + offset))
+        max_scan = max(limit + offset, min(5_000, int(max_scan)))
+        batch_size = min(500, max_scan)
+        scanned: List[Dict[str, Any]] = []
+        total = 0
+        next_offset = 0
+        while next_offset < max_scan:
+            rows, total = self._ds.list_detections(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=min(batch_size, max_scan - next_offset),
+                offset=next_offset,
+            )
+            if not rows:
+                break
+            scanned.extend(rows)
+            next_offset += len(rows)
+            if len(rows) < batch_size or next_offset >= total:
+                break
+        ordered = _sort_detection_rows(scanned, sort_by)
+        return ordered[offset: offset + limit], total
+
+    def _filter_detection_band(
+        self,
+        rows: List[Dict[str, Any]],
+        band: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        score_field = str(band.get("score_field") or "margin")
+        lower = band.get("min")
+        upper = band.get("max")
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            value = _opt_float(row.get(score_field))
+            if value is None:
+                continue
+            if lower is not None and value < float(lower):
+                continue
+            if upper is not None and value > float(upper):
+                continue
+            out.append(row)
+        return out
 
     def _resolve_probe_id_by_name(self, name: str) -> str:
         name_lower = name.lower()
@@ -1353,6 +1911,81 @@ def _probe_summary(probe: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _merge_prompt_settings_snapshot(current: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(current)
+    for field_name in ("stream_system_prompt", "json_alert_prompt", "bookmark_enabled", "bookmark_cooldown_sec"):
+        if field_name in changes:
+            merged[field_name] = changes[field_name]
+    if isinstance(changes.get("rollup_prompts"), dict):
+        rollups = dict(merged.get("rollup_prompts") or {})
+        for level, prompt in changes["rollup_prompts"].items():
+            level_key = str(level).strip().upper()
+            if level_key in {"L1", "L2", "L3"}:
+                rollups[level_key] = str(prompt)
+        merged["rollup_prompts"] = rollups
+    return merged
+
+
+def _prompt_settings_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    diff: Dict[str, Any] = {}
+    for field_name in (
+        "stream_system_prompt",
+        "json_alert_prompt",
+        "bookmark_enabled",
+        "bookmark_cooldown_sec",
+        "rollup_prompts",
+    ):
+        if before.get(field_name) != after.get(field_name):
+            diff[field_name] = {
+                "before": before.get(field_name),
+                "after": after.get(field_name),
+            }
+    return diff
+
+
+def _load_runtime_skill_docs() -> List[Dict[str, str]]:
+    skills_root = Path(__file__).resolve().parent / "skills"
+    docs: List[Dict[str, str]] = []
+    if not skills_root.exists():
+        return docs
+    for skill_file in sorted(skills_root.rglob("SKILL.md")):
+        try:
+            text = skill_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        docs.append({
+            "name": skill_file.parent.name.replace("_", " "),
+            "content": text,
+        })
+    return docs
+
+
+def _format_runtime_skills_for_prompt() -> str:
+    docs = _load_runtime_skill_docs()
+    if not docs:
+        return ""
+    remaining = AGENT_MAX_RUNTIME_SKILLS_CHARS
+    parts: List[str] = []
+    for doc in docs:
+        if remaining <= 0:
+            break
+        header = f"### {doc['name']}\n"
+        budget = remaining - len(header)
+        if budget <= 0:
+            break
+        content = doc["content"]
+        if len(content) > budget:
+            content = content[: max(0, budget - 16)].rstrip() + "\n[truncated]"
+        block = header + content
+        parts.append(block)
+        remaining -= len(block) + 2
+    if not parts:
+        return ""
+    return "\n\nRepository Playbooks:\n" + "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # System prompt builder
 # ---------------------------------------------------------------------------
@@ -1403,11 +2036,13 @@ def build_system_prompt(
         )
 
     probe_block = "\n".join(probe_lines) if probe_lines else "  (no probes configured)"
+    skills_block = _format_runtime_skills_for_prompt()
 
     return (
         f"You are the AI operations assistant for Luxriot EVA AI — a CCTV intelligent "
         f"monitoring platform. You have tools to search the archive, inspect detections, "
-        f"tune probes, describe frames, create bookmarks, and compile reports.\n"
+        f"assemble research batches, tune probes, adjust prompt settings, describe frames, "
+        f"create bookmarks, and compile reports.\n"
         f"Be concise and operator-focused. Never fabricate detection data.\n\n"
         f"Current time: {now_str}\n\n"
         f"Active probes ({len(probes)} total):\n{probe_block}\n\n"
@@ -1415,8 +2050,14 @@ def build_system_prompt(
         f"Rules:\n"
         f"- For probe modifications: always call update_probe with preview=true first, "
         f"show the user the diff, and only apply after explicit confirmation.\n"
+        f"- For prompt-setting modifications: always call update_prompt_settings with preview=true first, "
+        f"show the user the diff, and only apply after explicit confirmation.\n"
+        f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
+        f"- For probe tuning or archive research, follow the repository playbooks below as the default tool order.\n"
         f"- When returning search results or detections, summarize; don't dump raw lists.\n"
+        f"- Ask the operator a clarifying question if the available data is too sparse to make a safe change.\n"
         f"- Use markdown for structure."
+        f"{skills_block}"
     )
 
 
@@ -1698,6 +2339,27 @@ def _opt_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _sort_detection_rows(rows: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
+    sort_key: Callable[[Dict[str, Any]], Any]
+    reverse = True
+    if sort_by == "oldest":
+        sort_key = lambda r: (int(r.get("event_timestamp_ms") or 0), int(r.get("id") or 0))
+        reverse = False
+    elif sort_by == "highest_pos":
+        sort_key = lambda r: (float(r.get("pos_score") or 0.0), int(r.get("event_timestamp_ms") or 0))
+    elif sort_by == "lowest_pos":
+        sort_key = lambda r: (float(r.get("pos_score") or 0.0), int(r.get("event_timestamp_ms") or 0))
+        reverse = False
+    elif sort_by == "highest_margin":
+        sort_key = lambda r: (float(r.get("margin") or 0.0), int(r.get("event_timestamp_ms") or 0))
+    elif sort_by == "lowest_margin":
+        sort_key = lambda r: (float(r.get("margin") or 0.0), int(r.get("event_timestamp_ms") or 0))
+        reverse = False
+    else:
+        sort_key = lambda r: (int(r.get("event_timestamp_ms") or 0), int(r.get("id") or 0))
+    return sorted(rows, key=sort_key, reverse=reverse)
 
 
 def _detection_image_url(r: Dict[str, Any]) -> Optional[str]:
