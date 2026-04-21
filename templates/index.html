@@ -8,84 +8,128 @@
     <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
-    <div class="container">
+    <div class="app-shell">
         <div class="header">
             <div class="brand">
                 <div class="brand-top">
                     <img class="brand-logo" src="/branding/logo" alt="Luxriot logo" />
-                    <div class="brand-main">EVA AI</div>
+                    <div class="brand-lockup">
+                        <div class="brand-main">EVA AI</div>
+                        <div class="brand-ver">α {{ app_version }}</div>
+                    </div>
                 </div>
-                <div class="brand-sub">Smart Image Search and Understanding | version: {{ app_version }}</div>
+                <div class="brand-sub">Smart Image Search and Understanding</div>
+            </div>
+            <div class="header-center">
+                <div class="search-mode-tabs">
+                    <button id="archiveModeBtn" class="mode-tab active"><span class="mode-dot"></span>Archive</button>
+                    <button id="videoModeBtn" class="mode-tab"><span class="mode-dot"></span>Video</button>
+                    <button id="monitorModeBtn" class="mode-tab"><span class="mode-dot"></span>Monitoring</button>
+                    <button id="agentModeBtn" class="mode-tab agent-tab-btn"><span class="mode-dot"></span>Agent</button>
+                </div>
             </div>
             <div class="header-actions">
+                <div class="header-status">
+                    <span class="header-status-dot"></span>
+                    <span class="header-status-text">Command Center Online</span>
+                </div>
                 <div class="settings-icon" id="authTokenBtn" title="Set admin token">
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                         <path d="M240-160q-33 0-56.5-23.5T160-240v-480q0-33 23.5-56.5T240-800h360q33 0 56.5 23.5T680-720v160h40q33 0 56.5 23.5T800-480v240q0 33-23.5 56.5T720-160H240Zm0-80h480v-240H240v240Zm120-320h240v-160H360v160Zm120 200q17 0 28.5-11.5T520-400q0-17-11.5-28.5T480-440q-17 0-28.5 11.5T440-400q0 17 11.5 28.5T480-360Z"/>
                     </svg>
                 </div>
-                <div class="settings-icon" id="settingsBtn">
+                <div class="settings-icon" id="settingsBtn" title="Settings">
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                         <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
                     </svg>
                 </div>
             </div>
         </div>
-        
-        <div class="control-panel">
-            <div class="folder-select">
-                <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                <button id="indexBtn" class="feature-btn primary btn-md">Index Folder</button>
-            </div>
-            <div class="status" id="indexStatus"></div>
-        </div>
-        
-            <div class="search-panel">
-                <div class="search-mode-tabs">
-                    <button id="archiveModeBtn" class="mode-tab active">Archive Research</button>
-                    <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
-                    <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
-                    <button id="agentModeBtn" class="mode-tab agent-tab-btn">Agent</button>
-                </div>
-            <div id="archiveBox" class="archive-box">
-                <div class="search-controls">
-                    <div class="control-group">
-                        <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
-                    </div>
-                    <div class="control-group">
-                        <div class="sort-control">
-                            <label for="sortBy">Sort by:</label>
-                            <select id="sortBy">
-                                <option value="similarity" selected>Similarity</option>
-                                <option value="time">Time (Newest First)</option>
-                            </select>
+
+        <div class="search-panel">
+            <div id="archiveBox" class="archive-box studio-mode">
+                <aside class="studio-rail archive-rail">
+                    <div id="archiveSearchBox" class="archive-search-shell studio-scroll">
+                        <div class="archive-section archive-section-compact">
+                            <div class="archive-section-title">Index Folder</div>
+                            <div class="section-help">Point EVA at the active archive and refresh embeddings before search.</div>
+                            <div class="folder-select">
+                                <input type="text" id="folderPath" placeholder="Enter folder path..." />
+                                <button id="indexBtn" class="feature-btn primary btn-md">Index</button>
+                            </div>
+                            <div class="status shell-status" id="indexStatus"></div>
                         </div>
-                        <div class="limit-control">
-                            <label for="resultLimit">Results:</label>
-                            <select id="resultLimit">
-                                {{ result_options_html | safe }}
-                            </select>
-                        </div>
-                        <div class="scope-control">
-                            <label for="searchScope">Scope:</label>
-                            <select id="searchScope">
-                                <option value="folder" selected>Indexed Folder</option>
-                                <option value="detections">Detections Archive</option>
-                            </select>
-                        </div>
-                        <div class="segment-controls">
-                            <label for="segmentThresholdSlider">Region threshold:</label>
-                            <div class="segment-threshold-control" id="segmentThresholdControl">
-                                <input type="range" id="segmentThresholdSlider" min="40" max="99" value="{{ segment_threshold_percent }}" step="1">
-                                <span class="segment-threshold-value" id="segmentThresholdValue">{{ segment_threshold_percent }}%</span>
+
+                        <div class="archive-section archive-section-compact">
+                            <div class="archive-section-title">Search Controls</div>
+                            <div class="section-help">Tune ranking, scope, and region sensitivity for the current session.</div>
+                            <div class="archive-filter-grid archive-filter-grid-tight">
+                                <div class="input-group">
+                                    <label for="sortBy" class="input-label">Sort by:</label>
+                                    <select id="sortBy">
+                                        <option value="similarity" selected>Similarity</option>
+                                        <option value="time">Time (Newest First)</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="resultLimit" class="input-label">Results:</label>
+                                    <select id="resultLimit">
+                                        {{ result_options_html | safe }}
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="searchScope" class="input-label">Scope:</label>
+                                    <select id="searchScope">
+                                        <option value="folder" selected>Indexed Folder</option>
+                                        <option value="detections">Detections Archive</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="segmentThresholdSlider" class="input-label">Region threshold:</label>
+                                    <div class="segment-threshold-control" id="segmentThresholdControl">
+                                        <input type="range" id="segmentThresholdSlider" min="40" max="99" value="{{ segment_threshold_percent }}" step="1">
+                                        <span class="segment-threshold-value" id="segmentThresholdValue">{{ segment_threshold_percent }}%</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="archive-panel-actions">
+                                <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
                             </div>
                         </div>
-                    </div>
-                </div>
-                <div class="archive-workspace">
-                    <div id="archiveSearchBox" class="archive-search-shell">
+
+                        <div class="archive-section">
+                            <div class="archive-section-title">Text Query</div>
+                            <div class="section-help">Use natural language; selected scope and filters apply automatically.</div>
+                            <div id="textSearchBox" class="search-box">
+                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
+                                <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
+                            </div>
+                        </div>
+
+                        <div class="archive-section">
+                            <div class="archive-section-title">Image Query</div>
+                            <div class="section-help">Upload a visual reference and run similarity search against the active scope.</div>
+                            <div id="imageSearchBox" class="search-box image-search-box">
+                                <div id="imageQueryPanel" class="image-query-panel">
+                                    <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
+                                        <img id="queryImageThumb" src="" alt="Selected query preview" />
+                                        <div class="archive-query-preview-overlay">No image selected</div>
+                                    </div>
+                                    <div class="image-query-actions">
+                                        <div class="file-upload inline">
+                                            <input type="file" id="imageUpload" class="file-upload-input" accept="image/*" />
+                                            <label for="imageUpload" class="feature-btn file-upload-btn btn-md">Choose Image</label>
+                                            <span id="imageUploadName" class="file-upload-name is-hidden">No file selected</span>
+                                        </div>
+                                        <button id="imageSearchBtn" class="feature-btn primary image-search-btn btn-md">Search by Image</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
                         <div class="archive-section">
                             <div class="archive-section-title">Detections Archive</div>
-                            <div class="section-help">Choose stream/probe/time filters, then run text or image search in current scope.</div>
+                            <div class="section-help">Load stored probe hits by stream, probe, and time window before drilling down.</div>
                             <div class="archive-filter-grid">
                                 <div class="input-group">
                                     <label for="archiveChannelFilter" class="input-label">Stream:</label>
@@ -128,285 +172,365 @@
                             </div>
                             <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
                         </div>
-                        <div class="archive-section">
-                            <div class="archive-section-title">Text Query</div>
-                            <div class="section-help">Use natural language; scope and filters apply automatically.</div>
-                            <div id="textSearchBox" class="search-box">
-                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                                <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
+                    </div>
+                </aside>
+
+                <section class="studio-workspace archive-workspace">
+                    <div class="archive-results-panel studio-panel studio-panel--workspace">
+                        <div class="archive-results-head studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Search Results</div>
+                                <div class="archive-results-sub">Primary workspace for archive hits, detections, and visual search results.</div>
                             </div>
                         </div>
-                        <div class="archive-section">
-                            <div class="archive-section-title">Image Query</div>
-                            <div class="section-help">Select an image and run visual similarity search.</div>
-                            <div id="imageSearchBox" class="search-box image-search-box">
-                                <div id="imageQueryPanel" class="image-query-panel">
-                                    <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
-                                        <img id="queryImageThumb" src="" alt="Selected query preview" />
-                                        <div class="archive-query-preview-overlay">No image selected</div>
+                        <div id="results" class="results-grid"></div>
+                    </div>
+                </section>
+
+                <aside class="studio-inspector archive-inspector">
+                    <div class="archive-inspector-panel studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Inspector</div>
+                                <div class="studio-panel-sub">Preview, metrics, notes, region tools, and follow-up actions.</div>
+                            </div>
+                        </div>
+                        <div id="archiveInspectorEmpty" class="studio-empty-state">
+                            Select a result to inspect the full image, metrics, comments, and segmentation tools.
+                        </div>
+                        <div id="archiveInspectorBody" class="archive-inspector-body is-hidden"></div>
+                    </div>
+                </aside>
+            </div>
+
+            <div id="videoBox" class="video-box studio-mode">
+                <aside class="studio-rail video-rail">
+                    <div class="luxriot-card studio-panel video-command-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Live Stream Control</div>
+                                <div class="studio-panel-sub">Choose a channel, configure cadence, and steer live summaries.</div>
+                            </div>
+                            <div id="luxriotStatus" class="luxriot-status">Not connected</div>
+                        </div>
+                        <div class="luxriot-row">
+                            <label for="luxriotChannelSelect">Channel:</label>
+                            <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
+                            <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
+                        </div>
+                        <div class="luxriot-row luxriot-live-controls-row">
+                            <span class="luxriot-pill">Batch:
+                                <select id="luxriotBatchSize" class="luxriot-mini-input">
+                                    {{ luxriot_batch_options | safe }}
+                                </select>
+                            </span>
+                            <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
+                        </div>
+                        <div class="luxriot-actions">
+                            <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
+                            <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
+                            <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
+                        </div>
+                        <div class="luxriot-hidden-prompts">
+                            <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                            <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
+                            <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{{ luxriot_rollup_prompt_l1 }}</textarea>
+                            <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{{ luxriot_rollup_prompt_l2 }}</textarea>
+                            <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{{ luxriot_rollup_prompt_l3 }}</textarea>
+                            <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{{ luxriot_json_alert_prompt }}</textarea>
+                        </div>
+                    </div>
+                </aside>
+
+                <section class="studio-workspace video-workspace">
+                    <div class="luxriot-card video-live-card studio-panel">
+                        <div class="luxriot-viewport" id="luxriotViewport">
+                            <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                            <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                        </div>
+                    </div>
+
+                    <div class="luxriot-card luxriot-summaries-card studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Live / Summaries</div>
+                                <div class="studio-panel-sub">Structured rollups, playback history, and operator follow mode.</div>
+                            </div>
+                        </div>
+                        <div class="luxriot-summary-toolbar">
+                            <div class="luxriot-summary-filters">
+                                <div class="luxriot-summary-filter">
+                                    <label for="luxriotSummaryChannelSelect">Channel</label>
+                                    <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
+                                </div>
+                                <div class="luxriot-summary-filter">
+                                    <label for="luxriotSummaryRangeSelect">History</label>
+                                    <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
+                                        <option value="6h" selected>last 6 hours</option>
+                                        <option value="24h">last day</option>
+                                        <option value="3d">last 3 days</option>
+                                        <option value="7d">last week</option>
+                                        <option value="30d">last month</option>
+                                        <option value="all">all history</option>
+                                    </select>
+                                </div>
+                                <div class="luxriot-summary-filter">
+                                    <label for="luxriotSummaryLevelSelect">Depth</label>
+                                    <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
+                                        <option value="L0" selected>Live</option>
+                                        <option value="L1">Minutes</option>
+                                        <option value="L2">Hours</option>
+                                        <option value="L3">Days</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="luxriot-summary-actions-row">
+                                <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
+                                <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
+                                <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
+                                <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
+                                <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
+                            </div>
+                        </div>
+                        <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
+                        <div id="luxriotSummaries" class="luxriot-summaries">
+                            <div class="loading">No summaries yet.</div>
+                        </div>
+                    </div>
+                </section>
+
+                <aside class="studio-inspector video-inspector">
+                    <div class="video-analysis-shell studio-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Offline Video Analysis</div>
+                                <div class="video-analysis-sub">Run sampled-frame analysis against local video files with the current VLM backend.</div>
+                            </div>
+                        </div>
+                        <div class="video-analysis-grid">
+                            <div class="video-analysis-form">
+                                <div class="video-row">
+                                    <div class="input-group">
+                                        <label for="videoPath" class="input-label">Video Path:</label>
+                                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
                                     </div>
-                                    <div class="image-query-actions">
-                                        <div class="file-upload inline">
-                                            <input type="file" id="imageUpload" class="file-upload-input" accept="image/*" />
-                                            <label for="imageUpload" class="feature-btn file-upload-btn btn-md">Choose Image</label>
-                                            <span id="imageUploadName" class="file-upload-name is-hidden">No file selected</span>
-                                        </div>
-                                        <button id="imageSearchBtn" class="feature-btn primary image-search-btn btn-md">Search by Image</button>
+                                    <div class="input-group">
+                                        <label class="input-label" for="videoModel">Model ID:</label>
+                                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{{ lm_model }}" />
                                     </div>
+                                </div>
+                                <div class="video-row">
+                                    <div class="input-group">
+                                        <label class="input-label" for="videoFrameCount">Frames to sample:</label>
+                                        <select id="videoFrameCount">
+                                            {{ video_frame_options_html | safe }}
+                                        </select>
+                                    </div>
+                                    <div class="input-group">
+                                        <label class="input-label" for="videoSampleFps">Target sample FPS (optional):</label>
+                                        <input type="number" id="videoSampleFps" min="0" step="0.1" placeholder="auto" />
+                                    </div>
+                                </div>
+                                <div class="input-group">
+                                    <label class="input-label" for="videoPrompt">Prompt:</label>
+                                    <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
+                                    <label class="video-prompt-note">
+                                        <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
+                                    </label>
+                                </div>
+                                <div class="video-controls">
+                                    <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
+                                    <button id="saveSummaryBtn" class="feature-btn is-hidden">Save summary as comment</button>
+                                    <div id="videoStatus" class="video-status"></div>
+                                </div>
+                            </div>
+                            <div class="video-analysis-output">
+                                <div class="video-output-wrap">
+                                    <div class="video-block-title">Summary</div>
+                                    <div id="videoOutput" class="video-output is-hidden"></div>
+                                </div>
+                                <div class="video-frame-block">
+                                    <div class="video-block-title">Sampled Frames</div>
+                                    <div id="videoFrames" class="video-frame-grid"></div>
                                 </div>
                             </div>
                         </div>
                     </div>
-                    <div class="archive-results-panel">
-                        <div class="archive-results-head">Search Results</div>
-                        <div id="results" class="results-grid"></div>
-                    </div>
-                </div>
-            </div>
-            <div id="videoBox" class="video-box">
-        <div class="luxriot-grid">
-            <div class="luxriot-card">
-                <div class="luxriot-header">
-                    <h4>Luxriot Live Streams</h4>
-                    <div id="luxriotStatus" class="luxriot-status">Not connected</div>
-                </div>
-                <div class="luxriot-row">
-                    <label for="luxriotChannelSelect">Channel:</label>
-                    <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
-                    <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
-                </div>
-                <div class="luxriot-row luxriot-live-controls-row">
-                    <span class="luxriot-pill">Batch:
-                        <select id="luxriotBatchSize" class="luxriot-mini-input">
-                            {{ luxriot_batch_options | safe }}
-                        </select>
-                    </span>
-                    <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
-                    <div class="luxriot-actions">
-                        <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
-                        <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
-                    </div>
-                </div>
-                <div class="luxriot-viewport" id="luxriotViewport">
-                    <img id="luxriotPreview" src="" alt="Luxriot live preview" />
-                    <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
-                </div>
-                <div class="luxriot-actions luxriot-live-footer-actions">
-                    <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
-                </div>
-                <div class="luxriot-hidden-prompts">
-                    <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
-                    <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
-                    <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{{ luxriot_rollup_prompt_l1 }}</textarea>
-                    <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{{ luxriot_rollup_prompt_l2 }}</textarea>
-                    <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{{ luxriot_rollup_prompt_l3 }}</textarea>
-                    <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{{ luxriot_json_alert_prompt }}</textarea>
-                </div>
-            </div>
-                    <div class="luxriot-card luxriot-stream-card">
-                <div class="luxriot-stream-manager">
-                    <div class="luxriot-stream-manager-head">
-                        <div class="video-block-title">Channel Runtime</div>
-                        <div class="luxriot-actions">
-                            <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
-                            <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
-                            <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
-                        </div>
-                    </div>
-                    <div id="luxriotStreams" class="luxriot-stream-list">
-                        <div class="loading">No active channels.</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div class="luxriot-card luxriot-summaries-card">
-            <div class="luxriot-header">
-                <h4>Live/Summaries</h4>
-                <div class="luxriot-summary-toolbar">
-                    <div class="luxriot-summary-filters">
-                        <label for="luxriotSummaryChannelSelect">Channel:</label>
-                        <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
-                        <label for="luxriotSummaryRangeSelect">History:</label>
-                        <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
-                            <option value="6h" selected>last 6 hours</option>
-                            <option value="24h">last day</option>
-                            <option value="3d">last 3 days</option>
-                            <option value="7d">last week</option>
-                            <option value="30d">last month</option>
-                            <option value="all">all history</option>
-                        </select>
-                        <label for="luxriotSummaryLevelSelect">Depth:</label>
-                        <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
-                            <option value="L0" selected>Live</option>
-                            <option value="L1">Minutes</option>
-                            <option value="L2">Hours</option>
-                            <option value="L3">Days</option>
-                        </select>
-                    </div>
-                    <div class="luxriot-summary-actions-row">
-                        <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
-                        <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
-                        <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
-                        <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
-                        <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
-                    </div>
-                </div>
-            </div>
-            <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
-            <div id="luxriotSummaries" class="luxriot-summaries">
-                <div class="loading">No summaries yet.</div>
-            </div>
-        </div>
-        <div class="video-analysis-grid">
-            <div class="video-analysis-form">
-                <div class="video-row">
-                    <div class="input-group">
-                        <label for="videoPath" class="input-label">Video Path:</label>
-                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
-                    </div>
-                    <div class="input-group">
-                        <label class="input-label" for="videoModel">Model ID:</label>
-                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{{ lm_model }}" />
-                    </div>
-                </div>
-                <div class="video-row">
-                    <div class="input-group">
-                        <label class="input-label" for="videoFrameCount">Frames to sample:</label>
-                        <select id="videoFrameCount">
-                            {{ video_frame_options_html | safe }}
-                        </select>
-                    </div>
-                    <div class="input-group">
-                        <label class="input-label" for="videoSampleFps">Target sample FPS (optional):</label>
-                        <input type="number" id="videoSampleFps" min="0" step="0.1" placeholder="auto" />
-                    </div>
-                </div>
-                <div class="input-group">
-                    <label class="input-label" for="videoPrompt">Prompt:</label>
-                    <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
-                    <label class="video-prompt-note">
-                        <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
-                    </label>
-                </div>
-                <div class="video-controls">
-                    <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
-                    <button id="saveSummaryBtn" class="feature-btn is-hidden">Save summary as comment</button>
-                    <div id="videoStatus" class="video-status"></div>
-                </div>
-            </div>
-            <div class="video-analysis-output">
-                <div class="video-output-wrap">
-                    <div class="video-block-title">Summary</div>
-                    <div id="videoOutput" class="video-output is-hidden"></div>
-                </div>
-                <div class="video-frame-block">
-                    <div class="video-block-title">Sampled Frames</div>
-                    <div id="videoFrames" class="video-frame-grid"></div>
-                </div>
-            </div>
-        </div>
-            </div>
-                        <div id="monitorBox" class="monitor-box">
-                <div class="probe-shell">
-                    <div class="probe-panel">
-                        <div class="probe-header">
+
+                    <div class="luxriot-card luxriot-stream-card studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head">
                             <div>
-                                <h4>Saved probes</h4>
-                                <div class="probe-meta">Click to expand, run, or delete.</div>
+                                <div class="studio-panel-title">Channel Runtime</div>
+                                <div class="studio-panel-sub">Live channel states and stream lifecycle controls.</div>
                             </div>
-                            <div class="probe-header-actions">
-                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
-                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                            <div class="luxriot-actions">
+                                <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
+                                <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
+                                <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
                             </div>
                         </div>
-                        <div id="probeCards" class="probe-grid"></div>
+                        <div id="luxriotStreams" class="luxriot-stream-list">
+                            <div class="loading">No active channels.</div>
+                        </div>
                     </div>
-                    <div class="bench-card">
+                </aside>
+            </div>
+
+            <div id="monitorBox" class="monitor-box studio-mode">
+                <aside class="studio-rail monitor-rail">
+                    <div class="monitor-command-panel studio-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Saved Probes</div>
+                                <div class="studio-panel-sub">Select, run, disable, or edit probes without leaving the board.</div>
+                            </div>
+                        </div>
+                        <div class="monitor-command-actions">
+                            <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
+                            <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                        </div>
+                    </div>
+
+                    <div class="bench-card studio-panel">
                         <div>
-                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
+                            <div class="bench-title">CLIP Throughput Benchmark</div>
+                            <div class="bench-meta">GPU embed throughput estimate for sizing simultaneous streams and probes.</div>
                             <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
                         </div>
                         <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
                     </div>
-                    <div class="monitor-grid">
-                        <div class="monitor-panel monitor-detections-panel">
-                            <div class="probe-header split">
-                                <h4>Latest Detections</h4>
-                                <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
-                            </div>
-                            <div class="probe-nav">
-                                <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
-                                <div id="probeResults" class="probe-results"></div>
-                                <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="monitor-actions-bar">
-                        <div class="monitor-actions-main">
-                            <button id="probeEditBtn" class="feature-btn">Probe settings</button>
-                            <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                        </div>
-                        <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
-                    </div>
-                </div>
-            </div>
-    </div>
+                </aside>
 
-    <!-- Agent Tab -->
-    <div id="agentBox" class="agent-box" style="display:none;">
-        <!-- Sessions sidebar -->
-        <div class="agent-sessions">
-            <div class="agent-sessions-header">
-                <div class="agent-sessions-title">Sessions</div>
-                <button id="agentNewSessionBtn" class="feature-btn primary agent-new-session-btn">+ New</button>
+                <section class="studio-workspace monitor-workspace">
+                    <div class="monitor-board-panel studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Probe Board</div>
+                                <div class="studio-panel-sub">Operational grid of active, paused, and draft probes.</div>
+                            </div>
+                        </div>
+                        <div class="probe-shell">
+                            <div id="probeCards" class="probe-grid probes-grid"></div>
+                        </div>
+                    </div>
+                </section>
+
+                <aside class="studio-inspector monitor-inspector">
+                    <div class="monitor-selection-panel studio-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Selected Probe</div>
+                                <div class="studio-panel-sub">Current state, last signal, and direct probe actions.</div>
+                            </div>
+                            <div id="monitorSelectionStatus" class="probe-meta">No probe selected</div>
+                        </div>
+                        <div id="monitorProbeSummary" class="monitor-probe-summary">
+                            <div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>
+                        </div>
+                        <div class="monitor-actions-bar">
+                            <div class="monitor-actions-main">
+                                <button id="probeEditBtn" class="feature-btn">Probe settings</button>
+                                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                            </div>
+                            <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
+                        </div>
+                    </div>
+
+                    <div class="monitor-panel monitor-detections-panel studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Latest Detections</div>
+                                <div class="studio-panel-sub">Recent hits from the active probe window.</div>
+                            </div>
+                            <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
+                        </div>
+                        <div class="probe-nav">
+                            <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
+                            <div id="probeResults" class="probe-results"></div>
+                            <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
+                        </div>
+                    </div>
+                </aside>
             </div>
-            <div id="agentSessionList" class="agent-session-list">
-                <div class="agent-session-empty">No sessions yet</div>
-            </div>
-        </div>
-        <!-- Chat area -->
-        <div class="agent-chat-area">
-            <div id="agentMessages" class="agent-messages"></div>
-            <div class="agent-input-wrap">
-                <div id="agentImagePreview" class="agent-image-preview is-hidden">
-                    <img id="agentImageThumb" src="" alt="attached image" />
-                    <button id="agentImageClear" class="agent-image-clear" title="Remove image">&#x2715;</button>
-                </div>
-                <div class="agent-input-bar">
-                    <textarea id="agentInput" class="agent-textarea" rows="1" placeholder="Ask the agent..."></textarea>
-                    <button id="agentSendBtn" class="agent-send-btn" title="Send">&#8593;</button>
-                </div>
-                <div class="agent-chips">
-                    <label class="agent-chip agent-chip-file" title="Attach image">
-                        &#128247; Image
-                        <input type="file" id="agentImageFile" accept="image/*" style="display:none" />
-                    </label>
-                    <button class="agent-chip" data-prompt="Show latest detections">Latest detections</button>
-                    <button class="agent-chip" data-prompt="List all probes and their status">Probe status</button>
-                    <button class="agent-chip" data-prompt="Generate a daily report for all probes">Daily report</button>
-                    <button class="agent-chip" data-prompt="Search the archive for">Archive search</button>
-                    <button class="agent-chip" data-prompt="Describe the current frame from channel">Describe frame</button>
-                </div>
-            </div>
-        </div>
-        <!-- Context sidebar -->
-        <div class="agent-context">
-            <div class="agent-ctx-section">
-                <div class="agent-ctx-title">Active Probes</div>
-                <div id="agentProbeList" class="agent-probe-list">
-                    <div class="agent-probe-empty">Loading probes...</div>
-                </div>
-            </div>
-            <div class="agent-ctx-section">
-                <div class="agent-ctx-title">Agent Can</div>
-                <div class="agent-cap-list">
-                    <div class="agent-cap-item">&#8627; search archive by text/image</div>
-                    <div class="agent-cap-item">&#8627; view &amp; analyze detections</div>
-                    <div class="agent-cap-item">&#8627; tune probe thresholds</div>
-                    <div class="agent-cap-item">&#8627; generate daily reports</div>
-                    <div class="agent-cap-item">&#8627; create Luxriot bookmarks</div>
-                    <div class="agent-cap-item">&#8627; describe frames (VLM)</div>
-                </div>
+
+            <div id="agentBox" class="agent-box studio-mode" style="display:none;">
+                <aside class="studio-rail agent-rail">
+                    <div class="agent-sessions studio-panel studio-panel--workspace">
+                    <div class="agent-sessions-header">
+                        <div>
+                            <div class="agent-sessions-title">Sessions</div>
+                            <div class="agent-sessions-sub">Persistent operator conversations and task threads.</div>
+                        </div>
+                        <button id="agentNewSessionBtn" class="feature-btn primary agent-new-session-btn">+ New</button>
+                    </div>
+                    <div id="agentSessionList" class="agent-session-list">
+                        <div class="agent-session-empty">No sessions yet</div>
+                    </div>
+                    </div>
+                </aside>
+
+                <section class="studio-workspace agent-workspace">
+                    <div class="agent-chat-area studio-panel studio-panel--workspace">
+                    <div class="agent-chat-topbar">
+                        <div>
+                            <div class="agent-chat-title">EVA Agent</div>
+                            <div class="agent-chat-sub">Ask about detections, probe behavior, bookmarks, reports, and live frames.</div>
+                        </div>
+                    </div>
+                    <div id="agentMessages" class="agent-messages"></div>
+                    <div class="agent-input-wrap">
+                        <div id="agentImagePreview" class="agent-image-preview is-hidden">
+                            <img id="agentImageThumb" src="" alt="attached image" />
+                            <button id="agentImageClear" class="agent-image-clear" title="Remove image">&#x2715;</button>
+                        </div>
+                        <div class="agent-input-bar">
+                            <textarea id="agentInput" class="agent-textarea" rows="1" placeholder="Ask the agent..."></textarea>
+                            <button id="agentSendBtn" class="agent-send-btn" title="Send">&#8593;</button>
+                        </div>
+                        <div class="agent-chips">
+                            <label class="agent-chip agent-chip-file" title="Attach image">
+                                &#128247; Image
+                                <input type="file" id="agentImageFile" accept="image/*" style="display:none" />
+                            </label>
+                            <button class="agent-chip" data-prompt="Show latest detections">Latest detections</button>
+                            <button class="agent-chip" data-prompt="List all probes and their status">Probe status</button>
+                            <button class="agent-chip" data-prompt="Generate a daily report for all probes">Daily report</button>
+                            <button class="agent-chip" data-prompt="Search the archive for">Archive search</button>
+                            <button class="agent-chip" data-prompt="Describe the current frame from channel">Describe frame</button>
+                        </div>
+                    </div>
+                    </div>
+                </section>
+
+                <aside class="studio-inspector agent-inspector">
+                    <div class="agent-context studio-panel studio-panel--workspace">
+                    <div class="agent-ctx-section">
+                        <div class="agent-ctx-title">Ops Context</div>
+                        <div class="agent-ops-card">
+                            <div class="agent-ops-badge">Live Ops</div>
+                            <div class="agent-ops-title">Command surface for archive, video, and probe analytics.</div>
+                            <div class="agent-ops-meta">Use natural language to inspect detections, update thresholds, and generate operator-facing reports.</div>
+                        </div>
+                    </div>
+                    <div class="agent-ctx-section">
+                        <div class="agent-ctx-title">Active Probes</div>
+                        <div id="agentProbeList" class="agent-probe-list">
+                            <div class="agent-probe-empty">Loading probes...</div>
+                        </div>
+                    </div>
+                    <div class="agent-ctx-section">
+                        <div class="agent-ctx-title">Agent Can</div>
+                        <div class="agent-cap-list">
+                            <div class="agent-cap-item">&#8627; search archive by text/image</div>
+                            <div class="agent-cap-item">&#8627; view &amp; analyze detections</div>
+                            <div class="agent-cap-item">&#8627; tune probe thresholds</div>
+                            <div class="agent-cap-item">&#8627; generate daily reports</div>
+                            <div class="agent-cap-item">&#8627; create Luxriot bookmarks</div>
+                            <div class="agent-cap-item">&#8627; describe frames (VLM)</div>
+                        </div>
+                    </div>
+                    </div>
+                </aside>
             </div>
         </div>
     </div>
@@ -585,234 +709,282 @@
             </div>
         </div>
     </div>
+
+    <div id="imageLightboxModal" class="settings-modal image-lightbox-modal">
+        <div class="image-lightbox-shell">
+            <button class="close-btn image-lightbox-close" id="closeImageLightbox">&times;</button>
+            <img id="imageLightboxImg" class="image-lightbox-img" src="" alt="Expanded preview" />
+            <div id="imageLightboxMeta" class="image-lightbox-meta"></div>
+        </div>
+    </div>
     
     <!-- Settings Modal -->
     <div id="settingsModal" class="settings-modal">
-        <div class="settings-modal-content">
+        <div class="settings-modal-content app-settings-modal-content">
             <div class="settings-header">
-                <h2>Settings</h2>
+                <div class="settings-header-copy">
+                    <h2>Settings</h2>
+                    <div class="settings-header-sub">Tune runtime, ranking, Luxriot integration, and environment values without leaving the control surface.</div>
+                </div>
                 <button class="close-btn" id="closeSettings">&times;</button>
             </div>
-            
-            <div class="settings-section">
-                <h3>Server Configuration</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Host:</label>
-                    <input type="text" id="host" class="settings-input" placeholder="0.0.0.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Port:</label>
-                    <input type="number" id="port" class="settings-input" min="1000" max="65535" placeholder="5000">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Debug Mode:</label>
-                    <input type="checkbox" id="debug" class="settings-checkbox">
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Search Configuration</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Min Results:</label>
-                    <input type="number" id="minResults" class="settings-input" min="1" max="100" placeholder="3">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max Results:</label>
-                    <input type="number" id="maxResults" class="settings-input" min="1" max="200" placeholder="48">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Default Results:</label>
-                    <input type="number" id="defaultResults" class="settings-input" min="1" max="100" placeholder="12">
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Model & Processing</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Backend:</label>
-                    <select id="embedder" class="settings-select">
-                        <option value="clip">CLIP</option>
-                        <option value="dino">DINO</option>
-                        <option value="fusion">Fusion</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Fusion Enabled:</label>
-                    <input type="checkbox" id="fusionEnabled" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Fusion Alpha:</label>
-                    <input type="range" id="fusionAlpha" class="settings-range" min="0" max="1" step="0.05" value="0.7">
-                    <span class="range-value" id="fusionAlphaValue">0.70</span>
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Model:</label>
-                    <input type="text" id="dinoModel" class="settings-input" placeholder="dinov3_vitb16">
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Embedding Dim:</label>
-                    <input type="number" id="dinoEmbedDim" class="settings-input" min="128" max="4096" placeholder="1280">
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Weights Path:</label>
-                    <input type="text" id="dinoWeightsPath" class="settings-input" placeholder="/path/to/dinov3">
-                </div>
-                <div class="settings-row backend-clip">
-                    <label class="settings-label">CLIP Model:</label>
-                    <select id="clipModel" class="settings-select">
-                        <option value="ViT-B/32">ViT-B/32</option>
-                        <option value="ViT-B/16">ViT-B/16</option>
-                        <option value="ViT-L/14">ViT-L/14</option>
-                        <option value="google/siglip2-base-patch16-224">SigLIP2 Base (patch16-224)</option>
-                        <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Batch Size:</label>
-                    <input type="number" id="batchSize" class="settings-input" min="1" max="128" placeholder="32">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Thumbnail Quality:</label>
-                    <input type="range" id="thumbnailQuality" class="settings-range" min="50" max="100" value="85">
-                    <span class="range-value" id="qualityValue">85</span>
-                </div>
+            <div class="settings-sheet-nav">
+                <button type="button" class="settings-nav-btn active" data-settings-target="settings-section-server">
+                    <span class="settings-nav-label">Server</span>
+                    <span class="settings-nav-meta">Host, port, and debug runtime.</span>
+                </button>
+                <button type="button" class="settings-nav-btn" data-settings-target="settings-section-search">
+                    <span class="settings-nav-label">Search</span>
+                    <span class="settings-nav-meta">Default result limits and query behavior.</span>
+                </button>
+                <button type="button" class="settings-nav-btn" data-settings-target="settings-section-model">
+                    <span class="settings-nav-label">Models</span>
+                    <span class="settings-nav-meta">Embedder backend, fusion, and image quality.</span>
+                </button>
+                <button type="button" class="settings-nav-btn" data-settings-target="settings-section-luxriot">
+                    <span class="settings-nav-label">Luxriot</span>
+                    <span class="settings-nav-meta">Channels, snapshots, bookmarks, and severity mapping.</span>
+                </button>
+                <button type="button" class="settings-nav-btn" data-settings-target="settings-section-advanced">
+                    <span class="settings-nav-label">Advanced</span>
+                    <span class="settings-nav-meta">Indexing, rerank, and segment controls.</span>
+                </button>
+                <button type="button" class="settings-nav-btn" data-settings-target="settings-section-env">
+                    <span class="settings-nav-label">Environment</span>
+                    <span class="settings-nav-meta">Edit `EVOSSEARCH_*` values and persist to `.env`.</span>
+                </button>
             </div>
 
-            <div class="settings-section">
-                <h3>Luxriot Evo</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Base URL:</label>
-                    <input type="text" id="luxriotBaseUrl" class="settings-input" placeholder="http://192.168.1.102:8080">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Username:</label>
-                    <input type="text" id="luxriotUsername" class="settings-input" placeholder="admin">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Password:</label>
-                    <input type="password" id="luxriotPassword" class="settings-input" placeholder="••••••">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Default Channel ID:</label>
-                    <input type="number" id="luxriotDefaultChannelId" class="settings-input" min="1" placeholder="103">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Snapshot Interval (s):</label>
-                    <input type="number" id="luxriotSnapshotInterval" class="settings-input" min="1" max="300" placeholder="5">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Snapshot Max Edge (px):</label>
-                    <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max Buffer Frames:</label>
-                    <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Auto Bookmark Alerts:</label>
-                    <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Bookmark Cooldown (s):</label>
-                    <input type="number" id="probeBookmarkCooldownSec" class="settings-input" min="0" step="0.5" placeholder="8.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Dedupe Window (s):</label>
-                    <input type="number" id="probeBookmarkDedupeWindowSec" class="settings-input" min="0.5" step="0.5" placeholder="20.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Similarity High:</label>
-                    <input type="number" id="probeBookmarkSimHigh" class="settings-input" min="0.5" max="0.9999" step="0.0001" placeholder="0.985">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Margin Delta:</label>
-                    <input type="number" id="probeBookmarkMarginDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Score Delta:</label>
-                    <input type="number" id="probeBookmarkScoreDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Max Frame Gap:</label>
-                    <input type="number" id="probeBookmarkMaxFrameGap" class="settings-input" min="1" step="1" placeholder="8">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Severity Mapping:</label>
-                    <div class="severity-row">
-                        <input type="text" id="luxriotSevInfo" class="settings-input settings-short-input" placeholder="info">
-                        <input type="text" id="luxriotSevLow" class="settings-input settings-short-input" placeholder="low">
-                        <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
-                        <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
-                        <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
+            <div id="settingsScrollArea" class="settings-sheet-scroll">
+                <div class="settings-sheet-grid">
+                    <div id="settings-section-server" class="settings-section">
+                        <h3>Server Configuration</h3>
+                        <div class="settings-section-meta">Core HTTP runtime settings used by the local Flask control plane.</div>
+                        <div class="settings-row">
+                            <label class="settings-label">Host:</label>
+                            <input type="text" id="host" class="settings-input" placeholder="0.0.0.0">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Port:</label>
+                            <input type="number" id="port" class="settings-input" min="1000" max="65535" placeholder="5000">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Debug Mode:</label>
+                            <input type="checkbox" id="debug" class="settings-checkbox">
+                        </div>
+                    </div>
+
+                    <div id="settings-section-search" class="settings-section">
+                        <h3>Search Configuration</h3>
+                        <div class="settings-section-meta">Baseline retrieval counts for archive and agent-assisted search flows.</div>
+                        <div class="settings-row">
+                            <label class="settings-label">Min Results:</label>
+                            <input type="number" id="minResults" class="settings-input" min="1" max="100" placeholder="3">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Max Results:</label>
+                            <input type="number" id="maxResults" class="settings-input" min="1" max="200" placeholder="48">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Default Results:</label>
+                            <input type="number" id="defaultResults" class="settings-input" min="1" max="100" placeholder="12">
+                        </div>
+                    </div>
+
+                    <div id="settings-section-model" class="settings-section">
+                        <h3>Model &amp; Processing</h3>
+                        <div class="settings-section-meta">Backend selection, fusion controls, and thumbnail quality for embeddings.</div>
+                        <div class="settings-row">
+                            <label class="settings-label">Backend:</label>
+                            <select id="embedder" class="settings-select">
+                                <option value="clip">CLIP</option>
+                                <option value="dino">DINO</option>
+                                <option value="fusion">Fusion</option>
+                            </select>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Fusion Enabled:</label>
+                            <input type="checkbox" id="fusionEnabled" class="settings-checkbox">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Fusion Alpha:</label>
+                            <input type="range" id="fusionAlpha" class="settings-range" min="0" max="1" step="0.05" value="0.7">
+                            <span class="range-value" id="fusionAlphaValue">0.70</span>
+                        </div>
+                        <div class="settings-row backend-dino">
+                            <label class="settings-label">DINO Model:</label>
+                            <input type="text" id="dinoModel" class="settings-input" placeholder="dinov3_vitb16">
+                        </div>
+                        <div class="settings-row backend-dino">
+                            <label class="settings-label">DINO Embedding Dim:</label>
+                            <input type="number" id="dinoEmbedDim" class="settings-input" min="128" max="4096" placeholder="1280">
+                        </div>
+                        <div class="settings-row backend-dino">
+                            <label class="settings-label">DINO Weights Path:</label>
+                            <input type="text" id="dinoWeightsPath" class="settings-input" placeholder="/path/to/dinov3">
+                        </div>
+                        <div class="settings-row backend-clip">
+                            <label class="settings-label">CLIP Model:</label>
+                            <select id="clipModel" class="settings-select">
+                                <option value="ViT-B/32">ViT-B/32</option>
+                                <option value="ViT-B/16">ViT-B/16</option>
+                                <option value="ViT-L/14">ViT-L/14</option>
+                                <option value="google/siglip2-base-patch16-224">SigLIP2 Base (patch16-224)</option>
+                                <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
+                            </select>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Batch Size:</label>
+                            <input type="number" id="batchSize" class="settings-input" min="1" max="128" placeholder="32">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Thumbnail Quality:</label>
+                            <input type="range" id="thumbnailQuality" class="settings-range" min="50" max="100" value="85">
+                            <span class="range-value" id="qualityValue">85</span>
+                        </div>
+                    </div>
+
+                    <div id="settings-section-advanced" class="settings-section">
+                        <h3>Advanced Settings</h3>
+                        <div class="settings-section-meta">Index mode, reranking, segmentation, and storage-level constraints.</div>
+                        <div class="settings-row">
+                            <label class="settings-label">Max Comment Length:</label>
+                            <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Max File Size (MB):</label>
+                            <input type="number" id="maxFileSize" class="settings-input" min="1" max="500" placeholder="50">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Index Folder Name:</label>
+                            <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Index Mode:</label>
+                            <select id="indexMode" class="settings-select">
+                                <option value="clip">CLIP only</option>
+                                <option value="dino">DINO only</option>
+                                <option value="dual">Dual (CLIP &amp; DINO)</option>
+                            </select>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Rerank Enabled:</label>
+                            <input type="checkbox" id="rerankEnabled" class="settings-checkbox">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Rerank Top-K:</label>
+                            <input type="number" id="rerankTopK" class="settings-input" min="1" max="500" placeholder="50">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Segment Embeddings:</label>
+                            <input type="checkbox" id="segmentsEnabled" class="settings-checkbox" {{ segments_enabled_checked }}>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Min Segment Patches:</label>
+                            <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3" value="{{ segment_min_patches_default }}">
+                        </div>
+                    </div>
+
+                    <div id="settings-section-luxriot" class="settings-section settings-section-wide">
+                        <h3>Luxriot Evo</h3>
+                        <div class="settings-section-meta">Live source integration, bookmark behavior, and per-alert severity defaults.</div>
+                        <div class="settings-row">
+                            <label class="settings-label">Base URL:</label>
+                            <input type="text" id="luxriotBaseUrl" class="settings-input" placeholder="http://192.168.1.102:8080">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Username:</label>
+                            <input type="text" id="luxriotUsername" class="settings-input" placeholder="admin">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Password:</label>
+                            <input type="password" id="luxriotPassword" class="settings-input" placeholder="••••••">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Default Channel ID:</label>
+                            <input type="number" id="luxriotDefaultChannelId" class="settings-input" min="1" placeholder="103">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Snapshot Interval (s):</label>
+                            <input type="number" id="luxriotSnapshotInterval" class="settings-input" min="1" max="300" placeholder="5">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Snapshot Max Edge (px):</label>
+                            <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Max Buffer Frames:</label>
+                            <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Auto Bookmark Alerts:</label>
+                            <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Bookmark Cooldown (s):</label>
+                            <input type="number" id="probeBookmarkCooldownSec" class="settings-input" min="0" step="0.5" placeholder="8.0">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Dedupe Window (s):</label>
+                            <input type="number" id="probeBookmarkDedupeWindowSec" class="settings-input" min="0.5" step="0.5" placeholder="20.0">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Similarity High:</label>
+                            <input type="number" id="probeBookmarkSimHigh" class="settings-input" min="0.5" max="0.9999" step="0.0001" placeholder="0.985">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Margin Delta:</label>
+                            <input type="number" id="probeBookmarkMarginDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Score Delta:</label>
+                            <input type="number" id="probeBookmarkScoreDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Probe Max Frame Gap:</label>
+                            <input type="number" id="probeBookmarkMaxFrameGap" class="settings-input" min="1" step="1" placeholder="8">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Severity Mapping:</label>
+                            <div class="severity-row">
+                                <input type="text" id="luxriotSevInfo" class="settings-input settings-short-input" placeholder="info">
+                                <input type="text" id="luxriotSevLow" class="settings-input settings-short-input" placeholder="low">
+                                <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
+                                <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
+                                <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="settings-section-env" class="settings-section settings-section-wide">
+                        <h3>Environment Variables</h3>
+                        <div class="settings-section-meta">Persist `EVOSSEARCH_*` overrides to `.env` and reload the editor without leaving this modal.</div>
+                        <div class="settings-row align-start">
+                            <label class="settings-label">`EVOSSEARCH_*` values:</label>
+                            <textarea id="envEditor" class="settings-input env-editor" spellcheck="false" placeholder="EVOSSEARCH_KEY=value"></textarea>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Env actions:</label>
+                            <div class="env-editor-actions">
+                                <button class="settings-btn" id="reloadEnvBtn">Reload Env</button>
+                                <button class="settings-btn primary" id="saveEnvBtn">Save Env</button>
+                            </div>
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Runtime:</label>
+                            <div class="settings-note">Env changes are saved to `.env`. Restart server to apply all values.</div>
+                        </div>
                     </div>
                 </div>
             </div>
-            
-            <div class="settings-section">
-                <h3>Advanced Settings</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Max Comment Length:</label>
-                    <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max File Size (MB):</label>
-                    <input type="number" id="maxFileSize" class="settings-input" min="1" max="500" placeholder="50">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Index Folder Name:</label>
-                    <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Index Mode:</label>
-                    <select id="indexMode" class="settings-select">
-                        <option value="clip">CLIP only</option>
-                        <option value="dino">DINO only</option>
-                        <option value="dual">Dual (CLIP & DINO)</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Rerank Enabled:</label>
-                    <input type="checkbox" id="rerankEnabled" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Rerank Top-K:</label>
-                    <input type="number" id="rerankTopK" class="settings-input" min="1" max="500" placeholder="50">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Segment Embeddings:</label>
-                    <input type="checkbox" id="segmentsEnabled" class="settings-checkbox" {{ segments_enabled_checked }}>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Min Segment Patches:</label>
-                    <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3" value="{{ segment_min_patches_default }}">
-                </div>
-            </div>
 
-            <div class="settings-section">
-                <h3>Environment Variables</h3>
-                <div class="settings-row align-start">
-                    <label class="settings-label">`EVOSSEARCH_*` values:</label>
-                    <textarea id="envEditor" class="settings-input env-editor" spellcheck="false" placeholder="EVOSSEARCH_KEY=value"></textarea>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Env actions:</label>
-                    <div class="env-editor-actions">
-                        <button class="settings-btn" id="reloadEnvBtn">Reload Env</button>
-                        <button class="settings-btn primary" id="saveEnvBtn">Save Env</button>
-                    </div>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Runtime:</label>
-                    <div class="settings-note">Env changes are saved to `.env`. Restart server to apply all values.</div>
+            <div class="settings-footer">
+                <div id="settingsStatus" class="settings-status"></div>
+                <div class="settings-actions">
+                    <button class="settings-btn" id="resetSettings">Reset to Defaults</button>
+                    <button class="settings-btn primary" id="saveSettings">Save Settings</button>
                 </div>
             </div>
-            
-            <div class="settings-actions">
-                <button class="settings-btn" id="resetSettings">Reset to Defaults</button>
-                <button class="settings-btn primary" id="saveSettings">Save Settings</button>
-            </div>
-            
-            <div id="settingsStatus" class="settings-status"></div>
         </div>
     </div>
     

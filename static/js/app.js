@@ -28,6 +28,7 @@
     const monitorBox = document.getElementById('monitorBox');
     const agentModeBtn = document.getElementById('agentModeBtn');
     const agentBox = document.getElementById('agentBox');
+    const headerStatusText = document.querySelector('.header-status-text');
     const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
     const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
     const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
@@ -135,6 +136,8 @@
     const searchScopeSelect = document.getElementById('searchScope');
     const showCommentedBtn = document.getElementById('showCommentedBtn');
     const resultsContainer = document.getElementById('results');
+    const archiveInspectorBody = document.getElementById('archiveInspectorBody');
+    const archiveInspectorEmpty = document.getElementById('archiveInspectorEmpty');
     const archiveChannelFilter = document.getElementById('archiveChannelFilter');
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
     const archiveTimeFilter = document.getElementById('archiveTimeFilter');
@@ -148,6 +151,12 @@
     const probeEnableToggle = document.getElementById('probeEnableToggle');
     const probeBenchBtn = document.getElementById('probeBenchBtn');
     const probeBenchOutput = document.getElementById('probeBenchOutput');
+    const monitorProbeSummary = document.getElementById('monitorProbeSummary');
+    const monitorSelectionStatus = document.getElementById('monitorSelectionStatus');
+    const imageLightboxModal = document.getElementById('imageLightboxModal');
+    const closeImageLightboxBtn = document.getElementById('closeImageLightbox');
+    const imageLightboxImg = document.getElementById('imageLightboxImg');
+    const imageLightboxMeta = document.getElementById('imageLightboxMeta');
     
     let currentFolder = '';
     let currentMode = 'archive';
@@ -156,6 +165,9 @@
     let lastSummaryText = '';
     let lastSummaryTarget = null;
     let segmentContextByIndex = {};
+    let archiveRenderedResults = [];
+    let archiveRenderedCommented = false;
+    let activeArchiveInspectorIndex = -1;
     let luxriotSummaryLogCache = [];
     const luxriotSummaryChannelCache = {};
     const luxriotSummarySeenKeys = {};
@@ -494,11 +506,20 @@
         videoModeBtn.classList.toggle('active', mode === 'video');
         monitorModeBtn.classList.toggle('active', mode === 'monitor');
         if (agentModeBtn) agentModeBtn.classList.toggle('active', mode === 'agent');
-        if (archiveBox) {
-            archiveBox.style.display = mode === 'archive' ? 'flex' : 'none';
+        if (headerStatusText) {
+            const statusByMode = {
+                archive: 'Archive Research Ready',
+                video: 'Live Video Ops',
+                monitor: 'Probe Monitoring',
+                agent: 'Agent Session Active',
+            };
+            headerStatusText.textContent = statusByMode[mode] || 'Command Center Online';
         }
-        videoBox.style.display = mode === 'video' ? 'flex' : 'none';
-        monitorBox.style.display = mode === 'monitor' ? 'block' : 'none';
+        if (archiveBox) {
+            archiveBox.style.display = mode === 'archive' ? 'grid' : 'none';
+        }
+        videoBox.style.display = mode === 'video' ? 'grid' : 'none';
+        monitorBox.style.display = mode === 'monitor' ? 'grid' : 'none';
         if (agentBox) agentBox.style.display = mode === 'agent' ? 'grid' : 'none';
         if (mode === 'video') {
             ensureLuxriotInit();
@@ -2547,6 +2568,8 @@
     const saveSettingsBtn = document.getElementById('saveSettings');
     const resetSettingsBtn = document.getElementById('resetSettings');
     const settingsStatus = document.getElementById('settingsStatus');
+    const settingsScrollArea = document.getElementById('settingsScrollArea');
+    const settingsNavButtons = Array.from(document.querySelectorAll('[data-settings-target]'));
     const envEditorInput = document.getElementById('envEditor');
     const reloadEnvBtn = document.getElementById('reloadEnvBtn');
     const saveEnvBtn = document.getElementById('saveEnvBtn');
@@ -2588,6 +2611,21 @@
     const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
     
     let segmentThreshold = 0.7;
+
+    function setActiveSettingsNav(targetId) {
+        settingsNavButtons.forEach((btn) => {
+            btn.classList.toggle('active', btn.dataset.settingsTarget === targetId);
+        });
+    }
+
+    function scrollSettingsSectionIntoView(targetId, behavior = 'smooth') {
+        if (!settingsScrollArea) return;
+        const target = document.getElementById(targetId);
+        if (!target) return;
+        const offsetTop = Math.max(0, target.offsetTop - 8);
+        settingsScrollArea.scrollTo({ top: offsetTop, behavior });
+        setActiveSettingsNav(targetId);
+    }
 
     function toBool(value, fallback = false) {
         if (typeof value === 'boolean') return value;
@@ -2885,6 +2923,7 @@
 
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading detections archive...</div>';
         setArchiveDetectionsMeta('Loading detections...');
+        renderArchiveInspectorEmpty('Loading detections archive...');
         try {
             const response = await fetch(`/detections/list?${params.toString()}`);
             const data = await parseApiJson(response, 'Failed to load detections archive');
@@ -2895,6 +2934,7 @@
             if (!mapped.length) {
                 resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
                 setArchiveDetectionsMeta('No detections found for selected filters.');
+                renderArchiveInspectorEmpty('No detections found for the selected filters.');
                 updateArchiveDetectionsNav();
                 return;
             }
@@ -2906,6 +2946,7 @@
         } catch (err) {
             resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
             setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
+            renderArchiveInspectorEmpty(`Detections archive error: ${err.message || String(err)}`);
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
         }
@@ -2963,19 +3004,58 @@
     }
     
     // Settings modal functionality
+    settingsNavButtons.forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const targetId = btn.dataset.settingsTarget;
+            if (!targetId) return;
+            scrollSettingsSectionIntoView(targetId);
+        });
+    });
+
     settingsBtn.addEventListener('click', () => {
         settingsModal.style.display = 'block';
         loadSettings();
         loadEnvEditor();
+        if (settingsScrollArea) {
+            settingsScrollArea.scrollTop = 0;
+        }
+        const firstTarget = settingsNavButtons[0]?.dataset.settingsTarget;
+        if (firstTarget) {
+            setActiveSettingsNav(firstTarget);
+        }
     });
     
     closeSettingsBtn.addEventListener('click', () => {
         settingsModal.style.display = 'none';
     });
+
+    if (closeImageLightboxBtn) {
+        closeImageLightboxBtn.addEventListener('click', () => {
+            closeImageLightbox();
+        });
+    }
+    if (imageLightboxModal) {
+        imageLightboxModal.addEventListener('click', (e) => {
+            if (e.target === imageLightboxModal) {
+                closeImageLightbox();
+            }
+        });
+    }
     
     // Close modal when clicking outside
     settingsModal.addEventListener('click', (e) => {
         if (e.target === settingsModal) {
+            settingsModal.style.display = 'none';
+        }
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        if (imageLightboxModal && imageLightboxModal.style.display === 'block') {
+            closeImageLightbox();
+            return;
+        }
+        if (settingsModal && settingsModal.style.display === 'block') {
             settingsModal.style.display = 'none';
         }
     });
@@ -4583,6 +4663,74 @@
         };
     }
 
+    function renderMonitorProbeInspector() {
+        if (!monitorProbeSummary) return;
+        const probe = activeProbeId ? probeList.find((p) => String(p.id) === String(activeProbeId)) : null;
+        if (!probe) {
+            monitorProbeSummary.innerHTML = '<div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>';
+            if (monitorSelectionStatus) {
+                monitorSelectionStatus.textContent = 'No probe selected';
+            }
+            return;
+        }
+
+        const channelId = parseInt(String(probe.channel_id || luxriotActiveChannel), 10);
+        const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
+        const status = probe.enabled === false
+            ? 'disabled'
+            : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
+        const pillClass = status === 'disabled'
+            ? 'pill-disabled'
+            : status === 'running'
+                ? 'pill-running'
+                : status === 'paused'
+                    ? 'pill-paused'
+                    : 'pill-idle';
+        const last = probe.last_hit;
+        const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleString() : 'No detections yet';
+        const thumbSrc = last?.thumbnail || probe.image_probe?.data || '';
+        const gateView = describeProbeBookmarkGate(probe.bookmark_gate, probe.bookmark !== false);
+        const positiveCount = Array.isArray(probe.pairs) ? probe.pairs.filter((pair) => String(pair?.positive || '').trim()).length : 0;
+        const negativeCount = Array.isArray(probe.pairs) ? probe.pairs.filter((pair) => String(pair?.negative || '').trim()).length : 0;
+        const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
+
+        if (monitorSelectionStatus) {
+            monitorSelectionStatus.textContent = `${status.toUpperCase()} · Ch ${probe.channel_id || luxriotActiveChannel}`;
+        }
+
+        monitorProbeSummary.innerHTML = `
+            <div class="monitor-probe-hero">
+                <div class="monitor-probe-thumb ${thumbSrc ? '' : 'is-empty'}">
+                    ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(probe.name || 'probe preview')}" />` : '<span>No preview</span>'}
+                </div>
+                <div class="monitor-probe-copy">
+                    <div class="probe-status-pill ${pillClass}">${status}</div>
+                    <div class="monitor-probe-name">${escapeHtml(probe.name || 'unnamed probe')}</div>
+                    <div class="monitor-probe-meta">Channel ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || 'n/a'))}</div>
+                    <div class="monitor-probe-meta">Last event: ${escapeHtml(ts)}</div>
+                </div>
+            </div>
+            <div class="monitor-probe-stats">
+                <div class="monitor-probe-stat">
+                    <span class="monitor-probe-stat-label">Scores</span>
+                    <span class="monitor-probe-stat-value">${escapeHtml(scores)}</span>
+                </div>
+                <div class="monitor-probe-stat">
+                    <span class="monitor-probe-stat-label">Bookmark gate</span>
+                    <span class="monitor-probe-stat-value" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
+                </div>
+                <div class="monitor-probe-stat">
+                    <span class="monitor-probe-stat-label">Text pairs</span>
+                    <span class="monitor-probe-stat-value">${positiveCount} positive · ${negativeCount} negative</span>
+                </div>
+                <div class="monitor-probe-stat">
+                    <span class="monitor-probe-stat-label">Image probe</span>
+                    <span class="monitor-probe-stat-value">${probe.image_probe?.enabled !== false && probe.image_probe?.data ? 'enabled' : 'off'}</span>
+                </div>
+            </div>
+        `;
+    }
+
     function renderProbeCards() {
         if (!probeCards) return;
         if (!probeList.length) {
@@ -4593,6 +4741,7 @@
                         <span>New Probe</span>
                     </button>
                 </div>`;
+            renderMonitorProbeInspector();
             return;
         }
         const cards = probeList.map((p) => {
@@ -4616,7 +4765,7 @@
             const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
             const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
             return `
-                <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
+                <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}" data-probe-id="${p.id}">
                     <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
                         ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
                         <div class="probe-mini-overlay">
@@ -4649,6 +4798,7 @@
             </div>
         `);
         probeCards.innerHTML = cards.join('');
+        renderMonitorProbeInspector();
     }
 
     function setActiveProbe(probe) {
@@ -5020,11 +5170,20 @@
         if (probeFpsInput) probeFpsInput.value = '0';
         if (probeWindowSecInput) probeWindowSecInput.value = '300';
         updateProbeCaptureMeta(getSelectedProbeChannelId());
+        renderMonitorProbeInspector();
     }
 
     function handleProbeCardClick(event) {
         const btn = event.target.closest('button[data-action]');
-        if (!btn) return;
+        if (!btn) {
+            const card = event.target.closest('.probe-mini-card[data-probe-id]');
+            if (!card) return;
+            const probe = probeList.find((p) => String(p.id) === String(card.dataset.probeId || ''));
+            if (probe) {
+                setActiveProbe(probe);
+            }
+            return;
+        }
         const id = btn.getAttribute('data-id');
         const action = btn.getAttribute('data-action');
         const probe = probeList.find(p => String(p.id) === String(id));
@@ -5421,6 +5580,7 @@
         
         setButtonBusy(searchBtn, true);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
+        renderArchiveInspectorEmpty('Searching archive...');
         
         try {
             let response;
@@ -5458,9 +5618,11 @@
                 }
             } else {
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
+                renderArchiveInspectorEmpty('No results found for this query.');
             }
         } catch (error) {
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            renderArchiveInspectorEmpty(`Search error: ${error.message}`);
         } finally {
             setButtonBusy(searchBtn, false);
         }
@@ -5486,6 +5648,7 @@
         
         setButtonBusy(imageSearchBtn, true);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
+        renderArchiveInspectorEmpty('Searching by image...');
         
         try {
             const formData = new FormData();
@@ -5518,9 +5681,11 @@
                 displayResults(renderedResults);
             } else {
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
+                renderArchiveInspectorEmpty('No visual matches found for this reference image.');
             }
         } catch (error) {
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            renderArchiveInspectorEmpty(`Image search error: ${error.message}`);
         } finally {
             setButtonBusy(imageSearchBtn, false);
         }
@@ -5673,6 +5838,7 @@
         setMode('archive');
         
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
+        renderArchiveInspectorEmpty('Loading commented images...');
         
         try {
             const response = await fetch('/commented_images', {
@@ -5687,20 +5853,129 @@
                 displayCommentedResults(data.results);
             } else {
                 resultsContainer.innerHTML = '<div class="loading">No commented images found</div>';
+                renderArchiveInspectorEmpty('No commented images found for the current archive.');
             }
         } catch (error) {
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            renderArchiveInspectorEmpty(`Commented image load failed: ${error.message}`);
         }
     });
     
+    function renderArchiveInspectorEmpty(message = 'Select a result to inspect the full image, metrics, comments, and segmentation tools.') {
+        if (resultsContainer) {
+            resultsContainer.classList.remove('results-grid--detections');
+        }
+        activeArchiveInspectorIndex = -1;
+        if (archiveInspectorEmpty) {
+            archiveInspectorEmpty.textContent = message;
+            archiveInspectorEmpty.classList.remove('is-hidden');
+        }
+        if (archiveInspectorBody) {
+            archiveInspectorBody.innerHTML = '';
+            archiveInspectorBody.classList.add('is-hidden');
+        }
+        document.querySelectorAll('#results .result-item').forEach((item) => {
+            item.classList.remove('selected');
+        });
+    }
+
+    function syncArchiveResultsLayout(results) {
+        if (!resultsContainer) return;
+        const list = Array.isArray(results) ? results : [];
+        const detectionOnly = list.length > 0 && list.every((result) => Boolean(result && result.is_detection));
+        resultsContainer.classList.toggle('results-grid--detections', detectionOnly);
+    }
+
+    function highlightActiveArchiveResultCard(index) {
+        document.querySelectorAll('#results .result-item').forEach((item) => {
+            const itemIndex = Number.parseInt(item.dataset.resultIndex || '-1', 10);
+            item.classList.toggle('selected', itemIndex === index);
+        });
+    }
+
+    function openImageLightbox(src, meta = '') {
+        if (!imageLightboxModal || !imageLightboxImg) return;
+        imageLightboxImg.src = src || '';
+        if (imageLightboxMeta) {
+            imageLightboxMeta.textContent = meta || '';
+        }
+        imageLightboxModal.style.display = 'block';
+    }
+
+    function closeImageLightbox() {
+        if (!imageLightboxModal) return;
+        imageLightboxModal.style.display = 'none';
+        if (imageLightboxImg) imageLightboxImg.src = '';
+        if (imageLightboxMeta) imageLightboxMeta.textContent = '';
+    }
+
+    function showArchiveInspector(index) {
+        if (!archiveInspectorBody || !Array.isArray(archiveRenderedResults) || !archiveRenderedResults.length) {
+            renderArchiveInspectorEmpty();
+            return;
+        }
+        const result = archiveRenderedResults[index];
+        if (!result) {
+            renderArchiveInspectorEmpty();
+            return;
+        }
+
+        activeArchiveInspectorIndex = index;
+        if (archiveInspectorEmpty) {
+            archiveInspectorEmpty.classList.add('is-hidden');
+        }
+        archiveInspectorBody.classList.remove('is-hidden');
+        const detailClasses = ['result-item', 'result-item--detail', 'expanded'];
+        if (result.is_detection) {
+            detailClasses.push('result-item--detection-detail');
+        }
+        archiveInspectorBody.innerHTML = `
+            <div class="${detailClasses.join(' ')}" data-result-index="${index}">
+                ${generateResultItemHTML(result, index, archiveRenderedCommented, 'detail')}
+            </div>
+        `;
+
+        const detailItem = archiveInspectorBody.querySelector('.result-item');
+        if (!detailItem) return;
+        setupResultItemEventHandlers(detailItem, result, index, { variant: 'detail' });
+        highlightActiveArchiveResultCard(index);
+        archiveInspectorBody.scrollTop = 0;
+
+        const detailImg = detailItem.querySelector('.thumbnail');
+        const commentsContainer = document.getElementById(`comments-${index}`);
+        const activeFolder = folderInput.value.trim();
+        const canUseFolderComments = Boolean(result.path && activeFolder && String(result.path).startsWith(activeFolder));
+        if (!result.is_detection) {
+            if (activeFolder && result.path) {
+                loadComments(index, result.path, activeFolder);
+                prepareSegmentsPanel(detailItem, result, index);
+            } else if (commentsContainer) {
+                commentsContainer.innerHTML = '<div class="no-comments">Provide a folder path to load comments for indexed images.</div>';
+            }
+        } else if (commentsContainer) {
+            if (canUseFolderComments) {
+                loadComments(index, result.path, activeFolder);
+            } else {
+                commentsContainer.innerHTML = '<div class="no-comments">This detection can be described, but comments are only available when the image belongs to the active indexed folder.</div>';
+            }
+        }
+
+        if (detailImg && segmentsEnabledInput.checked && !result.is_detection) {
+            detailImg.classList.add('segment-enabled');
+        }
+    }
+
     // Generate common HTML structure for result items
-    function generateResultItemHTML(result, index, isCommented = false) {
+    function generateResultItemHTML(result, index, isCommented = false, variant = 'card') {
         const similarityMarkup = buildSimilarityMetrics(result, isCommented);
         const badgesMarkup = buildResultBadges(result);
         const safeFilename = escapeHtml(result.filename || 'unnamed');
         const rawPath = String(result.path || '');
         const hasPath = rawPath.length > 0;
-        const showFilenameRow = !(result && result.is_detection);
+        const isDetectionResult = Boolean(result && result.is_detection);
+        const showFilenameRow = !isDetectionResult;
+        const activeFolder = folderInput ? folderInput.value.trim() : '';
+        const canUseFolderComments = Boolean(hasPath && activeFolder && rawPath.startsWith(activeFolder));
         const safePath = escapeHtml(rawPath);
         const thumb = String(result.thumbnail || '').trim();
         const fallbackSvg = encodeURIComponent(
@@ -5710,15 +5985,89 @@
             '</svg>'
         );
         const thumbnailSrc = thumb ? `data:image/jpeg;base64,${thumb}` : `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
-            
+        const detailImageSrc = hasPath ? buildImageFetchUrl(rawPath, result) : thumbnailSrc;
+        const overlayIcon = variant === 'detail'
+            ? '<path d="M240-240v-200h80v120h120v80H240Zm400-400v-80h80v200H520v-80h120v-40Z"/>'
+            : '<path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>';
+
+        if (variant === 'card') {
+            return `
+                <div class="image-container">
+                    <img src="${thumbnailSrc}" class="thumbnail" alt="" />
+                    <div class="image-overlay">
+                        ${hasPath ? `
+                            <div class="expand-collapse-icon" data-index="${index}" title="Inspect result">
+                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
+                                    ${overlayIcon}
+                                </svg>
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>
+                <div class="result-info">
+                    ${showFilenameRow ? `
+                        <div class="filename">
+                            ${safeFilename}
+                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
+                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
+                            </svg>
+                        </div>
+                    ` : ''}
+                    ${badgesMarkup}
+                    <div class="similarity">${similarityMarkup}</div>
+                    <div class="result-actions">
+                        <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
+                            </svg>
+                        </button>
+                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${safePath}" title="Find similar">
+                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        const segmentsPanelMarkup = hasPath && !isDetectionResult ? `
+            <div class="segments-panel" id="segments-${index}">
+                <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
+            </div>
+        ` : '';
+        const commentsPanelMarkup = hasPath ? `
+            <div class="comment-section">
+                <div class="lm-description" id="lm-desc-${index}">
+                    <div class="no-comments">No LLM description yet.</div>
+                </div>
+                <div class="lm-description-actions">
+                    <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
+                </div>
+                ${!isDetectionResult || canUseFolderComments ? `
+                    <div class="comments-list" id="comments-${index}">
+                        <div class="comment-loading">Loading comments...</div>
+                    </div>
+                    <div class="comment-form">
+                        <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
+                        <button class="save-comment-btn" id="save-btn-${index}">Save</button>
+                    </div>
+                ` : `
+                    <div class="comments-list" id="comments-${index}">
+                        <div class="no-comments">Comments can be saved only when this image is inside the active indexed folder.</div>
+                    </div>
+                `}
+            </div>
+        ` : '';
+
         return `
             <div class="image-container">
-                <img src="${thumbnailSrc}" class="thumbnail" alt="" />
+                <img src="${detailImageSrc}" class="thumbnail" alt="" />
                 <div class="image-overlay">
                     ${hasPath ? `
-                        <div class="expand-collapse-icon" data-index="${index}">
+                        <div class="expand-collapse-icon" data-index="${index}" title="Open full preview">
                             <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
+                                ${overlayIcon}
                             </svg>
                         </div>
                     ` : ''}
@@ -5748,41 +6097,36 @@
                     </button>
                 </div>
             </div>
-            ${hasPath ? `
-                <div class="segments-panel" id="segments-${index}">
-                    <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
-                </div>
-                <div class="comment-section">
-                    <div class="lm-description" id="lm-desc-${index}">
-                        <div class="no-comments">No LLM description yet.</div>
-                    </div>
-                    <div class="lm-description-actions">
-                        <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
-                    </div>
-                    <div class="comments-list" id="comments-${index}">
-                        <div class="comment-loading">Loading comments...</div>
-                    </div>
-                    <div class="comment-form">
-                        <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                        <button class="save-comment-btn" id="save-btn-${index}">Save</button>
-                    </div>
-                </div>
-            ` : ''}
+            ${segmentsPanelMarkup}
+            ${commentsPanelMarkup}
         `;
     }
 
     // Setup event handlers for result item
-    function setupResultItemEventHandlers(item, result, index) {
-        // Handle expand/collapse via overlay icon
+    function setupResultItemEventHandlers(item, result, index, options = {}) {
+        const variant = options.variant || 'card';
+
         const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
         if (expandCollapseIcon && result.path) {
             expandCollapseIcon.addEventListener('click', (e) => {
                 e.stopPropagation();
-                toggleImageExpansion(item, result, index);
+                if (variant === 'detail') {
+                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                } else {
+                    showArchiveInspector(index);
+                }
             });
         }
-        
-        // Handle copy icon click
+
+        if (variant === 'card') {
+            item.addEventListener('click', (e) => {
+                if (e.target.closest('button, .expand-collapse-icon, .copy-icon')) {
+                    return;
+                }
+                showArchiveInspector(index);
+            });
+        }
+
         const copyIcon = item.querySelector('.copy-icon');
         if (copyIcon) {
             if (result.path) {
@@ -5794,9 +6138,7 @@
                 copyIcon.style.display = 'none';
             }
         }
-        
-        
-        // Handle find similar button
+
         const findSimilarIcon = item.querySelector('.find-similar-icon');
         if (findSimilarIcon) {
             if (result.path) {
@@ -5820,13 +6162,14 @@
                 describeIcon.style.display = 'none';
             }
         }
-        
-        // Add save comment functionality
+
         const saveBtn = item.querySelector(`#save-btn-${index}`);
         const commentInput = item.querySelector(`#comment-input-${index}`);
-        
+        const activeFolder = folderInput ? folderInput.value.trim() : '';
+        const canUseFolderComments = Boolean(result.path && activeFolder && String(result.path).startsWith(activeFolder));
+
         if (saveBtn) {
-            if (result.path && !result.is_detection) {
+            if (canUseFolderComments || (result.path && !result.is_detection)) {
                 saveBtn.addEventListener('click', () => {
                     saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
                 });
@@ -5837,7 +6180,7 @@
 
         const lmSaveBtn = item.querySelector(`#lm-save-btn-${index}`);
         if (lmSaveBtn) {
-            if (result.path && !result.is_detection) {
+            if (canUseFolderComments || (result.path && !result.is_detection)) {
                 lmSaveBtn.addEventListener('click', () => {
                     saveLmDescriptionAsComment(index, result.path);
                 });
@@ -5847,10 +6190,20 @@
         }
 
         const img = item.querySelector('.thumbnail');
-        if (img && result.path && !result.is_detection) {
-            img.addEventListener('click', (e) => {
-                handleSegmentClick(e, result, index, item);
-            });
+        if (img && result.path && variant === 'detail') {
+            if (!result.is_detection) {
+                img.addEventListener('click', (e) => {
+                    if (segmentsEnabledInput.checked) {
+                        handleSegmentClick(e, result, index, item);
+                        return;
+                    }
+                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                });
+            } else {
+                img.addEventListener('click', () => {
+                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                });
+            }
         }
     }
 
@@ -5858,38 +6211,56 @@
     function displayResults(results) {
         resultsContainer.innerHTML = '';
         segmentContextByIndex = {};
+        archiveRenderedResults = Array.isArray(results) ? results : [];
+        archiveRenderedCommented = false;
+        syncArchiveResultsLayout(archiveRenderedResults);
         
-        results.forEach((result, index) => {
+        archiveRenderedResults.forEach((result, index) => {
             const item = document.createElement('div');
             item.className = 'result-item';
+            if (result && result.is_detection) {
+                item.classList.add('result-item--detection-card');
+            }
             item.dataset.resultIndex = index;
-            item.innerHTML = generateResultItemHTML(result, index, false);
+            item.innerHTML = generateResultItemHTML(result, index, false, 'card');
             
-            setupResultItemEventHandlers(item, result, index);
-            resetSegmentsPanel(item, index);
+            setupResultItemEventHandlers(item, result, index, { variant: 'card' });
             resultsContainer.appendChild(item);
         });
 
-        refreshSegmentsPanels();
+        if (archiveRenderedResults.length) {
+            showArchiveInspector(0);
+        } else {
+            renderArchiveInspectorEmpty('Run a text search, image search, or load detections to populate the inspector.');
+        }
     }
     
     // Display commented results (similar to displayResults but with comment info)
     function displayCommentedResults(results) {
         resultsContainer.innerHTML = '';
         segmentContextByIndex = {};
+        archiveRenderedResults = Array.isArray(results) ? results : [];
+        archiveRenderedCommented = true;
+        syncArchiveResultsLayout(archiveRenderedResults);
         
-        results.forEach((result, index) => {
+        archiveRenderedResults.forEach((result, index) => {
             const item = document.createElement('div');
             item.className = 'result-item';
+            if (result && result.is_detection) {
+                item.classList.add('result-item--detection-card');
+            }
             item.dataset.resultIndex = index;
-            item.innerHTML = generateResultItemHTML(result, index, true);
+            item.innerHTML = generateResultItemHTML(result, index, true, 'card');
             
-            setupResultItemEventHandlers(item, result, index);
-            resetSegmentsPanel(item, index);
+            setupResultItemEventHandlers(item, result, index, { variant: 'card' });
             resultsContainer.appendChild(item);
         });
 
-        refreshSegmentsPanels();
+        if (archiveRenderedResults.length) {
+            showArchiveInspector(0);
+        } else {
+            renderArchiveInspectorEmpty('No commented images found for the current archive.');
+        }
     }
     
     // Comment functionality
@@ -6029,52 +6400,7 @@
     }
     
     function toggleImageExpansion(item, result, index) {
-        const img = item.querySelector('.thumbnail');
-        const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-        const isExpanded = item.classList.contains('expanded');
-        
-        if (isExpanded) {
-            // Collapse: switch back to thumbnail
-            img.src = `data:image/jpeg;base64,${result.thumbnail}`;
-            item.classList.remove('expanded');
-            resetSegmentsPanel(item, index);
-            delete segmentContextByIndex[index];
-            img.classList.remove('segment-enabled');
-            // Update icon to expand
-            expandCollapseIcon.innerHTML = `
-                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                </svg>
-            `;
-        } else {
-            // Expand: show original image and load comments
-            const activeFolder = folderInput.value.trim();
-            const originalImageUrl = buildImageFetchUrl(result.path || '', result);
-            img.src = originalImageUrl;
-            item.classList.add('expanded');
-            if (!result.is_detection && activeFolder) {
-                loadComments(index, result.path, activeFolder);
-                prepareSegmentsPanel(item, result, index);
-            } else {
-                const commentsContainer = document.getElementById(`comments-${index}`);
-                if (commentsContainer) {
-                    commentsContainer.innerHTML = '<div class="no-comments">Comments are available for indexed-folder images only.</div>';
-                }
-                const panel = item.querySelector(`#segments-${index}`);
-                if (panel) {
-                    panel.innerHTML = '<div class="segments-status warning">Segmentation is available for indexed-folder images only.</div>';
-                }
-            }
-            if (segmentsEnabledInput.checked && !result.is_detection) {
-                img.classList.add('segment-enabled');
-            }
-            // Update icon to collapse
-            expandCollapseIcon.innerHTML = `
-                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                    <path d="M432-432v240h-72v-168H192v-72h240Zm168-336v168h168v72H528v-240h72Z"/>
-                </svg>
-            `;
-        }
+        showArchiveInspector(index);
     }
 
     function resetSegmentsPanel(item, index) {
@@ -6098,29 +6424,18 @@
     }
 
     function refreshSegmentsPanels() {
-        document.querySelectorAll('.result-item').forEach((item) => {
-            const indexAttr = item.dataset.resultIndex;
-            if (typeof indexAttr === 'undefined') return;
-            const index = parseInt(indexAttr, 10);
-            if (Number.isNaN(index)) return;
-            if (item.classList.contains('expanded')) {
-                prepareSegmentsPanel(item, null, index);
-                const img = item.querySelector('.thumbnail');
-                if (img) {
-                    if (segmentsEnabledInput.checked) {
-                        img.classList.add('segment-enabled');
-                    } else {
-                        img.classList.remove('segment-enabled');
-                    }
-                }
+        if (!archiveInspectorBody || activeArchiveInspectorIndex < 0) return;
+        const detailItem = archiveInspectorBody.querySelector('.result-item');
+        if (!detailItem) return;
+        const img = detailItem.querySelector('.thumbnail');
+        prepareSegmentsPanel(detailItem, null, activeArchiveInspectorIndex);
+        if (img) {
+            if (segmentsEnabledInput.checked) {
+                img.classList.add('segment-enabled');
             } else {
-                resetSegmentsPanel(item, index);
-                const img = item.querySelector('.thumbnail');
-                if (img) {
-                    img.classList.remove('segment-enabled');
-                }
+                img.classList.remove('segment-enabled');
             }
-        });
+        }
     }
 
     function clamp01(value) {
@@ -6667,10 +6982,7 @@
         const modelId = videoModelInput ? videoModelInput.value.trim() : '';
 
         setMode('archive');
-        const targetItem = item || document.querySelector(`.result-item[data-result-index="${index}"]`);
-        if (targetItem && !targetItem.classList.contains('expanded') && result) {
-            toggleImageExpansion(targetItem, result, index);
-        }
+        showArchiveInspector(index);
 
         const descContainer = document.getElementById(`lm-desc-${index}`);
         const saveBtn = document.getElementById(`lm-save-btn-${index}`);
