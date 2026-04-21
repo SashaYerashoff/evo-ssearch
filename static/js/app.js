@@ -280,20 +280,98 @@
         return div.innerHTML;
     }
 
+    function sanitizeUrl(url) {
+        const value = String(url || '').trim();
+        if (!value) return '';
+        if (/^(https?:\/\/|\/|\.\.?\/|\?)/i.test(value)) {
+            return value;
+        }
+        if (/^data:image\//i.test(value)) {
+            return value;
+        }
+        return '#';
+    }
+
+    function parseMarkdownTableRow(line) {
+        const raw = String(line || '').trim();
+        if (!raw.includes('|')) return [];
+        const normalized = raw.replace(/^\|/, '').replace(/\|$/, '');
+        return normalized.split('|').map((cell) => cell.trim());
+    }
+
+    function isMarkdownTableDivider(line) {
+        const cells = parseMarkdownTableRow(line);
+        if (cells.length < 2) return false;
+        return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    }
+
+    function renderMarkdownTable(tableLines) {
+        if (!Array.isArray(tableLines) || tableLines.length < 2) return '';
+        const headerCells = parseMarkdownTableRow(tableLines[0]);
+        if (headerCells.length < 2 || !isMarkdownTableDivider(tableLines[1])) return '';
+
+        const alignments = parseMarkdownTableRow(tableLines[1]).map((cell) => {
+            const trimmed = String(cell || '').trim();
+            if (trimmed.startsWith(':') && trimmed.endsWith(':')) return 'center';
+            if (trimmed.endsWith(':')) return 'right';
+            return 'left';
+        });
+
+        const renderCells = (cells, tagName) => {
+            return cells.map((cell, idx) => {
+                const align = alignments[idx] || 'left';
+                return `<${tagName} style="text-align:${align}">${renderMarkdownInline(cell)}</${tagName}>`;
+            }).join('');
+        };
+
+        const headerHtml = `<thead><tr>${renderCells(headerCells, 'th')}</tr></thead>`;
+        const bodyRows = tableLines.slice(2).map((line) => {
+            const cells = parseMarkdownTableRow(line);
+            if (!cells.length) return '';
+            while (cells.length < headerCells.length) {
+                cells.push('');
+            }
+            return `<tr>${renderCells(cells.slice(0, headerCells.length), 'td')}</tr>`;
+        }).filter(Boolean);
+
+        return `<div class="markdown-table-wrap"><table>${headerHtml}<tbody>${bodyRows.join('')}</tbody></table></div>`;
+    }
+
     function renderMarkdownInline(text) {
         const source = String(text || '');
-        const inlineCode = [];
-        const placeholder = source.replace(/`([^`\n]+)`/g, (_, codeText) => {
-            const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
-            return `\x00IC${idx}\x00`;
-        });
+        const tokens = [];
+        const makeToken = (html) => `\x00MD${tokens.push(html) - 1}\x00`;
+        const placeholder = source
+            .replace(/`([^`\n]+)`/g, (_, codeText) => {
+                return makeToken(`<code>${escapeHtml(codeText)}</code>`);
+            })
+            .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, altText, url, title) => {
+                const safeUrl = sanitizeUrl(url);
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return makeToken(
+                    `<img class="markdown-inline-image" src="${escapeHtml(safeUrl)}" alt="${escapeHtml(altText || '')}"${titleAttr} loading="lazy" />`
+                );
+            })
+            .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, label, url, title) => {
+                const safeUrl = sanitizeUrl(url);
+                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+                return makeToken(
+                    `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${escapeHtml(label)}</a>`
+                );
+            })
+            .replace(/(^|[\s(])((?:https?:\/\/|\/)[^\s<]+?)(?=([),.!?]?(?:\s|$)))/g, (_, prefix, url) => {
+                const safeUrl = sanitizeUrl(url);
+                return `${prefix}${makeToken(
+                    `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`
+                )}`;
+            });
         let out = escapeHtml(placeholder);
         out = out
             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
             .replace(/__(.+?)__/g, '<strong>$1</strong>')
             .replace(/\*(.+?)\*/g, '<em>$1</em>')
             .replace(/_(.+?)_/g, '<em>$1</em>');
-        out = out.replace(/\x00IC(\d+)\x00/g, (_, idx) => inlineCode[Number(idx)] || '');
+        out = out.replace(/\x00MD(\d+)\x00/g, (_, idx) => tokens[Number(idx)] || '');
         return out;
     }
 
@@ -339,7 +417,8 @@
             codeFenceLines = [];
         };
 
-        for (const rawLine of lines) {
+        for (let i = 0; i < lines.length; i += 1) {
+            const rawLine = lines[i];
             const line = String(rawLine || '');
             const trimmed = line.trim();
             const fenceMatch = trimmed.match(/^```\s*([\w-]+)?\s*$/);
@@ -365,6 +444,31 @@
                 flushParagraph();
                 flushLists();
                 continue;
+            }
+
+            const nextLine = String(lines[i + 1] || '').trim();
+            const maybeTable = trimmed.includes('|') && nextLine && isMarkdownTableDivider(nextLine);
+            if (maybeTable) {
+                flushParagraph();
+                flushLists();
+                const tableLines = [line, lines[i + 1]];
+                i += 2;
+                while (i < lines.length) {
+                    const candidate = String(lines[i] || '');
+                    const candidateTrimmed = candidate.trim();
+                    if (!candidateTrimmed || !candidateTrimmed.includes('|')) {
+                        i -= 1;
+                        break;
+                    }
+                    tableLines.push(candidate);
+                    i += 1;
+                }
+                const tableHtml = renderMarkdownTable(tableLines);
+                if (tableHtml) {
+                    htmlParts.push(tableHtml);
+                    continue;
+                }
+                i -= 1;
             }
 
             const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
@@ -7229,12 +7333,15 @@
             div.className = 'agent-message assistant';
             const bodyEl = document.createElement('div');
             bodyEl.className = 'agent-msg-body';
-            if (text) bodyEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+            const textEl = document.createElement('div');
+            textEl.className = 'agent-msg-text';
+            if (text) textEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+            bodyEl.appendChild(textEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
             scrollToBottom();
-            return { el: div, bodyEl };
+            return { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
         }
 
         function startStreamingBubble() {
@@ -7248,25 +7355,59 @@
             div.className = 'agent-message assistant';
             const bodyEl = document.createElement('div');
             bodyEl.className = 'agent-msg-body';
-            bodyEl.innerHTML = '<span class="agent-typing-indicator"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span></span>';
+            const textEl = document.createElement('div');
+            textEl.className = 'agent-msg-text';
+            textEl.innerHTML = '<span class="agent-typing-indicator"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span></span>';
+            const traceEl = document.createElement('details');
+            traceEl.className = 'agent-tool-trace';
+            traceEl.open = true;
+            const traceSummary = document.createElement('summary');
+            traceSummary.className = 'agent-tool-trace-summary';
+            traceSummary.textContent = 'Research trace';
+            const actionsEl = document.createElement('div');
+            actionsEl.className = 'agent-msg-actions';
+            traceEl.appendChild(traceSummary);
+            traceEl.appendChild(actionsEl);
+            bodyEl.appendChild(textEl);
+            bodyEl.appendChild(traceEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
             scrollToBottom();
-            return { el: div, bodyEl, text: '' };
+            return { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '' };
         }
 
         function appendTokenToBubble(bubble, token) {
             bubble.text = (bubble.text || '') + token;
             const rendered = renderMarkdown ? renderMarkdown(bubble.text) : escapeHtml(bubble.text);
-            bubble.bodyEl.innerHTML = rendered;
+            if (bubble.textEl) {
+                bubble.textEl.innerHTML = rendered;
+            } else {
+                bubble.bodyEl.innerHTML = rendered;
+            }
             scrollToBottom();
         }
 
         function appendActionCard(bubble, name, result) {
             const card = buildActionCard(name, result);
-            if (card) bubble.bodyEl.appendChild(card);
+            if (!card) return;
+            if (bubble.actionsEl) {
+                bubble.actionsEl.appendChild(card);
+                bubble.actionCount = (bubble.actionCount || 0) + 1;
+                updateAgentTraceSummary(bubble);
+            } else {
+                bubble.bodyEl.appendChild(card);
+            }
             scrollToBottom();
+        }
+
+        function updateAgentTraceSummary(bubble) {
+            const summaryEl = bubble && bubble.traceEl
+                ? bubble.traceEl.querySelector('.agent-tool-trace-summary')
+                : null;
+            if (!summaryEl) return;
+            const count = Number(bubble.actionCount || 0);
+            summaryEl.textContent = count > 0 ? `Research trace · ${count} step${count === 1 ? '' : 's'}` : 'Research trace';
         }
 
         function scrollToBottom() {
@@ -7583,8 +7724,14 @@
         function finishStreamingBubble(bubble) {
             if (!bubble) return;
             // Remove typing indicator if still present (no tokens came)
-            const indicator = bubble.bodyEl.querySelector('.agent-typing-indicator');
+            const indicator = (bubble.textEl || bubble.bodyEl).querySelector('.agent-typing-indicator');
             if (indicator) indicator.remove();
+            updateAgentTraceSummary(bubble);
+            if (bubble.traceEl) {
+                const hasText = String(bubble.text || '').trim().length > 0;
+                const hasActions = Number(bubble.actionCount || 0) > 0;
+                bubble.traceEl.open = hasActions && !hasText;
+            }
         }
 
         function appendErrorToMessages(msg) {

@@ -821,26 +821,33 @@ def serve_app_js():
 @app.route('/image', methods=['GET'])
 @app.route('/image/<path:filepath>', methods=['GET'])
 def serve_image(filepath: str = ""):
-    """Serve image files only from indexed folders."""
+    """Serve image files from indexed folders and keep legacy detection-archive URLs working."""
     try:
         folder_raw = request.args.get('folder')
-        if not folder_raw:
-            return "Missing folder parameter", 400
-        folder_path = _resolve_folder_path(folder_raw, require_index=True)
-
         source_path = request.args.get('image_path') or filepath
         if not source_path:
             return "Missing image path", 400
 
         decoded = unquote(source_path)
         path_obj = Path(decoded)
-        if not path_obj.is_absolute():
-            path_obj = folder_path / path_obj
-        abs_path = path_obj.resolve()
+        folder_path: Optional[Path] = None
+        if folder_raw:
+            folder_path = _resolve_folder_path(folder_raw, require_index=True)
+            if not path_obj.is_absolute():
+                path_obj = folder_path / path_obj
+            abs_path = path_obj.resolve()
+        else:
+            if not path_obj.is_absolute():
+                return "Missing folder parameter", 400
+            abs_path = path_obj.expanduser().resolve()
         if abs_path.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
             return "Unsupported file type", 403
-        if not _path_within(abs_path, folder_path):
-            return "Access denied", 403
+        if folder_path is not None:
+            if not _path_within(abs_path, folder_path):
+                return "Access denied", 403
+        else:
+            if not _path_within(abs_path, detection_archive.root):
+                return "Access denied", 403
         if not abs_path.exists() or not abs_path.is_file():
             return "Image not found", 404
         return send_file(str(abs_path))

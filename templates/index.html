@@ -231,6 +231,47 @@
                             <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
                             <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
                         </div>
+                        <div class="video-summary-controls">
+                            <div class="video-summary-controls-head">
+                                <div class="video-summary-controls-title">Summary Lens</div>
+                                <div class="video-summary-controls-sub">Choose what lands in the live text feed.</div>
+                            </div>
+                            <div class="luxriot-summary-toolbar">
+                                <div class="luxriot-summary-filters">
+                                    <div class="luxriot-summary-filter">
+                                        <label for="luxriotSummaryChannelSelect">Channel</label>
+                                        <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
+                                    </div>
+                                    <div class="luxriot-summary-filter">
+                                        <label for="luxriotSummaryRangeSelect">History</label>
+                                        <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
+                                            <option value="6h" selected>last 6 hours</option>
+                                            <option value="24h">last day</option>
+                                            <option value="3d">last 3 days</option>
+                                            <option value="7d">last week</option>
+                                            <option value="30d">last month</option>
+                                            <option value="all">all history</option>
+                                        </select>
+                                    </div>
+                                    <div class="luxriot-summary-filter">
+                                        <label for="luxriotSummaryLevelSelect">Depth</label>
+                                        <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
+                                            <option value="L0" selected>Live</option>
+                                            <option value="L1">Minutes</option>
+                                            <option value="L2">Hours</option>
+                                            <option value="L3">Days</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="luxriot-summary-actions-row">
+                                    <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
+                                    <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
+                                    <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
+                                    <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
+                                    <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
+                                </div>
+                            </div>
+                        </div>
                         <div class="luxriot-hidden-prompts">
                             <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
                             <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
@@ -253,43 +294,8 @@
                     <div class="luxriot-card luxriot-summaries-card studio-panel studio-panel--workspace">
                         <div class="studio-panel-head">
                             <div>
-                                <div class="studio-panel-title">Live / Summaries</div>
-                                <div class="studio-panel-sub">Structured rollups, playback history, and operator follow mode.</div>
-                            </div>
-                        </div>
-                        <div class="luxriot-summary-toolbar">
-                            <div class="luxriot-summary-filters">
-                                <div class="luxriot-summary-filter">
-                                    <label for="luxriotSummaryChannelSelect">Channel</label>
-                                    <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
-                                </div>
-                                <div class="luxriot-summary-filter">
-                                    <label for="luxriotSummaryRangeSelect">History</label>
-                                    <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
-                                        <option value="6h" selected>last 6 hours</option>
-                                        <option value="24h">last day</option>
-                                        <option value="3d">last 3 days</option>
-                                        <option value="7d">last week</option>
-                                        <option value="30d">last month</option>
-                                        <option value="all">all history</option>
-                                    </select>
-                                </div>
-                                <div class="luxriot-summary-filter">
-                                    <label for="luxriotSummaryLevelSelect">Depth</label>
-                                    <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
-                                        <option value="L0" selected>Live</option>
-                                        <option value="L1">Minutes</option>
-                                        <option value="L2">Hours</option>
-                                        <option value="L3">Days</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="luxriot-summary-actions-row">
-                                <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
-                                <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
-                                <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
-                                <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
-                                <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
+                                <div class="studio-panel-title">VLM Feed</div>
+                                <div class="studio-panel-sub">Live summaries and drilled rollups for the selected channel context.</div>
                             </div>
                         </div>
                         <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>

@@ -701,7 +701,12 @@ class AgentStore:
     def load_history(self, session_id: str) -> List[Dict[str, Any]]:
         """
         Return the last AGENT_MAX_HISTORY_MESSAGES messages for this session
-        as a list of OpenAI-compatible message dicts, with orphan-scan applied.
+        as a compact list of OpenAI-compatible dialog messages.
+
+        We intentionally do not replay persisted tool-call / tool-result traffic
+        across turns. LM Studio prompt templates are often brittle around older
+        tool traces, while the operator-facing assistant text already summarizes
+        the important outcome ("preview generated", "report ready", etc.).
         """
         with self._lock:
             conn = self._connect()
@@ -709,19 +714,39 @@ class AgentStore:
                 rows = conn.execute(
                     """SELECT * FROM agent_messages WHERE session_id=?
                        ORDER BY id DESC LIMIT ?""",
-                    (session_id, AGENT_MAX_HISTORY_MESSAGES),
+                    (session_id, AGENT_MAX_HISTORY_MESSAGES * 4),
                 ).fetchall()
             finally:
                 conn.close()
 
         rows = list(reversed(rows))  # restore chronological order
-        messages = [_msg_row_to_openai(r) for r in rows]
+        messages: List[Dict[str, Any]] = []
 
-        # Orphan-scan: drop leading tool-result messages that have no
-        # preceding tool-call (would confuse the model).
-        while messages and messages[0].get("role") == "tool":
+        for row in rows:
+            msg = _msg_row_to_openai(row)
+            role = str(msg.get("role") or "")
+            content = str(msg.get("content") or "").strip()
+
+            if role not in {"user", "assistant"}:
+                continue
+            if not content:
+                continue
+
+            if messages:
+                prev = messages[-1]
+                prev_role = str(prev.get("role") or "")
+                prev_content = str(prev.get("content") or "")
+                if prev_role == role:
+                    if prev_content.strip() == content:
+                        continue
+                    prev["content"] = f"{prev_content}\n\n{content}".strip()
+                    continue
+
+            messages.append({"role": role, "content": content})
+
+        messages = messages[-AGENT_MAX_HISTORY_MESSAGES:]
+        while messages and messages[0].get("role") != "user":
             messages.pop(0)
-
         return messages
 
     # ── GC ──────────────────────────────────────────────────────────────────
@@ -822,7 +847,7 @@ class AgentTools:
             if not folder:
                 raise ToolError("'folder' is required when scope='indexed_folder'.")
             results = self._search_folder(query=query, folder=folder, limit=limit)
-            return {"scope": scope, "count": len(results), "results": _strip_thumbnails(results)}
+            return {"scope": scope, "count": len(results), "results": _strip_thumbnails(results, folder=folder)}
 
         # scope == "detections"
         since_hours = float(args.get("since_hours") or 24)
@@ -1677,7 +1702,7 @@ def _opt_float(v: Any) -> Optional[float]:
 
 def _detection_image_url(r: Dict[str, Any]) -> Optional[str]:
     """Return a URL the frontend can use to load the detection's image."""
-    ip = str(r.get("image_path") or "").strip()
+    ip = str(r.get("image_path") or r.get("path") or "").strip()
     if ip:
         from urllib.parse import quote
         return f"/detections/image?image_path={quote(ip, safe='')}"
@@ -1687,11 +1712,13 @@ def _detection_image_url(r: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _archive_result_image_url(r: Dict[str, Any]) -> Optional[str]:
+def _archive_result_image_url(r: Dict[str, Any], folder: Optional[str] = None) -> Optional[str]:
     """Return a URL the frontend can use to load an archive search result image."""
     fp = str(r.get("filepath") or r.get("path") or "").strip()
     if fp:
         from urllib.parse import quote
+        if folder:
+            return f"/image?folder={quote(folder, safe='')}&image_path={quote(fp, safe='')}"
         return f"/image/{quote(fp, safe='/')}"
     return None
 
@@ -1706,12 +1733,13 @@ def _safe_detection(r: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _strip_thumbnails(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _strip_thumbnails(results: List[Dict[str, Any]], folder: Optional[str] = None) -> List[Dict[str, Any]]:
     out = []
     for r in results:
         row = {k: v for k, v in r.items()
                if k not in ("thumbnail", "thumbnail_b64", "clip_vec", "dino_vec")}
-        url = _archive_result_image_url(r)
+        is_detection = bool(r.get("is_detection")) or bool(r.get("detection_id")) or bool(r.get("image_path"))
+        url = _detection_image_url(r) if is_detection else _archive_result_image_url(r, folder=folder)
         if url:
             row["image_url"] = url
         out.append(row)
