@@ -17,6 +17,7 @@ import base64
 import collections
 import copy
 import json
+import queue
 import sqlite3
 import threading
 import time
@@ -1163,8 +1164,14 @@ class AgentTools:
         self._jpeg = encode_jpeg_fn
         self._search_folder    = search_indexed_folder_fn
         self._search_det       = search_detections_fn
+        self._local = threading.local()
 
-    def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def execute(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         """Dispatch to the named tool. Returns a dict always."""
         dispatch = {
             "search_archive":       self._search_archive,
@@ -1187,7 +1194,11 @@ class AgentTools:
         fn = dispatch.get(name)
         if fn is None:
             raise ToolError(f"Unknown tool: {name!r}")
-        return fn(args)
+        self._local.progress_cb = progress_cb
+        try:
+            return fn(args)
+        finally:
+            self._local.progress_cb = None
 
     # ── search_archive ──────────────────────────────────────────────────────
 
@@ -1415,20 +1426,49 @@ class AgentTools:
             target_channels.append(channel)
 
         interval_sec = duration_sec / max(1, sample_count - 1)
+        self._report_progress({
+            "tool": "survey_channels",
+            "stage": "start",
+            "message": f"Surveying {len(target_channels)} channel(s)",
+            "channel_count": len(target_channels),
+        })
         for channel in target_channels:
             channel_id = int(channel.get("id"))
             channel_title = str(channel.get("title") or channel.get("name") or f"channel-{channel_id}")
+            self._report_progress({
+                "tool": "survey_channels",
+                "stage": "capture",
+                "channel_id": channel_id,
+                "title": channel_title,
+                "message": f"Capturing samples from CH {channel_id} ({channel_title})",
+            })
             snapshots: List[str] = []
             capture_errors: List[str] = []
             for idx in range(sample_count):
                 try:
                     encoded, _meta = self._lxm.get_snapshot_base64(channel_id)
                     snapshots.append(encoded)
+                    self._report_progress({
+                        "tool": "survey_channels",
+                        "stage": "capture_sample",
+                        "channel_id": channel_id,
+                        "title": channel_title,
+                        "sample": idx + 1,
+                        "sample_count": sample_count,
+                        "message": f"Captured sample {idx + 1}/{sample_count} for CH {channel_id}",
+                    })
                 except Exception as exc:
                     capture_errors.append(str(exc))
                 if idx < sample_count - 1:
                     time.sleep(interval_sec)
             if not snapshots:
+                self._report_progress({
+                    "tool": "survey_channels",
+                    "stage": "capture_failed",
+                    "channel_id": channel_id,
+                    "title": channel_title,
+                    "message": f"Could not capture samples from CH {channel_id}",
+                })
                 survey_items.append({
                     "channel_id": channel_id,
                     "title": channel_title,
@@ -1438,6 +1478,13 @@ class AgentTools:
                 })
                 continue
 
+            self._report_progress({
+                "tool": "survey_channels",
+                "stage": "analyze",
+                "channel_id": channel_id,
+                "title": channel_title,
+                "message": f"Analyzing CH {channel_id} ({channel_title})",
+            })
             user_content: List[Dict[str, Any]] = [
                 {"type": "text", "text": f"Channel {channel_id} ({channel_title}).\nTask: {prompt}"}
             ]
@@ -1457,6 +1504,13 @@ class AgentTools:
                 survey = self._lm(messages)
             except Exception as exc:
                 raise ToolError(f"Could not analyze channel {channel_id}: {exc}") from exc
+            self._report_progress({
+                "tool": "survey_channels",
+                "stage": "done_channel",
+                "channel_id": channel_id,
+                "title": channel_title,
+                "message": f"Survey complete for CH {channel_id} ({channel_title})",
+            })
             survey_items.append({
                 "channel_id": channel_id,
                 "title": channel_title,
@@ -2187,6 +2241,14 @@ class AgentTools:
                 return copy.deepcopy(p)
         raise ToolError(f"Probe not found: {probe_id!r}")
 
+    def _report_progress(self, payload: Dict[str, Any]) -> None:
+        cb = getattr(self._local, "progress_cb", None)
+        if callable(cb):
+            try:
+                cb(dict(payload))
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Probe merge / validate helpers
@@ -2587,11 +2649,17 @@ class AgentRunner:
             # Execute each tool call
             for tc in lm_response.tool_calls:
                 yield _sse({"type": "tool_call", "name": tc.name, "args": tc.args})
+                progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
                 try:
                     result = yield from _run_with_heartbeats(
-                        fn=lambda tc=tc: self._tools.execute(tc.name, tc.args),
+                        fn=lambda tc=tc, progress_queue=progress_queue: self._tools.execute(
+                            tc.name,
+                            tc.args,
+                            progress_cb=lambda event: progress_queue.put(event),
+                        ),
                         heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
+                        progress_queue=progress_queue,
                     )
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(result, default=str)}
@@ -2675,6 +2743,7 @@ class AgentRunner:
 def _run_with_heartbeats(
     fn: Callable[[], Any],
     heartbeat_interval: float = AGENT_HEARTBEAT_INTERVAL,
+    progress_queue: Optional["queue.Queue[Dict[str, Any]]"] = None,
 ) -> Generator[str, None, Any]:
     """
     Run fn() in a thread. Yield SSE heartbeat events every heartbeat_interval
@@ -2692,10 +2761,28 @@ def _run_with_heartbeats(
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
+    last_heartbeat = time.time()
     while t.is_alive():
-        t.join(timeout=heartbeat_interval)
-        if t.is_alive():
+        t.join(timeout=0.25)
+        if progress_queue is not None:
+            while True:
+                try:
+                    event = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                yield _sse({"type": "tool_progress", **event})
+        now = time.time()
+        if t.is_alive() and now - last_heartbeat >= heartbeat_interval:
             yield _sse({"type": "heartbeat"})
+            last_heartbeat = now
+
+    if progress_queue is not None:
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            yield _sse({"type": "tool_progress", **event})
 
     if "v" in exc_holder:
         raise exc_holder["v"]

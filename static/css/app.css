@@ -5429,6 +5429,34 @@ textarea::placeholder {
     padding: 0.9rem;
 }
 
+.agent-progress-note {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.8rem 0.95rem;
+    border-radius: 12px;
+    border: 1px dashed rgba(0, 214, 143, 0.26);
+    background: rgba(0, 214, 143, 0.05);
+}
+
+.agent-progress-badge {
+    flex: 0 0 auto;
+    padding: 0.22rem 0.46rem;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 214, 143, 0.28);
+    background: rgba(0, 214, 143, 0.12);
+    color: var(--accent-green);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.agent-progress-text {
+    color: var(--text);
+    font-size: 0.92rem;
+}
+
 .agent-msg-body > :first-child {
     margin-top: 0;
 }

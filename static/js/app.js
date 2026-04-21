@@ -7401,6 +7401,18 @@
             scrollToBottom();
         }
 
+        function appendProgressNote(bubble, evt) {
+            if (!bubble || !bubble.actionsEl) return;
+            const note = document.createElement('div');
+            note.className = 'agent-progress-note';
+            const message = evt && evt.message ? String(evt.message) : 'Working...';
+            note.innerHTML = `<span class="agent-progress-badge">In Progress</span><span class="agent-progress-text">${escapeHtml(message)}</span>`;
+            bubble.actionsEl.appendChild(note);
+            bubble.actionCount = (bubble.actionCount || 0) + 1;
+            updateAgentTraceSummary(bubble);
+            scrollToBottom();
+        }
+
         function updateAgentTraceSummary(bubble) {
             const summaryEl = bubble && bubble.traceEl
                 ? bubble.traceEl.querySelector('.agent-tool-trace-summary')
@@ -7793,6 +7805,9 @@
                     ) {
                         void loadProbeList();
                     }
+                    break;
+                case 'tool_progress':
+                    appendProgressNote(bubble, evt);
                     break;
                 case 'error':
                     appendErrorToMessages(evt.message || 'Unknown error');
