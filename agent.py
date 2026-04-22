@@ -766,6 +766,8 @@ class _AgentLMClient:
         self.endpoint = base_url.rstrip("/") + "/chat/completions"
         self.model    = model
         self.timeout  = timeout
+        self.connect_timeout = min(15, max(5, int(timeout or 120)))
+        self.read_timeout = max(int(timeout or 120), 900)
         self.headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
@@ -780,7 +782,10 @@ class _AgentLMClient:
             "stream": False,
         }
         resp = requests.post(
-            self.endpoint, json=payload, headers=self.headers, timeout=self.timeout
+            self.endpoint,
+            json=payload,
+            headers=self.headers,
+            timeout=(self.connect_timeout, self.read_timeout),
         )
         resp.raise_for_status()
         data   = resp.json()
@@ -823,8 +828,11 @@ class _AgentLMClient:
             "stream": True,
         }
         with requests.post(
-            self.endpoint, json=payload, headers=self.headers,
-            timeout=self.timeout, stream=True
+            self.endpoint,
+            json=payload,
+            headers=self.headers,
+            timeout=(self.connect_timeout, self.read_timeout),
+            stream=True,
         ) as resp:
             resp.raise_for_status()
             for raw_line in resp.iter_lines():

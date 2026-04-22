@@ -7350,7 +7350,7 @@
                     appendAssistantBubble(msg.content, msg.created_at);
                 }
             }
-            scrollToBottom();
+            scrollToBottom(true);
         }
 
         function appendUserBubble(text, ts, imageB64) {
@@ -7366,7 +7366,7 @@
             div.innerHTML = `<div class="agent-msg-header"><span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span> Operator</div>
                 <div class="agent-msg-body">${bodyContent}</div>`;
             el.appendChild(div);
-            scrollToBottom();
+            scrollToBottom(true);
         }
 
         function appendAssistantBubble(text, ts) {
@@ -7383,8 +7383,20 @@
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            scrollToBottom();
+            scrollToBottom(true);
             return { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
+        }
+
+        function isAgentNearBottom(threshold = 72) {
+            const el = elMessages();
+            if (!el) return true;
+            return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - threshold);
+        }
+
+        function setStreamingStatus(bubble, message, mode = 'thinking') {
+            if (!bubble || !bubble.textEl || String(bubble.text || '').trim()) return;
+            const safeMessage = escapeHtml(message || 'Thinking...');
+            bubble.textEl.innerHTML = `<span class="agent-typing-indicator agent-typing-indicator-${mode}"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-label">${safeMessage}</span></span>`;
         }
 
         function startStreamingBubble() {
@@ -7400,7 +7412,6 @@
             bodyEl.className = 'agent-msg-body';
             const textEl = document.createElement('div');
             textEl.className = 'agent-msg-text';
-            textEl.innerHTML = '<span class="agent-typing-indicator"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span></span>';
             const traceEl = document.createElement('details');
             traceEl.className = 'agent-tool-trace';
             traceEl.open = true;
@@ -7416,11 +7427,14 @@
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            scrollToBottom();
-            return { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '' };
+            const bubble = { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '' };
+            setStreamingStatus(bubble, 'Thinking through the request...', 'thinking');
+            scrollToBottom(true);
+            return bubble;
         }
 
         function appendTokenToBubble(bubble, token) {
+            const stickToBottom = isAgentNearBottom();
             bubble.text = (bubble.text || '') + token;
             const rendered = renderMarkdown ? renderMarkdown(bubble.text) : escapeHtml(bubble.text);
             if (bubble.textEl) {
@@ -7428,10 +7442,11 @@
             } else {
                 bubble.bodyEl.innerHTML = rendered;
             }
-            scrollToBottom();
+            scrollToBottom(stickToBottom);
         }
 
         function appendActionCard(bubble, name, result) {
+            const stickToBottom = isAgentNearBottom();
             const card = buildActionCard(name, result);
             if (!card) return;
             if (bubble.actionsEl) {
@@ -7441,11 +7456,12 @@
             } else {
                 bubble.bodyEl.appendChild(card);
             }
-            scrollToBottom();
+            scrollToBottom(stickToBottom);
         }
 
         function appendProgressNote(bubble, evt) {
             if (!bubble || !bubble.actionsEl) return;
+            const stickToBottom = isAgentNearBottom();
             const note = document.createElement('div');
             note.className = 'agent-progress-note';
             const message = evt && evt.message ? String(evt.message) : 'Working...';
@@ -7453,7 +7469,8 @@
             bubble.actionsEl.appendChild(note);
             bubble.actionCount = (bubble.actionCount || 0) + 1;
             updateAgentTraceSummary(bubble);
-            scrollToBottom();
+            setStreamingStatus(bubble, message, 'working');
+            scrollToBottom(stickToBottom);
         }
 
         function updateAgentTraceSummary(bubble) {
@@ -7465,9 +7482,14 @@
             summaryEl.textContent = count > 0 ? `Research trace · ${count} step${count === 1 ? '' : 's'}` : 'Research trace';
         }
 
-        function scrollToBottom() {
+        function scrollToBottom(force = false) {
             const el = elMessages();
-            if (el) el.scrollTop = el.scrollHeight;
+            if (!el) return;
+            if (!force && !isAgentNearBottom()) return;
+            const bubble = _agentPendingBubble;
+            const traceExpanded = Boolean(bubble && bubble.traceEl && bubble.traceEl.open);
+            if (!force && traceExpanded && !isAgentNearBottom()) return;
+            el.scrollTop = el.scrollHeight;
         }
 
         // ---- Action card builders ----
@@ -7838,7 +7860,11 @@
             switch (evt.type) {
                 case 'token':
                 case 'text':
+                    setStreamingStatus(bubble, 'Writing response...', 'writing');
                     if (evt.content) appendTokenToBubble(bubble, evt.content);
+                    break;
+                case 'tool_call':
+                    if (evt.name) setStreamingStatus(bubble, `Running ${evt.name}...`, 'working');
                     break;
                 case 'tool_result':
                     appendActionCard(bubble, evt.name, evt.result);
@@ -7856,6 +7882,8 @@
                     appendErrorToMessages(evt.message || 'Unknown error');
                     break;
                 case 'heartbeat':
+                    setStreamingStatus(bubble, 'Still working...', 'thinking');
+                    break;
                 case 'tool_start':
                 case 'done':
                     break;
@@ -7878,11 +7906,12 @@
         function appendErrorToMessages(msg) {
             const el = elMessages();
             if (!el) return;
+            const stickToBottom = isAgentNearBottom();
             const div = document.createElement('div');
             div.className = 'agent-error-msg';
             div.textContent = msg;
             el.appendChild(div);
-            scrollToBottom();
+            scrollToBottom(stickToBottom);
         }
 
         // ---- Probe list (context sidebar) ----
