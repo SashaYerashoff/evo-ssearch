@@ -91,6 +91,8 @@
     const probeStatus = document.getElementById('probeStatus');
     const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
     const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
+    const probeBookmarkCooldownLocalInput = document.getElementById('probeBookmarkCooldownSecLocal');
+    const probeBookmarkDedupeWindowLocalInput = document.getElementById('probeBookmarkDedupeWindowSecLocal');
     const probeFpsInput = document.getElementById('probeFps');
     const probeWindowSecInput = document.getElementById('probeWindowSec');
     const probeStreamToggleBtn = document.getElementById('probeStreamToggle');
@@ -4480,6 +4482,37 @@
         }
     }
 
+    function normalizeProbePairsForEditor(pairs) {
+        if (!Array.isArray(pairs)) return [];
+        return pairs.map((row) => ({
+            pos: String(row?.pos ?? row?.positive ?? '').trim(),
+            neg: String(row?.neg ?? row?.negative ?? '').trim(),
+        }));
+    }
+
+    function buildProbePairsFromLists(positives, negatives) {
+        const posList = Array.isArray(positives) ? positives : [];
+        const negList = Array.isArray(negatives) ? negatives : [];
+        const size = Math.max(posList.length, negList.length);
+        const rows = [];
+        for (let idx = 0; idx < size; idx += 1) {
+            rows.push({
+                pos: String(posList[idx] ?? '').trim(),
+                neg: String(negList[idx] ?? '').trim(),
+            });
+        }
+        return rows;
+    }
+
+    function serializeProbePairsForStorage(pairs) {
+        return normalizeProbePairsForEditor(pairs)
+            .filter((row) => row.pos || row.neg)
+            .map((row) => ({
+                positive: row.pos,
+                negative: row.neg,
+            }));
+    }
+
     function renderPairs() {
         if (!probePairRows) return;
         ensurePairsSeed();
@@ -4598,7 +4631,8 @@
         const normalizedRoi = normalizeProbeRoiNorm(probeRoiNorm);
         const roiActive = Boolean(probeRoiEnabled && normalizedRoi);
         ensurePairsSeed();
-        probePairsState.forEach((row) => {
+        const editorPairs = normalizeProbePairsForEditor(probePairsState);
+        editorPairs.forEach((row) => {
             if (row.pos?.trim()) positives.push(row.pos.trim());
             if (row.neg?.trim()) negatives.push(row.neg.trim());
         });
@@ -4607,7 +4641,7 @@
             id: activeProbeId,
             name: (probeNameInput?.value || '').trim(),
             channel_id: Number.isFinite(channelId) ? channelId : luxriotActiveChannel,
-            pairs: probePairsState.slice(),
+            pairs: serializeProbePairsForStorage(editorPairs),
             positives,
             negatives,
             pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
@@ -4617,6 +4651,8 @@
             fps: parseFloat(probeFpsInput?.value) || 0,
             severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'info',
             bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
+            bookmark_cooldown_sec: probeBookmarkCooldownLocalInput ? (parseFloat(probeBookmarkCooldownLocalInput.value) || 0) : 8,
+            bookmark_dedupe_window_sec: probeBookmarkDedupeWindowLocalInput ? (parseFloat(probeBookmarkDedupeWindowLocalInput.value) || 0.5) : 20,
             enabled: probeEnableToggle ? probeEnableToggle.checked : true,
             image_probe: {
                 data: probeImageState?.data,
@@ -4918,8 +4954,13 @@
         if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
         if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
+        if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = probe?.bookmark_cooldown_sec ?? 8;
+        if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = probe?.bookmark_dedupe_window_sec ?? 20;
         if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
-        probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
+        const normalizedPairs = normalizeProbePairsForEditor(probe?.pairs);
+        probePairsState = normalizedPairs.length
+            ? normalizedPairs
+            : (probe ? buildProbePairsFromLists(probe?.positives, probe?.negatives) : probePairsState);
         if (probe?.image_probe?.data) {
             probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
             applyImageThumb(probe.image_probe.data);
@@ -5269,6 +5310,8 @@
         if (probeEnableToggle) probeEnableToggle.checked = true;
         if (probeBookmarkToggle) probeBookmarkToggle.checked = true;
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
+        if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = '8';
+        if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = '20';
         if (probePosFloorInput) probePosFloorInput.value = '0.2';
         if (probeMarginInput) probeMarginInput.value = '0.05';
         if (probeFpsInput) probeFpsInput.value = '0';

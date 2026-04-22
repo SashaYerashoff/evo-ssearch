@@ -391,6 +391,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "enum": ["info", "low", "normal", "high", "critical"],
                     },
                     "bookmark_enabled": {"type": "boolean"},
+                    "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
+                    "bookmark_dedupe_window_sec": {"type": "number", "minimum": 0.5},
                     "enabled": {"type": "boolean"},
                     "preview": {"type": "boolean"},
                 },
@@ -481,6 +483,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                                 "enum": ["info", "low", "normal", "high", "critical"],
                             },
                             "bookmark_enabled": {"type": "boolean"},
+                            "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
+                            "bookmark_dedupe_window_sec": {"type": "number", "minimum": 0.5},
                         },
                         "additionalProperties": False,
                     },
@@ -1668,6 +1672,8 @@ class AgentTools:
             "negatives": negatives,
             "pos_floor": _opt_float(args.get("pos_floor")) if args.get("pos_floor") is not None else 0.2,
             "margin": _opt_float(args.get("margin_thr")) if args.get("margin_thr") is not None else 0.05,
+            "bookmark_cooldown_sec": _opt_float(args.get("bookmark_cooldown_sec")) if args.get("bookmark_cooldown_sec") is not None else 8.0,
+            "bookmark_dedupe_window_sec": _opt_float(args.get("bookmark_dedupe_window_sec")) if args.get("bookmark_dedupe_window_sec") is not None else 20.0,
             "top_k": max(1, int(args.get("top_k") or 6)),
             "window_sec": max(0.0, float(args.get("window_sec") or 300.0)),
             "severity": str(args.get("severity") or "critical").strip().lower(),
@@ -2257,6 +2263,7 @@ class AgentTools:
 _SCALAR_PROBE_FIELDS = (
     "pos_floor", "margin", "top_k", "window_sec",
     "enabled", "severity", "bookmark",
+    "bookmark_cooldown_sec", "bookmark_dedupe_window_sec",
     "name", "channel_id",
 )
 
@@ -2288,6 +2295,12 @@ def _merge_probe(current: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, 
             if not isinstance(raw, list):
                 raise ToolError(f"'{f}' must be a list of strings.")
             merged[f] = [str(s).strip() for s in raw if str(s).strip()]
+
+    if "positives" in changes or "negatives" in changes:
+        merged["pairs"] = _probe_pairs_from_lists(
+            merged.get("positives") or [],
+            merged.get("negatives") or [],
+        )
 
     # ROI and image_probe: intentionally not in the schema — preserved unchanged.
 
@@ -2322,6 +2335,24 @@ def _validate_probe(probe: Dict[str, Any]) -> List[str]:
         except (TypeError, ValueError):
             errors.append(f"margin must be a number, got {margin!r}.")
 
+    bookmark_cooldown_sec = probe.get("bookmark_cooldown_sec")
+    if bookmark_cooldown_sec is not None:
+        try:
+            v = float(bookmark_cooldown_sec)
+            if v < 0.0:
+                errors.append(f"bookmark_cooldown_sec must be >= 0.0, got {v}.")
+        except (TypeError, ValueError):
+            errors.append(f"bookmark_cooldown_sec must be a number, got {bookmark_cooldown_sec!r}.")
+
+    bookmark_dedupe_window_sec = probe.get("bookmark_dedupe_window_sec")
+    if bookmark_dedupe_window_sec is not None:
+        try:
+            v = float(bookmark_dedupe_window_sec)
+            if v < 0.5:
+                errors.append(f"bookmark_dedupe_window_sec must be >= 0.5, got {v}.")
+        except (TypeError, ValueError):
+            errors.append(f"bookmark_dedupe_window_sec must be a number, got {bookmark_dedupe_window_sec!r}.")
+
     return errors
 
 
@@ -2350,6 +2381,8 @@ def _probe_summary(probe: Dict[str, Any]) -> Dict[str, Any]:
         "window_sec":  probe.get("window_sec"),
         "severity":    probe.get("severity"),
         "bookmark":    probe.get("bookmark"),
+        "bookmark_cooldown_sec": probe.get("bookmark_cooldown_sec"),
+        "bookmark_dedupe_window_sec": probe.get("bookmark_dedupe_window_sec"),
     }
 
 

@@ -607,14 +607,29 @@ def get_image_embedding_from_pil(pil_image: Image.Image, embedder: Optional[str]
         return features[0]
 
 
-def get_text_embedding(text: str) -> np.ndarray:
-    """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
-    if active_embedder not in {"clip", "fusion"}:
-        raise RuntimeError("Text search is only supported when the CLIP backend is active.")
+def get_clip_text_embedding(text: str) -> np.ndarray:
+    """Extract a text embedding from the CLIP-like backend, including SigLIP2."""
     embeddings = _clip_text_embeddings([text])
     if embeddings.size == 0:
         raise RuntimeError("Text query is empty")
     return embeddings[0]
+
+
+def get_text_embedding(text: str) -> np.ndarray:
+    """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
+    if active_embedder not in {"clip", "fusion"}:
+        raise RuntimeError("Text search is only supported when the CLIP backend is active.")
+    return get_clip_text_embedding(text)
+
+
+def get_probe_image_embedding_from_pil(pil_image: Image.Image) -> np.ndarray:
+    """Probe image embeddings always use the CLIP-like backend so SigLIP2 can drive probe matching."""
+    return get_image_embedding_from_pil(pil_image, embedder="clip")
+
+
+def get_probe_text_embedding(text: str) -> np.ndarray:
+    """Probe text embeddings always use the CLIP-like backend so they remain available outside clip search mode."""
+    return get_clip_text_embedding(text)
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1378,8 +1393,8 @@ except Exception:
     pass
 
 probe_manager = ProbeManager(
-    embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
-    embed_text_fn=lambda text: get_text_embedding(text),
+    embed_image_fn=get_probe_image_embedding_from_pil,
+    embed_text_fn=get_probe_text_embedding,
     jpeg_encoder=_encode_jpeg,
 )
 luxriot_manager.probe_manager = probe_manager
@@ -1956,6 +1971,28 @@ class _ProbeBookmarkGate:
         snapshot_interval = max(1, int(getattr(config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         return snapshot_interval * 1000
 
+    def probe_config(self, probe_like: Mapping[str, Any]) -> Dict[str, Any]:
+        cooldown_sec = _to_optional_float(probe_like.get("bookmark_cooldown_sec"))
+        dedupe_window_sec = _to_optional_float(probe_like.get("bookmark_dedupe_window_sec"))
+        return {
+            "cooldown_ms": int(
+                max(
+                    0.0,
+                    (cooldown_sec if cooldown_sec is not None else (self.cooldown_ms / 1000.0)) * 1000.0,
+                )
+            ),
+            "dedupe_window_ms": int(
+                max(
+                    500.0,
+                    (dedupe_window_sec if dedupe_window_sec is not None else (self.dedupe_window_ms / 1000.0)) * 1000.0,
+                )
+            ),
+            "sim_high": self.sim_high,
+            "margin_delta_thr": self.margin_delta_thr,
+            "score_delta_thr": self.score_delta_thr,
+            "max_frame_gap": self.max_frame_gap,
+        }
+
     def _prune_locked(self) -> None:
         if len(self._state) <= self.max_states:
             return
@@ -1977,11 +2014,19 @@ class _ProbeBookmarkGate:
         neg_score: float,
         margin: float,
         fps_hint: Optional[float],
+        probe_config: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[bool, Dict[str, Any]]:
         key = self._state_key(channel_id, probe_key)
         ts_ms = int(timestamp_ms) if int(timestamp_ms) > 0 else int(time.time() * 1000)
         frame_interval_ms = self._estimate_frame_interval_ms(fps_hint)
         normalized_vec = self._normalize_vec(clip_vec)
+        cfg = dict(probe_config or {})
+        cooldown_ms = int(max(0, int(cfg.get("cooldown_ms", self.cooldown_ms) or self.cooldown_ms)))
+        dedupe_window_ms = int(max(500, int(cfg.get("dedupe_window_ms", self.dedupe_window_ms) or self.dedupe_window_ms)))
+        sim_high = float(cfg.get("sim_high", self.sim_high) or self.sim_high)
+        margin_delta_thr = float(cfg.get("margin_delta_thr", self.margin_delta_thr) or self.margin_delta_thr)
+        score_delta_thr = float(cfg.get("score_delta_thr", self.score_delta_thr) or self.score_delta_thr)
+        max_frame_gap = int(max(1, int(cfg.get("max_frame_gap", self.max_frame_gap) or self.max_frame_gap)))
 
         with self._lock:
             prev = self._state.get(key)
@@ -2011,7 +2056,7 @@ class _ProbeBookmarkGate:
             pos_delta = abs(float(pos_score) - float(prev.get("pos_score") or 0.0))
             neg_delta = abs(float(neg_score) - float(prev.get("neg_score") or 0.0))
 
-            if self.cooldown_ms > 0 and dt_ms < self.cooldown_ms:
+            if cooldown_ms > 0 and dt_ms < cooldown_ms:
                 return False, {
                     "reason": "cooldown",
                     "timestamp_ms": ts_ms,
@@ -2021,16 +2066,16 @@ class _ProbeBookmarkGate:
                 }
 
             stable_scores = (
-                margin_delta < self.margin_delta_thr
-                and pos_delta < self.score_delta_thr
-                and neg_delta < self.score_delta_thr
+                margin_delta < margin_delta_thr
+                and pos_delta < score_delta_thr
+                and neg_delta < score_delta_thr
             )
             if (
-                dt_ms < self.dedupe_window_ms
+                dt_ms < dedupe_window_ms
                 and similarity is not None
-                and similarity >= self.sim_high
+                and similarity >= sim_high
                 and stable_scores
-                and frame_gap <= float(self.max_frame_gap)
+                and frame_gap <= float(max_frame_gap)
             ):
                 return False, {
                     "reason": "similar_recent_hit",
@@ -2107,6 +2152,7 @@ def _maybe_send_probe_bookmark(
     margin = _to_float(hit.get("margin"), 0.0)
     fps_hint = _to_optional_float(probe_like.get("fps"))
     clip_vec = _embed_thumbnail_b64(hit.get("thumbnail"), "clip")
+    gate_config = probe_bookmark_gate.probe_config(probe_like)
 
     allow, gate_meta = probe_bookmark_gate.evaluate(
         channel_id=channel_id,
@@ -2117,8 +2163,11 @@ def _maybe_send_probe_bookmark(
         neg_score=neg_score,
         margin=margin,
         fps_hint=fps_hint,
+        probe_config=gate_config,
     )
     gate_meta["source"] = source
+    gate_meta["cooldown_sec"] = round(float(gate_config.get("cooldown_ms", 0)) / 1000.0, 3)
+    gate_meta["dedupe_window_sec"] = round(float(gate_config.get("dedupe_window_ms", 0)) / 1000.0, 3)
     if not allow:
         gate_meta["sent"] = False
         return False, gate_meta
@@ -4861,6 +4910,20 @@ def probes_save():
         "negatives": negatives,
         "pos_floor": _float(data.get('pos_floor'), 0.2),
         "margin": _float(data.get('margin'), 0.05),
+        "bookmark_cooldown_sec": max(
+            0.0,
+            _float(
+                data.get('bookmark_cooldown_sec'),
+                existing_probe.get('bookmark_cooldown_sec', config.PROBE_BOOKMARK_COOLDOWN_SEC),
+            ),
+        ),
+        "bookmark_dedupe_window_sec": max(
+            0.5,
+            _float(
+                data.get('bookmark_dedupe_window_sec'),
+                existing_probe.get('bookmark_dedupe_window_sec', config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC),
+            ),
+        ),
         "top_k": _int(data.get('top_k'), 6),
         "window_sec": _float(data.get('window_sec'), 300.0),
         "severity": (data.get('severity') or 'critical').lower(),
