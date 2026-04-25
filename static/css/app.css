@@ -4358,7 +4358,8 @@ body::after {
 .agent-sessions-sub,
 .agent-chat-sub,
 .archive-results-sub,
-.video-analysis-sub {
+.video-analysis-sub,
+.video-control-note {
     color: var(--muted);
     font-size: 0.83rem;
     line-height: 1.5;

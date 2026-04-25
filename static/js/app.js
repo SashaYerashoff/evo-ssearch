@@ -68,6 +68,7 @@
     const luxriotStopAllVideoBtn = document.getElementById('luxriotStopAllVideo');
     const luxriotStopAllAnalyticsBtn = document.getElementById('luxriotStopAllAnalytics');
     const luxriotPromptInput = document.getElementById('luxriotPrompt');
+    const luxriotLiveModelInput = document.getElementById('luxriotLiveModel');
     const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
     const luxriotRollupPromptL1Input = document.getElementById('luxriotRollupPromptL1');
     const luxriotRollupPromptL2Input = document.getElementById('luxriotRollupPromptL2');
@@ -235,6 +236,17 @@
     const channelCaptureConfig = {};
     const channelFpsDesired = {};
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
+    const LUXRIOT_LIVE_MODEL_STORAGE_KEY = 'evs_luxriot_live_model';
+
+    if (luxriotLiveModelInput) {
+        const storedLiveModel = (localStorage.getItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY) || '').trim();
+        if (storedLiveModel) {
+            luxriotLiveModelInput.value = storedLiveModel;
+        }
+        luxriotLiveModelInput.addEventListener('input', () => {
+            localStorage.setItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY, (luxriotLiveModelInput.value || '').trim());
+        });
+    }
 
     function getAdminToken() {
         return (localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '').trim();
@@ -2164,6 +2176,14 @@
             if (!(String(selectedChannelId) in luxriotCaptureRunningByChannel)) {
                 luxriotCaptureRunningByChannel[String(selectedChannelId)] = false;
             }
+            if (luxriotLiveModelInput && document.activeElement !== luxriotLiveModelInput) {
+                const selectedVideoStream = videoStreams.find((stream) => parseInt(String(stream?.channel_id ?? ''), 10) === selectedChannelId);
+                const liveModel = String(selectedVideoStream?.model || '').trim();
+                if (liveModel) {
+                    luxriotLiveModelInput.value = liveModel;
+                    localStorage.setItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY, liveModel);
+                }
+            }
             updateLuxriotCaptureToggleButton(selectedChannelId);
             try {
                 const probesResp = await fetch('/probes/list');
@@ -2525,7 +2545,7 @@
                     channel_id: channelId,
                     batch_size: batchSize,
                     prompt: prompt || fallbackPrompt,
-                    model: videoModelInput ? videoModelInput.value.trim() : '',
+                    model: luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '',
                     system_prompt: systemPrompt
                 })
             });
@@ -2535,7 +2555,8 @@
             }
             setLuxriotCaptureRunning(channelId, true);
             updateLuxriotCaptureToggleButton(channelId);
-            setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
+            const modelLabel = data?.session?.model || (luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '') || '';
+            setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize}${modelLabel ? ` · ${modelLabel}` : ''})`);
             luxriotSummaryChannel = channelId;
             luxriotSummaryFollowLive = true;
             syncLuxriotSummaryChannelSelect();

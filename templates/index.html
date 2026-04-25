@@ -226,6 +226,11 @@
                             </span>
                             <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
                         </div>
+                        <div class="luxriot-row">
+                            <label for="luxriotLiveModel">Live model:</label>
+                            <input type="text" id="luxriotLiveModel" class="luxriot-mini-input" placeholder="qwen/qwen3-vl-4b" value="{{ lm_model }}" />
+                        </div>
+                        <div class="video-control-note">Used only for live summaries. Offline Video Analysis uses its own separate model field.</div>
                         <div class="luxriot-actions">
                             <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
                             <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
