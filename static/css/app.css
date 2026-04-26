@@ -3935,35 +3935,75 @@
     font-family: 'Courier New', monospace;
 }
 
-.agent-cap-list {
+.agent-skill-list {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 10px;
 }
 
-.agent-cap-item {
-    font-size: 12px;
-    color: var(--muted);
-    padding: 6px 8px;
-    border-left: 2px solid var(--panel-border);
-    transition: border-color 0.15s, color 0.15s;
-    cursor: default;
+.agent-skill-card {
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(37, 51, 66, 0.92);
+    background: rgba(18, 24, 31, 0.96);
 }
 
-.agent-cap-item:hover {
-    border-left-color: var(--agent-green);
+.agent-skill-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.agent-skill-name {
     color: var(--text);
+    font-size: 0.84rem;
+    font-weight: 600;
 }
 
-/* Error state */
-.agent-error-msg {
+.agent-skill-summary {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.5;
+}
+
+.agent-skill-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.agent-skill-create-btn {
+    width: 100%;
+    margin-top: 12px;
+}
+
+/* Inline notices */
+.agent-inline-msg {
     padding: 10px 14px;
-    background: rgba(255, 71, 87, 0.1);
-    border: 1px solid rgba(255, 71, 87, 0.3);
     border-radius: 4px;
     font-size: 13px;
-    color: #ff4757;
     margin-top: 8px;
+}
+
+.agent-inline-msg.error {
+    background: rgba(255, 71, 87, 0.1);
+    border: 1px solid rgba(255, 71, 87, 0.3);
+    color: #ff4757;
+}
+
+.agent-inline-msg.info {
+    background: rgba(51, 154, 240, 0.12);
+    border: 1px solid rgba(51, 154, 240, 0.32);
+    color: #8bc4ff;
+}
+
+.agent-inline-msg.success {
+    background: rgba(0, 214, 143, 0.12);
+    border: 1px solid rgba(0, 214, 143, 0.32);
+    color: var(--agent-green);
 }
 
 /* Responsive */

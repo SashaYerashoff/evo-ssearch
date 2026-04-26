@@ -28,6 +28,17 @@
     const monitorBox = document.getElementById('monitorBox');
     const agentModeBtn = document.getElementById('agentModeBtn');
     const agentBox = document.getElementById('agentBox');
+    const agentSkillList = document.getElementById('agentSkillList');
+    const agentCreateSkillBtn = document.getElementById('agentCreateSkillBtn');
+    const agentSkillModal = document.getElementById('agentSkillModal');
+    const closeAgentSkillModalBtn = document.getElementById('closeAgentSkillModal');
+    const agentSkillCancelBtn = document.getElementById('agentSkillCancelBtn');
+    const agentSkillSaveBtn = document.getElementById('agentSkillSaveBtn');
+    const agentSkillModalTitle = document.getElementById('agentSkillModalTitle');
+    const agentSkillNameInput = document.getElementById('agentSkillNameInput');
+    const agentSkillSlugInput = document.getElementById('agentSkillSlugInput');
+    const agentSkillMeta = document.getElementById('agentSkillMeta');
+    const agentSkillContentInput = document.getElementById('agentSkillContentInput');
     const headerStatusText = document.querySelector('.header-status-text');
     const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
     const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
@@ -237,6 +248,7 @@
     const channelFpsDesired = {};
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
     const LUXRIOT_LIVE_MODEL_STORAGE_KEY = 'evs_luxriot_live_model';
+    let agentSkillDraft = null;
 
     if (luxriotLiveModelInput) {
         const storedLiveModel = (localStorage.getItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY) || '').trim();
@@ -7308,7 +7320,7 @@
                         ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
                         : `Using default model: ${data.default_model || 'n/a'}`;
                 }
-                appendErrorToMessages(`Agent model set to ${data.model || model || 'default'}`);
+                appendAgentNotice(`Agent model set to ${data.model || model || 'default'}`, 'success');
             } catch (e) {
                 appendErrorToMessages(`Failed to set agent model: ${e.message}`);
             } finally {
@@ -7974,15 +7986,19 @@
             }
         }
 
-        function appendErrorToMessages(msg) {
+        function appendAgentNotice(msg, tone = 'info') {
             const el = elMessages();
             if (!el) return;
             const stickToBottom = isAgentNearBottom();
             const div = document.createElement('div');
-            div.className = 'agent-error-msg';
+            div.className = `agent-inline-msg ${tone}`;
             div.textContent = msg;
             el.appendChild(div);
             scrollToBottom(stickToBottom);
+        }
+
+        function appendErrorToMessages(msg) {
+            appendAgentNotice(msg, 'error');
         }
 
         // ---- Probe list (context sidebar) ----
@@ -8011,6 +8027,108 @@
             } catch(e) {
                 el.innerHTML = '<div class="agent-probe-empty">Failed to load probes</div>';
             }
+        }
+
+        function closeAgentSkillModal() {
+            if (agentSkillModal) agentSkillModal.classList.remove('open');
+            agentSkillDraft = null;
+        }
+
+        function openAgentSkillModal(mode, skill = null) {
+            agentSkillDraft = { mode, skill };
+            if (agentSkillModalTitle) {
+                agentSkillModalTitle.textContent = mode === 'create' ? 'Create Skill' : 'Edit Skill';
+            }
+            if (agentSkillNameInput) agentSkillNameInput.value = skill?.name || '';
+            if (agentSkillSlugInput) {
+                agentSkillSlugInput.value = skill?.slug || '';
+                agentSkillSlugInput.disabled = mode !== 'create';
+            }
+            if (agentSkillMeta) {
+                agentSkillMeta.textContent = mode === 'create'
+                    ? 'Create a new playbook. It will immediately become available to the agent on the next message.'
+                    : `Editing ${skill?.path || 'skill'}`;
+            }
+            if (agentSkillContentInput) {
+                agentSkillContentInput.value = skill?.content || `# ${skill?.name || 'New Skill'}\n\nGoal: describe when this playbook should be used.\n\nDefault order:\n1. Clarify missing inputs if needed.\n2. Inspect the relevant context.\n3. Use the right tools in a safe order.\n4. Summarize the result for the operator.\n`;
+            }
+            if (agentSkillModal) agentSkillModal.classList.add('open');
+        }
+
+        async function agentLoadSkills() {
+            if (!agentSkillList) return;
+            try {
+                const r = await fetch('/agent/skills');
+                if (!r.ok) return;
+                const data = await r.json();
+                const skills = Array.isArray(data.skills) ? data.skills : [];
+                if (!skills.length) {
+                    agentSkillList.innerHTML = '<div class="agent-probe-empty">No skills yet</div>';
+                    return;
+                }
+                agentSkillList.innerHTML = skills.map((skill) => `
+                    <div class="agent-skill-card" data-skill-slug="${escapeHtml(skill.slug || '')}">
+                        <div class="agent-skill-head">
+                            <div class="agent-skill-name">${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}</div>
+                            <div class="agent-skill-actions">
+                                <button class="feature-btn" data-agent-skill-run="${escapeHtml(skill.slug || '')}">Run</button>
+                                <button class="feature-btn" data-agent-skill-edit="${escapeHtml(skill.slug || '')}">Edit</button>
+                            </div>
+                        </div>
+                        <div class="agent-skill-summary">${escapeHtml(skill.summary || 'No summary yet.')}</div>
+                    </div>
+                `).join('');
+            } catch(e) {
+                agentSkillList.innerHTML = '<div class="agent-probe-empty">Failed to load skills</div>';
+            }
+        }
+
+        async function agentOpenSkillEditor(slug) {
+            try {
+                const r = await fetch(`/agent/skills/${encodeURIComponent(slug)}`);
+                const data = await r.json();
+                if (!r.ok || data.error) throw new Error(data.error || 'Failed to load skill');
+                openAgentSkillModal('edit', data);
+            } catch (e) {
+                appendErrorToMessages(`Failed to open skill: ${e.message}`);
+            }
+        }
+
+        async function agentSaveSkill() {
+            if (!agentSkillDraft) return;
+            const payload = {
+                name: (agentSkillNameInput?.value || '').trim(),
+                slug: (agentSkillSlugInput?.value || '').trim(),
+                content: agentSkillContentInput?.value || '',
+            };
+            try {
+                const isCreate = agentSkillDraft.mode === 'create';
+                const endpoint = isCreate
+                    ? '/agent/skills/create'
+                    : `/agent/skills/${encodeURIComponent(agentSkillDraft.skill.slug)}`;
+                const r = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await r.json();
+                if (!r.ok || data.error) throw new Error(data.error || 'Failed to save skill');
+                closeAgentSkillModal();
+                await agentLoadSkills();
+                appendAgentNotice(`Skill saved: ${(data.skill && data.skill.name) || payload.name || payload.slug}`, 'success');
+            } catch (e) {
+                appendErrorToMessages(`Failed to save skill: ${e.message}`);
+            }
+        }
+
+        function agentRunSkill(slug) {
+            const input = elInput();
+            const existing = input ? (input.value || '').trim() : '';
+            const prompt = existing
+                ? `Use playbook "${slug}" for this operator request:\n${existing}`
+                : `Use playbook "${slug}" for the current task. If required inputs are missing, ask only the minimum clarifying questions before acting.`;
+            if (input) input.value = '';
+            void agentSend(prompt);
         }
 
         function clearImageAttachment() {
@@ -8050,6 +8168,7 @@
 
             setupTextarea();
             void agentLoadConfig();
+            void agentLoadSkills();
 
             const sendBtn = elSendBtn();
             if (sendBtn) {
@@ -8101,6 +8220,37 @@
                             ta.focus();
                         }
                     });
+                });
+            }
+
+            if (agentSkillList) {
+                agentSkillList.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof Element)) return;
+                    const runBtn = target.closest('[data-agent-skill-run]');
+                    if (runBtn instanceof HTMLButtonElement) {
+                        const slug = (runBtn.dataset.agentSkillRun || '').trim();
+                        if (slug) agentRunSkill(slug);
+                        return;
+                    }
+                    const editBtn = target.closest('[data-agent-skill-edit]');
+                    if (editBtn instanceof HTMLButtonElement) {
+                        const slug = (editBtn.dataset.agentSkillEdit || '').trim();
+                        if (slug) void agentOpenSkillEditor(slug);
+                    }
+                });
+            }
+
+            if (agentCreateSkillBtn) {
+                agentCreateSkillBtn.addEventListener('click', () => {
+                    openAgentSkillModal('create', null);
+                });
+            }
+            if (closeAgentSkillModalBtn) closeAgentSkillModalBtn.addEventListener('click', closeAgentSkillModal);
+            if (agentSkillCancelBtn) agentSkillCancelBtn.addEventListener('click', closeAgentSkillModal);
+            if (agentSkillSaveBtn) {
+                agentSkillSaveBtn.addEventListener('click', () => {
+                    void agentSaveSkill();
                 });
             }
 

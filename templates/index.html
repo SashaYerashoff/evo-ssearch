@@ -535,15 +535,11 @@
                         </div>
                     </div>
                     <div class="agent-ctx-section">
-                        <div class="agent-ctx-title">Agent Can</div>
-                        <div class="agent-cap-list">
-                            <div class="agent-cap-item">&#8627; search archive by text/image</div>
-                            <div class="agent-cap-item">&#8627; view &amp; analyze detections</div>
-                            <div class="agent-cap-item">&#8627; tune probe thresholds</div>
-                            <div class="agent-cap-item">&#8627; generate daily reports</div>
-                            <div class="agent-cap-item">&#8627; create Luxriot bookmarks</div>
-                            <div class="agent-cap-item">&#8627; describe frames (VLM)</div>
+                        <div class="agent-ctx-title">Skills</div>
+                        <div id="agentSkillList" class="agent-skill-list">
+                            <div class="agent-probe-empty">Loading skills...</div>
                         </div>
+                        <button id="agentCreateSkillBtn" class="feature-btn agent-skill-create-btn">Create New Skill</button>
                     </div>
                     </div>
                 </aside>
@@ -671,6 +667,33 @@
                     <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
                     <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="agentSkillModal" class="settings-modal">
+        <div class="settings-modal-content prompt-modal-content">
+            <div class="settings-header">
+                <h2 id="agentSkillModalTitle">Edit Skill</h2>
+                <button class="close-btn" id="closeAgentSkillModal">&times;</button>
+            </div>
+            <div class="prompt-modal-scrollarea">
+                <div class="prompt-modal-tabs">
+                    <div class="input-group">
+                        <label class="input-label" for="agentSkillNameInput">Skill name</label>
+                        <input type="text" id="agentSkillNameInput" class="settings-input" />
+                    </div>
+                    <div class="input-group">
+                        <label class="input-label" for="agentSkillSlugInput">Slug</label>
+                        <input type="text" id="agentSkillSlugInput" class="settings-input" />
+                    </div>
+                </div>
+                <div class="prompt-modal-meta" id="agentSkillMeta">Edit the playbook markdown used by the agent.</div>
+                <textarea id="agentSkillContentInput" class="luxriot-prompt prompt-modal-editor" placeholder="# Skill title"></textarea>
+            </div>
+            <div class="settings-actions prompt-modal-actions">
+                <button id="agentSkillCancelBtn" class="settings-btn">Cancel</button>
+                <button id="agentSkillSaveBtn" class="settings-btn primary">Save Skill</button>
             </div>
         </div>
     </div>

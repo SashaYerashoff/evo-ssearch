@@ -1470,6 +1470,151 @@ detections_store = DetectionsStore()
 _agent_runner: Optional[Any] = None
 _agent_runner_lock = threading.Lock()
 _agent_runtime_model_override: Optional[str] = None
+_skills_root = Path(__file__).resolve().parent / "skills"
+
+
+def _slugify_skill_name(value: str) -> str:
+    text = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(value or "").strip())
+    parts = [part for part in text.split("-") if part]
+    return "-".join(parts)[:80]
+
+
+def _normalize_skill_token(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    token = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw)
+    while "--" in token:
+        token = token.replace("--", "-")
+    return token.strip("-_")[:80]
+
+
+def _candidate_skill_slugs(value: str) -> List[str]:
+    base = _normalize_skill_token(value)
+    if not base:
+        return []
+    variants: List[str] = []
+    for candidate in (base, base.replace("-", "_"), base.replace("_", "-")):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _skill_title_from_markdown(content: str, fallback_slug: str) -> str:
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            return line.lstrip("#").strip() or fallback_slug.replace("-", " ").title()
+        break
+    return fallback_slug.replace("-", " ").title()
+
+
+def _skill_summary_from_markdown(content: str) -> str:
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line[:180]
+    return "No summary yet."
+
+
+def _skill_markdown_template(name: str) -> str:
+    title = str(name or "New Skill").strip() or "New Skill"
+    return (
+        f"# {title}\n\n"
+        "Goal: describe when this playbook should be used.\n\n"
+        "Default order:\n"
+        "1. Clarify missing inputs if needed.\n"
+        "2. Inspect the relevant context.\n"
+        "3. Use the right tools in a safe order.\n"
+        "4. Summarize the result for the operator.\n\n"
+        "Notes:\n"
+        "- Add decision rules here.\n"
+        "- Add embedder/model-specific guidance here.\n"
+    )
+
+
+def _apply_skill_title_to_markdown(name: str, content: str, slug: str) -> str:
+    title = str(name or "").strip() or slug.replace("-", " ").title()
+    body = str(content or "").strip()
+    if not body:
+        return _skill_markdown_template(title)
+    lines = body.splitlines()
+    for idx, raw_line in enumerate(lines):
+        if not raw_line.strip():
+            continue
+        if raw_line.lstrip().startswith("#"):
+            lines[idx] = f"# {title}"
+            return "\n".join(lines).strip()
+        return f"# {title}\n\n{body}".strip()
+    return _skill_markdown_template(title)
+
+
+def _resolve_skill_path(slug: str) -> Path:
+    candidates = _candidate_skill_slugs(slug)
+    if not candidates:
+        raise ValueError("Invalid skill slug")
+    root = _skills_root.resolve()
+    existing_paths: List[Path] = []
+    for candidate in candidates:
+        skill_file = (_skills_root / candidate / "SKILL.md").resolve()
+        if root not in skill_file.parents:
+            raise ValueError("Skill path is outside skills root")
+        if skill_file.exists():
+            existing_paths.append(skill_file)
+    if existing_paths:
+        return existing_paths[0]
+    fallback = (_skills_root / candidates[0] / "SKILL.md").resolve()
+    if root not in fallback.parents:
+        raise ValueError("Skill path is outside skills root")
+    return fallback
+
+
+def _list_skill_records() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not _skills_root.exists():
+        return records
+    for skill_file in sorted(_skills_root.rglob("SKILL.md")):
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        slug = skill_file.parent.name
+        stat = skill_file.stat()
+        records.append({
+            "slug": slug,
+            "name": _skill_title_from_markdown(content, slug),
+            "summary": _skill_summary_from_markdown(content),
+            "path": str(skill_file.relative_to(Path(__file__).resolve().parent)),
+            "updated_at": stat.st_mtime,
+        })
+    return records
+
+
+def _load_skill_record(slug: str) -> Dict[str, Any]:
+    skill_file = _resolve_skill_path(slug)
+    if not skill_file.exists():
+        raise FileNotFoundError(f"Skill not found: {slug}")
+    content = skill_file.read_text(encoding="utf-8")
+    stat = skill_file.stat()
+    return {
+        "slug": skill_file.parent.name,
+        "name": _skill_title_from_markdown(content, skill_file.parent.name),
+        "summary": _skill_summary_from_markdown(content),
+        "content": content,
+        "path": str(skill_file.relative_to(Path(__file__).resolve().parent)),
+        "updated_at": stat.st_mtime,
+    }
+
+
+def _save_skill_record(slug: str, name: str, content: str) -> Dict[str, Any]:
+    skill_file = _resolve_skill_path(slug)
+    skill_file.parent.mkdir(parents=True, exist_ok=True)
+    final_content = _apply_skill_title_to_markdown(name, content, skill_file.parent.name)
+    skill_file.write_text(final_content.rstrip() + "\n", encoding="utf-8")
+    return _load_skill_record(skill_file.parent.name)
 
 
 def _get_agent_runner() -> Any:
@@ -6057,6 +6202,68 @@ def agent_config():
         _agent_runtime_model_override = raw_model or None
         _agent_runner = None
     return jsonify({'success': True, **_get_agent_config_payload()})
+
+
+@app.route('/agent/skills', methods=['GET'])
+def agent_skills():
+    try:
+        return jsonify({'skills': _list_skill_records()})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/agent/skills/create', methods=['POST'])
+def agent_skills_create():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_name = str(data.get('name') or '').strip()
+    raw_slug = str(data.get('slug') or '').strip()
+    slug = _slugify_skill_name(raw_slug or raw_name)
+    if not raw_name:
+        return jsonify({'error': 'name is required'}), 400
+    if not slug:
+        return jsonify({'error': 'Could not derive a valid skill slug'}), 400
+    try:
+        skill_file = _resolve_skill_path(slug)
+        if skill_file.exists():
+            return jsonify({'error': f'Skill already exists: {slug}'}), 409
+        skill = _save_skill_record(slug, raw_name, str(data.get('content') or ''))
+        return jsonify({'success': True, 'skill': skill})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/agent/skills/<slug>', methods=['GET', 'POST'])
+def agent_skill_detail(slug: str):
+    if request.method == 'GET':
+        try:
+            return jsonify(_load_skill_record(slug))
+        except FileNotFoundError:
+            return jsonify({'error': 'Skill not found'}), 404
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        current = _load_skill_record(slug)
+    except FileNotFoundError:
+        return jsonify({'error': 'Skill not found'}), 404
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    try:
+        updated = _save_skill_record(
+            slug=current['slug'],
+            name=str(data.get('name') or current.get('name') or current['slug']),
+            content=str(data.get('content') or current.get('content') or ''),
+        )
+        return jsonify({'success': True, 'skill': updated})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/agent/session/<session_id>', methods=['GET', 'DELETE'])
