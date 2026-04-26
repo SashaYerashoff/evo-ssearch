@@ -1469,6 +1469,7 @@ detections_store = DetectionsStore()
 # are fully defined before the runner captures them as callables.
 _agent_runner: Optional[Any] = None
 _agent_runner_lock = threading.Lock()
+_agent_runtime_model_override: Optional[str] = None
 
 
 def _get_agent_runner() -> Any:
@@ -1535,11 +1536,20 @@ def _get_agent_runner() -> Any:
             search_indexed_folder_fn=_agent_search_folder,
             search_detections_fn=_agent_search_detections,
             lm_base_url=config.LM_BASE_URL,
-            lm_model=config.LM_MODEL,
+            lm_model=_agent_runtime_model_override or config.LM_MODEL,
             lm_api_key=config.LM_API_KEY,
             lm_timeout=config.LM_TIMEOUT,
         )
         return _agent_runner
+
+
+def _get_agent_config_payload() -> Dict[str, Any]:
+    return {
+        "model": str(_agent_runtime_model_override or config.LM_MODEL or "").strip(),
+        "default_model": str(config.LM_MODEL or "").strip(),
+        "override_model": str(_agent_runtime_model_override or "").strip() or None,
+        "source": "runtime_override" if _agent_runtime_model_override else "config",
+    }
 
 
 DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
@@ -6030,6 +6040,23 @@ def agent_sessions():
     except Exception as exc:
         return jsonify({'error': f'Agent unavailable: {exc}'}), 503
     return jsonify({'sessions': runner.store.list_sessions()})
+
+
+@app.route('/agent/config', methods=['GET', 'POST'])
+def agent_config():
+    global _agent_runner, _agent_runtime_model_override
+    if request.method == 'GET':
+        return jsonify(_get_agent_config_payload())
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_model = str(data.get('model') or '').strip()
+    with _agent_runner_lock:
+        _agent_runtime_model_override = raw_model or None
+        _agent_runner = None
+    return jsonify({'success': True, **_get_agent_config_payload()})
 
 
 @app.route('/agent/session/<session_id>', methods=['GET', 'DELETE'])

@@ -5350,6 +5350,25 @@ textarea::placeholder {
     gap: 12px;
 }
 
+.agent-model-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.agent-model-label {
+    color: var(--muted);
+    font-size: 0.76rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    font-family: "JetBrains Mono", monospace;
+}
+
+.agent-model-input {
+    min-width: 240px;
+}
+
 .agent-chat-title {
     font-family: "JetBrains Mono", monospace;
     letter-spacing: 0.14em;

@@ -7246,6 +7246,8 @@
         const elSendBtn     = () => q('agentSendBtn');
         const elNewSession  = () => q('agentNewSessionBtn');
         const elProbeList   = () => q('agentProbeList');
+        const elAgentModelInput = () => q('agentModelInput');
+        const elAgentModelApplyBtn = () => q('agentModelApplyBtn');
 
         // ---- Helpers ----
         function fmtTime(isoOrTs) {
@@ -7264,6 +7266,54 @@
                 if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
                 return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
             } catch(_) { return ''; }
+        }
+
+        async function agentLoadConfig() {
+            try {
+                const r = await fetch('/agent/config');
+                if (!r.ok) return;
+                const data = await r.json();
+                const input = elAgentModelInput();
+                if (input && document.activeElement !== input) {
+                    input.value = data.model || '';
+                    input.title = data.source === 'runtime_override'
+                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
+                        : `Using default model: ${data.default_model || 'n/a'}`;
+                }
+            } catch(e) {
+                console.warn('agent: failed to load config', e);
+            }
+        }
+
+        async function agentSaveConfig() {
+            const input = elAgentModelInput();
+            if (!input || _agentStreaming) return;
+            const applyBtn = elAgentModelApplyBtn();
+            const model = (input.value || '').trim();
+            const prevDisabled = applyBtn ? applyBtn.disabled : false;
+            if (applyBtn) applyBtn.disabled = true;
+            try {
+                const r = await fetch('/agent/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model }),
+                });
+                const data = await r.json();
+                if (!r.ok || data.error) {
+                    throw new Error(data.error || 'Failed to save agent model');
+                }
+                if (input) {
+                    input.value = data.model || model;
+                    input.title = data.source === 'runtime_override'
+                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
+                        : `Using default model: ${data.default_model || 'n/a'}`;
+                }
+                appendErrorToMessages(`Agent model set to ${data.model || model || 'default'}`);
+            } catch (e) {
+                appendErrorToMessages(`Failed to set agent model: ${e.message}`);
+            } finally {
+                if (applyBtn) applyBtn.disabled = prevDisabled;
+            }
         }
 
         // ---- Session list ----
@@ -7999,6 +8049,7 @@
             _agentInitDone = true;
 
             setupTextarea();
+            void agentLoadConfig();
 
             const sendBtn = elSendBtn();
             if (sendBtn) {
@@ -8020,6 +8071,22 @@
                     localStorage.removeItem(AGENT_LS_SESSION);
                     showWelcome();
                     highlightActiveSession(null);
+                });
+            }
+
+            const modelBtn = elAgentModelApplyBtn();
+            if (modelBtn) {
+                modelBtn.addEventListener('click', () => {
+                    void agentSaveConfig();
+                });
+            }
+            const modelInput = elAgentModelInput();
+            if (modelInput) {
+                modelInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void agentSaveConfig();
+                    }
                 });
             }
 
