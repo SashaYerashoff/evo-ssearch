@@ -74,7 +74,7 @@ class Config:
         EMB_DIM_DINO = 1280
     DINO_WEIGHTS_PATH = os.getenv(
         'EVOSSEARCH_DINO_WEIGHTS_PATH',
-        '/home/sasha/Downloads/dinoweigths/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth',
+        '',
     )
     DINO_DEVICE = os.getenv('EVOSSEARCH_DINO_DEVICE', 'cuda:0').strip()
 
@@ -145,7 +145,7 @@ class Config:
     ALLOWED_ROOTS = _get_path_list_env('EVOSSEARCH_ALLOWED_ROOTS')
 
     # LM Studio / Qwen video understanding
-    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://192.168.1.104:1234/v1').strip().rstrip('/')
+    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:1234/v1').strip().rstrip('/')
     LM_MODEL = os.getenv('EVOSSEARCH_LM_MODEL', 'qwen/qwen3-vl-4b').strip()
     LM_API_KEY = os.getenv('EVOSSEARCH_LM_API_KEY', '').strip()
     try:
@@ -179,7 +179,7 @@ class Config:
         LM_VIDEO_TEMPERATURE = 0.2
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
     # Luxriot Evo integration
-    LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://192.168.1.102:8080').strip().rstrip('/')
+    LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://luxriot-host:8080').strip().rstrip('/')
     LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
     LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '').strip()
     try:
@@ -194,9 +194,9 @@ class Config:
         LUXRIOT_SNAPSHOT_MAX_EDGE = 640
     LUXRIOT_BATCH_SIZES = (12, 24, 36)
     try:
-        LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '103'))
+        LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '1'))
     except (TypeError, ValueError):
-        LUXRIOT_DEFAULT_CHANNEL_ID = 103
+        LUXRIOT_DEFAULT_CHANNEL_ID = 1
     try:
         LUXRIOT_MAX_BUFFER_FRAMES = int(os.getenv('EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES', '180'))
     except (TypeError, ValueError):

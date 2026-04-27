@@ -20,7 +20,7 @@ Luxriot EVA AI is a CLIP/DINO visual search and monitoring PoC for Luxriot-integ
 
 ## Current Scope
 
-This branch (`lxrt-inntegration`) is a working exhibition PoC focused on:
+This branch is a working exhibition PoC focused on:
 
 - Stable end-to-end UX in 3 tabs: `Archive Research`, `Video Understanding`, `Monitoring`
 - Secure mutation paths via admin token
@@ -81,9 +81,9 @@ Note: Comments and segmentation are intentionally limited to indexed-folder imag
 ## Installation
 
 ```bash
-git clone https://github.com/SashaYerashoff/evo-ssearch.git
+git clone <your-repo-url>
 cd evo-ssearch
-git checkout lxrt-inntegration
+git checkout <feature-branch>
 
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\\Scripts\\Activate.ps1
@@ -300,10 +300,10 @@ EVOSSEARCH_LM_VIDEO_MAX_TOKENS=1536
 EVOSSEARCH_LM_VIDEO_TEMPERATURE=0.2
 
 # Luxriot
-EVOSSEARCH_LUXRIOT_BASE_URL=http://192.168.1.102:8080
+EVOSSEARCH_LUXRIOT_BASE_URL=http://luxriot-host:8080
 EVOSSEARCH_LUXRIOT_USERNAME=
 EVOSSEARCH_LUXRIOT_PASSWORD=
-EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=103
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=1
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=5
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES=180

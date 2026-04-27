@@ -3569,10 +3569,10 @@
             document.getElementById('maxCommentLength').value = '100';
             document.getElementById('maxFileSize').value = '50';
             document.getElementById('indexFolderName').value = '.clip_index';
-            luxriotBaseUrlInput.value = 'http://192.168.1.102:8080';
-            luxriotUsernameInput.value = 'admin';
-            luxriotPasswordInput.value = '123';
-            luxriotDefaultChannelIdInput.value = '103';
+            luxriotBaseUrlInput.value = 'http://luxriot-host:8080';
+            luxriotUsernameInput.value = '';
+            luxriotPasswordInput.value = '';
+            luxriotDefaultChannelIdInput.value = '1';
             luxriotSnapshotIntervalInput.value = '5';
             luxriotSnapshotMaxEdgeInput.value = '800';
             luxriotMaxBufferFramesInput.value = '180';
