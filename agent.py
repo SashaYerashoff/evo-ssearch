@@ -42,7 +42,9 @@ AGENT_HEARTBEAT_INTERVAL   = 15       # seconds between SSE heartbeats
 AGENT_SESSION_TTL_DAYS     = 30       # sessions older than this are GC'd
 AGENT_MAX_SESSIONS         = 100      # sessions kept per store (GC oldest)
 AGENT_MAX_MESSAGES_PER_SESSION = 200  # messages kept per session (prune oldest)
-AGENT_MAX_RUNTIME_SKILLS_CHARS = 12_000
+AGENT_MAX_RUNTIME_SKILLS_CHARS = 3_500
+AGENT_MAX_ACTIVE_SKILL_CHARS   = 6_000
+AGENT_MAX_PROBES_IN_PROMPT     = 12
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
@@ -2450,13 +2452,23 @@ def _load_runtime_skill_docs() -> List[Dict[str, str]]:
         if not text:
             continue
         docs.append({
+            "slug": skill_file.parent.name,
             "name": skill_file.parent.name.replace("_", " "),
             "content": text,
         })
     return docs
 
 
-def _format_runtime_skills_for_prompt() -> str:
+def _skill_summary_line(content: str) -> str:
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line[:220]
+    return "No summary provided."
+
+
+def _format_runtime_skill_index_for_prompt() -> str:
     docs = _load_runtime_skill_docs()
     if not docs:
         return ""
@@ -2465,11 +2477,59 @@ def _format_runtime_skills_for_prompt() -> str:
     for doc in docs:
         if remaining <= 0:
             break
-        header = f"### {doc['name']}\n"
+        line = f"- {doc['slug']}: {_skill_summary_line(doc['content'])}"
+        if len(line) > remaining:
+            break
+        parts.append(line)
+        remaining -= len(line) + 1
+    if not parts:
+        return ""
+    return "\n\nRepository Playbooks Index:\n" + "\n".join(parts)
+
+
+def _extract_requested_skill_slugs(message: Any) -> List[str]:
+    text = ""
+    if isinstance(message, str):
+        text = message
+    elif isinstance(message, list):
+        chunks: List[str] = []
+        for item in message:
+            if isinstance(item, dict) and item.get("type") == "text":
+                chunks.append(str(item.get("text") or ""))
+        text = "\n".join(chunks)
+    raw = str(text or "")
+    if not raw:
+        return []
+    docs = _load_runtime_skill_docs()
+    by_slug = {str(doc.get("slug") or "").strip(): doc for doc in docs}
+    hits: List[str] = []
+    lower = raw.lower()
+    for slug in by_slug:
+        if not slug:
+            continue
+        if f'use playbook "{slug.lower()}"' in lower or f"use playbook '{slug.lower()}'" in lower:
+            hits.append(slug)
+        elif f"skill:{slug.lower()}" in lower or f"playbook:{slug.lower()}" in lower:
+            hits.append(slug)
+    return hits
+
+
+def _format_active_skill_docs_for_prompt(skill_slugs: Sequence[str]) -> str:
+    if not skill_slugs:
+        return ""
+    docs = _load_runtime_skill_docs()
+    by_slug = {str(doc.get("slug") or "").strip(): doc for doc in docs}
+    remaining = AGENT_MAX_ACTIVE_SKILL_CHARS
+    parts: List[str] = []
+    for slug in skill_slugs:
+        doc = by_slug.get(str(slug or "").strip())
+        if not doc or remaining <= 0:
+            continue
+        header = f"### Active Playbook: {doc['slug']}\n"
         budget = remaining - len(header)
         if budget <= 0:
             break
-        content = doc["content"]
+        content = str(doc.get("content") or "")
         if len(content) > budget:
             content = content[: max(0, budget - 16)].rstrip() + "\n[truncated]"
         block = header + content
@@ -2477,7 +2537,7 @@ def _format_runtime_skills_for_prompt() -> str:
         remaining -= len(block) + 2
     if not parts:
         return ""
-    return "\n\nRepository Playbooks:\n" + "\n\n".join(parts)
+    return "\n\nActivated Playbooks:\n" + "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2488,6 +2548,7 @@ def build_system_prompt(
     probes_store: Any,
     detections_store: Any,
     luxriot_manager: Any,
+    active_skill_slugs: Optional[Sequence[str]] = None,
 ) -> str:
     now_str = time.strftime("%Y-%m-%d %H:%M")
 
@@ -2516,7 +2577,9 @@ def build_system_prompt(
         channels_str = "unknown"
 
     probe_lines = []
-    for p in probes:
+    for idx, p in enumerate(probes):
+        if idx >= AGENT_MAX_PROBES_IN_PROMPT:
+            break
         pid    = p.get("id", "?")
         pname  = p.get("name", pid)
         ch     = p.get("channel_id", "?")
@@ -2528,9 +2591,13 @@ def build_system_prompt(
             f"  - \"{pname}\" [id={pid}, ch={ch}]  "
             f"pos_floor={floor}, margin={margin}, {en}, {hits} hits/24h"
         )
+    remaining_probe_count = max(0, len(probes) - len(probe_lines))
+    if remaining_probe_count > 0:
+        probe_lines.append(f"  - ... {remaining_probe_count} more probe(s) not expanded here")
 
     probe_block = "\n".join(probe_lines) if probe_lines else "  (no probes configured)"
-    skills_block = _format_runtime_skills_for_prompt()
+    skills_block = _format_runtime_skill_index_for_prompt()
+    active_skills_block = _format_active_skill_docs_for_prompt(active_skill_slugs or [])
 
     return (
         f"You are the AI operations assistant for Luxriot EVA AI — a CCTV intelligent "
@@ -2547,11 +2614,13 @@ def build_system_prompt(
         f"- For prompt-setting modifications: always call update_prompt_settings with preview=true first, "
         f"show the user the diff, and only apply after explicit confirmation.\n"
         f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
-        f"- For probe tuning or archive research, follow the repository playbooks below as the default tool order.\n"
+        f"- Use the repository playbooks index below as routing hints; load-bearing details are provided only for explicitly activated playbooks.\n"
+        f"- For probe tuning or archive research, follow the matching playbook when one is activated or clearly implied.\n"
         f"- When returning search results or detections, summarize; don't dump raw lists.\n"
         f"- Ask the operator a clarifying question if the available data is too sparse to make a safe change.\n"
         f"- Use markdown for structure."
         f"{skills_block}"
+        f"{active_skills_block}"
     )
 
 
@@ -2640,7 +2709,13 @@ class AgentRunner:
         self.store.add_message(session_id, role="user", content=message)
 
         # ── build messages for LM ──────────────────────────────────────────
-        system_prompt = build_system_prompt(self._ps, self._ds, self._lxm)
+        requested_skill_slugs = _extract_requested_skill_slugs(user_content)
+        system_prompt = build_system_prompt(
+            self._ps,
+            self._ds,
+            self._lxm,
+            active_skill_slugs=requested_skill_slugs,
+        )
         history = self.store.load_history(session_id)
 
         # Replace the stored user content with the full (possibly image-bearing) one
@@ -2702,8 +2777,9 @@ class AgentRunner:
                         heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                         progress_queue=progress_queue,
                     )
+                    result_for_model = _compact_tool_result_for_model(tc.name, result)
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
-                                  "content": json.dumps(result, default=str)}
+                                  "content": json.dumps(result_for_model, default=str)}
                     yield _sse({"type": "tool_result", "name": tc.name, "result": result})
                 except ToolError as exc:
                     error_payload = {"error": str(exc)}
@@ -2938,6 +3014,138 @@ def _strip_thumbnails_deep(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_strip_thumbnails_deep(item) for item in obj]
     return obj
+
+
+def _compact_detection_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": r.get("id"),
+        "timestamp_ms": r.get("timestamp_ms") or r.get("event_timestamp_ms") or r.get("recorded_at_ms"),
+        "probe_id": r.get("probe_id"),
+        "probe_name": r.get("probe_name"),
+        "channel_id": r.get("channel_id"),
+        "severity": r.get("severity"),
+        "bookmark_sent": r.get("bookmark_sent"),
+        "pos_score": r.get("pos_score"),
+        "neg_score": r.get("neg_score"),
+        "margin": r.get("margin"),
+        "image_url": r.get("image_url") or _detection_image_url(r),
+    }
+
+
+def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "path": r.get("filepath") or r.get("path") or r.get("image_path"),
+        "score": r.get("score"),
+        "timestamp_ms": r.get("timestamp_ms") or r.get("event_timestamp_ms"),
+        "probe_name": r.get("probe_name"),
+        "channel_id": r.get("channel_id"),
+        "image_url": r.get("image_url"),
+    }
+    if r.get("detection_id") is not None:
+        row["detection_id"] = r.get("detection_id")
+    return row
+
+
+def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"value": result}
+    current = result.get("current") if isinstance(result.get("current"), dict) else result
+    rollups = current.get("rollup_prompts") if isinstance(current.get("rollup_prompts"), dict) else {}
+    return {
+        "scope": current.get("scope") or result.get("scope"),
+        "channel_id": current.get("channel_id") or result.get("channel_id"),
+        "stream_system_prompt": str(current.get("stream_system_prompt") or "")[:1000],
+        "json_alert_prompt": str(current.get("json_alert_prompt") or "")[:800],
+        "rollup_prompts": {
+            level: str(prompt or "")[:600]
+            for level, prompt in rollups.items()
+            if str(level).strip().upper() in {"L1", "L2", "L3"}
+        },
+        "bookmark_enabled": current.get("bookmark_enabled"),
+        "bookmark_cooldown_sec": current.get("bookmark_cooldown_sec"),
+    }
+
+
+def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    if tool_name == "get_detections":
+        detections = result.get("detections") if isinstance(result.get("detections"), list) else []
+        return {
+            "probe_id": result.get("probe_id"),
+            "channel_id": result.get("channel_id"),
+            "since_ms": result.get("since_ms"),
+            "until_ms": result.get("until_ms"),
+            "total_in_window": result.get("total_in_window"),
+            "returned": result.get("returned"),
+            "offset": result.get("offset"),
+            "sort_by": result.get("sort_by"),
+            "detections": [_compact_detection_for_model(r) for r in detections[:8] if isinstance(r, dict)],
+        }
+
+    if tool_name == "search_archive":
+        rows = result.get("results") if isinstance(result.get("results"), list) else []
+        return {
+            "scope": result.get("scope"),
+            "count": result.get("count"),
+            "results": [_compact_search_result_for_model(r) for r in rows[:8] if isinstance(r, dict)],
+        }
+
+    if tool_name == "build_research_batch":
+        rows = result.get("detections") if isinstance(result.get("detections"), list) else []
+        return {
+            "probe_id": result.get("probe_id"),
+            "channel_id": result.get("channel_id"),
+            "sort_by": result.get("sort_by"),
+            "batch_size": result.get("batch_size"),
+            "periods": result.get("periods"),
+            "bands": result.get("bands"),
+            "detections": [_compact_detection_for_model(r) for r in rows[:8] if isinstance(r, dict)],
+        }
+
+    if tool_name == "get_detection_summary":
+        rows = result.get("by_probe") if isinstance(result.get("by_probe"), list) else []
+        compact_rows = []
+        for row in rows[:12]:
+            if not isinstance(row, dict):
+                continue
+            compact_rows.append({
+                "probe_id": row.get("probe_id"),
+                "probe_name": row.get("probe_name"),
+                "channel_id": row.get("channel_id"),
+                "hit_count": row.get("hit_count"),
+                "latest_timestamp_ms": row.get("latest_timestamp_ms"),
+            })
+        return {
+            "since_ms": result.get("since_ms"),
+            "until_ms": result.get("until_ms"),
+            "probe_count": result.get("probe_count"),
+            "total_detections": result.get("total_detections"),
+            "by_probe": compact_rows,
+        }
+
+    if tool_name == "describe_frame":
+        return {
+            "description": result.get("description"),
+            "source": result.get("source"),
+            "channel_id": result.get("channel_id"),
+            "image_path": result.get("image_path"),
+            "note": result.get("note"),
+        }
+
+    if tool_name == "get_prompt_settings":
+        return _compact_prompt_settings_for_model(result)
+
+    if tool_name == "update_prompt_settings":
+        compact = dict(result)
+        if isinstance(compact.get("current"), dict):
+            compact["current"] = _compact_prompt_settings_for_model({"current": compact["current"]})
+        if isinstance(compact.get("proposed"), dict):
+            compact["proposed"] = _compact_prompt_settings_for_model({"current": compact["proposed"]})
+        return compact
+
+    return _strip_thumbnails_deep(result)
 
 
 def _msg_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:

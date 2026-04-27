@@ -2336,7 +2336,8 @@
     }
 
     .probe-short-input {
-        max-width: 84px;
+        min-width: 92px;
+        max-width: 92px;
     }
 
     .inline-check {
@@ -2966,8 +2967,8 @@
     }
 
     .probe-threshold-input {
-        min-width: 70px;
-        max-width: 70px;
+        min-width: 88px;
+        max-width: 88px;
     }
 
     .probe-meta {
@@ -3867,7 +3868,23 @@
     border-left: 1px solid var(--panel-border);
     display: flex;
     flex-direction: column;
+    min-height: 0;
     overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #243241 rgba(0, 0, 0, 0.08);
+}
+
+.agent-context::-webkit-scrollbar {
+    width: 8px;
+}
+
+.agent-context::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.06);
+}
+
+.agent-context::-webkit-scrollbar-thumb {
+    background: rgba(36, 50, 65, 0.92);
+    border-radius: 999px;
 }
 
 .agent-ctx-section {
@@ -3938,41 +3955,56 @@
 .agent-skill-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
 }
 
-.agent-skill-card {
-    padding: 12px;
-    border-radius: 14px;
+.agent-skill-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 10px;
+    border-radius: 10px;
     border: 1px solid rgba(37, 51, 66, 0.92);
     background: rgba(18, 24, 31, 0.96);
 }
 
-.agent-skill-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 10px;
-}
-
-.agent-skill-name {
+.agent-skill-run {
+    min-width: 0;
+    padding: 0;
+    border: none;
+    background: transparent;
     color: var(--text);
-    font-size: 0.84rem;
+    text-align: left;
+    font-size: 0.82rem;
+    line-height: 1.35;
+    cursor: pointer;
+}
+
+.agent-skill-run:hover,
+.agent-skill-run:focus-visible {
+    color: var(--accent-cyan);
+    outline: none;
+}
+
+.agent-skill-run-title {
+    display: block;
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.agent-skill-summary {
-    margin-top: 8px;
-    color: var(--muted);
-    font-size: 0.78rem;
-    line-height: 1.5;
-}
-
-.agent-skill-actions {
-    display: flex;
+.agent-skill-edit {
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    padding: 0;
+    border-radius: 10px;
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
+    justify-content: center;
+    font-size: 0.92rem;
 }
 
 .agent-skill-create-btn {

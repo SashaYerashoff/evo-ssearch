@@ -5063,7 +5063,7 @@
 
     async function loadProbeList(showStatus = false) {
         try {
-            const resp = await fetch('/probes/list');
+            const resp = await fetch(`/probes/list?t=${Date.now()}`, { cache: 'no-store' });
             const data = await resp.json();
             probeList = data.probes || [];
             probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
@@ -8006,7 +8006,7 @@
             const el = elProbeList();
             if (!el) return;
             try {
-                const r = await fetch('/probes/list');
+                const r = await fetch(`/probes/list?t=${Date.now()}`, { cache: 'no-store' });
                 if (!r.ok) return;
                 const data = await r.json();
                 const probes = data.probes || [];
@@ -8030,7 +8030,7 @@
         }
 
         function closeAgentSkillModal() {
-            if (agentSkillModal) agentSkillModal.classList.remove('open');
+            if (agentSkillModal) agentSkillModal.style.display = 'none';
             agentSkillDraft = null;
         }
 
@@ -8052,7 +8052,7 @@
             if (agentSkillContentInput) {
                 agentSkillContentInput.value = skill?.content || `# ${skill?.name || 'New Skill'}\n\nGoal: describe when this playbook should be used.\n\nDefault order:\n1. Clarify missing inputs if needed.\n2. Inspect the relevant context.\n3. Use the right tools in a safe order.\n4. Summarize the result for the operator.\n`;
             }
-            if (agentSkillModal) agentSkillModal.classList.add('open');
+            if (agentSkillModal) agentSkillModal.style.display = 'block';
         }
 
         async function agentLoadSkills() {
@@ -8067,15 +8067,20 @@
                     return;
                 }
                 agentSkillList.innerHTML = skills.map((skill) => `
-                    <div class="agent-skill-card" data-skill-slug="${escapeHtml(skill.slug || '')}">
-                        <div class="agent-skill-head">
-                            <div class="agent-skill-name">${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}</div>
-                            <div class="agent-skill-actions">
-                                <button class="feature-btn" data-agent-skill-run="${escapeHtml(skill.slug || '')}">Run</button>
-                                <button class="feature-btn" data-agent-skill-edit="${escapeHtml(skill.slug || '')}">Edit</button>
-                            </div>
-                        </div>
-                        <div class="agent-skill-summary">${escapeHtml(skill.summary || 'No summary yet.')}</div>
+                    <div class="agent-skill-row" data-skill-slug="${escapeHtml(skill.slug || '')}">
+                        <button
+                            class="agent-skill-run"
+                            type="button"
+                            title="${escapeHtml(skill.summary || 'Run skill')}"
+                            data-agent-skill-run="${escapeHtml(skill.slug || '')}">
+                            <span class="agent-skill-run-title">${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}</span>
+                        </button>
+                        <button
+                            class="feature-btn agent-skill-edit"
+                            type="button"
+                            title="Edit skill"
+                            aria-label="Edit skill ${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}"
+                            data-agent-skill-edit="${escapeHtml(skill.slug || '')}">&#9998;</button>
                     </div>
                 `).join('');
             } catch(e) {

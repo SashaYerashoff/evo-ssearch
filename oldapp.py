@@ -5100,7 +5100,11 @@ def probes_save():
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
     probes = probes_store.list_probes()
-    return jsonify({'probes': probes})
+    response = jsonify({'probes': probes})
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 
 @app.route('/probes/delete', methods=['POST'])
