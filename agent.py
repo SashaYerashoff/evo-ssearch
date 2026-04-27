@@ -2311,6 +2311,8 @@ class AgentTools:
             until_hours = _opt_float(args.get("until_hours"))
             if until_hours is not None:
                 until_ms = int(time.time() * 1000 - until_hours * 3_600_000)
+        if since_ms is not None and until_ms is not None and since_ms > until_ms:
+            since_ms, until_ms = until_ms, since_ms
         return since_ms, until_ms
 
     def _list_detection_window(
@@ -2383,6 +2385,25 @@ class AgentTools:
                 f"Multiple probes named {name!r}: {ids}. Use probe_id to be specific."
             )
         return str(matches[0]["id"])
+
+    def _find_probe_mentions_in_text(self, text: str) -> List[Dict[str, Any]]:
+        normalized_text = _normalize_probe_match_text(text)
+        if not normalized_text:
+            return []
+        hits: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for probe in self._ps.list_probes():
+            probe_name = str(probe.get("name") or "").strip()
+            probe_id = str(probe.get("id") or "").strip()
+            if not probe_name or not probe_id:
+                continue
+            normalized_name = _normalize_probe_match_text(probe_name)
+            if not normalized_name:
+                continue
+            if normalized_name in normalized_text and probe_id not in seen_ids:
+                hits.append(probe)
+                seen_ids.add(probe_id)
+        return hits
 
     @staticmethod
     def _normalize_channel_ref(value: Any) -> str:
@@ -2783,6 +2804,22 @@ def _extract_requested_skill_slugs(message: Any) -> List[str]:
     return list(dict.fromkeys(hits))
 
 
+def _extract_text_from_message_content(message: Any) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        chunks: List[str] = []
+        for item in message:
+            if isinstance(item, dict) and item.get("type") == "text":
+                chunks.append(str(item.get("text") or ""))
+        return "\n".join(chunks)
+    return str(message or "")
+
+
+def _normalize_probe_match_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
 def _format_active_skill_docs_for_prompt(skill_slugs: Sequence[str]) -> str:
     if not skill_slugs:
         return ""
@@ -2986,6 +3023,36 @@ class AgentRunner:
 
         # ── build messages for LM ──────────────────────────────────────────
         requested_skill_slugs = _extract_requested_skill_slugs(user_content)
+        user_text = _extract_text_from_message_content(user_content)
+        if "probe_tuning" in requested_skill_slugs:
+            normalized_user_text = _normalize_probe_match_text(user_text)
+            wants_all_probes = any(
+                token in normalized_user_text
+                for token in ("all probes", "all probe", "every probe", "probe audit", "all probes audit")
+            )
+            mentioned_probes = self._tools._find_probe_mentions_in_text(user_text)
+            if len(mentioned_probes) != 1 and not wants_all_probes:
+                probe_names = [
+                    str(probe.get("name") or "").strip()
+                    for probe in self._ps.list_probes()
+                    if str(probe.get("name") or "").strip()
+                ]
+                prompt_suffix = ""
+                if probe_names:
+                    prompt_suffix = " Available probes: " + ", ".join(probe_names[:8])
+                    if len(probe_names) > 8:
+                        prompt_suffix += f", and {len(probe_names) - 8} more."
+                    else:
+                        prompt_suffix += "."
+                clarification = (
+                    "Which probe should I tune?"
+                    " Name the probe explicitly, or say that you want an all-probes audit."
+                    + prompt_suffix
+                )
+                self.store.add_message(session_id, role="assistant", content=clarification)
+                yield _sse({"type": "text", "content": clarification})
+                yield _sse({"type": "done", "session_id": session_id})
+                return
         system_prompt = build_system_prompt(
             self._ps,
             self._ds,
