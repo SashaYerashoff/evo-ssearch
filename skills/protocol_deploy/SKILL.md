@@ -16,6 +16,8 @@ Standard flow:
    - the operator explicitly requested a non-destructive survey-only pass
 5. Call `list_channels`.
 6. Call `survey_channels` for the available channels.
+   - In standard mode, use the default survey.
+   - In magic-phrase mode, prefer `fast_mode=true` unless the operator explicitly asked for a deeper pass.
 7. Summarize what each channel appears to monitor.
 8. Ask the operator for preferences, priorities, and unwanted scenarios.
 9. Propose scenario packs per channel.
@@ -23,6 +25,7 @@ Standard flow:
    - delete old probes if approved
    - create probes for the selected scenarios
    - tune global or per-channel summary prompts with `update_prompt_settings`
+   - call `deploy_summary`
    - report what was created and why
 
 Magic-phrase mode:
@@ -36,9 +39,11 @@ Magic-phrase mode:
   - probes created
   - prompt settings changed
   - estimated elapsed time per stage
+  - call `deploy_summary` before the final narrative answer
 
 Rules:
 - Prefer a small, coherent starter pack over a noisy probe explosion.
 - Use `preview=true` by default for destructive or mutating tools, except in magic-phrase mode after wipe approval.
+- `create_probe` is idempotent by name+channel. Reuse the existing probe instead of creating duplicates when the same starter scenario is rerun.
 - If the operator only asked to check the connection, call `list_channels` and report connection status; do not resume deployment automatically.
 - If channel survey quality is poor or channels are missing, say so explicitly.

@@ -260,6 +260,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "items": {"type": "integer"},
                         "description": "Optional explicit list of channel IDs. Omit to survey all available channels.",
                     },
+                    "fast_mode": {
+                        "type": "boolean",
+                        "description": "If true, use a shorter demo survey with fewer samples and less wait time.",
+                    },
                     "duration_sec": {
                         "type": "number",
                         "description": "Approximate capture duration per channel. Default: 12 seconds.",
@@ -383,6 +387,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "properties": {
                     "name": {"type": "string"},
                     "channel_id": {"type": "integer"},
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
                     "positives": {"type": "array", "items": {"type": "string"}},
                     "negatives": {"type": "array", "items": {"type": "string"}},
                     "pos_floor": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -397,9 +405,52 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
                     "bookmark_dedupe_window_sec": {"type": "number", "minimum": 0.5},
                     "enabled": {"type": "boolean"},
+                    "update_existing": {
+                        "type": "boolean",
+                        "description": "If true, reuse an existing probe with the same name on the same channel instead of creating a duplicate. Default: true.",
+                    },
                     "preview": {"type": "boolean"},
                 },
-                "required": ["name", "channel_id"],
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deploy_summary",
+            "description": (
+                "Record the final outcome of a deployment or survey-only pass as a structured summary card. "
+                "Use at the end of Protocol Deploy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["standard", "magic", "survey_only"],
+                    },
+                    "wipe": {"type": "boolean"},
+                    "elapsed_sec": {"type": "number"},
+                    "overview": {"type": "string"},
+                    "channels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "probes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "prompt_targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "notes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -1236,6 +1287,7 @@ class AgentTools:
             "survey_channels":      self._survey_channels,
             "build_research_batch": self._build_research_batch,
             "create_probe":         self._create_probe,
+            "deploy_summary":       self._deploy_summary,
             "delete_probes":        self._delete_probes,
             "update_probe":         self._update_probe,
             "describe_frame":       self._describe_frame,
@@ -1455,8 +1507,11 @@ class AgentTools:
             int(item) for item in (requested_ids or [])
             if _opt_int(item) is not None
         }
-        duration_sec = max(2.0, min(20.0, float(args.get("duration_sec") or 12.0)))
-        sample_count = max(2, min(6, int(args.get("sample_count") or 4)))
+        fast_mode = bool(args.get("fast_mode", False))
+        default_duration = 4.0 if fast_mode else 12.0
+        default_samples = 2 if fast_mode else 4
+        duration_sec = max(1.0, min(20.0, float(args.get("duration_sec") or default_duration)))
+        sample_count = max(2, min(6, int(args.get("sample_count") or default_samples)))
         prompt = str(args.get("prompt") or "").strip() or (
             "You are surveying CCTV channels during deployment. "
             "Summarize what this camera is pointed at, what usually occupies the scene, "
@@ -1483,8 +1538,9 @@ class AgentTools:
         self._report_progress({
             "tool": "survey_channels",
             "stage": "start",
-            "message": f"Surveying {len(target_channels)} channel(s)",
+            "message": f"Surveying {len(target_channels)} channel(s){' in fast mode' if fast_mode else ''}",
             "channel_count": len(target_channels),
+            "fast_mode": fast_mode,
         })
         for channel in target_channels:
             channel_id = int(channel.get("id"))
@@ -1577,6 +1633,7 @@ class AgentTools:
         return {
             "duration_sec": duration_sec,
             "sample_count": sample_count,
+            "fast_mode": fast_mode,
             "channels": survey_items,
         }
 
@@ -1706,12 +1763,13 @@ class AgentTools:
 
     def _create_probe(self, args: Dict[str, Any]) -> Dict[str, Any]:
         name = str(args.get("name") or "").strip()
-        channel_id = _opt_int(args.get("channel_id"))
+        channel_id = self._resolve_channel_id(args, required=True)
         preview = bool(args.get("preview", True))
+        update_existing = bool(args.get("update_existing", True))
         if not name:
             raise ToolError("'name' is required.")
         if channel_id is None:
-            raise ToolError("'channel_id' is required.")
+            raise ToolError("'channel_id' or 'channel_ref' is required.")
 
         positives = [str(item).strip() for item in (args.get("positives") or []) if str(item).strip()]
         negatives = [str(item).strip() for item in (args.get("negatives") or []) if str(item).strip()]
@@ -1745,19 +1803,54 @@ class AgentTools:
             p for p in self._ps.list_probes()
             if str(p.get("name") or "").strip().lower() == name.lower() and _opt_int(p.get("channel_id")) == channel_id
         ]
+        if len(existing) > 1:
+            raise ToolError(
+                "Multiple existing probes have the same name on this channel. "
+                "Clean up duplicates first or choose a unique probe name."
+            )
+        existing_probe = existing[0] if existing else None
+        action = "create_new"
+        if existing_probe and update_existing:
+            probe = _merge_probe(existing_probe, probe)
+            probe["id"] = existing_probe.get("id")
+            action = "update_existing"
         if preview:
             return {
                 "status": "preview",
-                "exists": bool(existing),
+                "exists": bool(existing_probe),
+                "action": action,
                 "conflicts": [_probe_summary(p) for p in existing],
                 "proposed": _probe_summary(probe),
             }
         saved = self._ps.upsert_probe(probe)
         return {
             "status": "applied",
+            "action": action,
+            "exists": bool(existing_probe),
             "probe_id": saved.get("id"),
             "probe_name": saved.get("name"),
             "probe": _probe_summary(saved),
+        }
+
+    # ── deploy_summary ─────────────────────────────────────────────────────
+
+    def _deploy_summary(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        mode = str(args.get("mode") or "standard").strip().lower()
+        if mode not in {"standard", "magic", "survey_only"}:
+            mode = "standard"
+        channels = [str(item).strip() for item in (args.get("channels") or []) if str(item).strip()]
+        probes = [str(item).strip() for item in (args.get("probes") or []) if str(item).strip()]
+        prompt_targets = [str(item).strip() for item in (args.get("prompt_targets") or []) if str(item).strip()]
+        notes = [str(item).strip() for item in (args.get("notes") or []) if str(item).strip()]
+        return {
+            "mode": mode,
+            "wipe": bool(args.get("wipe", False)),
+            "elapsed_sec": _opt_float(args.get("elapsed_sec")),
+            "overview": str(args.get("overview") or "").strip(),
+            "channels": channels,
+            "probes": probes,
+            "prompt_targets": prompt_targets,
+            "notes": notes,
         }
 
     # ── delete_probes ──────────────────────────────────────────────────────
@@ -3314,6 +3407,90 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "by_probe": compact_rows,
         }
 
+    if tool_name == "list_channels":
+        rows = result.get("channels") if isinstance(result.get("channels"), list) else []
+        return {
+            "count": result.get("count"),
+            "channels": [
+                {
+                    "id": row.get("id"),
+                    "title": row.get("title"),
+                    "enabled": row.get("enabled"),
+                    "status": row.get("status"),
+                }
+                for row in rows[:12]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "list_probes":
+        rows = result.get("probes") if isinstance(result.get("probes"), list) else []
+        return {
+            "count": result.get("count"),
+            "since_hours": result.get("since_hours"),
+            "probes": [
+                {
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "channel_id": row.get("channel_id"),
+                    "enabled": row.get("enabled"),
+                    "hit_count_24h": row.get("hit_count_24h"),
+                }
+                for row in rows[:12]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "survey_channels":
+        rows = result.get("channels") if isinstance(result.get("channels"), list) else []
+        return {
+            "fast_mode": result.get("fast_mode"),
+            "duration_sec": result.get("duration_sec"),
+            "sample_count": result.get("sample_count"),
+            "channels": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "survey": str(row.get("survey") or "")[:500],
+                    "error": row.get("error"),
+                }
+                for row in rows[:8]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "create_probe":
+        probe = result.get("probe") if isinstance(result.get("probe"), dict) else result.get("proposed")
+        conflicts = result.get("conflicts") if isinstance(result.get("conflicts"), list) else []
+        return {
+            "status": result.get("status"),
+            "action": result.get("action"),
+            "exists": result.get("exists"),
+            "probe_id": result.get("probe_id"),
+            "probe_name": result.get("probe_name") or (probe or {}).get("name"),
+            "channel_id": (probe or {}).get("channel_id"),
+            "conflicts": [
+                {"id": row.get("id"), "name": row.get("name"), "channel_id": row.get("channel_id")}
+                for row in conflicts[:8]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "delete_probes":
+        rows = result.get("targets") if isinstance(result.get("targets"), list) else []
+        return {
+            "status": result.get("status"),
+            "delete_all": result.get("delete_all"),
+            "deleted": result.get("deleted"),
+            "count": result.get("count"),
+            "targets": [
+                {"id": row.get("id"), "name": row.get("name"), "channel_id": row.get("channel_id")}
+                for row in rows[:12]
+                if isinstance(row, dict)
+            ],
+        }
+
     if tool_name == "describe_frame":
         return {
             "description": result.get("description"),
@@ -3333,6 +3510,18 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         if isinstance(compact.get("proposed"), dict):
             compact["proposed"] = _compact_prompt_settings_for_model({"current": compact["proposed"]})
         return compact
+
+    if tool_name == "deploy_summary":
+        return {
+            "mode": result.get("mode"),
+            "wipe": result.get("wipe"),
+            "elapsed_sec": result.get("elapsed_sec"),
+            "overview": result.get("overview"),
+            "channels": result.get("channels"),
+            "probes": result.get("probes"),
+            "prompt_targets": result.get("prompt_targets"),
+            "notes": result.get("notes"),
+        }
 
     return _strip_thumbnails_deep(result)
 

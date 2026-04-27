@@ -7718,7 +7718,8 @@
 
             } else if (toolName === 'survey_channels') {
                 const channels = (result && result.channels) || [];
-                const label = `CHANNEL SURVEY — ${channels.length} channel${channels.length === 1 ? '' : 's'}`;
+                const fastMode = Boolean(result && result.fast_mode);
+                const label = `CHANNEL SURVEY${fastMode ? ' · FAST' : ''} — ${channels.length} channel${channels.length === 1 ? '' : 's'}`;
                 card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
@@ -7733,17 +7734,44 @@
 
             } else if (toolName === 'create_probe') {
                 const isPreview = result && result.status === 'preview';
-                const label = isPreview ? 'PROBE CREATE PREVIEW' : 'PROBE CREATED';
+                const action = String(result && result.action || '');
+                const label = isPreview
+                    ? (action === 'update_existing' ? 'PROBE UPSERT PREVIEW' : 'PROBE CREATE PREVIEW')
+                    : (action === 'update_existing' ? 'PROBE UPDATED VIA CREATE' : 'PROBE CREATED');
                 card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
                 const probe = (result && (result.proposed || result.probe)) || {};
                 const conflicts = (result && result.conflicts) || [];
                 let html = `<div class="agent-probe-update-row"><div class="agent-probe-update-field"><span class="agent-probe-update-key">Probe:</span><span class="agent-probe-update-val">${escapeHtml(probe.name || result.probe_name || 'unknown')}</span></div></div>`;
+                if (action === 'update_existing') {
+                    html += `<div style="margin-top:8px;font-size:12px;color:var(--muted)">Existing probe on this channel will be reused instead of creating a duplicate.</div>`;
+                }
                 if (conflicts.length) {
                     html += `<div style="margin-top:8px;font-size:12px;color:var(--warn)">Potential conflicts: ${escapeHtml(conflicts.map((item) => item.name || item.id || '?').join(', '))}</div>`;
                 }
                 body.innerHTML = html;
+                card.appendChild(body);
+
+            } else if (toolName === 'deploy_summary') {
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; DEPLOY SUMMARY</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const mode = escapeHtml(String(result && result.mode || 'standard'));
+                const wipe = Boolean(result && result.wipe);
+                const overview = escapeHtml(String(result && result.overview || 'Deployment summary recorded.'));
+                const elapsed = result && Number.isFinite(Number(result.elapsed_sec)) ? ` · ${Number(result.elapsed_sec).toFixed(1)}s` : '';
+                const channels = Array.isArray(result && result.channels) ? result.channels : [];
+                const probes = Array.isArray(result && result.probes) ? result.probes : [];
+                const prompts = Array.isArray(result && result.prompt_targets) ? result.prompt_targets : [];
+                const notes = Array.isArray(result && result.notes) ? result.notes : [];
+                body.innerHTML = `
+                    <div class="agent-summary-entry"><span class="agent-summary-ts">${mode.toUpperCase()}${wipe ? ' · WIPE' : ''}${elapsed}</span><span class="agent-summary-text">${overview}</span></div>
+                    ${channels.length ? `<div class="agent-summary-entry"><span class="agent-summary-ts">CHANNELS</span><span class="agent-summary-text">${escapeHtml(channels.join(' · '))}</span></div>` : ''}
+                    ${probes.length ? `<div class="agent-summary-entry"><span class="agent-summary-ts">PROBES</span><span class="agent-summary-text">${escapeHtml(probes.join(' · '))}</span></div>` : ''}
+                    ${prompts.length ? `<div class="agent-summary-entry"><span class="agent-summary-ts">PROMPTS</span><span class="agent-summary-text">${escapeHtml(prompts.join(' · '))}</span></div>` : ''}
+                    ${notes.length ? `<div class="agent-summary-entry"><span class="agent-summary-ts">NOTES</span><span class="agent-summary-text">${escapeHtml(notes.join(' · '))}</span></div>` : ''}
+                `;
                 card.appendChild(body);
 
             } else if (toolName === 'delete_probes') {
