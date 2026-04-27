@@ -18,6 +18,7 @@ import collections
 import copy
 import json
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -519,6 +520,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                             "and describes it. Use when the operator asks about the current scene."
                         ),
                     },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
                     "image_path": {
                         "type": "string",
                         "description": "Absolute filesystem path to an image file.",
@@ -551,6 +556,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Optional Luxriot channel ID. Omit to read global defaults.",
                     },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
                 },
                 "required": [],
             },
@@ -571,14 +580,33 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Optional Luxriot channel ID. Omit to update global defaults.",
                     },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
                     "changes": {
                         "type": "object",
-                        "description": "Partial prompt/settings update.",
+                        "description": (
+                            "Partial prompt/settings update. "
+                            "L0/live descriptions use stream_system_prompt. "
+                            "L1/L2/L3 summaries use rollup_prompts. "
+                            "Behavioral bookmark instructions belong inside the L0/live prompt. "
+                            "json_alert_prompt is only the structured alert-output template."
+                        ),
                         "properties": {
                             "stream_system_prompt": {"type": "string"},
+                            "l0_prompt": {"type": "string"},
+                            "live_prompt": {"type": "string"},
                             "json_alert_prompt": {"type": "string"},
+                            "bookmark_rule_prompt": {
+                                "type": "string",
+                                "description": "A bookmark/alert instruction line to add to the L0/live stream prompt.",
+                            },
                             "bookmark_enabled": {"type": "boolean"},
                             "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
+                            "l1_prompt": {"type": "string"},
+                            "l2_prompt": {"type": "string"},
+                            "l3_prompt": {"type": "string"},
                             "rollup_prompts": {
                                 "type": "object",
                                 "description": "Partial L1/L2/L3 prompt overrides.",
@@ -617,6 +645,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "integer",
                         "description": "Luxriot channel (camera) ID to attach the bookmark to.",
                     },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
                     "title": {
                         "type": "string",
                         "description": "Short bookmark title (max 80 characters).",
@@ -637,7 +669,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "description": "Optional event timestamp in milliseconds. Defaults to now.",
                     },
                 },
-                "required": ["channel_id", "title"],
+                "required": ["title"],
             },
         },
     },
@@ -657,6 +689,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "channel_id": {
                         "type": "integer",
                         "description": "Luxriot channel ID to query.",
+                    },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
                     },
                     "depth": {
                         "type": "string",
@@ -692,7 +728,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "description": "Max summary entries to return. Default: 20.",
                     },
                 },
-                "required": ["channel_id"],
+                "required": [],
             },
         },
     },
@@ -720,6 +756,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "channel_id": {
                         "type": "integer",
                         "description": "Optional. Restrict report to one channel.",
+                    },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
                     },
                     "include_probes": {
                         "type": "array",
@@ -1815,7 +1855,7 @@ class AgentTools:
     # ── describe_frame ──────────────────────────────────────────────────────
 
     def _describe_frame(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        channel_id   = _opt_int(args.get("channel_id"))
+        channel_id   = self._resolve_channel_id(args, required=False)
         image_path   = str(args.get("image_path") or "").strip() or None
         detection_id = _opt_int(args.get("detection_id"))
         prompt = str(args.get("prompt") or "").strip() or (
@@ -1851,7 +1891,7 @@ class AgentTools:
             }
 
         if image_path is None and detection_id is None:
-            raise ToolError("Provide 'channel_id', 'image_path', or 'detection_id'.")
+            raise ToolError("Provide 'channel_id'/'channel_ref', 'image_path', or 'detection_id'.")
 
         # Resolve image from detection record if needed
         resolved_path: Optional[str] = image_path
@@ -1920,16 +1960,16 @@ class AgentTools:
     def _get_prompt_settings(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not hasattr(self._lxm, "get_prompt_settings"):
             raise ToolError("Luxriot manager prompt settings are not available.")
-        channel_id = _opt_int(args.get("channel_id"))
+        channel_id = self._resolve_channel_id(args, required=False)
         try:
             return self._lxm.get_prompt_settings(channel_id=channel_id)
         except Exception as exc:
             raise ToolError(f"Could not fetch prompt settings: {exc}") from exc
 
     def _update_prompt_settings(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        changes = args.get("changes") or {}
+        changes = _normalize_prompt_setting_changes(args.get("changes") or {})
         preview = bool(args.get("preview", True))
-        channel_id = _opt_int(args.get("channel_id"))
+        channel_id = self._resolve_channel_id(args, required=False)
 
         if not changes:
             raise ToolError("'changes' must contain at least one field to modify.")
@@ -1983,9 +2023,9 @@ class AgentTools:
     # ── get_video_summaries ─────────────────────────────────────────────────
 
     def _get_video_summaries(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        channel_id  = _opt_int(args.get("channel_id"))
+        channel_id  = self._resolve_channel_id(args, required=True)
         if channel_id is None:
-            raise ToolError("'channel_id' is required.")
+            raise ToolError("'channel_id' or 'channel_ref' is required.")
         depth       = str(args.get("depth") or "L1").strip().upper()
         if depth == "LIVE":
             depth = "L0"
@@ -2051,9 +2091,9 @@ class AgentTools:
     # ── create_bookmark ─────────────────────────────────────────────────────
 
     def _create_bookmark(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        channel_id = _opt_int(args.get("channel_id"))
+        channel_id = self._resolve_channel_id(args, required=True)
         if channel_id is None:
-            raise ToolError("'channel_id' is required.")
+            raise ToolError("'channel_id' or 'channel_ref' is required.")
         title = str(args.get("title") or "").strip()[:80]
         if not title:
             raise ToolError("'title' is required.")
@@ -2088,7 +2128,7 @@ class AgentTools:
     def _generate_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
         since_hours = float(args.get("since_hours") or 24)
         until_hours = _opt_float(args.get("until_hours"))
-        channel_id  = _opt_int(args.get("channel_id"))
+        channel_id  = self._resolve_channel_id(args, required=False)
         include_probes: Optional[List[str]] = args.get("include_probes") or None
         top_events  = max(1, min(20, int(args.get("top_events") or 5)))
 
@@ -2251,6 +2291,75 @@ class AgentTools:
             )
         return str(matches[0]["id"])
 
+    @staticmethod
+    def _normalize_channel_ref(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw.startswith("#"):
+            raw = raw[1:]
+        return re.sub(r"[^a-z0-9]+", " ", raw).strip()
+
+    def _resolve_channel_id(self, args: Dict[str, Any], *, required: bool = False) -> Optional[int]:
+        channel_id = _opt_int(args.get("channel_id"))
+        if channel_id is not None:
+            return channel_id
+
+        raw_ref = None
+        for field_name in ("channel_ref", "channel", "channel_title", "channel_name"):
+            value = args.get(field_name)
+            if value is None:
+                continue
+            value_str = str(value).strip()
+            if value_str:
+                raw_ref = value_str
+                break
+
+        if raw_ref is None:
+            if required:
+                raise ToolError("Provide 'channel_id' or 'channel_ref'.")
+            return None
+
+        numeric_ref = _opt_int(str(raw_ref).lstrip("#"))
+        if numeric_ref is not None:
+            return numeric_ref
+
+        raw_channels = getattr(self._lxm, "channels", None) or []
+        channels = [
+            ch for ch in raw_channels
+            if isinstance(ch, dict) and _opt_int(ch.get("id")) is not None
+        ]
+        if not channels:
+            raise ToolError(
+                f"Could not resolve channel {raw_ref!r}: Luxriot did not report any channels. "
+                "Call list_channels first or verify the connection."
+            )
+
+        ref_norm = self._normalize_channel_ref(raw_ref)
+        matches: List[Tuple[int, str]] = []
+        for channel in channels:
+            cid = _opt_int(channel.get("id"))
+            if cid is None:
+                continue
+            title = str(channel.get("title") or channel.get("name") or channel.get("label") or f"channel-{cid}")
+            title_norm = self._normalize_channel_ref(title)
+            if not title_norm:
+                continue
+            if ref_norm == title_norm or ref_norm in title_norm or title_norm in ref_norm:
+                matches.append((cid, title))
+
+        if not matches:
+            known = ", ".join(
+                f"#{_opt_int(ch.get('id'))} {str(ch.get('title') or ch.get('name') or ch.get('label') or 'unknown')}"
+                for ch in channels[:8]
+                if _opt_int(ch.get("id")) is not None
+            ) or "none"
+            raise ToolError(f"No Luxriot channel matches {raw_ref!r}. Known channels: {known}")
+        if len(matches) > 1:
+            raise ToolError(
+                f"Channel reference {raw_ref!r} is ambiguous. Matches: "
+                + ", ".join(f"#{cid} {title}" for cid, title in matches[:8])
+            )
+        return matches[0][0]
+
     def _find_probe(self, probe_id: str) -> Dict[str, Any]:
         for p in self._ps.list_probes():
             if str(p.get("id")) == probe_id:
@@ -2412,6 +2521,14 @@ def _merge_prompt_settings_snapshot(current: Dict[str, Any], changes: Dict[str, 
     for field_name in ("stream_system_prompt", "json_alert_prompt", "bookmark_enabled", "bookmark_cooldown_sec"):
         if field_name in changes:
             merged[field_name] = changes[field_name]
+    bookmark_rule_prompt = str(changes.get("bookmark_rule_prompt") or "").strip()
+    if bookmark_rule_prompt:
+        current_stream_prompt = str(merged.get("stream_system_prompt") or "").strip()
+        if bookmark_rule_prompt not in current_stream_prompt:
+            merged["stream_system_prompt"] = (
+                f"{current_stream_prompt}\n- {bookmark_rule_prompt}"
+                if current_stream_prompt else bookmark_rule_prompt
+            )
     if isinstance(changes.get("rollup_prompts"), dict):
         rollups = dict(merged.get("rollup_prompts") or {})
         for level, prompt in changes["rollup_prompts"].items():
@@ -2420,6 +2537,30 @@ def _merge_prompt_settings_snapshot(current: Dict[str, Any], changes: Dict[str, 
                 rollups[level_key] = str(prompt)
         merged["rollup_prompts"] = rollups
     return merged
+
+
+def _normalize_prompt_setting_changes(changes: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(changes, dict):
+        return {}
+    normalized = copy.deepcopy(changes)
+
+    if "stream_system_prompt" not in normalized:
+        for alias in ("l0_prompt", "live_prompt"):
+            if alias in normalized:
+                normalized["stream_system_prompt"] = normalized[alias]
+                break
+
+    rollups = dict(normalized.get("rollup_prompts") or {}) if isinstance(normalized.get("rollup_prompts"), dict) else {}
+    for alias, level in (("l1_prompt", "L1"), ("l2_prompt", "L2"), ("l3_prompt", "L3")):
+        if alias in normalized:
+            rollups[level] = normalized[alias]
+    if rollups:
+        normalized["rollup_prompts"] = rollups
+
+    for alias in ("l0_prompt", "live_prompt", "bookmark_rule_prompt", "l1_prompt", "l2_prompt", "l3_prompt"):
+        normalized.pop(alias, None)
+
+    return normalized
 
 
 def _prompt_settings_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
@@ -2613,6 +2754,13 @@ def build_system_prompt(
         f"show the user the diff, and only apply after explicit confirmation.\n"
         f"- For prompt-setting modifications: always call update_prompt_settings with preview=true first, "
         f"show the user the diff, and only apply after explicit confirmation.\n"
+        f"- Prompt field mapping: L0/live feed prompt = stream_system_prompt. L1/L2/L3 rollups = rollup_prompts.L1/L2/L3. Behavioral bookmark instructions belong inside the L0/live prompt. json_alert_prompt is only the structured alert-output template.\n"
+        f"- There is no separate bookmark-rule registry. A bookmark rule only exists after update_prompt_settings applies the underlying L0/live prompt change.\n"
+        f"- Do not rewrite json_alert_prompt unless the operator explicitly asks to change the structured alert/parsing template.\n"
+        f"- Never claim that a prompt change, bookmark rule, or channel-specific setting was applied unless the corresponding tool returned status=applied in this turn.\n"
+        f"- Never claim that Luxriot is disconnected or that a channel does not exist unless list_channels or another Luxriot tool in this turn confirmed that failure.\n"
+        f"- Do not claim support for PDF export, CSV export, emails, file links, async report queues, or background jobs unless a tool explicitly returns that artifact.\n"
+        f"- If an operator asks for an unsupported export, say so plainly and offer the closest available format, such as a structured chat report.\n"
         f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
         f"- Use the repository playbooks index below as routing hints; load-bearing details are provided only for explicitly activated playbooks.\n"
         f"- For probe tuning or archive research, follow the matching playbook when one is activated or clearly implied.\n"
@@ -3051,16 +3199,22 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
         return {"value": result}
     current = result.get("current") if isinstance(result.get("current"), dict) else result
     rollups = current.get("rollup_prompts") if isinstance(current.get("rollup_prompts"), dict) else {}
+    stream_prompt = str(current.get("stream_system_prompt") or "")
+    json_prompt = str(current.get("json_alert_prompt") or "")
     return {
         "scope": current.get("scope") or result.get("scope"),
         "channel_id": current.get("channel_id") or result.get("channel_id"),
-        "stream_system_prompt": str(current.get("stream_system_prompt") or "")[:1000],
-        "json_alert_prompt": str(current.get("json_alert_prompt") or "")[:800],
+        "stream_system_prompt": stream_prompt[:1000],
+        "L0_live_prompt": stream_prompt[:1000],
+        "json_alert_prompt": json_prompt[:800],
         "rollup_prompts": {
             level: str(prompt or "")[:600]
             for level, prompt in rollups.items()
             if str(level).strip().upper() in {"L1", "L2", "L3"}
         },
+        "L1_prompt": str(rollups.get("L1") or "")[:600],
+        "L2_prompt": str(rollups.get("L2") or "")[:600],
+        "L3_prompt": str(rollups.get("L3") or "")[:600],
         "bookmark_enabled": current.get("bookmark_enabled"),
         "bookmark_cooldown_sec": current.get("bookmark_cooldown_sec"),
     }

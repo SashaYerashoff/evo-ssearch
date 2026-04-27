@@ -318,6 +318,24 @@
         return '#';
     }
 
+    function isPreviewableImageUrl(url) {
+        const value = String(url || '').trim();
+        if (!value || value === '#') return false;
+        if (/^data:image\//i.test(value)) return true;
+        if (/\/detections\/image\?/i.test(value)) return true;
+        if (/^\/image\//i.test(value)) return true;
+        if (/\/luxriot\/snapshot/i.test(value)) return true;
+        return /\.(?:png|jpe?g|webp|gif|bmp|svg)(?:[?#].*)?$/i.test(value);
+    }
+
+    function renderPreviewableLink(label, safeUrl, title = '') {
+        const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+        const previewAttrs = isPreviewableImageUrl(safeUrl)
+            ? ` class="markdown-preview-link" data-preview-image="${escapeHtml(safeUrl)}"`
+            : '';
+        return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"${titleAttr}${previewAttrs}>${escapeHtml(label)}</a>`;
+    }
+
     function parseMarkdownTableRow(line) {
         const raw = String(line || '').trim();
         if (!raw.includes('|')) return [];
@@ -375,21 +393,16 @@
                 const safeUrl = sanitizeUrl(url);
                 const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
                 return makeToken(
-                    `<img class="markdown-inline-image" src="${escapeHtml(safeUrl)}" alt="${escapeHtml(altText || '')}"${titleAttr} loading="lazy" />`
+                    `<img class="markdown-inline-image" src="${escapeHtml(safeUrl)}" alt="${escapeHtml(altText || '')}"${titleAttr} loading="lazy" data-preview-image="${escapeHtml(safeUrl)}" />`
                 );
             })
             .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_, label, url, title) => {
                 const safeUrl = sanitizeUrl(url);
-                const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-                return makeToken(
-                    `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${escapeHtml(label)}</a>`
-                );
+                return makeToken(renderPreviewableLink(label, safeUrl, title));
             })
             .replace(/(^|[\s(])((?:https?:\/\/|\/)[^\s<]+?)(?=([),.!?]?(?:\s|$)))/g, (_, prefix, url) => {
                 const safeUrl = sanitizeUrl(url);
-                return `${prefix}${makeToken(
-                    `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`
-                )}`;
+                return `${prefix}${makeToken(renderPreviewableLink(url, safeUrl))}`;
             });
         let out = escapeHtml(placeholder);
         out = out
@@ -7582,6 +7595,12 @@
             div.className = cls;
             const url = item.image_url || null;
             const score = scoreVal != null ? String(scoreVal) : '';
+            const previewTitle = item.filename || item.name || item.path || item.image_path || item.id || 'Preview';
+            if (url) {
+                div.dataset.previewImage = String(url);
+                div.dataset.previewTitle = String(previewTitle);
+                div.title = String(previewTitle);
+            }
             if (url) {
                 div.innerHTML = `<img src="${escapeHtml(url)}" alt="" loading="lazy" />${score ? `<div class="${cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score'}">${escapeHtml(score)}</div>` : ''}`;
             } else {
@@ -7791,7 +7810,7 @@
                 }
                 const desc = (result && result.description) || '';
                 if (imgSrc) {
-                    body.innerHTML = `<div class="agent-frame-img-wrap"><img class="agent-frame-img" src="${escapeHtml(imgSrc)}" alt="analyzed frame" /></div><div class="agent-describe-block">${escapeHtml(desc)}</div>`;
+                    body.innerHTML = `<div class="agent-frame-img-wrap"><img class="agent-frame-img" src="${escapeHtml(imgSrc)}" alt="analyzed frame" data-preview-image="${escapeHtml(imgSrc)}" data-preview-title="Analyzed frame" /></div><div class="agent-describe-block">${escapeHtml(desc)}</div>`;
                 } else {
                     body.innerHTML = `<div class="agent-describe-block">${escapeHtml(desc)}</div>`;
                 }
@@ -8243,6 +8262,31 @@
                         const slug = (editBtn.dataset.agentSkillEdit || '').trim();
                         if (slug) void agentOpenSkillEditor(slug);
                     }
+                });
+            }
+
+            const messagesEl = elMessages();
+            if (messagesEl) {
+                messagesEl.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (!(target instanceof Element)) return;
+                    const previewEl = target.closest('[data-preview-image], .agent-search-thumb, .agent-det-thumb');
+                    if (!(previewEl instanceof HTMLElement)) return;
+                    let src = '';
+                    let title = '';
+                    if (previewEl.dataset.previewImage) {
+                        src = previewEl.dataset.previewImage;
+                        title = previewEl.dataset.previewTitle || previewEl.getAttribute('title') || '';
+                    } else {
+                        const img = previewEl.querySelector('img');
+                        if (img) {
+                            src = img.getAttribute('src') || '';
+                            title = img.getAttribute('alt') || previewEl.getAttribute('title') || '';
+                        }
+                    }
+                    if (!isPreviewableImageUrl(src)) return;
+                    event.preventDefault();
+                    openImageLightbox(src, title || 'Agent preview');
                 });
             }
 

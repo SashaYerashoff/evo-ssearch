@@ -3568,6 +3568,7 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
+    cursor: zoom-in;
 }
 
 .agent-det-score {
@@ -3630,6 +3631,7 @@
     width: 100%;
     height: 100%;
     object-fit: cover;
+    cursor: zoom-in;
 }
 
 .agent-search-score {
@@ -3833,6 +3835,7 @@
     border-radius: 3px;
     border: 1px solid var(--panel-border);
     display: block;
+    cursor: zoom-in;
 }
 
 /* get_video_summaries entries */
@@ -5599,6 +5602,16 @@ textarea::placeholder {
     border-bottom-color: rgba(195, 240, 255, 0.48);
 }
 
+.agent-msg-body a.markdown-preview-link {
+    color: #baf7e2;
+    border-bottom-color: rgba(0, 214, 143, 0.32);
+}
+
+.agent-msg-body a.markdown-preview-link:hover {
+    color: #d8fff1;
+    border-bottom-color: rgba(0, 214, 143, 0.54);
+}
+
 .agent-msg-body code {
     display: inline-block;
     padding: 0.08rem 0.38rem;
@@ -5640,6 +5653,7 @@ textarea::placeholder {
     border-radius: 12px;
     border: 1px solid rgba(37, 51, 66, 0.92);
     background: rgba(10, 15, 20, 0.98);
+    cursor: zoom-in;
 }
 
 .agent-msg-body .markdown-table-wrap {
