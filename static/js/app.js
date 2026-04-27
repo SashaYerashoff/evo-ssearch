@@ -3269,6 +3269,11 @@
 
     settingsBtn.addEventListener('click', () => {
         settingsModal.style.display = 'block';
+        if (settingsStatus) {
+            settingsStatus.textContent = '';
+            settingsStatus.className = 'settings-status';
+            settingsStatus.style.display = 'none';
+        }
         loadSettings();
         loadEnvEditor();
         if (settingsScrollArea) {
@@ -3460,6 +3465,7 @@
                 const parsedFusionAlpha = parseFloat(settings.fusionAlpha);
                 const fusionAlpha = Number.isFinite(parsedFusionAlpha) ? parsedFusionAlpha : 0.7;
                 fusionAlphaInput.value = fusionAlpha.toFixed(2);
+                fusionAlphaValue.textContent = fusionAlpha.toFixed(2);
                 dinoModelInput.value = settings.dinoModel || 'dinov3_vitb16';
                 dinoEmbedDimInput.value = settings.dinoEmbedDim || 1280;
                 dinoWeightsInput.value = settings.dinoWeightsPath || '';

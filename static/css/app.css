@@ -6996,50 +6996,167 @@ textarea::placeholder {
 .app-settings-modal-content {
     top: 50%;
     transform: translate(-50%, -50%);
-    width: min(96vw, 1320px);
-    height: min(88vh, 920px);
-    max-height: min(88vh, 920px);
+    max-width: none;
+    width: min(96vw, 1460px);
+    min-width: min(94vw, 1120px);
+    height: min(92vh, 980px);
+    max-height: min(92vh, 980px);
     display: flex;
     flex-direction: column;
     gap: 16px;
-    padding: 24px;
+    padding: 28px;
     overflow: hidden;
 }
 
 .settings-sheet-nav {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
     gap: 10px;
-    padding-bottom: 14px;
+    padding-bottom: 16px;
     border-bottom: 1px solid rgba(37, 51, 66, 0.92);
 }
 
 .settings-sheet-nav .settings-nav-btn {
-    flex: 1 1 180px;
+    width: 100%;
     min-width: 0;
+    min-height: 44px;
+    padding: 10px 14px;
+    justify-content: flex-start;
+}
+
+.settings-sheet-nav .settings-nav-meta {
+    display: none;
 }
 
 .settings-sheet-scroll {
     flex: 1;
+    overflow: auto;
+    padding-right: 8px;
+    scrollbar-gutter: stable;
 }
 
 .settings-sheet-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 16px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
     align-items: start;
 }
 
 .settings-sheet-grid .settings-section {
     margin: 0;
+    padding: 22px 24px;
+    border-radius: 18px;
+    scroll-margin-top: 12px;
 }
 
 .settings-section-wide {
-    grid-column: 1 / -1;
+    grid-column: auto;
 }
 
 .settings-label {
     flex: 0 0 160px;
+}
+
+.app-settings-modal-content .settings-header {
+    margin-bottom: 0;
+    padding-bottom: 16px;
+}
+
+.app-settings-modal-content .settings-header-sub {
+    max-width: 860px;
+}
+
+.app-settings-modal-content .settings-section {
+    gap: 16px;
+}
+
+.app-settings-modal-content .settings-section h3 {
+    margin: 0;
+    padding-bottom: 12px;
+}
+
+.app-settings-modal-content .settings-section-meta {
+    margin-top: 0;
+    max-width: 900px;
+}
+
+.app-settings-modal-content .settings-row {
+    display: grid;
+    grid-template-columns: minmax(180px, 230px) minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px 18px;
+    margin: 0;
+}
+
+.app-settings-modal-content .settings-row + .settings-row {
+    margin-top: 0;
+}
+
+.app-settings-modal-content .settings-label {
+    min-width: 0;
+    padding-top: 0;
+    line-height: 1.4;
+}
+
+.app-settings-modal-content .settings-input,
+.app-settings-modal-content .settings-select,
+.app-settings-modal-content .settings-range {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+}
+
+.app-settings-modal-content .settings-input,
+.app-settings-modal-content .settings-select {
+    min-height: 44px;
+    padding-inline: 14px;
+}
+
+.app-settings-modal-content .settings-checkbox {
+    margin-top: 0;
+    justify-self: start;
+    align-self: center;
+}
+
+.app-settings-modal-content .range-value {
+    min-width: 56px;
+    padding-top: 0;
+    align-self: center;
+    text-align: right;
+}
+
+.app-settings-modal-content .severity-row,
+.app-settings-modal-content .env-editor-actions,
+.app-settings-modal-content .settings-note,
+.app-settings-modal-content .env-editor {
+    grid-column: 2 / -1;
+}
+
+.app-settings-modal-content .severity-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    width: 100%;
+}
+
+.app-settings-modal-content .settings-short-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.app-settings-modal-content .settings-row.align-start {
+    align-items: start;
+}
+
+.app-settings-modal-content .env-editor {
+    min-height: 360px;
+}
+
+.app-settings-modal-content .settings-footer {
+    margin-top: auto;
+    padding-top: 18px;
+    background: linear-gradient(180deg, rgba(17, 23, 30, 0), rgba(17, 23, 30, 0.96) 26%);
 }
 
 .env-editor {
@@ -7070,6 +7187,15 @@ textarea::placeholder {
 
     .agent-box {
         grid-template-columns: minmax(220px, 250px) minmax(0, 1fr);
+    }
+
+    .app-settings-modal-content {
+        min-width: 0;
+        width: min(97vw, 1240px);
+    }
+
+    .app-settings-modal-content .settings-row {
+        grid-template-columns: minmax(160px, 210px) minmax(0, 1fr) auto;
     }
 }
 
@@ -7131,12 +7257,37 @@ textarea::placeholder {
 
     .app-settings-modal-content {
         width: min(96vw, 96vw);
+        min-width: 0;
         height: min(94vh, 94vh);
         max-height: min(94vh, 94vh);
         padding: 18px;
     }
 
+    .settings-sheet-nav {
+        grid-template-columns: 1fr;
+    }
+
     .settings-sheet-nav .settings-nav-btn {
-        flex: 1 1 160px;
+        min-height: 74px;
+    }
+
+    .settings-sheet-nav .settings-nav-meta {
+        display: block;
+    }
+
+    .app-settings-modal-content .settings-row {
+        grid-template-columns: 1fr;
+        gap: 8px;
+    }
+
+    .app-settings-modal-content .severity-row,
+    .app-settings-modal-content .env-editor-actions,
+    .app-settings-modal-content .settings-note,
+    .app-settings-modal-content .env-editor {
+        grid-column: auto;
+    }
+
+    .app-settings-modal-content .range-value {
+        text-align: left;
     }
 }
