@@ -2609,6 +2609,35 @@ def _skill_summary_line(content: str) -> str:
     return "No summary provided."
 
 
+def _skill_trigger_phrases(content: str) -> List[str]:
+    phrases: List[str] = []
+    lines = str(content or "").splitlines()
+    in_section = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        lower = line.lower()
+        if not in_section:
+            if lower == "trigger phrases:":
+                in_section = True
+            continue
+        if not line:
+            if phrases:
+                break
+            continue
+        if line.startswith("#"):
+            break
+        if re.match(r"^[A-Za-z][A-Za-z0-9 _-]*:$", line):
+            break
+        if line.startswith("- "):
+            phrase = line[2:].strip().strip("`").strip()
+            if phrase:
+                phrases.append(phrase)
+            continue
+        if phrases:
+            break
+    return phrases
+
+
 def _format_runtime_skill_index_for_prompt() -> str:
     docs = _load_runtime_skill_docs()
     if not docs:
@@ -2652,7 +2681,13 @@ def _extract_requested_skill_slugs(message: Any) -> List[str]:
             hits.append(slug)
         elif f"skill:{slug.lower()}" in lower or f"playbook:{slug.lower()}" in lower:
             hits.append(slug)
-    return hits
+            continue
+        doc = by_slug.get(slug) or {}
+        for phrase in _skill_trigger_phrases(str(doc.get("content") or "")):
+            if phrase and phrase.lower() in lower:
+                hits.append(slug)
+                break
+    return list(dict.fromkeys(hits))
 
 
 def _format_active_skill_docs_for_prompt(skill_slugs: Sequence[str]) -> str:
