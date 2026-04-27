@@ -221,7 +221,9 @@
                         </div>
                         <div class="luxriot-row">
                             <label for="luxriotLiveModel">Live model:</label>
-                            <input type="text" id="luxriotLiveModel" class="luxriot-mini-input" placeholder="qwen/qwen3-vl-4b" value="{{ lm_model }}" />
+                            <select id="luxriotLiveModel" class="luxriot-mini-input">
+                                <option value="">Loading models...</option>
+                            </select>
                         </div>
                         <div class="video-control-note">Used only for live summaries. Offline Video Analysis uses its own separate model field.</div>
                         <div class="luxriot-actions">
@@ -320,7 +322,9 @@
                                     </div>
                                     <div class="input-group">
                                         <label class="input-label" for="videoModel">Model ID:</label>
-                                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{{ lm_model }}" />
+                                        <select id="videoModel">
+                                            <option value="">Loading models...</option>
+                                        </select>
                                     </div>
                                 </div>
                                 <div class="video-row">
@@ -482,7 +486,9 @@
                         </div>
                         <div class="agent-model-controls">
                             <label for="agentModelInput" class="agent-model-label">Model</label>
-                            <input type="text" id="agentModelInput" class="luxriot-mini-input agent-model-input" placeholder="qwen/qwen3.5-35b-a3b" />
+                            <select id="agentModelInput" class="luxriot-mini-input agent-model-input">
+                                <option value="">Loading models...</option>
+                            </select>
                             <button id="agentModelApplyBtn" class="feature-btn">Apply</button>
                         </div>
                     </div>

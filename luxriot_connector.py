@@ -1178,6 +1178,23 @@ class LuxriotManager:
                     return str(rollup_prompts.get(normalized_level) or "")
         return self._default_rollup_prompt_for_level_locked(normalized_level)
 
+    def _get_rollup_model_hint_locked(self, channel_id: Optional[int] = None) -> Optional[str]:
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping):
+                override_hint = str(overrides.get("model_hint") or "").strip()
+                if override_hint:
+                    return override_hint
+            runs = self.summary_runs.get(int(channel_id), [])
+            for run in reversed(runs):
+                if not isinstance(run, Mapping):
+                    continue
+                model_hint = str(run.get("model") or "").strip()
+                if model_hint:
+                    return model_hint
+        fallback_hint = str(self.rollup_llm_model_hint or "").strip()
+        return fallback_hint or None
+
     def get_stream_system_prompt(self, channel_id: Optional[int] = None) -> str:
         with self.cache_lock:
             return self._get_stream_system_prompt_locked(channel_id)
@@ -1817,7 +1834,9 @@ class LuxriotManager:
                 node=node,
                 children=children,
             )
-            summary = str(self.lm_callback(messages, self.rollup_llm_model_hint)).strip()
+            with self.cache_lock:
+                model_hint = self._get_rollup_model_hint_locked(channel_id)
+            summary = str(self.lm_callback(messages, model_hint)).strip()
             return summary or fallback_summary
         except Exception:
             return fallback_summary
@@ -2310,6 +2329,7 @@ class LuxriotManager:
         except Exception:
             batch = default_size
         prompt = prompt or ""
+        normalized_model_hint = str(model_hint or "").strip() or None
         with self.cache_lock:
             existing = self.sessions.pop(channel_id, None)
             if existing:
@@ -2325,14 +2345,20 @@ class LuxriotManager:
                 next_stream_prompt = str(system_prompt)
                 if next_stream_prompt != str(channel_overrides.get("stream_system_prompt") or ""):
                     channel_overrides["stream_system_prompt"] = next_stream_prompt
-                    self.channel_prompt_overrides[channel_id] = channel_overrides
-                    self._persist_summary_state_locked()
+            else:
+                overrides_raw = self.channel_prompt_overrides.get(channel_id)
+                channel_overrides = dict(overrides_raw) if isinstance(overrides_raw, Mapping) else {}
+            if normalized_model_hint and normalized_model_hint != str(channel_overrides.get("model_hint") or ""):
+                channel_overrides["model_hint"] = normalized_model_hint
+            if channel_overrides != dict(self.channel_prompt_overrides.get(channel_id) or {}):
+                self.channel_prompt_overrides[channel_id] = channel_overrides
+                self._persist_summary_state_locked()
             effective_system_prompt = self._get_stream_system_prompt_locked(channel_id)
             run = self._open_run_locked(
                 channel_id=channel_id,
                 batch_size=batch,
                 prompt=prompt,
-                model_hint=model_hint,
+                model_hint=normalized_model_hint,
                 system_prompt=effective_system_prompt,
             )
             session = LuxriotCaptureSession(
@@ -2342,7 +2368,7 @@ class LuxriotManager:
                 prompt,
                 run_id=run.get("run_id"),
                 run_started_at=run.get("started_at"),
-                model_hint=model_hint,
+                model_hint=normalized_model_hint,
                 summarization_enabled=True,
                 capture_kind="video",
             )

@@ -784,7 +784,6 @@ def home():
         luxriot_batch_options=luxriot_batch_options,
         luxriot_snapshot_interval=config.LUXRIOT_SNAPSHOT_INTERVAL,
         luxriot_snapshot_max_edge=config.LUXRIOT_SNAPSHOT_MAX_EDGE,
-        lm_model=config.LM_MODEL or '',
         video_frame_options_html=video_frame_options_html,
         luxriot_system_prompt_default=LUXRIOT_SYSTEM_PROMPT_DEFAULT or '',
         luxriot_rollup_prompt_l1=getattr(config, 'LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT', rollup_default) or rollup_default,
@@ -1471,6 +1470,9 @@ _agent_runner: Optional[Any] = None
 _agent_runner_lock = threading.Lock()
 _agent_runtime_model_override: Optional[str] = None
 _skills_root = Path(__file__).resolve().parent / "skills"
+_lm_models_cache_lock = threading.Lock()
+_lm_models_cache_payload: Optional[Dict[str, Any]] = None
+_lm_models_cache_expires_at = 0.0
 
 
 def _slugify_skill_name(value: str) -> str:
@@ -1695,6 +1697,71 @@ def _get_agent_config_payload() -> Dict[str, Any]:
         "override_model": str(_agent_runtime_model_override or "").strip() or None,
         "source": "runtime_override" if _agent_runtime_model_override else "config",
     }
+
+
+def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
+    global _lm_models_cache_payload, _lm_models_cache_expires_at
+
+    now = time.monotonic()
+    with _lm_models_cache_lock:
+        if (
+            not force
+            and _lm_models_cache_payload is not None
+            and now < _lm_models_cache_expires_at
+        ):
+            return copy.deepcopy(_lm_models_cache_payload)
+
+    default_model = str(config.LM_MODEL or "").strip()
+    fallback_models: List[str] = []
+    for candidate in (
+        default_model,
+        str(_agent_runtime_model_override or "").strip(),
+    ):
+        if candidate and candidate not in fallback_models:
+            fallback_models.append(candidate)
+
+    payload: Dict[str, Any] = {
+        "models": fallback_models,
+        "default_model": default_model,
+        "source": "fallback",
+        "error": None,
+        "fetched_at": time.time(),
+    }
+
+    try:
+        base_url = (config.LM_BASE_URL or "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
+        headers = {"Content-Type": "application/json"}
+        if config.LM_API_KEY:
+            headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
+        timeout = (3.05, min(10.0, max(5.0, float(config.LM_TIMEOUT or 120))))
+        response = requests.get(f"{base_url}/models", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        raw = response.json()
+        items = raw.get("data") if isinstance(raw, Mapping) else None
+        model_ids: List[str] = []
+        if isinstance(items, Sequence):
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                model_id = str(item.get("id") or item.get("model") or "").strip()
+                if model_id and model_id not in model_ids:
+                    model_ids.append(model_id)
+        if not model_ids:
+            model_ids = list(fallback_models)
+        payload.update({
+            "models": model_ids,
+            "source": "lm_studio",
+            "error": None,
+        })
+    except Exception as exc:
+        payload["error"] = str(exc)
+
+    with _lm_models_cache_lock:
+        _lm_models_cache_payload = copy.deepcopy(payload)
+        _lm_models_cache_expires_at = now + 15.0
+    return payload
 
 
 DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
@@ -6202,10 +6269,19 @@ def agent_config():
         return guard
     data = _json_body()
     raw_model = str(data.get('model') or '').strip()
+    default_model = str(config.LM_MODEL or '').strip()
     with _agent_runner_lock:
-        _agent_runtime_model_override = raw_model or None
+        _agent_runtime_model_override = raw_model if raw_model and raw_model != default_model else None
         _agent_runner = None
     return jsonify({'success': True, **_get_agent_config_payload()})
+
+
+@app.route('/lm/models', methods=['GET'])
+def lm_models():
+    force = str(request.args.get('force') or '').strip().lower() in TRUE_BOOL_STRINGS
+    payload = _fetch_lm_model_catalog(force=force)
+    payload['agent'] = _get_agent_config_payload()
+    return jsonify(payload)
 
 
 @app.route('/agent/skills', methods=['GET'])

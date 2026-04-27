@@ -248,17 +248,120 @@
     const channelFpsDesired = {};
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
     const LUXRIOT_LIVE_MODEL_STORAGE_KEY = 'evs_luxriot_live_model';
+    const VIDEO_MODEL_STORAGE_KEY = 'evs_video_model';
+    let lmModelCatalog = {
+        models: [],
+        defaultModel: '',
+        source: 'fallback',
+        error: '',
+    };
+    let lmModelCatalogPromise = null;
     let agentSkillDraft = null;
 
-    if (luxriotLiveModelInput) {
-        const storedLiveModel = (localStorage.getItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY) || '').trim();
-        if (storedLiveModel) {
-            luxriotLiveModelInput.value = storedLiveModel;
+    function normalizeModelId(value) {
+        return String(value || '').trim();
+    }
+
+    function uniqueModelIds(...values) {
+        const seen = new Set();
+        const out = [];
+        values.flat().forEach((value) => {
+            const normalized = normalizeModelId(value);
+            if (!normalized || seen.has(normalized)) return;
+            seen.add(normalized);
+            out.push(normalized);
+        });
+        return out;
+    }
+
+    function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '') {
+        if (!(selectEl instanceof HTMLSelectElement)) return;
+        const selected = normalizeModelId(selectedValue);
+        const fallback = normalizeModelId(fallbackValue || lmModelCatalog.defaultModel);
+        const options = uniqueModelIds(lmModelCatalog.models || [], selected, fallback);
+        const nextValue = selected || fallback || options[0] || '';
+        if (!options.length) {
+            selectEl.innerHTML = '<option value="">No models available</option>';
+            selectEl.value = '';
+            return;
         }
-        luxriotLiveModelInput.addEventListener('input', () => {
-            localStorage.setItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY, (luxriotLiveModelInput.value || '').trim());
+        selectEl.innerHTML = options
+            .map((modelId) => `<option value="${escapeHtml(modelId)}">${escapeHtml(modelId)}</option>`)
+            .join('');
+        if (options.includes(nextValue)) {
+            selectEl.value = nextValue;
+        } else {
+            selectEl.value = options[0];
+        }
+    }
+
+    function syncStoredModelSelection(selectEl, storageKey) {
+        if (!(selectEl instanceof HTMLSelectElement) || !storageKey) return;
+        selectEl.addEventListener('change', () => {
+            const value = normalizeModelId(selectEl.value);
+            if (value) {
+                localStorage.setItem(storageKey, value);
+            } else {
+                localStorage.removeItem(storageKey);
+            }
         });
     }
+
+    function applyLmModelCatalogToUi() {
+        const defaultModel = normalizeModelId(lmModelCatalog.defaultModel);
+        if (luxriotLiveModelInput) {
+            const preferredLiveModel = normalizeModelId(luxriotLiveModelInput.value)
+                || normalizeModelId(localStorage.getItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY))
+                || defaultModel;
+            setModelSelectOptions(luxriotLiveModelInput, preferredLiveModel, defaultModel);
+        }
+        if (videoModelInput) {
+            const preferredVideoModel = normalizeModelId(videoModelInput.value)
+                || normalizeModelId(localStorage.getItem(VIDEO_MODEL_STORAGE_KEY))
+                || defaultModel;
+            setModelSelectOptions(videoModelInput, preferredVideoModel, defaultModel);
+        }
+    }
+
+    async function loadLmModelCatalog(force = false) {
+        if (lmModelCatalogPromise && !force) {
+            return lmModelCatalogPromise;
+        }
+        lmModelCatalogPromise = (async () => {
+            try {
+                const url = force ? '/lm/models?force=1' : '/lm/models';
+                const response = await fetch(url, { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to load models');
+                }
+                lmModelCatalog = {
+                    models: uniqueModelIds(data.models || []),
+                    defaultModel: normalizeModelId(data.default_model),
+                    source: String(data.source || 'fallback'),
+                    error: normalizeModelId(data.error),
+                };
+            } catch (error) {
+                lmModelCatalog = {
+                    models: uniqueModelIds(
+                        lmModelCatalog.models || [],
+                        luxriotLiveModelInput ? luxriotLiveModelInput.value : '',
+                        videoModelInput ? videoModelInput.value : '',
+                    ),
+                    defaultModel: normalizeModelId(lmModelCatalog.defaultModel || ''),
+                    source: 'fallback',
+                    error: error.message || String(error),
+                };
+            }
+            applyLmModelCatalogToUi();
+            return lmModelCatalog;
+        })();
+        return lmModelCatalogPromise;
+    }
+
+    syncStoredModelSelection(luxriotLiveModelInput, LUXRIOT_LIVE_MODEL_STORAGE_KEY);
+    syncStoredModelSelection(videoModelInput, VIDEO_MODEL_STORAGE_KEY);
+    void loadLmModelCatalog();
 
     function getAdminToken() {
         return (localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '').trim();
@@ -2205,7 +2308,7 @@
                 const selectedVideoStream = videoStreams.find((stream) => parseInt(String(stream?.channel_id ?? ''), 10) === selectedChannelId);
                 const liveModel = String(selectedVideoStream?.model || '').trim();
                 if (liveModel) {
-                    luxriotLiveModelInput.value = liveModel;
+                    setModelSelectOptions(luxriotLiveModelInput, liveModel);
                     localStorage.setItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY, liveModel);
                 }
             }
@@ -7295,12 +7398,13 @@
 
         async function agentLoadConfig() {
             try {
+                await loadLmModelCatalog();
                 const r = await fetch('/agent/config');
                 if (!r.ok) return;
                 const data = await r.json();
                 const input = elAgentModelInput();
-                if (input && document.activeElement !== input) {
-                    input.value = data.model || '';
+                if (input) {
+                    setModelSelectOptions(input, data.model || data.default_model || '');
                     input.title = data.source === 'runtime_override'
                         ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
                         : `Using default model: ${data.default_model || 'n/a'}`;
@@ -7328,7 +7432,7 @@
                     throw new Error(data.error || 'Failed to save agent model');
                 }
                 if (input) {
-                    input.value = data.model || model;
+                    setModelSelectOptions(input, data.model || model || data.default_model || '');
                     input.title = data.source === 'runtime_override'
                         ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
                         : `Using default model: ${data.default_model || 'n/a'}`;
