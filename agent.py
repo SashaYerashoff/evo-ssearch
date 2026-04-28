@@ -2924,6 +2924,9 @@ def build_system_prompt(
         f"- Do not rewrite json_alert_prompt unless the operator explicitly asks to change the structured alert/parsing template.\n"
         f"- Never claim that a prompt change, bookmark rule, or channel-specific setting was applied unless the corresponding tool returned status=applied in this turn.\n"
         f"- Never claim that Luxriot is disconnected or that a channel does not exist unless list_channels or another Luxriot tool in this turn confirmed that failure.\n"
+        f"- Probe-threshold semantics are strict: raising pos_floor or raising margin makes a probe stricter; lowering pos_floor or lowering margin makes it more permissive. Never describe lowering margin as tightening, filtering more, or reducing noise.\n"
+        f"- Detection hit counts over 24h are historical archive summaries. After a probe threshold change, do not claim that the 24h hit count already improved, dropped, or 'took effect' unless you explicitly measured a fresh post-change window.\n"
+        f"- If the operator asks for probe status immediately after an update, report the saved settings and explain that effect on live volume still requires post-change observation unless a fresh post-change query was run.\n"
         f"- Do not claim support for PDF export, CSV export, emails, file links, async report queues, or background jobs unless a tool explicitly returns that artifact.\n"
         f"- If an operator asks for an unsupported export, say so plainly and offer the closest available format, such as a structured chat report.\n"
         f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
@@ -3501,7 +3504,12 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "name": row.get("name"),
                     "channel_id": row.get("channel_id"),
                     "enabled": row.get("enabled"),
+                    "pos_floor": row.get("pos_floor"),
+                    "margin": row.get("margin"),
+                    "severity": row.get("severity"),
+                    "bookmark": row.get("bookmark"),
                     "hit_count_24h": row.get("hit_count_24h"),
+                    "latest_timestamp_ms": row.get("latest_timestamp_ms"),
                 }
                 for row in rows[:12]
                 if isinstance(row, dict)

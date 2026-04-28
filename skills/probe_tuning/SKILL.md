@@ -20,3 +20,11 @@ Tuning heuristics:
   - medium: days
   - broad: the largest safe historical window available
 - If data is too thin or contradictory, say so and ask the operator for a target scenario or more time range context.
+- Threshold semantics are strict:
+  - raising `pos_floor` makes the probe stricter
+  - lowering `pos_floor` makes the probe more permissive
+  - raising `margin` makes the probe stricter
+  - lowering `margin` makes the probe more permissive
+- Never describe lowering `margin` as "tightening" or "filtering more".
+- A 24h hit count is historical archive data. After applying new thresholds, do not claim that the 24h count already improved unless you explicitly measured a post-change window.
+- If the operator asks for probe status right after an update, report the stored thresholds and say that impact on live volume still needs post-change observation unless a fresh post-change query was run.
