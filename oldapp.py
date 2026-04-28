@@ -5131,7 +5131,7 @@ def probes_save():
         "positives": positives,
         "negatives": negatives,
         "pos_floor": _float(data.get('pos_floor'), 0.2),
-        "margin": _float(data.get('margin'), 0.05),
+        "margin": max(0.0, _float(data.get('margin'), 0.05)),
         "bookmark_cooldown_sec": max(
             0.0,
             _float(

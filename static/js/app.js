@@ -4800,7 +4800,7 @@
             positives,
             negatives,
             pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
-            margin: parseFloat(probeMarginInput?.value) || 0.05,
+            margin: Math.max(0, parseFloat(probeMarginInput?.value) || 0.05),
             top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
             window_sec: parseFloat(probeWindowSecInput?.value) || 300,
             fps: parseFloat(probeFpsInput?.value) || 0,
