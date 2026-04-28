@@ -1,4 +1,4 @@
-# Prompt Tuning
+# Stream Prompt Tuning
 
 Goal: refine VLM descriptions and alert prompts with explicit evidence.
 

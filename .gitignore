@@ -62,3 +62,4 @@ video/
 node_modules
 detections_archive/
 detections_store.sqlite3
+agent_sessions.sqlite3
