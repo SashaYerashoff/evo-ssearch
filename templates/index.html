@@ -50,14 +50,50 @@
             <div id="archiveBox" class="archive-box studio-mode">
                 <aside class="studio-rail archive-rail">
                     <div id="archiveSearchBox" class="archive-search-shell studio-scroll">
-                        <div class="archive-section archive-section-compact">
-                            <div class="archive-section-title">Index Folder</div>
-                            <div class="section-help">Point EVA at the active archive and refresh embeddings before search.</div>
-                            <div class="folder-select">
-                                <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                                <button id="indexBtn" class="feature-btn primary btn-md">Index</button>
+                        <div class="archive-section">
+                            <div class="archive-section-title">Detections Archive</div>
+                            <div class="section-help">Load stored probe hits by stream, probe, and time window before drilling down.</div>
+                            <div class="archive-filter-grid">
+                                <div class="input-group">
+                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
+                                    <select id="archiveChannelFilter">
+                                        <option value="">All streams</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveProbeFilter" class="input-label">Probe:</label>
+                                    <select id="archiveProbeFilter">
+                                        <option value="">All probes</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveTimeFilter" class="input-label">Time range:</label>
+                                    <select id="archiveTimeFilter">
+                                        <option value="1">Last 1h</option>
+                                        <option value="6">Last 6h</option>
+                                        <option value="24" selected>Last 24h</option>
+                                        <option value="72">Last 3d</option>
+                                        <option value="168">Last 7d</option>
+                                        <option value="0">All time</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
+                                    <select id="archiveDetectionsLimit">
+                                        <option value="12">12</option>
+                                        <option value="24" selected>24</option>
+                                        <option value="36">36</option>
+                                        <option value="48">48</option>
+                                    </select>
+                                </div>
                             </div>
-                            <div class="status shell-status" id="indexStatus"></div>
+                            <div class="archive-detections-actions">
+                                <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
+                                <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
+                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
+                                <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
+                            </div>
+                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
                         </div>
 
                         <div class="archive-section archive-section-compact">
@@ -120,50 +156,14 @@
                             </div>
                         </div>
 
-                        <div class="archive-section">
-                            <div class="archive-section-title">Detections Archive</div>
-                            <div class="section-help">Load stored probe hits by stream, probe, and time window before drilling down.</div>
-                            <div class="archive-filter-grid">
-                                <div class="input-group">
-                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
-                                    <select id="archiveChannelFilter">
-                                        <option value="">All streams</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveProbeFilter" class="input-label">Probe:</label>
-                                    <select id="archiveProbeFilter">
-                                        <option value="">All probes</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveTimeFilter" class="input-label">Time range:</label>
-                                    <select id="archiveTimeFilter">
-                                        <option value="1">Last 1h</option>
-                                        <option value="6">Last 6h</option>
-                                        <option value="24" selected>Last 24h</option>
-                                        <option value="72">Last 3d</option>
-                                        <option value="168">Last 7d</option>
-                                        <option value="0">All time</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
-                                    <select id="archiveDetectionsLimit">
-                                        <option value="12">12</option>
-                                        <option value="24" selected>24</option>
-                                        <option value="36">36</option>
-                                        <option value="48">48</option>
-                                    </select>
-                                </div>
+                        <div class="archive-section archive-section-compact">
+                            <div class="archive-section-title">Index Folder</div>
+                            <div class="section-help">Point EVA at the active archive and refresh embeddings before search.</div>
+                            <div class="folder-select">
+                                <input type="text" id="folderPath" placeholder="Enter folder path..." />
+                                <button id="indexBtn" class="feature-btn primary btn-md">Index</button>
                             </div>
-                            <div class="archive-detections-actions">
-                                <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
-                                <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
-                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
-                                <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
-                            </div>
-                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
+                            <div class="status shell-status" id="indexStatus"></div>
                         </div>
                     </div>
                 </aside>
