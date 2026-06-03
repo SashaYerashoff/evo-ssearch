@@ -1462,6 +1462,147 @@ class ProbesStore:
 
 probes_store = ProbesStore()
 detections_store = DetectionsStore()
+APP_STARTED_AT = time.time()
+
+
+def _component_result(
+    ok: bool,
+    status: str,
+    *,
+    required: bool = True,
+    **details: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ok": bool(ok),
+        "status": status,
+        "required": bool(required),
+    }
+    for key, value in details.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _embedder_loaded_state() -> Dict[str, Any]:
+    if active_embedder == "clip":
+        loaded = clip_model is not None and (clip_preprocess is not None or clip_processor is not None)
+    elif active_embedder == "dino":
+        loaded = dino_encoder is not None
+    elif active_embedder == "fusion":
+        loaded = (
+            clip_model is not None
+            and (clip_preprocess is not None or clip_processor is not None)
+            and dino_encoder is not None
+        )
+    else:
+        return _component_result(False, "unsupported", embedder=active_embedder)
+    return _component_result(
+        loaded,
+        "loaded" if loaded else "not_loaded",
+        embedder=active_embedder,
+        clip_model=clip_runtime_model or None,
+        backend=clip_backend_kind if clip_model is not None else None,
+    )
+
+
+def _check_database_ready() -> Dict[str, Any]:
+    try:
+        with detections_store.lock:
+            conn = detections_store._connect()
+            try:
+                conn.execute("SELECT 1").fetchone()
+            finally:
+                conn.close()
+        return _component_result(True, "reachable", path=str(detections_store.path))
+    except Exception as exc:
+        return _component_result(False, "error", error=str(exc), path=str(detections_store.path))
+
+
+def _luxriot_configured() -> bool:
+    base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip()
+    if not base_url or "luxriot-host" in base_url:
+        return False
+    return bool(str(getattr(config, "LUXRIOT_USERNAME", "") or "").strip())
+
+
+def _check_luxriot_ready(timeout_sec: float = 2.0) -> Dict[str, Any]:
+    base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip().rstrip("/")
+    if not _luxriot_configured():
+        return _component_result(False, "not_configured", required=False, base_url=base_url or None)
+    try:
+        auth = requests.auth.HTTPDigestAuth(config.LUXRIOT_USERNAME, config.LUXRIOT_PASSWORD)
+        resp = requests.get(
+            f"{base_url}/channels",
+            params={"health": 0},
+            headers={"Accept": "application/json"},
+            auth=auth,
+            timeout=(1.0, max(1.0, float(timeout_sec))),
+            stream=True,
+        )
+        try:
+            ok = 200 <= int(resp.status_code) < 400
+            return _component_result(
+                ok,
+                "reachable" if ok else "http_error",
+                status_code=int(resp.status_code),
+                base_url=base_url,
+            )
+        finally:
+            resp.close()
+    except Exception as exc:
+        return _component_result(False, "error", error=str(exc), base_url=base_url)
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Liveness endpoint for process supervisors and load balancers."""
+    return jsonify(
+        {
+            "status": "ok",
+            "version": config.APP_VERSION,
+            "uptime_sec": round(max(0.0, time.time() - APP_STARTED_AT), 3),
+        }
+    )
+
+
+@app.route('/ready', methods=['GET'])
+def ready():
+    """Readiness endpoint with component-level dependency status."""
+    load_embedder = str(request.args.get("load") or "").strip().lower() in TRUE_BOOL_STRINGS
+    strict = str(request.args.get("strict") or "").strip().lower() in TRUE_BOOL_STRINGS
+
+    checks: Dict[str, Dict[str, Any]] = {
+        "database": _check_database_ready(),
+        "embedder": _embedder_loaded_state(),
+        "luxriot": _check_luxriot_ready(),
+    }
+
+    if load_embedder and not checks["embedder"].get("ok"):
+        try:
+            ensure_embedder_loaded(active_embedder)
+            checks["embedder"] = _embedder_loaded_state()
+        except Exception as exc:
+            checks["embedder"] = _component_result(
+                False,
+                "load_failed",
+                embedder=active_embedder,
+                error=str(exc),
+            )
+
+    required_names = ["database", "embedder"]
+    if strict or checks["luxriot"].get("required"):
+        required_names.append("luxriot")
+
+    is_ready = all(bool(checks[name].get("ok")) for name in required_names)
+    status_code = 200 if is_ready else 503
+    return jsonify(
+        {
+            "status": "ready" if is_ready else "not_ready",
+            "version": config.APP_VERSION,
+            "required": required_names,
+            "checks": checks,
+        }
+    ), status_code
 
 # Agent runner — instantiated lazily on first /agent/chat request so that
 # all helper functions (get_text_embedding, _search_detections_archive, etc.)

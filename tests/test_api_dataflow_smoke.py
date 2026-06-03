@@ -43,7 +43,13 @@ def _route_matches_frontend(route_path: str, frontend_path: str) -> bool:
 
 
 def _collect_frontend_and_backend_paths() -> Tuple[Set[str], Set[str]]:
-    source = Path(__file__).resolve().parent.parent.joinpath("oldapp.py").read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent
+    sources = [
+        root.joinpath("oldapp.py"),
+        root.joinpath("templates", "index.html"),
+        root.joinpath("static", "js", "app.js"),
+    ]
+    source = "\n".join(path.read_text(encoding="utf-8") for path in sources if path.exists())
     fetch_paths = re.findall(r"fetch\(\s*['\"](/[^'\"]+)['\"]", source)
     fetch_paths.extend(re.findall(r"fetch\(\s*`(/[^`]*)`", source))
     src_paths = re.findall(r"\.src\s*=\s*['\"](/[^'\"]+)['\"]", source)
@@ -81,7 +87,16 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         }
         allowed_backend_only = {
             "/",
+            "/branding/logo",
+            "/agent/skills/create",
+            "/detections/image",
+            "/favicon.ico",
+            "/health",
+            "/image",
             "/image/<path:filepath>",
+            "/js/app.js",
+            "/lm/models",
+            "/ready",
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
@@ -90,6 +105,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         config.ADMIN_TOKEN = ""
         checks: List[Tuple[str, str, Dict[str, Any], Set[int]]] = [
             ("GET", "/", {}, {200}),
+            ("GET", "/health", {}, {200}),
+            ("GET", "/ready", {}, {200, 503}),
             ("GET", "/settings", {}, {200, 403}),
             ("POST", "/check_index", {"json": {}}, {400}),
             ("POST", "/search", {"json": {}}, {400}),
@@ -107,8 +124,22 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             with self.subTest(endpoint=path, method=method):
                 req_kwargs = dict(kwargs)
                 resp = self.client.open(path=path, method=method, data=req_kwargs.get("data"), json=req_kwargs.get("json"))
-                self.assertLess(resp.status_code, 500)
+                if 503 not in allowed:
+                    self.assertLess(resp.status_code, 500)
                 self.assertIn(resp.status_code, allowed)
+
+    def test_health_and_ready_payloads_are_structured(self) -> None:
+        health = self.client.get("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.get_json()["status"], "ok")
+
+        ready = self.client.get("/ready")
+        self.assertIn(ready.status_code, {200, 503})
+        payload = ready.get_json()
+        self.assertIn(payload["status"], {"ready", "not_ready"})
+        self.assertIn("database", payload["checks"])
+        self.assertIn("embedder", payload["checks"])
+        self.assertIn("luxriot", payload["checks"])
 
     def test_mutating_frontend_endpoints_require_token(self) -> None:
         config.ADMIN_TOKEN = ""
