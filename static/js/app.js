@@ -8037,10 +8037,12 @@
                 if (_agentCurrentSession) body.session_id = _agentCurrentSession;
                 if (imageB64) body.image_b64 = imageB64;
 
+                const streamController = new AbortController();
                 const r = await fetch('/agent/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(body)
+                    body: JSON.stringify(body),
+                    signal: streamController.signal
                 });
 
                 if (!r.ok) {
@@ -8054,6 +8056,7 @@
                 const decoder = new TextDecoder();
                 let buf = '';
                 let newSessionId = null;
+                let sawDoneEvent = false;
 
                 while (true) {
                     const { done, value } = await reader.read();
@@ -8069,9 +8072,21 @@
                         let evt;
                         try { evt = JSON.parse(raw); } catch(_) { continue; }
                         handleAgentEvent(evt, _agentPendingBubble);
-                        if (evt.type === 'done' && evt.session_id) {
+                        if (evt.type === 'session' && evt.session_id) {
                             newSessionId = evt.session_id;
                         }
+                        if (evt.type === 'done' && evt.session_id) {
+                            newSessionId = evt.session_id;
+                            sawDoneEvent = true;
+                        }
+                        if (evt.type === 'done') {
+                            sawDoneEvent = true;
+                        }
+                    }
+                    if (sawDoneEvent) {
+                        try { reader.cancel().catch(() => {}); } catch(_) {}
+                        try { streamController.abort(); } catch(_) {}
+                        break;
                     }
                 }
 
@@ -8079,8 +8094,8 @@
                 if (newSessionId) {
                     _agentCurrentSession = newSessionId;
                     localStorage.setItem(AGENT_LS_SESSION, newSessionId);
-                    await agentLoadSessions();
                     highlightActiveSession(newSessionId);
+                    void agentLoadSessions().then(() => highlightActiveSession(newSessionId));
                 }
 
             } catch(e) {
