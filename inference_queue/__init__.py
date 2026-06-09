@@ -22,6 +22,7 @@ from .models import (
 from .repository import InferenceQueueRepository
 from .service import InferenceEnqueueService
 from .worker import InferenceWorker
+from .luxriot_runtime import LuxriotInferenceQueueRuntime
 from .postgres import (
     PostgreSQLInferenceQueueRepository,
     PostgresInferenceQueueRepository,
@@ -50,6 +51,7 @@ __all__ = [
     "JobResult",
     "JobState",
     "LeaseLostError",
+    "LuxriotInferenceQueueRuntime",
     "ManualClock",
     "MetricsSnapshot",
     "QueueFullError",

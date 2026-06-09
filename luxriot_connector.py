@@ -39,6 +39,7 @@ class ProbeManagerLike(Protocol):
 
 
 AlertParserFn = Callable[[str, int, Optional[int]], List[Dict[str, Any]]]
+SummaryDispatcherFn = Callable[[Mapping[str, Any], str], Mapping[str, Any]]
 
 
 def _parse_optional_int(value: object) -> Optional[int]:
@@ -242,6 +243,9 @@ class LuxriotCaptureSession:
         self.logs: List[Dict[str, Any]] = []
         self.total_flushes = 0
         self.dropped_frames = 0
+        self.queue_submissions = 0
+        self.queue_dropped_batches = 0
+        self.last_queue_job_id: Optional[str] = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -278,76 +282,49 @@ class LuxriotCaptureSession:
                         probe_manager.add_frame(self.channel_id, snapshot, ts_ms)
                 except Exception as pm_exc:
                     self.last_error = str(pm_exc)
-                if self.summarization_enabled and len(self.frames) >= self.batch_size:
+                with self.lock:
+                    ready_to_summarize = len(self.frames) >= self.batch_size
+                if self.summarization_enabled and ready_to_summarize:
                     self._summarize_batch()
-                    with self.lock:
-                        self.frames.clear()
                 self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
             self.stop_event.wait(self.interval)
 
-    def _summarize_batch(self) -> None:
+    def _summarize_batch(self, workload_class: str = "heartbeat") -> None:
         with self.lock:
             frames_copy = list(self.frames)
+            self.frames.clear()
         if not frames_copy:
             return
-        started = time.time()
         try:
-            frame_ts_ms: List[int] = []
-            for frame in frames_copy:
-                raw_ts = frame.get("captured_at") or frame.get("time_sec")
-                if isinstance(raw_ts, (int, float)):
-                    try:
-                        frame_ts_ms.append(int(float(raw_ts) * 1000.0))
-                    except Exception:
-                        continue
-            base_system_prompt = self.manager.get_effective_stream_system_prompt(self.channel_id)
-            system_prompt = self.manager.compose_live_system_prompt(self.channel_id, base_system_prompt)
-            messages = self.manager.message_builder(f"#{self.channel_id}", frames_copy, self.prompt, system_prompt)
-            summary = self.manager.lm_callback(messages, self.model_hint)
-            duration = time.time() - started
-            created_at = time.time()
-            created_at_ms = int(created_at * 1000.0)
-            batch_start_ms = min(frame_ts_ms) if frame_ts_ms else created_at_ms
-            batch_end_ms = max(frame_ts_ms) if frame_ts_ms else created_at_ms
-            ts_tolerance_ms = max(1000, int(max(0.2, float(self.interval)) * 1000.0))
-            entry = {
-                "channel_id": self.channel_id,
-                "run_id": self.run_id,
-                "summary": summary,
-                "frame_count": len(frames_copy),
-                "batch_size": self.batch_size,
-                "created_at": created_at,
-                "batch_start_ms": batch_start_ms,
-                "batch_end_ms": batch_end_ms,
-                "duration_sec": duration,
-                "prompt": self.prompt,
-            }
-            try:
-                sent_alerts = int(
-                    self.manager.process_summary_alerts(
-                        self.channel_id,
-                        summary,
-                        default_ts_ms=batch_end_ms,
-                        min_ts_ms=batch_start_ms - ts_tolerance_ms,
-                        max_ts_ms=batch_end_ms + ts_tolerance_ms,
+            batch = self.manager.create_summary_batch(
+                channel_id=self.channel_id,
+                run_id=self.run_id,
+                batch_size=self.batch_size,
+                prompt=self.prompt,
+                model_hint=self.model_hint,
+                interval_sec=self.interval,
+                frames=frames_copy,
+            )
+            outcome = self.manager.dispatch_summary_batch(
+                batch,
+                workload_class=workload_class,
+            )
+            if bool(outcome.get("queued")):
+                with self.lock:
+                    self.queue_submissions += 1
+                    self.last_queue_job_id = (
+                        str(outcome.get("job_id") or "").strip() or None
                     )
-                )
-            except Exception:
-                sent_alerts = 0
-            entry["bookmarks_sent"] = sent_alerts
-            with self.lock:
-                self.logs.append(entry)
-                self.total_flushes += 1
-                if len(self.logs) > 50:
-                    self.logs = self.logs[-50:]
-            try:
-                self.manager.record_summary_log(self.channel_id, entry)
-            except Exception:
-                pass
+                    if not bool(outcome.get("accepted", True)):
+                        self.queue_dropped_batches += 1
         except Exception as exc:
             self.last_error = str(exc)
+            with self.lock:
+                self.frames = frames_copy + self.frames
+                self._enforce_buffer_locked()
+                self.queue_dropped_batches += 1
 
     def _enforce_buffer_locked(self) -> None:
         """Ensure frame buffer does not grow unbounded."""
@@ -360,9 +337,7 @@ class LuxriotCaptureSession:
     def flush_now(self) -> None:
         """Force a summary of current buffer."""
         if self.summarization_enabled:
-            self._summarize_batch()
-        with self.lock:
-            self.frames.clear()
+            self._summarize_batch(workload_class="manual")
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
@@ -382,6 +357,9 @@ class LuxriotCaptureSession:
             "summarization_enabled": self.summarization_enabled,
             "dropped_frames": self.dropped_frames,
             "flush_count": self.total_flushes,
+            "queue_submissions": self.queue_submissions,
+            "queue_dropped_batches": self.queue_dropped_batches,
+            "last_queue_job_id": self.last_queue_job_id,
             "last_error": self.last_error,
             "logs": logs_copy,
             "prompt": self.prompt,
@@ -425,6 +403,7 @@ class LuxriotManager:
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
         self.probe_manager: Optional[ProbeManagerLike] = probe_manager
+        self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
@@ -2082,6 +2061,180 @@ class LuxriotManager:
             return
         with self.cache_lock:
             self._merge_summary_history_locked(channel_id, [normalized])
+
+    def set_summary_dispatcher(
+        self,
+        dispatcher: Optional[SummaryDispatcherFn],
+    ) -> None:
+        self.summary_dispatcher = dispatcher
+
+    def create_summary_batch(
+        self,
+        *,
+        channel_id: int,
+        run_id: str,
+        batch_size: int,
+        prompt: str,
+        model_hint: Optional[str],
+        interval_sec: float,
+        frames: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        frame_items = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
+        if not frame_items:
+            raise ValueError("summary batch requires at least one frame")
+        frame_ts_ms: List[int] = []
+        for frame in frame_items:
+            raw_ts = frame.get("captured_at") or frame.get("time_sec")
+            if not isinstance(raw_ts, (int, float)):
+                continue
+            try:
+                frame_ts_ms.append(int(float(raw_ts) * 1000.0))
+            except Exception:
+                continue
+        submitted_at = time.time()
+        submitted_at_ms = int(submitted_at * 1000.0)
+        base_system_prompt = self.get_effective_stream_system_prompt(channel_id)
+        system_prompt = self.compose_live_system_prompt(channel_id, base_system_prompt)
+        return {
+            "version": 1,
+            "channel_id": int(channel_id),
+            "run_id": str(run_id or "").strip(),
+            "batch_size": int(batch_size),
+            "prompt": str(prompt or ""),
+            "model_hint": str(model_hint or "").strip() or None,
+            "system_prompt": system_prompt,
+            "interval_sec": max(0.2, float(interval_sec)),
+            "frames": frame_items,
+            "frame_count": len(frame_items),
+            "batch_start_ms": min(frame_ts_ms) if frame_ts_ms else submitted_at_ms,
+            "batch_end_ms": max(frame_ts_ms) if frame_ts_ms else submitted_at_ms,
+            "submitted_at": submitted_at,
+        }
+
+    def run_summary_batch(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+        channel_id = _parse_optional_int(batch.get("channel_id"))
+        frames = batch.get("frames")
+        if channel_id is None or channel_id < 1:
+            raise ValueError("summary batch channel_id must be positive")
+        if (
+            not isinstance(frames, Sequence)
+            or isinstance(frames, (str, bytes, bytearray))
+            or not frames
+        ):
+            raise ValueError("summary batch frames are missing")
+        frame_items = [
+            dict(frame)
+            for frame in frames
+            if isinstance(frame, Mapping)
+        ]
+        if not frame_items:
+            raise ValueError("summary batch has no valid frames")
+        started = time.time()
+        messages = self.message_builder(
+            f"#{channel_id}",
+            frame_items,
+            str(batch.get("prompt") or ""),
+            str(batch.get("system_prompt") or ""),
+        )
+        model_hint = str(batch.get("model_hint") or "").strip() or None
+        summary = self.lm_callback(messages, model_hint)
+        submitted_at = self._coerce_float(batch.get("submitted_at"))
+        created_at = submitted_at if submitted_at is not None else time.time()
+        return {
+            "channel_id": int(channel_id),
+            "run_id": str(batch.get("run_id") or "").strip(),
+            "summary": summary,
+            "frame_count": len(frame_items),
+            "batch_size": max(
+                len(frame_items),
+                _parse_optional_int(batch.get("batch_size")) or 0,
+            ),
+            "created_at": float(created_at),
+            "batch_start_ms": (
+                _parse_optional_int(batch.get("batch_start_ms"))
+                or int(created_at * 1000.0)
+            ),
+            "batch_end_ms": (
+                _parse_optional_int(batch.get("batch_end_ms"))
+                or int(created_at * 1000.0)
+            ),
+            "duration_sec": max(0.0, time.time() - started),
+            "prompt": str(batch.get("prompt") or ""),
+            "interval_sec": max(
+                0.2,
+                self._coerce_float(batch.get("interval_sec")) or 1.0,
+            ),
+        }
+
+    def accept_summary_entry(self, entry: Mapping[str, Any]) -> Dict[str, Any]:
+        normalized = self._normalize_summary_log_entry(entry)
+        if normalized is None:
+            raise ValueError("invalid summary result")
+        accepted = dict(entry)
+        accepted.update(normalized)
+        channel_id = int(normalized["channel_id"])
+        batch_start_ms = (
+            _parse_optional_int(accepted.get("batch_start_ms"))
+            or int(float(normalized["created_at"]) * 1000.0)
+        )
+        batch_end_ms = (
+            _parse_optional_int(accepted.get("batch_end_ms"))
+            or batch_start_ms
+        )
+        interval_sec = max(
+            0.2,
+            self._coerce_float(accepted.get("interval_sec")) or 1.0,
+        )
+        tolerance_ms = max(1000, int(interval_sec * 1000.0))
+        try:
+            sent_alerts = int(
+                self.process_summary_alerts(
+                    channel_id,
+                    str(normalized["summary"]),
+                    default_ts_ms=batch_end_ms,
+                    min_ts_ms=batch_start_ms - tolerance_ms,
+                    max_ts_ms=batch_end_ms + tolerance_ms,
+                )
+            )
+        except Exception:
+            sent_alerts = 0
+        accepted["bookmarks_sent"] = sent_alerts
+
+        with self.cache_lock:
+            session = self.sessions.get(channel_id)
+        if session is not None:
+            run_id = str(accepted.get("run_id") or "").strip()
+            if not run_id or run_id == session.run_id:
+                with session.lock:
+                    entry_key = self._summary_log_key(accepted)
+                    if all(
+                        self._summary_log_key(existing) != entry_key
+                        for existing in session.logs
+                    ):
+                        session.logs.append(dict(accepted))
+                        session.total_flushes += 1
+                        session.last_error = None
+                        if len(session.logs) > 50:
+                            session.logs = session.logs[-50:]
+        self.record_summary_log(channel_id, accepted)
+        return accepted
+
+    def dispatch_summary_batch(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        workload_class: str = "heartbeat",
+    ) -> Dict[str, Any]:
+        dispatcher = self.summary_dispatcher
+        if dispatcher is not None:
+            return dict(dispatcher(batch, workload_class))
+        entry = self.run_summary_batch(batch)
+        self.accept_summary_entry(entry)
+        return {
+            "queued": False,
+            "accepted": True,
+            "status": "completed",
+        }
 
     def build_client(self) -> LuxriotClient:
         return LuxriotClient(

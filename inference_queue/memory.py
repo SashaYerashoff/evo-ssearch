@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 from threading import RLock
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .clock import Clock, SystemClock
 from .errors import (
@@ -61,14 +61,20 @@ class InMemoryInferenceQueueRepository:
 
             coalesced = self._coalesced_heartbeat(job)
             if coalesced is not None:
+                refreshed, replaced_payload = coalesced
                 if job.idempotency_key is not None:
                     self._idempotency[
                         (job.tenant_id, job.idempotency_key)
-                    ] = coalesced.id
+                    ] = refreshed.id
                 self._coalesced_count += 1
-                return EnqueueResult(coalesced, EnqueueStatus.COALESCED)
+                return EnqueueResult(
+                    refreshed,
+                    EnqueueStatus.COALESCED,
+                    replaced_payload=replaced_payload,
+                )
 
             evicted_job_id = None
+            evicted_payload = None
             if self._queue_depth() >= capacity:
                 if job.workload_class is WorkloadClass.HEARTBEAT:
                     dropped = replace(
@@ -84,13 +90,17 @@ class InMemoryInferenceQueueRepository:
                 evicted = self._evictable_heartbeat()
                 if evicted is None:
                     raise QueueFullError(capacity, job.workload_class)
+                evicted_payload = evicted.payload
                 self._drop_existing(evicted, "evicted for event/manual workload")
                 evicted_job_id = evicted.id
 
             self._store_new(job)
             self._activate(job)
             return EnqueueResult(
-                job, EnqueueStatus.ENQUEUED, evicted_job_id=evicted_job_id
+                job,
+                EnqueueStatus.ENQUEUED,
+                evicted_job_id=evicted_job_id,
+                evicted_payload=evicted_payload,
             )
 
     def claim(
@@ -307,7 +317,9 @@ class InMemoryInferenceQueueRepository:
         )
         return self._jobs.get(existing_id) if existing_id is not None else None
 
-    def _coalesced_heartbeat(self, job: InferenceJob) -> Optional[InferenceJob]:
+    def _coalesced_heartbeat(
+        self, job: InferenceJob
+    ) -> Optional[Tuple[InferenceJob, Mapping[str, object]]]:
         if job.workload_class is not WorkloadClass.HEARTBEAT:
             return None
         existing_id = self._heartbeats.get(self._heartbeat_key(job))
@@ -336,7 +348,7 @@ class InMemoryInferenceQueueRepository:
             last_error=None,
         )
         self._jobs[existing.id] = refreshed
-        return refreshed
+        return refreshed, existing.payload
 
     def _queue_depth(self) -> int:
         return sum(

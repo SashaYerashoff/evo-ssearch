@@ -36,6 +36,10 @@ from config import config
 from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
 from eva_db import DatabaseSettings, PsycopgPool
+from inference_queue import (
+    LuxriotInferenceQueueRuntime,
+    PostgresInferenceQueueRepository,
+)
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
 from security import (
@@ -2028,6 +2032,10 @@ detections_store = DetectionsStore()
 APP_STARTED_AT = time.time()
 _control_plane_db_pool: Optional[PsycopgPool] = None
 _control_plane_db_lock = Lock()
+_inference_worker_db_pool: Optional[PsycopgPool] = None
+_inference_worker_db_lock = Lock()
+_inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
+_inference_queue_lock = Lock()
 
 
 def _component_result(
@@ -2104,6 +2112,92 @@ def _get_control_plane_db_pool() -> PsycopgPool:
         return _control_plane_db_pool
 
 
+def _inference_worker_database_dsn() -> str:
+    return str(
+        os.getenv("EVA_WORKER_DATABASE_DSN")
+        or os.getenv("EVOSSEARCH_WORKER_DATABASE_DSN")
+        or ""
+    ).strip()
+
+
+def _get_inference_worker_db_pool() -> PsycopgPool:
+    global _inference_worker_db_pool
+    with _inference_worker_db_lock:
+        if _inference_worker_db_pool is None:
+            dsn = _inference_worker_database_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "EVA_WORKER_DATABASE_DSN is required when local inference "
+                    "workers are enabled"
+                )
+            base_settings = DatabaseSettings.from_env()
+            worker_count = max(
+                1,
+                int(getattr(config, "INFERENCE_WORKER_COUNT", 0)),
+            )
+            _inference_worker_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    dsn=dsn,
+                    pool_min_size=0,
+                    pool_max_size=min(64, worker_count + 1),
+                    application_name="eva-ai-inference-worker",
+                )
+            )
+        return _inference_worker_db_pool
+
+
+def _configure_inference_queue() -> Optional[LuxriotInferenceQueueRuntime]:
+    global _inference_queue_runtime
+    if not bool(getattr(config, "INFERENCE_QUEUE_ENABLED", False)):
+        return None
+    with _inference_queue_lock:
+        if _inference_queue_runtime is not None:
+            return _inference_queue_runtime
+        tenant_id = str(
+            getattr(config, "INFERENCE_QUEUE_TENANT_ID", "") or ""
+        ).strip()
+        if not tenant_id:
+            raise RuntimeError(
+                "EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID is required when the "
+                "inference queue is enabled"
+            )
+        api_repository = PostgresInferenceQueueRepository(
+            _get_control_plane_db_pool(),
+            tenant_id,
+        )
+        worker_count = int(getattr(config, "INFERENCE_WORKER_COUNT", 0))
+        worker_repository = (
+            PostgresInferenceQueueRepository(
+                _get_inference_worker_db_pool(),
+                tenant_id,
+            )
+            if worker_count > 0
+            else None
+        )
+        runtime = LuxriotInferenceQueueRuntime(
+            manager=luxriot_manager,
+            enqueue_repository=api_repository,
+            worker_repository=worker_repository,
+            tenant_id=tenant_id,
+            capacity=int(config.INFERENCE_QUEUE_CAPACITY),
+            spool_directory=config.INFERENCE_QUEUE_SPOOL_DIR,
+            default_model=config.LM_MODEL,
+            worker_count=worker_count,
+            poll_interval_seconds=float(
+                config.INFERENCE_WORKER_POLL_INTERVAL_SEC
+            ),
+            lease_seconds=float(config.INFERENCE_WORKER_LEASE_SEC),
+            spool_retention_hours=float(
+                config.INFERENCE_SPOOL_RETENTION_HOURS
+            ),
+        )
+        runtime.start()
+        luxriot_manager.set_summary_dispatcher(runtime.enqueue_summary)
+        _inference_queue_runtime = runtime
+        return runtime
+
+
 def _check_postgres_ready() -> Dict[str, Any]:
     if not _postgres_database_configured():
         return _component_result(False, "not_configured", required=False)
@@ -2177,6 +2271,30 @@ def _check_auth_ready() -> Dict[str, Any]:
     )
 
 
+def _check_inference_queue_ready() -> Dict[str, Any]:
+    if not bool(getattr(config, "INFERENCE_QUEUE_ENABLED", False)):
+        return _component_result(False, "disabled", required=False)
+    try:
+        runtime = _configure_inference_queue()
+        if runtime is None:
+            return _component_result(False, "disabled", required=False)
+        status = runtime.status()
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    worker_count = int(status.get("worker_count") or 0)
+    workers_alive = int(status.get("workers_alive") or 0)
+    workers_ready = worker_count == 0 or workers_alive == worker_count
+    return _component_result(
+        workers_ready,
+        "ready" if workers_ready else "worker_unavailable",
+        **status,
+    )
+
+
 def _luxriot_configured() -> bool:
     base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip()
     if not base_url or "luxriot-host" in base_url:
@@ -2212,6 +2330,9 @@ def _check_luxriot_ready(timeout_sec: float = 2.0) -> Dict[str, Any]:
         return _component_result(False, "error", error=str(exc), base_url=base_url)
 
 
+_configure_inference_queue()
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Liveness endpoint for process supervisors and load balancers."""
@@ -2234,6 +2355,7 @@ def ready():
         "database": _check_database_ready(),
         "postgresql": _check_postgres_ready(),
         "authentication": _check_auth_ready(),
+        "inference_queue": _check_inference_queue_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
     }
@@ -2255,6 +2377,8 @@ def ready():
         required_names.append("postgresql")
     if checks["authentication"].get("required"):
         required_names.append("authentication")
+    if checks["inference_queue"].get("required"):
+        required_names.append("inference_queue")
     if strict or checks["luxriot"].get("required"):
         required_names.append("luxriot")
 
@@ -7451,6 +7575,19 @@ def agent_session(session_id: str):
 @atexit.register
 def _shutdown_background_workers() -> None:
     global _audit_db_pool, _audit_writer, _control_plane_db_pool
+    global _inference_queue_runtime, _inference_worker_db_pool
+    try:
+        if _inference_queue_runtime is not None:
+            _inference_queue_runtime.stop()
+            _inference_queue_runtime = None
+    except Exception:
+        pass
+    try:
+        if _inference_worker_db_pool is not None:
+            _inference_worker_db_pool.close()
+            _inference_worker_db_pool = None
+    except Exception:
+        pass
     try:
         if _audit_db_pool is not None:
             _audit_db_pool.close()

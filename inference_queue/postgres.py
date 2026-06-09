@@ -127,7 +127,9 @@ class PostgresInferenceQueueRepository:
                             now=now,
                         )
                         return EnqueueResult(
-                            refreshed, EnqueueStatus.COALESCED
+                            refreshed,
+                            EnqueueStatus.COALESCED,
+                            replaced_payload=queued.payload,
                         )
 
                 queue_depth = connection.execute(
@@ -140,6 +142,7 @@ class PostgresInferenceQueueRepository:
                 ).fetchone()[0]
 
                 evicted_job_id: str | None = None
+                evicted_payload: Mapping[str, Any] | None = None
                 if queue_depth >= capacity:
                     if job.workload_class is WorkloadClass.HEARTBEAT:
                         dropped = self._insert_job(
@@ -171,7 +174,9 @@ class PostgresInferenceQueueRepository:
                     ).fetchone()
                     if evicted is None:
                         raise _QueueFullSignal
-                    evicted_job_id = str(evicted[0])
+                    evicted_job = _row_to_job(evicted)
+                    evicted_job_id = evicted_job.id
+                    evicted_payload = evicted_job.payload
                     self._mark_terminal(
                         connection,
                         evicted_job_id,
@@ -191,6 +196,7 @@ class PostgresInferenceQueueRepository:
                     inserted,
                     EnqueueStatus.ENQUEUED,
                     evicted_job_id=evicted_job_id,
+                    evicted_payload=evicted_payload,
                 )
         except _QueueFullSignal:
             raise QueueFullError(

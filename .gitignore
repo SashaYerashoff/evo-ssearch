@@ -58,6 +58,7 @@ Thumbs.db
 probes_store.json
 luxriot_rollups_cache.json
 luxriot_summary_state.json
+inference_spool/
 video/
 node_modules
 detections_archive/

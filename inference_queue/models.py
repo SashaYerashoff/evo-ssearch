@@ -211,6 +211,22 @@ class EnqueueResult:
     job: InferenceJob
     status: EnqueueStatus
     evicted_job_id: Optional[str] = None
+    replaced_payload: Optional[Mapping[str, Any]] = None
+    evicted_payload: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.replaced_payload is not None:
+            object.__setattr__(
+                self,
+                "replaced_payload",
+                FrozenMapping(self.replaced_payload),
+            )
+        if self.evicted_payload is not None:
+            object.__setattr__(
+                self,
+                "evicted_payload",
+                FrozenMapping(self.evicted_payload),
+            )
 
     @property
     def accepted(self) -> bool:

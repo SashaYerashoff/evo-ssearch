@@ -196,6 +196,72 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_TEMPERATURE = 0.2
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
+
+    # Durable L0 video-summary queue. Keep disabled until PostgreSQL roles and
+    # the shared spool directory are configured.
+    INFERENCE_QUEUE_ENABLED = _get_bool_env(
+        'EVOSSEARCH_INFERENCE_QUEUE_ENABLED',
+        'False',
+    )
+    INFERENCE_QUEUE_TENANT_ID = os.getenv(
+        'EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID',
+        AUTH_TENANT_ID,
+    ).strip()
+    INFERENCE_QUEUE_SPOOL_DIR = (
+        os.getenv(
+            'EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR',
+            'inference_spool',
+        ).strip()
+        or 'inference_spool'
+    )
+    try:
+        INFERENCE_QUEUE_CAPACITY = int(
+            os.getenv('EVOSSEARCH_INFERENCE_QUEUE_CAPACITY', '200')
+        )
+    except (TypeError, ValueError):
+        INFERENCE_QUEUE_CAPACITY = 200
+    INFERENCE_QUEUE_CAPACITY = min(100_000, max(1, INFERENCE_QUEUE_CAPACITY))
+    try:
+        INFERENCE_WORKER_COUNT = int(
+            os.getenv('EVOSSEARCH_INFERENCE_WORKER_COUNT', '0')
+        )
+    except (TypeError, ValueError):
+        INFERENCE_WORKER_COUNT = 0
+    INFERENCE_WORKER_COUNT = min(64, max(0, INFERENCE_WORKER_COUNT))
+    try:
+        INFERENCE_WORKER_POLL_INTERVAL_SEC = float(
+            os.getenv('EVOSSEARCH_INFERENCE_WORKER_POLL_INTERVAL_SEC', '0.25')
+        )
+    except (TypeError, ValueError):
+        INFERENCE_WORKER_POLL_INTERVAL_SEC = 0.25
+    INFERENCE_WORKER_POLL_INTERVAL_SEC = min(
+        30.0,
+        max(0.05, INFERENCE_WORKER_POLL_INTERVAL_SEC),
+    )
+    try:
+        INFERENCE_WORKER_LEASE_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_INFERENCE_WORKER_LEASE_SEC',
+                str(max(180, LM_TIMEOUT * 2)),
+            )
+        )
+    except (TypeError, ValueError):
+        INFERENCE_WORKER_LEASE_SEC = float(max(180, LM_TIMEOUT * 2))
+    INFERENCE_WORKER_LEASE_SEC = min(
+        3600.0,
+        max(10.0, INFERENCE_WORKER_LEASE_SEC),
+    )
+    try:
+        INFERENCE_SPOOL_RETENTION_HOURS = float(
+            os.getenv('EVOSSEARCH_INFERENCE_SPOOL_RETENTION_HOURS', '24')
+        )
+    except (TypeError, ValueError):
+        INFERENCE_SPOOL_RETENTION_HOURS = 24.0
+    INFERENCE_SPOOL_RETENTION_HOURS = min(
+        24.0 * 30.0,
+        max(1.0, INFERENCE_SPOOL_RETENTION_HOURS),
+    )
+
     # Luxriot Evo integration
     LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://luxriot-host:8080').strip().rstrip('/')
     LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
@@ -494,6 +560,14 @@ class Config:
         print(
             f"Video LM: {cls.LM_MODEL} @ {cls.LM_BASE_URL or 'unset'} "
             f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, max_edge={cls.LM_VIDEO_MAX_EDGE})"
+        )
+        print(
+            "Inference queue: {} (capacity={}, local_workers={}, spool={})".format(
+                'enabled' if cls.INFERENCE_QUEUE_ENABLED else 'disabled',
+                cls.INFERENCE_QUEUE_CAPACITY,
+                cls.INFERENCE_WORKER_COUNT,
+                cls.INFERENCE_QUEUE_SPOOL_DIR,
+            )
         )
         if cls.MASK2FORMER_ENABLED:
             print(
