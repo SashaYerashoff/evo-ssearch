@@ -143,6 +143,24 @@ class Config:
     SETTINGS_LOCAL_ONLY = _get_bool_env('EVOSSEARCH_SETTINGS_LOCAL_ONLY', 'True')
     CORS_ALLOWED_ORIGINS = _get_list_env('EVOSSEARCH_CORS_ALLOWED_ORIGINS')
     ALLOWED_ROOTS = _get_path_list_env('EVOSSEARCH_ALLOWED_ROOTS')
+    AUTH_ENABLED = _get_bool_env('EVOSSEARCH_AUTH_ENABLED', 'False')
+    AUTH_TENANT_ID = os.getenv('EVOSSEARCH_AUTH_TENANT_ID', '').strip()
+    AUTH_SESSION_COOKIE = (
+        os.getenv('EVOSSEARCH_AUTH_SESSION_COOKIE', 'eva_session').strip()
+        or 'eva_session'
+    )
+    AUTH_CSRF_COOKIE = (
+        os.getenv('EVOSSEARCH_AUTH_CSRF_COOKIE', 'eva_csrf').strip()
+        or 'eva_csrf'
+    )
+    AUTH_COOKIE_SECURE = _get_bool_env('EVOSSEARCH_AUTH_COOKIE_SECURE', 'True')
+    try:
+        AUTH_SESSION_TTL_HOURS = int(
+            os.getenv('EVOSSEARCH_AUTH_SESSION_TTL_HOURS', '12')
+        )
+    except (TypeError, ValueError):
+        AUTH_SESSION_TTL_HOURS = 12
+    AUTH_SESSION_TTL_HOURS = min(24 * 30, max(1, AUTH_SESSION_TTL_HOURS))
 
     # LM Studio / Qwen video understanding
     LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:1234/v1').strip().rstrip('/')

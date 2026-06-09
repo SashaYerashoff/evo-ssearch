@@ -92,6 +92,9 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/detections/image",
             "/favicon.ico",
             "/health",
+            "/auth/login",
+            "/auth/logout",
+            "/auth/me",
             "/image",
             "/image/<path:filepath>",
             "/js/app.js",
@@ -138,6 +141,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         payload = ready.get_json()
         self.assertIn(payload["status"], {"ready", "not_ready"})
         self.assertIn("postgresql", payload["checks"])
+        self.assertIn("authentication", payload["checks"])
         self.assertIn("database", payload["checks"])
         self.assertIn("embedder", payload["checks"])
         self.assertIn("luxriot", payload["checks"])

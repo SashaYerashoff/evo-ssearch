@@ -1,4 +1,14 @@
     const folderInput = document.getElementById('folderPath');
+    const AUTH_ENABLED = {auth_enabled_json};
+    const AUTH_CSRF_COOKIE = {auth_csrf_cookie_json};
+    const authGate = document.getElementById('authGate');
+    const authLoginForm = document.getElementById('authLoginForm');
+    const authUsernameInput = document.getElementById('authUsername');
+    const authPasswordInput = document.getElementById('authPassword');
+    const authLoginBtn = document.getElementById('authLoginBtn');
+    const authLoginStatus = document.getElementById('authLoginStatus');
+    const authTokenBtn = document.getElementById('authTokenBtn');
+    let authCurrentUser = null;
     const indexBtn = document.getElementById('indexBtn');
     const indexStatus = document.getElementById('indexStatus');
     const searchInput = document.getElementById('searchQuery');
@@ -390,18 +400,100 @@
     })();
 
     const rawFetch = window.fetch.bind(window);
+    function cookieValue(name) {
+        const prefix = `${encodeURIComponent(name)}=`;
+        const item = document.cookie
+            .split(';')
+            .map((part) => part.trim())
+            .find((part) => part.startsWith(prefix));
+        return item ? decodeURIComponent(item.slice(prefix.length)) : '';
+    }
+
+    function setAuthGateVisible(visible, message = '') {
+        if (!AUTH_ENABLED || !authGate) return;
+        authGate.classList.toggle('is-hidden', !visible);
+        document.body.classList.toggle('auth-required', visible);
+        if (authLoginStatus) authLoginStatus.textContent = message;
+        if (visible && authUsernameInput) authUsernameInput.focus();
+    }
+
     window.fetch = (input, init = {}) => {
         const options = init ? { ...init } : {};
+        const method = String(
+            options.method || (input instanceof Request ? input.method : 'GET')
+        ).toUpperCase();
+        const headers = new Headers(options.headers || {});
+        if (AUTH_ENABLED && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+            const csrfToken = cookieValue(AUTH_CSRF_COOKIE);
+            if (csrfToken && !headers.has('X-CSRF-Token')) {
+                headers.set('X-CSRF-Token', csrfToken);
+            }
+        }
         const token = getAdminToken();
         if (token) {
-            const headers = new Headers(options.headers || {});
             if (!headers.has('X-Admin-Token') && !headers.has('Authorization')) {
                 headers.set('X-Admin-Token', token);
             }
-            options.headers = headers;
         }
-        return rawFetch(input, options);
+        options.headers = headers;
+        return rawFetch(input, options).then((response) => {
+            const url = typeof input === 'string' ? input : input.url;
+            if (
+                AUTH_ENABLED
+                && response.status === 401
+                && !String(url).includes('/auth/login')
+            ) {
+                authCurrentUser = null;
+                setAuthGateVisible(true, 'Session expired. Sign in again.');
+            }
+            return response;
+        });
     };
+
+    async function loadCurrentUser() {
+        if (!AUTH_ENABLED) return;
+        try {
+            const response = await fetch('/auth/me', { cache: 'no-store' });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Sign in required');
+            authCurrentUser = data.user || null;
+            setAuthGateVisible(false);
+            if (authTokenBtn && authCurrentUser) {
+                authTokenBtn.title = `${authCurrentUser.displayName || authCurrentUser.username} · Sign out`;
+                authTokenBtn.style.opacity = '1';
+            }
+        } catch (error) {
+            setAuthGateVisible(true, error.message || 'Sign in required');
+        }
+    }
+
+    if (AUTH_ENABLED && authLoginForm) {
+        authLoginForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (authLoginBtn) authLoginBtn.disabled = true;
+            if (authLoginStatus) authLoginStatus.textContent = '';
+            try {
+                const response = await fetch('/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: authUsernameInput ? authUsernameInput.value : '',
+                        password: authPasswordInput ? authPasswordInput.value : '',
+                    }),
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Sign in failed');
+                authCurrentUser = data.user || null;
+                if (authPasswordInput) authPasswordInput.value = '';
+                await loadCurrentUser();
+            } catch (error) {
+                setAuthGateVisible(true, error.message || 'Sign in failed');
+            } finally {
+                if (authLoginBtn) authLoginBtn.disabled = false;
+            }
+        });
+        void loadCurrentUser();
+    }
 
     function escapeHtml(text) {
         const div = document.createElement('div');
@@ -2816,7 +2908,6 @@
     setMode(currentMode);
     
     // Settings modal elements
-    const authTokenBtn = document.getElementById('authTokenBtn');
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsModal = document.getElementById('settingsModal');
     const closeSettingsBtn = document.getElementById('closeSettings');
@@ -3240,7 +3331,20 @@
     }
 
     if (authTokenBtn) {
-        authTokenBtn.addEventListener('click', () => {
+        authTokenBtn.addEventListener('click', async () => {
+            if (AUTH_ENABLED) {
+                if (!authCurrentUser) {
+                    setAuthGateVisible(true);
+                    return;
+                }
+                try {
+                    await fetch('/auth/logout', { method: 'POST' });
+                } finally {
+                    authCurrentUser = null;
+                    setAuthGateVisible(true);
+                }
+                return;
+            }
             const existing = getAdminToken();
             const entered = window.prompt(
                 'Set admin token (stored in this browser for mutating API calls). Leave empty to clear.',
@@ -3255,7 +3359,7 @@
             indexStatus.textContent = hasToken ? 'Admin token saved in browser.' : 'Admin token cleared.';
             indexStatus.className = hasToken ? 'status success' : 'status warning';
         });
-        authTokenBtn.style.opacity = getAdminToken() ? '1' : '0.6';
+        authTokenBtn.style.opacity = AUTH_ENABLED || getAdminToken() ? '1' : '0.6';
     }
     
     // Settings modal functionality

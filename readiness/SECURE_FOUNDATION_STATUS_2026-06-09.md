@@ -7,11 +7,11 @@ Branch: `feature/secure-50-channel-foundation`
 
 | Stream | Owner | Implemented now | Still required |
 |---|---|---|---|
-| Integration | Lead | Readiness branch merged locally; contracts reconciled; live PostgreSQL verification | Route wiring, migration/import cutover, pilot acceptance |
-| Database | DB sub-agent + lead | Bounded pool, Alembic, schemas, least-privilege roles, RLS, append-only audit, `/ready` integration | Repositories, backup/restore, customer deployment principals |
-| IAM | IAM sub-agent | Immutable auth context, permission catalogue, Argon2id, session/CSRF/token primitives, throttling, audit redaction | Login UI/routes, durable sessions, endpoint policy enforcement |
-| Agent safety | Agent-safety sub-agent + lead | Closed tool registry, server context, channel grants, limits, audit lifecycle, plans and one-time approvals | Existing agent integration and durable plan/approval/audit adapters |
-| Data plane | Data-plane sub-agent + lead | Bounded reference queue, priorities, leases, retries, idempotency, heartbeat coalescing and overload counters | PostgreSQL queue adapter, capture/worker wiring, GPU concurrency controls |
+| Integration | Lead | Readiness branch merged locally; auth and route policy wired; live PostgreSQL role flow verified | State import/cutover, backup/restore, pilot acceptance |
+| Database | DB sub-agent + lead | Bounded pool, Alembic, schemas, least-privilege roles, RLS, append-only audit writer, `/ready` integration | State repositories, backup/restore, customer deployment principals |
+| IAM | IAM sub-agent + lead | PostgreSQL identities/sessions, Argon2id, login/logout/me UI, secure cookies, CSRF, route and channel policy | User administration, durable distributed throttling, complete route matrix review |
+| Agent safety | Agent-safety sub-agent + lead | Existing loop uses role-filtered `ToolGateway`; channel grants, audit, safe schemas, preview-only writes, owned sessions | PostgreSQL agent sessions and durable plan/approval UI for apply actions |
+| Data plane | Data-plane sub-agent + lead | PostgreSQL bounded queue, `SKIP LOCKED`, leases, retries, idempotency, coalescing, overload metrics, separate worker role | Capture/worker wiring, GPU concurrency controls, operational dashboards |
 
 ## Verified
 
@@ -21,19 +21,20 @@ Branch: `feature/secure-50-channel-foundation`
 - Tenant A cannot read tenant B rows through the API role.
 - Audit rows reject mutation.
 - `/ready` reports the expected schema revision.
-- Full suite: 70 tests passed against the live disposable database.
+- API, audit writer, and queue worker pass with three separate login principals.
+- The rendered browser JavaScript passes `node --check`.
+- Agent tools fail closed when durable audit is unavailable.
+- Agent sessions and channel-bearing HTTP resources enforce user ownership.
+- Full live suite: 129 tests passed against PostgreSQL 16.
 
 ## Next execution order
 
-1. Implement durable IAM repositories and bootstrap-admin command.
-2. Add login/logout/me, secure cookie sessions, CSRF, and route policy.
-3. Add a PostgreSQL audit writer and request correlation, then instrument every
-   sensitive read and mutation.
-4. Route the existing agent exclusively through `ToolGateway`.
-5. Implement PostgreSQL queue claims with `SKIP LOCKED`, then decouple Luxriot
-   capture from VLM execution.
-6. Import agent/probe/summary state and produce an idempotent comparison report.
-7. Add backup/restore and run the 50-channel replay/soak gate.
+1. Wire Luxriot capture producers and inference workers to the PostgreSQL queue.
+2. Implement durable agent plans, external approval UI, and one-time execution.
+3. Import agent/probe/prompt/summary state with an idempotent comparison report.
+4. Add user administration, session revocation, and shared login throttling.
+5. Add backup/restore automation and perform a clean restore drill.
+6. Run the 50-channel replay/soak gate and record queue/GPU/storage limits.
 
 The ethical and engineering invariant remains: touching sensitive system state
 must leave an attributable, durable fingerprint. No model output is trusted as

@@ -158,6 +158,7 @@ class AuditEventBuilder:
         target_id: str | None = None,
         channel_id: ChannelId | None = None,
         details: Mapping[str, Any] | None = None,
+        tenant_id: str | None = None,
     ) -> AuditEvent:
         timestamp = self._clock()
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
@@ -170,13 +171,17 @@ class AuditEventBuilder:
             raise ValueError("target_type is required")
         if not result:
             raise ValueError("result is required")
+        effective_tenant_id = context.tenant_id if context else tenant_id
+        if context is not None and tenant_id is not None:
+            if context.tenant_id != tenant_id:
+                raise ValueError("tenant_id cannot override authenticated context")
 
         return AuditEvent(
             timestamp=timestamp,
             request_id=context.request_id if context else None,
             actor_user_id=context.user_id if context else None,
             actor_roles=tuple(sorted(context.roles)) if context else (),
-            tenant_id=context.tenant_id if context else None,
+            tenant_id=effective_tenant_id,
             source_ip=source_ip,
             action=action,
             target_type=target_type,
@@ -198,6 +203,7 @@ def build_audit_event(
     channel_id: ChannelId | None = None,
     details: Mapping[str, Any] | None = None,
     timestamp: datetime | None = None,
+    tenant_id: str | None = None,
 ) -> AuditEvent:
     builder = AuditEventBuilder(
         clock=(lambda: timestamp) if timestamp is not None else (
@@ -213,4 +219,5 @@ def build_audit_event(
         target_id=target_id,
         channel_id=channel_id,
         details=details,
+        tenant_id=tenant_id,
     )

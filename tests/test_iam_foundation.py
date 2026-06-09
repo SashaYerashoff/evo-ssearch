@@ -196,6 +196,19 @@ class LoginThrottleTests(unittest.TestCase):
 
 
 class AuditEventTests(unittest.TestCase):
+    def test_anonymous_event_can_be_bound_to_known_tenant(self) -> None:
+        event = AuditEventBuilder().build(
+            context=None,
+            tenant_id="tenant-1",
+            source_ip="192.0.2.20",
+            action="auth.login",
+            target_type="user",
+            result="denied",
+        )
+
+        self.assertIsNone(event.actor_user_id)
+        self.assertEqual(event.tenant_id, "tenant-1")
+
     def test_builder_uses_context_identity_and_recursively_redacts(self) -> None:
         context = make_context()
         timestamp = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)

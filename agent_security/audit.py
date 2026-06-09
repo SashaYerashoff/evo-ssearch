@@ -15,6 +15,8 @@ class ToolAuditEvent:
     tenant_id: str
     request_id: str | None
     session_id: str | None
+    actor_roles: tuple[str, ...] = ()
+    source_ip: str | None = None
     risk: str | None = None
     required_permission: str | None = None
     arguments_hash: str | None = None
@@ -36,6 +38,8 @@ class ToolAuditEvent:
             "tenant_id": self.tenant_id,
             "request_id": self.request_id,
             "session_id": self.session_id,
+            "actor_roles": list(self.actor_roles),
+            "source_ip": self.source_ip,
             "risk": self.risk,
             "required_permission": self.required_permission,
             "arguments_hash": self.arguments_hash,

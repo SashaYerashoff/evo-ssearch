@@ -33,6 +33,10 @@ import numpy as np
 import requests
 from PIL import Image
 
+from agent_security import ToolExecutionContext, ToolGatewayError
+from agent_security.audit import ToolAuditEvent
+from agent_security.eva_adapter import EvaAgentToolAdapter
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -864,12 +868,16 @@ class _AgentLMClient:
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
 
-    def call_with_tools(self, messages: List[Dict[str, Any]]) -> _LMResponse:
+    def call_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> _LMResponse:
         """Blocking non-streaming call with tools. Returns parsed response."""
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "tools": _TOOL_SCHEMAS,
+            "tools": _TOOL_SCHEMAS if tools is None else tools,
             "tool_choice": "auto",
             "stream": False,
         }
@@ -982,6 +990,8 @@ class AgentStore:
                     CREATE TABLE IF NOT EXISTS agent_sessions (
                         id          TEXT PRIMARY KEY,
                         title       TEXT,
+                        tenant_id   TEXT,
+                        actor_id    TEXT,
                         created_at  INTEGER NOT NULL,
                         updated_at  INTEGER NOT NULL
                     );
@@ -1002,21 +1012,51 @@ class AgentStore:
                     CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated
                         ON agent_sessions (updated_at DESC);
                 """)
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA table_info(agent_sessions)"
+                    ).fetchall()
+                }
+                if "tenant_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE agent_sessions ADD COLUMN tenant_id TEXT"
+                    )
+                if "actor_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE agent_sessions ADD COLUMN actor_id TEXT"
+                    )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_agent_sessions_owner
+                    ON agent_sessions (tenant_id, actor_id, updated_at DESC)
+                    """
+                )
                 conn.commit()
             finally:
                 conn.close()
 
     # ── Session CRUD ────────────────────────────────────────────────────────
 
-    def create_session(self) -> str:
+    def create_session(
+        self,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> str:
         sid = uuid.uuid4().hex
         now = _now_ms()
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT INTO agent_sessions (id, title, created_at, updated_at) VALUES (?,?,?,?)",
-                    (sid, None, now, now),
+                    """
+                    INSERT INTO agent_sessions (
+                        id, title, tenant_id, actor_id, created_at, updated_at
+                    )
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (sid, None, tenant_id, actor_id, now, now),
                 )
                 conn.commit()
             finally:
@@ -1042,41 +1082,92 @@ class AgentStore:
             finally:
                 conn.close()
 
-    def session_exists(self, session_id: str) -> bool:
+    def session_exists(
+        self,
+        session_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> bool:
         with self._lock:
             conn = self._connect()
             try:
-                row = conn.execute(
-                    "SELECT id FROM agent_sessions WHERE id=?", (session_id,)
-                ).fetchone()
+                if tenant_id is None and actor_id is None:
+                    row = conn.execute(
+                        "SELECT id FROM agent_sessions WHERE id=?",
+                        (session_id,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT id
+                        FROM agent_sessions
+                        WHERE id=? AND tenant_id=? AND actor_id=?
+                        """,
+                        (session_id, tenant_id, actor_id),
+                    ).fetchone()
                 return row is not None
             finally:
                 conn.close()
 
-    def list_sessions(self) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         with self._lock:
             conn = self._connect()
             try:
-                rows = conn.execute("""
+                owner_clause = ""
+                params: tuple[Any, ...] = ()
+                if tenant_id is not None or actor_id is not None:
+                    owner_clause = "WHERE s.tenant_id=? AND s.actor_id=?"
+                    params = (tenant_id, actor_id)
+                rows = conn.execute(
+                    f"""
                     SELECT s.id, s.title, s.created_at, s.updated_at,
                            COUNT(m.id) AS message_count
                     FROM agent_sessions s
                     LEFT JOIN agent_messages m ON m.session_id = s.id
+                    {owner_clause}
                     GROUP BY s.id
                     ORDER BY s.updated_at DESC
-                """).fetchall()
+                    """,
+                    params,
+                ).fetchall()
                 return [dict(r) for r in rows]
             finally:
                 conn.close()
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         with self._lock:
             conn = self._connect()
             try:
-                row = conn.execute(
-                    "SELECT id, title, created_at, updated_at FROM agent_sessions WHERE id=?",
-                    (session_id,),
-                ).fetchone()
+                if tenant_id is None and actor_id is None:
+                    row = conn.execute(
+                        """
+                        SELECT id, title, created_at, updated_at
+                        FROM agent_sessions
+                        WHERE id=?
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT id, title, created_at, updated_at
+                        FROM agent_sessions
+                        WHERE id=? AND tenant_id=? AND actor_id=?
+                        """,
+                        (session_id, tenant_id, actor_id),
+                    ).fetchone()
                 if not row:
                     return None
                 messages = conn.execute(
@@ -1093,13 +1184,29 @@ class AgentStore:
             finally:
                 conn.close()
 
-    def delete_session(self, session_id: str) -> bool:
+    def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> bool:
         with self._lock:
             conn = self._connect()
             try:
-                cur = conn.execute(
-                    "DELETE FROM agent_sessions WHERE id=?", (session_id,)
-                )
+                if tenant_id is None and actor_id is None:
+                    cur = conn.execute(
+                        "DELETE FROM agent_sessions WHERE id=?",
+                        (session_id,),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        DELETE FROM agent_sessions
+                        WHERE id=? AND tenant_id=? AND actor_id=?
+                        """,
+                        (session_id, tenant_id, actor_id),
+                    )
                 conn.commit()
                 return cur.rowcount > 0
             finally:
@@ -2854,6 +2961,8 @@ def build_system_prompt(
     detections_store: Any,
     luxriot_manager: Any,
     active_skill_slugs: Optional[Sequence[str]] = None,
+    allowed_channel_ids: Optional[Sequence[str]] = None,
+    secure_tool_mode: bool = False,
 ) -> str:
     now_str = time.strftime("%Y-%m-%d %H:%M")
 
@@ -2862,6 +2971,17 @@ def build_system_prompt(
         probes = probes_store.list_probes()
     except Exception:
         probes = []
+    allowed_channels = (
+        None
+        if allowed_channel_ids is None or "*" in allowed_channel_ids
+        else {str(channel_id) for channel_id in allowed_channel_ids}
+    )
+    if allowed_channels is not None:
+        probes = [
+            probe
+            for probe in probes
+            if str(probe.get("channel_id")) in allowed_channels
+        ]
 
     # Recent detection counts (last 24h)
     since_ms = int(time.time() * 1000 - 86_400_000)
@@ -2874,9 +2994,21 @@ def build_system_prompt(
     # Available channels
     try:
         raw_channels = getattr(luxriot_manager, "channels", None) or []
+        raw_channel_list = (
+            raw_channels if isinstance(raw_channels, list) else []
+        )
+        visible_channels = (
+            raw_channel_list
+            if allowed_channels is None
+            else [
+                channel
+                for channel in raw_channel_list
+                if str(channel.get("id")) in allowed_channels
+            ]
+        )
         channels_str = ", ".join(
             f"{c.get('id')} ({c.get('title', 'unknown')})"
-            for c in (raw_channels if isinstance(raw_channels, list) else [])
+            for c in visible_channels
         ) or "unknown (Luxriot not connected)"
     except Exception:
         channels_str = "unknown"
@@ -2903,6 +3035,14 @@ def build_system_prompt(
     probe_block = "\n".join(probe_lines) if probe_lines else "  (no probes configured)"
     skills_block = _format_runtime_skill_index_for_prompt()
     active_skills_block = _format_active_skill_docs_for_prompt(active_skill_slugs or [])
+    secure_rules = (
+        "\n- Tool-driven probe and prompt changes are preview-only in this "
+        "deployment. Never request preview=false or claim that a preview was applied."
+        "\n- Bookmark creation is unavailable until the stored approval workflow "
+        "is enabled."
+        if secure_tool_mode
+        else ""
+    )
 
     return (
         f"You are the AI operations assistant for Luxriot EVA AI — a CCTV intelligent "
@@ -2934,6 +3074,7 @@ def build_system_prompt(
         f"- When returning search results or detections, summarize; don't dump raw lists.\n"
         f"- Ask the operator a clarifying question if the available data is too sparse to make a safe change.\n"
         f"- Use markdown for structure."
+        f"{secure_rules}"
         f"{skills_block}"
         f"{active_skills_block}"
     )
@@ -2966,6 +3107,9 @@ class AgentRunner:
         lm_api_key: str,
         lm_timeout: int,
         store_path: str = "agent_sessions.sqlite3",
+        tool_audit_callback: Optional[
+            Callable[[ToolAuditEvent], None]
+        ] = None,
     ) -> None:
         self._ps  = probes_store
         self._ds  = detections_store
@@ -2988,20 +3132,69 @@ class AgentRunner:
             search_indexed_folder_fn=search_indexed_folder_fn,
             search_detections_fn=search_detections_fn,
         )
+        self._secure_tools = (
+            EvaAgentToolAdapter(
+                self._tools,
+                _TOOL_SCHEMAS,
+                audit_callback=tool_audit_callback,
+            )
+            if tool_audit_callback is not None
+            else None
+        )
 
     def stream_chat(
         self,
         session_id: Optional[str],
         message: str,
         image_b64: Optional[str] = None,
+        tool_context: Optional[ToolExecutionContext] = None,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
         Each event is:  'data: <json>\\n\\n'
         """
         # ── session setup ──────────────────────────────────────────────────
-        if not session_id or not self.store.session_exists(session_id):
-            session_id = self.store.create_session()
+        if tool_context is None:
+            session_exists = bool(
+                session_id and self.store.session_exists(session_id)
+            )
+        else:
+            session_exists = bool(
+                session_id
+                and self.store.session_exists(
+                    session_id,
+                    tenant_id=tool_context.tenant_id,
+                    actor_id=tool_context.actor_id,
+                )
+            )
+        if not session_exists:
+            if tool_context is None:
+                session_id = self.store.create_session()
+            else:
+                session_id = self.store.create_session(
+                    tenant_id=tool_context.tenant_id,
+                    actor_id=tool_context.actor_id,
+                )
+        if tool_context is not None:
+            tool_context = ToolExecutionContext(
+                actor_id=tool_context.actor_id,
+                tenant_id=tool_context.tenant_id,
+                roles=tool_context.roles,
+                permissions=tool_context.permissions,
+                allowed_channel_ids=tool_context.allowed_channel_ids,
+                agent_session_id=session_id,
+                request_id=tool_context.request_id,
+                client_metadata=tool_context.client_metadata,
+            )
+            if self._secure_tools is None:
+                yield _sse(
+                    {
+                        "type": "error",
+                        "message": "Authorized agent tools are unavailable.",
+                    }
+                )
+                yield _sse({"type": "done", "session_id": session_id})
+                return
 
         title = message[:60].strip() or "Chat"
         self.store.touch_session(session_id, title=title)
@@ -3033,10 +3226,23 @@ class AgentRunner:
                 for token in ("all probes", "all probe", "every probe", "probe audit", "all probes audit")
             )
             mentioned_probes = self._tools._find_probe_mentions_in_text(user_text)
+            visible_probes = (
+                self._secure_tools.visible_probes(tool_context)
+                if tool_context is not None and self._secure_tools is not None
+                else self._ps.list_probes()
+            )
+            visible_probe_ids = {
+                str(probe.get("id") or "") for probe in visible_probes
+            }
+            mentioned_probes = [
+                probe
+                for probe in mentioned_probes
+                if str(probe.get("id") or "") in visible_probe_ids
+            ]
             if len(mentioned_probes) != 1 and not wants_all_probes:
                 probe_names = [
                     str(probe.get("name") or "").strip()
-                    for probe in self._ps.list_probes()
+                    for probe in visible_probes
                     if str(probe.get("name") or "").strip()
                 ]
                 prompt_suffix = ""
@@ -3060,6 +3266,12 @@ class AgentRunner:
             self._ds,
             self._lxm,
             active_skill_slugs=requested_skill_slugs,
+            allowed_channel_ids=(
+                sorted(tool_context.allowed_channel_ids)
+                if tool_context is not None
+                else None
+            ),
+            secure_tool_mode=tool_context is not None,
         )
         history = self.store.load_history(session_id)
 
@@ -3072,6 +3284,11 @@ class AgentRunner:
 
         # Accumulated messages from this turn (to persist after streaming)
         new_assistant_messages: List[Dict[str, Any]] = []
+        available_tool_schemas = (
+            self._secure_tools.available_tool_schemas(tool_context)
+            if tool_context is not None and self._secure_tools is not None
+            else _TOOL_SCHEMAS
+        )
 
         # ── tool loop ──────────────────────────────────────────────────────
         while True:
@@ -3079,7 +3296,10 @@ class AgentRunner:
             lm_response: _LMResponse
             try:
                 lm_response = yield from _run_with_heartbeats(
-                    fn=lambda: self._lm_client.call_with_tools(in_flight),
+                    fn=lambda: self._lm_client.call_with_tools(
+                        in_flight,
+                        tools=available_tool_schemas,
+                    ),
                     heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                 )
             except Exception as exc:
@@ -3114,10 +3334,20 @@ class AgentRunner:
 
                 try:
                     result = yield from _run_with_heartbeats(
-                        fn=lambda tc=tc, progress_queue=progress_queue: self._tools.execute(
-                            tc.name,
-                            tc.args,
-                            progress_cb=lambda event: progress_queue.put(event),
+                        fn=lambda tc=tc, progress_queue=progress_queue: (
+                            self._secure_tools.execute(
+                                tc.name,
+                                tc.args,
+                                tool_context,
+                                progress_cb=lambda event: progress_queue.put(event),
+                            )
+                            if tool_context is not None
+                            and self._secure_tools is not None
+                            else self._tools.execute(
+                                tc.name,
+                                tc.args,
+                                progress_cb=lambda event: progress_queue.put(event),
+                            )
                         ),
                         heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                         progress_queue=progress_queue,
@@ -3126,7 +3356,7 @@ class AgentRunner:
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(result_for_model, default=str)}
                     yield _sse({"type": "tool_result", "name": tc.name, "result": result})
-                except ToolError as exc:
+                except (ToolError, ToolGatewayError) as exc:
                     error_payload = {"error": str(exc)}
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}

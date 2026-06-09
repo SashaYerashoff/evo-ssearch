@@ -961,6 +961,8 @@ class ToolGateway:
             tenant_id=tenant_id,
             request_id=getattr(context, "request_id", None),
             session_id=getattr(context, "session_id", None),
+            actor_roles=tuple(sorted(getattr(context, "roles", ()))),
+            source_ip=getattr(context, "client_ip", None),
             risk=(
                 definition.policy.risk.value if definition is not None else None
             ),

@@ -7,7 +7,18 @@
     <!-- Cache buster: {{ timestamp }} -->
     <link rel="stylesheet" href="/static/css/app.css">
 </head>
-<body>
+<body class="{{ 'auth-required' if auth_enabled else '' }}">
+    <div id="authGate" class="auth-gate {{ '' if auth_enabled else 'is-hidden' }}">
+        <form id="authLoginForm" class="auth-login-panel" autocomplete="on">
+            <div class="auth-login-brand">EVA AI</div>
+            <label for="authUsername">Username</label>
+            <input id="authUsername" name="username" type="text" autocomplete="username" required />
+            <label for="authPassword">Password</label>
+            <input id="authPassword" name="password" type="password" autocomplete="current-password" required />
+            <button id="authLoginBtn" class="feature-btn primary" type="submit">Sign in</button>
+            <div id="authLoginStatus" class="auth-login-status" role="alert"></div>
+        </form>
+    </div>
     <div class="app-shell">
         <div class="header">
             <div class="brand">
@@ -33,7 +44,7 @@
                     <span class="header-status-dot"></span>
                     <span class="header-status-text">Command Center Online</span>
                 </div>
-                <div class="settings-icon" id="authTokenBtn" title="Set admin token">
+                <div class="settings-icon" id="authTokenBtn" title="Account">
                     <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                         <path d="M240-160q-33 0-56.5-23.5T160-240v-480q0-33 23.5-56.5T240-800h360q33 0 56.5 23.5T680-720v160h40q33 0 56.5 23.5T800-480v240q0 33-23.5 56.5T720-160H240Zm0-80h480v-240H240v240Zm120-320h240v-160H360v160Zm120 200q17 0 28.5-11.5T520-400q0-17-11.5-28.5T480-440q-17 0-28.5 11.5T440-400q0 17 11.5 28.5T480-360Z"/>
                     </svg>

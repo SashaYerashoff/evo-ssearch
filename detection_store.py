@@ -72,6 +72,9 @@ class DetectionsStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_detections_dino_ready ON detections (dino_ready, id DESC)"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_detections_image_path ON detections (image_path)"
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -493,6 +496,29 @@ class DetectionsStore:
                     tuple(params),
                 ).fetchall()
                 return [self._row_to_dict(row, include_vectors=include_vectors) for row in rows]
+            finally:
+                conn.close()
+
+    def channel_ids_for_image_path(self, image_path: str) -> frozenset[int]:
+        normalized = str(image_path or "").strip()
+        if not normalized:
+            return frozenset()
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT channel_id
+                    FROM detections
+                    WHERE image_path = ?
+                    """,
+                    (normalized,),
+                ).fetchall()
+                return frozenset(
+                    int(row["channel_id"])
+                    for row in rows
+                    if row["channel_id"] is not None
+                )
             finally:
                 conn.close()
 

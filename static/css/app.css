@@ -7291,3 +7291,59 @@ textarea::placeholder {
         text-align: left;
     }
 }
+body.auth-required {
+    overflow: hidden;
+}
+
+.auth-gate {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: grid;
+    place-items: center;
+    padding: 20px;
+    background: #081016;
+}
+
+.auth-gate.is-hidden {
+    display: none;
+}
+
+.auth-login-panel {
+    width: min(100%, 360px);
+    display: grid;
+    gap: 10px;
+    padding: 24px;
+    border: 1px solid #2a3a44;
+    border-radius: 8px;
+    background: #101a20;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+}
+
+.auth-login-brand {
+    margin-bottom: 8px;
+    color: #f1f5f7;
+    font-size: 24px;
+    font-weight: 700;
+}
+
+.auth-login-panel label {
+    color: #a9bac4;
+    font-size: 12px;
+}
+
+.auth-login-panel input {
+    min-width: 0;
+    height: 42px;
+    padding: 0 12px;
+    border: 1px solid #334752;
+    border-radius: 6px;
+    color: #eef5f7;
+    background: #0a1318;
+}
+
+.auth-login-status {
+    min-height: 18px;
+    color: #ff9a9a;
+    font-size: 12px;
+}

@@ -14,6 +14,8 @@ import threading
 import time
 import uuid
 import requests
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
@@ -27,7 +29,7 @@ import clip
 import faiss
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
-from flask import Flask, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
+from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 
 from config import config
@@ -36,6 +38,20 @@ from embedders.dino_encoder import DINOEncoder
 from eva_db import DatabaseSettings, PsycopgPool
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
+from security import (
+    ALL_CHANNELS,
+    AuditEvent,
+    AuditEventBuilder,
+    AuthContext,
+    AuthenticationService,
+    InvalidCredentials,
+    LoginThrottled,
+    Permission,
+    require_channel_access,
+    require_permission,
+)
+from agent_security import ToolExecutionContext
+from agent_security.audit import ToolAuditEvent
 if TYPE_CHECKING:
     from heads.mask2former_head import Mask2FormerHead
 try:
@@ -81,6 +97,100 @@ TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
 FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
 PROBE_ROI_MIN_SIDE = 0.02
 PROBE_ROI_PADDING = 0.05
+_auth_service: Optional[AuthenticationService] = None
+_auth_service_lock = Lock()
+_audit_writer: Optional[Any] = None
+_audit_writer_lock = Lock()
+_audit_db_pool: Optional[PsycopgPool] = None
+_audit_db_pool_lock = Lock()
+
+_MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
+    "auth_logout": None,
+    "save_comment": Permission.BOOKMARKS_CREATE,
+    "index_folder": Permission.MODELS_MANAGE,
+    "index_segments": Permission.MODELS_MANAGE,
+    "luxriot_start_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_prompt_settings": Permission.PROMPTS_MANAGE,
+    "luxriot_stop_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_flush_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_stop_stream": Permission.CAPTURE_MANAGE,
+    "luxriot_stop_all_streams": Permission.CAPTURE_MANAGE,
+    "luxriot_bookmark": Permission.BOOKMARKS_CREATE,
+    "probes_query": Permission.PROBES_RUN,
+    "probes_start_capture": Permission.CAPTURE_MANAGE,
+    "probes_stop_capture": Permission.CAPTURE_MANAGE,
+    "probes_save": Permission.PROBES_MANAGE,
+    "probes_delete": Permission.PROBES_MANAGE,
+    "probes_run": Permission.PROBES_RUN,
+    "agent_chat": Permission.AGENT_USE,
+    "agent_config": Permission.MODELS_MANAGE,
+    "agent_skills_create": Permission.PROMPTS_MANAGE,
+    "agent_skill_detail": Permission.PROMPTS_MANAGE,
+    "agent_session": Permission.AGENT_USE,
+    "save_settings": Permission.SETTINGS_MANAGE,
+    "save_settings_env": Permission.SETTINGS_MANAGE,
+}
+_SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
+    "serve_image": Permission.DETECTIONS_VIEW,
+    "serve_detection_image": Permission.DETECTIONS_VIEW,
+    "get_comments": Permission.REPORTS_VIEW,
+    "get_commented_images": Permission.REPORTS_VIEW,
+    "check_index": Permission.DIAGNOSTICS_VIEW,
+    "video_understanding": Permission.STREAMS_VIEW,
+    "describe_image": Permission.DETECTIONS_VIEW,
+    "search": Permission.DETECTIONS_VIEW,
+    "search_by_image": Permission.DETECTIONS_VIEW,
+    "search_by_mask": Permission.DETECTIONS_VIEW,
+    "segment_from_point": Permission.DETECTIONS_VIEW,
+    "detections_search_text": Permission.DETECTIONS_VIEW,
+    "detections_search_image": Permission.DETECTIONS_VIEW,
+    "detections_list": Permission.DETECTIONS_VIEW,
+    "detections_summary": Permission.DETECTIONS_VIEW,
+    "luxriot_channels": Permission.STREAMS_VIEW,
+    "luxriot_prompt_settings": Permission.STREAMS_VIEW,
+    "luxriot_snapshot": Permission.STREAMS_VIEW,
+    "luxriot_session_status": Permission.STREAMS_VIEW,
+    "luxriot_summary_rollups": Permission.REPORTS_VIEW,
+    "luxriot_streams_status": Permission.STREAMS_VIEW,
+    "probes_status": Permission.STREAMS_VIEW,
+    "probes_list": Permission.REPORTS_VIEW,
+    "probes_bench": Permission.DIAGNOSTICS_VIEW,
+    "agent_sessions": Permission.AGENT_USE,
+    "agent_config": Permission.AGENT_USE,
+    "agent_skills": Permission.AGENT_USE,
+    "agent_skill_detail": Permission.AGENT_USE,
+    "agent_session": Permission.AGENT_USE,
+}
+_CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
+    {
+        "detections_list",
+        "detections_search_image",
+        "detections_search_text",
+        "detections_summary",
+        "luxriot_prompt_settings",
+    }
+)
+_ALL_CHANNELS_REQUIRED_ENDPOINTS = frozenset(
+    {
+        "luxriot_stop_all_streams",
+    }
+)
+_DEFAULT_CHANNEL_ENDPOINTS = frozenset(
+    {
+        "luxriot_bookmark",
+        "luxriot_flush_capture",
+        "luxriot_session_status",
+        "luxriot_start_capture",
+        "luxriot_stop_capture",
+        "luxriot_stop_stream",
+        "luxriot_summary_rollups",
+        "probes_query",
+        "probes_save",
+        "probes_start_capture",
+        "probes_status",
+        "probes_stop_capture",
+    }
+)
 
 
 def _json_body() -> Dict[str, Any]:
@@ -189,7 +299,441 @@ def _has_admin_access() -> bool:
     return secrets.compare_digest(provided, configured)
 
 
+def _auth_enabled() -> bool:
+    return bool(getattr(config, "AUTH_ENABLED", False))
+
+
+def _request_id() -> str:
+    value = str(request.headers.get("X-Request-ID") or "").strip()
+    if value and len(value) <= 128 and all(
+        character.isalnum() or character in "._:-" for character in value
+    ):
+        return value
+    return str(uuid.uuid4())
+
+
+def _source_ip() -> str:
+    return str(request.remote_addr or "0.0.0.0")
+
+
+def _get_auth_service() -> AuthenticationService:
+    global _auth_service
+    with _auth_service_lock:
+        if _auth_service is None:
+            if not str(getattr(config, "AUTH_TENANT_ID", "") or "").strip():
+                raise RuntimeError("EVOSSEARCH_AUTH_TENANT_ID is required")
+            from security.postgres_identity import PostgresIdentityRepository
+
+            repository = PostgresIdentityRepository(_get_control_plane_db_pool())
+            _auth_service = AuthenticationService(
+                repository,
+                tenant_id=config.AUTH_TENANT_ID,
+                session_ttl=timedelta(
+                    hours=int(config.AUTH_SESSION_TTL_HOURS)
+                ),
+            )
+        return _auth_service
+
+
+def _get_audit_writer() -> Any:
+    global _audit_writer
+    with _audit_writer_lock:
+        if _audit_writer is None:
+            from security.postgres_audit import PostgresAuditWriter
+
+            _audit_writer = PostgresAuditWriter(_get_audit_db_pool())
+        return _audit_writer
+
+
+def _audit_database_dsn() -> str:
+    return str(
+        os.getenv("EVA_AUDIT_DATABASE_DSN")
+        or os.getenv("EVOSSEARCH_AUDIT_DATABASE_DSN")
+        or ""
+    ).strip()
+
+
+def _get_audit_db_pool() -> PsycopgPool:
+    global _audit_db_pool
+    with _audit_db_pool_lock:
+        if _audit_db_pool is None:
+            dsn = _audit_database_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "EVA_AUDIT_DATABASE_DSN is required for durable audit"
+                )
+            base_settings = DatabaseSettings.from_env()
+            _audit_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    dsn=dsn,
+                    pool_min_size=0,
+                    pool_max_size=min(4, base_settings.pool_max_size),
+                    application_name="eva-ai-audit",
+                )
+            )
+        return _audit_db_pool
+
+
+def _current_auth_context() -> Optional[AuthContext]:
+    context = getattr(g, "auth_context", None)
+    return context if isinstance(context, AuthContext) else None
+
+
+def _probe_channel_ids(probe_ids: Iterable[Any]) -> Set[int]:
+    wanted = {
+        str(probe_id).strip()
+        for probe_id in probe_ids
+        if str(probe_id or "").strip()
+    }
+    if not wanted:
+        return set()
+    try:
+        probes = probes_store.list_probes()
+    except Exception:
+        return set()
+    return {
+        int(probe["channel_id"])
+        for probe in probes
+        if str(probe.get("id") or "") in wanted
+        and _to_optional_int(probe.get("channel_id")) is not None
+    }
+
+
+def _request_channel_ids() -> Set[int]:
+    candidates: List[Any] = []
+    view_args = request.view_args or {}
+    candidates.extend(
+        view_args.get(key) for key in ("channel_id", "channel") if key in view_args
+    )
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        candidates.extend(
+            payload.get(key) for key in ("channel_id", "channel") if key in payload
+        )
+    form = request.form
+    candidates.extend(
+        form.get(key) for key in ("channel_id", "channel") if key in form
+    )
+    candidates.extend(
+        request.args.get(key) for key in ("channel_id", "channel") if key in request.args
+    )
+    channel_ids: Set[int] = set()
+    for candidate in candidates:
+        try:
+            channel_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if channel_id > 0:
+            channel_ids.add(channel_id)
+
+    endpoint = str(request.endpoint or "")
+    probe_ids: List[Any] = []
+    for source in (view_args, payload, form, request.args):
+        if not isinstance(source, Mapping):
+            continue
+        if "probe_id" in source:
+            probe_ids.append(source.get("probe_id"))
+        if endpoint in {"probes_delete", "probes_run", "probes_save"}:
+            if "id" in source:
+                probe_ids.append(source.get("id"))
+    channel_ids.update(_probe_channel_ids(probe_ids))
+
+    if endpoint == "serve_detection_image":
+        image_path = str(request.args.get("image_path") or "").strip()
+        if image_path:
+            try:
+                channel_ids.update(
+                    detections_store.channel_ids_for_image_path(image_path)
+                )
+            except Exception:
+                pass
+
+    if not channel_ids and endpoint in _DEFAULT_CHANNEL_ENDPOINTS:
+        default_channel = _to_optional_int(config.LUXRIOT_DEFAULT_CHANNEL_ID)
+        if default_channel is not None and default_channel > 0:
+            channel_ids.add(default_channel)
+    return channel_ids
+
+
+def _audit_scope_details(
+    details: Mapping[str, Any],
+    channel_ids: Set[int],
+) -> Dict[str, Any]:
+    scoped = dict(details)
+    if len(channel_ids) > 1:
+        scoped["channel_ids"] = sorted(channel_ids)
+    return scoped
+
+
+def _channel_for_audit(channel_ids: Set[int]) -> Optional[int]:
+    return next(iter(channel_ids)) if len(channel_ids) == 1 else None
+
+
+def _is_channel_scoped(context: AuthContext) -> bool:
+    return ALL_CHANNELS not in context.allowed_channel_ids
+
+
+def _can_access_context_channel(
+    context: Optional[AuthContext],
+    channel_id: Any,
+) -> bool:
+    if context is None:
+        return True
+    normalized = _to_optional_int(channel_id)
+    if normalized is None:
+        return False
+    try:
+        require_channel_access(context, normalized)
+    except PermissionError:
+        return False
+    return True
+
+
+def _write_security_audit(
+    *,
+    context: Optional[AuthContext],
+    action: str,
+    result: str,
+    target_type: str,
+    target_id: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    details: Optional[Mapping[str, Any]] = None,
+) -> None:
+    event = AuditEventBuilder().build(
+        context=context,
+        tenant_id=(
+            None
+            if context is not None
+            else str(getattr(config, "AUTH_TENANT_ID", "") or "").strip() or None
+        ),
+        source_ip=_source_ip(),
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        channel_id=channel_id,
+        result=result,
+        details=details,
+    )
+    _get_audit_writer().write(event)
+
+
+def _write_agent_tool_audit(event: ToolAuditEvent) -> None:
+    details = {
+        "phase": event.phase,
+        "operation": event.operation,
+        "risk": event.risk,
+        "required_permission": event.required_permission,
+        "arguments_hash": event.arguments_hash,
+        "code": event.code,
+        "duration_ms": event.duration_ms,
+        **dict(event.details),
+    }
+    audit_event = AuditEvent(
+        timestamp=event.timestamp,
+        request_id=event.request_id,
+        actor_user_id=event.actor_id,
+        actor_roles=tuple(sorted(event.actor_roles)),
+        tenant_id=event.tenant_id,
+        source_ip=event.source_ip or "0.0.0.0",
+        action=f"agent.tool.{event.operation}.{event.tool_name}",
+        target_type="agent_tool",
+        target_id=event.tool_name,
+        channel_id=None,
+        result=event.phase,
+        details=details,
+    )
+    _get_audit_writer().write(audit_event)
+
+
+def _auth_failure_response(message: str, status: int):
+    return jsonify({"success": False, "error": message}), status
+
+
+def _session_guard(
+    *,
+    permission: Optional[Permission],
+    require_csrf: bool,
+    action: str,
+):
+    context = _current_auth_context()
+    channel_ids = _request_channel_ids()
+    channel_id = _channel_for_audit(channel_ids)
+    if getattr(g, "auth_resolution_error", None):
+        return _auth_failure_response("Authentication service unavailable", 503)
+    if context is None:
+        try:
+            _write_security_audit(
+                context=None,
+                action=action,
+                result="denied",
+                target_type="route",
+                target_id=request.path,
+                channel_id=channel_id,
+                details=_audit_scope_details(
+                    {
+                        "method": request.method,
+                        "reason": "authentication_required",
+                    },
+                    channel_ids,
+                ),
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Authentication required", 401)
+
+    if require_csrf:
+        session_record = getattr(g, "auth_session", None)
+        cookie_token = str(
+            request.cookies.get(config.AUTH_CSRF_COOKIE) or ""
+        )
+        header_token = str(request.headers.get("X-CSRF-Token") or "")
+        try:
+            valid_csrf = bool(
+                session_record
+                and _get_auth_service().validate_csrf(
+                    session_record,
+                    cookie_token=cookie_token,
+                    header_token=header_token,
+                )
+            )
+        except Exception:
+            return _auth_failure_response("Authentication service unavailable", 503)
+        if not valid_csrf:
+            try:
+                _write_security_audit(
+                    context=context,
+                    action=action,
+                    result="denied",
+                    target_type="route",
+                    target_id=request.path,
+                    channel_id=channel_id,
+                    details=_audit_scope_details(
+                        {"method": request.method, "reason": "csrf_rejected"},
+                        channel_ids,
+                    ),
+                )
+            except Exception:
+                return _auth_failure_response("Audit service unavailable", 503)
+            return _auth_failure_response("CSRF token required", 403)
+
+    try:
+        if permission is not None:
+            require_permission(context, permission)
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "") in _ALL_CHANNELS_REQUIRED_ENDPOINTS
+        ):
+            raise PermissionError("all-channel access is required")
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "")
+            in _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS
+            and not channel_ids
+        ):
+            raise PermissionError("an explicit authorized channel is required")
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "") == "serve_detection_image"
+            and not channel_ids
+        ):
+            raise PermissionError(
+                "detection image ownership metadata is required"
+            )
+        for requested_channel_id in channel_ids:
+            require_channel_access(context, requested_channel_id)
+    except PermissionError as exc:
+        try:
+            _write_security_audit(
+                context=context,
+                action=action,
+                result="denied",
+                target_type="route",
+                target_id=request.path,
+                channel_id=channel_id,
+                details=_audit_scope_details(
+                    {"method": request.method, "reason": type(exc).__name__},
+                    channel_ids,
+                ),
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Access denied", 403)
+
+    try:
+        _write_security_audit(
+            context=context,
+            action=action,
+            result="success",
+            target_type="route",
+            target_id=request.path,
+            channel_id=channel_id,
+            details=_audit_scope_details(
+                {"method": request.method, "phase": "authorized"},
+                channel_ids,
+            ),
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return None
+
+
+@app.before_request
+def _bind_request_security_context() -> None:
+    g.request_id = _request_id()
+    g.auth_context = None
+    g.auth_session = None
+    g.auth_resolution_error = None
+    if not _auth_enabled():
+        return
+    session_token = str(
+        request.cookies.get(config.AUTH_SESSION_COOKIE) or ""
+    )
+    if not session_token:
+        resolved = None
+    else:
+        try:
+            resolved = _get_auth_service().resolve(
+                session_token,
+                request_id=g.request_id,
+            )
+            if resolved is not None:
+                g.auth_session, g.auth_context = resolved
+        except Exception as exc:
+            g.auth_resolution_error = type(exc).__name__
+
+    permission = _SENSITIVE_ENDPOINT_PERMISSIONS.get(str(request.endpoint or ""))
+    if permission is not None:
+        return _session_guard(
+            permission=permission,
+            require_csrf=request.method not in {"GET", "HEAD", "OPTIONS"},
+            action=f"http.{request.endpoint}.access",
+        )
+
+
+@app.after_request
+def _attach_request_security_headers(response):
+    response.headers["X-Request-ID"] = str(
+        getattr(g, "request_id", "") or uuid.uuid4()
+    )
+    return response
+
+
 def _settings_guard(write: bool = False):
+    if _auth_enabled():
+        return _session_guard(
+            permission=(
+                Permission.SETTINGS_MANAGE
+                if write
+                else Permission.SETTINGS_VIEW
+            ),
+            require_csrf=write,
+            action=(
+                "settings.write.authorize"
+                if write
+                else "settings.read"
+            ),
+        )
     if write:
         return _mutation_guard()
     if config.ADMIN_TOKEN:
@@ -202,6 +746,18 @@ def _settings_guard(write: bool = False):
 
 
 def _mutation_guard():
+    if _auth_enabled():
+        endpoint = str(request.endpoint or "")
+        permission = (
+            _MUTATION_ENDPOINT_PERMISSIONS[endpoint]
+            if endpoint in _MUTATION_ENDPOINT_PERMISSIONS
+            else Permission.SETTINGS_MANAGE
+        )
+        return _session_guard(
+            permission=permission,
+            require_csrf=True,
+            action=f"http.{endpoint or 'unknown'}.mutate",
+        )
     configured = (config.ADMIN_TOKEN or "").strip()
     if not configured:
         return jsonify(
@@ -791,6 +1347,7 @@ def home():
         luxriot_rollup_prompt_l2=getattr(config, 'LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT', rollup_default) or rollup_default,
         luxriot_rollup_prompt_l3=getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', rollup_default) or rollup_default,
         luxriot_json_alert_prompt=getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT,
+        auth_enabled=bool(config.AUTH_ENABLED),
     ))
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
@@ -827,6 +1384,11 @@ def serve_app_js():
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
+    js = js.replace('{auth_enabled_json}', json.dumps(bool(config.AUTH_ENABLED)))
+    js = js.replace(
+        '{auth_csrf_cookie_json}',
+        json.dumps(str(config.AUTH_CSRF_COOKIE)),
+    )
     response = make_response(js)
     response.headers['Content-Type'] = 'application/javascript; charset=utf-8'
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -1563,6 +2125,58 @@ def _check_postgres_ready() -> Dict[str, Any]:
         )
 
 
+def _check_auth_ready() -> Dict[str, Any]:
+    if not _auth_enabled():
+        return _component_result(False, "disabled", required=False)
+    tenant_id = str(getattr(config, "AUTH_TENANT_ID", "") or "").strip()
+    if not tenant_id:
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVOSSEARCH_AUTH_TENANT_ID is required",
+        )
+    try:
+        uuid.UUID(tenant_id)
+    except ValueError:
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVOSSEARCH_AUTH_TENANT_ID must be a UUID",
+        )
+    if not _postgres_database_configured():
+        return _component_result(
+            False,
+            "misconfigured",
+            error="PostgreSQL is required when authentication is enabled",
+        )
+    if not _audit_database_dsn():
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVA_AUDIT_DATABASE_DSN is required when authentication is enabled",
+        )
+    postgres = _check_postgres_ready()
+    try:
+        audit_database = _get_audit_db_pool().check_health()
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=f"audit database unavailable ({type(exc).__name__})",
+            tenant_id=tenant_id,
+        )
+    return _component_result(
+        bool(postgres.get("ok")) and audit_database.ready,
+        (
+            "ready"
+            if postgres.get("ok") and audit_database.ready
+            else "unavailable"
+        ),
+        tenant_id=tenant_id,
+        audit_latency_ms=audit_database.latency_ms,
+    )
+
+
 def _luxriot_configured() -> bool:
     base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip()
     if not base_url or "luxriot-host" in base_url:
@@ -1619,6 +2233,7 @@ def ready():
     checks: Dict[str, Dict[str, Any]] = {
         "database": _check_database_ready(),
         "postgresql": _check_postgres_ready(),
+        "authentication": _check_auth_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
     }
@@ -1638,6 +2253,8 @@ def ready():
     required_names = ["database", "embedder"]
     if checks["postgresql"].get("required"):
         required_names.append("postgresql")
+    if checks["authentication"].get("required"):
+        required_names.append("authentication")
     if strict or checks["luxriot"].get("required"):
         required_names.append("luxriot")
 
@@ -1651,6 +2268,169 @@ def ready():
             "checks": checks,
         }
     ), status_code
+
+
+def _identity_payload(identity: Any) -> Dict[str, Any]:
+    return {
+        "id": identity.user_id,
+        "tenantId": identity.tenant_id,
+        "username": identity.username,
+        "displayName": identity.display_name,
+        "roles": sorted(identity.roles),
+        "permissions": sorted(identity.permissions),
+        "allowedChannelIds": sorted(
+            identity.allowed_channel_ids,
+            key=lambda value: str(value),
+        ),
+    }
+
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    data = _json_body()
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    if not username or not password:
+        return _auth_failure_response("Username and password are required", 400)
+    try:
+        login = _get_auth_service().login(
+            username=username,
+            password=password,
+            client_ip=_source_ip(),
+            user_agent=str(request.headers.get("User-Agent") or "")[:1024] or None,
+        )
+    except LoginThrottled as exc:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="denied",
+                target_type="user",
+                details={"reason": "throttled"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        response = _auth_failure_response("Too many login attempts", 429)
+        response[0].headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response
+    except InvalidCredentials:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="failure",
+                target_type="user",
+                details={"reason": "invalid_credentials"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Invalid username or password", 401)
+    except Exception:
+        return _auth_failure_response("Authentication service unavailable", 503)
+
+    context = AuthContext(
+        user_id=login.identity.user_id,
+        tenant_id=login.identity.tenant_id,
+        roles=login.identity.roles,
+        permissions=login.identity.permissions,
+        allowed_channel_ids=login.identity.allowed_channel_ids,
+        request_id=g.request_id,
+    )
+    try:
+        _write_security_audit(
+            context=context,
+            action="auth.login",
+            result="success",
+            target_type="session",
+            target_id=login.session_id,
+        )
+    except Exception:
+        try:
+            _get_auth_service().logout(
+                login.session_token,
+                reason="audit_unavailable",
+            )
+        except Exception:
+            pass
+        return _auth_failure_response("Audit service unavailable", 503)
+
+    max_age = max(
+        1,
+        int((login.expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+    response = make_response(
+        jsonify(
+            {
+                "success": True,
+                "user": _identity_payload(login.identity),
+                "expiresAt": login.expires_at.isoformat(),
+                "csrfHeader": "X-CSRF-Token",
+            }
+        )
+    )
+    response.set_cookie(
+        config.AUTH_SESSION_COOKIE,
+        login.session_token,
+        max_age=max_age,
+        secure=bool(config.AUTH_COOKIE_SECURE),
+        httponly=True,
+        samesite="Strict",
+        path="/",
+    )
+    response.set_cookie(
+        config.AUTH_CSRF_COOKIE,
+        login.csrf_token,
+        max_age=max_age,
+        secure=bool(config.AUTH_COOKIE_SECURE),
+        httponly=False,
+        samesite="Strict",
+        path="/",
+    )
+    return response
+
+
+@app.route('/auth/me', methods=['GET'])
+def auth_me():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _session_guard(
+        permission=None,
+        require_csrf=False,
+        action="auth.me.read",
+    )
+    if guard is not None:
+        return guard
+    session_record = g.auth_session
+    return jsonify(
+        {
+            "success": True,
+            "user": _identity_payload(session_record.identity),
+            "expiresAt": session_record.expires_at.isoformat(),
+            "csrfHeader": "X-CSRF-Token",
+        }
+    )
+
+
+@app.route('/auth/logout', methods=['POST'])
+def auth_logout():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    session_token = str(
+        request.cookies.get(config.AUTH_SESSION_COOKIE) or ""
+    )
+    try:
+        _get_auth_service().logout(session_token, reason="logout")
+    except Exception:
+        return _auth_failure_response("Authentication service unavailable", 503)
+    response = make_response(jsonify({"success": True}))
+    response.delete_cookie(config.AUTH_SESSION_COOKIE, path="/")
+    response.delete_cookie(config.AUTH_CSRF_COOKIE, path="/")
+    return response
 
 # Agent runner — instantiated lazily on first /agent/chat request so that
 # all helper functions (get_text_embedding, _search_detections_archive, etc.)
@@ -1875,6 +2655,7 @@ def _get_agent_runner() -> Any:
             lm_model=_agent_runtime_model_override or config.LM_MODEL,
             lm_api_key=config.LM_API_KEY,
             lm_timeout=config.LM_TIMEOUT,
+            tool_audit_callback=_write_agent_tool_audit,
         )
         return _agent_runner
 
@@ -1885,6 +2666,18 @@ def _get_agent_config_payload() -> Dict[str, Any]:
         "default_model": str(config.LM_MODEL or "").strip(),
         "override_model": str(_agent_runtime_model_override or "").strip() or None,
         "source": "runtime_override" if _agent_runtime_model_override else "config",
+    }
+
+
+def _agent_session_owner() -> Dict[str, str]:
+    if not _auth_enabled():
+        return {}
+    context = _current_auth_context()
+    if context is None:
+        return {}
+    return {
+        "tenant_id": context.tenant_id,
+        "actor_id": context.user_id,
     }
 
 
@@ -4845,6 +5638,13 @@ def luxriot_channels():
     force = str(request.args.get('force', '')).lower() in {'1', 'true', 'yes'}
     try:
         channels = luxriot_manager.get_channels(force=force)
+        context = _current_auth_context()
+        if _auth_enabled() and context is not None:
+            channels = [
+                channel
+                for channel in channels
+                if _can_access_context_channel(context, channel.get("id"))
+            ]
         return jsonify({'channels': channels})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -5051,7 +5851,32 @@ def luxriot_summary_rollups():
 @app.route('/luxriot/streams', methods=['GET'])
 def luxriot_streams_status():
     try:
-        return jsonify(luxriot_manager.streams_status())
+        status = luxriot_manager.streams_status()
+        context = _current_auth_context()
+        if _auth_enabled() and context is not None:
+            for key in ("video_streams", "analytics_streams"):
+                status[key] = [
+                    item
+                    for item in status.get(key) or []
+                    if _can_access_context_channel(
+                        context,
+                        item.get("channel_id"),
+                    )
+                ]
+            for key in (
+                "paused_analytics_channels",
+                "video_history_channels",
+            ):
+                status[key] = [
+                    channel_id
+                    for channel_id in status.get(key) or []
+                    if _can_access_context_channel(context, channel_id)
+                ]
+            status["running_total"] = sum(
+                len(status.get(key) or [])
+                for key in ("video_streams", "analytics_streams")
+            )
+        return jsonify(status)
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
@@ -5356,6 +6181,16 @@ def probes_save():
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
     probes = probes_store.list_probes()
+    context = _current_auth_context()
+    if _auth_enabled() and context is not None:
+        probes = [
+            probe
+            for probe in probes
+            if _can_access_context_channel(
+                context,
+                probe.get("channel_id"),
+            )
+        ]
     response = jsonify({'probes': probes})
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
@@ -6448,6 +7283,22 @@ def agent_chat():
         return jsonify({'error': 'message is required'}), 400
     session_id = str(data.get('session_id') or '').strip() or None
     image_b64  = str(data.get('image_b64') or '').strip() or None
+    tool_context = None
+    auth_context = _current_auth_context()
+    if _auth_enabled() and auth_context is not None:
+        tool_context = ToolExecutionContext(
+            actor_id=auth_context.user_id,
+            tenant_id=auth_context.tenant_id,
+            roles=auth_context.roles,
+            permissions=auth_context.permissions,
+            allowed_channel_ids={
+                str(channel_id)
+                for channel_id in auth_context.allowed_channel_ids
+            },
+            agent_session_id=session_id,
+            request_id=auth_context.request_id,
+            client_ip=_source_ip(),
+        )
 
     try:
         runner = _get_agent_runner()
@@ -6459,6 +7310,7 @@ def agent_chat():
             session_id=session_id,
             message=message,
             image_b64=image_b64,
+            tool_context=tool_context,
         )
 
     response = Response(
@@ -6477,7 +7329,9 @@ def agent_sessions():
         runner = _get_agent_runner()
     except Exception as exc:
         return jsonify({'error': f'Agent unavailable: {exc}'}), 503
-    return jsonify({'sessions': runner.store.list_sessions()})
+    return jsonify({
+        'sessions': runner.store.list_sessions(**_agent_session_owner())
+    })
 
 
 @app.route('/agent/config', methods=['GET', 'POST'])
@@ -6578,11 +7432,17 @@ def agent_session(session_id: str):
         guard = _mutation_guard_error()
         if guard is not None:
             return guard
-        ok = runner.store.delete_session(session_id)
+        ok = runner.store.delete_session(
+            session_id,
+            **_agent_session_owner(),
+        )
         if not ok:
             return jsonify({'error': 'Session not found'}), 404
         return jsonify({'status': 'deleted'})
-    session = runner.store.get_session(session_id)
+    session = runner.store.get_session(
+        session_id,
+        **_agent_session_owner(),
+    )
     if not session:
         return jsonify({'error': 'Session not found'}), 404
     return jsonify(session)
@@ -6590,7 +7450,14 @@ def agent_session(session_id: str):
 
 @atexit.register
 def _shutdown_background_workers() -> None:
-    global _control_plane_db_pool
+    global _audit_db_pool, _audit_writer, _control_plane_db_pool
+    try:
+        if _audit_db_pool is not None:
+            _audit_db_pool.close()
+            _audit_db_pool = None
+            _audit_writer = None
+    except Exception:
+        pass
     try:
         if _control_plane_db_pool is not None:
             _control_plane_db_pool.close()
