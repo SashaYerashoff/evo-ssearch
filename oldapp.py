@@ -33,6 +33,7 @@ from flask_cors import CORS
 from config import config
 from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
+from eva_db import DatabaseSettings, PsycopgPool
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
 if TYPE_CHECKING:
@@ -1463,6 +1464,8 @@ class ProbesStore:
 probes_store = ProbesStore()
 detections_store = DetectionsStore()
 APP_STARTED_AT = time.time()
+_control_plane_db_pool: Optional[PsycopgPool] = None
+_control_plane_db_lock = Lock()
 
 
 def _component_result(
@@ -1516,6 +1519,48 @@ def _check_database_ready() -> Dict[str, Any]:
         return _component_result(True, "reachable", path=str(detections_store.path))
     except Exception as exc:
         return _component_result(False, "error", error=str(exc), path=str(detections_store.path))
+
+
+def _postgres_database_configured() -> bool:
+    return any(
+        str(os.getenv(name) or "").strip()
+        for name in (
+            "EVA_DATABASE_DSN",
+            "EVA_DATABASE_URL",
+            "EVOSSEARCH_DATABASE_DSN",
+            "EVOSSEARCH_DATABASE_URL",
+            "DATABASE_URL",
+        )
+    )
+
+
+def _get_control_plane_db_pool() -> PsycopgPool:
+    global _control_plane_db_pool
+    with _control_plane_db_lock:
+        if _control_plane_db_pool is None:
+            _control_plane_db_pool = PsycopgPool(DatabaseSettings.from_env())
+        return _control_plane_db_pool
+
+
+def _check_postgres_ready() -> Dict[str, Any]:
+    if not _postgres_database_configured():
+        return _component_result(False, "not_configured", required=False)
+    try:
+        result = _get_control_plane_db_pool().check_readiness()
+        return _component_result(
+            result.ready,
+            result.state.value,
+            detail=result.detail,
+            latency_ms=result.latency_ms,
+            current_revision=result.current_revision,
+            expected_revision=result.expected_revision,
+        )
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=type(exc).__name__,
+        )
 
 
 def _luxriot_configured() -> bool:
@@ -1573,6 +1618,7 @@ def ready():
 
     checks: Dict[str, Dict[str, Any]] = {
         "database": _check_database_ready(),
+        "postgresql": _check_postgres_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
     }
@@ -1590,6 +1636,8 @@ def ready():
             )
 
     required_names = ["database", "embedder"]
+    if checks["postgresql"].get("required"):
+        required_names.append("postgresql")
     if strict or checks["luxriot"].get("required"):
         required_names.append("luxriot")
 
@@ -6542,6 +6590,13 @@ def agent_session(session_id: str):
 
 @atexit.register
 def _shutdown_background_workers() -> None:
+    global _control_plane_db_pool
+    try:
+        if _control_plane_db_pool is not None:
+            _control_plane_db_pool.close()
+            _control_plane_db_pool = None
+    except Exception:
+        pass
     try:
         luxriot_manager.stop_all_streams(stop_video=True, stop_analytics=True, pause_analytics=False)
     except Exception:

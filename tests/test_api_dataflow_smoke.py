@@ -137,6 +137,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertIn(ready.status_code, {200, 503})
         payload = ready.get_json()
         self.assertIn(payload["status"], {"ready", "not_ready"})
+        self.assertIn("postgresql", payload["checks"])
         self.assertIn("database", payload["checks"])
         self.assertIn("embedder", payload["checks"])
         self.assertIn("luxriot", payload["checks"])
