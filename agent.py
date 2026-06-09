@@ -38,7 +38,6 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 AGENT_MAX_HISTORY_MESSAGES = 20       # last N messages kept as context
-AGENT_MAX_TOOL_ITERATIONS  = 8        # runaway loop guard
 AGENT_HEARTBEAT_INTERVAL   = 15       # seconds between SSE heartbeats
 AGENT_SESSION_TTL_DAYS     = 30       # sessions older than this are GC'd
 AGENT_MAX_SESSIONS         = 100      # sessions kept per store (GC oldest)
@@ -3075,7 +3074,7 @@ class AgentRunner:
         new_assistant_messages: List[Dict[str, Any]] = []
 
         # ── tool loop ──────────────────────────────────────────────────────
-        for iteration in range(AGENT_MAX_TOOL_ITERATIONS):
+        while True:
             # Run the blocking LM call in a thread so we can emit heartbeats
             lm_response: _LMResponse
             try:
@@ -3142,13 +3141,6 @@ class AgentRunner:
 
                 in_flight.append(result_msg)
                 new_assistant_messages.append(result_msg)
-
-        else:
-            # Hit iteration limit
-            yield _sse({"type": "error",
-                        "message": f"Tool loop exceeded {AGENT_MAX_TOOL_ITERATIONS} iterations."})
-            yield _sse({"type": "done", "session_id": session_id})
-            return
 
         # ── final streaming text response ──────────────────────────────────
         full_text_parts: List[str] = []
