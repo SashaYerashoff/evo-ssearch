@@ -100,7 +100,12 @@ class PlanStore(Protocol):
         expires_at: datetime,
     ) -> ToolPlan: ...
 
-    def get_plan(self, plan_id: str) -> ToolPlan: ...
+    def get_plan(
+        self,
+        plan_id: str,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolPlan: ...
 
 
 class ApprovalStore(Protocol):
@@ -112,7 +117,12 @@ class ApprovalStore(Protocol):
         expires_at: datetime,
     ) -> ToolApproval: ...
 
-    def get_approval(self, approval_id: str) -> ToolApproval: ...
+    def get_approval(
+        self,
+        approval_id: str,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolApproval: ...
 
     def consume_approval(
         self,
@@ -163,7 +173,12 @@ class InMemoryPlanApprovalStore(PlanStore, ApprovalStore):
             self._plans[plan.plan_id] = plan
         return plan
 
-    def get_plan(self, plan_id: str) -> ToolPlan:
+    def get_plan(
+        self,
+        plan_id: str,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolPlan:
         with self._lock:
             plan = self._plans.get(plan_id)
         if plan is None:
@@ -202,7 +217,12 @@ class InMemoryPlanApprovalStore(PlanStore, ApprovalStore):
             self._approvals[approval.approval_id] = approval
         return approval
 
-    def get_approval(self, approval_id: str) -> ToolApproval:
+    def get_approval(
+        self,
+        approval_id: str,
+        *,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolApproval:
         with self._lock:
             approval = self._approvals.get(approval_id)
         if approval is None:

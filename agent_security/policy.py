@@ -14,6 +14,7 @@ class ToolRisk(str, Enum):
 
 ChannelScopeResolver = Callable[[Mapping[str, Any]], Iterable[str]]
 ArgumentNormalizer = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+ApprovalPredicate = Callable[[Mapping[str, Any]], bool]
 
 
 _SINGULAR_CHANNEL_ARGUMENTS = ("channel_id", "channel")
@@ -69,6 +70,7 @@ class ToolPolicy:
     required_permission: str
     risk: ToolRisk | str = ToolRisk.READ
     approval_required: bool = False
+    approval_required_when: ApprovalPredicate | None = None
     approval_permission: str | None = None
     allowed_arguments: frozenset[str] = frozenset()
     required_arguments: frozenset[str] = frozenset()
@@ -150,6 +152,10 @@ class ToolPolicy:
             raise ValueError("timeout_seconds must be positive")
         if self.plan_ttl_seconds <= 0 or self.approval_ttl_seconds <= 0:
             raise ValueError("plan and approval TTLs must be positive")
+        if self.approval_required_when is not None and not self.approval_required:
+            raise ValueError(
+                "approval_required_when requires approval_required=True"
+            )
 
 
 def _as_timedelta(

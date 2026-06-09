@@ -23,6 +23,9 @@ MIGRATION = ROOT / "migrations" / "versions" / (
 QUEUE_GRANTS_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260609_0002_queue_role_grants.py"
 )
+DURABLE_APPROVALS_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260609_0003_durable_agent_approvals.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -211,8 +214,11 @@ class MigrationContentTests(unittest.TestCase):
         self.assertTrue((ROOT / "alembic.ini").is_file())
         self.assertTrue((ROOT / "migrations" / "env.py").is_file())
         queue_grants_source = QUEUE_GRANTS_MIGRATION.read_text(encoding="utf-8")
+        durable_approvals_source = DURABLE_APPROVALS_MIGRATION.read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260609_0002"',
             queue_grants_source,
         )
         self.assertIn(
@@ -230,6 +236,19 @@ class MigrationContentTests(unittest.TestCase):
         self.assertIn(
             "GRANT SELECT (id) ON audit.events TO eva_audit_writer",
             queue_grants_source,
+        )
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            durable_approvals_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260609_0002"',
+            durable_approvals_source,
+        )
+        self.assertIn("octet_length(arguments_hash) = 32", durable_approvals_source)
+        self.assertIn(
+            "ux_agent_action_approvals_one_active_per_plan",
+            durable_approvals_source,
         )
 
 

@@ -11,7 +11,6 @@ from security import Permission
 from .audit import ToolAuditEvent
 from .context import ToolExecutionContext
 from .errors import (
-    ApprovalRequiredError,
     AuditUnavailableError,
     ChannelAccessDeniedError,
     InvalidToolArgumentsError,
@@ -78,6 +77,10 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
 )
 
 
+def _preview_apply_requires_approval(arguments: Mapping[str, Any]) -> bool:
+    return arguments.get("preview", True) is not True
+
+
 class EvaAgentToolAdapter:
     """Authorize and audit legacy EVA agent tools before dispatch."""
 
@@ -111,7 +114,12 @@ class EvaAgentToolAdapter:
                     if name in _WRITE_TOOLS
                     else ToolRisk.READ
                 ),
-                approval_required=name in _HIDDEN_UNTIL_APPROVALS,
+                approval_required=name in _WRITE_TOOLS,
+                approval_required_when=(
+                    _preview_apply_requires_approval
+                    if name in _PREVIEW_ONLY_TOOLS
+                    else None
+                ),
                 allowed_arguments=frozenset(allowed_arguments),
                 required_arguments=frozenset(
                     map(str, parameters.get("required") or ())
@@ -210,6 +218,51 @@ class EvaAgentToolAdapter:
         finally:
             self._local.progress_cb = None
 
+    def create_plan(
+        self,
+        name: str,
+        arguments: Mapping[str, Any] | None,
+        context: ToolExecutionContext,
+        *,
+        ttl_seconds: float | None = None,
+    ):
+        try:
+            prepared = self._prepare_arguments(name, arguments or {}, context)
+        except ToolGatewayError as exc:
+            self._audit_preparation_denial(
+                name,
+                arguments or {},
+                context,
+                exc,
+            )
+            raise
+        return self.gateway.create_plan(
+            name,
+            prepared,
+            context,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def approve_and_execute(
+        self,
+        plan_id: str,
+        context: ToolExecutionContext,
+        *,
+        progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Any:
+        plan = self.gateway._plan_store.get_plan(plan_id, context=context)
+        self._local.progress_cb = progress_cb
+        try:
+            approval = self.gateway.approve(plan_id, context)
+            return self.gateway.execute(
+                plan.action,
+                None,
+                context,
+                approval_id=approval.approval_id,
+            )
+        finally:
+            self._local.progress_cb = None
+
     def _audit_preparation_denial(
         self,
         name: str,
@@ -258,15 +311,6 @@ class EvaAgentToolAdapter:
             context: ToolExecutionContext,
             arguments: Mapping[str, Any],
         ) -> Any:
-            if name in _PREVIEW_ONLY_TOOLS:
-                if arguments.get("preview", True) is not True:
-                    raise ApprovalRequiredError(
-                        "applying agent changes requires a stored one-time approval"
-                    )
-            if name == "create_bookmark":
-                raise ApprovalRequiredError(
-                    "bookmark creation requires a stored one-time approval"
-                )
             result = self._legacy_tools.execute(
                 name,
                 dict(arguments),
@@ -305,14 +349,6 @@ class EvaAgentToolAdapter:
             self._resolve_update_probe_channel(prepared)
         if name == "delete_probes":
             self._resolve_delete_probe_channels(prepared, context)
-        if (
-            name in _PREVIEW_ONLY_TOOLS
-            and prepared.get("preview", True) is not True
-        ):
-            raise ApprovalRequiredError(
-                "applying agent changes requires a stored one-time approval"
-            )
-
         scoped_channels = self._scoped_channels(context)
         if name == "survey_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))

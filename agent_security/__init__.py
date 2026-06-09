@@ -27,7 +27,9 @@ from .errors import (
     ToolTimeoutError,
 )
 from .gateway import InMemoryRateLimiter, RateLimiter, ToolGateway
+from .postgres_approvals import PostgresPlanApprovalStore
 from .policy import (
+    ApprovalPredicate,
     ArgumentNormalizer,
     ChannelScopeResolver,
     RateLimit,
@@ -45,6 +47,7 @@ __all__ = [
     "ApprovalRequiredError",
     "AuditUnavailableError",
     "ApprovalStore",
+    "ApprovalPredicate",
     "ArgumentNormalizer",
     "AuthorizationError",
     "ChannelAccessDeniedError",
@@ -56,6 +59,7 @@ __all__ = [
     "PermissionDeniedError",
     "PlanExpiredError",
     "PlanStore",
+    "PostgresPlanApprovalStore",
     "RateLimit",
     "RateLimitExceededError",
     "RateLimiter",

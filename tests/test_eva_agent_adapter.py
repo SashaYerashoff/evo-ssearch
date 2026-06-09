@@ -192,6 +192,23 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertEqual(len(self.legacy.calls), 1)
 
+    def test_write_apply_requires_plan_then_executes_stored_arguments(self):
+        plan = self.adapter.create_plan(
+            "update_probe",
+            {
+                "probe_id": "probe-7",
+                "changes": {"pos_floor": 0.4},
+                "preview": False,
+            },
+            self.context,
+        )
+
+        result = self.adapter.approve_and_execute(plan.plan_id, self.context)
+
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(result["arguments"]["preview"], False)
+        self.assertEqual(len(self.legacy.calls), 1)
+
     def test_audit_failure_blocks_legacy_handler(self):
         adapter = EvaAgentToolAdapter(
             self.legacy,

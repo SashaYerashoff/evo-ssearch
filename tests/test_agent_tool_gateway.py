@@ -102,6 +102,23 @@ class ToolGatewayTests(unittest.TestCase):
                 channel_required=True,
             ),
         )
+        self.registry.register(
+            "apply_setting",
+            self._record_call,
+            ToolPolicy(
+                required_permission="probe.write",
+                risk=ToolRisk.WRITE,
+                approval_required=True,
+                approval_required_when=lambda arguments: arguments.get(
+                    "preview",
+                    True,
+                )
+                is not True,
+                allowed_arguments=frozenset({"channel_id", "value", "preview"}),
+                required_arguments=frozenset({"channel_id", "value"}),
+                channel_required=True,
+            ),
+        )
         self.gateway = ToolGateway(
             self.registry,
             audit_callback=self.audit_events.append,
@@ -232,6 +249,57 @@ class ToolGatewayTests(unittest.TestCase):
             )
 
         self.assertEqual(self.calls, [])
+
+    def test_conditional_approval_allows_preview_and_requires_apply(self) -> None:
+        preview = self.gateway.execute(
+            "apply_setting",
+            {
+                "channel_id": "channel-1",
+                "value": "quiet",
+                "preview": True,
+            },
+            self.context,
+        )
+
+        self.assertEqual(preview["arguments"]["preview"], True)
+        with self.assertRaises(ApprovalRequiredError):
+            self.gateway.execute(
+                "apply_setting",
+                {
+                    "channel_id": "channel-1",
+                    "value": "quiet",
+                    "preview": False,
+                },
+                self.context,
+            )
+        with self.assertRaises(ApprovalError):
+            self.gateway.create_plan(
+                "apply_setting",
+                {
+                    "channel_id": "channel-1",
+                    "value": "quiet",
+                    "preview": True,
+                },
+                self.context,
+            )
+        plan = self.gateway.create_plan(
+            "apply_setting",
+            {
+                "channel_id": "channel-1",
+                "value": "quiet",
+                "preview": False,
+            },
+            self.context,
+        )
+        approval = self.gateway.approve(plan.plan_id, self.context)
+        result = self.gateway.execute(
+            "apply_setting",
+            None,
+            self.context,
+            approval_id=approval.approval_id,
+        )
+
+        self.assertEqual(result["arguments"]["preview"], False)
 
     def test_approval_is_one_time_and_executes_stored_arguments(self) -> None:
         arguments = {

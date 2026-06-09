@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-CURRENT_SCHEMA_REVISION = "20260609_0002"
+CURRENT_SCHEMA_REVISION = "20260609_0003"
 
 _SECRET_QUERY_KEYS = {
     "api_key",

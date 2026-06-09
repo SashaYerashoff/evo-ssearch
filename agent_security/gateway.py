@@ -163,11 +163,11 @@ class ToolGateway:
         try:
             self._require_context(context)
             definition = self.registry.get(tool_name)
-            if not definition.policy.approval_required:
-                raise ApprovalError("tool does not require an approval plan")
             normalized = self._normalize_arguments(
                 arguments, definition.policy, now=self._clock()
             )
+            if not self._requires_approval(definition.policy, normalized):
+                raise ApprovalError("tool does not require an approval plan")
             arguments_hash = hash_arguments(normalized)
             self._authorize(definition, normalized, context)
             self._emit(
@@ -239,7 +239,7 @@ class ToolGateway:
         arguments_hash: str | None = None
         try:
             self._require_context(context)
-            plan = self._plan_store.get_plan(plan_id)
+            plan = self._plan_store.get_plan(plan_id, context=context)
             tool_name = plan.action
             arguments_hash = plan.arguments_hash
             definition = self.registry.get(plan.action)
@@ -262,6 +262,8 @@ class ToolGateway:
                     f"missing permission: {approval_permission}"
                 )
             normalized = thaw_value(plan.normalized_arguments)
+            if not self._requires_approval(definition.policy, normalized):
+                raise ApprovalError("tool no longer requires approval")
             self._authorize(definition, normalized, context)
             self._emit(
                 "allow",
@@ -332,15 +334,10 @@ class ToolGateway:
             policy = definition.policy
             self._reject_context_injection(arguments)
 
-            if policy.approval_required:
-                if not approval_id:
-                    normalized = self._normalize_arguments(
-                        arguments, policy, now=self._clock()
-                    )
-                    arguments_hash = hash_arguments(normalized)
-                    self._authorize(definition, normalized, context)
-                    raise ApprovalRequiredError(
-                        "a stored one-time approval is required"
+            if approval_id:
+                if not policy.approval_required:
+                    raise ApprovalError(
+                        "approval_id is not accepted for this tool"
                     )
                 normalized, arguments_hash = self._approved_arguments(
                     tool_name,
@@ -349,19 +346,24 @@ class ToolGateway:
                     approval_id,
                     definition,
                 )
-            else:
-                if approval_id is not None:
+                if not self._requires_approval(policy, normalized):
                     raise ApprovalError(
-                        "approval_id is not accepted for this tool"
+                        "approval_id is not accepted for this argument set"
                     )
+            else:
                 normalized = self._normalize_arguments(
                     arguments, policy, now=self._clock()
                 )
                 arguments_hash = hash_arguments(normalized)
+                if self._requires_approval(policy, normalized):
+                    self._authorize(definition, normalized, context)
+                    raise ApprovalRequiredError(
+                        "a stored one-time approval is required"
+                    )
 
             self._authorize(definition, normalized, context)
             self._enforce_rate_limit(tool_name, context, policy)
-            if policy.approval_required:
+            if approval_id:
                 self._approval_store.consume_approval(
                     approval_id=approval_id,
                     actor_id=context.actor_id,
@@ -442,7 +444,10 @@ class ToolGateway:
         approval_id: str,
         definition: ToolDefinition,
     ) -> tuple[dict[str, Any], str]:
-        approval = self._approval_store.get_approval(approval_id)
+        approval = self._approval_store.get_approval(
+            approval_id,
+            context=context,
+        )
         now = self._clock()
         if approval.consumed_at is not None:
             raise ApprovalConsumedError("approval has already been consumed")
@@ -456,7 +461,10 @@ class ToolGateway:
             raise ApprovalError(
                 "approval is not valid for this actor, tenant, or action"
             )
-        plan = self._plan_store.get_plan(approval.plan_id)
+        plan = self._plan_store.get_plan(
+            approval.plan_id,
+            context=context,
+        )
         if plan.expires_at <= now:
             raise PlanExpiredError("plan has expired")
         if (
@@ -481,6 +489,22 @@ class ToolGateway:
                     "execution arguments differ from the approved plan"
                 )
         return stored_arguments, plan.arguments_hash
+
+    @staticmethod
+    def _requires_approval(
+        policy: ToolPolicy,
+        arguments: Mapping[str, Any],
+    ) -> bool:
+        if not policy.approval_required:
+            return False
+        if policy.approval_required_when is None:
+            return True
+        try:
+            return bool(policy.approval_required_when(arguments))
+        except Exception as exc:
+            raise InvalidToolArgumentsError(
+                "approval predicate rejected the tool arguments"
+            ) from exc
 
     def _authorize(
         self,
