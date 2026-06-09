@@ -7829,6 +7829,49 @@
             return div;
         }
 
+        function appendApprovalControl(card, toolName, result) {
+            const approval = result && result.approval;
+            const planId = approval && approval.plan_id;
+            if (!planId) return;
+            const footer = document.createElement('div');
+            footer.className = 'agent-approval-footer';
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'agent-approval-apply';
+            button.textContent = 'Apply';
+            button.addEventListener('click', async () => {
+                if (button.disabled) return;
+                button.disabled = true;
+                button.textContent = 'Applying';
+                try {
+                    const body = {};
+                    if (_agentCurrentSession) body.session_id = _agentCurrentSession;
+                    const response = await fetch(`/agent/action-plans/${encodeURIComponent(planId)}/execute`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok || !data.success) {
+                        throw new Error(data.error || `Server error ${response.status}`);
+                    }
+                    button.textContent = 'Applied';
+                    footer.classList.add('is-applied');
+                    const appliedCard = buildActionCard(toolName, data.result);
+                    if (appliedCard) card.after(appliedCard);
+                    if (['update_probe', 'create_probe', 'delete_probes'].includes(toolName)) {
+                        void loadProbeList();
+                    }
+                } catch (err) {
+                    button.disabled = false;
+                    button.textContent = 'Apply';
+                    appendAgentNotice(`Apply failed: ${err.message}`, 'error');
+                }
+            });
+            footer.appendChild(button);
+            card.appendChild(footer);
+        }
+
         function buildActionCard(toolName, result) {
             const card = document.createElement('div');
             card.className = 'agent-action-card';
@@ -8107,6 +8150,7 @@
                 card.appendChild(body);
             }
 
+            appendApprovalControl(card, toolName, result);
             return card;
         }
 

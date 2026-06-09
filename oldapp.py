@@ -54,7 +54,7 @@ from security import (
     require_channel_access,
     require_permission,
 )
-from agent_security import ToolExecutionContext
+from agent_security import ToolExecutionContext, ToolGatewayError
 from agent_security.audit import ToolAuditEvent
 if TYPE_CHECKING:
     from heads.mask2former_head import Mask2FormerHead
@@ -127,6 +127,7 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "probes_delete": Permission.PROBES_MANAGE,
     "probes_run": Permission.PROBES_RUN,
     "agent_chat": Permission.AGENT_USE,
+    "agent_action_plan_execute": Permission.AGENT_USE,
     "agent_config": Permission.MODELS_MANAGE,
     "agent_skills_create": Permission.PROMPTS_MANAGE,
     "agent_skill_detail": Permission.PROMPTS_MANAGE,
@@ -2721,6 +2722,11 @@ def _get_agent_runner() -> Any:
         if _agent_runner is not None:
             return _agent_runner
         from agent import AgentRunner
+        approval_store = None
+        if _auth_enabled():
+            from agent_security import PostgresPlanApprovalStore
+
+            approval_store = PostgresPlanApprovalStore(_get_control_plane_db_pool())
 
         def _agent_search_folder(
             *, query: str, folder: str, limit: int = 12, sort_by: str = "similarity"
@@ -2780,6 +2786,8 @@ def _get_agent_runner() -> Any:
             lm_api_key=config.LM_API_KEY,
             lm_timeout=config.LM_TIMEOUT,
             tool_audit_callback=_write_agent_tool_audit,
+            tool_plan_store=approval_store,
+            tool_approval_store=approval_store,
         )
         return _agent_runner
 
@@ -7445,6 +7453,39 @@ def agent_chat():
     response.headers['X-Accel-Buffering'] = 'no'
     response.headers['Connection']        = 'keep-alive'
     return response
+
+
+@app.route('/agent/action-plans/<plan_id>/execute', methods=['POST'])
+def agent_action_plan_execute(plan_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    auth_context = _current_auth_context()
+    if _auth_enabled() and auth_context is None:
+        return jsonify({'error': 'Authentication required'}), 401
+    if not _auth_enabled() or auth_context is None:
+        return jsonify({'error': 'Durable approvals require named users'}), 403
+    tool_context = ToolExecutionContext(
+        actor_id=auth_context.user_id,
+        tenant_id=auth_context.tenant_id,
+        roles=auth_context.roles,
+        permissions=auth_context.permissions,
+        allowed_channel_ids={
+            str(channel_id)
+            for channel_id in auth_context.allowed_channel_ids
+        },
+        request_id=auth_context.request_id,
+        client_ip=_source_ip(),
+    )
+    try:
+        runner = _get_agent_runner()
+        result = runner.approve_action_plan(plan_id, tool_context)
+        return jsonify({'success': True, 'result': result})
+    except ToolGatewayError as exc:
+        status = 403 if getattr(exc, 'code', '') in {'permission_denied', 'channel_access_denied'} else 409
+        return jsonify({'success': False, 'error': str(exc), 'code': getattr(exc, 'code', 'tool_error')}), status
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @app.route('/agent/sessions', methods=['GET'])

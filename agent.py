@@ -3110,6 +3110,8 @@ class AgentRunner:
         tool_audit_callback: Optional[
             Callable[[ToolAuditEvent], None]
         ] = None,
+        tool_plan_store: Any | None = None,
+        tool_approval_store: Any | None = None,
     ) -> None:
         self._ps  = probes_store
         self._ds  = detections_store
@@ -3137,10 +3139,21 @@ class AgentRunner:
                 self._tools,
                 _TOOL_SCHEMAS,
                 audit_callback=tool_audit_callback,
+                plan_store=tool_plan_store,
+                approval_store=tool_approval_store,
             )
             if tool_audit_callback is not None
             else None
         )
+
+    def approve_action_plan(
+        self,
+        plan_id: str,
+        tool_context: ToolExecutionContext,
+    ) -> Any:
+        if self._secure_tools is None:
+            raise ToolGatewayError("Authorized agent tools are unavailable.")
+        return self._secure_tools.approve_and_execute(plan_id, tool_context)
 
     def stream_chat(
         self,
@@ -3802,6 +3815,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
 
     if tool_name == "update_prompt_settings":
         compact = dict(result)
+        compact.pop("approval", None)
         if isinstance(compact.get("current"), dict):
             compact["current"] = _compact_prompt_settings_for_model({"current": compact["current"]})
         if isinstance(compact.get("proposed"), dict):

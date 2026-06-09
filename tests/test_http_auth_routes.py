@@ -96,10 +96,15 @@ class _AuditWriter:
 class _AgentRunner:
     def __init__(self) -> None:
         self.calls = []
+        self.approvals = []
 
     def stream_chat(self, **kwargs):
         self.calls.append(kwargs)
         yield 'data: {"type":"done","session_id":"session-1"}\n\n'
+
+    def approve_action_plan(self, plan_id, tool_context):
+        self.approvals.append((plan_id, tool_context))
+        return {"status": "applied", "plan_id": plan_id}
 
 
 class HttpAuthRouteTests(unittest.TestCase):
@@ -344,6 +349,32 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(context.tenant_id, TENANT_ID)
         self.assertEqual(context.allowed_channel_ids, frozenset({"7"}))
         self.assertNotEqual(context.actor_id, "forged-admin")
+
+    def test_agent_action_plan_execute_uses_server_context(self) -> None:
+        _, csrf_token = self._login()
+        runner = _AgentRunner()
+        original_runner = oldapp._agent_runner
+        oldapp._agent_runner = runner
+        self.addCleanup(setattr, oldapp, "_agent_runner", original_runner)
+
+        response = self.client.post(
+            "/agent/action-plans/plan-123/execute",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "preview": False,
+                "actor_id": "forged-admin",
+                "arguments": {"channel_id": 8},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["result"]["status"], "applied")
+        self.assertEqual(len(runner.approvals), 1)
+        plan_id, context = runner.approvals[0]
+        self.assertEqual(plan_id, "plan-123")
+        self.assertEqual(context.actor_id, USER_ID)
+        self.assertEqual(context.tenant_id, TENANT_ID)
+        self.assertEqual(context.allowed_channel_ids, frozenset({"7"}))
 
 
 if __name__ == "__main__":

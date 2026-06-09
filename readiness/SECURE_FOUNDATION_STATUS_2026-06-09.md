@@ -10,7 +10,7 @@ Branch: `feature/secure-50-channel-foundation`
 | Integration | Lead | Readiness branch merged locally; auth and route policy wired; live PostgreSQL role flow verified | State import/cutover, backup/restore, pilot acceptance |
 | Database | DB sub-agent + lead | Bounded pool, Alembic, schemas, least-privilege roles, RLS, append-only audit writer, `/ready` integration | State repositories, backup/restore, customer deployment principals |
 | IAM | IAM sub-agent + lead | PostgreSQL identities/sessions, Argon2id, login/logout/me UI, secure cookies, CSRF, route and channel policy | User administration, durable distributed throttling, complete route matrix review |
-| Agent safety | Agent-safety sub-agent + lead | Existing loop uses role-filtered `ToolGateway`; channel grants, audit, safe schemas, preview-safe writes, owned sessions, PostgreSQL durable one-time approvals for apply actions | UI card/route polish for operator-triggered apply actions |
+| Agent safety | Agent-safety sub-agent + lead | Existing loop uses role-filtered `ToolGateway`; channel grants, audit, safe schemas, preview-safe writes, owned sessions, PostgreSQL durable one-time approvals for apply actions, operator Apply route/card | Broader UX polish and stale-diff conflict checks |
 | Data plane | Data-plane sub-agent + lead | PostgreSQL bounded queue, `SKIP LOCKED`, leases, retries, idempotency, coalescing, overload metrics, separate worker role, Luxriot L0 summary admission/worker runtime with file spool | GPU concurrency controls, operational dashboards, soak tuning |
 
 ## Verified
@@ -34,12 +34,15 @@ Branch: `feature/secure-50-channel-foundation`
 - Durable approvals passed an `eva_api` login gate: raw approval token stayed
   out of the database, approval was consumed once, and the plan was marked
   executed before the side effect.
+- Agent preview cards now carry plan metadata only and render an `Apply`
+  command. The UI calls a server-side route that approves and executes stored
+  arguments; it never sends apply arguments or approval tokens.
 - The rendered browser JavaScript passes `node --check`.
 - Agent tools fail closed when durable audit is unavailable.
 - Agent sessions and channel-bearing HTTP resources enforce user ownership.
 - Full live suite before Luxriot runtime wiring: 129 tests passed against
   PostgreSQL 16.
-- Fast local suite after Luxriot runtime and durable approval wiring: 138 tests
+- Fast local suite after Luxriot runtime and approval UI wiring: 139 tests
   passed.
 - Disposable PostgreSQL 16 live suite after durable approval wiring: 52 tests
   passed, plus the separate-role Luxriot runtime and `eva_api` approval gates.
@@ -48,9 +51,9 @@ Branch: `feature/secure-50-channel-foundation`
 
 ## Next execution order
 
-1. Add the operator-facing apply approval route/card around the durable
-   plan/approval backend.
-2. Run the 50-channel replay/soak gate and record queue/GPU/storage limits.
+1. Run the 50-channel replay/soak gate and record queue/GPU/storage limits.
+2. Add stale-diff checks for apply operations where legacy handlers can expose
+   current object versions.
 3. Import agent/probe/prompt/summary state with an idempotent comparison report.
 4. Add user administration, session revocation, and shared login throttling.
 5. Add backup/restore automation and perform a clean restore drill.

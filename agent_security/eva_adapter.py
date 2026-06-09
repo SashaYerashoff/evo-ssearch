@@ -90,6 +90,8 @@ class EvaAgentToolAdapter:
         tool_schemas: Sequence[Mapping[str, Any]],
         *,
         audit_callback: Callable[[ToolAuditEvent], None],
+        plan_store: Any | None = None,
+        approval_store: Any | None = None,
     ) -> None:
         self._legacy_tools = legacy_tools
         self._audit_callback = audit_callback
@@ -146,6 +148,8 @@ class EvaAgentToolAdapter:
         self.gateway = ToolGateway(
             registry,
             audit_callback=audit_callback,
+            plan_store=plan_store,
+            approval_store=approval_store,
         )
 
     @staticmethod
@@ -214,9 +218,10 @@ class EvaAgentToolAdapter:
             raise
         self._local.progress_cb = progress_cb
         try:
-            return self.gateway.execute(name, prepared, context)
+            result = self.gateway.execute(name, prepared, context)
         finally:
             self._local.progress_cb = None
+        return self._with_approval_plan(name, prepared, context, result)
 
     def create_plan(
         self,
@@ -262,6 +267,32 @@ class EvaAgentToolAdapter:
             )
         finally:
             self._local.progress_cb = None
+
+    def _with_approval_plan(
+        self,
+        name: str,
+        prepared_arguments: Mapping[str, Any],
+        context: ToolExecutionContext,
+        result: Any,
+    ) -> Any:
+        if (
+            name not in _PREVIEW_ONLY_TOOLS
+            or not isinstance(result, Mapping)
+            or result.get("status") != "preview"
+            or prepared_arguments.get("preview", True) is not True
+        ):
+            return result
+        apply_arguments = dict(prepared_arguments)
+        apply_arguments["preview"] = False
+        plan = self.gateway.create_plan(name, apply_arguments, context)
+        enriched = dict(result)
+        enriched["approval"] = {
+            "plan_id": plan.plan_id,
+            "action": plan.action,
+            "expires_at": plan.expires_at.isoformat(),
+            "required_permission": plan.required_permission,
+        }
+        return enriched
 
     def _audit_preparation_denial(
         self,

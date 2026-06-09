@@ -178,6 +178,9 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             self.context,
         )
         self.assertEqual(result["status"], "preview")
+        self.assertIn("approval", result)
+        self.assertIn("plan_id", result["approval"])
+        self.assertNotIn("approval_id", result["approval"])
 
         with self.assertRaises(ApprovalRequiredError):
             self.adapter.execute(
