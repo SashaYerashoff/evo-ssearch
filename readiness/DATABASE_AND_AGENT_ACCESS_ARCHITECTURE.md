@@ -8,6 +8,11 @@ Status: proposed
 Use PostgreSQL as the system of record for the 50-channel pilot and the first
 production deployments.
 
+Audit is a system invariant: no authenticated access to sensitive data and no
+state-changing or external action may complete without an attributable
+fingerprint. The fingerprint binds actor, tenant, channel/resource, request,
+agent session/tool run where applicable, action, outcome, and timestamp.
+
 Recommended initial stack:
 
 - PostgreSQL 18.x; PostgreSQL 17.x is an acceptable compatibility fallback.
@@ -188,6 +193,19 @@ audit rows. Partitions are archived under a documented retention policy.
 For stronger evidence, chain event hashes and regularly export signed checkpoints
 or audit partitions to storage outside the application administrator's control.
 Hash chaining alone is tamper-evident, not tamper-proof.
+
+Audit sensitive reads as well as mutations:
+
+- live snapshot and archived image access;
+- detection, summary, and semantic searches;
+- report generation and export;
+- agent tool calls and model-triggered external actions;
+- settings, probe, prompt, user, permission, and retention changes.
+
+If the durable audit sink is unavailable, write and external-side-effect
+operations fail closed. Sensitive reads may fail closed or enter an explicitly
+configured emergency read-only mode that produces a local sealed fallback log
+and a prominent degraded-security alert. Silent unaudited access is not allowed.
 
 ## Database roles
 

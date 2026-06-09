@@ -17,6 +17,11 @@ deployment:
 - bounded inference scheduling that cannot stop capture under load;
 - a repeatable migration and pilot acceptance test.
 
+Sprint invariant: every sensitive read, mutation, export, external action, and
+agent tool execution leaves an attributable audit fingerprint. Sensitive writes
+and external side effects fail closed when durable audit recording is
+unavailable.
+
 Container packaging and the 50-100 channel agent navigation loop are explicitly
 out of scope. The code must nevertheless use configurable data/model paths,
 stdout logging, secrets, and health checks so containerization does not require
@@ -194,6 +199,8 @@ then targeted drill-down. It should not issue one serial tool call per channel.
 - An engineer can plan a probe/prompt change; an authorized user approves it;
   the exact approved change executes once.
 - Every sensitive action is attributable in audit data.
+- Sensitive reads, searches, image access, exports, and every agent tool run are
+  attributable; no silent unaudited path remains.
 - Capture remains live while VLM workers are slow or unavailable.
 - Summary/probe hot paths no longer rewrite whole JSON files.
 - Database migration, backup, restore, and restart are demonstrated.

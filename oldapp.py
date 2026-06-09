@@ -5761,6 +5761,38 @@ def _serialize_env_map(env_map: Dict[str, str]) -> str:
     return "\n".join(f"{key}={env_map[key]}" for key in keys_sorted)
 
 
+ENV_SECRET_REDACTION = "__EVOSSEARCH_SECRET_SET__"
+ENV_SECRET_KEY_PARTS = ("PASSWORD", "TOKEN", "SECRET", "API_KEY", "PRIVATE_KEY")
+
+
+def _is_secret_env_key(key: str) -> bool:
+    normalized = str(key or "").strip().upper()
+    return any(part in normalized for part in ENV_SECRET_KEY_PARTS)
+
+
+def _redact_env_map(env_map: Mapping[str, str]) -> Dict[str, str]:
+    return {
+        str(key): (
+            ENV_SECRET_REDACTION
+            if _is_secret_env_key(str(key)) and bool(str(value or ""))
+            else str(value or "")
+        )
+        for key, value in env_map.items()
+    }
+
+
+def _restore_redacted_env_secrets(
+    target_env: Mapping[str, str],
+    current_env: Mapping[str, str],
+) -> Dict[str, str]:
+    restored = {str(key): str(value) for key, value in target_env.items()}
+    for key, value in list(restored.items()):
+        if not _is_secret_env_key(key) or value != ENV_SECRET_REDACTION:
+            continue
+        restored[key] = str(current_env.get(key) or "")
+    return restored
+
+
 def _runtime_env_map() -> Dict[str, str]:
     sev = config.LUXRIOT_SEVERITY_MAP or {}
     env: Dict[str, str] = {
@@ -5882,7 +5914,7 @@ def get_settings_env():
     if guard is not None:
         return guard
     try:
-        env_map = _effective_env_map()
+        env_map = _redact_env_map(_effective_env_map())
         return jsonify(
             {
                 'success': True,
@@ -5917,6 +5949,7 @@ def save_settings_env():
         if not target_env:
             return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
 
+        target_env = _restore_redacted_env_secrets(target_env, _effective_env_map())
         existing_map = _read_env_file_map(".env")
         preserved_other = {
             key: value

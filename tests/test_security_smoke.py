@@ -1,8 +1,15 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from oldapp import app, config
+from oldapp import (
+    ENV_SECRET_REDACTION,
+    _redact_env_map,
+    _restore_redacted_env_secrets,
+    app,
+    config,
+)
 
 
 class SecuritySmokeTests(unittest.TestCase):
@@ -34,6 +41,49 @@ class SecuritySmokeTests(unittest.TestCase):
         settings = payload.get("settings", {})
         self.assertEqual(settings.get("luxriotPassword"), "")
         self.assertIn("luxriotPasswordSet", settings)
+
+    def test_env_editor_redacts_and_preserves_secrets(self) -> None:
+        current = {
+            "EVOSSEARCH_LM_API_KEY": "lm-secret",
+            "EVOSSEARCH_LUXRIOT_PASSWORD": "camera-secret",
+            "EVOSSEARCH_PORT": "5000",
+        }
+        redacted = _redact_env_map(current)
+
+        self.assertEqual(redacted["EVOSSEARCH_LM_API_KEY"], ENV_SECRET_REDACTION)
+        self.assertEqual(redacted["EVOSSEARCH_LUXRIOT_PASSWORD"], ENV_SECRET_REDACTION)
+        self.assertEqual(redacted["EVOSSEARCH_PORT"], "5000")
+        self.assertNotIn("lm-secret", str(redacted))
+        self.assertNotIn("camera-secret", str(redacted))
+
+        submitted = dict(redacted)
+        submitted["EVOSSEARCH_PORT"] = "5001"
+        restored = _restore_redacted_env_secrets(submitted, current)
+        self.assertEqual(restored["EVOSSEARCH_LM_API_KEY"], "lm-secret")
+        self.assertEqual(restored["EVOSSEARCH_LUXRIOT_PASSWORD"], "camera-secret")
+        self.assertEqual(restored["EVOSSEARCH_PORT"], "5001")
+
+    def test_env_endpoint_never_returns_secret_values(self) -> None:
+        with (
+            patch.object(config, "ADMIN_TOKEN", "admin-secret"),
+            patch.object(config, "LM_API_KEY", "lm-secret"),
+            patch.object(config, "LUXRIOT_PASSWORD", "camera-secret"),
+        ):
+            resp = self.client.get(
+                "/settings/env",
+                headers={"X-Admin-Token": "admin-secret"},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        serialized = str(payload)
+        self.assertNotIn("admin-secret", serialized)
+        self.assertNotIn("lm-secret", serialized)
+        self.assertNotIn("camera-secret", serialized)
+        self.assertEqual(
+            payload["envVariables"]["EVOSSEARCH_ADMIN_TOKEN"],
+            ENV_SECRET_REDACTION,
+        )
 
     def test_mutating_endpoint_requires_admin_token(self) -> None:
         config.ADMIN_TOKEN = ""
