@@ -57,6 +57,58 @@ class PostgreSQLSecurityIntegrationTests(unittest.TestCase):
                 self.assertFalse(can_create_db)
                 self.assertFalse(bypasses_rls)
 
+    def test_queue_roles_have_separate_admission_and_worker_grants(self):
+        privileges = self.connection.execute(
+            """
+            SELECT
+                has_table_privilege(
+                    'eva_api',
+                    'jobs.inference_jobs',
+                    'SELECT,INSERT,UPDATE'
+                ),
+                has_table_privilege(
+                    'eva_api',
+                    'jobs.job_attempts',
+                    'INSERT'
+                ),
+                has_table_privilege(
+                    'eva_worker',
+                    'jobs.inference_jobs',
+                    'SELECT,UPDATE'
+                ),
+                has_table_privilege(
+                    'eva_worker',
+                    'jobs.job_attempts',
+                    'SELECT,INSERT,UPDATE'
+                )
+            """
+        ).fetchone()
+
+        self.assertEqual(privileges, (True, False, True, True))
+        self.assertTrue(
+            self.connection.execute(
+                """
+                SELECT has_table_privilege(
+                    'eva_api',
+                    'public.alembic_version',
+                    'SELECT'
+                )
+                """
+            ).fetchone()[0]
+        )
+        self.assertTrue(
+            self.connection.execute(
+                """
+                SELECT has_column_privilege(
+                    'eva_audit_writer',
+                    'audit.events',
+                    'id',
+                    'SELECT'
+                )
+                """
+            ).fetchone()[0]
+        )
+
     def test_api_role_is_tenant_isolated(self):
         tenant_a = str(uuid4())
         tenant_b = str(uuid4())

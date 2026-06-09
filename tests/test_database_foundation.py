@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MIGRATION = ROOT / "migrations" / "versions" / (
     "20260609_0001_secure_foundation.py"
 )
+QUEUE_GRANTS_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260609_0002_queue_role_grants.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -207,7 +210,27 @@ class MigrationContentTests(unittest.TestCase):
     def test_alembic_config_and_revision_agree(self):
         self.assertTrue((ROOT / "alembic.ini").is_file())
         self.assertTrue((ROOT / "migrations" / "env.py").is_file())
-        self.assertIn(f'revision: str = "{CURRENT_SCHEMA_REVISION}"', self.source)
+        queue_grants_source = QUEUE_GRANTS_MIGRATION.read_text(encoding="utf-8")
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            queue_grants_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260609_0001"',
+            queue_grants_source,
+        )
+        self.assertIn(
+            "GRANT UPDATE ON jobs.inference_jobs TO eva_api",
+            queue_grants_source,
+        )
+        self.assertIn(
+            "GRANT SELECT ON public.alembic_version",
+            queue_grants_source,
+        )
+        self.assertIn(
+            "GRANT SELECT (id) ON audit.events TO eva_audit_writer",
+            queue_grants_source,
+        )
 
 
 @unittest.skipUnless(

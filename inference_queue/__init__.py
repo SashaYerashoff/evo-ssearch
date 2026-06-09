@@ -22,6 +22,10 @@ from .models import (
 from .repository import InferenceQueueRepository
 from .service import InferenceEnqueueService
 from .worker import InferenceWorker
+from .postgres import (
+    PostgreSQLInferenceQueueRepository,
+    PostgresInferenceQueueRepository,
+)
 
 EnqueueService = InferenceEnqueueService
 InMemoryRepository = InMemoryInferenceQueueRepository
@@ -49,6 +53,8 @@ __all__ = [
     "ManualClock",
     "MetricsSnapshot",
     "QueueFullError",
+    "PostgresInferenceQueueRepository",
+    "PostgreSQLInferenceQueueRepository",
     "RetryPolicy",
     "SystemClock",
     "Worker",
