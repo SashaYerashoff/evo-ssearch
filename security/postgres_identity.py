@@ -220,6 +220,32 @@ class PostgresIdentityRepository:
                 return None
             return self._load_identity(connection, tenant, target_user)
 
+    def get_user_by_username(
+        self,
+        tenant_id: uuid.UUID | str,
+        username: str,
+        *,
+        actor_user_id: uuid.UUID | str = NIL_UUID,
+    ) -> IdentityRecord | None:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        normalized_username = _normalize_username(username)
+        with self._pool.transaction(
+            _transaction_context(tenant, actor),
+            readonly=True,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM iam.users
+                WHERE tenant_id = %s AND lower(username) = lower(%s)
+                """,
+                (tenant, normalized_username),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._load_identity(connection, tenant, row[0])
+
     def create_user(
         self,
         tenant_id: uuid.UUID | str,

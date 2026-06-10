@@ -543,6 +543,102 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
         self.assertIsNone(repository.resolve_session(tenant_id, token))
         self.assertFalse(repository.revoke_session(tenant_id, token, "test"))
 
+    def test_create_update_and_revoke_user_lifecycle(self):
+        tenant_id = uuid.uuid4()
+        repository = PostgresIdentityRepository(self.pool)
+        admin = repository.bootstrap_admin(
+            tenant_id,
+            "LifecycleAdmin",
+            "correct horse battery staple",
+            "Lifecycle Administrator",
+        )
+
+        operator = repository.create_user(
+            tenant_id,
+            actor_user_id=admin.user_id,
+            username="operator-" + uuid.uuid4().hex[:8],
+            password="operator password 123",
+            display_name="Pilot Operator",
+            roles=[Role.OPERATOR.value],
+            allowed_channel_ids=[7, 42],
+        )
+
+        self.assertEqual(operator.roles, frozenset({Role.OPERATOR.value}))
+        self.assertEqual(operator.allowed_channel_ids, frozenset({7, 42}))
+        self.assertIn(Permission.PROBES_RUN.value, operator.permissions)
+        self.assertEqual(
+            repository.get_user_by_username(
+                tenant_id,
+                operator.username.upper(),
+                actor_user_id=admin.user_id,
+            ),
+            operator,
+        )
+        self.assertIn(
+            operator.user_id,
+            {
+                user.user_id
+                for user in repository.list_users(
+                    tenant_id,
+                    actor_user_id=admin.user_id,
+                )
+            },
+        )
+
+        authenticated = repository.authenticate(
+            tenant_id,
+            operator.username,
+            "operator password 123",
+        )
+        self.assertEqual(authenticated, operator)
+        token = "operator-session-" + uuid.uuid4().hex
+        csrf_token = "operator-csrf-" + uuid.uuid4().hex
+        repository.create_session(
+            authenticated,
+            token,
+            csrf_token,
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+            client_ip="127.0.0.1",
+            user_agent="identity-lifecycle-live-test",
+        )
+        self.assertIsNotNone(repository.resolve_session(tenant_id, token))
+
+        viewer = repository.update_user(
+            tenant_id,
+            operator.user_id,
+            actor_user_id=admin.user_id,
+            roles=[Role.VIEWER.value],
+            allowed_channel_ids=[7],
+            display_name="Pilot Viewer",
+        )
+        self.assertEqual(viewer.roles, frozenset({Role.VIEWER.value}))
+        self.assertEqual(viewer.allowed_channel_ids, frozenset({7}))
+        self.assertNotIn(Permission.PROBES_RUN.value, viewer.permissions)
+
+        revoked = repository.revoke_user_sessions(
+            tenant_id,
+            operator.user_id,
+            actor_user_id=admin.user_id,
+            reason="live_test_rotation",
+        )
+        self.assertEqual(revoked, 1)
+        self.assertIsNone(repository.resolve_session(tenant_id, token))
+
+        inactive = repository.update_user(
+            tenant_id,
+            operator.user_id,
+            actor_user_id=admin.user_id,
+            is_active=False,
+        )
+        self.assertFalse(inactive.is_active)
+        self.assertIsNone(
+            repository.authenticate(
+                tenant_id,
+                operator.username,
+                "operator password 123",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
