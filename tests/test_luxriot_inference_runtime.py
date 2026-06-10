@@ -185,6 +185,38 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(list((self.directory / "spool").glob("*.json")), [])
         self.assertEqual(self.runtime.status()["completed_count"], 1)
 
+    def test_worker_restores_queued_default_model_hint(self):
+        seen_models = []
+
+        def lm_callback(_messages, model):
+            seen_models.append(model)
+            return "queued summary"
+
+        manager = build_manager(self.directory, lm_callback=lm_callback)
+        repository = InMemoryInferenceQueueRepository()
+        runtime = LuxriotInferenceQueueRuntime(
+            manager=manager,
+            enqueue_repository=repository,
+            worker_repository=repository,
+            tenant_id=str(uuid4()),
+            capacity=1,
+            spool_directory=self.directory / "spool-model",
+            default_model="vlm-a",
+            worker_count=1,
+            poll_interval_seconds=0.01,
+            lease_seconds=10.0,
+        )
+        try:
+            manager.set_summary_dispatcher(runtime.enqueue_summary)
+            outcome = runtime.enqueue_summary(self.batch())
+            self.assertTrue(outcome["accepted"])
+            runtime.start()
+            self.wait_for(lambda: bool(seen_models))
+        finally:
+            runtime.stop()
+
+        self.assertEqual(seen_models, ["vlm-a"])
+
     def test_queued_heartbeat_coalescing_removes_superseded_spool(self):
         self.runtime.stop()
         first = self.runtime.enqueue_summary(self.batch(start=100.0))

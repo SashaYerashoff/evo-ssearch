@@ -3,6 +3,7 @@ Configuration file for evo-ssearch oldapp.py
 Contains all configurable settings with environment variable support
 """
 import os
+import re
 from pathlib import Path
 
 # Load .env file if it exists
@@ -41,6 +42,73 @@ def _get_path_list_env(name: str) -> tuple[str, ...]:
         except Exception:
             continue
     return tuple(resolved)
+
+
+def _profile_env_key(profile_id: str, suffix: str) -> str:
+    normalized = re.sub(r'[^A-Za-z0-9]+', '_', profile_id).strip('_').upper()
+    if not normalized:
+        normalized = 'DEFAULT'
+    return f'EVOSSEARCH_LM_PROFILE_{normalized}_{suffix}'
+
+
+def _get_lm_profiles(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    timeout: int,
+) -> dict[str, dict[str, object]]:
+    profiles: dict[str, dict[str, object]] = {
+        'default': {
+            'id': 'default',
+            'kind': 'general',
+            'base_url': base_url,
+            'model': model,
+            'api_key': api_key,
+            'timeout': timeout,
+        }
+    }
+    raw_ids = os.getenv('EVOSSEARCH_LM_PROFILES', '').strip()
+    if not raw_ids:
+        return profiles
+    for raw_profile_id in raw_ids.split(','):
+        profile_id = raw_profile_id.strip()
+        if not profile_id:
+            continue
+        profile_base_url = os.getenv(
+            _profile_env_key(profile_id, 'BASE_URL'),
+            base_url,
+        ).strip().rstrip('/')
+        profile_model = os.getenv(
+            _profile_env_key(profile_id, 'MODEL'),
+            model,
+        ).strip()
+        profile_api_key = os.getenv(
+            _profile_env_key(profile_id, 'API_KEY'),
+            api_key,
+        ).strip()
+        profile_kind = os.getenv(
+            _profile_env_key(profile_id, 'KIND'),
+            'general',
+        ).strip().lower() or 'general'
+        try:
+            profile_timeout = int(
+                os.getenv(
+                    _profile_env_key(profile_id, 'TIMEOUT'),
+                    str(timeout),
+                )
+            )
+        except (TypeError, ValueError):
+            profile_timeout = timeout
+        profiles[profile_id] = {
+            'id': profile_id,
+            'kind': profile_kind,
+            'base_url': profile_base_url,
+            'model': profile_model,
+            'api_key': profile_api_key,
+            'timeout': min(3600, max(1, profile_timeout)),
+        }
+    return profiles
 
 
 def _get_app_version(default: str = "α 0.4.2") -> str:
@@ -174,6 +242,30 @@ class Config:
         LM_TIMEOUT = int(os.getenv('EVOSSEARCH_LM_TIMEOUT', '120'))
     except (TypeError, ValueError):
         LM_TIMEOUT = 120
+    LM_PROFILES = _get_lm_profiles(
+        base_url=LM_BASE_URL,
+        model=LM_MODEL,
+        api_key=LM_API_KEY,
+        timeout=LM_TIMEOUT,
+    )
+    LM_AGENT_PROFILE_ID = (
+        os.getenv(
+            'EVOSSEARCH_LM_AGENT_PROFILE_ID',
+            'agent' if 'agent' in LM_PROFILES else 'default',
+        ).strip()
+        or 'default'
+    )
+    LM_VLM_PROFILE_ID = (
+        os.getenv(
+            'EVOSSEARCH_LM_VLM_PROFILE_ID',
+            'vlm' if 'vlm' in LM_PROFILES else 'default',
+        ).strip()
+        or 'default'
+    )
+    LM_MAX_TIMEOUT = max(
+        int(profile.get('timeout') or LM_TIMEOUT)
+        for profile in LM_PROFILES.values()
+    )
     try:
         LM_VIDEO_DEFAULT_FRAMES = int(os.getenv('EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES', '16'))
     except (TypeError, ValueError):
@@ -246,11 +338,11 @@ class Config:
         INFERENCE_WORKER_LEASE_SEC = float(
             os.getenv(
                 'EVOSSEARCH_INFERENCE_WORKER_LEASE_SEC',
-                str(max(180, LM_TIMEOUT * 2)),
+                str(max(180, LM_MAX_TIMEOUT * 2)),
             )
         )
     except (TypeError, ValueError):
-        INFERENCE_WORKER_LEASE_SEC = float(max(180, LM_TIMEOUT * 2))
+        INFERENCE_WORKER_LEASE_SEC = float(max(180, LM_MAX_TIMEOUT * 2))
     INFERENCE_WORKER_LEASE_SEC = min(
         3600.0,
         max(10.0, INFERENCE_WORKER_LEASE_SEC),

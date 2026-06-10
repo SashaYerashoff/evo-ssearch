@@ -319,6 +319,8 @@ class LuxriotInferenceQueueRuntime:
         channel_id = self._positive_channel_id(batch.get("channel_id"))
         if str(channel_id) != str(job.channel_id):
             raise ValueError("spooled channel does not match inference job")
+        if not str(batch.get("model_hint") or "").strip():
+            batch["model_hint"] = str(job.model or "").strip() or None
         return batch
 
     def _write_spool(self, batch: Mapping[str, Any]) -> str:

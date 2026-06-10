@@ -8,6 +8,7 @@ import html as html_lib
 import json
 import math
 import pickle
+import re
 import secrets
 import socket
 import threading
@@ -1677,27 +1678,144 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
     ]
 
 
-def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
-    base_url = (config.LM_BASE_URL or '').rstrip('/')
+def _configured_lm_profiles() -> Dict[str, Dict[str, Any]]:
+    profiles = getattr(config, "LM_PROFILES", None)
+    if isinstance(profiles, Mapping) and profiles:
+        return {
+            str(profile_id): dict(profile)
+            for profile_id, profile in profiles.items()
+            if str(profile_id).strip()
+        }
+    return {
+        "default": {
+            "id": "default",
+            "kind": "general",
+            "base_url": config.LM_BASE_URL,
+            "model": config.LM_MODEL,
+            "api_key": config.LM_API_KEY,
+            "timeout": config.LM_TIMEOUT,
+        }
+    }
+
+
+def _default_lm_profile_id(kind: str = "general") -> str:
+    profiles = _configured_lm_profiles()
+    configured = (
+        getattr(config, "LM_AGENT_PROFILE_ID", "")
+        if kind == "agent"
+        else getattr(config, "LM_VLM_PROFILE_ID", "")
+        if kind in {"vlm", "vision", "video"}
+        else "default"
+    )
+    profile_id = str(configured or "").strip()
+    if profile_id in profiles:
+        return profile_id
+    if kind in {"vlm", "vision", "video"}:
+        for candidate_id, profile in profiles.items():
+            if str(profile.get("kind") or "").lower() in {"vlm", "vision", "video"}:
+                return candidate_id
+    if kind == "agent":
+        for candidate_id, profile in profiles.items():
+            if str(profile.get("kind") or "").lower() == "agent":
+                return candidate_id
+    return "default" if "default" in profiles else next(iter(profiles))
+
+
+def _lm_profile_selector_value(profile: Mapping[str, Any]) -> str:
+    profile_id = str(profile.get("id") or "").strip()
+    model = str(profile.get("model") or "").strip()
+    if profile_id and profile_id != "default":
+        return profile_id
+    return model or profile_id
+
+
+def _lm_profile_env_key(profile_id: str, suffix: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", profile_id).strip("_").upper()
+    return f"EVOSSEARCH_LM_PROFILE_{normalized or 'DEFAULT'}_{suffix}"
+
+
+def _resolve_lm_profile(
+    *,
+    profile_id: Optional[str] = None,
+    model_override: Optional[str] = None,
+    kind: str = "general",
+) -> Dict[str, Any]:
+    profiles = _configured_lm_profiles()
+    selected_profile_id = str(profile_id or "").strip()
+    selected_model_override = str(model_override or "").strip()
+    if not selected_profile_id and selected_model_override in profiles:
+        selected_profile_id = selected_model_override
+        selected_model_override = ""
+    if not selected_profile_id:
+        selected_profile_id = _default_lm_profile_id(kind)
+    if selected_profile_id not in profiles:
+        selected_profile_id = _default_lm_profile_id(kind)
+    profile = dict(profiles[selected_profile_id])
+    profile["id"] = selected_profile_id
+    profile["base_url"] = str(profile.get("base_url") or "").rstrip("/")
+    profile["model"] = selected_model_override or str(
+        profile.get("model") or config.LM_MODEL
+    ).strip()
+    profile["api_key"] = str(profile.get("api_key") or "").strip()
+    try:
+        profile["timeout"] = min(
+            3600,
+            max(1, int(profile.get("timeout") or config.LM_TIMEOUT)),
+        )
+    except (TypeError, ValueError):
+        profile["timeout"] = int(config.LM_TIMEOUT)
+    profile["kind"] = str(profile.get("kind") or kind or "general").lower()
+    return profile
+
+
+def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(profile.get("id") or ""),
+        "kind": str(profile.get("kind") or "general"),
+        "model": str(profile.get("model") or ""),
+        "selector": _lm_profile_selector_value(profile),
+        "timeout": int(profile.get("timeout") or config.LM_TIMEOUT),
+    }
+
+
+def _call_lm_chat(
+    messages: List[Dict[str, Any]],
+    model_override: Optional[str] = None,
+    *,
+    profile_id: Optional[str] = None,
+    profile_kind: str = "vlm",
+) -> str:
+    profile = _resolve_lm_profile(
+        profile_id=profile_id,
+        model_override=model_override,
+        kind=profile_kind,
+    )
+    base_url = str(profile.get("base_url") or "").rstrip("/")
     if not base_url:
-        raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
+        raise RuntimeError("LM profile base URL is not configured.")
+    if not str(profile.get("model") or "").strip():
+        raise RuntimeError(f"LM profile {profile['id']} model is not configured.")
     endpoint = f"{base_url}/chat/completions"
     headers = {"Content-Type": "application/json"}
-    if config.LM_API_KEY:
-        headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
+    if profile.get("api_key"):
+        headers["Authorization"] = f"Bearer {profile['api_key']}"
 
-    target_model = (model_override or config.LM_MODEL).strip()
     payload = {
-        "model": target_model,
+        "model": str(profile.get("model") or "").strip(),
         "messages": messages,
         "temperature": float(config.LM_VIDEO_TEMPERATURE),
         "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
     }
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=config.LM_TIMEOUT)
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
+        )
         response.raise_for_status()
     except Exception as exc:
-        raise RuntimeError(f"LM Studio request failed: {exc}") from exc
+        raise RuntimeError(f"LM request failed for profile {profile['id']}: {exc}") from exc
 
     data = response.json()
     choice = (data.get("choices") or [{}])[0]
@@ -1714,8 +1832,18 @@ def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] 
     return content_text or "(empty response from model)"
 
 
-def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
-    return _call_lm_chat(messages, model_override=model_override)
+def _call_video_understanding(
+    messages: List[Dict[str, Any]],
+    model_override: Optional[str] = None,
+    *,
+    profile_id: Optional[str] = None,
+) -> str:
+    return _call_lm_chat(
+        messages,
+        model_override=model_override,
+        profile_id=profile_id,
+        profile_kind="vlm",
+    )
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -2238,7 +2366,7 @@ def _configure_inference_queue() -> Optional[LuxriotInferenceQueueRuntime]:
             tenant_id=tenant_id,
             capacity=int(config.INFERENCE_QUEUE_CAPACITY),
             spool_directory=config.INFERENCE_QUEUE_SPOOL_DIR,
-            default_model=config.LM_MODEL,
+            default_model=_lm_profile_selector_value(_resolve_lm_profile(kind="vlm")),
             worker_count=worker_count,
             poll_interval_seconds=float(
                 config.INFERENCE_WORKER_POLL_INTERVAL_SEC
@@ -3140,6 +3268,10 @@ def _get_agent_runner() -> Any:
                 candidate_limit=candidate_limit,
             )
 
+        agent_profile = _resolve_lm_profile(
+            model_override=_agent_runtime_model_override,
+            kind="agent",
+        )
         _agent_runner = AgentRunner(
             embed_text_fn=lambda text: get_text_embedding(text),
             embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder='clip'),
@@ -3150,10 +3282,10 @@ def _get_agent_runner() -> Any:
             luxriot_manager=luxriot_manager,
             search_indexed_folder_fn=_agent_search_folder,
             search_detections_fn=_agent_search_detections,
-            lm_base_url=config.LM_BASE_URL,
-            lm_model=_agent_runtime_model_override or config.LM_MODEL,
-            lm_api_key=config.LM_API_KEY,
-            lm_timeout=config.LM_TIMEOUT,
+            lm_base_url=str(agent_profile.get("base_url") or ""),
+            lm_model=str(agent_profile.get("model") or ""),
+            lm_api_key=str(agent_profile.get("api_key") or ""),
+            lm_timeout=int(agent_profile.get("timeout") or config.LM_TIMEOUT),
             tool_audit_callback=_write_agent_tool_audit,
             tool_plan_store=approval_store,
             tool_approval_store=approval_store,
@@ -3162,9 +3294,23 @@ def _get_agent_runner() -> Any:
 
 
 def _get_agent_config_payload() -> Dict[str, Any]:
+    profile = _resolve_lm_profile(
+        model_override=_agent_runtime_model_override,
+        kind="agent",
+    )
+    default_profile = _resolve_lm_profile(kind="agent")
+    selected_value = (
+        str(_agent_runtime_model_override or "").strip()
+        or _lm_profile_selector_value(profile)
+    )
+    default_value = _lm_profile_selector_value(default_profile)
     return {
-        "model": str(_agent_runtime_model_override or config.LM_MODEL or "").strip(),
-        "default_model": str(config.LM_MODEL or "").strip(),
+        "model": selected_value,
+        "resolved_model": str(profile.get("model") or "").strip(),
+        "profile_id": str(profile.get("id") or "").strip(),
+        "default_model": default_value,
+        "default_resolved_model": str(default_profile.get("model") or "").strip(),
+        "default_profile_id": str(default_profile.get("id") or "").strip(),
         "override_model": str(_agent_runtime_model_override or "").strip() or None,
         "source": "runtime_override" if _agent_runtime_model_override else "config",
     }
@@ -3194,49 +3340,98 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
         ):
             return copy.deepcopy(_lm_models_cache_payload)
 
-    default_model = str(config.LM_MODEL or "").strip()
+    default_profile = _resolve_lm_profile(kind="vlm")
+    default_model = _lm_profile_selector_value(default_profile)
     fallback_models: List[str] = []
-    for candidate in (
-        default_model,
-        str(_agent_runtime_model_override or "").strip(),
-    ):
-        if candidate and candidate not in fallback_models:
-            fallback_models.append(candidate)
+    profiles = [
+        _resolve_lm_profile(profile_id=profile_id)
+        for profile_id in _configured_lm_profiles()
+    ]
+    for profile in profiles:
+        for candidate in (
+            _lm_profile_selector_value(profile),
+            str(profile.get("model") or "").strip(),
+        ):
+            if candidate and candidate not in fallback_models:
+                fallback_models.append(candidate)
+    agent_selector = str(_agent_runtime_model_override or "").strip()
+    if agent_selector and agent_selector not in fallback_models:
+        fallback_models.append(agent_selector)
 
     payload: Dict[str, Any] = {
         "models": fallback_models,
         "default_model": default_model,
+        "default_profile_id": str(default_profile.get("id") or "").strip(),
+        "profiles": [_public_lm_profile(profile) for profile in profiles],
+        "profile_errors": {},
         "source": "fallback",
         "error": None,
         "fetched_at": time.time(),
     }
 
+    profile_errors: Dict[str, str] = {}
+    fetched_any = False
     try:
-        base_url = (config.LM_BASE_URL or "").rstrip("/")
-        if not base_url:
-            raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
-        headers = {"Content-Type": "application/json"}
-        if config.LM_API_KEY:
-            headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
-        timeout = (3.05, min(10.0, max(5.0, float(config.LM_TIMEOUT or 120))))
-        response = requests.get(f"{base_url}/models", headers=headers, timeout=timeout)
-        response.raise_for_status()
-        raw = response.json()
-        items = raw.get("data") if isinstance(raw, Mapping) else None
         model_ids: List[str] = []
-        if isinstance(items, Sequence):
-            for item in items:
-                if not isinstance(item, Mapping):
-                    continue
-                model_id = str(item.get("id") or item.get("model") or "").strip()
-                if model_id and model_id not in model_ids:
-                    model_ids.append(model_id)
-        if not model_ids:
-            model_ids = list(fallback_models)
+        for candidate in fallback_models:
+            if candidate and candidate not in model_ids:
+                model_ids.append(candidate)
+        available_by_profile: Dict[str, List[str]] = {}
+        for profile in profiles:
+            profile_id = str(profile.get("id") or "").strip()
+            base_url = str(profile.get("base_url") or "").rstrip("/")
+            if not base_url:
+                profile_errors[profile_id] = "base URL is not configured"
+                continue
+            headers = {"Content-Type": "application/json"}
+            if profile.get("api_key"):
+                headers["Authorization"] = f"Bearer {profile['api_key']}"
+            timeout_value = float(profile.get("timeout") or config.LM_TIMEOUT or 120)
+            timeout = (3.05, min(10.0, max(5.0, timeout_value)))
+            try:
+                response = requests.get(
+                    f"{base_url}/models",
+                    headers=headers,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                raw = response.json()
+                items = raw.get("data") if isinstance(raw, Mapping) else None
+                profile_models: List[str] = []
+                if isinstance(items, Sequence):
+                    for item in items:
+                        if not isinstance(item, Mapping):
+                            continue
+                        model_id = str(item.get("id") or item.get("model") or "").strip()
+                        if not model_id:
+                            continue
+                        if model_id not in profile_models:
+                            profile_models.append(model_id)
+                        if model_id not in model_ids:
+                            model_ids.append(model_id)
+                if profile_models:
+                    available_by_profile[profile_id] = profile_models
+                    fetched_any = True
+            except Exception as exc:
+                profile_errors[profile_id] = str(exc)
+        if available_by_profile:
+            by_id = {
+                str(profile.get("id") or ""): dict(profile)
+                for profile in payload["profiles"]
+                if isinstance(profile, Mapping)
+            }
+            for profile_id, models in available_by_profile.items():
+                if profile_id in by_id:
+                    by_id[profile_id]["available_models"] = models
+            payload["profiles"] = list(by_id.values())
         payload.update({
             "models": model_ids,
-            "source": "lm_studio",
-            "error": None,
+            "source": "lm_profiles" if fetched_any else "fallback",
+            "profile_errors": profile_errors,
+            "error": None if not profile_errors else "; ".join(
+                f"{profile_id}: {error}"
+                for profile_id, error in profile_errors.items()
+            ),
         })
     except Exception as exc:
         payload["error"] = str(exc)
@@ -5560,8 +5755,17 @@ def video_understanding():
 
     user_prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
+    profile_hint = (
+        str(data.get('profile_id') or data.get('profileId') or '').strip()
+        or None
+    )
 
     try:
+        lm_profile = _resolve_lm_profile(
+            profile_id=profile_hint,
+            model_override=model_hint or None,
+            kind="vlm",
+        )
         frames, fps, duration = _sample_video_frames(
             str(video_obj),
             max_frames=max_frames_int,
@@ -5571,7 +5775,11 @@ def video_understanding():
         if not frames:
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
         messages = _build_video_messages(str(video_obj), frames, user_prompt)
-        summary = _call_video_understanding(messages, model_override=model_hint or None)
+        summary = _call_video_understanding(
+            messages,
+            model_override=model_hint or None,
+            profile_id=profile_hint,
+        )
         return jsonify(
             {
                 'summary': summary,
@@ -5585,7 +5793,9 @@ def video_understanding():
                 ],
                 'fps': fps,
                 'duration_sec': duration,
-                'model': model_hint or config.LM_MODEL,
+                'model': str(lm_profile.get('model') or ''),
+                'profile_id': str(lm_profile.get('id') or ''),
+                'model_selector': _lm_profile_selector_value(lm_profile),
             }
         )
     except Exception as exc:
@@ -5599,9 +5809,18 @@ def describe_image():
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
+    profile_hint = (
+        str(data.get('profile_id') or data.get('profileId') or '').strip()
+        or None
+    )
     if not image_path:
         return jsonify({'error': 'image_path is required'}), 400
     try:
+        lm_profile = _resolve_lm_profile(
+            profile_id=profile_hint,
+            model_override=model_hint or None,
+            kind="vlm",
+        )
         if folder_raw:
             folder_path = _resolve_folder_path(folder_raw, require_index=True)
             path_obj = Path(image_path).expanduser().resolve()
@@ -5614,14 +5833,21 @@ def describe_image():
         else:
             path_obj = detection_archive.resolve_archive_image_path(image_path)
         messages = _build_image_messages(str(path_obj), prompt)
-        summary = _call_lm_chat(messages, model_override=model_hint or None)
+        summary = _call_lm_chat(
+            messages,
+            model_override=model_hint or None,
+            profile_id=profile_hint,
+            profile_kind="vlm",
+        )
         with Image.open(path_obj) as src:
             thumb = _encode_jpeg(src, max_edge=config.THUMBNAIL_SIZE[0])
         return jsonify(
             {
                 'summary': summary,
                 'thumbnail': thumb,
-                'model': model_hint or config.LM_MODEL,
+                'model': str(lm_profile.get('model') or ''),
+                'profile_id': str(lm_profile.get('id') or ''),
+                'model_selector': _lm_profile_selector_value(lm_profile),
                 'image_path': str(path_obj),
             }
         )
@@ -7174,6 +7400,12 @@ def _restore_redacted_env_secrets(
 
 def _runtime_env_map() -> Dict[str, str]:
     sev = config.LUXRIOT_SEVERITY_MAP or {}
+    lm_profiles = _configured_lm_profiles()
+    lm_profile_ids = [
+        profile_id
+        for profile_id in lm_profiles
+        if str(profile_id).strip() and str(profile_id).strip() != "default"
+    ]
     env: Dict[str, str] = {
         "EVOSSEARCH_HOST": str(config.HOST),
         "EVOSSEARCH_PORT": str(config.PORT),
@@ -7200,6 +7432,13 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LM_MODEL": str(config.LM_MODEL),
         "EVOSSEARCH_LM_API_KEY": str(config.LM_API_KEY),
         "EVOSSEARCH_LM_TIMEOUT": str(config.LM_TIMEOUT),
+        "EVOSSEARCH_LM_PROFILES": ",".join(lm_profile_ids),
+        "EVOSSEARCH_LM_AGENT_PROFILE_ID": str(
+            getattr(config, "LM_AGENT_PROFILE_ID", "")
+        ),
+        "EVOSSEARCH_LM_VLM_PROFILE_ID": str(
+            getattr(config, "LM_VLM_PROFILE_ID", "")
+        ),
         "EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES": str(config.LM_VIDEO_DEFAULT_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
@@ -7250,6 +7489,19 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
         "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
     }
+    for profile_id in lm_profile_ids:
+        profile = lm_profiles[profile_id]
+        env[_lm_profile_env_key(profile_id, "KIND")] = str(
+            profile.get("kind") or "general"
+        )
+        env[_lm_profile_env_key(profile_id, "BASE_URL")] = str(
+            profile.get("base_url") or ""
+        )
+        env[_lm_profile_env_key(profile_id, "MODEL")] = str(profile.get("model") or "")
+        env[_lm_profile_env_key(profile_id, "API_KEY")] = str(profile.get("api_key") or "")
+        env[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(
+            profile.get("timeout") or config.LM_TIMEOUT
+        )
     return env
 
 
@@ -7874,9 +8126,14 @@ def agent_config():
         return guard
     data = _json_body()
     raw_model = str(data.get('model') or '').strip()
-    default_model = str(config.LM_MODEL or '').strip()
+    default_profile = _resolve_lm_profile(kind="agent")
+    default_values = {
+        _lm_profile_selector_value(default_profile),
+        str(default_profile.get("model") or "").strip(),
+    }
+    default_values.discard("")
     with _agent_runner_lock:
-        _agent_runtime_model_override = raw_model if raw_model and raw_model != default_model else None
+        _agent_runtime_model_override = raw_model if raw_model and raw_model not in default_values else None
         _agent_runner = None
     return jsonify({'success': True, **_get_agent_config_payload()})
 
