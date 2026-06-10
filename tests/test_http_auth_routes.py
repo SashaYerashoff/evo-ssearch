@@ -487,6 +487,49 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(payload["video_history_channels"], [7])
         self.assertEqual(payload["running_total"], 1)
 
+    def test_luxriot_start_capture_writes_completion_audit(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.CAPTURE_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch(
+            "oldapp.luxriot_manager.start_session",
+            return_value={"running": True, "channel_id": 7},
+        ):
+            response = self.client.post(
+                "/luxriot/start_capture",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "channel_id": 7,
+                    "batch_size": 16,
+                    "prompt": "operator sensitive prompt",
+                    "system_prompt": "system sensitive prompt",
+                    "model": "qwen35-4b-q4",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        event = next(
+            event
+            for event in self.audit.events
+            if event.action == "luxriot.capture.start.completed"
+        )
+        self.assertEqual(event.result, "success")
+        self.assertEqual(event.channel_id, 7)
+        self.assertTrue(event.details["prompt_supplied"])
+        self.assertTrue(event.details["system_prompt_supplied"])
+        self.assertTrue(event.details["model_supplied"])
+        self.assertNotIn("operator sensitive prompt", str(event.details))
+        self.assertNotIn("system sensitive prompt", str(event.details))
+
     def test_scoped_detection_queries_require_owned_channel(self) -> None:
         self._login()
 
@@ -590,8 +633,78 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         self.repository.users[USER_ID] = self.repository.identity
         self._login()
-        scoped_engineer = self.client.get("/lm/models")
+        with (
+            patch(
+                "oldapp._fetch_lm_model_catalog",
+                return_value={
+                    "profiles": [{"id": "vlm-4b", "model": "qwen35-4b"}],
+                    "models": ["qwen35-4b"],
+                },
+            ),
+            patch(
+                "oldapp._get_agent_config_payload",
+                return_value={"model": "qwen35-9b"},
+            ),
+        ):
+            scoped_engineer = self.client.get("/lm/models?force=1")
         self.assertEqual(scoped_engineer.status_code, 200)
+        event = next(
+            event for event in self.audit.events if event.action == "lm.models.completed"
+        )
+        self.assertEqual(event.result, "success")
+        self.assertEqual(event.details["profile_count"], 1)
+        self.assertEqual(event.details["model_count"], 1)
+        self.assertTrue(event.details["force"])
+
+    def test_settings_env_write_audits_keys_without_secret_values(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        writes = []
+
+        class _FakePath:
+            def __init__(self, value):
+                self.value = value
+
+            def write_text(self, text, encoding=None):
+                writes.append((self.value, text, encoding))
+                return len(text)
+
+        with (
+            patch("oldapp.Path", _FakePath),
+            patch(
+                "oldapp._effective_env_map",
+                return_value={"EVOSSEARCH_LUXRIOT_PASSWORD": "old-secret"},
+            ),
+            patch("oldapp._read_env_file_map", return_value={}),
+        ):
+            response = self.client.post(
+                "/settings/env",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "envVariables": {
+                        "EVOSSEARCH_LUXRIOT_PASSWORD": "new-secret",
+                        "EVOSSEARCH_LM_BASE_URL": "http://llm.internal:8080",
+                    }
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(writes[0][0], ".env")
+        event = next(
+            event
+            for event in self.audit.events
+            if event.action == "settings.env.write.completed"
+        )
+        self.assertEqual(event.result, "success")
+        self.assertIn("EVOSSEARCH_LUXRIOT_PASSWORD", event.details["keys"])
+        self.assertIn("EVOSSEARCH_LM_BASE_URL", event.details["keys"])
+        self.assertNotIn("new-secret", str(event.details))
+        self.assertNotIn("llm.internal", str(event.details))
 
     def test_detection_image_requires_owned_metadata(self) -> None:
         self._login()

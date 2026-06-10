@@ -4,6 +4,7 @@ import atexit
 import base64
 import copy
 import gc
+import hashlib
 import html as html_lib
 import json
 import math
@@ -622,6 +623,50 @@ def _write_security_audit(
         details=details,
     )
     _get_audit_writer().write(event)
+
+
+def _audit_fingerprint(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _audit_key_details(name: str, values: Iterable[Any], *, limit: int = 100) -> Dict[str, Any]:
+    keys = sorted({str(value).strip() for value in values if str(value).strip()})
+    details: Dict[str, Any] = {
+        f"{name}_count": len(keys),
+        name: keys[:limit],
+    }
+    if len(keys) > limit:
+        details[f"{name}_truncated"] = True
+    return details
+
+
+def _write_completion_audit_or_error(
+    *,
+    action: str,
+    result: str = "success",
+    target_type: str = "route",
+    target_id: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    details: Optional[Mapping[str, Any]] = None,
+):
+    if not _auth_enabled():
+        return None
+    try:
+        _write_security_audit(
+            context=_current_auth_context(),
+            action=action,
+            result=result,
+            target_type=target_type,
+            target_id=target_id,
+            channel_id=channel_id,
+            details=details,
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return None
 
 
 def _write_agent_tool_audit(event: ToolAuditEvent) -> None:
@@ -5966,6 +6011,19 @@ def video_understanding():
             max_edge=config.LM_VIDEO_MAX_EDGE,
         )
         if not frames:
+            audit_error = _write_completion_audit_or_error(
+                action="lm.video_understanding.completed",
+                result="failure",
+                target_type="video",
+                target_id=_audit_fingerprint(video_obj),
+                details={
+                    "reason": "no_frames",
+                    "frame_count_requested": max_frames_int,
+                    "sample_fps_supplied": sample_fps_raw is not None,
+                },
+            )
+            if audit_error is not None:
+                return audit_error
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
         messages = _build_video_messages(str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(
@@ -5973,6 +6031,22 @@ def video_understanding():
             model_override=model_hint or None,
             profile_id=profile_hint,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="lm.video_understanding.completed",
+            result="success",
+            target_type="video",
+            target_id=_audit_fingerprint(video_obj),
+            details={
+                "frames": len(frames),
+                "frame_count_requested": max_frames_int,
+                "sample_fps_supplied": sample_fps_raw is not None,
+                "prompt_supplied": bool(str(user_prompt).strip()),
+                "profile_id": str(lm_profile.get('id') or ''),
+                "model": str(lm_profile.get('model') or ''),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'summary': summary,
@@ -5992,6 +6066,19 @@ def video_understanding():
             }
         )
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="lm.video_understanding.completed",
+            result="failure",
+            target_type="video",
+            target_id=_audit_fingerprint(video_obj if 'video_obj' in locals() else video_path),
+            details={
+                "reason": type(exc).__name__,
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6034,6 +6121,21 @@ def describe_image():
         )
         with Image.open(path_obj) as src:
             thumb = _encode_jpeg(src, max_edge=config.THUMBNAIL_SIZE[0])
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="success",
+            target_type="image",
+            target_id=_audit_fingerprint(path_obj),
+            details={
+                "folder_supplied": bool(folder_raw),
+                "prompt_supplied": bool(str(prompt).strip()),
+                "thumbnail_returned": bool(thumb),
+                "profile_id": str(lm_profile.get('id') or ''),
+                "model": str(lm_profile.get('model') or ''),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'summary': summary,
@@ -6045,8 +6147,36 @@ def describe_image():
             }
         )
     except ValueError as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="failure",
+            target_type="image",
+            target_id=_audit_fingerprint(image_path),
+            details={
+                "reason": type(exc).__name__,
+                "folder_supplied": bool(folder_raw),
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="failure",
+            target_type="image",
+            target_id=_audit_fingerprint(path_obj if 'path_obj' in locals() else image_path),
+            details={
+                "reason": type(exc).__name__,
+                "folder_supplied": bool(folder_raw),
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 @app.route('/search', methods=['POST'])
 def search():
@@ -6608,8 +6738,36 @@ def luxriot_start_capture():
             model_hint=model_hint,
             system_prompt=system_prompt,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.start.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "batch_size_supplied": batch_size is not None,
+                "prompt_supplied": bool(str(prompt).strip()),
+                "system_prompt_supplied": bool(system_prompt),
+                "model_supplied": bool(model_hint),
+                "session_running": bool(status.get("running"))
+                if isinstance(status, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, 'session': status})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.start.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6687,8 +6845,37 @@ def luxriot_prompt_settings():
             bookmark_enabled=bookmark_enabled,
             bookmark_cooldown_sec=bookmark_cooldown_sec,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.prompt_settings.update.completed",
+            result="success",
+            target_type="luxriot_prompt_settings",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "stream_system_prompt_updated": stream_system_prompt is not None,
+                "rollup_prompts_updated": bool(rollup_prompt_updates),
+                "json_alert_prompt_updated": json_alert_prompt is not None,
+                "bookmark_enabled_updated": bookmark_enabled is not None,
+                "bookmark_cooldown_updated": bookmark_cooldown_sec is not None,
+                "rollup_levels": sorted(rollup_prompt_updates.keys())
+                if isinstance(rollup_prompt_updates, Mapping)
+                else [],
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, **settings})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.prompt_settings.update.completed",
+            result="failure",
+            target_type="luxriot_prompt_settings",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6704,8 +6891,32 @@ def luxriot_stop_capture():
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     try:
         state = luxriot_manager.stop_session(channel_id)
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.stop.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "session_running": bool(state.get("running"))
+                if isinstance(state, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, 'session': state})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.stop.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6722,9 +6933,43 @@ def luxriot_flush_capture():
     try:
         result = luxriot_manager.flush_session(channel_id)
         if not result.get('success'):
+            audit_error = _write_completion_audit_or_error(
+                action="luxriot.capture.flush.completed",
+                result="failure",
+                target_type="luxriot_capture",
+                target_id=str(channel_id),
+                channel_id=channel_id,
+                details={"reason": "flush_unsuccessful"},
+            )
+            if audit_error is not None:
+                return audit_error
             return jsonify(result), 400
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.flush.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "items": len(result.get("items") or [])
+                if isinstance(result, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(result)
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.flush.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6796,6 +7041,19 @@ def luxriot_stop_stream():
     pause_analytics = _coerce_bool(data.get('pause_analytics'), True)
     try:
         result = luxriot_manager.stop_stream(channel_id, stream_type=stream_type, pause_analytics=pause_analytics)
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="success",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "stream_type": stream_type,
+                "pause_analytics": pause_analytics,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({
             'success': True,
             'result': result,
@@ -6805,8 +7063,28 @@ def luxriot_stop_stream():
             ),
         })
     except ValueError as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="failure",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="failure",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6827,6 +7105,18 @@ def luxriot_stop_all_streams():
             stop_analytics=stop_analytics,
             pause_analytics=pause_analytics,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop_all.completed",
+            result="success",
+            target_type="luxriot_streams",
+            details={
+                "stop_video": stop_video,
+                "stop_analytics": stop_analytics,
+                "pause_analytics": pause_analytics,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({
             'success': True,
             'result': result,
@@ -6836,6 +7126,14 @@ def luxriot_stop_all_streams():
             ),
         })
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop_all.completed",
+            result="failure",
+            target_type="luxriot_streams",
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -6868,8 +7166,41 @@ def luxriot_bookmark():
             state=state,
             timestamp_ms=timestamp_ms,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.bookmark.create.completed",
+            result="success",
+            target_type="luxriot_bookmark",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "severity": severity,
+                "state": state,
+                "timestamp_supplied": timestamp_ms is not None,
+                "title_length": len(title),
+                "description_length": len(str(description)),
+                "success": bool(result.get("success"))
+                if isinstance(result, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(result)
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.bookmark.create.completed",
+            result="failure",
+            target_type="luxriot_bookmark",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "reason": type(exc).__name__,
+                "severity": severity,
+                "state": state,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -7790,6 +8121,14 @@ def save_settings_env():
         header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
         Path(".env").write_text(header + "\n".join(env_lines) + "\n", encoding="utf-8")
 
+        audit_error = _write_completion_audit_or_error(
+            action="settings.env.write.completed",
+            result="success",
+            target_type="settings_env",
+            details=_audit_key_details("keys", target_env.keys()),
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'success': True,
@@ -8188,6 +8527,24 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         payload: Dict[str, Any] = {'success': True, 'message': message}
         if warmup_warning:
             payload['warning'] = warmup_warning
+        audit_details = _audit_key_details("fields", data.keys())
+        audit_details.update(
+            {
+                "embedder": embedder,
+                "index_mode": index_mode,
+                "debug": debug_enabled,
+                "luxriot_password_supplied": luxriot_password_raw is not None,
+                "warmup_warning": bool(warmup_warning),
+            }
+        )
+        audit_error = _write_completion_audit_or_error(
+            action="settings.write.completed",
+            result="success",
+            target_type="settings",
+            details=audit_details,
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(payload)
 
     except Exception as e:
@@ -8340,6 +8697,21 @@ def lm_models():
     force = str(request.args.get('force') or '').strip().lower() in TRUE_BOOL_STRINGS
     payload = _fetch_lm_model_catalog(force=force)
     payload['agent'] = _get_agent_config_payload()
+    profiles = payload.get("profiles") if isinstance(payload, Mapping) else None
+    models = payload.get("models") if isinstance(payload, Mapping) else None
+    audit_error = _write_completion_audit_or_error(
+        action="lm.models.completed",
+        result="success",
+        target_type="lm_catalog",
+        details={
+            "force": force,
+            "profile_count": len(profiles) if isinstance(profiles, Sequence) else 0,
+            "model_count": len(models) if isinstance(models, Sequence) else 0,
+            "has_error": bool(payload.get("error")) if isinstance(payload, Mapping) else False,
+        },
+    )
+    if audit_error is not None:
+        return audit_error
     return jsonify(payload)
 
 
