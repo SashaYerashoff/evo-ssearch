@@ -99,6 +99,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/auth/logout",
             "/auth/me",
             "/auth/roles",
+            "/auth/sessions",
+            "/auth/sessions/<session_id>/revoke",
             "/auth/users",
             "/auth/users/<user_id>",
             "/auth/users/<user_id>/revoke-sessions",

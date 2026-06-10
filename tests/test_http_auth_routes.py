@@ -338,11 +338,18 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         self.assertEqual(forbidden_channel.status_code, 403)
 
-        allowed = self.client.post(
-            "/probes/delete",
-            headers={"X-CSRF-Token": csrf_token},
-            json={"id": "missing-probe", "channel_id": 7},
-        )
+        with (
+            patch(
+                "oldapp.probes_store.list_probes",
+                return_value=[{"id": "missing-probe", "channel_id": 7}],
+            ),
+            patch("oldapp.probes_store.delete_probe", return_value=False),
+        ):
+            allowed = self.client.post(
+                "/probes/delete",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"id": "missing-probe", "channel_id": 7},
+            )
         self.assertEqual(allowed.status_code, 404)
         self.assertTrue(
             any(
@@ -495,6 +502,75 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
         delete_probe.assert_not_called()
+
+    def test_probe_id_lookup_failure_denies_scoped_mutation(self) -> None:
+        _, csrf_token = self._login()
+        with (
+            patch(
+                "oldapp.probes_store.list_probes",
+                side_effect=RuntimeError("probe store unavailable"),
+            ),
+            patch("oldapp.probes_store.delete_probe") as delete_probe,
+        ):
+            response = self.client.post(
+                "/probes/delete",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"id": "probe-7", "channel_id": 7},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        delete_probe.assert_not_called()
+
+    def test_probe_id_missing_owner_denies_scoped_mutation(self) -> None:
+        _, csrf_token = self._login()
+        with (
+            patch("oldapp.probes_store.list_probes", return_value=[]),
+            patch("oldapp.probes_store.delete_probe") as delete_probe,
+        ):
+            response = self.client.post(
+                "/probes/delete",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"id": "missing-probe", "channel_id": 7},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        delete_probe.assert_not_called()
+
+    def test_legacy_folder_routes_require_all_channel_for_scoped_users(self) -> None:
+        _, csrf_token = self._login()
+
+        image = self.client.get("/image?folder=/tmp&image_path=frame.jpg")
+        search = self.client.post(
+            "/search",
+            headers={"X-CSRF-Token": csrf_token},
+            json={"folder": "/tmp", "query": "person"},
+        )
+        describe = self.client.post(
+            "/describe_image",
+            headers={"X-CSRF-Token": csrf_token},
+            json={"folder": "/tmp", "image_path": "/tmp/frame.jpg"},
+        )
+
+        self.assertEqual(image.status_code, 403)
+        self.assertEqual(search.status_code, 403)
+        self.assertEqual(describe.status_code, 403)
+
+    def test_lm_models_requires_authenticated_diagnostics_permission(self) -> None:
+        anonymous = self.client.get("/lm/models")
+        self.assertEqual(anonymous.status_code, 401)
+
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.DIAGNOSTICS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        scoped_engineer = self.client.get("/lm/models")
+        self.assertEqual(scoped_engineer.status_code, 200)
 
     def test_detection_image_requires_owned_metadata(self) -> None:
         self._login()

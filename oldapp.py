@@ -148,6 +148,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "check_index": Permission.DIAGNOSTICS_VIEW,
     "video_understanding": Permission.STREAMS_VIEW,
     "describe_image": Permission.DETECTIONS_VIEW,
+    "lm_models": Permission.DIAGNOSTICS_VIEW,
     "search": Permission.DETECTIONS_VIEW,
     "search_by_image": Permission.DETECTIONS_VIEW,
     "search_by_mask": Permission.DETECTIONS_VIEW,
@@ -177,7 +178,13 @@ _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
         "detections_search_image",
         "detections_search_text",
         "detections_summary",
+        "describe_image",
+        "search",
+        "serve_image",
         "luxriot_prompt_settings",
+        "probes_delete",
+        "probes_run",
+        "probes_save",
     }
 )
 _ALL_CHANNELS_REQUIRED_ENDPOINTS = frozenset(
@@ -420,13 +427,58 @@ def _probe_channel_ids(probe_ids: Iterable[Any]) -> Set[int]:
     try:
         probes = probes_store.list_probes()
     except Exception:
+        g.channel_resolution_error = "probe_lookup_failed"
         return set()
-    return {
-        int(probe["channel_id"])
-        for probe in probes
-        if str(probe.get("id") or "") in wanted
-        and _to_optional_int(probe.get("channel_id")) is not None
-    }
+    matched: Set[str] = set()
+    channel_ids: Set[int] = set()
+    for probe in probes:
+        probe_id = str(probe.get("id") or "")
+        if probe_id not in wanted:
+            continue
+        matched.add(probe_id)
+        channel_id = _to_optional_int(probe.get("channel_id"))
+        if channel_id is not None:
+            channel_ids.add(channel_id)
+    if matched != wanted:
+        g.channel_resolution_error = "probe_owner_missing"
+    return channel_ids
+
+
+def _image_channel_ids_for_request_value(value: Any) -> Set[int]:
+    image_path = str(value or "").strip()
+    if not image_path:
+        return set()
+    try:
+        return {
+            int(channel_id)
+            for channel_id in detections_store.channel_ids_for_image_path(image_path)
+            if _to_optional_int(channel_id) is not None
+        }
+    except Exception:
+        g.channel_resolution_error = "image_owner_lookup_failed"
+        return set()
+
+
+def _request_image_channel_ids(
+    endpoint: str,
+    view_args: Mapping[str, Any],
+    payload: Any,
+    form: Mapping[str, Any],
+) -> Set[int]:
+    values: List[Any] = []
+    if endpoint == "serve_detection_image":
+        values.append(request.args.get("image_path"))
+    if endpoint == "serve_image":
+        values.append(request.args.get("image_path"))
+        values.append(view_args.get("filepath"))
+    if endpoint == "describe_image":
+        if isinstance(payload, Mapping):
+            values.append(payload.get("image_path"))
+        values.append(form.get("image_path"))
+    channel_ids: Set[int] = set()
+    for value in values:
+        channel_ids.update(_image_channel_ids_for_request_value(value))
+    return channel_ids
 
 
 def _request_channel_ids() -> Set[int]:
@@ -463,20 +515,13 @@ def _request_channel_ids() -> Set[int]:
             continue
         if "probe_id" in source:
             probe_ids.append(source.get("probe_id"))
-        if endpoint in {"probes_delete", "probes_run", "probes_save"}:
+        if endpoint in {"probes_delete", "probes_run"}:
             if "id" in source:
                 probe_ids.append(source.get("id"))
     channel_ids.update(_probe_channel_ids(probe_ids))
-
-    if endpoint == "serve_detection_image":
-        image_path = str(request.args.get("image_path") or "").strip()
-        if image_path:
-            try:
-                channel_ids.update(
-                    detections_store.channel_ids_for_image_path(image_path)
-                )
-            except Exception:
-                pass
+    channel_ids.update(
+        _request_image_channel_ids(endpoint, view_args, payload, form)
+    )
 
     if not channel_ids and endpoint in _DEFAULT_CHANNEL_ENDPOINTS:
         default_channel = _to_optional_int(config.LUXRIOT_DEFAULT_CHANNEL_ID)
@@ -686,6 +731,12 @@ def _session_guard(
             and str(request.endpoint or "") in _ALL_CHANNELS_REQUIRED_ENDPOINTS
         ):
             raise PermissionError("all-channel access is required")
+        if _is_channel_scoped(context) and getattr(
+            g,
+            "channel_resolution_error",
+            None,
+        ):
+            raise PermissionError(str(g.channel_resolution_error))
         if (
             _is_channel_scoped(context)
             and str(request.endpoint or "")
@@ -745,6 +796,7 @@ def _bind_request_security_context() -> None:
     g.auth_context = None
     g.auth_session = None
     g.auth_resolution_error = None
+    g.channel_resolution_error = None
     if not _auth_enabled():
         return
     session_token = str(
