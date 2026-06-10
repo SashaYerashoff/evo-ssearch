@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -37,6 +38,7 @@ _EXTERNAL_SIDE_EFFECT_PERMISSIONS = {
     Permission.DATA_EXPORT,
     Permission.PROBES_RUN,
 }
+_UNSET = object()
 
 
 class IdentityBootstrapConflict(ValueError):
@@ -163,6 +165,301 @@ class PostgresIdentityRepository:
             )
             self._set_actor_id(connection, user_id)
             return self._load_identity(connection, tenant, user_id)
+
+    def list_users(
+        self,
+        tenant_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        include_inactive: bool = True,
+    ) -> tuple[IdentityRecord, ...]:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        with self._pool.transaction(
+            _transaction_context(tenant, actor),
+            readonly=True,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM iam.users
+                WHERE tenant_id = %s
+                  AND (%s OR is_active)
+                ORDER BY lower(username), id
+                """,
+                (tenant, bool(include_inactive)),
+            ).fetchall()
+            return tuple(
+                self._load_identity(connection, tenant, row[0])
+                for row in rows
+            )
+
+    def get_user(
+        self,
+        tenant_id: uuid.UUID | str,
+        user_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+    ) -> IdentityRecord | None:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        target_user = _require_uuid(user_id, "user_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        with self._pool.transaction(
+            _transaction_context(tenant, actor),
+            readonly=True,
+        ) as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM iam.users
+                WHERE tenant_id = %s AND id = %s
+                """,
+                (tenant, target_user),
+            ).fetchone()
+            if exists is None:
+                return None
+            return self._load_identity(connection, tenant, target_user)
+
+    def create_user(
+        self,
+        tenant_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        username: str,
+        password: str,
+        roles: Iterable[str | Role],
+        display_name: str | None = None,
+        allowed_channel_ids: Iterable[ChannelId] = (),
+        is_active: bool = True,
+    ) -> IdentityRecord:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        normalized_username = _normalize_username(username)
+        _require_password_strength(password)
+        normalized_display_name = _normalize_optional_text(
+            display_name,
+            "display_name",
+            maximum=255,
+        )
+        normalized_roles = _normalize_roles(roles)
+        normalized_channels = _normalize_channel_ids(
+            allowed_channel_ids,
+            roles=normalized_roles,
+        )
+
+        with self._pool.transaction(
+            _transaction_context(tenant, actor)
+        ) as connection:
+            role_ids = self._seed_authorization_catalogue(connection, tenant)
+            duplicate = connection.execute(
+                """
+                SELECT id
+                FROM iam.users
+                WHERE tenant_id = %s AND lower(username) = lower(%s)
+                """,
+                (tenant, normalized_username),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError("username already exists")
+
+            user_id = uuid.uuid4()
+            connection.execute(
+                """
+                INSERT INTO iam.users (
+                    id,
+                    tenant_id,
+                    username,
+                    password_hash,
+                    display_name,
+                    is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    tenant,
+                    normalized_username,
+                    self._password_hasher.hash(password),
+                    normalized_display_name,
+                    bool(is_active),
+                ),
+            )
+            self._replace_roles(
+                connection,
+                tenant_id=tenant,
+                user_id=user_id,
+                actor_user_id=actor,
+                role_ids=role_ids,
+                roles=normalized_roles,
+            )
+            self._replace_channel_grants(
+                connection,
+                tenant_id=tenant,
+                user_id=user_id,
+                actor_user_id=actor,
+                channel_ids=normalized_channels,
+            )
+            return self._load_identity(connection, tenant, user_id)
+
+    def update_user(
+        self,
+        tenant_id: uuid.UUID | str,
+        user_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        display_name: str | None | object = _UNSET,
+        password: str | None | object = _UNSET,
+        roles: Iterable[str | Role] | object = _UNSET,
+        allowed_channel_ids: Iterable[ChannelId] | object = _UNSET,
+        is_active: bool | object = _UNSET,
+    ) -> IdentityRecord:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        target_user = _require_uuid(user_id, "user_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        normalized_roles = (
+            None if roles is _UNSET else _normalize_roles(_cast_roles(roles))
+        )
+        normalized_channels = (
+            None
+            if allowed_channel_ids is _UNSET
+            else _normalize_channel_ids(
+                _cast_channels(allowed_channel_ids),
+                roles=normalized_roles or frozenset(),
+                allow_admin_all=(
+                    normalized_roles is not None
+                    and Role.ADMIN in normalized_roles
+                ),
+            )
+        )
+        normalized_display_name = (
+            _UNSET
+            if display_name is _UNSET
+            else _normalize_optional_text(
+                None if display_name is None else str(display_name),
+                "display_name",
+                maximum=255,
+            )
+        )
+        if password is not _UNSET:
+            if password is None:
+                raise ValueError("password cannot be null")
+            _require_password_strength(str(password))
+        if (
+            target_user == actor
+            and is_active is not _UNSET
+            and not bool(is_active)
+        ):
+            raise ValueError("cannot deactivate your own account")
+        if (
+            target_user == actor
+            and normalized_roles is not None
+            and Role.ADMIN not in normalized_roles
+        ):
+            raise ValueError("cannot remove your own admin role")
+
+        with self._pool.transaction(
+            _transaction_context(tenant, actor)
+        ) as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM iam.users
+                WHERE tenant_id = %s AND id = %s
+                FOR UPDATE
+                """,
+                (tenant, target_user),
+            ).fetchone()
+            if exists is None:
+                raise LookupError("user not found")
+
+            updates: list[str] = ["updated_at = clock_timestamp()"]
+            params: list[Any] = []
+            if normalized_display_name is not _UNSET:
+                updates.append("display_name = %s")
+                params.append(normalized_display_name)
+            if password is not _UNSET:
+                updates.append("password_hash = %s")
+                updates.append("password_changed_at = clock_timestamp()")
+                params.append(self._password_hasher.hash(str(password)))
+            if is_active is not _UNSET:
+                updates.append("is_active = %s")
+                params.append(bool(is_active))
+            if len(updates) > 1:
+                params.extend([tenant, target_user])
+                connection.execute(
+                    f"""
+                    UPDATE iam.users
+                    SET {", ".join(updates)}
+                    WHERE tenant_id = %s AND id = %s
+                    """,
+                    tuple(params),
+                )
+
+            if normalized_roles is not None:
+                role_ids = self._seed_authorization_catalogue(
+                    connection,
+                    tenant,
+                )
+                self._replace_roles(
+                    connection,
+                    tenant_id=tenant,
+                    user_id=target_user,
+                    actor_user_id=actor,
+                    role_ids=role_ids,
+                    roles=normalized_roles,
+                )
+            if normalized_channels is not None:
+                self._replace_channel_grants(
+                    connection,
+                    tenant_id=tenant,
+                    user_id=target_user,
+                    actor_user_id=actor,
+                    channel_ids=normalized_channels,
+                )
+            if is_active is not _UNSET and not bool(is_active):
+                self._revoke_user_sessions(
+                    connection,
+                    tenant_id=tenant,
+                    user_id=target_user,
+                    reason="account_deactivated",
+                )
+            return self._load_identity(connection, tenant, target_user)
+
+    def revoke_user_sessions(
+        self,
+        tenant_id: uuid.UUID | str,
+        user_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        reason: str,
+    ) -> int:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        target_user = _require_uuid(user_id, "user_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        normalized_reason = _normalize_required_text(
+            reason,
+            "reason",
+            maximum=512,
+        )
+        with self._pool.transaction(
+            _transaction_context(tenant, actor)
+        ) as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM iam.users
+                WHERE tenant_id = %s AND id = %s
+                """,
+                (tenant, target_user),
+            ).fetchone()
+            if exists is None:
+                raise LookupError("user not found")
+            return self._revoke_user_sessions(
+                connection,
+                tenant_id=tenant,
+                user_id=target_user,
+                reason=normalized_reason,
+            )
 
     def authenticate(
         self,
@@ -500,6 +797,88 @@ class PostgresIdentityRepository:
             is_active=bool(user[4]),
         )
 
+    def _replace_roles(
+        self,
+        connection: Any,
+        *,
+        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+        role_ids: dict[Role, uuid.UUID],
+        roles: frozenset[Role],
+    ) -> None:
+        if not roles:
+            raise ValueError("at least one role is required")
+        connection.execute(
+            """
+            DELETE FROM iam.user_roles
+            WHERE tenant_id = %s AND user_id = %s
+            """,
+            (tenant_id, user_id),
+        )
+        for role in sorted(roles, key=lambda item: item.value):
+            connection.execute(
+                """
+                INSERT INTO iam.user_roles (
+                    tenant_id, user_id, role_id, assigned_by
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                (tenant_id, user_id, role_ids[role], actor_user_id),
+            )
+
+    def _replace_channel_grants(
+        self,
+        connection: Any,
+        *,
+        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        actor_user_id: uuid.UUID,
+        channel_ids: frozenset[int],
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM iam.user_channel_grants
+            WHERE tenant_id = %s AND user_id = %s
+            """,
+            (tenant_id, user_id),
+        )
+        for channel_id in sorted(channel_ids):
+            connection.execute(
+                """
+                INSERT INTO iam.user_channel_grants (
+                    tenant_id,
+                    user_id,
+                    channel_id,
+                    access_level,
+                    granted_by
+                )
+                VALUES (%s, %s, %s, 'view', %s)
+                """,
+                (tenant_id, user_id, channel_id, actor_user_id),
+            )
+
+    def _revoke_user_sessions(
+        self,
+        connection: Any,
+        *,
+        tenant_id: uuid.UUID,
+        user_id: uuid.UUID,
+        reason: str,
+    ) -> int:
+        result = connection.execute(
+            """
+            UPDATE iam.sessions
+            SET revoked_at = clock_timestamp(),
+                revoke_reason = %s
+            WHERE tenant_id = %s
+              AND user_id = %s
+              AND revoked_at IS NULL
+            """,
+            (reason, tenant_id, user_id),
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
+
     @staticmethod
     def _set_actor_id(connection: Any, actor_id: uuid.UUID) -> None:
         connection.execute(
@@ -524,6 +903,71 @@ def _require_uuid(value: uuid.UUID | str, field_name: str) -> uuid.UUID:
 
 def _normalize_username(username: str) -> str:
     return _normalize_required_text(username, "username", maximum=255)
+
+
+def _cast_roles(value: object) -> Iterable[str | Role]:
+    if value is _UNSET or value is None:
+        raise ValueError("roles are required")
+    if isinstance(value, (str, Role)):
+        return (value,)
+    if not isinstance(value, Iterable):
+        raise ValueError("roles must be a list")
+    return value
+
+
+def _cast_channels(value: object) -> Iterable[ChannelId]:
+    if value is _UNSET or value is None:
+        raise ValueError("allowed_channel_ids are required")
+    if isinstance(value, (str, int)):
+        return (value,)
+    if not isinstance(value, Iterable):
+        raise ValueError("allowed_channel_ids must be a list")
+    return value
+
+
+def _normalize_roles(roles: Iterable[str | Role]) -> frozenset[Role]:
+    normalized: set[Role] = set()
+    for role in roles:
+        try:
+            normalized.add(
+                Role(
+                    str(role.value if isinstance(role, Role) else role)
+                    .strip()
+                    .lower()
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(f"unknown role: {role}") from exc
+    if not normalized:
+        raise ValueError("at least one role is required")
+    return frozenset(normalized)
+
+
+def _normalize_channel_ids(
+    channel_ids: Iterable[ChannelId],
+    *,
+    roles: frozenset[Role],
+    allow_admin_all: bool = False,
+) -> frozenset[int]:
+    normalized: set[int] = set()
+    for raw_channel_id in channel_ids:
+        if str(raw_channel_id).strip() == ALL_CHANNELS:
+            if allow_admin_all or Role.ADMIN in roles:
+                continue
+            raise ValueError("all-channel grants require admin role")
+        try:
+            channel_id = int(raw_channel_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("channel ids must be positive integers") from exc
+        if channel_id <= 0:
+            raise ValueError("channel ids must be positive integers")
+        normalized.add(channel_id)
+    return frozenset(normalized)
+
+
+def _require_password_strength(password: str) -> None:
+    if not isinstance(password, str) or len(password) < 12 or "\x00" in password:
+        raise ValueError("password must contain at least 12 safe characters")
 
 
 def _normalize_required_text(value: str, field_name: str, *, maximum: int) -> str:

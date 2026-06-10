@@ -80,11 +80,16 @@ class PostgreSQLSecurityIntegrationTests(unittest.TestCase):
                     'eva_worker',
                     'jobs.job_attempts',
                     'SELECT,INSERT,UPDATE'
+                ),
+                has_table_privilege(
+                    'eva_api',
+                    'iam.login_attempts',
+                    'SELECT,INSERT,UPDATE,DELETE'
                 )
             """
         ).fetchone()
 
-        self.assertEqual(privileges, (True, False, True, True))
+        self.assertEqual(privileges, (True, False, True, True, True))
         self.assertTrue(
             self.connection.execute(
                 """

@@ -1,10 +1,10 @@
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import oldapp
 from unittest.mock import patch
-from security import Permission, Role, digest_session_token
+from security import ALL_CHANNELS, Permission, Role, digest_session_token
 from security.http_auth import AuthenticationService
 
 
@@ -42,6 +42,8 @@ class _Repository:
     def __init__(self) -> None:
         self.identity = _Identity()
         self.sessions = {}
+        self.users = {USER_ID: self.identity}
+        self.revoked_user_sessions = []
 
     def authenticate(self, tenant_id, username, password):
         if (
@@ -79,6 +81,77 @@ class _Repository:
         if tenant_id != TENANT_ID:
             return False
         return self.sessions.pop(token, None) is not None
+
+    def list_users(self, tenant_id, *, actor_user_id, include_inactive=True):
+        if tenant_id != TENANT_ID:
+            return ()
+        users = list(self.users.values())
+        if not include_inactive:
+            users = [user for user in users if user.is_active]
+        return tuple(users)
+
+    def get_user(self, tenant_id, user_id, *, actor_user_id):
+        if tenant_id != TENANT_ID:
+            return None
+        return self.users.get(user_id)
+
+    def create_user(
+        self,
+        tenant_id,
+        *,
+        actor_user_id,
+        username,
+        password,
+        roles,
+        display_name=None,
+        allowed_channel_ids=(),
+        is_active=True,
+    ):
+        if tenant_id != TENANT_ID:
+            raise RuntimeError("wrong tenant")
+        del actor_user_id, password
+        user_id = f"user-{len(self.users) + 1}"
+        user = _Identity(
+            user_id=user_id,
+            username=username,
+            display_name=display_name,
+            roles=frozenset(str(role) for role in roles),
+            permissions=frozenset({Permission.STREAMS_VIEW.value}),
+            allowed_channel_ids=frozenset(allowed_channel_ids),
+            is_active=bool(is_active),
+        )
+        self.users[user_id] = user
+        return user
+
+    def update_user(self, tenant_id, user_id, *, actor_user_id, **updates):
+        if tenant_id != TENANT_ID:
+            raise RuntimeError("wrong tenant")
+        del actor_user_id
+        user = self.users.get(user_id)
+        if user is None:
+            raise LookupError("user not found")
+        replacements = {}
+        if "display_name" in updates:
+            replacements["display_name"] = updates["display_name"]
+        if "roles" in updates:
+            replacements["roles"] = frozenset(str(role) for role in updates["roles"])
+        if "allowed_channel_ids" in updates:
+            replacements["allowed_channel_ids"] = frozenset(
+                updates["allowed_channel_ids"]
+            )
+        if "is_active" in updates:
+            replacements["is_active"] = bool(updates["is_active"])
+        updated = replace(user, **replacements)
+        self.users[user_id] = updated
+        return updated
+
+    def revoke_user_sessions(self, tenant_id, user_id, *, actor_user_id, reason):
+        if tenant_id != TENANT_ID:
+            raise RuntimeError("wrong tenant")
+        if user_id not in self.users:
+            raise LookupError("user not found")
+        self.revoked_user_sessions.append((user_id, actor_user_id, reason))
+        return 2
 
 
 class _AuditWriter:
@@ -123,6 +196,7 @@ class HttpAuthRouteTests(unittest.TestCase):
             self.repository,
             tenant_id=TENANT_ID,
         )
+        oldapp._identity_repository = self.repository
         oldapp._audit_writer = self.audit
         self.client = oldapp.app.test_client()
 
@@ -131,6 +205,7 @@ class HttpAuthRouteTests(unittest.TestCase):
         oldapp.config.AUTH_TENANT_ID = self.original["AUTH_TENANT_ID"]
         oldapp.config.AUTH_COOKIE_SECURE = self.original["AUTH_COOKIE_SECURE"]
         oldapp._auth_service = None
+        oldapp._identity_repository = None
         oldapp._audit_writer = None
         oldapp._audit_db_pool = None
 
@@ -375,6 +450,91 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(context.actor_id, USER_ID)
         self.assertEqual(context.tenant_id, TENANT_ID)
         self.assertEqual(context.allowed_channel_ids, frozenset({"7"}))
+
+    def test_non_admin_cannot_manage_users(self) -> None:
+        self._login()
+
+        response = self.client.get("/auth/users")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_manage_users_and_revoke_sessions(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        missing_csrf = self.client.post(
+            "/auth/users",
+            json={
+                "username": "viewer",
+                "password": "correct-password",
+                "roles": [Role.VIEWER.value],
+                "allowedChannelIds": [7],
+            },
+        )
+        self.assertEqual(missing_csrf.status_code, 403)
+
+        created = self.client.post(
+            "/auth/users",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "username": "viewer",
+                "password": "correct-password",
+                "displayName": "Pilot Viewer",
+                "roles": [Role.VIEWER.value],
+                "allowedChannelIds": [7],
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        created_user = created.get_json()["user"]
+        self.assertEqual(created_user["username"], "viewer")
+        self.assertEqual(created_user["allowedChannelIds"], [7])
+
+        listed = self.client.get("/auth/users")
+        self.assertEqual(listed.status_code, 200)
+        self.assertIn(
+            created_user["id"],
+            {user["id"] for user in listed.get_json()["users"]},
+        )
+
+        patched = self.client.patch(
+            f"/auth/users/{created_user['id']}",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "roles": [Role.OPERATOR.value],
+                "allowedChannelIds": [7, 8],
+                "isActive": False,
+            },
+        )
+        self.assertEqual(patched.status_code, 200, patched.get_json())
+        self.assertFalse(patched.get_json()["user"]["isActive"])
+        self.assertEqual(
+            patched.get_json()["user"]["allowedChannelIds"],
+            [7, 8],
+        )
+
+        revoked = self.client.post(
+            f"/auth/users/{created_user['id']}/revoke-sessions",
+            headers={"X-CSRF-Token": csrf_token},
+            json={"reason": "pilot_rotation"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.get_json())
+        self.assertEqual(revoked.get_json()["revokedSessions"], 2)
+        self.assertEqual(
+            self.repository.revoked_user_sessions[-1],
+            (created_user["id"], USER_ID, "pilot_rotation"),
+        )
+        self.assertTrue(
+            any(
+                event.action == "auth.users.update.completed"
+                and event.target_id == created_user["id"]
+                for event in self.audit.events
+            )
+        )
 
 
 if __name__ == "__main__":

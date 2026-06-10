@@ -26,6 +26,9 @@ QUEUE_GRANTS_MIGRATION = ROOT / "migrations" / "versions" / (
 DURABLE_APPROVALS_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260609_0003_durable_agent_approvals.py"
 )
+IAM_ADMIN_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260610_0004_iam_admin_and_throttle.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -238,7 +241,7 @@ class MigrationContentTests(unittest.TestCase):
             queue_grants_source,
         )
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260609_0003"',
             durable_approvals_source,
         )
         self.assertIn(
@@ -250,6 +253,17 @@ class MigrationContentTests(unittest.TestCase):
             "ux_agent_action_approvals_one_active_per_plan",
             durable_approvals_source,
         )
+        iam_admin_source = IAM_ADMIN_MIGRATION.read_text(encoding="utf-8")
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            iam_admin_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260609_0003"',
+            iam_admin_source,
+        )
+        self.assertIn("CREATE TABLE iam.login_attempts", iam_admin_source)
+        self.assertIn("GRANT SELECT, INSERT, UPDATE, DELETE", iam_admin_source)
 
 
 @unittest.skipUnless(

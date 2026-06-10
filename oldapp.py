@@ -51,6 +51,8 @@ from security import (
     InvalidCredentials,
     LoginThrottled,
     Permission,
+    ROLE_PERMISSIONS,
+    Role,
     require_channel_access,
     require_permission,
 )
@@ -103,6 +105,8 @@ PROBE_ROI_MIN_SIDE = 0.02
 PROBE_ROI_PADDING = 0.05
 _auth_service: Optional[AuthenticationService] = None
 _auth_service_lock = Lock()
+_identity_repository: Optional[Any] = None
+_identity_repository_lock = Lock()
 _audit_writer: Optional[Any] = None
 _audit_writer_lock = Lock()
 _audit_db_pool: Optional[PsycopgPool] = None
@@ -321,21 +325,40 @@ def _source_ip() -> str:
     return str(request.remote_addr or "0.0.0.0")
 
 
+def _get_identity_repository() -> Any:
+    global _identity_repository
+    with _identity_repository_lock:
+        if _identity_repository is None:
+            from security.postgres_identity import PostgresIdentityRepository
+
+            _identity_repository = PostgresIdentityRepository(
+                _get_control_plane_db_pool()
+            )
+        return _identity_repository
+
+
 def _get_auth_service() -> AuthenticationService:
     global _auth_service
     with _auth_service_lock:
         if _auth_service is None:
             if not str(getattr(config, "AUTH_TENANT_ID", "") or "").strip():
                 raise RuntimeError("EVOSSEARCH_AUTH_TENANT_ID is required")
-            from security.postgres_identity import PostgresIdentityRepository
+            from security.postgres_throttling import PostgresLoginThrottleRepository
+            from security.throttling import LoginThrottleService
 
-            repository = PostgresIdentityRepository(_get_control_plane_db_pool())
+            throttle = LoginThrottleService(
+                PostgresLoginThrottleRepository(
+                    _get_control_plane_db_pool(),
+                    config.AUTH_TENANT_ID,
+                )
+            )
             _auth_service = AuthenticationService(
-                repository,
+                _get_identity_repository(),
                 tenant_id=config.AUTH_TENANT_ID,
                 session_ttl=timedelta(
                     hours=int(config.AUTH_SESSION_TTL_HOURS)
                 ),
+                throttle=throttle,
             )
         return _auth_service
 
@@ -2401,6 +2424,7 @@ def _identity_payload(identity: Any) -> Dict[str, Any]:
         "tenantId": identity.tenant_id,
         "username": identity.username,
         "displayName": identity.display_name,
+        "isActive": bool(getattr(identity, "is_active", True)),
         "roles": sorted(identity.roles),
         "permissions": sorted(identity.permissions),
         "allowedChannelIds": sorted(
@@ -2408,6 +2432,87 @@ def _identity_payload(identity: Any) -> Dict[str, Any]:
             key=lambda value: str(value),
         ),
     }
+
+
+def _role_payload(role: Role) -> Dict[str, Any]:
+    permissions = ROLE_PERMISSIONS[role]
+    return {
+        "name": role.value,
+        "permissions": sorted(permission.value for permission in permissions),
+    }
+
+
+def _auth_admin_guard(*, write: bool, action: str):
+    return _session_guard(
+        permission=Permission.USERS_MANAGE,
+        require_csrf=write,
+        action=action,
+    )
+
+
+def _body_value(data: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in data:
+            return data[name]
+    return None
+
+
+def _has_body_value(data: Mapping[str, Any], *names: str) -> bool:
+    return any(name in data for name in names)
+
+
+def _parse_roles_payload(value: Any, *, default: Sequence[str] | None = None) -> List[str]:
+    raw = default if value is None and default is not None else value
+    if isinstance(raw, str):
+        roles = [raw]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+        roles = [str(item) for item in raw]
+    else:
+        raise ValueError("roles must be a list")
+    if not roles:
+        raise ValueError("at least one role is required")
+    return roles
+
+
+def _parse_channel_ids_payload(value: Any) -> List[Union[int, str]]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int)):
+        raw_items: Sequence[Any] = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        raw_items = value
+    else:
+        raise ValueError("allowedChannelIds must be a list")
+    parsed: List[Union[int, str]] = []
+    for item in raw_items:
+        if str(item).strip() == ALL_CHANNELS:
+            parsed.append(ALL_CHANNELS)
+            continue
+        try:
+            channel_id = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("allowedChannelIds must contain positive integers") from exc
+        if channel_id <= 0:
+            raise ValueError("allowedChannelIds must contain positive integers")
+        parsed.append(channel_id)
+    return parsed
+
+
+def _audit_identity_admin_result(
+    *,
+    action: str,
+    result: str,
+    target_id: Optional[str] = None,
+    details: Optional[Mapping[str, Any]] = None,
+) -> None:
+    _write_security_audit(
+        context=_current_auth_context(),
+        action=action,
+        result=result,
+        target_type="iam_user",
+        target_id=target_id,
+        details=details,
+    )
 
 
 @app.route('/auth/login', methods=['POST'])
@@ -2536,6 +2641,220 @@ def auth_me():
             "csrfHeader": "X-CSRF-Token",
         }
     )
+
+
+@app.route('/auth/roles', methods=['GET'])
+def auth_roles():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=False, action="auth.roles.read")
+    if guard is not None:
+        return guard
+    return jsonify(
+        {
+            "success": True,
+            "roles": [_role_payload(role) for role in Role],
+        }
+    )
+
+
+@app.route('/auth/users', methods=['GET', 'POST'])
+def auth_users():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=request.method == "POST",
+        action=(
+            "auth.users.create"
+            if request.method == "POST"
+            else "auth.users.list"
+        ),
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+
+    repository = _get_identity_repository()
+    if request.method == "GET":
+        include_inactive = _coerce_bool(
+            request.args.get("includeInactive"),
+            default=True,
+        )
+        try:
+            users = repository.list_users(
+                context.tenant_id,
+                actor_user_id=context.user_id,
+                include_inactive=include_inactive,
+            )
+        except Exception:
+            return _auth_failure_response("Identity service unavailable", 503)
+        return jsonify(
+            {
+                "success": True,
+                "users": [_identity_payload(user) for user in users],
+            }
+        )
+
+    data = _json_body()
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    display_name = _body_value(data, "displayName", "display_name")
+    is_active = _coerce_bool(_body_value(data, "isActive", "is_active"), True)
+    try:
+        roles = _parse_roles_payload(data.get("roles"), default=[Role.VIEWER.value])
+        channel_ids = _parse_channel_ids_payload(
+            _body_value(data, "allowedChannelIds", "allowed_channel_ids")
+        )
+        if not username or not password:
+            raise ValueError("username and password are required")
+        user = repository.create_user(
+            context.tenant_id,
+            actor_user_id=context.user_id,
+            username=username,
+            password=password,
+            display_name=None if display_name is None else str(display_name),
+            roles=roles,
+            allowed_channel_ids=channel_ids,
+            is_active=is_active,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.create.completed",
+            result="success",
+            target_id=user.user_id,
+            details={
+                "username": user.username,
+                "roles": sorted(user.roles),
+                "is_active": user.is_active,
+            },
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+
+    return jsonify({"success": True, "user": _identity_payload(user)}), 201
+
+
+@app.route('/auth/users/<user_id>', methods=['GET', 'PATCH'])
+def auth_user(user_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=request.method == "PATCH",
+        action=(
+            "auth.users.update"
+            if request.method == "PATCH"
+            else "auth.users.read"
+        ),
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+
+    repository = _get_identity_repository()
+    if request.method == "GET":
+        try:
+            user = repository.get_user(
+                context.tenant_id,
+                user_id,
+                actor_user_id=context.user_id,
+            )
+        except ValueError as exc:
+            return _auth_failure_response(str(exc), 400)
+        except Exception:
+            return _auth_failure_response("Identity service unavailable", 503)
+        if user is None:
+            return _auth_failure_response("User not found", 404)
+        return jsonify({"success": True, "user": _identity_payload(user)})
+
+    data = _json_body()
+    updates: Dict[str, Any] = {}
+    try:
+        if _has_body_value(data, "displayName", "display_name"):
+            updates["display_name"] = _body_value(
+                data,
+                "displayName",
+                "display_name",
+            )
+        if _has_body_value(data, "password"):
+            updates["password"] = str(data.get("password") or "")
+        if _has_body_value(data, "roles"):
+            updates["roles"] = _parse_roles_payload(data.get("roles"))
+        if _has_body_value(data, "allowedChannelIds", "allowed_channel_ids"):
+            updates["allowed_channel_ids"] = _parse_channel_ids_payload(
+                _body_value(data, "allowedChannelIds", "allowed_channel_ids")
+            )
+        if _has_body_value(data, "isActive", "is_active"):
+            updates["is_active"] = _coerce_bool(
+                _body_value(data, "isActive", "is_active"),
+                default=True,
+            )
+        if not updates:
+            raise ValueError("no user fields to update")
+        user = repository.update_user(
+            context.tenant_id,
+            user_id,
+            actor_user_id=context.user_id,
+            **updates,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.update.completed",
+            result="success",
+            target_id=user.user_id,
+            details={
+                "updated_fields": sorted(updates),
+                "roles": sorted(user.roles),
+                "is_active": user.is_active,
+            },
+        )
+    except LookupError:
+        return _auth_failure_response("User not found", 404)
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "user": _identity_payload(user)})
+
+
+@app.route('/auth/users/<user_id>/revoke-sessions', methods=['POST'])
+def auth_user_revoke_sessions(user_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=True,
+        action="auth.users.revoke_sessions",
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    data = _json_body()
+    reason = str(data.get("reason") or "admin_revoked").strip()
+    try:
+        revoked = _get_identity_repository().revoke_user_sessions(
+            context.tenant_id,
+            user_id,
+            actor_user_id=context.user_id,
+            reason=reason,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.revoke_sessions.completed",
+            result="success",
+            target_id=user_id,
+            details={"revoked_sessions": revoked, "reason": reason},
+        )
+    except LookupError:
+        return _auth_failure_response("User not found", 404)
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "revokedSessions": revoked})
 
 
 @app.route('/auth/logout', methods=['POST'])
@@ -7616,6 +7935,7 @@ def agent_session(session_id: str):
 @atexit.register
 def _shutdown_background_workers() -> None:
     global _audit_db_pool, _audit_writer, _control_plane_db_pool
+    global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
     try:
         if _inference_queue_runtime is not None:
@@ -7640,6 +7960,7 @@ def _shutdown_background_workers() -> None:
         if _control_plane_db_pool is not None:
             _control_plane_db_pool.close()
             _control_plane_db_pool = None
+            _identity_repository = None
     except Exception:
         pass
     try:

@@ -376,6 +376,32 @@ class RepositoryUnitTests(unittest.TestCase):
         )
         self.assertEqual(set(role_ids), set(Role))
 
+    def test_user_lifecycle_validates_before_database_access(self):
+        repository = PostgresIdentityRepository(FakePool(), self.hasher)
+
+        with self.assertRaisesRegex(ValueError, "cannot deactivate"):
+            repository.update_user(
+                self.tenant_id,
+                self.user_id,
+                actor_user_id=self.user_id,
+                is_active=False,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot remove"):
+            repository.update_user(
+                self.tenant_id,
+                self.user_id,
+                actor_user_id=self.user_id,
+                roles=[Role.VIEWER.value],
+            )
+        with self.assertRaisesRegex(ValueError, "at least 12"):
+            repository.create_user(
+                self.tenant_id,
+                actor_user_id=self.user_id,
+                username="viewer",
+                password="short",
+                roles=[Role.VIEWER.value],
+            )
+
     def test_admin_identity_uses_all_channels_without_reading_grants(self):
         connection = ScriptedConnection(
             [
