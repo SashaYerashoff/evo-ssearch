@@ -233,6 +233,10 @@ class Config:
         'EVOSSEARCH_DB_STRICT_RUNTIME_ROLES',
         os.getenv('EVA_DB_STRICT_RUNTIME_ROLES', 'False'),
     )
+    SECURE_DEPLOYMENT_REQUIRED = _get_bool_env(
+        'EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED',
+        'False',
+    )
 
     # LM Studio / Qwen video understanding
     LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:1234/v1').strip().rstrip('/')

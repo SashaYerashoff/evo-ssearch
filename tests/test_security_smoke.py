@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import oldapp
 from oldapp import (
     ENV_SECRET_REDACTION,
     _redact_env_map,
@@ -18,12 +19,24 @@ class SecuritySmokeTests(unittest.TestCase):
         self._orig_auth_enabled = config.AUTH_ENABLED
         self._orig_admin_token = config.ADMIN_TOKEN
         self._orig_settings_local_only = config.SETTINGS_LOCAL_ONLY
+        self._orig_secure_deployment_required = getattr(
+            config,
+            "SECURE_DEPLOYMENT_REQUIRED",
+            False,
+        )
+        self._orig_db_strict_runtime_roles = getattr(
+            config,
+            "DB_STRICT_RUNTIME_ROLES",
+            False,
+        )
         config.AUTH_ENABLED = False
 
     def tearDown(self) -> None:
         config.AUTH_ENABLED = self._orig_auth_enabled
         config.ADMIN_TOKEN = self._orig_admin_token
         config.SETTINGS_LOCAL_ONLY = self._orig_settings_local_only
+        config.SECURE_DEPLOYMENT_REQUIRED = self._orig_secure_deployment_required
+        config.DB_STRICT_RUNTIME_ROLES = self._orig_db_strict_runtime_roles
 
     def test_search_missing_json_returns_api_error(self) -> None:
         resp = self.client.post("/search")
@@ -87,6 +100,23 @@ class SecuritySmokeTests(unittest.TestCase):
             payload["envVariables"]["EVOSSEARCH_ADMIN_TOKEN"],
             ENV_SECRET_REDACTION,
         )
+
+    def test_secure_deployment_gate_requires_named_auth_and_strict_roles(self) -> None:
+        config.SECURE_DEPLOYMENT_REQUIRED = True
+        config.AUTH_ENABLED = False
+
+        disabled = oldapp._check_auth_ready()
+        self.assertFalse(disabled["ok"])
+        self.assertTrue(disabled["required"])
+        self.assertEqual(disabled["status"], "disabled")
+
+        config.AUTH_ENABLED = True
+        config.DB_STRICT_RUNTIME_ROLES = False
+        misconfigured = oldapp._check_auth_ready()
+        self.assertFalse(misconfigured["ok"])
+        self.assertTrue(misconfigured["required"])
+        self.assertEqual(misconfigured["status"], "misconfigured")
+        self.assertIn("STRICT_RUNTIME_ROLES", misconfigured["error"])
 
     def test_mutating_endpoint_requires_admin_token(self) -> None:
         config.ADMIN_TOKEN = ""

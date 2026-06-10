@@ -2469,8 +2469,31 @@ def _check_postgres_ready() -> Dict[str, Any]:
 
 
 def _check_auth_ready() -> Dict[str, Any]:
+    secure_required = bool(
+        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+    )
     if not _auth_enabled():
-        return _component_result(False, "disabled", required=False)
+        return _component_result(
+            False,
+            "disabled",
+            required=secure_required,
+            error=(
+                "EVOSSEARCH_AUTH_ENABLED=true is required for secure deployment"
+                if secure_required
+                else None
+            ),
+        )
+    if secure_required and not bool(
+        getattr(config, "DB_STRICT_RUNTIME_ROLES", False)
+    ):
+        return _component_result(
+            False,
+            "misconfigured",
+            error=(
+                "EVOSSEARCH_DB_STRICT_RUNTIME_ROLES=true is required for "
+                "secure deployment"
+            ),
+        )
     tenant_id = str(getattr(config, "AUTH_TENANT_ID", "") or "").strip()
     if not tenant_id:
         return _component_result(
@@ -7656,6 +7679,9 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_MAX_FILE_SIZE_MB": str(config.MAX_FILE_SIZE_MB),
         "EVOSSEARCH_ADMIN_TOKEN": str(config.ADMIN_TOKEN),
         "EVOSSEARCH_SETTINGS_LOCAL_ONLY": _bool_to_env(config.SETTINGS_LOCAL_ONLY),
+        "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED": _bool_to_env(
+            getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+        ),
         "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
         "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
     }
@@ -8097,6 +8123,7 @@ EVOSSEARCH_MAX_COMMENT_LENGTH={max_comment_length}
 EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 EVOSSEARCH_ADMIN_TOKEN={config.ADMIN_TOKEN}
 EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
+EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED={str(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)).lower()}
 EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
 EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
