@@ -2955,8 +2955,33 @@
     const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
     const luxriotSevHighInput = document.getElementById('luxriotSevHigh');
     const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
+    const adminUsersNavBtn = document.getElementById('adminUsersNavBtn');
+    const adminUsersSection = document.getElementById('settings-section-users');
+    const adminUsersDenied = document.getElementById('adminUsersDenied');
+    const adminUsersPanel = document.getElementById('adminUsersPanel');
+    const adminUsersStatus = document.getElementById('adminUsersStatus');
+    const adminUsersRefreshBtn = document.getElementById('adminUsersRefreshBtn');
+    const adminUsersNewBtn = document.getElementById('adminUsersNewBtn');
+    const adminUsersList = document.getElementById('adminUsersList');
+    const adminUserEditorTitle = document.getElementById('adminUserEditorTitle');
+    const adminUsernameInput = document.getElementById('adminUsernameInput');
+    const adminDisplayNameInput = document.getElementById('adminDisplayNameInput');
+    const adminPasswordInput = document.getElementById('adminPasswordInput');
+    const adminRolesList = document.getElementById('adminRolesList');
+    const adminAllowedChannelsInput = document.getElementById('adminAllowedChannelsInput');
+    const adminUserActiveInput = document.getElementById('adminUserActiveInput');
+    const adminUserSaveBtn = document.getElementById('adminUserSaveBtn');
+    const adminUserRevokeBtn = document.getElementById('adminUserRevokeBtn');
+    const adminUserClearBtn = document.getElementById('adminUserClearBtn');
+    const adminSessionsActiveOnlyInput = document.getElementById('adminSessionsActiveOnlyInput');
+    const adminSessionsRefreshBtn = document.getElementById('adminSessionsRefreshBtn');
+    const adminSessionsList = document.getElementById('adminSessionsList');
     
     let segmentThreshold = 0.7;
+    let adminRoles = [];
+    let adminUsers = [];
+    let adminSessions = [];
+    let selectedAdminUserId = null;
 
     function setActiveSettingsNav(targetId) {
         settingsNavButtons.forEach((btn) => {
@@ -2983,6 +3008,358 @@
             return fallback;
         }
         return Boolean(value);
+    }
+
+    function userCanManageUsers() {
+        return Boolean(
+            AUTH_ENABLED
+            && authCurrentUser
+            && Array.isArray(authCurrentUser.permissions)
+            && authCurrentUser.permissions.includes('users:manage')
+        );
+    }
+
+    function setAdminUsersStatus(message = '', type = '') {
+        if (!adminUsersStatus) return;
+        adminUsersStatus.textContent = message;
+        adminUsersStatus.className = `admin-inline-status ${type || ''}`.trim();
+    }
+
+    function setAdminUsersAccess(allowed) {
+        const enabled = Boolean(allowed);
+        if (adminUsersNavBtn) adminUsersNavBtn.classList.toggle('is-hidden', !enabled);
+        if (adminUsersSection) adminUsersSection.classList.toggle('is-hidden', !enabled);
+        if (adminUsersDenied) adminUsersDenied.classList.toggle('is-hidden', enabled);
+        if (adminUsersPanel) adminUsersPanel.classList.toggle('is-hidden', !enabled);
+    }
+
+    function syncAdminUsersAccess() {
+        const allowed = userCanManageUsers();
+        setAdminUsersAccess(allowed);
+        return allowed;
+    }
+
+    function effectiveAdminRoles() {
+        if (adminRoles.length) return adminRoles;
+        return ['admin', 'engineer', 'operator', 'viewer'].map((name) => ({
+            name,
+            permissions: [],
+        }));
+    }
+
+    function formatAllowedChannels(channels) {
+        const values = Array.isArray(channels) ? channels : [];
+        if (values.some((value) => String(value).trim() === '*')) return '*';
+        return values.map((value) => String(value).trim()).filter(Boolean).join(', ');
+    }
+
+    function parseAllowedChannelsText(text) {
+        const raw = String(text || '').trim();
+        if (!raw) return [];
+        if (raw === '*') return ['*'];
+        const seen = new Set();
+        const parsed = [];
+        raw.split(/[,\s]+/).forEach((item) => {
+            if (seen.has('*')) return;
+            const clean = item.trim();
+            if (!clean) return;
+            if (clean === '*') {
+                seen.clear();
+                parsed.length = 0;
+                parsed.push('*');
+                seen.add('*');
+                return;
+            }
+            const value = Number.parseInt(clean, 10);
+            if (!Number.isFinite(value) || value <= 0 || String(value) !== clean) {
+                throw new Error('Channels must be "*" or positive numeric IDs.');
+            }
+            if (!seen.has(value)) {
+                seen.add(value);
+                parsed.push(value);
+            }
+        });
+        return parsed;
+    }
+
+    function formatDateTime(value) {
+        if (!value) return 'n/a';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString();
+    }
+
+    function selectedAdminRoles() {
+        if (!adminRolesList) return [];
+        return Array.from(adminRolesList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((input) => String(input.value || '').trim())
+            .filter(Boolean);
+    }
+
+    function renderAdminRoles(selectedRoles = []) {
+        if (!adminRolesList) return;
+        const selected = new Set(selectedRoles.map((role) => String(role || '').trim()));
+        adminRolesList.innerHTML = effectiveAdminRoles().map((role) => {
+            const name = String(role.name || '').trim();
+            if (!name) return '';
+            const permissions = Array.isArray(role.permissions) ? role.permissions : [];
+            const title = permissions.length ? ` title="${escapeHtml(permissions.join(', '))}"` : '';
+            const checked = selected.has(name) ? ' checked' : '';
+            return `
+                <label class="admin-role-item"${title}>
+                    <input type="checkbox" value="${escapeHtml(name)}"${checked} />
+                    <span>${escapeHtml(name)}</span>
+                </label>
+            `;
+        }).join('');
+    }
+
+    function setAdminEditorUser(user = null) {
+        const isExisting = Boolean(user && user.id);
+        selectedAdminUserId = isExisting ? String(user.id) : null;
+        if (adminUserEditorTitle) {
+            adminUserEditorTitle.textContent = isExisting ? `Edit ${user.username || user.id}` : 'New User';
+        }
+        if (adminUsernameInput) {
+            adminUsernameInput.value = isExisting ? String(user.username || '') : '';
+            adminUsernameInput.disabled = isExisting;
+        }
+        if (adminDisplayNameInput) {
+            adminDisplayNameInput.value = isExisting ? String(user.displayName || '') : '';
+        }
+        if (adminPasswordInput) {
+            adminPasswordInput.value = '';
+            adminPasswordInput.placeholder = isExisting ? 'Leave blank to keep current password' : 'Required for new user';
+        }
+        renderAdminRoles(isExisting ? (user.roles || []) : ['viewer']);
+        if (adminAllowedChannelsInput) {
+            adminAllowedChannelsInput.value = isExisting ? formatAllowedChannels(user.allowedChannelIds || []) : '*';
+        }
+        if (adminUserActiveInput) {
+            adminUserActiveInput.checked = isExisting ? Boolean(user.isActive) : true;
+        }
+        if (adminUserRevokeBtn) {
+            adminUserRevokeBtn.disabled = !isExisting;
+        }
+        renderAdminUsers();
+    }
+
+    function renderAdminUsers() {
+        if (!adminUsersList) return;
+        if (!adminUsers.length) {
+            adminUsersList.innerHTML = '<div class="admin-empty">No users found.</div>';
+            return;
+        }
+        const currentUserId = authCurrentUser ? String(authCurrentUser.id || '') : '';
+        adminUsersList.innerHTML = adminUsers.map((user) => {
+            const id = String(user.id || '');
+            const selected = id && id === selectedAdminUserId ? ' selected' : '';
+            const inactive = user.isActive ? '' : ' inactive';
+            const selfBadge = id && id === currentUserId ? '<span class="admin-user-badge">you</span>' : '';
+            const channels = formatAllowedChannels(user.allowedChannelIds || []) || 'none';
+            return `
+                <button type="button" class="admin-user-row${selected}${inactive}" data-user-id="${escapeHtml(id)}">
+                    <span class="admin-user-main">
+                        <span class="admin-user-name">${escapeHtml(user.username || id)}</span>
+                        ${selfBadge}
+                    </span>
+                    <span class="admin-user-meta">${escapeHtml((user.roles || []).join(', ') || 'no roles')} · channels ${escapeHtml(channels)}</span>
+                </button>
+            `;
+        }).join('');
+    }
+
+    function renderAdminSessions() {
+        if (!adminSessionsList) return;
+        if (!adminSessions.length) {
+            adminSessionsList.innerHTML = '<div class="admin-empty">No sessions found.</div>';
+            return;
+        }
+        adminSessionsList.innerHTML = `
+            <table class="admin-session-table">
+                <thead>
+                    <tr>
+                        <th>User</th>
+                        <th>Last seen</th>
+                        <th>Expires</th>
+                        <th>Status</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${adminSessions.map((session) => {
+                        const revoked = Boolean(session.revokedAt);
+                        const status = revoked ? `revoked${session.revokeReason ? `: ${session.revokeReason}` : ''}` : 'active';
+                        const revokeButton = revoked
+                            ? ''
+                            : `<button type="button" class="settings-btn admin-row-btn" data-session-revoke="${escapeHtml(session.id || '')}">Revoke</button>`;
+                        return `
+                            <tr>
+                                <td>
+                                    <div class="admin-session-user">${escapeHtml(session.username || session.userId || '')}</div>
+                                    <div class="admin-session-sub">${escapeHtml(session.clientIp || '')}</div>
+                                </td>
+                                <td>${escapeHtml(formatDateTime(session.lastSeenAt))}</td>
+                                <td>${escapeHtml(formatDateTime(session.expiresAt))}</td>
+                                <td><span class="admin-session-status ${revoked ? 'revoked' : 'active'}">${escapeHtml(status)}</span></td>
+                                <td>${revokeButton}</td>
+                            </tr>
+                        `;
+                    }).join('')}
+                </tbody>
+            </table>
+        `;
+    }
+
+    async function loadAdminRoles() {
+        const response = await fetch('/auth/roles', { cache: 'no-store' });
+        const data = await parseApiJson(response, 'Failed to load roles');
+        adminRoles = Array.isArray(data.roles) ? data.roles : [];
+        const selected = selectedAdminRoles();
+        renderAdminRoles(selected.length ? selected : ['viewer']);
+    }
+
+    async function loadAdminUsers() {
+        const response = await fetch('/auth/users?includeInactive=true', { cache: 'no-store' });
+        const data = await parseApiJson(response, 'Failed to load users');
+        adminUsers = Array.isArray(data.users) ? data.users : [];
+        adminUsers.sort((left, right) => String(left.username || '').localeCompare(String(right.username || '')));
+        if (selectedAdminUserId && !adminUsers.some((user) => String(user.id) === selectedAdminUserId)) {
+            selectedAdminUserId = null;
+        }
+        renderAdminUsers();
+        if (selectedAdminUserId) {
+            const selected = adminUsers.find((user) => String(user.id) === selectedAdminUserId);
+            if (selected) setAdminEditorUser(selected);
+        } else if (adminUsers.length && adminUserEditorTitle && adminUserEditorTitle.textContent !== 'New User') {
+            setAdminEditorUser(adminUsers[0]);
+        }
+    }
+
+    async function loadAdminSessions() {
+        const activeOnly = adminSessionsActiveOnlyInput ? adminSessionsActiveOnlyInput.checked : true;
+        const params = new URLSearchParams({ activeOnly: activeOnly ? 'true' : 'false' });
+        const response = await fetch(`/auth/sessions?${params.toString()}`, { cache: 'no-store' });
+        const data = await parseApiJson(response, 'Failed to load sessions');
+        adminSessions = Array.isArray(data.sessions) ? data.sessions : [];
+        renderAdminSessions();
+    }
+
+    async function loadAdminConsole() {
+        if (!syncAdminUsersAccess()) return;
+        if (!selectedAdminUserId) {
+            setAdminEditorUser(null);
+        }
+        setAdminUsersStatus('Loading users...', 'loading');
+        try {
+            await loadAdminRoles();
+            await Promise.all([loadAdminUsers(), loadAdminSessions()]);
+            setAdminUsersStatus(`Loaded ${adminUsers.length} users and ${adminSessions.length} sessions.`, 'success');
+        } catch (error) {
+            const message = error.message || String(error);
+            if (/permission|forbidden|required/i.test(message)) {
+                setAdminUsersAccess(false);
+            }
+            setAdminUsersStatus(message, 'error');
+        }
+    }
+
+    async function saveAdminUser() {
+        if (!syncAdminUsersAccess()) return;
+        const roles = selectedAdminRoles();
+        if (!roles.length) {
+            setAdminUsersStatus('Select at least one role.', 'error');
+            return;
+        }
+        let allowedChannelIds;
+        try {
+            allowedChannelIds = parseAllowedChannelsText(adminAllowedChannelsInput ? adminAllowedChannelsInput.value : '');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+            return;
+        }
+        const password = adminPasswordInput ? adminPasswordInput.value : '';
+        const payload = {
+            displayName: adminDisplayNameInput ? adminDisplayNameInput.value.trim() : '',
+            roles,
+            allowedChannelIds,
+            isActive: adminUserActiveInput ? adminUserActiveInput.checked : true,
+        };
+        if (selectedAdminUserId) {
+            if (password) payload.password = password;
+        } else {
+            payload.username = adminUsernameInput ? adminUsernameInput.value.trim() : '';
+            payload.password = password;
+            if (!payload.username || !payload.password) {
+                setAdminUsersStatus('Username and password are required for a new user.', 'error');
+                return;
+            }
+        }
+
+        setButtonBusy(adminUserSaveBtn, true);
+        setAdminUsersStatus('Saving user...', 'loading');
+        try {
+            const url = selectedAdminUserId ? `/auth/users/${encodeURIComponent(selectedAdminUserId)}` : '/auth/users';
+            const response = await fetch(url, {
+                method: selectedAdminUserId ? 'PATCH' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await parseApiJson(response, 'Failed to save user');
+            const saved = data.user || null;
+            if (saved && saved.id) {
+                selectedAdminUserId = String(saved.id);
+            }
+            if (adminPasswordInput) adminPasswordInput.value = '';
+            await loadAdminUsers();
+            setAdminUsersStatus('User saved.', 'success');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        } finally {
+            setButtonBusy(adminUserSaveBtn, false);
+        }
+    }
+
+    async function revokeSelectedAdminUserSessions() {
+        if (!selectedAdminUserId) return;
+        const user = adminUsers.find((item) => String(item.id) === selectedAdminUserId);
+        const label = user ? (user.username || user.id) : selectedAdminUserId;
+        if (!window.confirm(`Revoke active sessions for ${label}?`)) return;
+        setButtonBusy(adminUserRevokeBtn, true);
+        setAdminUsersStatus('Revoking user sessions...', 'loading');
+        try {
+            const response = await fetch(`/auth/users/${encodeURIComponent(selectedAdminUserId)}/revoke-sessions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: 'admin_ui' }),
+            });
+            const data = await parseApiJson(response, 'Failed to revoke sessions');
+            await loadAdminSessions();
+            setAdminUsersStatus(`Revoked ${data.revokedSessions || 0} sessions.`, 'success');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        } finally {
+            setButtonBusy(adminUserRevokeBtn, false);
+        }
+    }
+
+    async function revokeAdminSession(sessionId) {
+        const clean = String(sessionId || '').trim();
+        if (!clean) return;
+        if (!window.confirm('Revoke this session?')) return;
+        setAdminUsersStatus('Revoking session...', 'loading');
+        try {
+            const response = await fetch(`/auth/sessions/${encodeURIComponent(clean)}/revoke`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: 'admin_ui' }),
+            });
+            await parseApiJson(response, 'Failed to revoke session');
+            await loadAdminSessions();
+            setAdminUsersStatus('Session revoked.', 'success');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        }
     }
 
     function clampSegmentThreshold(value) {
@@ -3380,6 +3757,9 @@
         }
         loadSettings();
         loadEnvEditor();
+        if (syncAdminUsersAccess()) {
+            loadAdminConsole();
+        }
         if (settingsScrollArea) {
             settingsScrollArea.scrollTop = 0;
         }
@@ -3423,6 +3803,79 @@
             settingsModal.style.display = 'none';
         }
     });
+
+    if (adminUsersRefreshBtn) {
+        adminUsersRefreshBtn.addEventListener('click', async () => {
+            setButtonBusy(adminUsersRefreshBtn, true);
+            try {
+                await loadAdminConsole();
+            } finally {
+                setButtonBusy(adminUsersRefreshBtn, false);
+            }
+        });
+    }
+    if (adminUsersNewBtn) {
+        adminUsersNewBtn.addEventListener('click', () => {
+            setAdminEditorUser(null);
+            setAdminUsersStatus('Creating a new user.', 'loading');
+        });
+    }
+    if (adminUsersList) {
+        adminUsersList.addEventListener('click', (event) => {
+            const row = event.target.closest('[data-user-id]');
+            if (!row) return;
+            const userId = String(row.dataset.userId || '');
+            const user = adminUsers.find((item) => String(item.id) === userId);
+            if (user) {
+                setAdminEditorUser(user);
+                setAdminUsersStatus(`Selected ${user.username || user.id}.`, 'loading');
+            }
+        });
+    }
+    if (adminUserSaveBtn) {
+        adminUserSaveBtn.addEventListener('click', () => {
+            saveAdminUser();
+        });
+    }
+    if (adminUserRevokeBtn) {
+        adminUserRevokeBtn.addEventListener('click', () => {
+            revokeSelectedAdminUserSessions();
+        });
+    }
+    if (adminUserClearBtn) {
+        adminUserClearBtn.addEventListener('click', () => {
+            setAdminEditorUser(null);
+            setAdminUsersStatus('', '');
+        });
+    }
+    if (adminSessionsRefreshBtn) {
+        adminSessionsRefreshBtn.addEventListener('click', async () => {
+            setButtonBusy(adminSessionsRefreshBtn, true);
+            setAdminUsersStatus('Refreshing sessions...', 'loading');
+            try {
+                await loadAdminSessions();
+                setAdminUsersStatus(`Loaded ${adminSessions.length} sessions.`, 'success');
+            } catch (error) {
+                setAdminUsersStatus(error.message || String(error), 'error');
+            } finally {
+                setButtonBusy(adminSessionsRefreshBtn, false);
+            }
+        });
+    }
+    if (adminSessionsActiveOnlyInput) {
+        adminSessionsActiveOnlyInput.addEventListener('change', () => {
+            loadAdminSessions().catch((error) => {
+                setAdminUsersStatus(error.message || String(error), 'error');
+            });
+        });
+    }
+    if (adminSessionsList) {
+        adminSessionsList.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-session-revoke]');
+            if (!button) return;
+            revokeAdminSession(button.dataset.sessionRevoke);
+        });
+    }
 
     if (probeEditBtn && probeEditorModal) {
         probeEditBtn.addEventListener('click', () => {

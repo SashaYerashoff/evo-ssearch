@@ -797,6 +797,10 @@
                     <span class="settings-nav-label">Luxriot</span>
                     <span class="settings-nav-meta">Channels, snapshots, bookmarks, and severity mapping.</span>
                 </button>
+                <button type="button" class="settings-nav-btn" id="adminUsersNavBtn" data-settings-target="settings-section-users">
+                    <span class="settings-nav-label">Users</span>
+                    <span class="settings-nav-meta">Named accounts, channel scope, and active sessions.</span>
+                </button>
                 <button type="button" class="settings-nav-btn" data-settings-target="settings-section-env">
                     <span class="settings-nav-label">Environment</span>
                     <span class="settings-nav-meta">Edit `EVOSSEARCH_*` values and persist to `.env`.</span>
@@ -1000,6 +1004,73 @@
                                 <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
                                 <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
                                 <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="settings-section-users" class="settings-section settings-section-wide admin-users-section">
+                        <h3>Users &amp; Sessions</h3>
+                        <div class="settings-section-meta">Named-account control for deployments with audit requirements.</div>
+                        <div id="adminUsersDenied" class="admin-access-note is-hidden">Users require an administrator session.</div>
+                        <div id="adminUsersPanel" class="admin-users-panel">
+                            <div class="admin-users-toolbar">
+                                <div id="adminUsersStatus" class="admin-inline-status"></div>
+                                <div class="admin-users-actions">
+                                    <button type="button" class="settings-btn" id="adminUsersRefreshBtn">Refresh</button>
+                                    <button type="button" class="settings-btn primary" id="adminUsersNewBtn">New User</button>
+                                </div>
+                            </div>
+                            <div class="admin-users-grid">
+                                <div class="admin-users-list">
+                                    <div class="admin-panel-title">Accounts</div>
+                                    <div id="adminUsersList" class="admin-list"></div>
+                                </div>
+                                <div class="admin-user-editor">
+                                    <div class="admin-panel-title" id="adminUserEditorTitle">New User</div>
+                                    <div class="settings-row">
+                                        <label class="settings-label" for="adminUsernameInput">Username:</label>
+                                        <input type="text" id="adminUsernameInput" class="settings-input" autocomplete="off" />
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="settings-label" for="adminDisplayNameInput">Display name:</label>
+                                        <input type="text" id="adminDisplayNameInput" class="settings-input" autocomplete="off" />
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="settings-label" for="adminPasswordInput">Password:</label>
+                                        <input type="password" id="adminPasswordInput" class="settings-input" autocomplete="new-password" />
+                                    </div>
+                                    <div class="settings-row align-start">
+                                        <label class="settings-label">Roles:</label>
+                                        <div id="adminRolesList" class="admin-role-list"></div>
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="settings-label" for="adminAllowedChannelsInput">Channels:</label>
+                                        <input type="text" id="adminAllowedChannelsInput" class="settings-input" placeholder="* or 7,8,9" />
+                                    </div>
+                                    <div class="settings-row">
+                                        <label class="settings-label" for="adminUserActiveInput">Active:</label>
+                                        <input type="checkbox" id="adminUserActiveInput" class="settings-checkbox" checked />
+                                    </div>
+                                    <div class="admin-editor-actions">
+                                        <button type="button" class="settings-btn primary" id="adminUserSaveBtn">Save User</button>
+                                        <button type="button" class="settings-btn" id="adminUserRevokeBtn">Revoke Sessions</button>
+                                        <button type="button" class="settings-btn" id="adminUserClearBtn">Clear</button>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="admin-sessions-panel">
+                                <div class="admin-sessions-head">
+                                    <div>
+                                        <div class="admin-panel-title">Sessions</div>
+                                        <div class="settings-section-meta">Current session inventory for named users.</div>
+                                    </div>
+                                    <label class="admin-checkbox-label">
+                                        <input type="checkbox" id="adminSessionsActiveOnlyInput" checked />
+                                        Active only
+                                    </label>
+                                    <button type="button" class="settings-btn" id="adminSessionsRefreshBtn">Refresh Sessions</button>
+                                </div>
+                                <div id="adminSessionsList" class="admin-session-list"></div>
                             </div>
                         </div>
                     </div>

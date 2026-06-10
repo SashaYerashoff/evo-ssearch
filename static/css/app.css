@@ -7185,6 +7185,231 @@ textarea::placeholder {
     background: linear-gradient(180deg, rgba(17, 23, 30, 0), rgba(17, 23, 30, 0.96) 26%);
 }
 
+.admin-access-note {
+    border: 1px solid rgba(201, 141, 64, 0.42);
+    border-radius: 8px;
+    padding: 12px 14px;
+    color: #f1c487;
+    background: rgba(201, 141, 64, 0.12);
+}
+
+.admin-users-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.admin-users-toolbar,
+.admin-users-actions,
+.admin-editor-actions,
+.admin-sessions-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.admin-users-toolbar,
+.admin-sessions-head {
+    justify-content: space-between;
+}
+
+.admin-inline-status {
+    min-height: 20px;
+    color: #a8b1bd;
+    font-size: 0.86rem;
+}
+
+.admin-inline-status.success {
+    color: #79d49d;
+}
+
+.admin-inline-status.error {
+    color: #ef7d7d;
+}
+
+.admin-inline-status.loading {
+    color: #8dbdff;
+}
+
+.admin-users-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+}
+
+.admin-panel-title {
+    color: #edf3fb;
+    font-size: 0.88rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+}
+
+.admin-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 420px;
+    overflow: auto;
+    padding-right: 4px;
+}
+
+.admin-user-row {
+    width: 100%;
+    border: 1px solid rgba(58, 72, 88, 0.9);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #dde6f1;
+    background: rgba(12, 18, 26, 0.7);
+    text-align: left;
+    cursor: pointer;
+}
+
+.admin-user-row:hover,
+.admin-user-row.selected {
+    border-color: rgba(88, 156, 224, 0.85);
+    background: rgba(35, 79, 120, 0.28);
+}
+
+.admin-user-row.inactive {
+    opacity: 0.58;
+}
+
+.admin-user-main,
+.admin-user-meta,
+.admin-session-user,
+.admin-session-sub {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.admin-user-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.admin-user-name {
+    font-weight: 700;
+}
+
+.admin-user-badge,
+.admin-session-status {
+    border: 1px solid rgba(95, 134, 176, 0.8);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 0.68rem;
+    color: #cfe5ff;
+    background: rgba(71, 117, 168, 0.22);
+    text-transform: uppercase;
+}
+
+.admin-user-meta,
+.admin-session-sub {
+    color: #8e9aa8;
+    font-size: 0.78rem;
+}
+
+.admin-user-editor {
+    min-width: 0;
+}
+
+.app-settings-modal-content .admin-role-list,
+.app-settings-modal-content .admin-editor-actions {
+    grid-column: 2 / -1;
+}
+
+.admin-role-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.admin-role-item,
+.admin-checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    color: #d9e1eb;
+    font-size: 0.86rem;
+}
+
+.admin-role-item {
+    border: 1px solid rgba(64, 80, 98, 0.9);
+    border-radius: 8px;
+    padding: 7px 10px;
+    background: rgba(12, 18, 26, 0.66);
+}
+
+.admin-editor-actions {
+    justify-content: flex-start;
+    margin-top: 12px;
+}
+
+.admin-sessions-panel {
+    border-top: 1px solid rgba(47, 62, 78, 0.88);
+    padding-top: 18px;
+}
+
+.admin-session-list {
+    overflow: auto;
+}
+
+.admin-session-table {
+    width: 100%;
+    min-width: 760px;
+    border-collapse: collapse;
+    color: #dbe4ee;
+    font-size: 0.84rem;
+}
+
+.admin-session-table th,
+.admin-session-table td {
+    border-bottom: 1px solid rgba(44, 58, 74, 0.9);
+    padding: 9px 10px;
+    text-align: left;
+    vertical-align: middle;
+}
+
+.admin-session-table th {
+    color: #91a0b2;
+    font-size: 0.72rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.admin-session-status.active {
+    border-color: rgba(76, 162, 105, 0.82);
+    color: #c9f2d5;
+    background: rgba(76, 162, 105, 0.16);
+}
+
+.admin-session-status.revoked {
+    border-color: rgba(180, 81, 81, 0.82);
+    color: #ffc6c6;
+    background: rgba(180, 81, 81, 0.16);
+}
+
+.admin-row-btn {
+    min-height: 34px;
+    padding: 7px 10px;
+}
+
+.admin-empty {
+    border: 1px dashed rgba(67, 82, 99, 0.9);
+    border-radius: 8px;
+    padding: 14px;
+    color: #8e9aa8;
+    background: rgba(10, 15, 22, 0.45);
+}
+
 .env-editor {
     min-height: 320px;
 }
@@ -7309,8 +7534,14 @@ textarea::placeholder {
     .app-settings-modal-content .severity-row,
     .app-settings-modal-content .env-editor-actions,
     .app-settings-modal-content .settings-note,
-    .app-settings-modal-content .env-editor {
+    .app-settings-modal-content .env-editor,
+    .app-settings-modal-content .admin-role-list,
+    .app-settings-modal-content .admin-editor-actions {
         grid-column: auto;
+    }
+
+    .admin-users-grid {
+        grid-template-columns: 1fr;
     }
 
     .app-settings-modal-content .range-value {
