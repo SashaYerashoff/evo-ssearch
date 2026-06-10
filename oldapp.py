@@ -518,6 +518,38 @@ def _can_access_context_channel(
     return True
 
 
+def _filter_stream_status_for_context(
+    status: Mapping[str, Any],
+    context: Optional[AuthContext],
+) -> Dict[str, Any]:
+    filtered = dict(status)
+    if not _auth_enabled() or context is None:
+        return filtered
+    for key in ("video_streams", "analytics_streams"):
+        filtered[key] = [
+            item
+            for item in filtered.get(key) or []
+            if _can_access_context_channel(
+                context,
+                item.get("channel_id") if isinstance(item, Mapping) else None,
+            )
+        ]
+    for key in (
+        "paused_analytics_channels",
+        "video_history_channels",
+    ):
+        filtered[key] = [
+            channel_id
+            for channel_id in filtered.get(key) or []
+            if _can_access_context_channel(context, channel_id)
+        ]
+    filtered["running_total"] = sum(
+        len(filtered.get(key) or [])
+        for key in ("video_streams", "analytics_streams")
+    )
+    return filtered
+
+
 def _write_security_audit(
     *,
     context: Optional[AuthContext],
@@ -6303,31 +6335,12 @@ def luxriot_summary_rollups():
 def luxriot_streams_status():
     try:
         status = luxriot_manager.streams_status()
-        context = _current_auth_context()
-        if _auth_enabled() and context is not None:
-            for key in ("video_streams", "analytics_streams"):
-                status[key] = [
-                    item
-                    for item in status.get(key) or []
-                    if _can_access_context_channel(
-                        context,
-                        item.get("channel_id"),
-                    )
-                ]
-            for key in (
-                "paused_analytics_channels",
-                "video_history_channels",
-            ):
-                status[key] = [
-                    channel_id
-                    for channel_id in status.get(key) or []
-                    if _can_access_context_channel(context, channel_id)
-                ]
-            status["running_total"] = sum(
-                len(status.get(key) or [])
-                for key in ("video_streams", "analytics_streams")
+        return jsonify(
+            _filter_stream_status_for_context(
+                status,
+                _current_auth_context(),
             )
-        return jsonify(status)
+        )
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
@@ -6346,7 +6359,14 @@ def luxriot_stop_stream():
     pause_analytics = _coerce_bool(data.get('pause_analytics'), True)
     try:
         result = luxriot_manager.stop_stream(channel_id, stream_type=stream_type, pause_analytics=pause_analytics)
-        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
+        return jsonify({
+            'success': True,
+            'result': result,
+            'streams': _filter_stream_status_for_context(
+                luxriot_manager.streams_status(),
+                _current_auth_context(),
+            ),
+        })
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
@@ -6370,7 +6390,14 @@ def luxriot_stop_all_streams():
             stop_analytics=stop_analytics,
             pause_analytics=pause_analytics,
         )
-        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
+        return jsonify({
+            'success': True,
+            'result': result,
+            'streams': _filter_stream_status_for_context(
+                luxriot_manager.streams_status(),
+                _current_auth_context(),
+            ),
+        })
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 

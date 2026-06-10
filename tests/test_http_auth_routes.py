@@ -337,6 +337,53 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(payload["video_history_channels"], [7])
         self.assertEqual(payload["running_total"], 1)
 
+    def test_stop_stream_response_is_filtered_to_channel_grants(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.CAPTURE_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        streams = {
+            "video_streams": [
+                {"channel_id": 7},
+                {"channel_id": 8},
+            ],
+            "analytics_streams": [{"channel_id": 8}],
+            "paused_analytics_channels": [7, 8],
+            "video_history_channels": [7, 8],
+            "running_total": 3,
+        }
+        with (
+            patch(
+                "oldapp.luxriot_manager.stop_stream",
+                return_value={"stopped": True, "channel_id": 7},
+            ) as stop_stream,
+            patch(
+                "oldapp.luxriot_manager.streams_status",
+                return_value=streams,
+            ),
+        ):
+            response = self.client.post(
+                "/luxriot/streams/stop",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        stop_stream.assert_called_once()
+        payload = response.get_json()["streams"]
+        self.assertEqual(payload["video_streams"], [{"channel_id": 7}])
+        self.assertEqual(payload["analytics_streams"], [])
+        self.assertEqual(payload["paused_analytics_channels"], [7])
+        self.assertEqual(payload["video_history_channels"], [7])
+        self.assertEqual(payload["running_total"], 1)
+
     def test_scoped_detection_queries_require_owned_channel(self) -> None:
         self._login()
 
