@@ -23,6 +23,7 @@ class DatabaseState(str, Enum):
     READY = "ready"
     UNAVAILABLE = "unavailable"
     MIGRATION_MISMATCH = "migration_mismatch"
+    UNSAFE_RUNTIME_ROLE = "unsafe_runtime_role"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,9 @@ class DatabaseCheckResult:
     latency_ms: float
     current_revision: str | None = None
     expected_revision: str | None = None
+    current_user: str | None = None
+    session_user: str | None = None
+    unsafe_reason: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -270,6 +274,65 @@ class PsycopgPool:
             expected_revision=expected,
         )
 
+    def check_runtime_role(self, *, strict: bool = False) -> DatabaseCheckResult:
+        """Verify the connected principal is not a privileged deployment role."""
+
+        started = time.monotonic()
+        try:
+            with self.connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT
+                        current_user,
+                        session_user,
+                        rolsuper,
+                        rolcreaterole,
+                        rolcreatedb,
+                        rolbypassrls
+                    FROM pg_roles
+                    WHERE rolname = current_user
+                    """
+                ).fetchone()
+            if row is None:
+                raise RuntimeError("current database role was not found")
+        except Exception as exc:
+            return DatabaseCheckResult(
+                state=DatabaseState.UNAVAILABLE,
+                detail=f"database unavailable ({_safe_exception_name(exc)})",
+                latency_ms=_elapsed_ms(started),
+            )
+
+        current_user = str(row[0])
+        session_user = str(row[1])
+        unsafe_reason = _unsafe_runtime_role_reason(
+            current_user=current_user,
+            is_superuser=bool(row[2]),
+            can_create_role=bool(row[3]),
+            can_create_db=bool(row[4]),
+            bypasses_rls=bool(row[5]),
+        )
+        if unsafe_reason and strict:
+            return DatabaseCheckResult(
+                state=DatabaseState.UNSAFE_RUNTIME_ROLE,
+                detail="database runtime role is unsafe for production",
+                latency_ms=_elapsed_ms(started),
+                current_user=current_user,
+                session_user=session_user,
+                unsafe_reason=unsafe_reason,
+            )
+        return DatabaseCheckResult(
+            state=DatabaseState.READY,
+            detail=(
+                "database runtime role is acceptable"
+                if unsafe_reason is None
+                else "database runtime role is unsafe; strict mode is disabled"
+            ),
+            latency_ms=_elapsed_ms(started),
+            current_user=current_user,
+            session_user=session_user,
+            unsafe_reason=unsafe_reason,
+        )
+
     def health(self) -> DatabaseCheckResult:
         return self.check_health()
 
@@ -287,6 +350,27 @@ def _elapsed_ms(started: float) -> float:
 def _safe_exception_name(exc: Exception) -> str:
     name = type(exc).__name__
     return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else "DatabaseError"
+
+
+def _unsafe_runtime_role_reason(
+    *,
+    current_user: str,
+    is_superuser: bool,
+    can_create_role: bool,
+    can_create_db: bool,
+    bypasses_rls: bool,
+) -> str | None:
+    if current_user in {"postgres", "eva_owner", "eva_migrator"}:
+        return f"forbidden runtime role: {current_user}"
+    if is_superuser:
+        return "runtime role is superuser"
+    if bypasses_rls:
+        return "runtime role bypasses row-level security"
+    if can_create_role:
+        return "runtime role can create roles"
+    if can_create_db:
+        return "runtime role can create databases"
+    return None
 
 
 def _is_missing_revision_table(exc: Exception) -> bool:

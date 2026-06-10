@@ -1,6 +1,6 @@
 # EVA PostgreSQL foundation runbook
 
-Date: 2026-06-09
+Date: 2026-06-10
 
 ## Scope
 
@@ -20,9 +20,35 @@ repository adapters are implemented.
 .venv/bin/pip install -r requirements-db.txt
 ```
 
-Set a PostgreSQL DSN through `EVA_DATABASE_DSN` or
-`EVOSSEARCH_DATABASE_DSN`. Do not place the DSN in source control or expose it
-through the settings API.
+Set a privileged deployment PostgreSQL DSN through `EVA_DATABASE_DSN` or
+`EVOSSEARCH_DATABASE_DSN` only while running migrations and role bootstrap.
+Do not place the DSN in source control or expose it through the settings API.
+
+```bash
+export EVA_DATABASE_DSN='postgresql://postgres:...@db/eva'
+```
+
+After migrations, create least-privilege login principals. Passwords are read
+from environment variables and are not printed:
+
+```bash
+export EVA_MIGRATOR_PASSWORD='...'
+export EVA_API_PASSWORD='...'
+export EVA_AUDIT_PASSWORD='...'
+export EVA_WORKER_PASSWORD='...'
+export EVA_BACKUP_PASSWORD='...'
+.venv/bin/python scripts/bootstrap_db_roles.py
+```
+
+Switch runtime DSNs to the login principals and enable strict runtime role
+checks:
+
+```bash
+export EVA_DATABASE_DSN='postgresql://eva_api_login:...@db/eva'
+export EVA_AUDIT_DATABASE_DSN='postgresql://eva_audit_login:...@db/eva'
+export EVA_WORKER_DATABASE_DSN='postgresql://eva_worker_login:...@db/eva'
+export EVOSSEARCH_DB_STRICT_RUNTIME_ROLES=true
+```
 
 Configure a separate login principal and DSN for the append-only writer:
 
@@ -30,8 +56,9 @@ Configure a separate login principal and DSN for the append-only writer:
 export EVA_AUDIT_DATABASE_DSN='postgresql://eva_audit_login:...@db/eva'
 ```
 
-Grant the application login `eva_api` and the audit login
-`eva_audit_writer`. Do not grant both roles to the same principal.
+Grant the application login membership in `eva_api` and the audit login
+membership in `eva_audit_writer`. Do not grant both roles to the same
+principal.
 
 Inference workers use a third login principal granted only `eva_worker`.
 Construct API-side and worker-side
@@ -47,7 +74,7 @@ EVA_DATABASE_DSN='postgresql://...' .venv/bin/alembic upgrade head
 Expected revision:
 
 ```text
-20260609_0002
+20260610_0004
 ```
 
 ## Bootstrap named-user authentication
@@ -76,9 +103,24 @@ provisioning and must be removed immediately afterward.
 `EVOSSEARCH_AUTH_COOKIE_SECURE=true` requires HTTPS. Set it to `false` only for
 local HTTP development.
 
+Use the operational CLI for pilot users, roles, channel grants, and session
+revocation:
+
+```bash
+.venv/bin/python scripts/manage_users.py list
+EVA_USER_PASSWORD='temporary password value' \
+  .venv/bin/python scripts/manage_users.py create operator-1 \
+  --role operator \
+  --channels 1,2,3,4
+.venv/bin/python scripts/manage_users.py revoke-sessions operator-1
+```
+
 The application `/ready` response includes a required `postgresql` component
 when a DSN is configured. It distinguishes an unavailable database from a
-schema revision mismatch.
+schema revision mismatch and reports `runtime_user`, `runtime_role_ok`, and
+`runtime_unsafe_reason`. With `EVOSSEARCH_DB_STRICT_RUNTIME_ROLES=true`,
+`postgres`, `eva_owner`, `eva_migrator`, superuser, role-creator,
+database-creator, or RLS-bypass runtime principals fail readiness.
 
 ## Verify
 
@@ -99,13 +141,16 @@ EVA_TEST_DATABASE_DSN='postgresql://...' \
 ```
 
 The live checks verify runtime role restrictions, tenant RLS isolation, schema
-readiness, and append-only audit enforcement.
+readiness, user lifecycle, durable approvals, queue grants, and append-only
+audit enforcement.
 
 ## Security boundary
 
 - Runtime roles are `NOLOGIN`, non-superuser, and cannot bypass RLS.
 - The deployment layer creates login principals and grants only the required
   runtime role.
+- Runtime readiness fails in strict mode if the application connects as a
+  privileged role.
 - Every transaction must receive server-derived tenant and actor context.
 - Agent tool writes and external actions must fail before handler execution if
   the durable audit sink is unavailable.
@@ -126,9 +171,7 @@ not rely on destructive downgrade.
 
 ## Remaining pilot work
 
-- Durable PostgreSQL repositories for agent plans/approvals.
-- User administration, session revocation UI, and distributed login throttling.
-- Capture producer and inference worker integration with the PostgreSQL queue.
+- Session inventory UI/API and targeted single-session revocation.
 - SQLite/JSON import and comparison report.
 - Backup/restore automation and a tested restore.
 - Complete route ownership review and outcome audit after handler execution.

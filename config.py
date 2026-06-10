@@ -161,6 +161,10 @@ class Config:
     except (TypeError, ValueError):
         AUTH_SESSION_TTL_HOURS = 12
     AUTH_SESSION_TTL_HOURS = min(24 * 30, max(1, AUTH_SESSION_TTL_HOURS))
+    DB_STRICT_RUNTIME_ROLES = _get_bool_env(
+        'EVOSSEARCH_DB_STRICT_RUNTIME_ROLES',
+        os.getenv('EVA_DB_STRICT_RUNTIME_ROLES', 'False'),
+    )
 
     # LM Studio / Qwen video understanding
     LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:1234/v1').strip().rstrip('/')

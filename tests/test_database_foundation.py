@@ -9,11 +9,13 @@ from eva_db import (
     CURRENT_SCHEMA_REVISION,
     DatabaseConfigurationError,
     DatabaseDependencyError,
+    DatabaseState,
     DatabaseSettings,
     PsycopgPool,
     TransactionContext,
     redact_dsn,
 )
+from eva_db.pool import _unsafe_runtime_role_reason
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -150,6 +152,39 @@ class TransactionContextTests(unittest.TestCase):
             ).as_database_values()
 
 
+class RuntimeRoleSafetyTests(unittest.TestCase):
+    def test_unsafe_runtime_role_reasons(self):
+        self.assertEqual(
+            _unsafe_runtime_role_reason(
+                current_user="postgres",
+                is_superuser=False,
+                can_create_role=False,
+                can_create_db=False,
+                bypasses_rls=False,
+            ),
+            "forbidden runtime role: postgres",
+        )
+        self.assertEqual(
+            _unsafe_runtime_role_reason(
+                current_user="eva_api_login",
+                is_superuser=False,
+                can_create_role=False,
+                can_create_db=False,
+                bypasses_rls=True,
+            ),
+            "runtime role bypasses row-level security",
+        )
+        self.assertIsNone(
+            _unsafe_runtime_role_reason(
+                current_user="eva_api_login",
+                is_superuser=False,
+                can_create_role=False,
+                can_create_db=False,
+                bypasses_rls=False,
+            )
+        )
+
+
 class MigrationContentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -283,6 +318,28 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         finally:
             pool.close()
         self.assertTrue(result.ready, result)
+
+    def test_live_database_runtime_role_check(self):
+        settings = DatabaseSettings(
+            dsn=os.environ["EVA_TEST_DATABASE_DSN"],
+            pool_min_size=0,
+            pool_max_size=1,
+        )
+        pool = PsycopgPool(settings)
+        try:
+            relaxed = pool.check_runtime_role(strict=False)
+            strict = pool.check_runtime_role(strict=True)
+        finally:
+            pool.close()
+
+        self.assertEqual(relaxed.state, DatabaseState.READY)
+        self.assertTrue(relaxed.current_user)
+        if relaxed.unsafe_reason:
+            self.assertEqual(strict.state, DatabaseState.UNSAFE_RUNTIME_ROLE)
+            self.assertFalse(strict.ready)
+        else:
+            self.assertEqual(strict.state, DatabaseState.READY)
+            self.assertTrue(strict.ready)
 
 
 if __name__ == "__main__":

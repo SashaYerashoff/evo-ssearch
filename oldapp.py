@@ -2258,14 +2258,27 @@ def _check_postgres_ready() -> Dict[str, Any]:
     if not _postgres_database_configured():
         return _component_result(False, "not_configured", required=False)
     try:
-        result = _get_control_plane_db_pool().check_readiness()
+        pool = _get_control_plane_db_pool()
+        result = pool.check_readiness()
+        role_result = pool.check_runtime_role(
+            strict=bool(getattr(config, "DB_STRICT_RUNTIME_ROLES", False))
+        )
+        ok = result.ready and role_result.ready
         return _component_result(
-            result.ready,
-            result.state.value,
+            ok,
+            role_result.state.value if result.ready else result.state.value,
             detail=result.detail,
             latency_ms=result.latency_ms,
             current_revision=result.current_revision,
             expected_revision=result.expected_revision,
+            runtime_role_ok=role_result.ready,
+            runtime_role_status=role_result.state.value,
+            runtime_user=role_result.current_user,
+            session_user=role_result.session_user,
+            runtime_unsafe_reason=role_result.unsafe_reason,
+            strict_runtime_roles=bool(
+                getattr(config, "DB_STRICT_RUNTIME_ROLES", False)
+            ),
         )
     except Exception as exc:
         return _component_result(
@@ -2307,7 +2320,11 @@ def _check_auth_ready() -> Dict[str, Any]:
         )
     postgres = _check_postgres_ready()
     try:
-        audit_database = _get_audit_db_pool().check_health()
+        audit_pool = _get_audit_db_pool()
+        audit_database = audit_pool.check_health()
+        audit_role = audit_pool.check_runtime_role(
+            strict=bool(getattr(config, "DB_STRICT_RUNTIME_ROLES", False))
+        )
     except Exception as exc:
         return _component_result(
             False,
@@ -2315,15 +2332,16 @@ def _check_auth_ready() -> Dict[str, Any]:
             error=f"audit database unavailable ({type(exc).__name__})",
             tenant_id=tenant_id,
         )
+    ok = bool(postgres.get("ok")) and audit_database.ready and audit_role.ready
     return _component_result(
-        bool(postgres.get("ok")) and audit_database.ready,
-        (
-            "ready"
-            if postgres.get("ok") and audit_database.ready
-            else "unavailable"
-        ),
+        ok,
+        "ready" if ok else "unavailable",
         tenant_id=tenant_id,
         audit_latency_ms=audit_database.latency_ms,
+        audit_runtime_role_ok=audit_role.ready,
+        audit_runtime_role_status=audit_role.state.value,
+        audit_runtime_user=audit_role.current_user,
+        audit_runtime_unsafe_reason=audit_role.unsafe_reason,
     )
 
 
