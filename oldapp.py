@@ -27,8 +27,6 @@ from threading import Lock
 import numpy as np
 import torch
 import cv2
-import clip
-import faiss
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
 from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
@@ -80,13 +78,64 @@ clip_processor: Optional[Any] = None
 clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
 clip_runtime_device = device
+_clip_module: Optional[Any] = None
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
 _mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
+
+
+class _FaissTypingStub:
+    Index = Any
+
+
+faiss: Any = _FaissTypingStub()
+_faiss_module: Optional[Any] = None
 FaissIndexBundle = Tuple[Optional[faiss.Index], Optional[List[str]], Optional[List[Dict[str, Any]]], Dict[str, Any]]
+
+
+def _get_faiss() -> Any:
+    """Load FAISS only for index/search paths.
+
+    Some older CPU-only hosts can import the rest of the control plane but crash
+    with SIGILL when importing faiss-cpu wheels. Keeping this lazy lets auth,
+    audit, settings, Luxriot, and remote LLM smoke tests run on those hosts.
+    """
+    global faiss, _faiss_module
+    if not _local_vision_stack_enabled():
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _faiss_module is None:
+        import importlib
+
+        _faiss_module = importlib.import_module("faiss")
+        faiss = _faiss_module
+    return _faiss_module
+
+
+def _get_clip_module() -> Any:
+    """Load clip-anytorch only when CLIP embeddings are actually needed."""
+    global _clip_module
+    if not _local_vision_stack_enabled():
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _clip_module is None:
+        import importlib
+
+        _clip_module = importlib.import_module("clip")
+    return _clip_module
+
+
+def _local_vision_stack_enabled() -> bool:
+    return str(
+        os.getenv("EVOSSEARCH_LOCAL_VISION_ENABLED", "true") or "true"
+    ).strip().lower() in TRUE_BOOL_STRINGS
 
 if hasattr(Image, "Resampling"):
     RESAMPLE_NEAREST = Image.Resampling.NEAREST
@@ -1066,7 +1115,8 @@ def _release_cuda_memory() -> None:
 
 
 def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
-    model, preprocess = clip.load(model_name, device=target_device)
+    clip_module = _get_clip_module()
+    model, preprocess = clip_module.load(model_name, device=target_device)
     cast(torch.nn.Module, model).eval()
     return cast(torch.nn.Module, model), preprocess
 
@@ -1139,7 +1189,7 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
         else:
             if clip_model is None:
                 raise RuntimeError("CLIP backend is not initialized")
-            text_tokens = clip.tokenize(prepared).to(clip_runtime_device)
+            text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
             text_features = cast(Any, clip_model).encode_text(text_tokens)
         text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
     return text_features.cpu().numpy().astype(np.float32, copy=False)
@@ -1426,7 +1476,7 @@ def _create_index_for_embedder(entries: List[Tuple[Path, Dict[str, Any]]], embed
         return None
 
     embeddings_array = np.array(embeddings, dtype='float32')
-    index = faiss.IndexFlatIP(embeddings_array.shape[1])
+    index = _get_faiss().IndexFlatIP(embeddings_array.shape[1])
     _faiss_add_vectors(index, embeddings_array)
     index_meta = _build_index_metadata(embedder, {'image_count': len(image_paths)})
     return index, image_paths, image_metadata, index_meta
@@ -2672,6 +2722,9 @@ def ready():
     """Readiness endpoint with component-level dependency status."""
     load_embedder = str(request.args.get("load") or "").strip().lower() in TRUE_BOOL_STRINGS
     strict = str(request.args.get("strict") or "").strip().lower() in TRUE_BOOL_STRINGS
+    embedder_required = str(
+        os.getenv("EVOSSEARCH_EMBEDDER_REQUIRED", "true") or "true"
+    ).strip().lower() in TRUE_BOOL_STRINGS
 
     checks: Dict[str, Dict[str, Any]] = {
         "database": _check_database_ready(),
@@ -2694,7 +2747,11 @@ def ready():
                 error=str(exc),
             )
 
-    required_names = ["database", "embedder"]
+    required_names = ["database"]
+    if embedder_required:
+        required_names.append("embedder")
+    else:
+        checks["embedder"]["required"] = False
     if checks["postgresql"].get("required"):
         required_names.append("postgresql")
     if checks["authentication"].get("required"):
@@ -3718,7 +3775,7 @@ class _DetectionClipShardCache:
                 self._cache.pop(shard, None)
             return None, None
 
-        index = faiss.IndexFlatIP(int(vectors.shape[1]))
+        index = _get_faiss().IndexFlatIP(int(vectors.shape[1]))
         _faiss_add_vectors(index, vectors)
         ids_arr = np.asarray(ids, dtype=np.int64)
 
@@ -4620,7 +4677,7 @@ def save_index(index_results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[
         embed_dir = _index_directory(folder_path, embedder)
         embed_dir.mkdir(parents=True, exist_ok=True)
 
-        faiss.write_index(index, str(embed_dir / 'index.faiss'))
+        _get_faiss().write_index(index, str(embed_dir / 'index.faiss'))
 
         with open(embed_dir / 'paths.pkl', 'wb') as f:
             pickle.dump(image_paths, f)
@@ -4655,7 +4712,7 @@ def load_index(folder_path: Union[str, Path], embedder: Optional[str] = None) ->
             meta = {}
 
     try:
-        index = faiss.read_index(str(embed_dir / 'index.faiss'))
+        index = _get_faiss().read_index(str(embed_dir / 'index.faiss'))
 
         with open(embed_dir / 'paths.pkl', 'rb') as f:
             image_paths = pickle.load(f)
@@ -4692,7 +4749,7 @@ def save_segment_index(
         raise ValueError("Segment embeddings must be a 2D array")
 
     if index_path.exists():
-        index = faiss.read_index(str(index_path))
+        index = _get_faiss().read_index(str(index_path))
         if index.d != embeddings.shape[1]:
             raise ValueError(
                 f"Segment embedding dimension mismatch: existing index expects {index.d}, got {embeddings.shape[1]}"
@@ -4700,13 +4757,13 @@ def save_segment_index(
         with open(metadata_path, 'rb') as fh:
             existing_meta: List[Dict[str, Any]] = pickle.load(fh)
     else:
-        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index = _get_faiss().IndexFlatIP(embeddings.shape[1])
         existing_meta = []
 
     _faiss_add_vectors(index, embeddings)
     existing_meta.extend(segment_metadata)
 
-    faiss.write_index(index, str(index_path))
+    _get_faiss().write_index(index, str(index_path))
     with open(metadata_path, 'wb') as fh:
         pickle.dump(existing_meta, fh)
 
@@ -4730,7 +4787,7 @@ def load_segment_index(folder_path: Union[str, Path]):
         return None, [], {}
 
     try:
-        index = faiss.read_index(str(index_path))
+        index = _get_faiss().read_index(str(index_path))
         with open(metadata_path, 'rb') as fh:
             segment_meta: List[Dict[str, Any]] = pickle.load(fh)
         meta_info = {}

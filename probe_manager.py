@@ -1,14 +1,42 @@
 import base64
+import os
 import threading
 import time
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
-import faiss  # type: ignore
 import numpy as np
 from PIL import Image
 
 from config import config
+
+
+class _FaissTypingStub:
+    IndexFlatIP = Any
+
+
+faiss: Any = _FaissTypingStub()
+_faiss_module: Optional[Any] = None
+
+
+def _get_faiss() -> Any:
+    global faiss, _faiss_module
+    if str(os.getenv("EVOSSEARCH_LOCAL_VISION_ENABLED", "true") or "true").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _faiss_module is None:
+        import importlib
+
+        _faiss_module = importlib.import_module("faiss")
+        faiss = _faiss_module
+    return _faiss_module
 
 
 def _faiss_add(index: faiss.IndexFlatIP, vectors: np.ndarray) -> None:
@@ -56,7 +84,7 @@ class ProbeBuffer:
             self.index = None
             return
         mat = np.stack(self.embeddings, axis=0).astype(np.float32)
-        self.index = faiss.IndexFlatIP(mat.shape[1])
+        self.index = _get_faiss().IndexFlatIP(mat.shape[1])
         _faiss_add(self.index, mat)
 
     @staticmethod
