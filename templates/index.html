@@ -801,6 +801,10 @@
                     <span class="settings-nav-label">Users</span>
                     <span class="settings-nav-meta">Named accounts, channel scope, and active sessions.</span>
                 </button>
+                <button type="button" class="settings-nav-btn" id="auditEventsNavBtn" data-settings-target="settings-section-audit">
+                    <span class="settings-nav-label">Audit</span>
+                    <span class="settings-nav-meta">Security events, actors, targets, and outcomes.</span>
+                </button>
                 <button type="button" class="settings-nav-btn" data-settings-target="settings-section-env">
                     <span class="settings-nav-label">Environment</span>
                     <span class="settings-nav-meta">Edit `EVOSSEARCH_*` values and persist to `.env`.</span>
@@ -1072,6 +1076,57 @@
                                 </div>
                                 <div id="adminSessionsList" class="admin-session-list"></div>
                             </div>
+                        </div>
+                    </div>
+
+                    <div id="settings-section-audit" class="settings-section settings-section-wide audit-events-section">
+                        <h3>Audit Events</h3>
+                        <div class="settings-section-meta">Append-only security event view for administrator review.</div>
+                        <div id="auditEventsDenied" class="admin-access-note is-hidden">Audit requires an all-channel account with audit permission.</div>
+                        <div id="auditEventsPanel" class="audit-events-panel">
+                            <div class="audit-toolbar">
+                                <div id="auditEventsStatus" class="admin-inline-status"></div>
+                                <div class="audit-actions">
+                                    <button type="button" class="settings-btn primary" id="auditEventsRefreshBtn">Refresh</button>
+                                    <button type="button" class="settings-btn" id="auditEventsNextBtn" disabled>Next Page</button>
+                                </div>
+                            </div>
+                            <div class="audit-filter-grid">
+                                <label>
+                                    <span>Result</span>
+                                    <select id="auditResultFilter" class="settings-select">
+                                        <option value="">Any</option>
+                                        <option value="success">Success</option>
+                                        <option value="failure">Failure</option>
+                                        <option value="denied">Denied</option>
+                                    </select>
+                                </label>
+                                <label>
+                                    <span>Action</span>
+                                    <input type="text" id="auditActionFilter" class="settings-input" placeholder="auth.login" />
+                                </label>
+                                <label>
+                                    <span>Actor ID</span>
+                                    <input type="text" id="auditActorFilter" class="settings-input" placeholder="uuid" />
+                                </label>
+                                <label>
+                                    <span>Channel</span>
+                                    <input type="number" id="auditChannelFilter" class="settings-input" min="1" placeholder="7" />
+                                </label>
+                                <label>
+                                    <span>Request ID</span>
+                                    <input type="text" id="auditRequestFilter" class="settings-input" placeholder="request id" />
+                                </label>
+                                <label>
+                                    <span>Limit</span>
+                                    <select id="auditLimitSelect" class="settings-select">
+                                        <option value="25">25</option>
+                                        <option value="50" selected>50</option>
+                                        <option value="100">100</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <div id="auditEventsList" class="audit-events-list"></div>
                         </div>
                     </div>
 

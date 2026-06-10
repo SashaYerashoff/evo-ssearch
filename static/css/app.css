@@ -7410,6 +7410,111 @@ textarea::placeholder {
     background: rgba(10, 15, 22, 0.45);
 }
 
+.audit-events-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.audit-toolbar,
+.audit-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.audit-toolbar {
+    justify-content: space-between;
+}
+
+.audit-filter-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 10px;
+}
+
+.audit-filter-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    color: #95a4b6;
+    font-size: 0.72rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.audit-events-list {
+    overflow: auto;
+}
+
+.audit-events-table {
+    width: 100%;
+    min-width: 980px;
+    border-collapse: collapse;
+    color: #dbe4ee;
+    font-size: 0.82rem;
+}
+
+.audit-events-table th,
+.audit-events-table td {
+    border-bottom: 1px solid rgba(44, 58, 74, 0.9);
+    padding: 9px 10px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.audit-events-table th {
+    color: #91a0b2;
+    font-size: 0.7rem;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.audit-result {
+    display: inline-flex;
+    border: 1px solid rgba(95, 134, 176, 0.8);
+    border-radius: 999px;
+    padding: 2px 7px;
+    color: #d6e7fb;
+    background: rgba(71, 117, 168, 0.18);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+}
+
+.audit-result.success {
+    border-color: rgba(76, 162, 105, 0.82);
+    color: #c9f2d5;
+    background: rgba(76, 162, 105, 0.16);
+}
+
+.audit-result.failure,
+.audit-result.denied {
+    border-color: rgba(180, 81, 81, 0.82);
+    color: #ffc6c6;
+    background: rgba(180, 81, 81, 0.16);
+}
+
+.audit-time,
+.audit-actor {
+    max-width: 190px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.audit-details {
+    display: block;
+    max-width: 360px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #b9c5d2;
+    background: rgba(6, 11, 17, 0.56);
+    border: 1px solid rgba(47, 62, 78, 0.82);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
 .env-editor {
     min-height: 320px;
 }

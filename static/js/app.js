@@ -2976,12 +2976,29 @@
     const adminSessionsActiveOnlyInput = document.getElementById('adminSessionsActiveOnlyInput');
     const adminSessionsRefreshBtn = document.getElementById('adminSessionsRefreshBtn');
     const adminSessionsList = document.getElementById('adminSessionsList');
+    const auditEventsNavBtn = document.getElementById('auditEventsNavBtn');
+    const auditEventsSection = document.getElementById('settings-section-audit');
+    const auditEventsDenied = document.getElementById('auditEventsDenied');
+    const auditEventsPanel = document.getElementById('auditEventsPanel');
+    const auditEventsStatus = document.getElementById('auditEventsStatus');
+    const auditEventsRefreshBtn = document.getElementById('auditEventsRefreshBtn');
+    const auditEventsNextBtn = document.getElementById('auditEventsNextBtn');
+    const auditResultFilter = document.getElementById('auditResultFilter');
+    const auditActionFilter = document.getElementById('auditActionFilter');
+    const auditActorFilter = document.getElementById('auditActorFilter');
+    const auditChannelFilter = document.getElementById('auditChannelFilter');
+    const auditRequestFilter = document.getElementById('auditRequestFilter');
+    const auditLimitSelect = document.getElementById('auditLimitSelect');
+    const auditEventsList = document.getElementById('auditEventsList');
     
     let segmentThreshold = 0.7;
     let adminRoles = [];
     let adminUsers = [];
     let adminSessions = [];
     let selectedAdminUserId = null;
+    let auditEvents = [];
+    let auditNextCursor = null;
+    let auditLastParams = null;
 
     function setActiveSettingsNav(targetId) {
         settingsNavButtons.forEach((btn) => {
@@ -3037,6 +3054,43 @@
         const allowed = userCanManageUsers();
         setAdminUsersAccess(allowed);
         return allowed;
+    }
+
+    function hasAllChannelAccess() {
+        const channels = authCurrentUser && Array.isArray(authCurrentUser.allowedChannelIds)
+            ? authCurrentUser.allowedChannelIds
+            : [];
+        return channels.some((value) => String(value).trim() === '*');
+    }
+
+    function userCanViewAudit() {
+        return Boolean(
+            AUTH_ENABLED
+            && authCurrentUser
+            && Array.isArray(authCurrentUser.permissions)
+            && authCurrentUser.permissions.includes('audit:view')
+            && hasAllChannelAccess()
+        );
+    }
+
+    function setAuditAccess(allowed) {
+        const enabled = Boolean(allowed);
+        if (auditEventsNavBtn) auditEventsNavBtn.classList.toggle('is-hidden', !enabled);
+        if (auditEventsSection) auditEventsSection.classList.toggle('is-hidden', !enabled);
+        if (auditEventsDenied) auditEventsDenied.classList.toggle('is-hidden', enabled);
+        if (auditEventsPanel) auditEventsPanel.classList.toggle('is-hidden', !enabled);
+    }
+
+    function syncAuditAccess() {
+        const allowed = userCanViewAudit();
+        setAuditAccess(allowed);
+        return allowed;
+    }
+
+    function setAuditStatus(message = '', type = '') {
+        if (!auditEventsStatus) return;
+        auditEventsStatus.textContent = message;
+        auditEventsStatus.className = `admin-inline-status ${type || ''}`.trim();
     }
 
     function effectiveAdminRoles() {
@@ -3359,6 +3413,106 @@
             setAdminUsersStatus('Session revoked.', 'success');
         } catch (error) {
             setAdminUsersStatus(error.message || String(error), 'error');
+        }
+    }
+
+    function auditParamsFromInputs() {
+        const params = new URLSearchParams();
+        const limit = auditLimitSelect ? auditLimitSelect.value : '50';
+        params.set('limit', limit || '50');
+        const filters = [
+            ['result', auditResultFilter ? auditResultFilter.value : ''],
+            ['action', auditActionFilter ? auditActionFilter.value.trim() : ''],
+            ['actorUserId', auditActorFilter ? auditActorFilter.value.trim() : ''],
+            ['channelId', auditChannelFilter ? auditChannelFilter.value.trim() : ''],
+            ['requestId', auditRequestFilter ? auditRequestFilter.value.trim() : ''],
+        ];
+        filters.forEach(([name, value]) => {
+            if (value) params.set(name, value);
+        });
+        return params;
+    }
+
+    function renderAuditEvents() {
+        if (!auditEventsList) return;
+        if (!auditEvents.length) {
+            auditEventsList.innerHTML = '<div class="admin-empty">No audit events found.</div>';
+            if (auditEventsNextBtn) auditEventsNextBtn.disabled = true;
+            return;
+        }
+        auditEventsList.innerHTML = `
+            <table class="audit-events-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Result</th>
+                        <th>Action</th>
+                        <th>Actor</th>
+                        <th>Target</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${auditEvents.map((event) => {
+                        const target = [event.targetType, event.targetId]
+                            .map((value) => String(value || '').trim())
+                            .filter(Boolean)
+                            .join(': ');
+                        const channel = event.channelId ? `channel ${event.channelId}` : '';
+                        const details = JSON.stringify(event.details || {});
+                        return `
+                            <tr>
+                                <td>
+                                    <div class="audit-time">${escapeHtml(formatDateTime(event.occurredAt))}</div>
+                                    <div class="admin-session-sub">${escapeHtml(event.requestId || '')}</div>
+                                </td>
+                                <td><span class="audit-result ${escapeHtml(event.result || '')}">${escapeHtml(event.result || '')}</span></td>
+                                <td>${escapeHtml(event.action || '')}</td>
+                                <td>
+                                    <div class="audit-actor">${escapeHtml(event.actorUserId || 'system')}</div>
+                                    <div class="admin-session-sub">${escapeHtml((event.actorRoles || []).join(', '))}</div>
+                                </td>
+                                <td>
+                                    <div>${escapeHtml(target || 'route')}</div>
+                                    <div class="admin-session-sub">${escapeHtml(channel)}</div>
+                                </td>
+                                <td><code class="audit-details">${escapeHtml(details)}</code></td>
+                            </tr>
+                        `;
+                    }).join('')}
+                </tbody>
+            </table>
+        `;
+        if (auditEventsNextBtn) auditEventsNextBtn.disabled = !auditNextCursor;
+    }
+
+    async function loadAuditEvents({ append = false } = {}) {
+        if (!syncAuditAccess()) return;
+        const params = append && auditLastParams
+            ? new URLSearchParams(auditLastParams.toString())
+            : auditParamsFromInputs();
+        if (append) {
+            if (!auditNextCursor) return;
+            params.set('cursor', auditNextCursor);
+        } else {
+            auditNextCursor = null;
+            auditLastParams = new URLSearchParams(params.toString());
+        }
+        setAuditStatus(append ? 'Loading next audit page...' : 'Loading audit events...', 'loading');
+        setButtonBusy(append ? auditEventsNextBtn : auditEventsRefreshBtn, true);
+        try {
+            const response = await fetch(`/audit/events?${params.toString()}`, { cache: 'no-store' });
+            const data = await parseApiJson(response, 'Failed to load audit events');
+            const rows = Array.isArray(data.events) ? data.events : [];
+            auditEvents = append ? auditEvents.concat(rows) : rows;
+            auditNextCursor = data.nextCursor || null;
+            renderAuditEvents();
+            setAuditStatus(`Loaded ${auditEvents.length} audit events.`, 'success');
+        } catch (error) {
+            setAuditStatus(error.message || String(error), 'error');
+        } finally {
+            setButtonBusy(append ? auditEventsNextBtn : auditEventsRefreshBtn, false);
+            if (auditEventsNextBtn) auditEventsNextBtn.disabled = !auditNextCursor;
         }
     }
 
@@ -3760,6 +3914,9 @@
         if (syncAdminUsersAccess()) {
             loadAdminConsole();
         }
+        if (syncAuditAccess()) {
+            loadAuditEvents();
+        }
         if (settingsScrollArea) {
             settingsScrollArea.scrollTop = 0;
         }
@@ -3876,6 +4033,30 @@
             revokeAdminSession(button.dataset.sessionRevoke);
         });
     }
+    if (auditEventsRefreshBtn) {
+        auditEventsRefreshBtn.addEventListener('click', () => {
+            loadAuditEvents();
+        });
+    }
+    if (auditEventsNextBtn) {
+        auditEventsNextBtn.addEventListener('click', () => {
+            loadAuditEvents({ append: true });
+        });
+    }
+    [auditResultFilter, auditLimitSelect].forEach((control) => {
+        if (!control) return;
+        control.addEventListener('change', () => {
+            loadAuditEvents();
+        });
+    });
+    [auditActionFilter, auditActorFilter, auditChannelFilter, auditRequestFilter].forEach((control) => {
+        if (!control) return;
+        control.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                loadAuditEvents();
+            }
+        });
+    });
 
     if (probeEditBtn && probeEditorModal) {
         probeEditBtn.addEventListener('click', () => {
