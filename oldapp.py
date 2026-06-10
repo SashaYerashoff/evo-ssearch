@@ -2777,6 +2777,16 @@ def auth_login():
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     if not username or not password:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="denied",
+                target_type="user",
+                details={"reason": "missing_credentials"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
         return _auth_failure_response("Username and password are required", 400)
     try:
         login = _get_auth_service().login(
@@ -3194,10 +3204,21 @@ def auth_logout():
     session_token = str(
         request.cookies.get(config.AUTH_SESSION_COOKIE) or ""
     )
+    context = _current_auth_context()
     try:
-        _get_auth_service().logout(session_token, reason="logout")
+        revoked = _get_auth_service().logout(session_token, reason="logout")
     except Exception:
         return _auth_failure_response("Authentication service unavailable", 503)
+    try:
+        _write_security_audit(
+            context=context,
+            action="auth.logout.completed",
+            result="success",
+            target_type="session",
+            details={"revoked": bool(revoked)},
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
     response = make_response(jsonify({"success": True}))
     response.delete_cookie(config.AUTH_SESSION_COOKIE, path="/")
     response.delete_cookie(config.AUTH_CSRF_COOKIE, path="/")

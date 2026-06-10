@@ -464,6 +464,17 @@ class PostgresIdentityRepository:
                     user_id=target_user,
                     reason="account_deactivated",
                 )
+            elif (
+                password is not _UNSET
+                or normalized_roles is not None
+                or normalized_channels is not None
+            ):
+                self._revoke_user_sessions(
+                    connection,
+                    tenant_id=tenant,
+                    user_id=target_user,
+                    reason="account_security_changed",
+                )
             return self._load_identity(connection, tenant, target_user)
 
     def revoke_user_sessions(

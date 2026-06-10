@@ -342,6 +342,33 @@ class RepositoryUnitTests(unittest.TestCase):
         self.assertEqual(connection.executions[0][1][2], session_id)
         connection.assert_finished()
 
+    def test_password_update_revokes_active_sessions(self):
+        expected = identity(tenant_id=self.tenant_id, user_id=self.user_id)
+        connection = ScriptedConnection(
+            [
+                ("SELECT 1 FROM iam.users", Result(row=(1,))),
+                ("UPDATE iam.users", Result(rowcount=1)),
+                ("UPDATE iam.sessions", Result(rowcount=2)),
+            ]
+        )
+        pool = FakePool(connection)
+        repository = PostgresIdentityRepository(pool, self.hasher)
+
+        with patch.object(repository, "_load_identity", return_value=expected):
+            actual = repository.update_user(
+                self.tenant_id,
+                self.user_id,
+                actor_user_id=self.user_id,
+                password="new password 123",
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            connection.executions[2][1][0],
+            "account_security_changed",
+        )
+        connection.assert_finished()
+
     def test_bootstrap_is_idempotent_only_for_same_admin_username(self):
         existing = identity(tenant_id=self.tenant_id, user_id=self.user_id)
         connection = ScriptedConnection(
@@ -696,6 +723,17 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
             )
         )
 
+        second_token = "operator-session-2-" + uuid.uuid4().hex
+        repository.create_session(
+            authenticated,
+            second_token,
+            "operator-csrf-2-" + uuid.uuid4().hex,
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+            client_ip="127.0.0.1",
+            user_agent="identity-lifecycle-live-test",
+        )
+        self.assertIsNotNone(repository.resolve_session(tenant_id, second_token))
+
         viewer = repository.update_user(
             tenant_id,
             operator.user_id,
@@ -707,12 +745,13 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
         self.assertEqual(viewer.roles, frozenset({Role.VIEWER.value}))
         self.assertEqual(viewer.allowed_channel_ids, frozenset({7}))
         self.assertNotIn(Permission.PROBES_RUN.value, viewer.permissions)
+        self.assertIsNone(repository.resolve_session(tenant_id, second_token))
 
-        second_token = "operator-session-2-" + uuid.uuid4().hex
+        third_token = "operator-session-3-" + uuid.uuid4().hex
         repository.create_session(
             authenticated,
-            second_token,
-            "operator-csrf-2-" + uuid.uuid4().hex,
+            third_token,
+            "operator-csrf-3-" + uuid.uuid4().hex,
             datetime.now(timezone.utc) + timedelta(minutes=10),
             client_ip="127.0.0.1",
             user_agent="identity-lifecycle-live-test",
@@ -724,7 +763,7 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
             reason="live_test_rotation",
         )
         self.assertEqual(revoked, 1)
-        self.assertIsNone(repository.resolve_session(tenant_id, second_token))
+        self.assertIsNone(repository.resolve_session(tenant_id, third_token))
 
         inactive = repository.update_user(
             tenant_id,

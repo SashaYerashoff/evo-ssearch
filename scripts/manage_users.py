@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - optional developer convenience
     load_dotenv = None  # type: ignore[assignment]
 
 from eva_db import DatabaseSettings, PsycopgPool  # noqa: E402
-from security import ALL_CHANNELS, Role  # noqa: E402
+from security import ALL_CHANNELS, Permission, Role  # noqa: E402
 from security.postgres_identity import (  # noqa: E402
     IdentityRecord,
     PostgresIdentityRepository,
@@ -228,16 +228,26 @@ def _actor_user_id(
     args: argparse.Namespace,
 ) -> str:
     if args.actor_user_id:
-        return str(uuid.UUID(str(args.actor_user_id)))
-    actor = repository.get_user_by_username(
-        tenant_id,
-        args.actor_username,
-    )
+        actor_id = uuid.UUID(str(args.actor_user_id))
+        actor = repository.get_user(
+            tenant_id,
+            actor_id,
+            actor_user_id=actor_id,
+        )
+    else:
+        actor = repository.get_user_by_username(
+            tenant_id,
+            args.actor_username,
+        )
     if actor is None:
         raise SystemExit(
             "Admin actor was not found. Pass --actor-user-id or set "
             "EVA_ADMIN_USERNAME to an existing admin user."
         )
+    if not actor.is_active:
+        raise SystemExit("Admin actor is inactive.")
+    if Permission.USERS_MANAGE.value not in actor.permissions:
+        raise SystemExit("Admin actor must have users:manage permission.")
     return actor.user_id
 
 

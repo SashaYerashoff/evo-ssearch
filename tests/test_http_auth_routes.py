@@ -297,6 +297,19 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertIsNotNone(csrf_cookie)
         return response, csrf_cookie.value
 
+    def test_malformed_login_is_audited(self) -> None:
+        response = self.client.post("/auth/login", json={"username": "engineer"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(
+            any(
+                event.action == "auth.login"
+                and event.result == "denied"
+                and event.details.get("reason") == "missing_credentials"
+                for event in self.audit.events
+            )
+        )
+
     def test_login_me_and_logout(self) -> None:
         login, csrf_token = self._login()
 
@@ -321,6 +334,14 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         self.assertEqual(logout.status_code, 200)
         self.assertEqual(self.client.get("/auth/me").status_code, 401)
+        self.assertTrue(
+            any(
+                event.action == "auth.logout.completed"
+                and event.result == "success"
+                and event.details.get("revoked") is True
+                for event in self.audit.events
+            )
+        )
 
     def test_mutation_requires_csrf_permission_and_channel_grant(self) -> None:
         _, csrf_token = self._login()
