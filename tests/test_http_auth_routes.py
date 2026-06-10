@@ -38,12 +38,29 @@ class _Session:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class _ManagedSession:
+    session_id: str
+    tenant_id: str
+    user_id: str
+    username: str
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    revoke_reason: str | None = None
+    client_ip: str | None = None
+    user_agent: str | None = None
+
+
 class _Repository:
     def __init__(self) -> None:
         self.identity = _Identity()
         self.sessions = {}
+        self.session_inventory = []
         self.users = {USER_ID: self.identity}
         self.revoked_user_sessions = []
+        self.revoked_session_ids = []
 
     def authenticate(self, tenant_id, username, password):
         if (
@@ -69,6 +86,19 @@ class _Repository:
             identity=identity,
             csrf_digest=digest_session_token(csrf_token),
             expires_at=expires_at,
+        )
+        self.session_inventory.append(
+            _ManagedSession(
+                session_id=session_id,
+                tenant_id=identity.tenant_id,
+                user_id=identity.user_id,
+                username=identity.username,
+                created_at=datetime(2026, 1, 1, 10, 0, 0),
+                last_seen_at=datetime(2026, 1, 1, 10, 5, 0),
+                expires_at=expires_at,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
         )
         return session_id
 
@@ -152,6 +182,51 @@ class _Repository:
             raise LookupError("user not found")
         self.revoked_user_sessions.append((user_id, actor_user_id, reason))
         return 2
+
+    def list_sessions(
+        self,
+        tenant_id,
+        *,
+        actor_user_id,
+        user_id=None,
+        active_only=True,
+    ):
+        if tenant_id != TENANT_ID:
+            raise RuntimeError("wrong tenant")
+        del actor_user_id
+        sessions = [
+            session
+            for session in self.session_inventory
+            if user_id is None or session.user_id == user_id
+        ]
+        if active_only:
+            sessions = [
+                session for session in sessions if session.revoked_at is None
+            ]
+        return tuple(sessions)
+
+    def revoke_session_by_id(
+        self,
+        tenant_id,
+        session_id,
+        *,
+        actor_user_id,
+        reason,
+    ):
+        if tenant_id != TENANT_ID:
+            raise RuntimeError("wrong tenant")
+        del actor_user_id
+        for index, session in enumerate(self.session_inventory):
+            if session.session_id != session_id or session.revoked_at is not None:
+                continue
+            self.session_inventory[index] = replace(
+                session,
+                revoked_at=datetime(2026, 1, 1, 11, 0, 0),
+                revoke_reason=reason,
+            )
+            self.revoked_session_ids.append((session_id, reason))
+            return True
+        return False
 
 
 class _AuditWriter:
@@ -579,6 +654,47 @@ class HttpAuthRouteTests(unittest.TestCase):
             any(
                 event.action == "auth.users.update.completed"
                 and event.target_id == created_user["id"]
+                for event in self.audit.events
+            )
+        )
+
+    def test_admin_can_list_and_revoke_single_session(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        session_id = self.repository.session_inventory[0].session_id
+
+        listed = self.client.get("/auth/sessions")
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        sessions = listed.get_json()["sessions"]
+        self.assertEqual(sessions[0]["id"], session_id)
+        self.assertEqual(sessions[0]["userId"], USER_ID)
+        self.assertIsNone(sessions[0]["revokedAt"])
+
+        missing_csrf = self.client.post(
+            f"/auth/sessions/{session_id}/revoke",
+            json={"reason": "device_lost"},
+        )
+        self.assertEqual(missing_csrf.status_code, 403)
+
+        revoked = self.client.post(
+            f"/auth/sessions/{session_id}/revoke",
+            headers={"X-CSRF-Token": csrf_token},
+            json={"reason": "device_lost"},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.get_json())
+        self.assertEqual(
+            self.repository.revoked_session_ids[-1],
+            (session_id, "device_lost"),
+        )
+        self.assertTrue(
+            any(
+                event.action == "auth.sessions.revoke.completed"
+                and event.target_id == session_id
                 for event in self.audit.events
             )
         )

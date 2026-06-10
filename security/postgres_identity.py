@@ -64,6 +64,21 @@ class SessionRecord:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class IdentitySessionRecord:
+    session_id: str
+    tenant_id: str
+    user_id: str
+    username: str
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    revoke_reason: str | None
+    client_ip: str | None
+    user_agent: str | None
+
+
 class PostgresIdentityRepository:
     """Tenant-isolated identity persistence using the shared bounded pool."""
 
@@ -686,6 +701,105 @@ class PostgresIdentityRepository:
                   AND revoked_at IS NULL
                 """,
                 (normalized_reason, tenant, token_digest),
+            )
+            return bool(result.rowcount)
+
+    def list_sessions(
+        self,
+        tenant_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        user_id: uuid.UUID | str | None = None,
+        active_only: bool = True,
+    ) -> tuple[IdentitySessionRecord, ...]:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        target_user = (
+            None
+            if user_id is None or str(user_id).strip() == ""
+            else _require_uuid(user_id, "user_id")
+        )
+        with self._pool.transaction(
+            _transaction_context(tenant, actor),
+            readonly=True,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    s.id,
+                    s.tenant_id,
+                    s.user_id,
+                    u.username,
+                    s.created_at,
+                    s.last_seen_at,
+                    s.expires_at,
+                    s.revoked_at,
+                    s.revoke_reason,
+                    host(s.client_ip),
+                    s.user_agent
+                FROM iam.sessions AS s
+                JOIN iam.users AS u
+                  ON u.tenant_id = s.tenant_id AND u.id = s.user_id
+                WHERE s.tenant_id = %s
+                  AND (%s::uuid IS NULL OR s.user_id = %s::uuid)
+                  AND (
+                    NOT %s
+                    OR (
+                      s.revoked_at IS NULL
+                      AND s.expires_at > clock_timestamp()
+                    )
+                  )
+                ORDER BY s.last_seen_at DESC, s.created_at DESC
+                LIMIT 1000
+                """,
+                (tenant, target_user, target_user, bool(active_only)),
+            ).fetchall()
+            return tuple(
+                IdentitySessionRecord(
+                    session_id=str(row[0]),
+                    tenant_id=str(row[1]),
+                    user_id=str(row[2]),
+                    username=str(row[3]),
+                    created_at=row[4],
+                    last_seen_at=row[5],
+                    expires_at=row[6],
+                    revoked_at=row[7],
+                    revoke_reason=row[8],
+                    client_ip=row[9],
+                    user_agent=row[10],
+                )
+                for row in rows
+            )
+
+    def revoke_session_by_id(
+        self,
+        tenant_id: uuid.UUID | str,
+        session_id: uuid.UUID | str,
+        *,
+        actor_user_id: uuid.UUID | str,
+        reason: str,
+    ) -> bool:
+        tenant = _require_uuid(tenant_id, "tenant_id")
+        target_session = _require_uuid(session_id, "session_id")
+        actor = _require_uuid(actor_user_id, "actor_user_id")
+        normalized_reason = _normalize_required_text(
+            reason,
+            "reason",
+            maximum=512,
+        )
+        with self._pool.transaction(
+            _transaction_context(tenant, actor)
+        ) as connection:
+            result = connection.execute(
+                """
+                UPDATE iam.sessions
+                SET revoked_at = clock_timestamp(),
+                    revoke_reason = %s
+                WHERE tenant_id = %s
+                  AND id = %s
+                  AND revoked_at IS NULL
+                """,
+                (normalized_reason, tenant, target_session),
             )
             return bool(result.rowcount)
 

@@ -273,6 +273,75 @@ class RepositoryUnitTests(unittest.TestCase):
         )
         connection.assert_finished()
 
+    def test_list_sessions_returns_inventory_records(self):
+        session_id = uuid.uuid4()
+        created = datetime.now(timezone.utc) - timedelta(minutes=5)
+        last_seen = datetime.now(timezone.utc)
+        expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        connection = ScriptedConnection(
+            [
+                (
+                    "FROM iam.sessions AS s JOIN iam.users AS u",
+                    Result(
+                        rows=[
+                            (
+                                session_id,
+                                self.tenant_id,
+                                self.user_id,
+                                "operator",
+                                created,
+                                last_seen,
+                                expires,
+                                None,
+                                None,
+                                "127.0.0.1",
+                                "Chrome",
+                            )
+                        ]
+                    ),
+                )
+            ]
+        )
+        pool = FakePool(connection)
+        repository = PostgresIdentityRepository(pool, self.hasher)
+
+        sessions = repository.list_sessions(
+            self.tenant_id,
+            actor_user_id=self.user_id,
+            user_id=self.user_id,
+        )
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].session_id, str(session_id))
+        self.assertEqual(sessions[0].username, "operator")
+        self.assertEqual(sessions[0].client_ip, "127.0.0.1")
+        self.assertEqual(pool.contexts[0].actor_id, self.user_id)
+        self.assertEqual(connection.executions[0][1][1], self.user_id)
+        self.assertTrue(connection.executions[0][1][3])
+        connection.assert_finished()
+
+    def test_revoke_session_by_id_uses_actor_context(self):
+        session_id = uuid.uuid4()
+        connection = ScriptedConnection(
+            [("UPDATE iam.sessions", Result(rowcount=1))]
+        )
+        pool = FakePool(connection)
+        repository = PostgresIdentityRepository(pool, self.hasher)
+
+        self.assertTrue(
+            repository.revoke_session_by_id(
+                self.tenant_id,
+                session_id,
+                actor_user_id=self.user_id,
+                reason="device_lost",
+            )
+        )
+
+        self.assertEqual(pool.contexts[0].actor_id, self.user_id)
+        self.assertEqual(connection.executions[0][1][0], "device_lost")
+        self.assertEqual(connection.executions[0][1][2], session_id)
+        connection.assert_finished()
+
     def test_bootstrap_is_idempotent_only_for_same_admin_username(self):
         existing = identity(tenant_id=self.tenant_id, user_id=self.user_id)
         connection = ScriptedConnection(
@@ -602,6 +671,30 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
             user_agent="identity-lifecycle-live-test",
         )
         self.assertIsNotNone(repository.resolve_session(tenant_id, token))
+        active_sessions = repository.list_sessions(
+            tenant_id,
+            actor_user_id=admin.user_id,
+            user_id=operator.user_id,
+        )
+        self.assertEqual(len(active_sessions), 1)
+        self.assertEqual(active_sessions[0].username, operator.username)
+        self.assertTrue(
+            repository.revoke_session_by_id(
+                tenant_id,
+                active_sessions[0].session_id,
+                actor_user_id=admin.user_id,
+                reason="single_session_rotation",
+            )
+        )
+        self.assertIsNone(repository.resolve_session(tenant_id, token))
+        self.assertFalse(
+            repository.revoke_session_by_id(
+                tenant_id,
+                active_sessions[0].session_id,
+                actor_user_id=admin.user_id,
+                reason="single_session_rotation",
+            )
+        )
 
         viewer = repository.update_user(
             tenant_id,
@@ -615,6 +708,15 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
         self.assertEqual(viewer.allowed_channel_ids, frozenset({7}))
         self.assertNotIn(Permission.PROBES_RUN.value, viewer.permissions)
 
+        second_token = "operator-session-2-" + uuid.uuid4().hex
+        repository.create_session(
+            authenticated,
+            second_token,
+            "operator-csrf-2-" + uuid.uuid4().hex,
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+            client_ip="127.0.0.1",
+            user_agent="identity-lifecycle-live-test",
+        )
         revoked = repository.revoke_user_sessions(
             tenant_id,
             operator.user_id,
@@ -622,7 +724,7 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
             reason="live_test_rotation",
         )
         self.assertEqual(revoked, 1)
-        self.assertIsNone(repository.resolve_session(tenant_id, token))
+        self.assertIsNone(repository.resolve_session(tenant_id, second_token))
 
         inactive = repository.update_user(
             tenant_id,

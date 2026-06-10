@@ -2612,6 +2612,30 @@ def _identity_payload(identity: Any) -> Dict[str, Any]:
     }
 
 
+def _identity_session_payload(session: Any) -> Dict[str, Any]:
+    return {
+        "id": str(getattr(session, "session_id", "")),
+        "tenantId": str(getattr(session, "tenant_id", "")),
+        "userId": str(getattr(session, "user_id", "")),
+        "username": str(getattr(session, "username", "")),
+        "createdAt": getattr(session, "created_at").isoformat()
+        if getattr(session, "created_at", None) is not None
+        else None,
+        "lastSeenAt": getattr(session, "last_seen_at").isoformat()
+        if getattr(session, "last_seen_at", None) is not None
+        else None,
+        "expiresAt": getattr(session, "expires_at").isoformat()
+        if getattr(session, "expires_at", None) is not None
+        else None,
+        "revokedAt": getattr(session, "revoked_at").isoformat()
+        if getattr(session, "revoked_at", None) is not None
+        else None,
+        "revokeReason": getattr(session, "revoke_reason", None),
+        "clientIp": getattr(session, "client_ip", None),
+        "userAgent": getattr(session, "user_agent", None),
+    }
+
+
 def _role_payload(role: Role) -> Dict[str, Any]:
     permissions = ROLE_PERMISSIONS[role]
     return {
@@ -3033,6 +3057,79 @@ def auth_user_revoke_sessions(user_id: str):
     except Exception:
         return _auth_failure_response("Identity service unavailable", 503)
     return jsonify({"success": True, "revokedSessions": revoked})
+
+
+@app.route('/auth/sessions', methods=['GET'])
+def auth_sessions():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=False, action="auth.sessions.list")
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    user_id = (
+        str(request.args.get("userId") or request.args.get("user_id") or "").strip()
+        or None
+    )
+    active_only = _coerce_bool(
+        request.args.get("activeOnly") or request.args.get("active_only"),
+        default=True,
+    )
+    try:
+        sessions = _get_identity_repository().list_sessions(
+            context.tenant_id,
+            actor_user_id=context.user_id,
+            user_id=user_id,
+            active_only=active_only,
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify(
+        {
+            "success": True,
+            "sessions": [_identity_session_payload(session) for session in sessions],
+        }
+    )
+
+
+@app.route('/auth/sessions/<session_id>/revoke', methods=['POST'])
+def auth_session_revoke(session_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=True, action="auth.sessions.revoke")
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    data = _json_body()
+    reason = str(data.get("reason") or "admin_revoked").strip()
+    try:
+        revoked = _get_identity_repository().revoke_session_by_id(
+            context.tenant_id,
+            session_id,
+            actor_user_id=context.user_id,
+            reason=reason,
+        )
+        if not revoked:
+            return _auth_failure_response("Session not found", 404)
+        _write_security_audit(
+            context=context,
+            action="auth.sessions.revoke.completed",
+            result="success",
+            target_type="iam_session",
+            target_id=session_id,
+            details={"reason": reason},
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "revoked": True})
 
 
 @app.route('/auth/logout', methods=['POST'])
