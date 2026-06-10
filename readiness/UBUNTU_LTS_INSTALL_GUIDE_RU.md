@@ -5,9 +5,9 @@
 ## Scope
 
 Этот runbook поднимает EVA AI web/API, PostgreSQL, пользователей, роли,
-audit и systemd-service на чистой Ubuntu Server LTS. Настройка LLM/VLM
-inference, llama.cpp/LM Studio/Ollama, CUDA-бенчей и лицензий моделей здесь
-намеренно вынесена за скобки.
+audit и systemd-service на чистой Ubuntu Server LTS. Он подходит для Ubuntu
+24.04 LTS и 26.04 LTS. Настройка LLM/VLM inference, llama.cpp/LM Studio/Ollama,
+CUDA-бенчей и лицензий моделей здесь намеренно вынесена за скобки.
 
 На дату документа последняя стабильная Ubuntu Server LTS на официальном сайте
 Canonical — Ubuntu 26.04 LTS. Canonical указывает, что LTS-релизы выходят раз
@@ -20,7 +20,7 @@ Canonical — Ubuntu 26.04 LTS. Canonical указывает, что LTS-рел�
 
 ## Целевая схема
 
-- OS: Ubuntu Server 26.04 LTS, amd64.
+- OS: Ubuntu Server 24.04 LTS или 26.04 LTS, amd64.
 - App user: `eva`.
 - App path: `/opt/eva-ai/evo-ssearch`.
 - Data path: `/var/lib/eva-ai`.
@@ -64,7 +64,7 @@ nvidia-smi
 
 ```bash
 sudo adduser --system --group --home /opt/eva-ai eva
-sudo install -d -o eva -g eva -m 0750 /opt/eva-ai
+sudo install -d -o eva -g eva -m 0755 /opt/eva-ai
 sudo install -d -o eva -g eva -m 0750 /var/lib/eva-ai
 sudo install -d -o eva -g eva -m 0750 /var/lib/eva-ai/detections_archive
 sudo install -d -o eva -g eva -m 0750 /var/log/eva-ai
@@ -157,6 +157,11 @@ EVOSSEARCH_GUNICORN_WORKERS=1
 EVOSSEARCH_GUNICORN_THREADS=4
 EVOSSEARCH_GUNICORN_TIMEOUT=240
 
+EVOSSEARCH_EMBEDDER=clip
+EVOSSEARCH_INDEX_MODE=clip
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_M2F_ENABLED=false
+
 EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED=true
 EVOSSEARCH_AUTH_ENABLED=true
 EVOSSEARCH_AUTH_TENANT_ID=${EVOSSEARCH_AUTH_TENANT_ID}
@@ -189,14 +194,16 @@ sudo chown root:root /etc/eva-ai/eva-ai.env
 ## 6. Первый администратор
 
 ```bash
-cd /opt/eva-ai/evo-ssearch
-set -a
-. /etc/eva-ai/eva-ai.env
-set +a
-sudo -u eva -E .venv/bin/python scripts/bootstrap_admin.py \
-  --tenant-id "$EVOSSEARCH_AUTH_TENANT_ID" \
-  --username admin \
-  --display-name "EVA Admin"
+sudo bash -lc '
+  set -a
+  . /etc/eva-ai/eva-ai.env
+  set +a
+  cd /opt/eva-ai/evo-ssearch
+  sudo -u eva -E .venv/bin/python scripts/bootstrap_admin.py \
+    --tenant-id "$EVOSSEARCH_AUTH_TENANT_ID" \
+    --username admin \
+    --display-name "EVA Admin"
+'
 ```
 
 Пароль вводится интерактивно и не попадает в shell history.
@@ -204,17 +211,21 @@ sudo -u eva -E .venv/bin/python scripts/bootstrap_admin.py \
 Создание пилотного оператора на каналы 1-50:
 
 ```bash
-cd /opt/eva-ai/evo-ssearch
-set -a
-. /etc/eva-ai/eva-ai.env
-set +a
 read -rsp 'Operator temporary password: ' EVA_USER_PASSWORD
 echo
 export EVA_USER_PASSWORD
 CHANNELS_1_50="$(seq -s, 1 50)"
-sudo -u eva -E .venv/bin/python scripts/manage_users.py create operator-1 \
-  --role operator \
-  --channels "$CHANNELS_1_50"
+sudo EVA_USER_PASSWORD="$EVA_USER_PASSWORD" CHANNELS_1_50="$CHANNELS_1_50" bash -lc '
+  set -a
+  . /etc/eva-ai/eva-ai.env
+  set +a
+  cd /opt/eva-ai/evo-ssearch
+  sudo -u eva -E \
+    EVA_USER_PASSWORD="$EVA_USER_PASSWORD" \
+    .venv/bin/python scripts/manage_users.py create operator-1 \
+    --role operator \
+    --channels "$CHANNELS_1_50"
+'
 unset EVA_USER_PASSWORD
 ```
 
@@ -324,15 +335,24 @@ curl -k -sS https://127.0.0.1/ready | jq
 ## 9. Smoke checklist перед клиентским демо
 
 ```bash
-cd /opt/eva-ai/evo-ssearch
-set -a
-. /etc/eva-ai/eva-ai.env
-set +a
-
-sudo -u eva -E .venv/bin/python -m unittest discover tests
-sudo -u eva -E .venv/bin/python -m unittest tests.test_postgres_identity
+sudo -u eva -H bash -lc \
+  'cd /opt/eva-ai/evo-ssearch && .venv/bin/python -m unittest discover tests'
+sudo bash -lc '
+  set -a
+  . /etc/eva-ai/eva-ai.env
+  set +a
+  export EVA_TEST_DATABASE_DSN="$EVA_DATABASE_DSN"
+  cd /opt/eva-ai/evo-ssearch
+  sudo -u eva -E .venv/bin/python -m unittest tests.test_postgres_identity
+'
 curl -k -sS https://127.0.0.1/ready | jq
-sudo -u eva -E .venv/bin/python scripts/manage_users.py list
+sudo bash -lc '
+  set -a
+  . /etc/eva-ai/eva-ai.env
+  set +a
+  cd /opt/eva-ai/evo-ssearch
+  sudo -u eva -E .venv/bin/python scripts/manage_users.py list
+'
 ```
 
 Ручная проверка в UI:
