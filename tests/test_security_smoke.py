@@ -15,10 +15,13 @@ from oldapp import (
 class SecuritySmokeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = app.test_client()
+        self._orig_auth_enabled = config.AUTH_ENABLED
         self._orig_admin_token = config.ADMIN_TOKEN
         self._orig_settings_local_only = config.SETTINGS_LOCAL_ONLY
+        config.AUTH_ENABLED = False
 
     def tearDown(self) -> None:
+        config.AUTH_ENABLED = self._orig_auth_enabled
         config.ADMIN_TOKEN = self._orig_admin_token
         config.SETTINGS_LOCAL_ONLY = self._orig_settings_local_only
 
