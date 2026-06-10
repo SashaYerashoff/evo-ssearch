@@ -160,6 +160,8 @@ _identity_repository: Optional[Any] = None
 _identity_repository_lock = Lock()
 _audit_writer: Optional[Any] = None
 _audit_writer_lock = Lock()
+_audit_reader: Optional[Any] = None
+_audit_reader_lock = Lock()
 _audit_db_pool: Optional[PsycopgPool] = None
 _audit_db_pool_lock = Lock()
 
@@ -221,6 +223,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "agent_skills": Permission.AGENT_USE,
     "agent_skill_detail": Permission.AGENT_USE,
     "agent_session": Permission.AGENT_USE,
+    "audit_events": Permission.AUDIT_VIEW,
 }
 _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
     {
@@ -239,6 +242,7 @@ _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
 )
 _ALL_CHANNELS_REQUIRED_ENDPOINTS = frozenset(
     {
+        "audit_events",
         "luxriot_stop_all_streams",
     }
 )
@@ -429,6 +433,16 @@ def _get_audit_writer() -> Any:
 
             _audit_writer = PostgresAuditWriter(_get_audit_db_pool())
         return _audit_writer
+
+
+def _get_audit_reader() -> Any:
+    global _audit_reader
+    with _audit_reader_lock:
+        if _audit_reader is None:
+            from security.postgres_audit_reader import PostgresAuditReader
+
+            _audit_reader = PostgresAuditReader(_get_control_plane_db_pool())
+        return _audit_reader
 
 
 def _audit_database_dsn() -> str:
@@ -3317,6 +3331,56 @@ def auth_session_revoke(session_id: str):
     except Exception:
         return _auth_failure_response("Identity service unavailable", 503)
     return jsonify({"success": True, "revoked": True})
+
+
+@app.route('/audit/events', methods=['GET'])
+def audit_events():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    try:
+        page = _get_audit_reader().list_events(
+            context,
+            limit=request.args.get("limit"),
+            cursor=request.args.get("cursor"),
+            since=request.args.get("since"),
+            until=request.args.get("until"),
+            actor_user_id=(
+                request.args.get("actorUserId")
+                or request.args.get("actor_user_id")
+            ),
+            action=request.args.get("action"),
+            target_type=(
+                request.args.get("targetType")
+                or request.args.get("target_type")
+            ),
+            target_id=(
+                request.args.get("targetId")
+                or request.args.get("target_id")
+            ),
+            channel_id=(
+                request.args.get("channelId")
+                or request.args.get("channel_id")
+            ),
+            result=request.args.get("result"),
+            request_id=(
+                request.args.get("requestId")
+                or request.args.get("request_id")
+            ),
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return jsonify(
+        {
+            "success": True,
+            "events": [event.to_dict() for event in page.events],
+            "nextCursor": page.next_cursor,
+        }
+    )
 
 
 @app.route('/auth/logout', methods=['POST'])
@@ -8862,7 +8926,7 @@ def agent_session(session_id: str):
 
 @atexit.register
 def _shutdown_background_workers() -> None:
-    global _audit_db_pool, _audit_writer, _control_plane_db_pool
+    global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
     global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
     try:
@@ -8888,6 +8952,7 @@ def _shutdown_background_workers() -> None:
         if _control_plane_db_pool is not None:
             _control_plane_db_pool.close()
             _control_plane_db_pool = None
+            _audit_reader = None
             _identity_repository = None
     except Exception:
         pass

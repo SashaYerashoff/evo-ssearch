@@ -53,6 +53,37 @@ class _ManagedSession:
     user_agent: str | None = None
 
 
+@dataclass(frozen=True)
+class _AuditRow:
+    event_id: str = "event-1"
+    action: str = "auth.login"
+
+    def to_dict(self):
+        return {
+            "id": self.event_id,
+            "action": self.action,
+            "details": {"safe": "visible"},
+        }
+
+
+@dataclass(frozen=True)
+class _AuditPage:
+    events: tuple[_AuditRow, ...] = (_AuditRow(),)
+    next_cursor: str | None = "cursor-1"
+
+
+class _AuditReader:
+    def __init__(self) -> None:
+        self.calls = []
+        self.error = None
+
+    def list_events(self, context, **kwargs):
+        if self.error is not None:
+            raise self.error
+        self.calls.append((context, kwargs))
+        return _AuditPage()
+
+
 class _Repository:
     def __init__(self) -> None:
         self.identity = _Identity()
@@ -273,6 +304,8 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         oldapp._identity_repository = self.repository
         oldapp._audit_writer = self.audit
+        self.audit_reader = _AuditReader()
+        oldapp._audit_reader = self.audit_reader
         self.client = oldapp.app.test_client()
 
     def tearDown(self) -> None:
@@ -282,6 +315,7 @@ class HttpAuthRouteTests(unittest.TestCase):
         oldapp._auth_service = None
         oldapp._identity_repository = None
         oldapp._audit_writer = None
+        oldapp._audit_reader = None
         oldapp._audit_db_pool = None
 
     def _login(self):
@@ -908,6 +942,82 @@ class HttpAuthRouteTests(unittest.TestCase):
                 for event in self.audit.events
             )
         )
+
+    def test_admin_can_read_audit_events(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        response = self.client.get("/audit/events?limit=10&result=success")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertEqual(body["events"][0]["action"], "auth.login")
+        self.assertEqual(body["nextCursor"], "cursor-1")
+        context, kwargs = self.audit_reader.calls[-1]
+        self.assertEqual(context.user_id, USER_ID)
+        self.assertEqual(kwargs["limit"], "10")
+        self.assertEqual(kwargs["result"], "success")
+
+    def test_non_admin_cannot_read_audit_events(self) -> None:
+        self._login()
+
+        response = self.client.get("/audit/events")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.audit_reader.calls, [])
+
+    def test_scoped_audit_viewer_cannot_read_tenant_wide_audit(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.VIEWER.value}),
+            permissions=frozenset({Permission.AUDIT_VIEW.value}),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        response = self.client.get("/audit/events")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.audit_reader.calls, [])
+
+    def test_audit_reader_validation_errors_are_400(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        self.audit_reader.error = ValueError("limit must be between 1 and 100")
+
+        response = self.client.get("/audit/events?limit=101")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json()["error"],
+            "limit must be between 1 and 100",
+        )
+
+    def test_audit_outage_blocks_audit_event_reads(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.ADMIN.value}),
+            permissions=frozenset(permission.value for permission in Permission),
+            allowed_channel_ids=frozenset({ALL_CHANNELS}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        self.audit.error = RuntimeError("audit unavailable")
+
+        response = self.client.get("/audit/events")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"], "Audit service unavailable")
+        self.assertEqual(self.audit_reader.calls, [])
 
 
 if __name__ == "__main__":

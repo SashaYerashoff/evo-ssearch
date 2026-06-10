@@ -104,6 +104,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/auth/users",
             "/auth/users/<user_id>",
             "/auth/users/<user_id>/revoke-sessions",
+            "/audit/events",
             "/image",
             "/image/<path:filepath>",
             "/js/app.js",
