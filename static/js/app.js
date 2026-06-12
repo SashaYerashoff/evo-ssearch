@@ -166,6 +166,9 @@
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
     const archiveTimeFilter = document.getElementById('archiveTimeFilter');
     const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
+    const archiveScoreThresholdInput = document.getElementById('archiveScoreThreshold');
+    const archiveScoreThresholdValue = document.getElementById('archiveScoreThresholdValue');
+    const archiveScoreThresholdMeta = document.getElementById('archiveScoreThresholdMeta');
     const loadDetectionsBtn = document.getElementById('loadDetectionsBtn');
     const refreshDetectionsFiltersBtn = document.getElementById('refreshDetectionsFiltersBtn');
     const archiveDetectionsPrevBtn = document.getElementById('archiveDetectionsPrev');
@@ -254,6 +257,7 @@
     let archiveDetectionsOffset = 0;
     let archiveDetectionsTotal = 0;
     let archiveDetectionsHasMore = false;
+    let archiveScoreThreshold = 0;
     const channelCaptureConfig = {};
     const channelFpsDesired = {};
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
@@ -3543,6 +3547,100 @@
         return `${(value * 100).toFixed(1)}%`;
     }
 
+    function normalizeArchiveThresholdPercent(value) {
+        const parsed = Number.parseInt(value, 10);
+        return Math.min(100, Math.max(0, Number.isFinite(parsed) ? parsed : 0));
+    }
+
+    function getArchiveResultScore(result) {
+        if (!result || typeof result !== 'object') return null;
+        const candidates = [
+            result.similarity,
+            result.score,
+            result.match_score,
+            result.final_score,
+            result?.fusion?.clip_similarity,
+            result?.fusion?.dino_similarity,
+        ];
+        for (const candidate of candidates) {
+            const score = Number.parseFloat(candidate);
+            if (Number.isFinite(score)) {
+                if (score > 1 && score <= 100) return score / 100;
+                return Math.min(1, Math.max(0, score));
+            }
+        }
+        return null;
+    }
+
+    function archiveResultPassesThreshold(result) {
+        if (archiveScoreThreshold <= 0) return true;
+        const score = getArchiveResultScore(result);
+        return Number.isFinite(score) && score >= archiveScoreThreshold;
+    }
+
+    function visibleArchiveResultIndexes() {
+        return archiveRenderedResults
+            .map((result, index) => (archiveResultPassesThreshold(result) ? index : -1))
+            .filter((index) => index >= 0);
+    }
+
+    function updateArchiveThresholdUi() {
+        const percent = Math.round(archiveScoreThreshold * 100);
+        if (archiveScoreThresholdInput) {
+            archiveScoreThresholdInput.value = String(percent);
+        }
+        if (archiveScoreThresholdValue) {
+            archiveScoreThresholdValue.textContent = `${percent}%`;
+        }
+    }
+
+    function applyArchiveScoreThreshold({ selectFirstVisible = false } = {}) {
+        updateArchiveThresholdUi();
+        const items = Array.from(document.querySelectorAll('#results .result-item'));
+        let visibleCount = 0;
+        let scoredCount = 0;
+        let firstVisibleIndex = -1;
+        items.forEach((item) => {
+            const index = Number.parseInt(item.dataset.resultIndex || '-1', 10);
+            const result = archiveRenderedResults[index];
+            const score = getArchiveResultScore(result);
+            if (Number.isFinite(score)) scoredCount += 1;
+            const visible = archiveResultPassesThreshold(result);
+            item.classList.toggle('is-score-hidden', !visible);
+            if (visible) {
+                visibleCount += 1;
+                if (firstVisibleIndex < 0) firstVisibleIndex = index;
+            }
+        });
+        if (archiveScoreThresholdMeta) {
+            const total = archiveRenderedResults.length;
+            const percent = Math.round(archiveScoreThreshold * 100);
+            if (!total) {
+                archiveScoreThresholdMeta.textContent = 'No results loaded.';
+            } else if (archiveScoreThreshold <= 0) {
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results. ${scoredCount} have match scores.`;
+            } else {
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results at ${percent}%+ match.`;
+            }
+        }
+        if (!archiveRenderedResults.length) return;
+        const activeVisible = activeArchiveInspectorIndex >= 0
+            && archiveResultPassesThreshold(archiveRenderedResults[activeArchiveInspectorIndex]);
+        if ((selectFirstVisible || !activeVisible) && firstVisibleIndex >= 0) {
+            showArchiveInspector(firstVisibleIndex);
+        } else if (firstVisibleIndex < 0) {
+            renderArchiveInspectorEmpty('No results match the current score threshold.');
+            highlightActiveArchiveResultCard(-1);
+            activeArchiveInspectorIndex = -1;
+        }
+    }
+
+    function setArchiveScoreThresholdFromInput(value) {
+        const percent = normalizeArchiveThresholdPercent(value);
+        archiveScoreThreshold = percent / 100;
+        applyArchiveScoreThreshold();
+    }
+
     function buildSimilarityMetrics(result, isCommented = false) {
         if (isCommented) {
             const count = result.comment_count || 0;
@@ -3809,6 +3907,8 @@
             archiveDetectionsHasMore = Boolean(data.has_more);
             const mapped = normalizeDetectionResults(detections);
             if (!mapped.length) {
+                archiveRenderedResults = [];
+                applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
                 setArchiveDetectionsMeta('No detections found for selected filters.');
                 renderArchiveInspectorEmpty('No detections found for the selected filters.');
@@ -3846,16 +3946,19 @@
     }
 
     function isDetectionsScope() {
-        return searchScopeSelect && searchScopeSelect.value === 'detections';
+        return !searchScopeSelect || searchScopeSelect.value === 'detections';
     }
 
     function updateSearchScopeUI() {
+        if (searchScopeSelect && searchScopeSelect.value !== 'detections') {
+            searchScopeSelect.value = 'detections';
+        }
         if (!searchScopeSelect) return;
         if (isDetectionsScope()) {
             if (searchInput) {
                 searchInput.placeholder = 'Describe detection scene (filtered by stream/probe/time)...';
             }
-            setArchiveDetectionsMeta('Detections scope active: text/image search runs over filtered detection shards.');
+            setArchiveDetectionsMeta('Detection archive active: text/image search runs over filtered detection shards.');
         } else if (searchInput) {
             searchInput.placeholder = "Describe what you're looking for...";
         }
@@ -6531,7 +6634,16 @@
             updateArchiveDetectionsNav();
         });
     }
+    if (archiveScoreThresholdInput) {
+        archiveScoreThresholdInput.addEventListener('input', () => {
+            setArchiveScoreThresholdFromInput(archiveScoreThresholdInput.value);
+        });
+        setArchiveScoreThresholdFromInput(archiveScoreThresholdInput.value);
+    } else {
+        updateArchiveThresholdUi();
+    }
     if (searchScopeSelect) {
+        searchScopeSelect.value = 'detections';
         searchScopeSelect.addEventListener('change', () => {
             updateSearchScopeUI();
         });
@@ -6657,6 +6769,8 @@
                     indexStatus.className = 'status warning';
                 }
             } else {
+                archiveRenderedResults = [];
+                applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 renderArchiveInspectorEmpty('No results found for this query.');
             }
@@ -6720,6 +6834,8 @@
                     : data.results;
                 displayResults(renderedResults);
             } else {
+                archiveRenderedResults = [];
+                applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 renderArchiveInspectorEmpty('No visual matches found for this reference image.');
             }
@@ -6996,7 +7112,7 @@
             if (canUseFolderComments) {
                 loadComments(index, result.path, activeFolder);
             } else {
-                commentsContainer.innerHTML = '<div class="no-comments">This detection can be described, but comments are only available when the image belongs to the active indexed folder.</div>';
+                commentsContainer.innerHTML = '<div class="no-comments">This detection can be described; inline comments are unavailable for archive-only results.</div>';
             }
         }
 
@@ -7094,7 +7210,7 @@
                     </div>
                 ` : `
                     <div class="comments-list" id="comments-${index}">
-                        <div class="no-comments">Comments can be saved only when this image is inside the active indexed folder.</div>
+                        <div class="no-comments">Comments are unavailable for archive-only results.</div>
                     </div>
                 `}
             </div>
@@ -7273,6 +7389,7 @@
         } else {
             renderArchiveInspectorEmpty('Run a text search, image search, or load detections to populate the inspector.');
         }
+        applyArchiveScoreThreshold({ selectFirstVisible: true });
     }
     
     // Display commented results (similar to displayResults but with comment info)
@@ -7301,6 +7418,7 @@
         } else {
             renderArchiveInspectorEmpty('No commented images found for the current archive.');
         }
+        applyArchiveScoreThreshold({ selectFirstVisible: true });
     }
     
     // Comment functionality

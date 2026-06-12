@@ -109,7 +109,7 @@
 
                         <div class="archive-section archive-section-compact">
                             <div class="archive-section-title">Search Controls</div>
-                            <div class="section-help">Tune ranking, scope, and region sensitivity for the current session.</div>
+                            <div class="section-help">Tune ranking and match threshold for archive review.</div>
                             <div class="archive-filter-grid archive-filter-grid-tight">
                                 <div class="input-group">
                                     <label for="sortBy" class="input-label">Sort by:</label>
@@ -124,22 +124,30 @@
                                         {{ result_options_html | safe }}
                                     </select>
                                 </div>
-                                <div class="input-group">
+                                <div class="input-group archive-scope-control is-hidden">
                                     <label for="searchScope" class="input-label">Scope:</label>
                                     <select id="searchScope">
-                                        <option value="folder" selected>Indexed Folder</option>
-                                        <option value="detections">Detections Archive</option>
+                                        <option value="folder">Indexed Folder</option>
+                                        <option value="detections" selected>Detections Archive</option>
                                     </select>
                                 </div>
                             </div>
+                            <div class="archive-threshold-control">
+                                <div class="archive-threshold-head">
+                                    <label for="archiveScoreThreshold" class="input-label">Min match:</label>
+                                    <span id="archiveScoreThresholdValue" class="archive-threshold-value">0%</span>
+                                </div>
+                                <input type="range" id="archiveScoreThreshold" min="0" max="100" value="0" step="1" />
+                                <div id="archiveScoreThresholdMeta" class="archive-threshold-meta">Showing all scored matches.</div>
+                            </div>
                             <div class="archive-panel-actions">
-                                <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
+                                <button id="showCommentedBtn" class="feature-btn is-hidden">Show Commented Images</button>
                             </div>
                         </div>
 
                         <div class="archive-section">
                             <div class="archive-section-title">Text Query</div>
-                            <div class="section-help">Use natural language; selected scope and filters apply automatically.</div>
+                            <div class="section-help">Use natural language; stream, probe, and time filters apply automatically.</div>
                             <div id="textSearchBox" class="search-box">
                                 <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
                                 <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
@@ -148,7 +156,7 @@
 
                         <div class="archive-section">
                             <div class="archive-section-title">Image Query</div>
-                            <div class="section-help">Upload a visual reference and run similarity search against the active scope.</div>
+                            <div class="section-help">Upload a visual reference and run similarity search against the detection archive.</div>
                             <div id="imageSearchBox" class="search-box image-search-box">
                                 <div id="imageQueryPanel" class="image-query-panel">
                                     <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
@@ -167,7 +175,7 @@
                             </div>
                         </div>
 
-                        <div class="archive-section archive-section-compact">
+                        <div class="archive-section archive-section-compact is-hidden">
                             <div class="archive-section-title">Index Folder</div>
                             <div class="section-help">Point EVA at the active archive and refresh embeddings before search.</div>
                             <div class="folder-select">
@@ -791,7 +799,7 @@
                 </button>
                 <button type="button" class="settings-nav-btn" data-settings-target="settings-section-advanced">
                     <span class="settings-nav-label">Advanced</span>
-                    <span class="settings-nav-meta">Indexing, rerank, and segment controls.</span>
+                    <span class="settings-nav-meta">Rerank, segmentation, and storage controls.</span>
                 </button>
                 <button type="button" class="settings-nav-btn" data-settings-target="settings-section-luxriot">
                     <span class="settings-nav-label">Luxriot</span>
@@ -902,7 +910,7 @@
 
                     <div id="settings-section-advanced" class="settings-section">
                         <h3>Advanced Settings</h3>
-                        <div class="settings-section-meta">Index mode, reranking, segmentation, and storage-level constraints.</div>
+                        <div class="settings-section-meta">Reranking, segmentation, and storage-level constraints.</div>
                         <div class="settings-row">
                             <label class="settings-label">Max Comment Length:</label>
                             <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
@@ -911,11 +919,11 @@
                             <label class="settings-label">Max File Size (MB):</label>
                             <input type="number" id="maxFileSize" class="settings-input" min="1" max="500" placeholder="50">
                         </div>
-                        <div class="settings-row">
+                        <div class="settings-row is-hidden">
                             <label class="settings-label">Index Folder Name:</label>
                             <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
                         </div>
-                        <div class="settings-row">
+                        <div class="settings-row is-hidden">
                             <label class="settings-label">Index Mode:</label>
                             <select id="indexMode" class="settings-select">
                                 <option value="clip">CLIP only</option>
