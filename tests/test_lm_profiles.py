@@ -7,14 +7,18 @@ from config import _get_lm_profiles
 
 
 class _Response:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self._payload
+
+    def close(self):
+        return None
 
 
 class LmProfileConfigTests(unittest.TestCase):
@@ -29,6 +33,8 @@ class LmProfileConfigTests(unittest.TestCase):
             "EVOSSEARCH_LM_PROFILE_VLM_EAST_KIND": "vlm",
             "EVOSSEARCH_LM_PROFILE_VLM_EAST_BASE_URL": "http://vlm-east.local/v1",
             "EVOSSEARCH_LM_PROFILE_VLM_EAST_MODEL": "qwen3.5-vl-4b",
+            "EVOSSEARCH_LM_PROFILE_VLM_EAST_ENABLED": "false",
+            "EVOSSEARCH_LM_PROFILE_VLM_EAST_GPU": "server-a:0",
         }
         with patch.dict(os.environ, env, clear=True):
             profiles = _get_lm_profiles(
@@ -46,6 +52,8 @@ class LmProfileConfigTests(unittest.TestCase):
         self.assertEqual(profiles["agent"]["timeout"], 600)
         self.assertEqual(profiles["vlm-east"]["kind"], "vlm")
         self.assertEqual(profiles["vlm-east"]["model"], "qwen3.5-vl-4b")
+        self.assertFalse(profiles["vlm-east"]["enabled"])
+        self.assertEqual(profiles["vlm-east"]["gpu"], "server-a:0")
 
 
 class LmProfileRuntimeTests(unittest.TestCase):
@@ -129,6 +137,7 @@ class LmProfileRuntimeTests(unittest.TestCase):
                 "model": "qwen-vlm",
                 "api_key": "vlm-secret",
                 "timeout": 300,
+                "gpu": "infer-a:0",
             },
         }
 
@@ -141,6 +150,8 @@ class LmProfileRuntimeTests(unittest.TestCase):
             patch.object(oldapp.config, "LM_PROFILES", profiles),
             patch.object(oldapp.config, "LM_AGENT_PROFILE_ID", "agent"),
             patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-a",)),
             patch.object(oldapp.requests, "get", fake_get),
         ):
             payload = oldapp._fetch_lm_model_catalog(force=True)
@@ -150,7 +161,116 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertIn("vlm-a", payload["models"])
         self.assertIn("qwen-agent", payload["models"])
         self.assertIn("qwen-vlm", payload["models"])
+        self.assertEqual(payload["auto_model_selector"], "__auto__")
+        self.assertTrue(payload["vlm_balancer"]["enabled"])
+        self.assertEqual(payload["vlm_balancer"]["profile_ids"], ["vlm-a"])
+        public_vlm = next(profile for profile in payload["profiles"] if profile["id"] == "vlm-a")
+        self.assertEqual(public_vlm["gpu"], "infer-a:0")
         self.assertNotIn("agent-secret", str(payload))
+        self.assertNotIn("vlm-secret", str(payload))
+
+    def test_auto_balancer_assigns_stable_vlm_profile(self):
+        profiles = {
+            "default": {
+                "id": "default",
+                "kind": "general",
+                "base_url": "http://default.local/v1",
+                "model": "default-model",
+                "api_key": "",
+                "timeout": 120,
+            },
+            "vlm-a": {
+                "id": "vlm-a",
+                "kind": "vlm",
+                "base_url": "http://vlm-a.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+            "vlm-b": {
+                "id": "vlm-b",
+                "kind": "vlm",
+                "base_url": "http://vlm-b.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+            "vlm-disabled": {
+                "id": "vlm-disabled",
+                "kind": "vlm",
+                "base_url": "http://disabled.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": False,
+            },
+        }
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(
+                oldapp.config,
+                "LM_VLM_BALANCER_PROFILES",
+                ("vlm-a", "vlm-b", "vlm-disabled"),
+            ),
+        ):
+            first_hint, first_meta = oldapp._resolve_luxriot_vlm_model_hint(7, "__auto__")
+            second_hint, second_meta = oldapp._resolve_luxriot_vlm_model_hint(7, "")
+            manual_hint, manual_meta = oldapp._resolve_luxriot_vlm_model_hint(7, "vlm-b")
+
+        self.assertIn(first_hint, {"vlm-a", "vlm-b"})
+        self.assertEqual(second_hint, first_hint)
+        self.assertEqual(first_meta["mode"], "auto")
+        self.assertEqual(second_meta["assigned_profile_id"], first_hint)
+        self.assertEqual(first_meta["profile_count"], 2)
+        self.assertEqual(manual_hint, "vlm-b")
+        self.assertEqual(manual_meta["mode"], "manual")
+
+    def test_ready_checks_required_vlm_profiles_without_secrets(self):
+        profiles = {
+            "default": {
+                "id": "default",
+                "kind": "general",
+                "base_url": "http://default.local/v1",
+                "model": "default-model",
+                "api_key": "",
+                "timeout": 120,
+            },
+            "vlm-a": {
+                "id": "vlm-a",
+                "kind": "vlm",
+                "base_url": "http://vlm-a.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "vlm-secret",
+                "timeout": 300,
+                "enabled": True,
+                "gpu": "server-a:0",
+            },
+        }
+        captured_headers = []
+
+        def fake_get(_url, **kwargs):
+            captured_headers.append(kwargs.get("headers") or {})
+            return _Response({"data": [{"id": "qwen-vlm"}]})
+
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-a",)),
+            patch.object(oldapp.requests, "get", fake_get),
+        ):
+            payload = oldapp._check_lm_profiles_ready(timeout_sec=0.1)
+
+        self.assertTrue(payload["ok"], payload)
+        self.assertTrue(payload["required"])
+        self.assertEqual(payload["required_profile_ids"], ["vlm-a"])
+        public_vlm = next(profile for profile in payload["profiles"] if profile["id"] == "vlm-a")
+        self.assertEqual(public_vlm["gpu"], "server-a:0")
+        self.assertIn("Bearer vlm-secret", str(captured_headers))
         self.assertNotIn("vlm-secret", str(payload))
 
 

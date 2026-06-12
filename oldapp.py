@@ -1890,6 +1890,131 @@ def _lm_profile_selector_value(profile: Mapping[str, Any]) -> str:
     return model or profile_id
 
 
+LM_AUTO_BALANCE_SELECTOR = "__auto__"
+LM_AUTO_BALANCE_LABEL = "Auto balance"
+LM_AUTO_BALANCE_ALIASES = {
+    LM_AUTO_BALANCE_SELECTOR,
+    "auto",
+    "auto-balance",
+    "auto_balance",
+}
+VLM_PROFILE_KINDS = {"vlm", "vision", "video"}
+
+
+def _lm_profile_enabled(profile: Mapping[str, Any]) -> bool:
+    raw = profile.get("enabled")
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def _is_auto_lm_selector(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in LM_AUTO_BALANCE_ALIASES
+
+
+def _configured_vlm_balancer_profile_ids() -> List[str]:
+    profiles = _configured_lm_profiles()
+    raw_configured = getattr(config, "LM_VLM_BALANCER_PROFILES", ())
+    if isinstance(raw_configured, str):
+        configured_ids = [
+            item.strip()
+            for item in raw_configured.split(",")
+            if item.strip()
+        ]
+    else:
+        configured_ids = [
+            str(item).strip()
+            for item in (raw_configured or ())
+            if str(item).strip()
+        ]
+
+    profile_ids: List[str] = []
+    if configured_ids:
+        candidates = configured_ids
+    else:
+        candidates = [
+            profile_id
+            for profile_id, profile in profiles.items()
+            if str(profile.get("kind") or "").strip().lower() in VLM_PROFILE_KINDS
+        ]
+        if not candidates:
+            candidates = [_default_lm_profile_id("vlm")]
+
+    for profile_id in candidates:
+        if profile_id in profile_ids:
+            continue
+        profile = profiles.get(profile_id)
+        if not isinstance(profile, Mapping):
+            continue
+        if not _lm_profile_enabled(profile):
+            continue
+        if not str(profile.get("base_url") or "").strip():
+            continue
+        if not str(profile.get("model") or "").strip():
+            continue
+        profile_ids.append(profile_id)
+    return profile_ids
+
+
+def _vlm_balancer_enabled() -> bool:
+    return bool(getattr(config, "LM_VLM_BALANCER_ENABLED", False))
+
+
+def _stable_vlm_profile_for_channel(channel_id: int, profile_ids: Sequence[str]) -> Optional[str]:
+    if not profile_ids:
+        return None
+    digest = hashlib.sha256(f"vlm:{int(channel_id)}".encode("utf-8")).digest()
+    slot = int.from_bytes(digest[:8], "big") % len(profile_ids)
+    return str(profile_ids[slot])
+
+
+def _resolve_luxriot_vlm_model_hint(
+    channel_id: int,
+    requested_model_hint: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    raw_hint = str(requested_model_hint or "").strip()
+    profiles = _configured_lm_profiles()
+    if raw_hint and not _is_auto_lm_selector(raw_hint):
+        return raw_hint, {
+            "mode": "manual",
+            "requested": raw_hint,
+            "assigned_profile_id": raw_hint if raw_hint in profiles else None,
+            "balancer_enabled": _vlm_balancer_enabled(),
+        }
+
+    default_profile = _resolve_lm_profile(kind="vlm")
+    default_selector = _lm_profile_selector_value(default_profile)
+    if not _vlm_balancer_enabled():
+        return (default_selector if raw_hint else None), {
+            "mode": "default",
+            "requested": raw_hint or None,
+            "assigned_profile_id": str(default_profile.get("id") or "").strip() or None,
+            "balancer_enabled": False,
+            "profile_count": len(_configured_vlm_balancer_profile_ids()),
+        }
+
+    profile_ids = _configured_vlm_balancer_profile_ids()
+    selected_profile_id = _stable_vlm_profile_for_channel(channel_id, profile_ids)
+    if not selected_profile_id:
+        return (default_selector if raw_hint else None), {
+            "mode": "default",
+            "requested": raw_hint or None,
+            "assigned_profile_id": str(default_profile.get("id") or "").strip() or None,
+            "balancer_enabled": True,
+            "profile_count": 0,
+            "reason": "no_vlm_profiles",
+        }
+    return selected_profile_id, {
+        "mode": "auto",
+        "requested": raw_hint or None,
+        "assigned_profile_id": selected_profile_id,
+        "balancer_enabled": True,
+        "profile_count": len(profile_ids),
+    }
+
+
 def _lm_profile_env_key(profile_id: str, suffix: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", profile_id).strip("_").upper()
     return f"EVOSSEARCH_LM_PROFILE_{normalized or 'DEFAULT'}_{suffix}"
@@ -1936,6 +2061,8 @@ def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
         "model": str(profile.get("model") or ""),
         "selector": _lm_profile_selector_value(profile),
         "timeout": int(profile.get("timeout") or config.LM_TIMEOUT),
+        "enabled": _lm_profile_enabled(profile),
+        "gpu": str(profile.get("gpu") or ""),
     }
 
 
@@ -2681,6 +2808,133 @@ def _check_inference_queue_ready() -> Dict[str, Any]:
     )
 
 
+def _check_lm_profiles_ready(timeout_sec: float = 1.0) -> Dict[str, Any]:
+    profiles = _configured_lm_profiles()
+    named_profile_ids = [
+        profile_id
+        for profile_id in profiles
+        if str(profile_id).strip() and str(profile_id).strip() != "default"
+    ]
+    if not _vlm_balancer_enabled() and not named_profile_ids:
+        return _component_result(
+            False,
+            "not_configured",
+            required=False,
+            profile_count=0,
+            required_profile_ids=[],
+            profiles=[],
+        )
+    configured_required_ids: List[str] = []
+    if _vlm_balancer_enabled():
+        configured_required_ids.extend(_configured_vlm_balancer_profile_ids())
+
+    required_ids: List[str] = []
+    for profile_id in configured_required_ids:
+        if profile_id and profile_id not in required_ids:
+            required_ids.append(profile_id)
+
+    profile_payloads: List[Dict[str, Any]] = []
+    any_checked = False
+    required_ok = True
+    enabled_profile_ids = [
+        profile_id
+        for profile_id, profile in profiles.items()
+        if _lm_profile_enabled(profile)
+        and (_vlm_balancer_enabled() or profile_id in named_profile_ids)
+    ]
+    for profile_id in enabled_profile_ids:
+        try:
+            profile = _resolve_lm_profile(profile_id=profile_id)
+        except Exception as exc:
+            profile_required = profile_id in required_ids
+            required_ok = required_ok and not profile_required
+            profile_payloads.append(
+                {
+                    "id": profile_id,
+                    "required": profile_required,
+                    "ok": False,
+                    "status": "config_error",
+                    "error": type(exc).__name__,
+                }
+            )
+            continue
+
+        profile_required = profile_id in required_ids
+        base_url = str(profile.get("base_url") or "").rstrip("/")
+        model = str(profile.get("model") or "").strip()
+        public_profile = _public_lm_profile(profile)
+        profile_status: Dict[str, Any] = {
+            "id": profile_id,
+            "kind": public_profile.get("kind"),
+            "selector": public_profile.get("selector"),
+            "model": model,
+            "gpu": public_profile.get("gpu") or "",
+            "base_url": base_url,
+            "required": profile_required,
+            "ok": False,
+        }
+        if not base_url or not model:
+            profile_status["status"] = "not_configured"
+            if profile_required:
+                required_ok = False
+            profile_payloads.append(profile_status)
+            continue
+
+        any_checked = True
+        headers = {"Accept": "application/json"}
+        if profile.get("api_key"):
+            headers["Authorization"] = f"Bearer {profile['api_key']}"
+        start = time.monotonic()
+        try:
+            resp = requests.get(
+                f"{base_url}/models",
+                headers=headers,
+                timeout=(0.5, max(0.5, float(timeout_sec))),
+                stream=True,
+            )
+            try:
+                status_code = int(resp.status_code)
+                ok = 200 <= status_code < 400
+                profile_status.update(
+                    {
+                        "ok": ok,
+                        "status": "reachable" if ok else "http_error",
+                        "status_code": status_code,
+                        "latency_ms": round(
+                            max(0.0, time.monotonic() - start) * 1000.0,
+                            3,
+                        ),
+                    }
+                )
+            finally:
+                resp.close()
+        except Exception as exc:
+            profile_status.update(
+                {
+                    "ok": False,
+                    "status": "error",
+                    "error": type(exc).__name__,
+                }
+            )
+        if profile_required and not profile_status.get("ok"):
+            required_ok = False
+        profile_payloads.append(profile_status)
+
+    required = bool(required_ids)
+    if required:
+        ok = required_ok
+    else:
+        ok = any(bool(profile.get("ok")) for profile in profile_payloads)
+    return _component_result(
+        ok,
+        "ready" if ok else ("not_configured" if not any_checked else "unavailable"),
+        required=required,
+        profile_count=len(profile_payloads),
+        required_profile_ids=required_ids,
+        profiles=profile_payloads,
+    )
+
+
 def _luxriot_configured() -> bool:
     base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip()
     if not base_url or "luxriot-host" in base_url:
@@ -2745,6 +2999,7 @@ def ready():
         "postgresql": _check_postgres_ready(),
         "authentication": _check_auth_ready(),
         "inference_queue": _check_inference_queue_ready(),
+        "lm_profiles": _check_lm_profiles_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
     }
@@ -2772,6 +3027,8 @@ def ready():
         required_names.append("authentication")
     if checks["inference_queue"].get("required"):
         required_names.append("inference_queue")
+    if checks["lm_profiles"].get("required"):
+        required_names.append("lm_profiles")
     if strict or checks["luxriot"].get("required"):
         required_names.append("luxriot")
 
@@ -3722,6 +3979,12 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
         "default_model": default_model,
         "default_profile_id": str(default_profile.get("id") or "").strip(),
         "profiles": [_public_lm_profile(profile) for profile in profiles],
+        "auto_model_selector": LM_AUTO_BALANCE_SELECTOR,
+        "auto_model_label": LM_AUTO_BALANCE_LABEL,
+        "vlm_balancer": {
+            "enabled": _vlm_balancer_enabled(),
+            "profile_ids": _configured_vlm_balancer_profile_ids(),
+        },
         "profile_errors": {},
         "source": "fallback",
         "error": None,
@@ -6849,7 +7112,11 @@ def luxriot_start_capture():
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     batch_size = data.get('batch_size')
     prompt = data.get('prompt') or ''
-    model_hint = (data.get('model') or '').strip() or None
+    requested_model_hint = (data.get('model') or '').strip() or None
+    model_hint, model_selection = _resolve_luxriot_vlm_model_hint(
+        channel_id,
+        requested_model_hint,
+    )
     system_prompt = (data.get('system_prompt') or '').strip() or None
     try:
         status = luxriot_manager.start_session(
@@ -6859,6 +7126,10 @@ def luxriot_start_capture():
             model_hint=model_hint,
             system_prompt=system_prompt,
         )
+        if isinstance(status, Mapping):
+            status = dict(status)
+            status["model_selection"] = model_selection.get("mode")
+            status["assigned_profile_id"] = model_selection.get("assigned_profile_id")
         audit_error = _write_completion_audit_or_error(
             action="luxriot.capture.start.completed",
             result="success",
@@ -6869,7 +7140,11 @@ def luxriot_start_capture():
                 "batch_size_supplied": batch_size is not None,
                 "prompt_supplied": bool(str(prompt).strip()),
                 "system_prompt_supplied": bool(system_prompt),
-                "model_supplied": bool(model_hint),
+                "model_supplied": bool(requested_model_hint),
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
                 "session_running": bool(status.get("running"))
                 if isinstance(status, Mapping)
                 else None,
@@ -8084,6 +8359,12 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LM_VLM_PROFILE_ID": str(
             getattr(config, "LM_VLM_PROFILE_ID", "")
         ),
+        "EVOSSEARCH_LM_VLM_BALANCER_ENABLED": _bool_to_env(
+            getattr(config, "LM_VLM_BALANCER_ENABLED", False)
+        ),
+        "EVOSSEARCH_LM_VLM_BALANCER_PROFILES": ",".join(
+            _configured_vlm_balancer_profile_ids()
+        ),
         "EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES": str(config.LM_VIDEO_DEFAULT_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
@@ -8150,6 +8431,10 @@ def _runtime_env_map() -> Dict[str, str]:
         env[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(
             profile.get("timeout") or config.LM_TIMEOUT
         )
+        env[_lm_profile_env_key(profile_id, "ENABLED")] = _bool_to_env(
+            _lm_profile_enabled(profile)
+        )
+        env[_lm_profile_env_key(profile_id, "GPU")] = str(profile.get("gpu") or "")
     return env
 
 

@@ -564,6 +564,80 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertNotIn("operator sensitive prompt", str(event.details))
         self.assertNotIn("system sensitive prompt", str(event.details))
 
+    def test_luxriot_start_capture_auto_balances_to_profile(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.CAPTURE_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        profiles = {
+            "default": {
+                "id": "default",
+                "kind": "general",
+                "base_url": "http://default.local/v1",
+                "model": "default-model",
+                "api_key": "",
+                "timeout": 120,
+            },
+            "vlm-a": {
+                "id": "vlm-a",
+                "kind": "vlm",
+                "base_url": "http://vlm-a.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+            "vlm-b": {
+                "id": "vlm-b",
+                "kind": "vlm",
+                "base_url": "http://vlm-b.local/v1",
+                "model": "qwen-vlm",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+        }
+        captured = {}
+
+        def fake_start_session(channel_id, **kwargs):
+            captured["channel_id"] = channel_id
+            captured.update(kwargs)
+            return {"running": True, "channel_id": channel_id, "model": kwargs.get("model_hint")}
+
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-a", "vlm-b")),
+            patch("oldapp.luxriot_manager.start_session", side_effect=fake_start_session),
+        ):
+            response = self.client.post(
+                "/luxriot/start_capture",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "batch_size": 16, "model": "__auto__"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertIn(captured["model_hint"], {"vlm-a", "vlm-b"})
+        payload = response.get_json()
+        self.assertEqual(payload["session"]["model_selection"], "auto")
+        self.assertEqual(payload["session"]["assigned_profile_id"], captured["model_hint"])
+        event = next(
+            event
+            for event in self.audit.events
+            if event.action == "luxriot.capture.start.completed"
+        )
+        self.assertEqual(event.details["model_selection"], "auto")
+        self.assertEqual(event.details["assigned_profile_id"], captured["model_hint"])
+        self.assertTrue(event.details["balancer_enabled"])
+
     def test_scoped_detection_queries_require_owned_channel(self) -> None:
         self._login()
 

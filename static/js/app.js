@@ -263,9 +263,14 @@
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
     const LUXRIOT_LIVE_MODEL_STORAGE_KEY = 'evs_luxriot_live_model';
     const VIDEO_MODEL_STORAGE_KEY = 'evs_video_model';
+    const LM_AUTO_MODEL_SELECTOR = '__auto__';
+    const LM_AUTO_MODEL_LABEL = 'Auto balance';
     let lmModelCatalog = {
         models: [],
         defaultModel: '',
+        autoModelSelector: LM_AUTO_MODEL_SELECTOR,
+        autoModelLabel: LM_AUTO_MODEL_LABEL,
+        vlmBalancer: { enabled: false, profileIds: [] },
         source: 'fallback',
         error: '',
     };
@@ -288,19 +293,27 @@
         return out;
     }
 
-    function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '') {
+    function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '', optionsConfig = {}) {
         if (!(selectEl instanceof HTMLSelectElement)) return;
+        const includeAuto = Boolean(optionsConfig.includeAuto);
+        const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
+        const autoLabel = normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL);
         const selected = normalizeModelId(selectedValue);
         const fallback = normalizeModelId(fallbackValue || lmModelCatalog.defaultModel);
-        const options = uniqueModelIds(lmModelCatalog.models || [], selected, fallback);
-        const nextValue = selected || fallback || options[0] || '';
+        const options = includeAuto
+            ? uniqueModelIds(autoSelector, lmModelCatalog.models || [], selected, fallback)
+            : uniqueModelIds(lmModelCatalog.models || [], selected, fallback);
+        const nextValue = selected || (includeAuto ? autoSelector : '') || fallback || options[0] || '';
         if (!options.length) {
             selectEl.innerHTML = '<option value="">No models available</option>';
             selectEl.value = '';
             return;
         }
         selectEl.innerHTML = options
-            .map((modelId) => `<option value="${escapeHtml(modelId)}">${escapeHtml(modelId)}</option>`)
+            .map((modelId) => {
+                const label = includeAuto && modelId === autoSelector ? autoLabel : modelId;
+                return `<option value="${escapeHtml(modelId)}">${escapeHtml(label)}</option>`;
+            })
             .join('');
         if (options.includes(nextValue)) {
             selectEl.value = nextValue;
@@ -324,10 +337,12 @@
     function applyLmModelCatalogToUi() {
         const defaultModel = normalizeModelId(lmModelCatalog.defaultModel);
         if (luxriotLiveModelInput) {
+            const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
             const preferredLiveModel = normalizeModelId(luxriotLiveModelInput.value)
                 || normalizeModelId(localStorage.getItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY))
+                || autoSelector
                 || defaultModel;
-            setModelSelectOptions(luxriotLiveModelInput, preferredLiveModel, defaultModel);
+            setModelSelectOptions(luxriotLiveModelInput, preferredLiveModel, defaultModel, { includeAuto: true });
         }
         if (videoModelInput) {
             const preferredVideoModel = normalizeModelId(videoModelInput.value)
@@ -352,6 +367,12 @@
                 lmModelCatalog = {
                     models: uniqueModelIds(data.models || []),
                     defaultModel: normalizeModelId(data.default_model),
+                    autoModelSelector: normalizeModelId(data.auto_model_selector || LM_AUTO_MODEL_SELECTOR),
+                    autoModelLabel: normalizeModelId(data.auto_model_label || LM_AUTO_MODEL_LABEL),
+                    vlmBalancer: {
+                        enabled: Boolean(data?.vlm_balancer?.enabled),
+                        profileIds: uniqueModelIds(data?.vlm_balancer?.profile_ids || []),
+                    },
                     source: String(data.source || 'fallback'),
                     error: normalizeModelId(data.error),
                 };
@@ -363,6 +384,9 @@
                         videoModelInput ? videoModelInput.value : '',
                     ),
                     defaultModel: normalizeModelId(lmModelCatalog.defaultModel || ''),
+                    autoModelSelector: normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR),
+                    autoModelLabel: normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL),
+                    vlmBalancer: lmModelCatalog.vlmBalancer || { enabled: false, profileIds: [] },
                     source: 'fallback',
                     error: error.message || String(error),
                 };
@@ -2403,8 +2427,10 @@
             if (luxriotLiveModelInput && document.activeElement !== luxriotLiveModelInput) {
                 const selectedVideoStream = videoStreams.find((stream) => parseInt(String(stream?.channel_id ?? ''), 10) === selectedChannelId);
                 const liveModel = String(selectedVideoStream?.model || '').trim();
-                if (liveModel) {
-                    setModelSelectOptions(luxriotLiveModelInput, liveModel);
+                const currentLiveModel = normalizeModelId(luxriotLiveModelInput.value);
+                const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
+                if (liveModel && currentLiveModel !== autoSelector) {
+                    setModelSelectOptions(luxriotLiveModelInput, liveModel, '', { includeAuto: true });
                     localStorage.setItem(LUXRIOT_LIVE_MODEL_STORAGE_KEY, liveModel);
                 }
             }

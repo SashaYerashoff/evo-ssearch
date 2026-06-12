@@ -153,6 +153,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertIn("postgresql", payload["checks"])
         self.assertIn("authentication", payload["checks"])
         self.assertIn("database", payload["checks"])
+        self.assertIn("lm_profiles", payload["checks"])
         self.assertIn("embedder", payload["checks"])
         self.assertIn("luxriot", payload["checks"])
 

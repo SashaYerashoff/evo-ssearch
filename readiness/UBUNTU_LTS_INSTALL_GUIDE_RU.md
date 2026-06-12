@@ -181,6 +181,33 @@ EVOSSEARCH_CORS_ALLOWED_ORIGINS=
 EVOSSEARCH_LM_BASE_URL=http://127.0.0.1:1234/v1
 EVOSSEARCH_LM_MODEL=
 EVOSSEARCH_LM_API_KEY=
+
+# OpenAI-compatible inference profiles.
+# Для демо-схемы: один endpoint под агента и четыре VLM endpoint-а под live summaries.
+# Profile id `vlm-1` в EVOSSEARCH_LM_PROFILES превращается в env prefix
+# EVOSSEARCH_LM_PROFILE_VLM_1_*.
+# EVOSSEARCH_LM_PROFILES=agent,vlm-1,vlm-2,vlm-3,vlm-4
+# EVOSSEARCH_LM_AGENT_PROFILE_ID=agent
+# EVOSSEARCH_LM_VLM_PROFILE_ID=vlm-1
+# EVOSSEARCH_LM_VLM_BALANCER_ENABLED=true
+# EVOSSEARCH_LM_VLM_BALANCER_PROFILES=vlm-1,vlm-2,vlm-3,vlm-4
+#
+# EVOSSEARCH_LM_PROFILE_AGENT_KIND=agent
+# EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL=http://<agent-host>:1234/v1
+# EVOSSEARCH_LM_PROFILE_AGENT_MODEL=<agent-model-id>
+# EVOSSEARCH_LM_PROFILE_AGENT_API_KEY=
+# EVOSSEARCH_LM_PROFILE_AGENT_TIMEOUT=600
+# EVOSSEARCH_LM_PROFILE_AGENT_ENABLED=true
+#
+# EVOSSEARCH_LM_PROFILE_VLM_1_KIND=vlm
+# EVOSSEARCH_LM_PROFILE_VLM_1_BASE_URL=http://<vlm-1-host>:1234/v1
+# EVOSSEARCH_LM_PROFILE_VLM_1_MODEL=<vlm-model-id>
+# EVOSSEARCH_LM_PROFILE_VLM_1_API_KEY=
+# EVOSSEARCH_LM_PROFILE_VLM_1_TIMEOUT=240
+# EVOSSEARCH_LM_PROFILE_VLM_1_ENABLED=true
+# EVOSSEARCH_LM_PROFILE_VLM_1_GPU=server-a:0
+#
+# Повторить VLM_2/VLM_3/VLM_4 для остальных endpoints.
 EOF
 
 sudo chmod 0600 /etc/eva-ai/eva-ai.env
@@ -222,6 +249,7 @@ sudo EVA_USER_PASSWORD="$EVA_USER_PASSWORD" CHANNELS_1_50="$CHANNELS_1_50" bash 
   cd /opt/eva-ai/evo-ssearch
   sudo -u eva -E \
     EVA_USER_PASSWORD="$EVA_USER_PASSWORD" \
+    EVA_ADMIN_USERNAME=admin \
     .venv/bin/python scripts/manage_users.py create operator-1 \
     --role operator \
     --channels "$CHANNELS_1_50"
@@ -351,7 +379,7 @@ sudo bash -lc '
   . /etc/eva-ai/eva-ai.env
   set +a
   cd /opt/eva-ai/evo-ssearch
-  sudo -u eva -E .venv/bin/python scripts/manage_users.py list
+  sudo -u eva -E EVA_ADMIN_USERNAME=admin .venv/bin/python scripts/manage_users.py list
 '
 ```
 
@@ -363,6 +391,24 @@ sudo bash -lc '
 - проверить, что `/auth/sessions` показывает сессии;
 - сделать logout/login;
 - убедиться, что audit DB пишет события login, route access и completion events.
+
+Минимальный preflight для выезда:
+
+```bash
+curl -k -fsS https://127.0.0.1/health | jq -e '.status == "ok"'
+curl -k -fsS 'https://127.0.0.1/ready?strict=true' | jq -e '
+  .status == "ready"
+  and (.checks.authentication.ok == true)
+  and (.checks.postgresql.ok == true)
+  and (.checks.lm_profiles.ok == true or .checks.lm_profiles.required == false)
+  and (.checks.luxriot.ok == true)
+'
+sudo journalctl -u eva-ai -n 120 --no-pager
+```
+
+Для схемы с включённым `EVOSSEARCH_LM_VLM_BALANCER_ENABLED=true`
+`checks.lm_profiles.required` должен быть `true`, а все profile id из
+`checks.lm_profiles.required_profile_ids` должны иметь `ok=true`.
 
 ## 10. Что не забыть перед реальным rollout
 

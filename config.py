@@ -66,6 +66,8 @@ def _get_lm_profiles(
             'model': model,
             'api_key': api_key,
             'timeout': timeout,
+            'enabled': True,
+            'gpu': '',
         }
     }
     raw_ids = os.getenv('EVOSSEARCH_LM_PROFILES', '').strip()
@@ -100,6 +102,14 @@ def _get_lm_profiles(
             )
         except (TypeError, ValueError):
             profile_timeout = timeout
+        profile_enabled = os.getenv(
+            _profile_env_key(profile_id, 'ENABLED'),
+            'true',
+        ).strip().lower() in ('true', '1', 'yes', 'on')
+        profile_gpu = os.getenv(
+            _profile_env_key(profile_id, 'GPU'),
+            '',
+        ).strip()
         profiles[profile_id] = {
             'id': profile_id,
             'kind': profile_kind,
@@ -107,6 +117,8 @@ def _get_lm_profiles(
             'model': profile_model,
             'api_key': profile_api_key,
             'timeout': min(3600, max(1, profile_timeout)),
+            'enabled': profile_enabled,
+            'gpu': profile_gpu,
         }
     return profiles
 
@@ -265,6 +277,13 @@ class Config:
             'vlm' if 'vlm' in LM_PROFILES else 'default',
         ).strip()
         or 'default'
+    )
+    LM_VLM_BALANCER_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LM_VLM_BALANCER_ENABLED',
+        'False',
+    )
+    LM_VLM_BALANCER_PROFILES = _get_list_env(
+        'EVOSSEARCH_LM_VLM_BALANCER_PROFILES',
     )
     LM_MAX_TIMEOUT = max(
         int(profile.get('timeout') or LM_TIMEOUT)
