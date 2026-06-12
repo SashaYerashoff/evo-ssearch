@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from unittest.mock import patch
 
-from oldapp import app, config
+from oldapp import (
+    _MUTATION_ENDPOINT_PERMISSIONS,
+    _SENSITIVE_ENDPOINT_PERMISSIONS,
+    app,
+    config,
+)
 
 
 def _normalize_frontend_path(raw_path: str) -> str:
@@ -113,6 +118,60 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
+
+    def test_non_public_routes_are_declared_in_security_surface(self) -> None:
+        public_endpoints = {
+            "static",
+            "home",
+            "favicon",
+            "branding_logo",
+            "serve_app_js",
+            "health",
+            "ready",
+            "auth_login",
+        }
+        internally_guarded_reads = {
+            "auth_me",
+            "auth_roles",
+            "auth_users",
+            "auth_user",
+            "auth_sessions",
+            "get_settings",
+            "get_settings_env",
+        }
+        internally_guarded_mutations = {
+            "auth_logout",
+            "auth_users",
+            "auth_user",
+            "auth_user_revoke_sessions",
+            "auth_session_revoke",
+        }
+        for rule in app.url_map.iter_rules():
+            endpoint = str(rule.endpoint)
+            if endpoint in public_endpoints:
+                continue
+            methods = set(rule.methods or set()) - {"HEAD", "OPTIONS"}
+            mutating = bool(methods & {"POST", "PATCH", "PUT", "DELETE"})
+            if mutating and endpoint in internally_guarded_mutations:
+                continue
+            if not mutating and endpoint in internally_guarded_reads:
+                continue
+            if endpoint in _SENSITIVE_ENDPOINT_PERMISSIONS:
+                continue
+            if endpoint in _MUTATION_ENDPOINT_PERMISSIONS:
+                continue
+            if mutating:
+                self.assertIn(
+                    endpoint,
+                    _MUTATION_ENDPOINT_PERMISSIONS,
+                    msg=f"{endpoint} mutates but is not in mutation guard map",
+                )
+            else:
+                self.assertIn(
+                    endpoint,
+                    _SENSITIVE_ENDPOINT_PERMISSIONS,
+                    msg=f"{endpoint} reads sensitive data but is not guarded",
+                )
 
     def test_non_mutating_endpoints_return_validation_errors_not_500(self) -> None:
         config.ADMIN_TOKEN = ""
