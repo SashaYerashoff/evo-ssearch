@@ -12,6 +12,7 @@ import pickle
 import re
 import secrets
 import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -33,6 +34,13 @@ from flask import Flask, g, request, jsonify, send_file, make_response, render_t
 from flask_cors import CORS
 
 from config import config
+from archive_store import (
+    ARCHIVE_RUNTIME_REVISION,
+    ArchiveStoreNotReady,
+    PostgresDetectionsStore,
+    PostgresProbesStore,
+    PostgresRuntimeStateStore,
+)
 from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
 from eva_db import DatabaseSettings, PsycopgPool
@@ -154,6 +162,7 @@ TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
 FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
 PROBE_ROI_MIN_SIDE = 0.02
 PROBE_ROI_PADDING = 0.05
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 _auth_service: Optional[AuthenticationService] = None
 _auth_service_lock = Lock()
 _identity_repository: Optional[Any] = None
@@ -164,6 +173,50 @@ _audit_reader: Optional[Any] = None
 _audit_reader_lock = Lock()
 _audit_db_pool: Optional[PsycopgPool] = None
 _audit_db_pool_lock = Lock()
+_control_plane_db_pool: Optional[PsycopgPool] = None
+_control_plane_db_lock = Lock()
+_inference_worker_db_pool: Optional[PsycopgPool] = None
+_inference_worker_db_lock = Lock()
+_inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
+_inference_queue_lock = Lock()
+
+
+def _experimental_embedding_models_enabled() -> bool:
+    return bool(getattr(config, "EXPERIMENTAL_EMBEDDERS_ENABLED", False))
+
+
+def _production_clip_model() -> str:
+    model = str(getattr(config, "PRODUCTION_CLIP_MODEL", "ViT-B/32") or "").strip()
+    return model or "ViT-B/32"
+
+
+def _normalize_clip_model_for_policy(model_name: Any) -> str:
+    requested = str(model_name or "").strip()
+    if not requested:
+        requested = _production_clip_model()
+    if _experimental_embedding_models_enabled():
+        return requested
+    return _production_clip_model()
+
+
+def _normalize_embedder_for_policy(embedder: Any, fusion_enabled: bool = False) -> str:
+    requested = str(embedder or "clip").strip().lower()
+    if requested not in SUPPORTED_EMBEDDERS:
+        requested = "clip"
+    if not _experimental_embedding_models_enabled():
+        return "clip"
+    if requested == "fusion" and not fusion_enabled:
+        return "clip"
+    return requested
+
+
+def _normalize_index_mode_for_policy(index_mode: Any) -> str:
+    requested = str(index_mode or "clip").strip().lower()
+    if requested not in {"clip", "dino", "dual"}:
+        requested = "clip"
+    if not _experimental_embedding_models_enabled():
+        return "clip"
+    return requested
 
 _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "auth_logout": None,
@@ -181,6 +234,7 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "probes_start_capture": Permission.CAPTURE_MANAGE,
     "probes_stop_capture": Permission.CAPTURE_MANAGE,
     "probes_save": Permission.PROBES_MANAGE,
+    "probes_cast": Permission.PROBES_MANAGE,
     "probes_delete": Permission.PROBES_MANAGE,
     "probes_run": Permission.PROBES_RUN,
     "agent_chat": Permission.AGENT_USE,
@@ -200,7 +254,9 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "check_index": Permission.DIAGNOSTICS_VIEW,
     "video_understanding": Permission.STREAMS_VIEW,
     "describe_image": Permission.DETECTIONS_VIEW,
+    "get_settings_env": Permission.SETTINGS_MANAGE,
     "lm_models": Permission.DIAGNOSTICS_VIEW,
+    "settings_archive_capacity": Permission.DIAGNOSTICS_VIEW,
     "search": Permission.DETECTIONS_VIEW,
     "search_by_image": Permission.DETECTIONS_VIEW,
     "search_by_mask": Permission.DETECTIONS_VIEW,
@@ -209,6 +265,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "detections_search_image": Permission.DETECTIONS_VIEW,
     "detections_list": Permission.DETECTIONS_VIEW,
     "detections_summary": Permission.DETECTIONS_VIEW,
+    "detections_diagnostics": Permission.DETECTIONS_VIEW,
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
     "luxriot_snapshot": Permission.STREAMS_VIEW,
@@ -238,6 +295,7 @@ _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
         "probes_delete",
         "probes_run",
         "probes_save",
+        "probes_cast",
     }
 )
 _ALL_CHANNELS_REQUIRED_ENDPOINTS = frozenset(
@@ -262,6 +320,24 @@ _DEFAULT_CHANNEL_ENDPOINTS = frozenset(
         "probes_stop_capture",
     }
 )
+
+
+def _archive_store_not_ready_response(exc: ArchiveStoreNotReady):
+    app.logger.warning(
+        "Archive store not ready request_id=%s error=%s",
+        getattr(g, "request_id", ""),
+        exc,
+    )
+    return jsonify(
+        {
+            "error": (
+                "Archive storage is not ready. Apply the required database "
+                "migration before using archive search."
+            ),
+            "not_ready": "archive_store",
+            "required_revision": ARCHIVE_RUNTIME_REVISION,
+        }
+    ), 503
 
 
 def _json_body() -> Dict[str, Any]:
@@ -385,6 +461,71 @@ def _request_id() -> str:
 
 def _source_ip() -> str:
     return str(request.remote_addr or "0.0.0.0")
+
+
+def _postgres_database_configured() -> bool:
+    return any(
+        str(os.getenv(name) or "").strip()
+        for name in (
+            "EVA_DATABASE_DSN",
+            "EVA_DATABASE_URL",
+            "EVOSSEARCH_DATABASE_DSN",
+            "EVOSSEARCH_DATABASE_URL",
+            "DATABASE_URL",
+        )
+    )
+
+
+def _get_control_plane_db_pool() -> PsycopgPool:
+    global _control_plane_db_pool
+    with _control_plane_db_lock:
+        if _control_plane_db_pool is None:
+            _control_plane_db_pool = PsycopgPool(DatabaseSettings.from_env())
+        return _control_plane_db_pool
+
+
+def _archive_store_mode() -> str:
+    mode = str(getattr(config, "ARCHIVE_STORE", "auto") or "auto").strip().lower()
+    return mode if mode in {"auto", "postgres", "sqlite"} else "auto"
+
+
+def _archive_tenant_id() -> str:
+    return str(
+        getattr(config, "ARCHIVE_TENANT_ID", "")
+        or getattr(config, "AUTH_TENANT_ID", "")
+        or ""
+    ).strip()
+
+
+def _archive_store_required() -> bool:
+    return _archive_store_mode() == "postgres" or bool(
+        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+    )
+
+
+def _postgres_archive_enabled() -> bool:
+    mode = _archive_store_mode()
+    if mode == "sqlite":
+        return False
+    if not _postgres_database_configured():
+        return False
+    if not _archive_tenant_id():
+        return False
+    if mode == "postgres":
+        return True
+    return bool(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False))
+
+
+def _build_luxriot_runtime_state_store() -> Optional[PostgresRuntimeStateStore]:
+    if not _postgres_archive_enabled():
+        return None
+    try:
+        return PostgresRuntimeStateStore(
+            _get_control_plane_db_pool(),
+            _archive_tenant_id(),
+        )
+    except Exception:
+        return None
 
 
 def _get_identity_repository() -> Any:
@@ -556,6 +697,12 @@ def _request_channel_ids() -> Set[int]:
         candidates.extend(
             payload.get(key) for key in ("channel_id", "channel") if key in payload
         )
+        for key in ("channel_ids", "channels"):
+            raw_values = payload.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                candidates.extend(raw_values)
+            elif raw_values is not None:
+                candidates.append(raw_values)
     form = request.form
     candidates.extend(
         form.get(key) for key in ("channel_id", "channel") if key in form
@@ -1002,6 +1149,33 @@ def _mutation_guard_error():
     return jsonify({"error": message}), status
 
 
+def _permission_guard_error(permission: Permission, *, action: str):
+    if not _auth_enabled():
+        return None
+    guard = _session_guard(
+        permission=permission,
+        require_csrf=False,
+        action=action,
+    )
+    if guard is None:
+        return None
+    body, status = guard
+    payload = body.get_json(silent=True) if hasattr(body, "get_json") else {}
+    message = (payload or {}).get("error") or "Access denied"
+    return jsonify({"error": message}), status
+
+
+def _current_request_has_permission(permission: Permission) -> bool:
+    if not _auth_enabled():
+        return True
+    context = _current_auth_context()
+    return bool(context and permission.value in context.permissions)
+
+
+def _bookmark_permission_guard_error(*, action: str):
+    return _permission_guard_error(Permission.BOOKMARKS_CREATE, action=action)
+
+
 def _path_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -1046,7 +1220,8 @@ def init_clip() -> None:
             return
 
     preferred_device = device
-    requested_model = str(config.CLIP_MODEL or "").strip() or "ViT-B/32"
+    requested_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+    config.CLIP_MODEL = requested_model
     if _is_siglip2_clip_model(requested_model):
         try:
             model_obj, processor_obj = _load_siglip2_clip_model(requested_model, preferred_device)
@@ -1448,6 +1623,27 @@ def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = 
     return base
 
 
+def _index_metadata_compatible(embedder: str, meta: Mapping[str, Any]) -> bool:
+    if not meta:
+        return True
+    if embedder == "clip":
+        expected_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+        meta_model = str(meta.get("model") or meta.get("requested_model") or "").strip()
+        if meta_model and meta_model != expected_model:
+            return False
+        if not _experimental_embedding_models_enabled():
+            backend = str(meta.get("backend") or "").strip().lower()
+            if backend and backend != "openai_clip":
+                return False
+        return True
+    if embedder == "dino":
+        if not _experimental_embedding_models_enabled():
+            return False
+        meta_model = str(meta.get("config_model") or meta.get("model") or "").strip()
+        return not meta_model or meta_model == str(config.DINO_MODEL)
+    return True
+
+
 def _index_targets() -> List[str]:
     if config.INDEX_MODE == 'dual':
         return list(EMBEDDER_SUBDIRS.keys())
@@ -1651,9 +1847,18 @@ def serve_image(filepath: str = ""):
             return "Image not found", 404
         return send_file(str(abs_path))
     except ValueError as exc:
-        return str(exc), 400
+        app.logger.info(
+            "Image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return "Invalid image request", 400
     except Exception as exc:
-        return f"Error serving image: {exc}", 500
+        app.logger.exception(
+            "Image serving failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return "Image unavailable", 500
 
 
 @app.route('/detections/image', methods=['GET'])
@@ -1663,11 +1868,20 @@ def serve_detection_image():
         resolved = detection_archive.resolve_archive_image_path(image_path)
         return send_file(str(resolved))
     except ValueError as exc:
-        message = str(exc)
-        status = 404 if message.lower() == "image not found" else 400
-        return message, status
+        message = str(exc).lower()
+        status = 404 if message == "image not found" else 400
+        app.logger.info(
+            "Detection image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return ("Image not found" if status == 404 else "Invalid image request"), status
     except Exception as exc:
-        return f"Error serving detection image: {exc}", 500
+        app.logger.exception(
+            "Detection image serving failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return "Image unavailable", 500
 
 
 def _index_directory(folder_path: Union[str, Path], embedder: str) -> Path:
@@ -1781,6 +1995,43 @@ def _sample_video_frames(
     finally:
         cap.release()
     return frames, fps, duration
+
+
+def _uploaded_file_suffix(file_obj: Any, fallback: str = "") -> str:
+    filename = str(getattr(file_obj, "filename", "") or "").strip()
+    suffix = Path(filename).suffix.lower()
+    return suffix or fallback
+
+
+def _save_upload_to_temp(file_obj: Any, *, allowed_suffixes: Set[str], prefix: str) -> Path:
+    if file_obj is None or not str(getattr(file_obj, "filename", "") or "").strip():
+        raise ValueError("No upload supplied")
+    suffix = _uploaded_file_suffix(file_obj)
+    if suffix not in allowed_suffixes:
+        raise ValueError("Unsupported uploaded file type")
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        file_obj.save(str(tmp_path))
+        if tmp_path.stat().st_size <= 0:
+            raise ValueError("Uploaded file is empty")
+        return tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _cleanup_temp_upload(path_obj: Optional[Path]) -> None:
+    if path_obj is None:
+        return
+    try:
+        path_obj.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
@@ -2369,6 +2620,7 @@ luxriot_manager = LuxriotManager(
     jpeg_encoder=_encode_jpeg,
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
+    runtime_state_store=_build_luxriot_runtime_state_store(),
 )
 try:
     with luxriot_manager.cache_lock:
@@ -2441,6 +2693,8 @@ probe_daemon_stop = threading.Event()
 
 
 class ProbesStore:
+    backend = "json"
+
     def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
         self.path = Path(path)
         self.data: Dict[str, Any] = {"probes": []}
@@ -2498,16 +2752,46 @@ class ProbesStore:
             self._save_locked()
             return True
 
+    def health(self) -> Dict[str, Any]:
+        try:
+            with self.lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            return {
+                "ok": True,
+                "status": "reachable",
+                "backend": self.backend,
+                "path": str(self.path),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "backend": self.backend,
+                "path": str(self.path),
+                "error": str(exc),
+            }
 
-probes_store = ProbesStore()
-detections_store = DetectionsStore()
+
+def _build_archive_stores() -> Tuple[Any, Any]:
+    if _postgres_archive_enabled():
+        try:
+            pool = _get_control_plane_db_pool()
+            tenant_id = _archive_tenant_id()
+            return (
+                PostgresProbesStore(pool, tenant_id),
+                PostgresDetectionsStore(
+                    pool,
+                    tenant_id,
+                    max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+                ),
+            )
+        except Exception:
+            pass
+    return ProbesStore(), DetectionsStore()
+
+
+probes_store, detections_store = _build_archive_stores()
 APP_STARTED_AT = time.time()
-_control_plane_db_pool: Optional[PsycopgPool] = None
-_control_plane_db_lock = Lock()
-_inference_worker_db_pool: Optional[PsycopgPool] = None
-_inference_worker_db_lock = Lock()
-_inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
-_inference_queue_lock = Lock()
 
 
 def _component_result(
@@ -2526,6 +2810,22 @@ def _component_result(
         if value is not None:
             payload[key] = value
     return payload
+
+
+_PUBLIC_READY_KEYS = frozenset({"ok", "status", "required"})
+
+
+def _public_ready_checks(
+    checks: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    public_checks: Dict[str, Dict[str, Any]] = {}
+    for name, payload in checks.items():
+        public_checks[str(name)] = {
+            key: payload[key]
+            for key in _PUBLIC_READY_KEYS
+            if key in payload
+        }
+    return public_checks
 
 
 def _embedder_loaded_state() -> Dict[str, Any]:
@@ -2551,37 +2851,68 @@ def _embedder_loaded_state() -> Dict[str, Any]:
 
 
 def _check_database_ready() -> Dict[str, Any]:
-    try:
-        with detections_store.lock:
-            conn = detections_store._connect()
-            try:
-                conn.execute("SELECT 1").fetchone()
-            finally:
-                conn.close()
-        return _component_result(True, "reachable", path=str(detections_store.path))
-    except Exception as exc:
-        return _component_result(False, "error", error=str(exc), path=str(detections_store.path))
+    required_postgres = _archive_store_required()
+    store_checks: Dict[str, Dict[str, Any]] = {}
 
+    for name, store in (
+        ("detections", detections_store),
+        ("probes", probes_store),
+    ):
+        try:
+            health_fn = getattr(store, "health")
+            health = dict(health_fn())
+        except Exception as exc:
+            health = {"ok": False, "status": "error", "error": type(exc).__name__}
+        if required_postgres and health.get("backend") != "postgres":
+            health["ok"] = False
+            health["status"] = "not_postgres"
+            health["required_backend"] = "postgres"
+        store_checks[name] = health
 
-def _postgres_database_configured() -> bool:
-    return any(
-        str(os.getenv(name) or "").strip()
-        for name in (
-            "EVA_DATABASE_DSN",
-            "EVA_DATABASE_URL",
-            "EVOSSEARCH_DATABASE_DSN",
-            "EVOSSEARCH_DATABASE_URL",
-            "DATABASE_URL",
-        )
+    runtime_state_store = getattr(luxriot_manager, "runtime_state_store", None)
+    if runtime_state_store is not None:
+        try:
+            runtime_state = dict(runtime_state_store.health())
+        except Exception as exc:
+            runtime_state = {
+                "ok": False,
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+    else:
+        runtime_state = {
+            "ok": not required_postgres,
+            "status": "file_fallback" if not required_postgres else "not_configured",
+            "backend": "json",
+            "required_backend": "postgres" if required_postgres else None,
+        }
+    store_checks["runtime_state"] = runtime_state
+
+    ok = all(bool(item.get("ok")) for item in store_checks.values())
+    first_status = next(
+        (
+            str(item.get("status") or "error")
+            for item in store_checks.values()
+            if not item.get("ok")
+        ),
+        "reachable",
     )
-
-
-def _get_control_plane_db_pool() -> PsycopgPool:
-    global _control_plane_db_pool
-    with _control_plane_db_lock:
-        if _control_plane_db_pool is None:
-            _control_plane_db_pool = PsycopgPool(DatabaseSettings.from_env())
-        return _control_plane_db_pool
+    return _component_result(
+        ok,
+        "reachable" if ok else first_status,
+        backend=str(store_checks["detections"].get("backend") or ""),
+        archive_store_mode=_archive_store_mode(),
+        tenant_id=_archive_tenant_id() or None,
+        stores=store_checks,
+        retention={
+            "enabled": bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+            "row_retention_days": float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+            "thumbnail_retention_days": float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+            "max_records": int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+            "prune_interval_sec": float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0)),
+            "last_result": dict(_archive_retention_last_result),
+        },
+    )
 
 
 def _inference_worker_database_dsn() -> str:
@@ -2702,6 +3033,63 @@ def _check_postgres_ready() -> Dict[str, Any]:
             "unavailable",
             error=type(exc).__name__,
         )
+
+
+def _secret_is_weak(value: str) -> bool:
+    secret = str(value or "").strip()
+    if not secret:
+        return False
+    if len(secret) < 32:
+        return True
+    lowered = secret.lower()
+    weak_values = {
+        "123",
+        "1234",
+        "12345",
+        "admin",
+        "password",
+        "changeme",
+        "change-me",
+        "secret",
+        "unit-token",
+    }
+    return lowered in weak_values or len(set(secret)) < 8
+
+
+def _check_deployment_security_ready() -> Dict[str, Any]:
+    secure_required = bool(
+        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+    )
+    issues: List[str] = []
+    if not bool(getattr(config, "AUTH_COOKIE_SECURE", False)):
+        issues.append("EVOSSEARCH_AUTH_COOKIE_SECURE=true is required behind TLS")
+    if not config.ALLOWED_ROOTS:
+        issues.append("EVOSSEARCH_ALLOWED_ROOTS must whitelist deployment data roots")
+    else:
+        invalid_roots = [
+            str(root)
+            for root in config.ALLOWED_ROOTS
+            if not Path(root).expanduser().exists()
+        ]
+        if invalid_roots:
+            issues.append("ALLOWED_ROOTS contains missing paths: " + ", ".join(invalid_roots[:3]))
+    if _secret_is_weak(getattr(config, "ADMIN_TOKEN", "")):
+        issues.append("EVOSSEARCH_ADMIN_TOKEN is set but weak; rotate or unset under named auth")
+    if _secret_is_weak(getattr(config, "LUXRIOT_PASSWORD", "")):
+        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD appears to be a placeholder")
+
+    ok = not secure_required or not issues
+    return _component_result(
+        ok,
+        "ready" if ok else "misconfigured",
+        required=secure_required,
+        issues=issues,
+        secure_deployment_required=secure_required,
+        auth_cookie_secure=bool(getattr(config, "AUTH_COOKIE_SECURE", False)),
+        allowed_roots_count=len(config.ALLOWED_ROOTS),
+        admin_token_set=bool(getattr(config, "ADMIN_TOKEN", "")),
+        settings_local_only=bool(getattr(config, "SETTINGS_LOCAL_ONLY", False)),
+    )
 
 
 def _check_auth_ready() -> Dict[str, Any]:
@@ -2990,6 +3378,23 @@ def ready():
     """Readiness endpoint with component-level dependency status."""
     load_embedder = str(request.args.get("load") or "").strip().lower() in TRUE_BOOL_STRINGS
     strict = str(request.args.get("strict") or "").strip().lower() in TRUE_BOOL_STRINGS
+    details_requested = str(request.args.get("details") or "").strip().lower() in TRUE_BOOL_STRINGS
+    secure_required = bool(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False))
+    details_allowed = not secure_required
+    if secure_required and (details_requested or load_embedder):
+        if not _auth_enabled():
+            return _auth_failure_response(
+                "Named-user authentication is disabled",
+                503,
+            )
+        guard = _session_guard(
+            permission=Permission.DIAGNOSTICS_VIEW,
+            require_csrf=False,
+            action="ready.details",
+        )
+        if guard is not None:
+            return guard
+        details_allowed = True
     embedder_required = str(
         os.getenv("EVOSSEARCH_EMBEDDER_REQUIRED", "true") or "true"
     ).strip().lower() in TRUE_BOOL_STRINGS
@@ -2998,22 +3403,28 @@ def ready():
         "database": _check_database_ready(),
         "postgresql": _check_postgres_ready(),
         "authentication": _check_auth_ready(),
+        "deployment_security": _check_deployment_security_ready(),
         "inference_queue": _check_inference_queue_ready(),
         "lm_profiles": _check_lm_profiles_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
     }
 
-    if load_embedder and not checks["embedder"].get("ok"):
+    if load_embedder and details_allowed and not checks["embedder"].get("ok"):
         try:
             ensure_embedder_loaded(active_embedder)
             checks["embedder"] = _embedder_loaded_state()
         except Exception as exc:
+            app.logger.warning(
+                "Readiness embedder load failed request_id=%s error=%s",
+                getattr(g, "request_id", ""),
+                exc,
+            )
             checks["embedder"] = _component_result(
                 False,
                 "load_failed",
                 embedder=active_embedder,
-                error=str(exc),
+                error=type(exc).__name__,
             )
 
     required_names = ["database"]
@@ -3025,6 +3436,8 @@ def ready():
         required_names.append("postgresql")
     if checks["authentication"].get("required"):
         required_names.append("authentication")
+    if checks["deployment_security"].get("required"):
+        required_names.append("deployment_security")
     if checks["inference_queue"].get("required"):
         required_names.append("inference_queue")
     if checks["lm_profiles"].get("required"):
@@ -3039,7 +3452,7 @@ def ready():
             "status": "ready" if is_ready else "not_ready",
             "version": config.APP_VERSION,
             "required": required_names,
-            "checks": checks,
+            "checks": checks if details_allowed else _public_ready_checks(checks),
         }
     ), status_code
 
@@ -3863,6 +4276,7 @@ def _get_agent_runner() -> Any:
         def _agent_search_detections(
             *, query: str, probe_id: Optional[str] = None,
             channel_id: Optional[int] = None,
+            source: Optional[str] = None,
             since_ms: Optional[int] = None,
             until_ms: Optional[int] = None,
             limit: int = 12,
@@ -3877,6 +4291,7 @@ def _get_agent_runner() -> Any:
                 mode=mode,
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=_normalize_archive_source_filter(source),
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=limit,
@@ -4069,6 +4484,49 @@ DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
 DETECTIONS_SEARCH_SHARD_OVERFETCH = 200
 DETECTIONS_SEARCH_DINO_POOL_MIN = 64
 DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER = 8
+ARCHIVE_SOURCE_FILTERS = {"probe", "vlm_summary", "vlm_alert"}
+ARCHIVE_SOURCE_ALIASES = {
+    "probe": "probe",
+    "probes_run": "probe",
+    "probes_query": "probe",
+    "probe_daemon": "probe",
+    "detection": "probe",
+    "detections": "probe",
+    "vlm_summary": "vlm_summary",
+    "video_description": "vlm_summary",
+    "video_descriptions": "vlm_summary",
+    "vlm_alert": "vlm_alert",
+    "alert": "vlm_alert",
+    "alerts": "vlm_alert",
+}
+
+
+def _normalize_archive_source_filter(value: Any) -> Optional[str]:
+    source = str(value or "").strip().lower()
+    source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    return source if source in ARCHIVE_SOURCE_FILTERS else None
+
+
+def _archive_source_label(value: Any) -> str:
+    source = _normalize_archive_source_filter(value)
+    if source == "probe":
+        return "Probe hit"
+    if source == "vlm_summary":
+        return "Video description"
+    if source == "vlm_alert":
+        return "VLM alert"
+    return "Archive frame"
+
+
+def _archive_item_type(value: Any) -> str:
+    source = _normalize_archive_source_filter(value)
+    if source == "probe":
+        return "probe_detection"
+    if source == "vlm_summary":
+        return "video_description_frame"
+    if source == "vlm_alert":
+        return "video_description_alert"
+    return "archive_frame"
 
 
 class _DetectionClipShardCache:
@@ -4178,6 +4636,45 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _parse_luxriot_capture_interval_sec(data: Mapping[str, Any]) -> Optional[float]:
+    interval_keys = (
+        "interval_sec",
+        "snapshot_interval_sec",
+        "sample_interval_sec",
+        "capture_interval_sec",
+    )
+    interval_present = False
+    interval_sec: Optional[float] = None
+    for key in interval_keys:
+        if key not in data:
+            continue
+        interval_present = True
+        interval_sec = _to_optional_float(data.get(key))
+        break
+    if interval_present and interval_sec is None:
+        raise ValueError("Provide a valid positive interval_sec")
+
+    fps_keys = ("fps", "target_fps", "sample_fps")
+    fps_present = False
+    fps: Optional[float] = None
+    for key in fps_keys:
+        if key not in data:
+            continue
+        fps_present = True
+        fps = _to_optional_float(data.get(key))
+        break
+    if interval_sec is None and fps_present:
+        if fps is None or fps <= 0 or not math.isfinite(fps):
+            raise ValueError("Provide a valid positive fps")
+        interval_sec = 1.0 / fps
+
+    if interval_sec is None:
+        return None
+    if interval_sec <= 0 or not math.isfinite(interval_sec):
+        raise ValueError("Provide a valid positive interval_sec")
+    return max(0.2, min(300.0, float(interval_sec)))
 
 
 def _probe_identity(probe_like: Mapping[str, Any]) -> str:
@@ -4450,6 +4947,88 @@ class _AdaptiveDetectionArchive:
 
 
 detection_archive = _AdaptiveDetectionArchive()
+_archive_retention_lock = threading.RLock()
+_archive_retention_last_run = 0.0
+_archive_retention_last_result: Dict[str, Any] = {}
+
+
+def _delete_retained_archive_images(image_paths: Sequence[Any]) -> Dict[str, Any]:
+    deleted = 0
+    skipped = 0
+    errors = 0
+    root = detection_archive.root
+    seen: Set[str] = set()
+    for raw_path in image_paths:
+        text = str(raw_path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        try:
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = (root / path).resolve()
+            else:
+                path = path.resolve()
+            if not _path_within(path, root):
+                skipped += 1
+                continue
+            if path.exists() and path.is_file():
+                path.unlink()
+                deleted += 1
+            else:
+                skipped += 1
+        except Exception:
+            errors += 1
+    return {
+        "files_deleted": deleted,
+        "files_skipped": skipped,
+        "file_delete_errors": errors,
+    }
+
+
+def _apply_archive_retention(*, force: bool = False) -> Dict[str, Any]:
+    global _archive_retention_last_run, _archive_retention_last_result
+    if not bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)):
+        return {"ok": True, "status": "disabled"}
+    prune_fn = getattr(detections_store, "apply_retention", None)
+    if not callable(prune_fn):
+        return {"ok": True, "status": "unsupported", "backend": getattr(detections_store, "backend", "unknown")}
+    now = time.time()
+    interval = float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0))
+    with _archive_retention_lock:
+        if (
+            not force
+            and _archive_retention_last_run > 0
+            and now - _archive_retention_last_run < interval
+        ):
+            cached = dict(_archive_retention_last_result)
+            cached["status"] = "cached"
+            cached["next_run_in_sec"] = max(0.0, interval - (now - _archive_retention_last_run))
+            return cached
+        try:
+            result = dict(
+                prune_fn(
+                    row_retention_days=float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+                    thumbnail_retention_days=float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+                    max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+                    batch_size=int(getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000)),
+                )
+            )
+            deleted_paths = result.pop("deleted_image_paths", [])
+            result.update(_delete_retained_archive_images(deleted_paths))
+            result["status"] = "applied"
+            _archive_retention_last_run = now
+            _archive_retention_last_result = dict(result)
+            return result
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            _archive_retention_last_run = now
+            _archive_retention_last_result = dict(result)
+            return result
 
 
 class _ProbeBookmarkGate:
@@ -4663,6 +5242,8 @@ def _maybe_send_probe_bookmark(
 ) -> Tuple[bool, Dict[str, Any]]:
     if not bool(probe_like.get("bookmark", False)):
         return False, {"reason": "bookmark_disabled", "source": source}
+    if _auth_enabled() and not bool(probe_like.get("bookmark_authorized", False)):
+        return False, {"reason": "bookmark_not_authorized", "source": source}
 
     channel_id = _to_int(probe_like.get("channel_id"), config.LUXRIOT_DEFAULT_CHANNEL_ID)
     probe_key = _probe_bookmark_identity(probe_like)
@@ -4734,6 +5315,8 @@ def _store_probe_hits(
     if not hits:
         return 0
     probe_id = _probe_identity(probe_like)
+    origin_source = str(source or "probe").strip().lower() or "probe"
+    archive_source = _normalize_archive_source_filter(origin_source) or "probe"
     channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     probe_name = str(probe_like.get("name") or "").strip() or probe_id
     severity = str(probe_like.get("severity") or "normal").strip().lower() or "normal"
@@ -4768,7 +5351,7 @@ def _store_probe_hits(
         keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
             probe_id=probe_id,
             channel_id=channel_id,
-            source=source,
+            source=archive_source,
             timestamp_ms=ts_ms,
             clip_vec=clip_vec,
             thumbnail_b64=archive_thumbnail_b64,
@@ -4784,7 +5367,8 @@ def _store_probe_hits(
             "hit_index": idx,
             "probe_window_sec": probe_like.get("window_sec"),
             "probe_fps": probe_like.get("fps"),
-            "source": source,
+            "source": archive_source,
+            "origin": origin_source,
             "image_path": image_path,
             "retention": retention_meta,
             "hit": {
@@ -4799,7 +5383,7 @@ def _store_probe_hits(
             payload["context"] = extra_payload
         records.append(
             {
-                "dedupe_key": f"{probe_id}:{source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
+                "dedupe_key": f"{probe_id}:{archive_source}:{origin_source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
                 "timestamp_ms": ts_ms,
                 "probe_id": probe_id,
                 "probe_name": probe_name,
@@ -4813,17 +5397,224 @@ def _store_probe_hits(
                 "thumbnail_b64": thumbnail_b64,
                 "clip_vec": clip_vec,
                 "image_path": image_path,
-                "source": source,
+                "source": archive_source,
                 "payload": payload,
             }
         )
     if not records:
         return 0
     try:
-        return detections_store.add_detections(records)
+        inserted = detections_store.add_detections(records)
+        _apply_archive_retention()
+        return inserted
     except Exception as exc:
         print(f"Detections store write failed for {probe_id}: {exc}")
         return 0
+
+
+_VLM_ARCHIVE_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
+
+
+def _vlm_archive_alert_counts(raw_counts: Any) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if isinstance(raw_counts, Mapping):
+        for raw_severity, raw_count in raw_counts.items():
+            severity = str(raw_severity or "").strip().lower()
+            if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+                severity = "normal"
+            count = _to_int(raw_count, 0)
+            if count > 0:
+                counts[severity] = counts.get(severity, 0) + count
+    return {
+        severity: int(counts[severity])
+        for severity in _VLM_ARCHIVE_SEVERITY_ORDER
+        if counts.get(severity, 0) > 0
+    }
+
+
+def _vlm_archive_top_severity(alert_counts: Mapping[str, int]) -> str:
+    for severity in _VLM_ARCHIVE_SEVERITY_ORDER:
+        if int(alert_counts.get(severity, 0) or 0) > 0:
+            return severity
+    return "normal"
+
+
+def _vlm_archive_excerpt(value: Any, limit: int) -> Tuple[str, bool]:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], int, int]:
+    raw_frames = entry.get("archive_frames")
+    if (
+        not isinstance(raw_frames, Sequence)
+        or isinstance(raw_frames, (str, bytes, bytearray))
+    ):
+        return [], 0, 0
+
+    channel_id = _to_int(entry.get("channel_id"), 0)
+    if channel_id < 1:
+        return [], 0, 0
+
+    created_at = _to_optional_float(entry.get("created_at")) or time.time()
+    created_ms = int(created_at * 1000.0)
+    batch_start_ms = _to_int(entry.get("batch_start_ms"), created_ms)
+    batch_end_ms = _to_int(entry.get("batch_end_ms"), batch_start_ms)
+    run_id = str(entry.get("run_id") or "").strip() or "manual"
+    summary_excerpt, summary_truncated = _vlm_archive_excerpt(entry.get("summary"), 4000)
+    prompt_excerpt, prompt_truncated = _vlm_archive_excerpt(entry.get("prompt"), 1000)
+    alert_counts = _vlm_archive_alert_counts(entry.get("alert_counts"))
+    alert_total = _to_int(entry.get("alert_total"), sum(alert_counts.values()))
+    bookmarks_sent = _to_int(entry.get("bookmarks_sent"), 0)
+    frame_count = _to_int(entry.get("frame_count"), 0)
+    batch_size = _to_int(entry.get("batch_size"), 0)
+
+    base_payload = {
+        "run_id": run_id,
+        "batch_start_ms": batch_start_ms,
+        "batch_end_ms": batch_end_ms,
+        "frame_count": frame_count,
+        "batch_size": batch_size,
+        "duration_sec": _to_float(entry.get("duration_sec"), 0.0),
+        "summary": summary_excerpt,
+        "summary_truncated": summary_truncated,
+        "prompt": prompt_excerpt,
+        "prompt_truncated": prompt_truncated,
+        "alert_counts": alert_counts,
+        "alert_total": alert_total,
+        "bookmarks_sent": bookmarks_sent,
+    }
+
+    records: List[Dict[str, Any]] = []
+    valid_frames: List[Dict[str, Any]] = []
+    for fallback_index, raw_frame in enumerate(raw_frames):
+        if not isinstance(raw_frame, Mapping):
+            continue
+        thumbnail_b64 = str(raw_frame.get("thumbnail") or raw_frame.get("thumbnail_b64") or "").strip()
+        if not thumbnail_b64:
+            continue
+        frame_index = _to_int(raw_frame.get("frame_index"), fallback_index)
+        timestamp_ms = _to_int(raw_frame.get("timestamp_ms"), batch_start_ms)
+        timestamp_ms = max(0, timestamp_ms)
+        anchor_role = str(raw_frame.get("anchor_role") or "sample").strip().lower() or "sample"
+        width = _to_optional_int(raw_frame.get("width"))
+        height = _to_optional_int(raw_frame.get("height"))
+        frame_payload = {
+            **base_payload,
+            "source": "vlm_summary",
+            "anchor_role": anchor_role,
+            "frame_index": frame_index,
+            "frame_timestamp_ms": timestamp_ms,
+            "captured_at": _to_optional_float(raw_frame.get("captured_at")),
+            "width": width,
+            "height": height,
+        }
+        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
+        records.append(
+            {
+                "dedupe_key": (
+                    f"vlm_summary:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
+                    f"{frame_index}:{timestamp_ms}:{anchor_role}"
+                ),
+                "timestamp_ms": timestamp_ms,
+                "probe_id": f"vlm_summary:{channel_id}",
+                "probe_name": f"VLM summary ch {channel_id}",
+                "channel_id": channel_id,
+                "severity": "info",
+                "bookmark_enabled": False,
+                "bookmark_sent": False,
+                "pos_score": 0.0,
+                "neg_score": 0.0,
+                "margin": 0.0,
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "source": "vlm_summary",
+                "payload": frame_payload,
+            }
+        )
+        valid_frames.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "frame_index": frame_index,
+                "anchor_role": anchor_role,
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "payload": frame_payload,
+            }
+        )
+
+    summary_count = len(records)
+    alert_count = 0
+    if valid_frames and (alert_total > 0 or bookmarks_sent > 0):
+        anchor = valid_frames[-1]
+        severity = _vlm_archive_top_severity(alert_counts)
+        alert_payload = {
+            **base_payload,
+            "source": "vlm_alert",
+            "severity": severity,
+            "anchor_role": "alert_anchor",
+            "anchor_frame_index": anchor["frame_index"],
+            "anchor_frame_timestamp_ms": anchor["timestamp_ms"],
+            "anchor_source_role": anchor["anchor_role"],
+        }
+        records.append(
+            {
+                "dedupe_key": (
+                    f"vlm_alert:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
+                    f"{anchor['timestamp_ms']}:{severity}:{alert_total}:{bookmarks_sent}"
+                ),
+                "timestamp_ms": int(anchor["timestamp_ms"]),
+                "probe_id": f"vlm_alert:{channel_id}",
+                "probe_name": f"VLM alert ch {channel_id}",
+                "channel_id": channel_id,
+                "severity": severity,
+                "bookmark_enabled": False,
+                "bookmark_sent": bookmarks_sent > 0,
+                "pos_score": 0.0,
+                "neg_score": 0.0,
+                "margin": 0.0,
+                "thumbnail_b64": anchor["thumbnail_b64"],
+                "clip_vec": anchor["clip_vec"],
+                "source": "vlm_alert",
+                "payload": alert_payload,
+            }
+        )
+        alert_count = 1
+    return records, summary_count, alert_count
+
+
+def _store_vlm_summary_archive_frames(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    records, summary_count, alert_count = _vlm_summary_frame_records(entry)
+    if not records:
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "summary_frames": 0,
+            "alert_frames": 0,
+        }
+    try:
+        inserted = detections_store.add_detections(records)
+        _apply_archive_retention()
+        return {
+            "attempted": len(records),
+            "inserted": int(inserted),
+            "summary_frames": summary_count,
+            "alert_frames": alert_count,
+        }
+    except Exception as exc:
+        print(f"VLM summary archive write failed: {exc}")
+        return {
+            "attempted": len(records),
+            "inserted": 0,
+            "summary_frames": summary_count,
+            "alert_frames": alert_count,
+            "error": str(exc)[:240] or exc.__class__.__name__,
+        }
+
+
+luxriot_manager.set_summary_archive_callback(_store_vlm_summary_archive_frames)
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -5038,6 +5829,10 @@ def load_index(folder_path: Union[str, Path], embedder: Optional[str] = None) ->
         except json.JSONDecodeError:
             meta = {}
 
+    if not _index_metadata_compatible(target, meta):
+        print(f"Index metadata for {target} does not match current embedding model; rebuild index.")
+        return None, None, None, meta
+
     try:
         index = _get_faiss().read_index(str(embed_dir / 'index.faiss'))
 
@@ -5210,7 +6005,6 @@ def _build_result_entry(img_path: str, similarity: float, metadata: Optional[Dic
     except Exception as img_error:
         # Keep the result entry even if thumbnail creation fails so search never collapses to empty.
         # Frontend can still show filename/path and let operators inspect the source image directly.
-        result['metadata']['thumbnail_error'] = str(img_error)
         print(f"Warning: thumbnail generation failed for {img_path}: {img_error}")
     if extra:
         result.update(extra)
@@ -5447,6 +6241,7 @@ def _normalize_detection_search_mode(requested: Optional[str]) -> str:
 def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DETECTIONS_SEARCH_DEFAULT_HOURS) -> Dict[str, Any]:
     probe_raw = str(payload.get("probe_id") or "").strip()
     probe_id = probe_raw or None
+    source = _normalize_archive_source_filter(payload.get("source"))
 
     channel_raw = str(payload.get("channel_id") or "").strip()
     channel_id: Optional[int] = None
@@ -5468,6 +6263,7 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
     return {
         "probe_id": probe_id,
         "channel_id": channel_id,
+        "source": source,
         "since_ms": since_ms,
         "until_ms": until_ms,
     }
@@ -5476,6 +6272,7 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
 def _backfill_clip_vectors_for_filters(
     probe_id: Optional[str],
     channel_id: Optional[int],
+    source: Optional[str],
     since_ms: Optional[int],
     until_ms: Optional[int],
     *,
@@ -5485,6 +6282,7 @@ def _backfill_clip_vectors_for_filters(
     detections, _ = detections_store.list_detections(
         probe_id=probe_id,
         channel_id=channel_id,
+        source=source,
         since_ms=since_ms,
         until_ms=until_ms,
         limit=max_backfill,
@@ -5644,6 +6442,7 @@ def _build_detection_search_result(
     if not image_path and isinstance(payload_obj, dict):
         image_path = str(payload_obj.get("image_path") or "").strip()
 
+    origin = str(payload_obj.get("origin") or payload_obj.get("source") or "").strip()
     result: Dict[str, Any] = {
         "path": image_path,
         "filename": f"{probe_label} · {ts_label}",
@@ -5653,6 +6452,7 @@ def _build_detection_search_result(
             "mtime": ts_ms,
             "detection_id": item.get("id"),
             "source": item.get("source"),
+            "origin": origin,
             "probe_id": item.get("probe_id"),
             "probe_name": item.get("probe_name"),
             "channel_id": item.get("channel_id"),
@@ -5668,6 +6468,9 @@ def _build_detection_search_result(
         "neg_score": float(item.get("neg_score") or 0.0),
         "margin": float(item.get("margin") or 0.0),
         "source": item.get("source"),
+        "source_label": _archive_source_label(item.get("source")),
+        "archive_item_type": _archive_item_type(item.get("source")),
+        "origin": origin,
         "shard_key": item.get("shard_key"),
         "search_mode": mode,
         "dino_fallback": bool(dino_fallback),
@@ -5689,6 +6492,7 @@ def _search_detections_archive(
     mode: str,
     probe_id: Optional[str],
     channel_id: Optional[int],
+    source: Optional[str],
     since_ms: Optional[int],
     until_ms: Optional[int],
     limit: int,
@@ -5702,6 +6506,7 @@ def _search_detections_archive(
     candidates = detections_store.list_vector_candidates(
         probe_id=probe_id,
         channel_id=channel_id,
+        source=source,
         since_ms=since_ms,
         until_ms=until_ms,
         limit=candidate_limit,
@@ -5712,6 +6517,7 @@ def _search_detections_archive(
         updated = _backfill_clip_vectors_for_filters(
             probe_id,
             channel_id,
+            source,
             since_ms,
             until_ms,
             expected_dim=clip_dim,
@@ -5721,6 +6527,7 @@ def _search_detections_archive(
             candidates = detections_store.list_vector_candidates(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=source,
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=candidate_limit,
@@ -5735,6 +6542,7 @@ def _search_detections_archive(
         updated = _backfill_clip_vectors_for_filters(
             probe_id,
             channel_id,
+            source,
             since_ms,
             until_ms,
             expected_dim=clip_dim,
@@ -5744,6 +6552,7 @@ def _search_detections_archive(
             candidates = detections_store.list_vector_candidates(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=source,
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=candidate_limit,
@@ -5765,9 +6574,12 @@ def _search_detections_archive(
         pool_size = min(len(clip_hits), max(DETECTIONS_SEARCH_DINO_POOL_MIN, limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER))
         pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
         dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
+        dino_dim = int(dino_query_vec.shape[0]) if dino_query_vec.ndim == 1 else 0
         for det_id in pool_ids:
             vec = dino_vectors.get(det_id)
             if vec is None:
+                continue
+            if dino_dim <= 0 or vec.ndim != 1 or int(vec.shape[0]) != dino_dim:
                 continue
             dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
 
@@ -6347,17 +7159,37 @@ def index_segments():
 
 @app.route('/video_understanding', methods=['POST'])
 def video_understanding():
-    data = _json_body()
-    video_path = (data.get('video') or '').strip()
-    if not video_path:
-        return jsonify({'error': 'Provide a video path.'}), 400
-    video_obj = Path(video_path).expanduser().resolve()
-    if not video_obj.exists() or not video_obj.is_file():
-        return jsonify({'error': f'Video file not found: {video_path}'}), 400
-    if config.ALLOWED_ROOTS:
-        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
-        if not any(_path_within(video_obj, root) for root in allowed_roots):
-            return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
+    is_multipart = bool(request.files)
+    data = request.form if is_multipart else _json_body()
+    upload_obj = request.files.get('video') or request.files.get('file')
+    uploaded_temp_path: Optional[Path] = None
+    uploaded_original_name = str(getattr(upload_obj, "filename", "") or "").strip()
+
+    if upload_obj is not None and uploaded_original_name:
+        try:
+            uploaded_temp_path = _save_upload_to_temp(
+                upload_obj,
+                allowed_suffixes=SUPPORTED_VIDEO_EXTENSIONS,
+                prefix="eva-video-",
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        video_obj = uploaded_temp_path
+        video_path = uploaded_original_name
+    else:
+        video_path = (data.get('video') or '').strip()
+        if not video_path:
+            return jsonify({'error': 'Provide a video path or upload a video file.'}), 400
+        video_obj = Path(video_path).expanduser().resolve()
+        if not video_obj.exists() or not video_obj.is_file():
+            return jsonify({'error': 'Video file not found'}), 400
+        if video_obj.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+            return jsonify({'error': 'Unsupported video file type'}), 400
+        if config.ALLOWED_ROOTS:
+            allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+            if not any(_path_within(video_obj, root) for root in allowed_roots):
+                return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
+
     max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
     try:
         max_frames_int = int(max_frames)
@@ -6409,7 +7241,7 @@ def video_understanding():
             if audit_error is not None:
                 return audit_error
             return jsonify({'error': 'No frames could be extracted from the video.'}), 400
-        messages = _build_video_messages(str(video_obj), frames, user_prompt)
+        messages = _build_video_messages(video_path or str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(
             messages,
             model_override=model_hint or None,
@@ -6447,6 +7279,8 @@ def video_understanding():
                 'model': str(lm_profile.get('model') or ''),
                 'profile_id': str(lm_profile.get('id') or ''),
                 'model_selector': _lm_profile_selector_value(lm_profile),
+                'uploaded': bool(uploaded_temp_path),
+                'filename': uploaded_original_name or Path(video_obj).name,
             }
         )
     except Exception as exc:
@@ -6463,13 +7297,23 @@ def video_understanding():
         )
         if audit_error is not None:
             return audit_error
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Video understanding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'video_understanding_failed'}), 500
+    finally:
+        _cleanup_temp_upload(uploaded_temp_path)
 
 
 @app.route('/describe_image', methods=['POST'])
 def describe_image():
-    data = _json_body()
+    is_multipart = bool(request.files)
+    data = request.form if is_multipart else _json_body()
     folder_raw = data.get('folder')
+    upload_obj = request.files.get('image') or request.files.get('file')
+    uploaded_temp_path: Optional[Path] = None
+    uploaded_original_name = str(getattr(upload_obj, "filename", "") or "").strip()
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
@@ -6477,21 +7321,35 @@ def describe_image():
         str(data.get('profile_id') or data.get('profileId') or '').strip()
         or None
     )
-    if not image_path:
-        return jsonify({'error': 'image_path is required'}), 400
+    if upload_obj is not None and uploaded_original_name:
+        try:
+            uploaded_temp_path = _save_upload_to_temp(
+                upload_obj,
+                allowed_suffixes=set(config.SUPPORTED_EXTENSIONS),
+                prefix="eva-image-",
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        image_path = uploaded_original_name
+    elif not image_path:
+        return jsonify({'error': 'image_path or image upload is required'}), 400
     try:
         lm_profile = _resolve_lm_profile(
             profile_id=profile_hint,
             model_override=model_hint or None,
             kind="vlm",
         )
-        if folder_raw:
+        if uploaded_temp_path is not None:
+            path_obj = uploaded_temp_path
+            with Image.open(path_obj) as uploaded_img:
+                uploaded_img.verify()
+        elif folder_raw:
             folder_path = _resolve_folder_path(folder_raw, require_index=True)
             path_obj = Path(image_path).expanduser().resolve()
             if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
                 return jsonify({'error': 'Unsupported image file type'}), 400
             if not path_obj.exists() or not path_obj.is_file():
-                return jsonify({'error': f'Image not found: {image_path}'}), 400
+                return jsonify({'error': 'Image not found'}), 400
             if not _path_within(path_obj, folder_path):
                 return jsonify({'error': 'image_path must be inside folder'}), 400
         else:
@@ -6527,7 +7385,8 @@ def describe_image():
                 'model': str(lm_profile.get('model') or ''),
                 'profile_id': str(lm_profile.get('id') or ''),
                 'model_selector': _lm_profile_selector_value(lm_profile),
-                'image_path': str(path_obj),
+                'uploaded': bool(uploaded_temp_path),
+                'filename': uploaded_original_name or Path(path_obj).name,
             }
         )
     except ValueError as exc:
@@ -6545,7 +7404,12 @@ def describe_image():
         )
         if audit_error is not None:
             return audit_error
-        return jsonify({'error': str(exc)}), 400
+        app.logger.info(
+            "Describe image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'Invalid image request'}), 400
     except Exception as exc:
         audit_error = _write_completion_audit_or_error(
             action="lm.describe_image.completed",
@@ -6561,7 +7425,15 @@ def describe_image():
         )
         if audit_error is not None:
             return audit_error
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Describe image failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'image_description_failed'}), 500
+    finally:
+        _cleanup_temp_upload(uploaded_temp_path)
+
+
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
@@ -7113,6 +7985,10 @@ def luxriot_start_capture():
     batch_size = data.get('batch_size')
     prompt = data.get('prompt') or ''
     requested_model_hint = (data.get('model') or '').strip() or None
+    try:
+        interval_sec = _parse_luxriot_capture_interval_sec(data)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     model_hint, model_selection = _resolve_luxriot_vlm_model_hint(
         channel_id,
         requested_model_hint,
@@ -7125,6 +8001,7 @@ def luxriot_start_capture():
             prompt=prompt,
             model_hint=model_hint,
             system_prompt=system_prompt,
+            interval_sec=interval_sec,
         )
         if isinstance(status, Mapping):
             status = dict(status)
@@ -7141,6 +8018,8 @@ def luxriot_start_capture():
                 "prompt_supplied": bool(str(prompt).strip()),
                 "system_prompt_supplied": bool(system_prompt),
                 "model_supplied": bool(requested_model_hint),
+                "interval_sec_supplied": interval_sec is not None,
+                "interval_sec": interval_sec,
                 "model_selection": model_selection.get("mode"),
                 "assigned_profile_id": model_selection.get("assigned_profile_id"),
                 "balancer_enabled": model_selection.get("balancer_enabled"),
@@ -7215,6 +8094,12 @@ def luxriot_prompt_settings():
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('bookmark_cooldown_sec'), default=0.0))
     elif 'cooldown_sec' in data:
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('cooldown_sec'), default=0.0))
+    if json_alert_prompt is not None or bookmark_enabled is not None or bookmark_cooldown_sec is not None:
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.luxriot_prompt_settings.bookmark_settings",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
 
     rollup_prompt_updates: Optional[Dict[str, Any]] = None
     rollup_prompts_raw = data.get('rollup_prompts')
@@ -7634,12 +8519,20 @@ def probes_query():
         "name": (data.get('name') or 'probe'),
         "channel_id": channel_id,
         "severity": (data.get('severity') or 'critical'),
-        "bookmark": bool(data.get('bookmark')),
+        "bookmark": _coerce_bool(data.get('bookmark'), default=False),
+        "bookmark_authorized": False,
         "window_sec": window_sec,
         "fps": data.get('fps'),
         "roi_enabled": probe_roi_enabled,
         "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
     }
+    if probe_like["bookmark"]:
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.probes_query.bookmark",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        probe_like["bookmark_authorized"] = True
     result = probe_manager.query(
         channel_id,
         positives,
@@ -7739,85 +8632,369 @@ def probes_stop_capture():
         return jsonify({'error': str(exc)}), 500
 
 
+def _probe_float(val: Any, default: float) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def _probe_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def _probe_text_values(raw: Any) -> List[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _find_probe_by_id(
+    probe_id: Any,
+    probes: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    normalized = str(probe_id or "").strip()
+    if not normalized:
+        return {}
+    try:
+        source = probes if probes is not None else probes_store.list_probes()
+        return dict(
+            next(
+                (p for p in source if str(p.get("id")) == normalized),
+                {},
+            )
+        )
+    except Exception:
+        return {}
+
+
+def _probe_bookmark_requested(
+    data: Mapping[str, Any],
+    existing_probe: Mapping[str, Any],
+) -> bool:
+    bookmark_field_present = 'bookmark' in data
+    if bookmark_field_present:
+        return _coerce_bool(data.get('bookmark'), default=False)
+    if existing_probe:
+        return bool(existing_probe.get('bookmark', False))
+    return False
+
+
+def _probe_bookmark_settings_touched(data: Mapping[str, Any]) -> bool:
+    return any(
+        key in data
+        for key in (
+            'bookmark_cooldown_sec',
+            'bookmark_dedupe_window_sec',
+        )
+    )
+
+
+def _probe_bookmark_guard_error(
+    data: Mapping[str, Any],
+    existing_probe: Mapping[str, Any],
+    *,
+    action: str,
+):
+    bookmark_requested = _probe_bookmark_requested(data, existing_probe)
+    bookmark_settings_touched = _probe_bookmark_settings_touched(data)
+    if bookmark_requested or (bool(existing_probe.get('bookmark')) and bookmark_settings_touched):
+        return _bookmark_permission_guard_error(action=action)
+    return None
+
+
+def _build_probe_payload(
+    data: Mapping[str, Any],
+    *,
+    existing_probe: Optional[Mapping[str, Any]] = None,
+    channel_id_override: Optional[int] = None,
+    probe_id_override: Optional[str] = None,
+    force_new: bool = False,
+    name_override: Optional[str] = None,
+    cast_group_id: Optional[str] = None,
+    cast_base_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        channel_id = int(channel_id_override if channel_id_override is not None else (data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID))
+    except Exception as exc:
+        raise ValueError('Provide a valid channel_id') from exc
+    if channel_id <= 0:
+        raise ValueError('Provide a valid channel_id')
+
+    positives = _probe_text_values(data.get('positives'))
+    negatives = _probe_text_values(data.get('negatives'))
+    raw_image_probe = data.get('image_probe') or {}
+    image_probe = dict(raw_image_probe) if isinstance(raw_image_probe, Mapping) else {}
+    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
+        raise ValueError('Provide at least one positive (text or image).')
+
+    existing = dict(existing_probe or {})
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
+    bookmark_requested = _probe_bookmark_requested(data, existing)
+    bookmark_authorized = bool(
+        bookmark_requested
+        and _current_request_has_permission(Permission.BOOKMARKS_CREATE)
+    )
+    pairs = data.get('pairs') or []
+    if not isinstance(pairs, list):
+        pairs = []
+    recent_hits = data.get('recent_hits') or []
+    if not isinstance(recent_hits, list):
+        recent_hits = []
+
+    if force_new:
+        probe_id = None
+    elif probe_id_override is not None:
+        probe_id = str(probe_id_override).strip() or None
+    else:
+        probe_id = data.get('id') or None
+
+    name = (name_override if name_override is not None else (data.get('name') or '')).strip()
+    if not name:
+        name = f"probe-{int(time.time())}"
+
+    probe = {
+        "id": probe_id,
+        "name": name,
+        "channel_id": channel_id,
+        "positives": positives,
+        "negatives": negatives,
+        "pos_floor": _probe_float(data.get('pos_floor'), 0.2),
+        "margin": max(0.0, _probe_float(data.get('margin'), 0.05)),
+        "bookmark_cooldown_sec": max(
+            0.0,
+            _probe_float(
+                data.get('bookmark_cooldown_sec'),
+                existing.get('bookmark_cooldown_sec', config.PROBE_BOOKMARK_COOLDOWN_SEC),
+            ),
+        ),
+        "bookmark_dedupe_window_sec": max(
+            0.5,
+            _probe_float(
+                data.get('bookmark_dedupe_window_sec'),
+                existing.get('bookmark_dedupe_window_sec', config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC),
+            ),
+        ),
+        "top_k": _probe_int(data.get('top_k'), 6),
+        "window_sec": _probe_float(data.get('window_sec'), 300.0),
+        "severity": (data.get('severity') or 'critical').lower(),
+        "bookmark": bookmark_requested,
+        "bookmark_authorized": bookmark_authorized,
+        "enabled": _coerce_bool(data.get('enabled'), True),
+        "image_probe": image_probe,
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
+        "pairs": pairs,
+        "last_hit": data.get('last_hit'),
+        "recent_hits": recent_hits[:PROBE_MAX_STORED_HITS],
+        "bookmark_gate": existing.get("bookmark_gate"),
+        "bookmark_gate_updated_at_ms": existing.get("bookmark_gate_updated_at_ms"),
+    }
+    if cast_group_id:
+        probe["cast_group_id"] = str(cast_group_id)
+    if cast_base_name:
+        probe["cast_base_name"] = str(cast_base_name)
+    return probe
+
+
+def _matching_probe_for_channel(
+    probes: Sequence[Mapping[str, Any]],
+    *,
+    name: str,
+    channel_id: int,
+) -> Dict[str, Any]:
+    normalized_name = str(name or "").strip().casefold()
+    for probe in probes:
+        try:
+            probe_channel = int(probe.get("channel_id"))
+        except Exception:
+            continue
+        if probe_channel != channel_id:
+            continue
+        if str(probe.get("name") or "").strip().casefold() == normalized_name:
+            return dict(probe)
+    return {}
+
+
 @app.route('/probes/save', methods=['POST'])
 def probes_save():
     guard = _mutation_guard_error()
     if guard is not None:
         return guard
     data = _json_body()
+    existing_probe = _find_probe_by_id(data.get('id'))
+    bookmark_guard = _probe_bookmark_guard_error(
+        data,
+        existing_probe,
+        action="http.probes_save.bookmark_settings",
+    )
+    if bookmark_guard is not None:
+        return bookmark_guard
     try:
-        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
-    except Exception:
-        return jsonify({'error': 'Provide a valid channel_id'}), 400
-    positives = [str(x).strip() for x in (data.get('positives') or []) if str(x).strip()]
-    negatives = [str(x).strip() for x in (data.get('negatives') or []) if str(x).strip()]
-    image_probe = data.get('image_probe') or {}
-    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
-        return jsonify({'error': 'Provide at least one positive (text or image).'}), 400
-
-    def _float(val, default):
-        try:
-            return float(val)
-        except Exception:
-            return default
-
-    def _int(val, default):
-        try:
-            return int(val)
-        except Exception:
-            return default
-
-    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
-
-    existing_probe: Dict[str, Any] = {}
-    probe_id_raw = data.get('id')
-    if probe_id_raw:
-        try:
-            existing_probe = next(
-                (p for p in probes_store.list_probes() if str(p.get('id')) == str(probe_id_raw)),
-                {},
-            )
-        except Exception:
-            existing_probe = {}
-
-    probe = {
-        "id": data.get('id') or None,
-        "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
-        "channel_id": channel_id,
-        "positives": positives,
-        "negatives": negatives,
-        "pos_floor": _float(data.get('pos_floor'), 0.2),
-        "margin": max(0.0, _float(data.get('margin'), 0.05)),
-        "bookmark_cooldown_sec": max(
-            0.0,
-            _float(
-                data.get('bookmark_cooldown_sec'),
-                existing_probe.get('bookmark_cooldown_sec', config.PROBE_BOOKMARK_COOLDOWN_SEC),
-            ),
-        ),
-        "bookmark_dedupe_window_sec": max(
-            0.5,
-            _float(
-                data.get('bookmark_dedupe_window_sec'),
-                existing_probe.get('bookmark_dedupe_window_sec', config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC),
-            ),
-        ),
-        "top_k": _int(data.get('top_k'), 6),
-        "window_sec": _float(data.get('window_sec'), 300.0),
-        "severity": (data.get('severity') or 'critical').lower(),
-        "bookmark": bool(data.get('bookmark', True)),
-        "enabled": bool(data.get('enabled', True)),
-        "image_probe": image_probe,
-        "roi_enabled": probe_roi_enabled,
-        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
-        "pairs": data.get('pairs') or [],
-        "last_hit": data.get('last_hit'),
-        "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
-        "bookmark_gate": existing_probe.get("bookmark_gate"),
-        "bookmark_gate_updated_at_ms": existing_probe.get("bookmark_gate_updated_at_ms"),
-    }
+        probe = _build_probe_payload(data, existing_probe=existing_probe)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     saved = probes_store.upsert_probe(probe)
     return jsonify({'success': True, 'probe': saved})
+
+
+@app.route('/probes/cast', methods=['POST'])
+def probes_cast():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_channel_ids = data.get("channel_ids")
+    if not isinstance(raw_channel_ids, (list, tuple)):
+        return jsonify({"error": "Provide channel_ids as a non-empty list."}), 400
+    channel_ids: List[int] = []
+    seen_channels: Set[int] = set()
+    for raw_channel_id in raw_channel_ids:
+        try:
+            channel_id = int(raw_channel_id)
+        except Exception:
+            continue
+        if channel_id <= 0 or channel_id in seen_channels:
+            continue
+        seen_channels.add(channel_id)
+        channel_ids.append(channel_id)
+    if not channel_ids:
+        return jsonify({"error": "Select at least one valid channel."}), 400
+    if len(channel_ids) > 500:
+        return jsonify({"error": "Too many channels for one cast operation."}), 400
+
+    conflict_policy = str(data.get("conflict") or "skip").strip().lower()
+    if conflict_policy not in {"skip", "create", "update"}:
+        return jsonify({"error": "Unsupported conflict policy."}), 400
+    copy_roi = _coerce_bool(data.get("copy_roi"), False)
+    cast_group_id = str(data.get("cast_group_id") or uuid.uuid4().hex).strip()
+    base_name = str(data.get("name") or "").strip() or f"probe-{int(time.time())}"
+
+    base_payload = dict(data)
+    base_payload.pop("id", None)
+    base_payload.pop("channel_ids", None)
+    base_payload.pop("channels", None)
+    base_payload.pop("conflict", None)
+    base_payload.pop("copy_roi", None)
+    base_payload["name"] = base_name
+    if not copy_roi:
+        base_payload["roi_enabled"] = False
+        base_payload["roi_norm"] = None
+        base_payload.pop("roi", None)
+
+    try:
+        existing_probes = probes_store.list_probes()
+    except Exception as exc:
+        app.logger.exception("Probe cast failed to list probes request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "Probe store is unavailable."}), 503
+
+    for channel_id in channel_ids:
+        existing_probe = (
+            _matching_probe_for_channel(existing_probes, name=base_name, channel_id=channel_id)
+            if conflict_policy == "update"
+            else {}
+        )
+        bookmark_guard = _probe_bookmark_guard_error(
+            base_payload,
+            existing_probe,
+            action="http.probes_cast.bookmark_settings",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        try:
+            _build_probe_payload(
+                base_payload,
+                existing_probe=existing_probe,
+                channel_id_override=channel_id,
+                probe_id_override=str(existing_probe.get("id") or "") if existing_probe else None,
+                force_new=not existing_probe,
+                cast_group_id=cast_group_id,
+                cast_base_name=base_name,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    created: List[Dict[str, Any]] = []
+    updated: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for channel_id in channel_ids:
+        matching_probe = _matching_probe_for_channel(
+            existing_probes,
+            name=base_name,
+            channel_id=channel_id,
+        )
+        if matching_probe and conflict_policy == "skip":
+            skipped.append(
+                {
+                    "channel_id": channel_id,
+                    "probe_id": matching_probe.get("id"),
+                    "reason": "matching_probe_exists",
+                }
+            )
+            continue
+        updating = bool(matching_probe and conflict_policy == "update")
+        try:
+            probe = _build_probe_payload(
+                base_payload,
+                existing_probe=matching_probe if updating else {},
+                channel_id_override=channel_id,
+                probe_id_override=str(matching_probe.get("id") or "") if updating else None,
+                force_new=not updating,
+                cast_group_id=cast_group_id,
+                cast_base_name=base_name,
+            )
+            saved = probes_store.upsert_probe(probe)
+            item = {
+                "channel_id": channel_id,
+                "probe_id": saved.get("id"),
+                "name": saved.get("name"),
+            }
+            if updating:
+                updated.append(item)
+            else:
+                created.append(item)
+        except Exception as exc:
+            failed.append({"channel_id": channel_id, "error": str(exc)})
+
+    status = 207 if failed and (created or updated or skipped) else (500 if failed else 200)
+    audit_error = _write_completion_audit_or_error(
+        action="probes.cast.completed",
+        result="partial" if failed and status == 207 else ("failure" if failed else "success"),
+        target_type="probe_cast",
+        target_id=cast_group_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "conflict": conflict_policy,
+            "copy_roi": copy_roi,
+            "created": len(created),
+            "updated": len(updated),
+            "skipped": len(skipped),
+            "failed": len(failed),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify(
+        {
+            "success": not failed,
+            "cast_group_id": cast_group_id,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+            "counts": {
+                "created": len(created),
+                "updated": len(updated),
+                "skipped": len(skipped),
+                "failed": len(failed),
+            },
+        }
+    ), status
 
 
 @app.route('/probes/list', methods=['GET'])
@@ -7868,6 +9045,13 @@ def probes_run():
     probe = probes.get(probe_id)
     if not probe:
         return jsonify({'error': 'Probe not found'}), 404
+    if probe.get('bookmark'):
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.probes_run.bookmark",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        probe['bookmark_authorized'] = True
     probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
     result = probe_manager.query(
         probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
@@ -7968,7 +9152,11 @@ def probes_bench():
             "resolution": target_size,
         })
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        app.logger.exception(
+            "Probe benchmark failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "probe_benchmark_failed"}), 500
 
 
 @app.route('/detections/search_text', methods=['POST'])
@@ -8004,11 +9192,20 @@ def detections_search_text():
     mode = 'clip'
 
     try:
-        clip_query_vec = get_text_embedding(query)
+        clip_query_vec = get_clip_text_embedding(query)
     except RuntimeError as exc:
-        return jsonify({'error': str(exc)}), 400
+        app.logger.info(
+            "Detection text query embedding unavailable request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'text_embedding_unavailable'}), 400
     except Exception as exc:
-        return jsonify({'error': f'Failed to embed text query: {exc}'}), 500
+        app.logger.exception(
+            "Detection text query embedding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'text_embedding_failed'}), 500
 
     try:
         results = _search_detections_archive(
@@ -8017,6 +9214,7 @@ def detections_search_text():
             mode=mode,
             probe_id=filters['probe_id'],
             channel_id=filters['channel_id'],
+            source=filters['source'],
             since_ms=filters['since_ms'],
             until_ms=filters['until_ms'],
             limit=limit,
@@ -8032,8 +9230,14 @@ def detections_search_text():
                 'query': query,
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection text archive query failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/search_image', methods=['POST'])
@@ -8043,6 +9247,7 @@ def detections_search_image():
     filters_payload = {
         'probe_id': request.form.get('probe_id'),
         'channel_id': request.form.get('channel_id'),
+        'source': request.form.get('source'),
         'since_ms': request.form.get('since_ms'),
         'until_ms': request.form.get('until_ms'),
         'hours': request.form.get('hours'),
@@ -8077,12 +9282,21 @@ def detections_search_image():
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
     except Exception as exc:
-        return jsonify({'error': f'Failed to read uploaded image: {exc}'}), 400
+        app.logger.info(
+            "Detection image query upload rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'invalid_uploaded_image'}), 400
 
     try:
         clip_query_vec = get_image_embedding_from_pil(pil_image, embedder='clip')
     except Exception as exc:
-        return jsonify({'error': f'Failed to embed image query with CLIP: {exc}'}), 500
+        app.logger.exception(
+            "Detection image query CLIP embedding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'image_embedding_failed'}), 500
 
     dino_query_vec: Optional[np.ndarray] = None
     if mode in {'dino', 'fusion'}:
@@ -8099,6 +9313,7 @@ def detections_search_image():
             mode=mode,
             probe_id=filters['probe_id'],
             channel_id=filters['channel_id'],
+            source=filters['source'],
             since_ms=filters['since_ms'],
             until_ms=filters['until_ms'],
             limit=limit,
@@ -8112,14 +9327,21 @@ def detections_search_image():
                 'filters': filters,
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection image archive query failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/list', methods=['GET'])
 def detections_list():
     probe_id_raw = (request.args.get('probe_id') or '').strip()
     probe_id = probe_id_raw or None
+    source = _normalize_archive_source_filter(request.args.get('source'))
 
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
@@ -8167,6 +9389,7 @@ def detections_list():
         detections, total = detections_store.list_detections(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
             limit=limit,
@@ -8182,17 +9405,25 @@ def detections_list():
                 'filters': {
                     'probe_id': probe_id,
                     'channel_id': channel_id,
+                    'source': source,
                     'since_ms': since_ms,
                     'until_ms': until_ms,
                 },
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection archive list failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/summary', methods=['GET'])
 def detections_summary():
+    source = _normalize_archive_source_filter(request.args.get('source'))
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
     if channel_id_raw:
@@ -8217,25 +9448,135 @@ def detections_summary():
         if hours > 0:
             since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
 
+    until_ms_raw = (request.args.get('until_ms') or '').strip()
+    until_ms: Optional[int] = None
+    if until_ms_raw:
+        try:
+            until_ms = int(until_ms_raw)
+        except Exception:
+            return jsonify({'error': 'until_ms must be an integer'}), 400
+
     try:
         limit = int(request.args.get('limit', 100))
     except Exception:
         limit = 100
 
     try:
-        summary = detections_store.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, limit=limit)
+        summary = detections_store.summarize_by_probe(
+            since_ms=since_ms,
+            channel_id=channel_id,
+            source=source,
+            limit=limit,
+            until_ms=until_ms,
+        )
         return jsonify(
             {
                 'summary': summary,
                 'count': len(summary),
                 'filters': {
                     'channel_id': channel_id,
+                    'source': source,
                     'since_ms': since_ms,
+                    'until_ms': until_ms,
                 },
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection archive summary failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
+
+
+@app.route('/detections/diagnostics', methods=['GET'])
+def detections_diagnostics():
+    source = _normalize_archive_source_filter(request.args.get('source'))
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms = _to_optional_int(request.args.get('since_ms'))
+    until_ms = _to_optional_int(request.args.get('until_ms'))
+    if since_ms is None:
+        hours_raw = (request.args.get('hours') or '').strip()
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 8))
+    except Exception:
+        limit = 8
+    limit = max(1, min(50, limit))
+
+    try:
+        source_summary_fn = getattr(detections_store, "summarize_by_source", None)
+        source_summary = (
+            list(source_summary_fn(since_ms=since_ms, channel_id=channel_id))
+            if callable(source_summary_fn)
+            else []
+        )
+        recent_rows, total = detections_store.list_detections(
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            offset=0,
+        )
+        recent: List[Dict[str, Any]] = []
+        for row in recent_rows:
+            thumbnail = str(row.get("thumbnail") or "")
+            recent.append(
+                {
+                    "id": row.get("id"),
+                    "source": row.get("source"),
+                    "channel_id": row.get("channel_id"),
+                    "probe_id": row.get("probe_id"),
+                    "probe_name": row.get("probe_name"),
+                    "timestamp_ms": row.get("timestamp_ms"),
+                    "severity": row.get("severity"),
+                    "has_thumbnail": bool(thumbnail),
+                    "thumbnail_chars": len(thumbnail),
+                    "has_clip": bool(row.get("has_clip")),
+                    "has_dino": bool(row.get("has_dino")),
+                    "shard_key": row.get("shard_key"),
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "filters": {
+                    "channel_id": channel_id,
+                    "source": source,
+                    "since_ms": since_ms,
+                    "until_ms": until_ms,
+                    "limit": limit,
+                },
+                "storage": _archive_storage_summary(),
+                "sources": source_summary,
+                "recent": recent,
+                "recent_total": total,
+            }
+        )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Detection archive diagnostics failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_diagnostics_failed'}), 500
 
 
 ENV_PREFIX = "EVOSSEARCH_"
@@ -8287,7 +9628,15 @@ def _serialize_env_map(env_map: Dict[str, str]) -> str:
 
 
 ENV_SECRET_REDACTION = "__EVOSSEARCH_SECRET_SET__"
-ENV_SECRET_KEY_PARTS = ("PASSWORD", "TOKEN", "SECRET", "API_KEY", "PRIVATE_KEY")
+ENV_SECRET_KEY_PARTS = (
+    "PASSWORD",
+    "TOKEN",
+    "SECRET",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "DSN",
+    "DATABASE_URL",
+)
 
 
 def _is_secret_env_key(key: str) -> bool:
@@ -8377,6 +9726,12 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": str(config.LUXRIOT_SNAPSHOT_INTERVAL),
         "EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE": str(config.LUXRIOT_SNAPSHOT_MAX_EDGE),
         "EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES": str(config.LUXRIOT_MAX_BUFFER_FRAMES),
+        "EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS": str(
+            getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0)
+        ),
+        "EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT": str(
+            getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600)
+        ),
         "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
         "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
         "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
@@ -8414,6 +9769,40 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_SETTINGS_LOCAL_ONLY": _bool_to_env(config.SETTINGS_LOCAL_ONLY),
         "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED": _bool_to_env(
             getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+        ),
+        "EVOSSEARCH_ARCHIVE_STORE": str(getattr(config, "ARCHIVE_STORE", "auto")),
+        "EVOSSEARCH_ARCHIVE_TENANT_ID": str(
+            getattr(config, "ARCHIVE_TENANT_ID", "")
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED": _bool_to_env(
+            getattr(config, "ARCHIVE_RETENTION_ENABLED", True)
+        ),
+        "EVOSSEARCH_ARCHIVE_MAX_RECORDS": str(
+            getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)
+        ),
+        "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS": str(
+            getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS": str(
+            getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC": str(
+            getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE": str(
+            getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS": str(
+            getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH": str(
+            getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB": str(
+            getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY": str(
+            getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
         ),
         "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
         "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
@@ -8472,6 +9861,209 @@ def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
     return ("\n" + "\n".join(chunks) + "\n") if chunks else ""
 
 
+def _archive_storage_summary() -> Dict[str, Any]:
+    summary_fn = getattr(detections_store, "storage_summary", None)
+    if not callable(summary_fn):
+        return {
+            "available": False,
+            "backend": getattr(detections_store, "backend", "unknown"),
+        }
+    try:
+        summary = dict(summary_fn())
+        summary["available"] = True
+        return summary
+    except Exception as exc:
+        app.logger.warning(
+            "Archive storage summary failed request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return {
+            "available": False,
+            "backend": getattr(detections_store, "backend", "unknown"),
+            "error": type(exc).__name__,
+        }
+
+
+def _archive_capacity_estimate(
+    *,
+    channels: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    snapshot_interval_sec: Optional[float] = None,
+    frames_per_batch: Optional[float] = None,
+    avg_jpeg_kb: Optional[float] = None,
+    probe_records_per_channel_day: Optional[float] = None,
+    summary_retention_days: Optional[float] = None,
+    summary_history_limit: Optional[int] = None,
+    frame_retention_days: Optional[float] = None,
+    thumbnail_retention_days: Optional[float] = None,
+    max_records: Optional[int] = None,
+) -> Dict[str, Any]:
+    channel_count = max(
+        1,
+        int(channels if channels is not None else getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)),
+    )
+    default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    batch = max(1, int(batch_size if batch_size is not None else default_batch))
+    interval = max(
+        0.2,
+        float(snapshot_interval_sec if snapshot_interval_sec is not None else config.LUXRIOT_SNAPSHOT_INTERVAL),
+    )
+    frames = max(
+        0.0,
+        float(frames_per_batch if frames_per_batch is not None else getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5)),
+    )
+    jpeg_kb = max(
+        1.0,
+        float(avg_jpeg_kb if avg_jpeg_kb is not None else getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0)),
+    )
+    probe_daily = max(
+        0.0,
+        float(
+            probe_records_per_channel_day
+            if probe_records_per_channel_day is not None
+            else getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
+        ),
+    )
+    summary_days = max(
+        0.0,
+        float(summary_retention_days if summary_retention_days is not None else getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0)),
+    )
+    summary_cap = max(
+        40,
+        int(summary_history_limit if summary_history_limit is not None else getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600)),
+    )
+    frame_days = max(
+        0.0,
+        float(frame_retention_days if frame_retention_days is not None else getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+    )
+    thumb_days = max(
+        0.0,
+        float(thumbnail_retention_days if thumbnail_retention_days is not None else getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+    )
+    record_cap = max(
+        1000,
+        int(max_records if max_records is not None else getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+    )
+
+    batches_per_channel_day = 86400.0 / max(1.0, interval * batch)
+    l0_per_channel_day = batches_per_channel_day
+    l1_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L1_WINDOW_SEC", 900)))
+    l2_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L2_WINDOW_SEC", 3600)))
+    l3_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L3_WINDOW_SEC", 21600)))
+    summary_per_channel_day = (
+        l0_per_channel_day
+        + 86400.0 / l1_window
+        + 86400.0 / l2_window
+        + 86400.0 / l3_window
+    )
+    summary_rows_day = channel_count * summary_per_channel_day
+    frame_rows_day = channel_count * (
+        batches_per_channel_day * frames + probe_daily
+    )
+    uncapped_frame_rows = frame_rows_day * frame_days
+    retained_frame_rows = min(float(record_cap), uncapped_frame_rows)
+    retained_thumbnail_rows = min(
+        retained_frame_rows,
+        frame_rows_day * min(frame_days, thumb_days),
+    )
+    summary_rows_retained = channel_count * min(
+        float(summary_cap),
+        summary_per_channel_day * summary_days,
+    )
+
+    jpeg_bytes = jpeg_kb * 1024.0
+    db_thumbnail_bytes = retained_thumbnail_rows * jpeg_bytes * 4.0 / 3.0
+    fs_jpeg_bytes = retained_frame_rows * jpeg_bytes
+    vector_and_meta_bytes = retained_frame_rows * 8192.0
+    summary_bytes = summary_rows_retained * 4096.0
+    db_total_bytes = db_thumbnail_bytes + vector_and_meta_bytes + summary_bytes
+    total_bytes = db_total_bytes + fs_jpeg_bytes
+
+    return {
+        "inputs": {
+            "channels": channel_count,
+            "batch_size": batch,
+            "snapshot_interval_sec": interval,
+            "frames_per_batch": frames,
+            "avg_jpeg_kb": jpeg_kb,
+            "probe_records_per_channel_day": probe_daily,
+            "summary_retention_days": summary_days,
+            "summary_history_limit": summary_cap,
+            "frame_retention_days": frame_days,
+            "thumbnail_retention_days": thumb_days,
+            "max_records": record_cap,
+        },
+        "daily": {
+            "batches_per_channel": batches_per_channel_day,
+            "summary_rows": summary_rows_day,
+            "frame_rows": frame_rows_day,
+        },
+        "retained": {
+            "summary_rows": summary_rows_retained,
+            "frame_rows": retained_frame_rows,
+            "thumbnail_rows": retained_thumbnail_rows,
+            "capped_by_max_records": uncapped_frame_rows > float(record_cap),
+        },
+        "bytes": {
+            "database": db_total_bytes,
+            "database_thumbnails": db_thumbnail_bytes,
+            "database_vectors_meta": vector_and_meta_bytes,
+            "database_summaries": summary_bytes,
+            "archive_files": fs_jpeg_bytes,
+            "total": total_bytes,
+        },
+    }
+
+
+@app.route('/settings/archive_capacity', methods=['GET'])
+def settings_archive_capacity():
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
+    try:
+        def _optional_float(name: str) -> Optional[float]:
+            raw = request.args.get(name)
+            if raw is None or str(raw).strip() == "":
+                return None
+            return float(raw)
+
+        def _optional_int(name: str) -> Optional[int]:
+            raw = request.args.get(name)
+            if raw is None or str(raw).strip() == "":
+                return None
+            return int(float(raw))
+
+        estimate = _archive_capacity_estimate(
+            channels=_optional_int("channels"),
+            batch_size=_optional_int("batch_size"),
+            snapshot_interval_sec=_optional_float("snapshot_interval_sec"),
+            frames_per_batch=_optional_float("frames_per_batch"),
+            avg_jpeg_kb=_optional_float("avg_jpeg_kb"),
+            probe_records_per_channel_day=_optional_float("probe_records_per_channel_day"),
+            summary_retention_days=_optional_float("summary_retention_days"),
+            summary_history_limit=_optional_int("summary_history_limit"),
+            frame_retention_days=_optional_float("frame_retention_days"),
+            thumbnail_retention_days=_optional_float("thumbnail_retention_days"),
+            max_records=_optional_int("max_records"),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "estimate": estimate,
+                "current": _archive_storage_summary(),
+                "retention": dict(_archive_retention_last_result),
+            }
+        )
+    except Exception as exc:
+        app.logger.info(
+            "Archive capacity estimate failed request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({"success": False, "error": "Invalid archive capacity request"}), 400
+
+
 @app.route('/settings/env', methods=['GET'])
 def get_settings_env():
     guard = _settings_guard(write=False)
@@ -8488,7 +10080,11 @@ def get_settings_env():
             }
         )
     except Exception as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
+        app.logger.exception(
+            "Settings env read failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_env_unavailable'}), 500
 
 
 @app.route('/settings/env', methods=['POST'])
@@ -8543,7 +10139,11 @@ def save_settings_env():
             }
         )
     except Exception as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
+        app.logger.exception(
+            "Settings env write failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_env_unavailable'}), 500
 
 
 @app.route('/settings', methods=['GET'])
@@ -8553,23 +10153,31 @@ def get_settings():
     if guard is not None:
         return guard
     try:
-        requested_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder
+        experimental_embedders_enabled = _experimental_embedding_models_enabled()
+        requested_embedder = _normalize_embedder_for_policy(
+            config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder,
+            bool(config.FUSION_ENABLED),
+        )
+        clip_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+        index_mode = _normalize_index_mode_for_policy(config.INDEX_MODE)
         settings = {
             'host': config.HOST,
             'port': config.PORT,
             'debug': config.DEBUG,
             'appVersion': config.APP_VERSION,
+            'experimentalEmbeddersEnabled': experimental_embedders_enabled,
+            'productionClipModel': _production_clip_model(),
             'embedder': requested_embedder,
-            'clipModel': config.CLIP_MODEL,
+            'clipModel': clip_model,
             'dinoModel': config.DINO_MODEL,
             'dinoEmbedDim': config.EMB_DIM_DINO,
             'dinoWeightsPath': config.DINO_WEIGHTS_PATH,
-            'indexMode': config.INDEX_MODE,
-            'fusionEnabled': config.FUSION_ENABLED,
+            'indexMode': index_mode,
+            'fusionEnabled': bool(config.FUSION_ENABLED) if experimental_embedders_enabled else False,
             'fusionAlpha': config.FUSION_ALPHA,
             'rerankEnabled': config.RERANK_ENABLED,
             'rerankTopK': config.RERANK_TOP_K,
-            'segmentsEnabled': config.DINO_SEGMENTS_ENABLED,
+            'segmentsEnabled': bool(config.DINO_SEGMENTS_ENABLED) if experimental_embedders_enabled else False,
             'segmentMinPatches': config.DINO_SEGMENT_MIN_PATCHES,
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
             'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
@@ -8580,6 +10188,8 @@ def get_settings():
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
             'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
+            'luxriotSummaryRetentionDays': getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0),
+            'luxriotSummaryHistoryLimit': getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600),
             'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
             'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
             'probeBookmarkCooldownSec': config.PROBE_BOOKMARK_COOLDOWN_SEC,
@@ -8601,11 +10211,31 @@ def get_settings():
             'adminTokenSet': bool(config.ADMIN_TOKEN),
             'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
             'allowedRoots': list(config.ALLOWED_ROOTS),
+            'archiveRetentionEnabled': getattr(config, "ARCHIVE_RETENTION_ENABLED", True),
+            'archiveMaxRecords': getattr(config, "ARCHIVE_MAX_RECORDS", 5000000),
+            'archiveRowRetentionDays': getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0),
+            'archiveThumbnailRetentionDays': getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0),
+            'archiveRetentionPruneIntervalSec': getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0),
+            'archiveRetentionBatchSize': getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000),
+            'archiveEstimateChannels': getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50),
+            'archiveEstimateFramesPerBatch': getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5),
+            'archiveEstimateAvgJpegKb': getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0),
+            'archiveEstimateProbeRecordsPerChannelDay': getattr(
+                config,
+                "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY",
+                250.0,
+            ),
+            'archiveCapacityEstimate': _archive_capacity_estimate(),
+            'archiveStorageSummary': _archive_storage_summary(),
             'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        app.logger.exception(
+            "Settings read failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_unavailable'}), 500
 
 @app.route('/settings', methods=['POST'])
 def save_settings():
@@ -8625,6 +10255,7 @@ def save_settings():
             if field not in data:
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
         debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
+        experimental_embedders_enabled = _experimental_embedding_models_enabled()
 
         try:
             port = int(data['port'])
@@ -8644,6 +10275,8 @@ def save_settings():
             return jsonify({'success': False, 'error': f'Invalid number format: {str(e)}'}), 400
 
         fusion_enabled = _coerce_bool(data.get('fusionEnabled', config.FUSION_ENABLED), config.FUSION_ENABLED)
+        if not experimental_embedders_enabled:
+            fusion_enabled = False
 
         try:
             fusion_alpha = float(data.get('fusionAlpha', config.FUSION_ALPHA))
@@ -8661,6 +10294,8 @@ def save_settings():
             rerank_top_k = 1
 
         segments_enabled = _coerce_bool(data.get('segmentsEnabled', config.DINO_SEGMENTS_ENABLED), config.DINO_SEGMENTS_ENABLED)
+        if not experimental_embedders_enabled:
+            segments_enabled = False
 
         try:
             segment_min_patches = int(data.get('segmentMinPatches', config.DINO_SEGMENT_MIN_PATCHES))
@@ -8704,6 +10339,100 @@ def save_settings():
             luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
         if luxriot_max_buffer_frames < 12:
             luxriot_max_buffer_frames = 12
+        try:
+            luxriot_summary_retention_days = float(
+                data.get(
+                    'luxriotSummaryRetentionDays',
+                    getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_retention_days = float(getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0))
+        luxriot_summary_retention_days = max(0.0, min(3650.0, luxriot_summary_retention_days))
+        try:
+            luxriot_summary_history_limit = int(
+                data.get(
+                    'luxriotSummaryHistoryLimit',
+                    getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
+        luxriot_summary_history_limit = max(40, min(1000000, luxriot_summary_history_limit))
+        archive_retention_enabled = _coerce_bool(
+            data.get('archiveRetentionEnabled', getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+            bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+        )
+        try:
+            archive_max_records = int(data.get('archiveMaxRecords', getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)))
+        except (TypeError, ValueError):
+            archive_max_records = int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000))
+        archive_max_records = max(1000, min(500000000, archive_max_records))
+        try:
+            archive_row_retention_days = float(
+                data.get('archiveRowRetentionDays', getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0))
+            )
+        except (TypeError, ValueError):
+            archive_row_retention_days = float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0))
+        archive_row_retention_days = max(0.0, min(3650.0, archive_row_retention_days))
+        try:
+            archive_thumbnail_retention_days = float(
+                data.get('archiveThumbnailRetentionDays', getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0))
+            )
+        except (TypeError, ValueError):
+            archive_thumbnail_retention_days = float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0))
+        archive_thumbnail_retention_days = max(0.0, min(3650.0, archive_thumbnail_retention_days))
+        try:
+            archive_retention_prune_interval_sec = float(
+                data.get(
+                    'archiveRetentionPruneIntervalSec',
+                    getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0),
+                )
+            )
+        except (TypeError, ValueError):
+            archive_retention_prune_interval_sec = float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0))
+        archive_retention_prune_interval_sec = max(60.0, min(86400.0, archive_retention_prune_interval_sec))
+        try:
+            archive_retention_batch_size = int(
+                data.get('archiveRetentionBatchSize', getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000))
+            )
+        except (TypeError, ValueError):
+            archive_retention_batch_size = int(getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000))
+        archive_retention_batch_size = max(100, min(50000, archive_retention_batch_size))
+        try:
+            archive_estimate_channels = int(data.get('archiveEstimateChannels', getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)))
+        except (TypeError, ValueError):
+            archive_estimate_channels = int(getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50))
+        archive_estimate_channels = max(1, min(10000, archive_estimate_channels))
+        try:
+            archive_estimate_frames_per_batch = float(
+                data.get('archiveEstimateFramesPerBatch', getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5))
+            )
+        except (TypeError, ValueError):
+            archive_estimate_frames_per_batch = float(getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5))
+        archive_estimate_frames_per_batch = max(0.0, min(32.0, archive_estimate_frames_per_batch))
+        try:
+            archive_estimate_avg_jpeg_kb = float(
+                data.get('archiveEstimateAvgJpegKb', getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0))
+            )
+        except (TypeError, ValueError):
+            archive_estimate_avg_jpeg_kb = float(getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0))
+        archive_estimate_avg_jpeg_kb = max(1.0, min(5000.0, archive_estimate_avg_jpeg_kb))
+        try:
+            archive_estimate_probe_records_per_channel_day = float(
+                data.get(
+                    'archiveEstimateProbeRecordsPerChannelDay',
+                    getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0),
+                )
+            )
+        except (TypeError, ValueError):
+            archive_estimate_probe_records_per_channel_day = float(
+                getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
+            )
+        archive_estimate_probe_records_per_channel_day = max(
+            0.0,
+            min(100000.0, archive_estimate_probe_records_per_channel_day),
+        )
         luxriot_auto_bookmarks = _coerce_bool(
             data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS),
             config.LUXRIOT_AUTO_BOOKMARKS,
@@ -8747,11 +10476,8 @@ def save_settings():
             if key in severity_map:
                 merged_sev[key] = str(severity_map[key] or merged_sev.get(key, key)).lower()
 
-        embedder = str(data.get('embedder', active_embedder)).strip().lower()
-        if embedder == 'fusion' and not fusion_enabled:
-            embedder = 'clip'
-        if embedder not in SUPPORTED_EMBEDDERS:
-            embedder = 'clip'
+        clip_model = _normalize_clip_model_for_policy(data.get('clipModel', config.CLIP_MODEL))
+        embedder = _normalize_embedder_for_policy(data.get('embedder', active_embedder), fusion_enabled)
         dino_model = str(data.get('dinoModel', config.DINO_MODEL)).strip() or config.DINO_MODEL
         try:
             dino_dim = int(data.get('dinoEmbedDim', config.EMB_DIM_DINO))
@@ -8761,9 +10487,7 @@ def save_settings():
         dino_weights_path = data.get('dinoWeightsPath', config.DINO_WEIGHTS_PATH) or ''
         dino_device = str(data.get('dinoDevice', config.DINO_DEVICE)).strip()
 
-        index_mode = str(data.get('indexMode', config.INDEX_MODE)).strip().lower()
-        if index_mode not in {'clip', 'dino', 'dual'}:
-            index_mode = 'clip'
+        index_mode = _normalize_index_mode_for_policy(data.get('indexMode', config.INDEX_MODE))
 
         batch_size = int(data.get('batchSize', config.BATCH_SIZE))
         thumbnail_quality = int(data.get('thumbnailQuality', config.THUMBNAIL_QUALITY))
@@ -8781,8 +10505,10 @@ EVOSSEARCH_DEBUG={str(debug_enabled).lower()}
 EVOSSEARCH_APP_VERSION="{config.APP_VERSION}"
 
 # Embedder configuration
+EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED={str(experimental_embedders_enabled).lower()}
+EVOSSEARCH_PRODUCTION_CLIP_MODEL={_production_clip_model()}
 EVOSSEARCH_EMBEDDER={embedder}
-EVOSSEARCH_CLIP_MODEL={data['clipModel']}
+EVOSSEARCH_CLIP_MODEL={clip_model}
 EVOSSEARCH_DINO_MODEL={dino_model}
 EVOSSEARCH_EMB_DIM_DINO={dino_dim}
 EVOSSEARCH_DINO_WEIGHTS_PATH={dino_weights_path}
@@ -8819,6 +10545,8 @@ EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
+EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS={luxriot_summary_retention_days}
+EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT={luxriot_summary_history_limit}
 EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
 EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
 EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
@@ -8869,6 +10597,18 @@ EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 EVOSSEARCH_ADMIN_TOKEN={config.ADMIN_TOKEN}
 EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
 EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED={str(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)).lower()}
+EVOSSEARCH_ARCHIVE_STORE={getattr(config, "ARCHIVE_STORE", "auto")}
+EVOSSEARCH_ARCHIVE_TENANT_ID={getattr(config, "ARCHIVE_TENANT_ID", "")}
+EVOSSEARCH_ARCHIVE_RETENTION_ENABLED={str(archive_retention_enabled).lower()}
+EVOSSEARCH_ARCHIVE_MAX_RECORDS={archive_max_records}
+EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS={archive_row_retention_days}
+EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS={archive_thumbnail_retention_days}
+EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC={archive_retention_prune_interval_sec}
+EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE={archive_retention_batch_size}
+EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS={archive_estimate_channels}
+EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH={archive_estimate_frames_per_batch}
+EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB={archive_estimate_avg_jpeg_kb}
+EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY={archive_estimate_probe_records_per_channel_day}
 EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
 EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
@@ -8884,8 +10624,18 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.HOST = data['host']
         config.PORT = port
         config.DEBUG = debug_enabled
+        embedder_state_changed = (
+            str(config.EMBEDDER) != str(embedder)
+            or str(config.CLIP_MODEL) != str(clip_model)
+            or str(config.INDEX_MODE) != str(index_mode)
+            or bool(config.FUSION_ENABLED) != bool(fusion_enabled)
+            or bool(config.DINO_SEGMENTS_ENABLED) != bool(segments_enabled)
+        )
+
+        config.EXPERIMENTAL_EMBEDDERS_ENABLED = experimental_embedders_enabled
+        config.PRODUCTION_CLIP_MODEL = _production_clip_model()
         config.EMBEDDER = embedder
-        config.CLIP_MODEL = data['clipModel']
+        config.CLIP_MODEL = clip_model
         config.DINO_MODEL = dino_model
         config.EMB_DIM_DINO = dino_dim
         config.DINO_WEIGHTS_PATH = dino_weights_path
@@ -8914,8 +10664,22 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
         config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
+        config.LUXRIOT_SUMMARY_RETENTION_DAYS = luxriot_summary_retention_days
+        config.LUXRIOT_SUMMARY_HISTORY_LIMIT = luxriot_summary_history_limit
         config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
         config.LUXRIOT_SEVERITY_MAP = merged_sev
+        luxriot_manager.summary_retention_days = luxriot_summary_retention_days
+        luxriot_manager.summary_history_limit = luxriot_summary_history_limit
+        config.ARCHIVE_RETENTION_ENABLED = archive_retention_enabled
+        config.ARCHIVE_MAX_RECORDS = archive_max_records
+        config.ARCHIVE_ROW_RETENTION_DAYS = archive_row_retention_days
+        config.ARCHIVE_THUMBNAIL_RETENTION_DAYS = archive_thumbnail_retention_days
+        config.ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC = archive_retention_prune_interval_sec
+        config.ARCHIVE_RETENTION_BATCH_SIZE = archive_retention_batch_size
+        config.ARCHIVE_ESTIMATE_CHANNELS = archive_estimate_channels
+        config.ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = archive_estimate_frames_per_batch
+        config.ARCHIVE_ESTIMATE_AVG_JPEG_KB = archive_estimate_avg_jpeg_kb
+        config.ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY = archive_estimate_probe_records_per_channel_day
         config.PROBE_BOOKMARK_COOLDOWN_SEC = probe_bookmark_cooldown_sec
         config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC = probe_bookmark_dedupe_window_sec
         config.PROBE_BOOKMARK_SIM_HIGH = probe_bookmark_sim_high
@@ -8928,11 +10692,25 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
             active_embedder = 'clip'
         reset_embedder_runtime_state()
+        if embedder_state_changed:
+            try:
+                probe_manager.clear_all()
+            except Exception:
+                pass
+            try:
+                detection_clip_shard_cache.clear()
+            except Exception:
+                pass
         warmup_warning = warm_start_embedder()
         message = 'Settings saved successfully. Restart the server if issues persist.'
         payload: Dict[str, Any] = {'success': True, 'message': message}
         if warmup_warning:
-            payload['warning'] = warmup_warning
+            app.logger.warning(
+                "Embedder warmup warning after settings save request_id=%s warning=%s",
+                getattr(g, "request_id", ""),
+                warmup_warning,
+            )
+            payload['warning'] = 'Embedder warmup failed; restart or check server logs.'
         audit_details = _audit_key_details("fields", data.keys())
         audit_details.update(
             {
@@ -8954,7 +10732,11 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         return jsonify(payload)
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        app.logger.exception(
+            "Settings write failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_update_failed'}), 500
 
 
 def _stop_probe_daemon_thread() -> None:
@@ -8962,6 +10744,20 @@ def _stop_probe_daemon_thread() -> None:
     probe_daemon_stop.set()
     if probe_daemon_thread is not None and probe_daemon_thread.is_alive():
         probe_daemon_thread.join(timeout=1.5)
+
+
+def ensure_probe_daemon_thread() -> None:
+    """Start the saved-probe daemon for production entrypoints."""
+    global probe_daemon_thread
+    if probe_daemon_thread is not None and probe_daemon_thread.is_alive():
+        return
+    probe_daemon_stop.clear()
+    probe_daemon_thread = threading.Thread(
+        target=_probe_daemon,
+        name="eva-probe-daemon",
+        daemon=True,
+    )
+    probe_daemon_thread.start()
 
 
 def _port_is_available(host: str, port: int) -> bool:
@@ -9268,7 +11064,5 @@ if __name__ == '__main__':
     if warmup_warning:
         print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
-    if probe_daemon_thread is None:
-        probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)
-        probe_daemon_thread.start()
+    ensure_probe_daemon_thread()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

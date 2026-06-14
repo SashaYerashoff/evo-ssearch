@@ -1,6 +1,6 @@
 # Luxriot EVA AI (Smart Image Search and Understanding)
 
-Luxriot EVA AI is a CLIP/DINO visual search and monitoring PoC for Luxriot-integrated workflows. It combines:
+Luxriot EVA AI is a production-pilot CLIP visual search and monitoring system for Luxriot-integrated workflows. It combines:
 
 - Archive research over indexed folders and detections archive
 - Video understanding via OpenAI-compatible vision models (LM Studio/vLLM)
@@ -8,19 +8,19 @@ Luxriot EVA AI is a CLIP/DINO visual search and monitoring PoC for Luxriot-integ
 
 ## Version
 
-- Current version: `α 0.4.2`
+- Current version: `β 0.8.0`
 - Source of truth: `VERSION` (UI reads it at runtime; optional override via `EVOSSEARCH_APP_VERSION`)
 
 ### Versioning Policy
 
-- `major.minor.patch` (shown in UI with alpha prefix, e.g. `α 0.4.2`)
+- Release label + `major.minor.patch` (shown in UI from `VERSION`, e.g. `β 0.8.0`)
 - New feature branch work: increment `minor`
 - Minor adjustments inside a branch: increment `patch`
 - Merge to `main`: increment `major`, reset `minor` and `patch` to `0`
 
 ## Current Scope
 
-This branch is a working exhibition PoC focused on:
+This branch is a beta production-pilot build focused on:
 
 - Stable end-to-end UX in 3 tabs: `Archive Research`, `Video Understanding`, `Monitoring`
 - Secure mutation paths via admin token
@@ -264,7 +264,7 @@ Effective variables currently used by app/config:
 EVOSSEARCH_HOST=0.0.0.0
 EVOSSEARCH_PORT=5000
 EVOSSEARCH_DEBUG=false
-EVOSSEARCH_APP_VERSION="α 0.4.2"
+EVOSSEARCH_APP_VERSION="β 0.8.0"
 
 # Embedder/index
 EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion

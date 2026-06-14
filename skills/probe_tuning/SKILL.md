@@ -3,7 +3,7 @@
 Goal: tune probes using evidence from short-term, medium-term, and broader history.
 
 Default order:
-0. Ask operator which probe to tune
+
 1. Read `get_detection_summary` for the last 24h and for the target channel if known.
 2. Build a representative sample with `build_research_batch`.
 3. Compare recent, medium, and longer windows instead of tuning from a single moment.

@@ -157,9 +157,14 @@ class PostgresIdentityRepository:
             connection.execute(
                 """
                 INSERT INTO iam.users (
-                    id, tenant_id, username, password_hash, display_name
+                    id,
+                    tenant_id,
+                    username,
+                    password_hash,
+                    display_name,
+                    all_channel_access
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, true)
                 """,
                 (
                     user_id,
@@ -287,6 +292,7 @@ class PostgresIdentityRepository:
             allowed_channel_ids,
             roles=normalized_roles,
         )
+        all_channel_access = _has_all_channel_access(normalized_channels)
 
         with self._pool.transaction(
             _transaction_context(tenant, actor)
@@ -312,9 +318,10 @@ class PostgresIdentityRepository:
                     username,
                     password_hash,
                     display_name,
-                    is_active
+                    is_active,
+                    all_channel_access
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     user_id,
@@ -323,6 +330,7 @@ class PostgresIdentityRepository:
                     self._password_hasher.hash(password),
                     normalized_display_name,
                     bool(is_active),
+                    all_channel_access,
                 ),
             )
             self._replace_roles(
@@ -425,6 +433,9 @@ class PostgresIdentityRepository:
             if is_active is not _UNSET:
                 updates.append("is_active = %s")
                 params.append(bool(is_active))
+            if normalized_channels is not None:
+                updates.append("all_channel_access = %s")
+                params.append(_has_all_channel_access(normalized_channels))
             if len(updates) > 1:
                 params.extend([tenant, target_user])
                 connection.execute(
@@ -883,7 +894,13 @@ class PostgresIdentityRepository:
     ) -> IdentityRecord:
         user = connection.execute(
             """
-            SELECT id, tenant_id, username, display_name, is_active
+            SELECT
+                id,
+                tenant_id,
+                username,
+                display_name,
+                is_active,
+                all_channel_access
             FROM iam.users
             WHERE tenant_id = %s AND id = %s
             """,
@@ -920,7 +937,7 @@ class PostgresIdentityRepository:
                 (tenant_id, user_id),
             ).fetchall()
         )
-        if Role.ADMIN.value in roles:
+        if Role.ADMIN.value in roles or bool(user[5]):
             allowed_channel_ids: frozenset[ChannelId] = frozenset({ALL_CHANNELS})
         else:
             allowed_channel_ids = frozenset(
@@ -985,7 +1002,7 @@ class PostgresIdentityRepository:
         tenant_id: uuid.UUID,
         user_id: uuid.UUID,
         actor_user_id: uuid.UUID,
-        channel_ids: frozenset[int],
+        channel_ids: frozenset[ChannelId],
     ) -> None:
         connection.execute(
             """
@@ -994,7 +1011,9 @@ class PostgresIdentityRepository:
             """,
             (tenant_id, user_id),
         )
-        for channel_id in sorted(channel_ids):
+        if _has_all_channel_access(channel_ids):
+            return
+        for channel_id in sorted(_numeric_channel_ids(channel_ids)):
             connection.execute(
                 """
                 INSERT INTO iam.user_channel_grants (
@@ -1099,13 +1118,14 @@ def _normalize_channel_ids(
     *,
     roles: frozenset[Role],
     allow_admin_all: bool = False,
-) -> frozenset[int]:
-    normalized: set[int] = set()
+) -> frozenset[ChannelId]:
+    normalized: set[ChannelId] = set()
     for raw_channel_id in channel_ids:
         if str(raw_channel_id).strip() == ALL_CHANNELS:
-            if allow_admin_all or Role.ADMIN in roles:
-                continue
-            raise ValueError("all-channel grants require admin role")
+            normalized = {ALL_CHANNELS}
+            continue
+        if ALL_CHANNELS in normalized:
+            continue
         try:
             channel_id = int(raw_channel_id)
         except (TypeError, ValueError) as exc:
@@ -1114,6 +1134,21 @@ def _normalize_channel_ids(
             raise ValueError("channel ids must be positive integers")
         normalized.add(channel_id)
     return frozenset(normalized)
+
+
+def _has_all_channel_access(channel_ids: Iterable[ChannelId]) -> bool:
+    return any(str(channel_id).strip() == ALL_CHANNELS for channel_id in channel_ids)
+
+
+def _numeric_channel_ids(channel_ids: Iterable[ChannelId]) -> frozenset[int]:
+    numeric: set[int] = set()
+    for raw_channel_id in channel_ids:
+        if str(raw_channel_id).strip() == ALL_CHANNELS:
+            continue
+        channel_id = int(raw_channel_id)
+        if channel_id > 0:
+            numeric.add(channel_id)
+    return frozenset(numeric)
 
 
 def _require_password_strength(password: str) -> None:

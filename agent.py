@@ -27,7 +27,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Generator, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import requests
@@ -49,6 +49,36 @@ AGENT_MAX_MESSAGES_PER_SESSION = 200  # messages kept per session (prune oldest)
 AGENT_MAX_RUNTIME_SKILLS_CHARS = 3_500
 AGENT_MAX_ACTIVE_SKILL_CHARS   = 6_000
 AGENT_MAX_PROBES_IN_PROMPT     = 12
+AGENT_MAX_TOOL_CALLS_PER_TURN  = 64
+AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN = 8
+ARCHIVE_SOURCE_LABELS = {
+    "probe": "Probe hit",
+    "vlm_summary": "Video-description frame",
+    "vlm_alert": "VLM alert frame",
+}
+ARCHIVE_SOURCE_ITEM_TYPES = {
+    "probe": "probe_detection",
+    "vlm_summary": "video_description_frame",
+    "vlm_alert": "video_description_alert",
+}
+ARCHIVE_SOURCE_ALIASES = {
+    "detection": "probe",
+    "detections": "probe",
+    "probe_hit": "probe",
+    "probe_hits": "probe",
+    "probes_run": "probe",
+    "probes_query": "probe",
+    "probe_daemon": "probe",
+    "summary": "vlm_summary",
+    "video_summary": "vlm_summary",
+    "video_summaries": "vlm_summary",
+    "video_description": "vlm_summary",
+    "video_descriptions": "vlm_summary",
+    "alert": "vlm_alert",
+    "alerts": "vlm_alert",
+    "vlm_summary_frame": "vlm_summary",
+    "vlm_alert_frame": "vlm_alert",
+}
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
@@ -57,8 +87,9 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "search_archive",
             "description": (
                 "Semantic text search over either an indexed folder (CLIP/FAISS) or "
-                "the detections archive (vector search over stored detections). "
-                "Returns ranked results with file paths, similarity scores, and metadata. "
+                "the frame archive (vector search over probe hits and video-description frames). "
+                "Returns ranked results with image URLs/previews, similarity scores, source labels, and metadata. "
+                "When source is vlm_summary or vlm_alert, the result is from video descriptions, not a probe detection. "
                 "TODO v1.1: add image_path/detection_id params for image-similarity search."
             ),
             "parameters": {
@@ -73,7 +104,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "enum": ["indexed_folder", "detections"],
                         "description": (
                             "indexed_folder: searches a FAISS-indexed image directory. "
-                            "detections: searches the detections archive via stored CLIP vectors."
+                            "detections: searches the frame archive via stored CLIP vectors."
                         ),
                     },
                     "folder": {
@@ -82,11 +113,20 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "probe_id": {
                         "type": "string",
-                        "description": "Optional. When scope=detections, restrict to detections from this probe.",
+                        "description": "Optional. When scope=detections, restrict to one archive item/probe id.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["probe", "vlm_summary", "vlm_alert"],
+                        "description": (
+                            "Optional archive source filter. probe = probe hits/detections; "
+                            "vlm_summary = regular frames saved from video-description batches; "
+                            "vlm_alert = frames anchored to video-description alerts."
+                        ),
                     },
                     "channel_id": {
                         "type": "integer",
-                        "description": "Optional. Restrict detections search to this channel.",
+                        "description": "Optional. Restrict archive search to this channel.",
                     },
                     "since_hours": {
                         "type": "number",
@@ -108,11 +148,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "mode": {
                         "type": "string",
                         "enum": ["clip", "dino", "fusion"],
-                        "description": "Detections search only. clip: fast/default. dino/fusion: richer visual matching when available.",
+                        "description": "Frame archive search only. clip: fast/default. dino/fusion: richer visual matching when available.",
                     },
                     "candidate_limit": {
                         "type": "integer",
-                        "description": "Detections search only. Candidate pool before final ranking. Default: 20000.",
+                        "description": "Frame archive search only. Candidate pool before final ranking. Default: 20000.",
                     },
                     "limit": {
                         "type": "integer",
@@ -128,16 +168,17 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "get_detections",
             "description": (
-                "Retrieve recent detection events from the archive for one or more probes. "
-                "Returns a list with timestamps, confidence scores, and image paths. "
-                "Use to inspect what a probe has been triggering on."
+                "Retrieve recent archive frame records. By default this includes probe hits, "
+                "video-description frames, and VLM alert frames. Use source=probe when you need "
+                "actual probe detections only. Returns timestamps, source labels, scores where present, "
+                "and preview image URLs."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "probe_id": {
                         "type": "string",
-                        "description": "Probe ID to filter by. If omitted, returns detections across all probes.",
+                        "description": "Archive item/probe ID to filter by. If omitted, returns records across all archive items.",
                     },
                     "probe_name": {
                         "type": "string",
@@ -145,7 +186,15 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "channel_id": {
                         "type": "integer",
-                        "description": "Optional. Restrict to detections from this channel.",
+                        "description": "Optional. Restrict to archive records from this channel.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["probe", "vlm_summary", "vlm_alert"],
+                        "description": (
+                            "Optional archive source filter. Use source=probe for real probe detections, "
+                            "source=vlm_summary for regular video-description frames, and source=vlm_alert for VLM alert frames."
+                        ),
                     },
                     "since_hours": {
                         "type": "number",
@@ -186,8 +235,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "get_detection_summary",
             "description": (
-                "Aggregate detection statistics grouped by probe. Returns hit counts and "
-                "latest activity timestamps. Use for an overview before drilling into specific events."
+                "Aggregate archive frame statistics grouped by archive item/probe. Returns counts, "
+                "source labels, and latest activity timestamps. Use source=probe for actual probe detection summaries."
             ),
             "parameters": {
                 "type": "object",
@@ -199,6 +248,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "channel_id": {
                         "type": "integer",
                         "description": "Optional. Restrict summary to one channel.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["probe", "vlm_summary", "vlm_alert"],
+                        "description": "Optional archive source filter: probe, vlm_summary, or vlm_alert.",
                     },
                     "since_ms": {
                         "type": "integer",
@@ -224,6 +278,91 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "force": {
                         "type": "boolean",
                         "description": "If true, refresh channel list from Luxriot instead of relying on cache.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "normalize_time_window",
+            "description": (
+                "Convert an operator-facing time range into exact Unix seconds/milliseconds. "
+                "Use before archive or video-summary tools when the user gives relative or local times "
+                "such as 'last night from 1:30am to 8:30am'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Optional local date in YYYY-MM-DD. If omitted, day_hint is used.",
+                    },
+                    "day_hint": {
+                        "type": "string",
+                        "enum": ["today", "yesterday", "last_night", "explicit"],
+                        "description": "How to choose the date when date is omitted. Default: today.",
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": "Local start time, e.g. '01:30', '1:30am', or '23:00'.",
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "description": "Local end time, e.g. '08:30', '8:30am', or '02:00'.",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone. Default: Europe/Riga.",
+                    },
+                },
+                "required": ["start_time", "end_time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_video_summary_channels",
+            "description": (
+                "Inventory which Luxriot channels have VLM video-summary coverage in a time window. "
+                "Use this before broad video-description review when the operator did not name channels. "
+                "Returns metadata and candidate channels, not full summaries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional channel IDs to inspect. Omit to inspect all available authorized channels.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["live", "L1", "L2", "L3"],
+                        "description": "Summary level to count. Default: L1.",
+                    },
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Return coverage from the past N hours. Default: 6.",
+                    },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
+                    "run": {
+                        "type": "string",
+                        "description": "Optional run selector: latest, running, all, or a concrete run id.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum candidate channels to return. Default: 16, max: 100.",
                     },
                 },
                 "required": [],
@@ -1389,6 +1528,8 @@ class AgentTools:
             "get_detections":       self._get_detections,
             "get_detection_summary": self._get_detection_summary,
             "list_channels":        self._list_channels,
+            "normalize_time_window": self._normalize_time_window,
+            "list_video_summary_channels": self._list_video_summary_channels,
             "list_probes":          self._list_probes,
             "survey_channels":      self._survey_channels,
             "build_research_batch": self._build_research_batch,
@@ -1436,6 +1577,7 @@ class AgentTools:
         since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
         probe_id    = str(args.get("probe_id") or "").strip() or None
         channel_id  = _opt_int(args.get("channel_id"))
+        source = _normalize_archive_source(args.get("source"))
         mode = str(args.get("mode") or "clip").strip().lower()
         if mode not in {"clip", "dino", "fusion"}:
             mode = "clip"
@@ -1447,6 +1589,7 @@ class AgentTools:
             query=query,
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
             limit=limit,
@@ -1454,7 +1597,13 @@ class AgentTools:
             candidate_limit=candidate_limit,
             mode=mode,
         )
-        return {"scope": scope, "count": len(results), "results": _strip_thumbnails(results)}
+        return {
+            "scope": scope,
+            "source": source,
+            "source_label": _archive_source_label(source),
+            "count": len(results),
+            "results": _strip_thumbnails([_annotate_archive_row(result) for result in results]),
+        }
 
     # ── get_detections ──────────────────────────────────────────────────────
 
@@ -1467,6 +1616,7 @@ class AgentTools:
             probe_id = self._resolve_probe_id_by_name(probe_name_raw)
 
         channel_id  = _opt_int(args.get("channel_id"))
+        source = _normalize_archive_source(args.get("source"))
         since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
         limit       = max(1, min(100, int(args.get("limit") or 20)))
         offset      = max(0, int(args.get("offset") or 0))
@@ -1477,6 +1627,7 @@ class AgentTools:
         rows, total = self._list_detection_window(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
             limit=limit,
@@ -1487,30 +1638,34 @@ class AgentTools:
         return {
             "probe_id": probe_id,
             "channel_id": channel_id,
+            "source": source,
+            "source_label": _archive_source_label(source),
             "since_ms": since_ms,
             "until_ms": until_ms,
             "total_in_window": total,
             "returned": len(rows),
             "offset": offset,
             "sort_by": sort_by,
-            "detections": [_safe_detection(r) for r in rows],
+            "detections": [_safe_detection(_annotate_archive_row(r)) for r in rows],
         }
 
     # ── get_detection_summary ───────────────────────────────────────────────
 
     def _get_detection_summary(self, args: Dict[str, Any]) -> Dict[str, Any]:
         channel_id  = _opt_int(args.get("channel_id"))
+        source = _normalize_archive_source(args.get("source"))
         since_ms, until_ms = self._resolve_time_window(args, default_since_hours=24.0)
 
         if until_ms is None:
-            rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id)
+            rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, source=source)
         else:
-            grouped: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            grouped: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
             offset = 0
             while True:
                 batch, _total = self._ds.list_detections(
                     probe_id=None,
                     channel_id=channel_id,
+                    source=source,
                     since_ms=since_ms,
                     until_ms=until_ms,
                     limit=500,
@@ -1519,11 +1674,15 @@ class AgentTools:
                 if not batch:
                     break
                 for row in batch:
-                    key = (str(row.get("probe_id") or ""), int(row.get("channel_id") or 0))
+                    row_source = str(row.get("source") or "").strip().lower()
+                    key = (str(row.get("probe_id") or ""), int(row.get("channel_id") or 0), row_source)
                     slot = grouped.setdefault(key, {
                         "probe_id": row.get("probe_id"),
                         "probe_name": row.get("probe_name"),
                         "channel_id": row.get("channel_id"),
+                        "source": row_source,
+                        "source_label": _archive_source_label(row_source),
+                        "archive_item_type": _archive_item_type(row_source),
                         "hit_count": 0,
                         "latest_timestamp_ms": 0,
                     })
@@ -1540,11 +1699,15 @@ class AgentTools:
                 key=lambda row: int(row.get("latest_timestamp_ms") or 0),
                 reverse=True,
             )
+        rows = [_annotate_archive_row(row) for row in rows]
         return {
             "since_ms": since_ms,
             "until_ms": until_ms,
+            "source": source,
+            "source_label": _archive_source_label(source),
             "probe_count": len(rows),
             "total_detections": sum(r.get("hit_count", 0) for r in rows),
+            "total_archive_items": sum(r.get("hit_count", 0) for r in rows),
             "by_probe": rows,
         }
 
@@ -1573,13 +1736,185 @@ class AgentTools:
             "channels": clean_channels,
         }
 
+    # ── normalize_time_window ───────────────────────────────────────────────
+
+    def _normalize_time_window(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        tz_name = str(args.get("timezone") or "Europe/Riga").strip() or "Europe/Riga"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception as exc:
+            raise ToolError(f"Unknown timezone: {tz_name}") from exc
+
+        now_local = datetime.now(tz)
+        date_raw = str(args.get("date") or "").strip()
+        day_hint = str(args.get("day_hint") or "today").strip().lower()
+        if date_raw:
+            try:
+                base_date = datetime.strptime(date_raw, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ToolError("'date' must be YYYY-MM-DD.") from exc
+        elif day_hint == "yesterday":
+            base_date = (now_local - timedelta(days=1)).date()
+        elif day_hint == "last_night":
+            # Before noon, "last night" usually means the current local date after midnight.
+            # Later in the day, choose the previous overnight period unless the user supplies date.
+            base_date = now_local.date() if now_local.hour < 12 else (now_local - timedelta(days=1)).date()
+        else:
+            base_date = now_local.date()
+
+        start_clock = _parse_operator_clock(str(args.get("start_time") or ""))
+        end_clock = _parse_operator_clock(str(args.get("end_time") or ""))
+        if start_clock is None or end_clock is None:
+            raise ToolError("'start_time' and 'end_time' must be parseable local times.")
+
+        start_local = datetime.combine(base_date, start_clock, tzinfo=tz)
+        end_local = datetime.combine(base_date, end_clock, tzinfo=tz)
+        if end_local <= start_local:
+            end_local += timedelta(days=1)
+
+        from_ts = int(start_local.timestamp())
+        to_ts = int(end_local.timestamp())
+        return {
+            "timezone": tz_name,
+            "day_hint": day_hint,
+            "from_local": start_local.isoformat(),
+            "to_local": end_local.isoformat(),
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "since_ms": from_ts * 1000,
+            "until_ms": to_ts * 1000,
+            "duration_sec": max(0, to_ts - from_ts),
+        }
+
+    # ── list_video_summary_channels ─────────────────────────────────────────
+
+    def _list_video_summary_channels(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "get_channels") or not hasattr(self._lxm, "session_status"):
+            raise ToolError("Luxriot manager is not available or not configured.")
+        depth = _normalize_summary_depth(args.get("depth"))
+        limit = max(1, min(100, int(args.get("limit") or 16)))
+        run_selector = str(args.get("run") or "").strip() or None
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(args, default_since_hours=6.0)
+        requested_ids = args.get("channel_ids") if isinstance(args.get("channel_ids"), list) else None
+        requested_ids_set = {
+            int(item) for item in (requested_ids or [])
+            if _opt_int(item) is not None and int(item) > 0
+        }
+        try:
+            channels = self._lxm.get_channels(force=False)
+        except Exception as exc:
+            raise ToolError(f"Could not fetch channels: {exc}") from exc
+
+        channel_rows: List[Dict[str, Any]] = []
+        inactive_count = 0
+        errors: List[Dict[str, Any]] = []
+        for channel in channels if isinstance(channels, list) else []:
+            if not isinstance(channel, dict):
+                continue
+            channel_id = _opt_int(channel.get("id"))
+            if channel_id is None or channel_id <= 0:
+                continue
+            if requested_ids_set and channel_id not in requested_ids_set:
+                continue
+            title = str(channel.get("title") or channel.get("name") or f"channel-{channel_id}")
+            try:
+                status = self._lxm.session_status(
+                    channel_id=channel_id,
+                    run_selector=run_selector,
+                    start_ts=from_ts,
+                    end_ts=to_ts,
+                    limit=None,
+                )
+            except Exception as exc:
+                errors.append({"channel_id": channel_id, "title": title, "error": str(exc)[:200]})
+                continue
+            logs = status.get("logs") if isinstance(status, dict) else []
+            logs = logs if isinstance(logs, list) else []
+            if not logs:
+                inactive_count += 1
+                continue
+            starts: List[float] = []
+            ends: List[float] = []
+            frame_count = 0
+            alert_counts: Dict[str, int] = {}
+            for log in logs:
+                if not isinstance(log, dict):
+                    continue
+                created = _coerce_epoch_seconds(log.get("created_at"))
+                if created is not None:
+                    starts.append(created)
+                    ends.append(created)
+                frame_count += int(_opt_int(log.get("frame_count")) or 0)
+                raw_counts = log.get("alert_counts")
+                if isinstance(raw_counts, dict):
+                    for key, value in raw_counts.items():
+                        severity = str(key or "normal").strip().lower() or "normal"
+                        alert_counts[severity] = alert_counts.get(severity, 0) + int(_opt_int(value) or 0)
+                else:
+                    total = _opt_int(log.get("alert_total")) or 0
+                    if total > 0:
+                        severity = str(log.get("severity") or "normal").strip().lower() or "normal"
+                        alert_counts[severity] = alert_counts.get(severity, 0) + total
+            latest_ts = max(ends) if ends else None
+            first_ts = min(starts) if starts else None
+            alert_total = int(sum(alert_counts.values()))
+            channel_rows.append(
+                {
+                    "channel_id": channel_id,
+                    "title": title,
+                    "summary_depth_recommended": depth,
+                    "summary_count": len(logs),
+                    "first_ts": first_ts,
+                    "latest_ts": latest_ts,
+                    "first_time": _format_epoch_minute(first_ts),
+                    "latest_time": _format_epoch_minute(latest_ts),
+                    "frame_count": frame_count,
+                    "alert_total": alert_total,
+                    "alert_counts": alert_counts,
+                    "running": bool(status.get("running")) if isinstance(status, dict) else False,
+                    "selected_run": status.get("selected_run") if isinstance(status, dict) else None,
+                }
+            )
+        channel_rows.sort(
+            key=lambda row: (
+                int(row.get("alert_total") or 0),
+                float(row.get("latest_ts") or 0.0),
+                int(row.get("summary_count") or 0),
+            ),
+            reverse=True,
+        )
+        active_count = len(channel_rows)
+        per_turn_limit = AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN
+        return {
+            "depth": depth,
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "time_window": time_meta,
+            "total_channels_checked": active_count + inactive_count + len(errors),
+            "active_count": active_count,
+            "inactive_count": inactive_count,
+            "error_count": len(errors),
+            "returned": min(limit, active_count),
+            "per_turn_channel_limit": per_turn_limit,
+            "requires_confirmation": active_count > per_turn_limit and not requested_ids_set,
+            "full_research_note": (
+                f"{active_count} active channel(s) have summaries in this window. "
+                f"Reviewing more than {per_turn_limit} channels should be confirmed and chunked."
+            ),
+            "candidate_channels": channel_rows[:limit],
+            "errors": errors[:8],
+        }
+
     # ── list_probes ────────────────────────────────────────────────────────
 
     def _list_probes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         since_hours = float(args.get("since_hours") or 24)
         since_ms = int(time.time() * 1000 - since_hours * 3_600_000)
         probes = self._ps.list_probes()
-        summary_rows = self._ds.summarize_by_probe(since_ms=since_ms)
+        summary_rows = self._ds.summarize_by_probe(since_ms=since_ms, source="probe")
         summary_by_probe = {str(row.get("probe_id") or ""): row for row in summary_rows}
         items: List[Dict[str, Any]] = []
         for probe in probes:
@@ -1802,6 +2137,7 @@ class AgentTools:
             window_rows, total = self._list_detection_window(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source="probe",
                 since_ms=period["since_ms"],
                 until_ms=period["until_ms"],
                 limit=max_candidates,
@@ -1858,11 +2194,13 @@ class AgentTools:
         return {
             "probe_id": probe_id,
             "channel_id": channel_id,
+            "source": "probe",
+            "source_label": _archive_source_label("probe"),
             "sort_by": sort_by,
             "periods": period_reports,
             "bands": band_reports,
             "batch_size": len(selected),
-            "detections": [_safe_detection(row) for row in selected],
+            "detections": [_safe_detection(_annotate_archive_row(row)) for row in selected],
         }
 
     # ── create_probe ───────────────────────────────────────────────────────
@@ -2225,9 +2563,7 @@ class AgentTools:
         channel_id  = self._resolve_channel_id(args, required=True)
         if channel_id is None:
             raise ToolError("'channel_id' or 'channel_ref' is required.")
-        depth       = str(args.get("depth") or "L1").strip().upper()
-        if depth == "LIVE":
-            depth = "L0"
+        depth       = _normalize_summary_depth(args.get("depth"))
         limit       = max(1, min(100, int(args.get("limit") or 20)))
         level_limit = max(limit, min(500, int(args.get("level_limit") or limit)))
         run_selector = str(args.get("run") or "").strip() or None
@@ -2235,17 +2571,7 @@ class AgentTools:
         if not hasattr(self._lxm, "summary_rollups"):
             raise ToolError("Luxriot manager is not available or not configured.")
 
-        from_ts = _opt_float(args.get("from_ts"))
-        to_ts = _opt_float(args.get("to_ts"))
-        if from_ts is None and to_ts is None:
-            since_hours = float(args.get("since_hours") or 6)
-            to_ts = time.time()
-            from_ts = to_ts - since_hours * 3600.0
-        else:
-            if to_ts is None:
-                to_ts = time.time()
-            if from_ts is None:
-                from_ts = max(0.0, float(to_ts) - 6 * 3600.0)
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(args, default_since_hours=6.0)
 
         try:
             rollups = self._lxm.summary_rollups(
@@ -2261,13 +2587,23 @@ class AgentTools:
         nodes = (rollups.get("levels") or {}).get(depth) or []
 
         # Flatten to a clean list for the LLM
-        import datetime as _dt
         entries = []
-        for node in nodes[-limit:]:
+        filtered_nodes = [
+            node for node in nodes
+            if isinstance(node, dict) and _summary_node_overlaps(node, from_ts, to_ts)
+        ]
+        for node in filtered_nodes[-limit:]:
             entry: Dict[str, Any] = {}
-            ts = node.get("window_start") or node.get("created_at")
-            if ts:
-                entry["time"] = _dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+            start, end = _summary_node_bounds(node)
+            if start is not None:
+                entry["time"] = _format_epoch_minute(start)
+                entry["window_start"] = start
+            if end is not None:
+                entry["window_end"] = end
+                entry["window_end_time"] = _format_epoch_minute(end)
+            for key in ("level", "frame_count", "item_count", "alert_total", "alert_counts", "alert_severities"):
+                if key in node:
+                    entry[key] = node.get(key)
             text = str(node.get("summary") or "").strip()
             if text:
                 entry["summary"] = text[:800]
@@ -2279,8 +2615,11 @@ class AgentTools:
             "depth": depth,
             "from_ts": from_ts,
             "to_ts": to_ts,
+            "time_window": time_meta,
             "run": run_selector,
             "count": len(entries),
+            "total_in_window": len(filtered_nodes),
+            "truncated": len(filtered_nodes) > len(entries),
             "selected_run": rollups.get("selected_run"),
             "run_filter_id": rollups.get("run_filter_id"),
             "running": bool(rollups.get("running")),
@@ -2335,7 +2674,7 @@ class AgentTools:
         since_ms = int(now_ms - since_hours * 3_600_000)
         until_ms = int(now_ms - until_hours * 3_600_000) if until_hours is not None else None
 
-        summary_rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id)
+        summary_rows = self._ds.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, source="probe")
 
         # Filter probes if requested
         if include_probes:
@@ -2357,6 +2696,7 @@ class AgentTools:
             top_rows, _ = self._ds.list_detections(
                 probe_id=pid,
                 channel_id=channel_id,
+                source="probe",
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=top_events,
@@ -2367,6 +2707,7 @@ class AgentTools:
             all_rows, _ = self._ds.list_detections(
                 probe_id=pid,
                 channel_id=channel_id,
+                source="probe",
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=500,
@@ -2383,7 +2724,7 @@ class AgentTools:
                 "channel_id": row.get("channel_id"),
                 "hit_count": row.get("hit_count", 0),
                 "latest_ts": row.get("latest_timestamp_ms"),
-                "top_events": [_safe_detection(r) for r in top_rows],
+                "top_events": [_safe_detection(_annotate_archive_row(r)) for r in top_rows],
             })
 
         return {
@@ -2399,6 +2740,45 @@ class AgentTools:
         }
 
     # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _resolve_summary_time_window(
+        self,
+        args: Dict[str, Any],
+        *,
+        default_since_hours: float,
+    ) -> Tuple[float, float, Dict[str, Any]]:
+        raw_from = args.get("from_ts")
+        raw_to = args.get("to_ts")
+        from_ts = _coerce_epoch_seconds(raw_from)
+        to_ts = _coerce_epoch_seconds(raw_to)
+        normalized_units = {
+            "from_ts": _epoch_input_unit(raw_from),
+            "to_ts": _epoch_input_unit(raw_to),
+        }
+        if from_ts is None and to_ts is None:
+            since_hours = float(args.get("since_hours") or default_since_hours)
+            to_ts = time.time()
+            from_ts = to_ts - since_hours * 3600.0
+        else:
+            if to_ts is None:
+                to_ts = time.time()
+            if from_ts is None:
+                from_ts = max(0.0, float(to_ts) - default_since_hours * 3600.0)
+        if from_ts > to_ts:
+            from_ts, to_ts = to_ts, from_ts
+        return (
+            float(from_ts),
+            float(to_ts),
+            {
+                "from_ts": float(from_ts),
+                "to_ts": float(to_ts),
+                "since_ms": int(float(from_ts) * 1000.0),
+                "until_ms": int(float(to_ts) * 1000.0),
+                "from_time": _format_epoch_minute(from_ts),
+                "to_time": _format_epoch_minute(to_ts),
+                "normalized_input_units": normalized_units,
+            },
+        )
 
     def _resolve_time_window(
         self,
@@ -2426,6 +2806,7 @@ class AgentTools:
         *,
         probe_id: Optional[str],
         channel_id: Optional[int],
+        source: Optional[str],
         since_ms: Optional[int],
         until_ms: Optional[int],
         limit: int,
@@ -2443,6 +2824,7 @@ class AgentTools:
             rows, total = self._ds.list_detections(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=source,
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=min(batch_size, max_scan - next_offset),
@@ -2926,6 +3308,43 @@ def _normalize_probe_match_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
 
 
+def _normalize_archive_source(value: Any) -> Optional[str]:
+    source = str(value or "").strip().lower()
+    if not source:
+        return None
+    source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    if source not in ARCHIVE_SOURCE_LABELS:
+        raise ToolError("source must be one of: probe, vlm_summary, vlm_alert")
+    return source
+
+
+def _archive_source_label(source: Any) -> str:
+    normalized = str(source or "").strip().lower()
+    normalized = ARCHIVE_SOURCE_ALIASES.get(normalized, normalized)
+    return ARCHIVE_SOURCE_LABELS.get(normalized, "Archive frame")
+
+
+def _archive_item_type(source: Any) -> str:
+    normalized = str(source or "").strip().lower()
+    normalized = ARCHIVE_SOURCE_ALIASES.get(normalized, normalized)
+    return ARCHIVE_SOURCE_ITEM_TYPES.get(normalized, "archive_frame")
+
+
+def _annotate_archive_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    source = str(out.get("source") or "").strip().lower()
+    if source:
+        out["source"] = source
+    logical_source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    if logical_source and logical_source != source:
+        out["logical_source"] = logical_source
+    out["source_label"] = _archive_source_label(source)
+    out["archive_item_type"] = _archive_item_type(source)
+    out["is_probe_detection"] = logical_source == "probe"
+    out["is_video_description_frame"] = logical_source in {"vlm_summary", "vlm_alert"}
+    return out
+
+
 def _format_active_skill_docs_for_prompt(skill_slugs: Sequence[str]) -> str:
     if not skill_slugs:
         return ""
@@ -2986,7 +3405,7 @@ def build_system_prompt(
     # Recent detection counts (last 24h)
     since_ms = int(time.time() * 1000 - 86_400_000)
     try:
-        probe_summary = detections_store.summarize_by_probe(since_ms=since_ms)
+        probe_summary = detections_store.summarize_by_probe(since_ms=since_ms, source="probe")
         hit_by_probe  = {r["probe_id"]: r["hit_count"] for r in probe_summary}
     except Exception:
         hit_by_probe  = {}
@@ -3069,6 +3488,12 @@ def build_system_prompt(
         f"- Do not claim support for PDF export, CSV export, emails, file links, async report queues, or background jobs unless a tool explicitly returns that artifact.\n"
         f"- If an operator asks for an unsupported export, say so plainly and offer the closest available format, such as a structured chat report.\n"
         f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
+        f"- For video-description or video-summary review over a period, first call normalize_time_window unless the user already provided exact Unix timestamps. Use from_ts/to_ts for video summaries and since_ms/until_ms for detection archive tools.\n"
+        f"- If the operator asks for video-summary review without naming channel(s), call list_video_summary_channels for the normalized period before reading full summaries. If active_count exceeds the per_turn_channel_limit, present candidate channels and ask the operator to choose channels or confirm full multi-turn research.\n"
+        f"- Do not review more than {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels of video summaries in one turn unless the operator explicitly confirmed broad research. For broad research, work in chunks and report unchecked channels.\n"
+        f"- Archive source semantics: source=probe rows are real probe hits/detections; source=vlm_summary rows are sampled frames saved from video-description batches; source=vlm_alert rows are frames anchored to VLM alerts from video descriptions.\n"
+        f"- Do not call vlm_summary or vlm_alert rows probe detections. When answering from archive tools, name the source class and separate probe hits, video-description frames, and VLM alert frames.\n"
+        f"- When answering from video summaries, include coverage gaps. Never imply that missing summary windows were reviewed. Keep VLM summaries separate from archive detections; use archive tools only as corroborating evidence.\n"
         f"- Use the repository playbooks index below as routing hints; load-bearing details are provided only for explicitly activated playbooks.\n"
         f"- For probe tuning or archive research, follow the matching playbook when one is activated or clearly implied.\n"
         f"- When returning search results or detections, summarize; don't dump raw lists.\n"
@@ -3304,7 +3729,30 @@ class AgentRunner:
         )
 
         # ── tool loop ──────────────────────────────────────────────────────
+        tool_calls_used = 0
         while True:
+            if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
+                in_flight.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Tool budget exhausted after {tool_calls_used} tool call(s). "
+                            "Give the operator a concise partial answer, list what remains unchecked, "
+                            "and ask for confirmation before continuing in another turn."
+                        ),
+                    }
+                )
+                yield _sse(
+                    {
+                        "type": "tool_budget",
+                        "message": (
+                            f"Stopped tool use after {tool_calls_used} call(s); "
+                            "preparing a partial answer."
+                        ),
+                        "max_tool_calls": AGENT_MAX_TOOL_CALLS_PER_TURN,
+                    }
+                )
+                break
             # Run the blocking LM call in a thread so we can emit heartbeats
             lm_response: _LMResponse
             try:
@@ -3344,6 +3792,21 @@ class AgentRunner:
             for tc in lm_response.tool_calls:
                 yield _sse({"type": "tool_call", "name": tc.name, "args": tc.args})
                 progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+                if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
+                    error_payload = {
+                        "error": (
+                            "Tool budget exhausted. Ask the operator to continue "
+                            "or narrow the channel/time scope."
+                        )
+                    }
+                    result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
+                                  "content": json.dumps(error_payload)}
+                    yield _sse({"type": "tool_result", "name": tc.name,
+                                "result": error_payload, "error": error_payload["error"]})
+                    in_flight.append(result_msg)
+                    new_assistant_messages.append(result_msg)
+                    continue
+                tool_calls_used += 1
 
                 try:
                     result = yield from _run_with_heartbeats(
@@ -3517,6 +3980,107 @@ def _opt_float(v: Any) -> Optional[float]:
         return None
 
 
+def _epoch_input_unit(v: Any) -> Optional[str]:
+    value = _opt_float(v)
+    if value is None:
+        return None
+    return "milliseconds" if abs(value) >= 10_000_000_000 else "seconds"
+
+
+def _coerce_epoch_seconds(v: Any) -> Optional[float]:
+    value = _opt_float(v)
+    if value is None:
+        return None
+    if abs(value) >= 10_000_000_000:
+        value = value / 1000.0
+    # Guard against obviously invalid epoch values while still allowing old archives.
+    if value < 0:
+        return None
+    return float(value)
+
+
+def _format_epoch_minute(v: Any) -> Optional[str]:
+    value = _coerce_epoch_seconds(v)
+    if value is None:
+        return None
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def _parse_operator_clock(value: str) -> Optional[Any]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = text.replace(".", ":").replace(" ", "")
+    ampm: Optional[str] = None
+    if text.endswith("am") or text.endswith("pm"):
+        ampm = text[-2:]
+        text = text[:-2]
+    if ":" in text:
+        hour_text, minute_text = text.split(":", 1)
+    else:
+        hour_text, minute_text = text, "0"
+    try:
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError:
+        return None
+    if minute < 0 or minute > 59:
+        return None
+    if ampm:
+        if hour < 1 or hour > 12:
+            return None
+        if ampm == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    elif hour < 0 or hour > 23:
+        return None
+    from datetime import time as _time
+    return _time(hour=hour, minute=minute)
+
+
+def _normalize_summary_depth(value: Any) -> str:
+    depth = str(value or "L1").strip().upper()
+    if depth == "LIVE":
+        return "L0"
+    if depth in {"L0", "L1", "L2", "L3"}:
+        return depth
+    return "L1"
+
+
+def _summary_node_bounds(node: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    start = _coerce_epoch_seconds(node.get("window_start"))
+    if start is None:
+        start = _coerce_epoch_seconds(node.get("created_at"))
+    end = _coerce_epoch_seconds(node.get("window_end"))
+    if end is None:
+        end = start
+    return start, end
+
+
+def _summary_node_overlaps(node: Mapping[str, Any], from_ts: float, to_ts: float) -> bool:
+    start, end = _summary_node_bounds(node)
+    if start is None and end is None:
+        return False
+    if start is None:
+        start = end
+    if end is None:
+        end = start
+    if end is None or start is None:
+        return False
+    start_f = float(start)
+    end_f = float(end)
+    from_f = float(from_ts)
+    to_f = float(to_ts)
+    if start_f == end_f:
+        return from_f <= start_f <= to_f
+    return end_f > from_f and start_f < to_f
+
+
 def _sort_detection_rows(rows: List[Dict[str, Any]], sort_by: str) -> List[Dict[str, Any]]:
     sort_key: Callable[[Dict[str, Any]], Any]
     reverse = True
@@ -3564,6 +4128,16 @@ def _archive_result_image_url(r: Dict[str, Any], folder: Optional[str] = None) -
 def _safe_detection(r: Dict[str, Any]) -> Dict[str, Any]:
     """Return detection dict with thumbnail stripped, plus a serveable image_url."""
     out = {k: v for k, v in r.items() if k not in ("thumbnail", "clip_vec", "dino_vec")}
+    source = str(out.get("source") or "").strip().lower()
+    if source:
+        out["source"] = source
+    logical_source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    if logical_source and logical_source != source:
+        out["logical_source"] = logical_source
+    out["source_label"] = _archive_source_label(source)
+    out["archive_item_type"] = _archive_item_type(source)
+    out["is_probe_detection"] = logical_source == "probe"
+    out["is_video_description_frame"] = logical_source in {"vlm_summary", "vlm_alert"}
     out["has_thumbnail"] = bool(r.get("thumbnail"))
     url = _detection_image_url(r)
     if url:
@@ -3576,6 +4150,8 @@ def _strip_thumbnails(results: List[Dict[str, Any]], folder: Optional[str] = Non
     for r in results:
         row = {k: v for k, v in r.items()
                if k not in ("thumbnail", "thumbnail_b64", "clip_vec", "dino_vec")}
+        if row.get("source") is not None:
+            row = _annotate_archive_row(row)
         is_detection = bool(r.get("is_detection")) or bool(r.get("detection_id")) or bool(r.get("image_path"))
         url = _detection_image_url(r) if is_detection else _archive_result_image_url(r, folder=folder)
         if url:
@@ -3601,6 +4177,15 @@ def _compact_detection_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": r.get("id"),
         "timestamp_ms": r.get("timestamp_ms") or r.get("event_timestamp_ms") or r.get("recorded_at_ms"),
+        "source": r.get("source"),
+        "source_label": r.get("source_label") or _archive_source_label(r.get("source")),
+        "archive_item_type": r.get("archive_item_type") or _archive_item_type(r.get("source")),
+        "is_probe_detection": bool(
+            r.get(
+                "is_probe_detection",
+                ARCHIVE_SOURCE_ALIASES.get(str(r.get("source") or "").lower(), str(r.get("source") or "").lower()) == "probe",
+            )
+        ),
         "probe_id": r.get("probe_id"),
         "probe_name": r.get("probe_name"),
         "channel_id": r.get("channel_id"),
@@ -3618,6 +4203,9 @@ def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
         "path": r.get("filepath") or r.get("path") or r.get("image_path"),
         "score": r.get("score"),
         "timestamp_ms": r.get("timestamp_ms") or r.get("event_timestamp_ms"),
+        "source": r.get("source"),
+        "source_label": r.get("source_label") or _archive_source_label(r.get("source")),
+        "archive_item_type": r.get("archive_item_type") or _archive_item_type(r.get("source")),
         "probe_name": r.get("probe_name"),
         "channel_id": r.get("channel_id"),
         "image_url": r.get("image_url"),
@@ -3662,6 +4250,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         return {
             "probe_id": result.get("probe_id"),
             "channel_id": result.get("channel_id"),
+            "source": result.get("source"),
+            "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "since_ms": result.get("since_ms"),
             "until_ms": result.get("until_ms"),
             "total_in_window": result.get("total_in_window"),
@@ -3675,6 +4265,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         rows = result.get("results") if isinstance(result.get("results"), list) else []
         return {
             "scope": result.get("scope"),
+            "source": result.get("source"),
+            "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "count": result.get("count"),
             "results": [_compact_search_result_for_model(r) for r in rows[:8] if isinstance(r, dict)],
         }
@@ -3684,6 +4276,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         return {
             "probe_id": result.get("probe_id"),
             "channel_id": result.get("channel_id"),
+            "source": result.get("source"),
+            "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "sort_by": result.get("sort_by"),
             "batch_size": result.get("batch_size"),
             "periods": result.get("periods"),
@@ -3701,14 +4295,20 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 "probe_id": row.get("probe_id"),
                 "probe_name": row.get("probe_name"),
                 "channel_id": row.get("channel_id"),
+                "source": row.get("source"),
+                "source_label": row.get("source_label") or _archive_source_label(row.get("source")),
+                "archive_item_type": row.get("archive_item_type") or _archive_item_type(row.get("source")),
                 "hit_count": row.get("hit_count"),
                 "latest_timestamp_ms": row.get("latest_timestamp_ms"),
             })
         return {
             "since_ms": result.get("since_ms"),
             "until_ms": result.get("until_ms"),
+            "source": result.get("source"),
+            "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "probe_count": result.get("probe_count"),
             "total_detections": result.get("total_detections"),
+            "total_archive_items": result.get("total_archive_items"),
             "by_probe": compact_rows,
         }
 
@@ -3724,6 +4324,43 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "status": row.get("status"),
                 }
                 for row in rows[:12]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "normalize_time_window":
+        return {
+            "timezone": result.get("timezone"),
+            "from_local": result.get("from_local"),
+            "to_local": result.get("to_local"),
+            "from_ts": result.get("from_ts"),
+            "to_ts": result.get("to_ts"),
+            "since_ms": result.get("since_ms"),
+            "until_ms": result.get("until_ms"),
+            "duration_sec": result.get("duration_sec"),
+        }
+
+    if tool_name == "list_video_summary_channels":
+        rows = result.get("candidate_channels") if isinstance(result.get("candidate_channels"), list) else []
+        return {
+            "depth": result.get("depth"),
+            "time_window": result.get("time_window"),
+            "active_count": result.get("active_count"),
+            "total_channels_checked": result.get("total_channels_checked"),
+            "per_turn_channel_limit": result.get("per_turn_channel_limit"),
+            "requires_confirmation": result.get("requires_confirmation"),
+            "full_research_note": result.get("full_research_note"),
+            "candidate_channels": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "summary_count": row.get("summary_count"),
+                    "first_time": row.get("first_time"),
+                    "latest_time": row.get("latest_time"),
+                    "alert_total": row.get("alert_total"),
+                    "running": row.get("running"),
+                }
+                for row in rows[:AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN]
                 if isinstance(row, dict)
             ],
         }

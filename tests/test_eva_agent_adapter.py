@@ -78,11 +78,17 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         }
 
         self.assertNotIn("create_bookmark", schemas)
+        self.assertIn("normalize_time_window", schemas)
+        self.assertIn("list_video_summary_channels", schemas)
         search = schemas["search_archive"]["function"]["parameters"]
         self.assertNotIn("folder", search["properties"])
         self.assertEqual(
             search["properties"]["scope"]["enum"],
             ["detections"],
+        )
+        self.assertEqual(
+            search["properties"]["source"]["enum"],
+            ["probe", "vlm_summary", "vlm_alert"],
         )
         describe = schemas["describe_frame"]["function"]["parameters"]
         self.assertNotIn("image_path", describe["properties"])
@@ -156,6 +162,15 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             [event.phase for event in self.audit_events],
             ["deny", "deny"],
         )
+
+    def test_summary_channel_inventory_defaults_to_scoped_channels(self):
+        result = self.adapter.execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 200.0},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
 
     def test_detection_ownership_is_resolved_before_dispatch(self):
         with self.assertRaises(ChannelAccessDeniedError):

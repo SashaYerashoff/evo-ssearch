@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from agent import AgentRunner, _LMResponse, _ToolCall
+from agent import AgentRunner, _LMResponse, _ToolCall, _compact_tool_result_for_model
 from agent_security import ToolExecutionContext
 
 
@@ -85,6 +85,39 @@ class _FakeSecureTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_archive_tool_compaction_preserves_source_semantics(self):
+        compact = _compact_tool_result_for_model(
+            "search_archive",
+            {
+                "scope": "detections",
+                "source": "vlm_summary",
+                "source_label": "Video-description frame",
+                "count": 1,
+                "results": [
+                    {
+                        "detection_id": 42,
+                        "image_path": "/tmp/frame.jpg",
+                        "score": 0.78,
+                        "timestamp_ms": 1_781_389_900_000,
+                        "source": "vlm_summary",
+                        "source_label": "Video-description frame",
+                        "archive_item_type": "video_description_frame",
+                        "probe_name": "VLM summary frame",
+                        "channel_id": 7,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(compact["source"], "vlm_summary")
+        self.assertEqual(compact["source_label"], "Video-description frame")
+        self.assertEqual(compact["results"][0]["source"], "vlm_summary")
+        self.assertEqual(compact["results"][0]["source_label"], "Video-description frame")
+        self.assertEqual(
+            compact["results"][0]["archive_item_type"],
+            "video_description_frame",
+        )
+
     def test_tool_loop_can_exceed_eight_rounds(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
@@ -136,6 +169,26 @@ class AgentToolLoopTests(unittest.TestCase):
             runner._secure_tools.calls[0][2].session_id,
             "session-1",
         )
+
+    def test_tool_loop_has_high_but_finite_budget(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(tool_rounds=100)
+        runner._tools = _FakeTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = list(runner.stream_chat("session-1", "test"))
+        payloads = [
+            json.loads(event.removeprefix("data: ").strip())
+            for event in events
+            if event.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 64)
+        self.assertTrue(any(item.get("type") == "tool_budget" for item in payloads))
+        self.assertEqual(payloads[-1]["type"], "done")
 
 
 if __name__ == "__main__":

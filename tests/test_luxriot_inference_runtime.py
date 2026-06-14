@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 from inference_queue import (
@@ -14,7 +15,12 @@ from inference_queue import (
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager
 
 
-def build_manager(directory: Path, lm_callback=None) -> LuxriotManager:
+def build_manager(
+    directory: Path,
+    lm_callback=None,
+    alert_parser=None,
+    summary_archive_callback=None,
+) -> LuxriotManager:
     config = SimpleNamespace(
         LUXRIOT_SYSTEM_PROMPT_DEFAULT="Describe the stream.",
         LUXRIOT_ALERTS_JSON_PROMPT="",
@@ -52,6 +58,8 @@ def build_manager(directory: Path, lm_callback=None) -> LuxriotManager:
         lm_callback=lm_callback or (lambda _messages, _model: "summary"),
         message_builder=message_builder,
         jpeg_encoder=lambda _image, **_kwargs: "jpeg",
+        alert_parser=alert_parser,
+        summary_archive_callback=summary_archive_callback,
     )
 
 
@@ -119,6 +127,105 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "summary",
             )
 
+    def test_sync_fallback_archives_batch_frame_anchors(self):
+        archived = []
+
+        def archive_callback(entry):
+            archived.append(dict(entry))
+            return {
+                "attempted": len(entry.get("archive_frames") or []),
+                "inserted": len(entry.get("archive_frames") or []),
+                "summary_frames": len(entry.get("archive_frames") or []),
+                "alert_frames": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), summary_archive_callback=archive_callback)
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint="model-a",
+                interval_sec=5.0,
+                frames=sample_frames(),
+            )
+
+            outcome = manager.dispatch_summary_batch(batch)
+
+            self.assertFalse(outcome["queued"])
+            self.assertEqual(len(archived), 1)
+            frames = archived[0]["archive_frames"]
+            self.assertEqual([frame["anchor_role"] for frame in frames], ["first", "last"])
+            self.assertEqual([frame["timestamp_ms"] for frame in frames], [100000, 105000])
+            self.assertNotIn("archive_frames", manager.summary_history[7][0])
+
+    def test_summary_alert_counts_roll_up_by_severity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def parse_alerts(text, _channel_id, _default_ts_ms=None):
+                if "critical-event" in text:
+                    return [{"severity": "critical"}, {"severity": "normal"}]
+                if "low-event" in text:
+                    return [{"severity": "low"}]
+                return []
+
+            manager = build_manager(Path(temp), alert_parser=parse_alerts)
+            now = time.time()
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "critical-event\nALERTS_JSON:\n{\"alerts\":[]}",
+                    "frame_count": 2,
+                    "created_at": now,
+                },
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "low-event\nALERTS_JSON:\n{\"alerts\":[]}",
+                    "frame_count": 2,
+                    "created_at": now + 1.0,
+                },
+            )
+
+            logs = manager.session_status(7, run_selector="all")["logs"]
+            self.assertEqual(logs[0]["alert_counts"], {"critical": 1, "normal": 1})
+            self.assertEqual(logs[1]["alert_counts"], {"low": 1})
+
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
+            self.assertEqual(rollups["levels"]["L1"][0]["alert_counts"], {"critical": 1, "normal": 1, "low": 1})
+            self.assertEqual(rollups["levels"]["L1"][0]["alert_total"], 3)
+
+    def test_start_session_persists_channel_interval_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                status = manager.start_session(
+                    7,
+                    batch_size=12,
+                    prompt="Describe activity.",
+                    interval_sec=4.5,
+                )
+
+            self.assertEqual(status["interval_sec"], 4.5)
+            self.assertEqual(manager.channel_prompt_overrides[7]["capture_interval_sec"], 4.5)
+            manager.stop_session(7)
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                status = manager.start_session(
+                    7,
+                    batch_size=12,
+                    prompt="Describe activity.",
+                )
+
+            self.assertEqual(status["interval_sec"], 4.5)
+            manager.stop_session(7)
+
 
 class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
     def setUp(self):
@@ -184,6 +291,28 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(list((self.directory / "spool").glob("*.json")), [])
         self.assertEqual(self.runtime.status()["completed_count"], 1)
+
+    def test_worker_archives_batch_frame_anchors(self):
+        archived = []
+        self.manager.set_summary_archive_callback(
+            lambda entry: archived.append(dict(entry)) or {
+                "attempted": len(entry.get("archive_frames") or []),
+                "inserted": len(entry.get("archive_frames") or []),
+                "summary_frames": len(entry.get("archive_frames") or []),
+                "alert_frames": 0,
+            }
+        )
+
+        outcome = self.runtime.enqueue_summary(self.batch())
+        self.assertTrue(outcome["accepted"])
+
+        self.runtime.start()
+        self.wait_for(lambda: bool(archived))
+
+        frames = archived[0]["archive_frames"]
+        self.assertEqual([frame["anchor_role"] for frame in frames], ["first", "last"])
+        self.assertEqual([frame["timestamp_ms"] for frame in frames], [100000, 105000])
+        self.assertNotIn("archive_frames", self.manager.summary_history[7][0])
 
     def test_worker_restores_queued_default_model_hint(self):
         seen_models = []

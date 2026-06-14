@@ -50,6 +50,8 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "get_detections": Permission.DETECTIONS_VIEW,
     "get_detection_summary": Permission.DETECTIONS_VIEW,
     "list_channels": Permission.STREAMS_VIEW,
+    "normalize_time_window": Permission.AGENT_USE,
+    "list_video_summary_channels": Permission.STREAMS_VIEW,
     "list_probes": Permission.REPORTS_VIEW,
     "survey_channels": Permission.STREAMS_VIEW,
     "build_research_batch": Permission.DETECTIONS_VIEW,
@@ -132,6 +134,7 @@ class EvaAgentToolAdapter:
                 max_output_bytes=96_000,
                 max_output_items=500,
                 max_output_string_chars=24_000,
+                timeout_seconds=self._timeout_seconds(name),
                 rate_limit=RateLimit(
                     max_calls=120,
                     window_seconds=60,
@@ -157,6 +160,7 @@ class EvaAgentToolAdapter:
         return {
             "search_archive": 48,
             "get_detections": 100,
+            "list_video_summary_channels": 100,
             "get_video_summaries": 100,
         }.get(name)
 
@@ -165,8 +169,21 @@ class EvaAgentToolAdapter:
         return {
             "search_archive": 12,
             "get_detections": 20,
+            "list_video_summary_channels": 16,
             "get_video_summaries": 20,
         }.get(name)
+
+    @staticmethod
+    def _timeout_seconds(name: str) -> float:
+        return {
+            "survey_channels": 300.0,
+            "describe_frame": 120.0,
+            "search_archive": 90.0,
+            "build_research_batch": 90.0,
+            "get_video_summaries": 90.0,
+            "list_video_summary_channels": 90.0,
+            "generate_report": 90.0,
+        }.get(name, 45.0)
 
     def close(self) -> None:
         self.gateway.close()
@@ -382,6 +399,8 @@ class EvaAgentToolAdapter:
             self._resolve_delete_probe_channels(prepared, context)
         scoped_channels = self._scoped_channels(context)
         if name == "survey_channels" and scoped_channels is not None:
+            prepared.setdefault("channel_ids", sorted(scoped_channels))
+        elif name == "list_video_summary_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif (
             name in _SINGLE_CHANNEL_FOR_SCOPED_ACTORS

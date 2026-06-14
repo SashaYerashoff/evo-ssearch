@@ -1,5 +1,5 @@
 flask==3.0.3
-flask-cors==4.0.0
+flask-cors>=4.0.2
 # CLIP setup.py imports pkg_resources; keep setuptools<81 where pkg_resources still exists.
 setuptools<81
 torch>=2.1.0

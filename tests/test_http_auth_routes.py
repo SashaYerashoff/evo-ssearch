@@ -377,6 +377,24 @@ class HttpAuthRouteTests(unittest.TestCase):
             )
         )
 
+    def test_logout_does_not_stop_background_captures(self) -> None:
+        _, csrf_token = self._login()
+
+        with (
+            patch("oldapp.luxriot_manager.stop_session") as stop_video,
+            patch("oldapp.luxriot_manager.stop_probe_capture") as stop_probe,
+            patch("oldapp.luxriot_manager.stop_all_streams") as stop_all,
+        ):
+            logout = self.client.post(
+                "/auth/logout",
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(logout.status_code, 200, logout.get_json())
+        stop_video.assert_not_called()
+        stop_probe.assert_not_called()
+        stop_all.assert_not_called()
+
     def test_mutation_requires_csrf_permission_and_channel_grant(self) -> None:
         _, csrf_token = self._login()
 
@@ -413,6 +431,50 @@ class HttpAuthRouteTests(unittest.TestCase):
                 for event in self.audit.events
             )
         )
+
+    def test_probe_cast_checks_every_selected_channel(self) -> None:
+        _, csrf_token = self._login()
+
+        with patch("oldapp.probes_store.upsert_probe") as upsert_probe:
+            forbidden = self.client.post(
+                "/probes/cast",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "name": "Door watch",
+                    "channel_ids": [7, 8],
+                    "positives": ["person near door"],
+                    "bookmark": False,
+                },
+            )
+
+        self.assertEqual(forbidden.status_code, 403)
+        upsert_probe.assert_not_called()
+
+        saved_probes = []
+
+        def _upsert(probe):
+            stored = dict(probe)
+            stored["id"] = stored.get("id") or f"probe-{len(saved_probes) + 1}"
+            saved_probes.append(stored)
+            return stored
+
+        with (
+            patch("oldapp.probes_store.list_probes", return_value=[]),
+            patch("oldapp.probes_store.upsert_probe", side_effect=_upsert),
+        ):
+            allowed = self.client.post(
+                "/probes/cast",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "name": "Door watch",
+                    "channel_ids": [7],
+                    "positives": ["person near door"],
+                    "bookmark": False,
+                },
+            )
+
+        self.assertEqual(allowed.status_code, 200, allowed.get_json())
+        self.assertEqual([probe["channel_id"] for probe in saved_probes], [7])
 
     def test_sensitive_reads_require_login_and_channel_scope(self) -> None:
         anonymous = self.client.get("/luxriot/channels")
@@ -537,13 +599,14 @@ class HttpAuthRouteTests(unittest.TestCase):
         with patch(
             "oldapp.luxriot_manager.start_session",
             return_value={"running": True, "channel_id": 7},
-        ):
+        ) as start_session:
             response = self.client.post(
                 "/luxriot/start_capture",
                 headers={"X-CSRF-Token": csrf_token},
                 json={
                     "channel_id": 7,
                     "batch_size": 16,
+                    "interval_sec": 2.5,
                     "prompt": "operator sensitive prompt",
                     "system_prompt": "system sensitive prompt",
                     "model": "qwen35-4b-q4",
@@ -551,6 +614,7 @@ class HttpAuthRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(start_session.call_args.kwargs["interval_sec"], 2.5)
         event = next(
             event
             for event in self.audit.events
@@ -561,6 +625,8 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertTrue(event.details["prompt_supplied"])
         self.assertTrue(event.details["system_prompt_supplied"])
         self.assertTrue(event.details["model_supplied"])
+        self.assertTrue(event.details["interval_sec_supplied"])
+        self.assertEqual(event.details["interval_sec"], 2.5)
         self.assertNotIn("operator sensitive prompt", str(event.details))
         self.assertNotIn("system sensitive prompt", str(event.details))
 
@@ -638,6 +704,32 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(event.details["assigned_profile_id"], captured["model_hint"])
         self.assertTrue(event.details["balancer_enabled"])
 
+    def test_luxriot_start_capture_accepts_fps_alias(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.CAPTURE_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch(
+            "oldapp.luxriot_manager.start_session",
+            return_value={"running": True, "channel_id": 7},
+        ) as start_session:
+            response = self.client.post(
+                "/luxriot/start_capture",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "batch_size": 12, "fps": 0.2},
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(start_session.call_args.kwargs["interval_sec"], 5.0)
+
     def test_scoped_detection_queries_require_owned_channel(self) -> None:
         self._login()
 
@@ -648,6 +740,157 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(missing_scope.status_code, 403)
         self.assertEqual(forbidden_scope.status_code, 403)
         self.assertEqual(allowed_scope.status_code, 200)
+
+    def test_archive_not_ready_response_is_sanitized(self) -> None:
+        self._login()
+
+        with patch(
+            "oldapp.detections_store.list_detections",
+            side_effect=oldapp.ArchiveStoreNotReady(
+                "Archive storage is not migrated yet. Apply database migration 20260612_0005."
+            ),
+        ):
+            response = self.client.get("/detections/list?channel_id=7")
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.get_json()
+        self.assertEqual(payload["not_ready"], "archive_store")
+        self.assertEqual(payload["required_revision"], "20260612_0005")
+        self.assertNotIn("archive.detections", payload["error"])
+
+    def test_luxriot_prompt_bookmark_settings_require_bookmark_permission(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.PROMPTS_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch("oldapp.luxriot_manager.update_prompt_settings") as update_settings:
+            denied = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "bookmark_enabled": True},
+            )
+
+        self.assertEqual(denied.status_code, 403)
+        update_settings.assert_not_called()
+
+        with patch("oldapp.luxriot_manager.update_prompt_settings") as update_settings:
+            denied_json_prompt = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "json_alert_prompt": "emit every vehicle as alert"},
+            )
+
+        self.assertEqual(denied_json_prompt.status_code, 403)
+        update_settings.assert_not_called()
+
+        with patch(
+            "oldapp.luxriot_manager.update_prompt_settings",
+            return_value={"stream_system_prompt": "ok"},
+        ) as update_settings:
+            allowed_prompt_only = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "stream_system_prompt": "plain prompt"},
+            )
+
+        self.assertEqual(allowed_prompt_only.status_code, 200, allowed_prompt_only.get_json())
+        self.assertIsNone(update_settings.call_args.kwargs["bookmark_enabled"])
+        self.assertIsNone(update_settings.call_args.kwargs["bookmark_cooldown_sec"])
+
+    def test_probe_bookmark_save_requires_bookmark_permission(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.PROBES_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch("oldapp.probes_store.upsert_probe") as upsert_probe:
+            response = self.client.post(
+                "/probes/save",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "channel_id": 7,
+                    "name": "door",
+                    "positives": ["person at door"],
+                    "bookmark": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+        upsert_probe.assert_not_called()
+
+    def test_probe_bookmark_query_requires_bookmark_permission(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.PROBES_RUN.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch("oldapp.probe_manager.query") as query:
+            response = self.client.post(
+                "/probes/query",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "channel_id": 7,
+                    "positives": ["person"],
+                    "bookmark": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+        query.assert_not_called()
+
+    def test_probe_bookmark_run_requires_bookmark_permission(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.PROBES_RUN.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        probe = {
+            "id": "probe-7",
+            "channel_id": 7,
+            "positives": ["person"],
+            "bookmark": True,
+        }
+
+        with (
+            patch("oldapp.probes_store.list_probes", return_value=[probe]),
+            patch("oldapp.probe_manager.query") as query,
+        ):
+            response = self.client.post(
+                "/probes/run",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"id": "probe-7"},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        query.assert_not_called()
 
     def test_probe_id_ownership_is_checked_before_mutation(self) -> None:
         _, csrf_token = self._login()
@@ -933,6 +1176,23 @@ class HttpAuthRouteTests(unittest.TestCase):
         created_user = created.get_json()["user"]
         self.assertEqual(created_user["username"], "viewer")
         self.assertEqual(created_user["allowedChannelIds"], [7])
+
+        operator_all = self.client.post(
+            "/auth/users",
+            headers={"X-CSRF-Token": csrf_token},
+            json={
+                "username": "operator-all",
+                "password": "correct-password",
+                "displayName": "All Channel Operator",
+                "roles": [Role.OPERATOR.value],
+                "allowedChannelIds": [ALL_CHANNELS],
+            },
+        )
+        self.assertEqual(operator_all.status_code, 201, operator_all.get_json())
+        self.assertEqual(
+            operator_all.get_json()["user"]["allowedChannelIds"],
+            [ALL_CHANNELS],
+        )
 
         listed = self.client.get("/auth/users")
         self.assertEqual(listed.status_code, 200)

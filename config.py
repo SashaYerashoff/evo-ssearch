@@ -123,7 +123,7 @@ def _get_lm_profiles(
     return profiles
 
 
-def _get_app_version(default: str = "α 0.4.2") -> str:
+def _get_app_version(default: str = "β 0.8.0") -> str:
     env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
     if env_value:
         return env_value
@@ -145,8 +145,19 @@ class Config:
     APP_VERSION = _get_app_version()
 
     # Embedder configuration
+    EXPERIMENTAL_EMBEDDERS_ENABLED = _get_bool_env(
+        'EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED',
+        'False',
+    )
+    PRODUCTION_CLIP_MODEL = (
+        os.getenv('EVOSSEARCH_PRODUCTION_CLIP_MODEL', 'ViT-B/32').strip()
+        or 'ViT-B/32'
+    )
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
-    CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', 'ViT-B/32')
+    CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
+    if not EXPERIMENTAL_EMBEDDERS_ENABLED:
+        EMBEDDER = 'clip'
+        CLIP_MODEL = PRODUCTION_CLIP_MODEL
     DINO_MODEL = os.getenv('EVOSSEARCH_DINO_MODEL', 'dinov3_vith16plus')
     try:
         EMB_DIM_DINO = int(os.getenv('EVOSSEARCH_EMB_DIM_DINO', '1280'))
@@ -178,6 +189,9 @@ class Config:
     except (TypeError, ValueError):
         FUSION_ALPHA = 0.7
     FUSION_ALPHA = min(1.0, max(0.0, FUSION_ALPHA))
+    if not EXPERIMENTAL_EMBEDDERS_ENABLED:
+        INDEX_MODE = 'clip'
+        FUSION_ENABLED = False
 
     RERANK_ENABLED = _get_bool_env('EVOSSEARCH_RERANK_ENABLED', 'False')
     try:
@@ -188,6 +202,8 @@ class Config:
         RERANK_TOP_K = 1
 
     DINO_SEGMENTS_ENABLED = _get_bool_env('EVOSSEARCH_DINO_SEGMENTS_ENABLED', 'False')
+    if not EXPERIMENTAL_EMBEDDERS_ENABLED:
+        DINO_SEGMENTS_ENABLED = False
     try:
         DINO_SEGMENT_MIN_PATCHES = int(os.getenv('EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES', '3'))
     except (TypeError, ValueError):
@@ -249,9 +265,52 @@ class Config:
         'EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED',
         'False',
     )
+    ARCHIVE_STORE = os.getenv('EVOSSEARCH_ARCHIVE_STORE', 'auto').strip().lower() or 'auto'
+    if ARCHIVE_STORE not in {'auto', 'postgres', 'sqlite'}:
+        ARCHIVE_STORE = 'auto'
+    ARCHIVE_TENANT_ID = (
+        os.getenv('EVOSSEARCH_ARCHIVE_TENANT_ID', AUTH_TENANT_ID).strip()
+    )
+    ARCHIVE_RETENTION_ENABLED = _get_bool_env(
+        'EVOSSEARCH_ARCHIVE_RETENTION_ENABLED',
+        'True',
+    )
+    try:
+        ARCHIVE_MAX_RECORDS = int(os.getenv('EVOSSEARCH_ARCHIVE_MAX_RECORDS', '5000000'))
+    except (TypeError, ValueError):
+        ARCHIVE_MAX_RECORDS = 5000000
+    ARCHIVE_MAX_RECORDS = max(1000, ARCHIVE_MAX_RECORDS)
+    try:
+        ARCHIVE_ROW_RETENTION_DAYS = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS', '90')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_ROW_RETENTION_DAYS = 90.0
+    ARCHIVE_ROW_RETENTION_DAYS = max(0.0, ARCHIVE_ROW_RETENTION_DAYS)
+    try:
+        ARCHIVE_THUMBNAIL_RETENTION_DAYS = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS', '14')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_THUMBNAIL_RETENTION_DAYS = 14.0
+    ARCHIVE_THUMBNAIL_RETENTION_DAYS = max(0.0, ARCHIVE_THUMBNAIL_RETENTION_DAYS)
+    try:
+        ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC', '3600')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC = 3600.0
+    ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC = max(60.0, ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC)
+    try:
+        ARCHIVE_RETENTION_BATCH_SIZE = int(
+            os.getenv('EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE', '5000')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_RETENTION_BATCH_SIZE = 5000
+    ARCHIVE_RETENTION_BATCH_SIZE = max(100, min(50000, ARCHIVE_RETENTION_BATCH_SIZE))
 
     # LM Studio / Qwen video understanding
-    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:1234/v1').strip().rstrip('/')
+    LM_BASE_URL = os.getenv('EVOSSEARCH_LM_BASE_URL', 'http://127.0.0.1:8088/v1').strip().rstrip('/')
     LM_MODEL = os.getenv('EVOSSEARCH_LM_MODEL', 'qwen/qwen3-vl-4b').strip()
     LM_API_KEY = os.getenv('EVOSSEARCH_LM_API_KEY', '').strip()
     try:
@@ -396,6 +455,60 @@ class Config:
     if LUXRIOT_SNAPSHOT_MAX_EDGE < 640:
         LUXRIOT_SNAPSHOT_MAX_EDGE = 640
     LUXRIOT_BATCH_SIZES = (12, 24, 36)
+    try:
+        LUXRIOT_SUMMARY_RETENTION_DAYS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS', '7')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_RETENTION_DAYS = 7.0
+    LUXRIOT_SUMMARY_RETENTION_DAYS = max(0.0, LUXRIOT_SUMMARY_RETENTION_DAYS)
+    _SUMMARY_DEFAULT_BATCH = LUXRIOT_BATCH_SIZES[0] if LUXRIOT_BATCH_SIZES else 12
+    _SUMMARY_DEFAULT_LIMIT = int(
+        max(
+            600,
+            (LUXRIOT_SUMMARY_RETENTION_DAYS * 86400.0)
+            / max(1.0, float(LUXRIOT_SNAPSHOT_INTERVAL * _SUMMARY_DEFAULT_BATCH)),
+        )
+    )
+    try:
+        LUXRIOT_SUMMARY_HISTORY_LIMIT = int(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT',
+                str(_SUMMARY_DEFAULT_LIMIT),
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_HISTORY_LIMIT = _SUMMARY_DEFAULT_LIMIT
+    LUXRIOT_SUMMARY_HISTORY_LIMIT = max(40, LUXRIOT_SUMMARY_HISTORY_LIMIT)
+    try:
+        ARCHIVE_ESTIMATE_CHANNELS = int(os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS', '50'))
+    except (TypeError, ValueError):
+        ARCHIVE_ESTIMATE_CHANNELS = 50
+    ARCHIVE_ESTIMATE_CHANNELS = max(1, min(10000, ARCHIVE_ESTIMATE_CHANNELS))
+    try:
+        ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH', '2.5')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = 2.5
+    ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = max(0.0, min(32.0, ARCHIVE_ESTIMATE_FRAMES_PER_BATCH))
+    try:
+        ARCHIVE_ESTIMATE_AVG_JPEG_KB = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB', '100')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_ESTIMATE_AVG_JPEG_KB = 100.0
+    ARCHIVE_ESTIMATE_AVG_JPEG_KB = max(1.0, min(5000.0, ARCHIVE_ESTIMATE_AVG_JPEG_KB))
+    try:
+        ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY', '250')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY = 250.0
+    ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY = max(
+        0.0,
+        min(100000.0, ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY),
+    )
     try:
         LUXRIOT_DEFAULT_CHANNEL_ID = int(os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID', '1'))
     except (TypeError, ValueError):
@@ -575,7 +688,7 @@ class Config:
     DETECTIONS_ARCHIVE_JPEG_QUALITY = max(60, min(95, DETECTIONS_ARCHIVE_JPEG_QUALITY))
 
     DETECTIONS_RETENTION_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_ENABLED', 'True')
-    DETECTIONS_RETENTION_DROP_SKIPPED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED', 'False')
+    DETECTIONS_RETENTION_DROP_SKIPPED = _get_bool_env('EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED', 'True')
     try:
         DETECTIONS_RETENTION_WINDOW_SEC = float(os.getenv('EVOSSEARCH_DETECTIONS_RETENTION_WINDOW_SEC', '6'))
     except (TypeError, ValueError):

@@ -33,6 +33,9 @@ DEFAULT_ALERTS_JSON_PROMPT = (
     "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
 )
 
+ALERT_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
+ALERT_SEVERITY_SET = set(ALERT_SEVERITY_ORDER)
+
 
 class ProbeManagerLike(Protocol):
     def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> Any: ...
@@ -40,6 +43,7 @@ class ProbeManagerLike(Protocol):
 
 AlertParserFn = Callable[[str, int, Optional[int]], List[Dict[str, Any]]]
 SummaryDispatcherFn = Callable[[Mapping[str, Any], str], Mapping[str, Any]]
+SummaryArchiveFn = Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]]
 
 
 def _parse_optional_int(value: object) -> Optional[int]:
@@ -396,6 +400,8 @@ class LuxriotManager:
         jpeg_encoder: Callable[..., str],
         alert_parser: Optional[AlertParserFn] = None,
         probe_manager: Optional[ProbeManagerLike] = None,
+        runtime_state_store: Optional[Any] = None,
+        summary_archive_callback: Optional[SummaryArchiveFn] = None,
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
@@ -403,7 +409,9 @@ class LuxriotManager:
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
         self.probe_manager: Optional[ProbeManagerLike] = probe_manager
+        self.runtime_state_store = runtime_state_store
         self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
+        self.summary_archive_callback: Optional[SummaryArchiveFn] = summary_archive_callback
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
@@ -416,6 +424,11 @@ class LuxriotManager:
         except Exception:
             history_limit = 600
         self.summary_history_limit = max(40, history_limit)
+        try:
+            summary_retention_days = float(getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0))
+        except Exception:
+            summary_retention_days = 7.0
+        self.summary_retention_days = max(0.0, summary_retention_days)
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
@@ -572,6 +585,89 @@ class LuxriotManager:
         ordered.sort(key=lambda key: float(key[0]))
         return [merged[key] for key in ordered]
 
+    @staticmethod
+    def _normalize_alert_severity(value: Any) -> str:
+        severity = str(value or "").strip().lower()
+        return severity if severity in ALERT_SEVERITY_SET else "normal"
+
+    @classmethod
+    def _normalize_alert_counts(cls, raw_counts: Any) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        if isinstance(raw_counts, Mapping):
+            for raw_severity, raw_count in raw_counts.items():
+                severity = cls._normalize_alert_severity(raw_severity)
+                count = _parse_optional_int(raw_count) or 0
+                if count > 0:
+                    counts[severity] = counts.get(severity, 0) + count
+        return {
+            severity: int(counts[severity])
+            for severity in ALERT_SEVERITY_ORDER
+            if counts.get(severity, 0) > 0
+        }
+
+    @classmethod
+    def _alert_meta_from_counts(cls, raw_counts: Any) -> Dict[str, Any]:
+        counts = cls._normalize_alert_counts(raw_counts)
+        total = int(sum(counts.values()))
+        return {
+            "alert_counts": counts,
+            "alert_total": total,
+            "alert_severities": [severity for severity in ALERT_SEVERITY_ORDER if counts.get(severity, 0) > 0],
+        }
+
+    def _summary_alert_metadata(
+        self,
+        summary_text: str,
+        *,
+        channel_id: int,
+        timestamp_ms: int,
+        fallback: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if fallback is not None:
+            counts = self._normalize_alert_counts(fallback.get("alert_counts"))
+            if counts:
+                return self._alert_meta_from_counts(counts)
+            raw_total = _parse_optional_int(fallback.get("alert_total")) or 0
+            if raw_total > 0:
+                severity = self._normalize_alert_severity(fallback.get("severity") or "normal")
+                return self._alert_meta_from_counts({severity: raw_total})
+
+        text = str(summary_text or "")
+        if not text or not self.alert_parser or not self._contains_alerts_json(text):
+            return self._alert_meta_from_counts({})
+        try:
+            parsed_alerts = self.alert_parser(text, int(channel_id), int(timestamp_ms))
+        except TypeError:
+            parsed_alerts = cast(Any, self.alert_parser)(text, int(channel_id))
+        except Exception:
+            parsed_alerts = []
+
+        counts: Dict[str, int] = {}
+        if isinstance(parsed_alerts, Sequence) and not isinstance(parsed_alerts, (str, bytes, bytearray)):
+            for raw_alert in parsed_alerts:
+                if not isinstance(raw_alert, Mapping):
+                    continue
+                severity = self._normalize_alert_severity(raw_alert.get("severity"))
+                counts[severity] = counts.get(severity, 0) + 1
+        return self._alert_meta_from_counts(counts)
+
+    @classmethod
+    def _merge_alert_metadata(cls, nodes: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        counts: Dict[str, int] = {}
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            node_counts = cls._normalize_alert_counts(node.get("alert_counts"))
+            if node_counts:
+                for severity, count in node_counts.items():
+                    counts[severity] = counts.get(severity, 0) + int(count)
+                continue
+            total = _parse_optional_int(node.get("alert_total")) or 0
+            if total > 0:
+                severity = cls._normalize_alert_severity(node.get("severity") or "normal")
+                counts[severity] = counts.get(severity, 0) + total
+        return cls._alert_meta_from_counts(counts)
+
     def _normalize_summary_log_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         channel_id = _parse_optional_int(entry.get("channel_id"))
         if channel_id is None:
@@ -585,6 +681,14 @@ class LuxriotManager:
         frame_count = _parse_optional_int(entry.get("frame_count")) or 0
         batch_size = _parse_optional_int(entry.get("batch_size")) or 0
         duration_sec = self._coerce_float(entry.get("duration_sec")) or 0.0
+        created_ms = int(float(created_at) * 1000.0)
+        alert_meta = self._summary_alert_metadata(
+            summary,
+            channel_id=int(channel_id),
+            timestamp_ms=created_ms,
+            fallback=entry,
+        )
+        bookmarks_sent = _parse_optional_int(entry.get("bookmarks_sent")) or 0
         return {
             "channel_id": int(channel_id),
             "run_id": str(entry.get("run_id") or "").strip(),
@@ -594,6 +698,8 @@ class LuxriotManager:
             "created_at": float(created_at),
             "duration_sec": float(max(0.0, duration_sec)),
             "prompt": str(entry.get("prompt") or ""),
+            "bookmarks_sent": int(max(0, bookmarks_sent)),
+            **alert_meta,
         }
 
     def _normalize_summary_run_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -613,10 +719,50 @@ class LuxriotManager:
             "ended_at": ended_at,
             "running": bool(entry.get("running")),
             "batch_size": int(batch_size) if batch_size is not None else 0,
+            "interval_sec": self._normalize_capture_interval_sec(entry.get("interval_sec")),
             "model": str(entry.get("model") or "").strip() or None,
             "prompt": str(entry.get("prompt") or ""),
             "system_prompt": str(entry.get("system_prompt") or ""),
         }
+
+    def _summary_retention_cutoff(self) -> Optional[float]:
+        if self.summary_retention_days <= 0:
+            return None
+        return time.time() - self.summary_retention_days * 86400.0
+
+    def _filter_summary_history_retention(
+        self,
+        logs: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        cutoff = self._summary_retention_cutoff()
+        out: List[Dict[str, Any]] = []
+        for log in logs:
+            normalized = self._normalize_summary_log_entry(log)
+            if normalized is None:
+                continue
+            created = self._coerce_float(normalized.get("created_at"))
+            if cutoff is not None and created is not None and created < cutoff:
+                continue
+            out.append(normalized)
+        return out
+
+    def _filter_summary_runs_retention(
+        self,
+        runs: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        cutoff = self._summary_retention_cutoff()
+        out: List[Dict[str, Any]] = []
+        for run in runs:
+            normalized = self._normalize_summary_run_entry(run)
+            if normalized is None:
+                continue
+            ended = self._coerce_float(normalized.get("ended_at"))
+            started = self._coerce_float(normalized.get("started_at"))
+            anchor = ended if ended is not None else started
+            if cutoff is not None and anchor is not None and anchor < cutoff:
+                continue
+            out.append(normalized)
+        return out
 
     def _persist_summary_state_locked(self) -> None:
         history_payload: Dict[str, List[Dict[str, Any]]] = {}
@@ -658,6 +804,13 @@ class LuxriotManager:
             "channel_routines": routine_payload,
             "prompt_settings": prompt_payload,
         }
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is not None:
+            try:
+                state_store.save_state("luxriot_summary_state", payload)
+            except Exception:
+                return
+            return
         path = self.summary_state_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -668,13 +821,23 @@ class LuxriotManager:
             return
 
     def _load_summary_state_from_disk(self) -> None:
-        path = self.summary_state_file
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return
+        payload: Optional[Dict[str, Any]] = None
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is not None:
+            try:
+                loaded_payload = state_store.load_state("luxriot_summary_state")
+                if isinstance(loaded_payload, Mapping):
+                    payload = dict(loaded_payload)
+            except Exception:
+                payload = None
+        if payload is None:
+            path = self.summary_state_file
+            if not path.exists():
+                return
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return
         history_raw = payload.get("summary_history") if isinstance(payload, Mapping) else None
         runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
         routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
@@ -694,7 +857,9 @@ class LuxriotManager:
                         normalized_logs.append(normalized)
                 if not normalized_logs:
                     continue
-                combined = self._combine_summary_logs([], normalized_logs)
+                combined = self._filter_summary_history_retention(
+                    self._combine_summary_logs([], normalized_logs)
+                )
                 if len(combined) > self.summary_history_limit:
                     combined = combined[-self.summary_history_limit :]
                 loaded_history[int(channel_id)] = combined
@@ -716,7 +881,7 @@ class LuxriotManager:
                         normalized_run["ended_at"] = normalized_run.get("started_at")
                     dedup[str(normalized_run["run_id"])] = normalized_run
                 runs_list = sorted(
-                    dedup.values(),
+                    self._filter_summary_runs_retention(dedup.values()),
                     key=lambda row: float(self._coerce_float(row.get("started_at")) or 0.0),
                     reverse=True,
                 )
@@ -785,6 +950,12 @@ class LuxriotManager:
                         parsed_channel_payload["bookmark_cooldown_sec"] = max(
                             0.0, raw_channel_cooldown if raw_channel_cooldown is not None else 0.0
                         )
+                    if "capture_interval_sec" in channel_payload:
+                        channel_interval = self._normalize_capture_interval_sec(
+                            channel_payload.get("capture_interval_sec")
+                        )
+                        if channel_interval is not None:
+                            parsed_channel_payload["capture_interval_sec"] = channel_interval
                     if "json_alert_prompt" in channel_payload:
                         parsed_channel_payload["json_alert_prompt"] = str(channel_payload.get("json_alert_prompt") or "")
                     channel_rollup_prompts_raw = channel_payload.get("rollup_prompts")
@@ -850,6 +1021,29 @@ class LuxriotManager:
             return None
         return num if math.isfinite(num) else None
 
+    def _normalize_capture_interval_sec(self, value: object) -> Optional[float]:
+        interval = self._coerce_float(value)
+        if interval is None or interval <= 0:
+            return None
+        return max(0.2, min(300.0, float(interval)))
+
+    def _default_capture_interval_sec(self) -> float:
+        return self._normalize_capture_interval_sec(
+            getattr(self.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)
+        ) or 5.0
+
+    def _get_capture_interval_sec_locked(self, channel_id: Optional[int] = None) -> float:
+        interval = self._default_capture_interval_sec()
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping):
+                channel_interval = self._normalize_capture_interval_sec(
+                    overrides.get("capture_interval_sec")
+                )
+                if channel_interval is not None:
+                    interval = channel_interval
+        return interval
+
     def _generate_run_id_locked(self, channel_id: int) -> str:
         base = f"ch{channel_id}-{int(time.time() * 1000)}"
         existing = {
@@ -871,6 +1065,7 @@ class LuxriotManager:
         prompt: str,
         model_hint: Optional[str],
         system_prompt: Optional[str],
+        interval_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         started_at = time.time()
         run = {
@@ -880,6 +1075,7 @@ class LuxriotManager:
             "ended_at": None,
             "running": True,
             "batch_size": int(batch_size),
+            "interval_sec": self._normalize_capture_interval_sec(interval_sec),
             "model": (model_hint or "").strip() or None,
             "prompt": prompt or "",
             "system_prompt": system_prompt or "",
@@ -902,6 +1098,7 @@ class LuxriotManager:
                 if not run.get("ended_at"):
                     run["ended_at"] = time.time()
                 break
+        self.summary_runs[channel_id] = self._filter_summary_runs_retention(runs)
         if active_run_id == target_run_id:
             self.active_summary_runs.pop(channel_id, None)
         self._persist_summary_state_locked()
@@ -1199,6 +1396,7 @@ class LuxriotManager:
                     "L2": self._default_rollup_prompt_for_level_locked("L2"),
                     "L3": self._default_rollup_prompt_for_level_locked("L3"),
                 },
+                "capture_interval_sec": self._default_capture_interval_sec(),
                 "bookmark_enabled": bool(defaults_bookmark.get("bookmark_enabled")),
                 "bookmark_cooldown_sec": float(defaults_bookmark.get("bookmark_cooldown_sec") or 0.0),
                 "json_alert_prompt": str(defaults_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
@@ -1209,6 +1407,7 @@ class LuxriotManager:
                 "L2": self._get_rollup_system_prompt_locked("L2", channel_id),
                 "L3": self._get_rollup_system_prompt_locked("L3", channel_id),
             }
+            effective_capture_interval_sec = self._get_capture_interval_sec_locked(channel_id)
             effective_bookmark = self._get_channel_bookmark_settings_locked(channel_id)
             has_channel_override = bool(
                 channel_id is not None and isinstance(self.channel_prompt_overrides.get(int(channel_id)), Mapping)
@@ -1217,6 +1416,7 @@ class LuxriotManager:
             "channel_id": int(channel_id) if channel_id is not None else None,
             "stream_system_prompt": effective_stream_prompt,
             "rollup_prompts": effective_rollup_prompts,
+            "capture_interval_sec": effective_capture_interval_sec,
             "bookmark_enabled": bool(effective_bookmark.get("bookmark_enabled")),
             "bookmark_cooldown_sec": float(effective_bookmark.get("bookmark_cooldown_sec") or 0.0),
             "json_alert_prompt": str(effective_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
@@ -1466,6 +1666,11 @@ class LuxriotManager:
             source_signature = self._source_signature(source_ids)
         highlights = self._coerce_str_list(entry.get("highlights"))
         summary_kind = str(entry.get("summary_kind") or "").strip() or "llm_cached"
+        alert_meta = self._alert_meta_from_counts(entry.get("alert_counts"))
+        if not alert_meta.get("alert_total"):
+            raw_total = _parse_optional_int(entry.get("alert_total")) or 0
+            if raw_total > 0:
+                alert_meta = self._alert_meta_from_counts({"normal": raw_total})
         created_at = self._coerce_float(entry.get("created_at"))
         if created_at is None:
             created_at = time.time()
@@ -1487,7 +1692,36 @@ class LuxriotManager:
             "summary": summary,
             "summary_kind": summary_kind,
             "created_at": float(created_at),
+            **alert_meta,
         }
+
+    def _filter_rollup_cache_retention(
+        self,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        cutoff = self._summary_retention_cutoff()
+        out: List[Dict[str, Any]] = []
+        for entry in entries:
+            normalized = self._normalize_cached_rollup_entry(entry)
+            if normalized is None:
+                continue
+            created = self._coerce_float(normalized.get("created_at"))
+            if cutoff is not None and created is not None and created < cutoff:
+                continue
+            out.append(normalized)
+        return out
+
+    def _prune_rollup_cache_retention_locked(self) -> None:
+        cutoff = self._summary_retention_cutoff()
+        if cutoff is None:
+            return
+        for key, entry in list(self.rollup_summary_cache.items()):
+            if not isinstance(entry, Mapping):
+                self.rollup_summary_cache.pop(key, None)
+                continue
+            created = self._coerce_float(entry.get("created_at"))
+            if created is not None and created < cutoff:
+                self.rollup_summary_cache.pop(key, None)
 
     def _persist_rollup_cache_locked(self) -> None:
         payload_entries = [
@@ -1497,6 +1731,13 @@ class LuxriotManager:
         ]
         cache_file = self.rollup_cache_file
         payload = {"version": 1, "updated_at": time.time(), "entries": payload_entries}
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is not None:
+            try:
+                state_store.save_state("luxriot_rollup_cache", payload)
+            except Exception:
+                return
+            return
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             tmp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
@@ -1507,13 +1748,21 @@ class LuxriotManager:
             return
 
     def _load_rollup_cache_from_disk(self) -> None:
-        cache_file = self.rollup_cache_file
-        if not cache_file.exists():
-            return
-        try:
-            payload = json.loads(cache_file.read_text(encoding="utf-8"))
-        except Exception:
-            return
+        payload: Optional[Any] = None
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is not None:
+            try:
+                payload = state_store.load_state("luxriot_rollup_cache")
+            except Exception:
+                payload = None
+        if payload is None:
+            cache_file = self.rollup_cache_file
+            if not cache_file.exists():
+                return
+            try:
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                return
         raw_entries: Sequence[object]
         if isinstance(payload, Mapping):
             data_entries = payload.get("entries")
@@ -1540,7 +1789,8 @@ class LuxriotManager:
         normalized_entries.sort(key=lambda row: float(self._coerce_float(row.get("created_at")) or 0.0))
         with self.cache_lock:
             self.rollup_summary_cache.clear()
-            for entry in normalized_entries[-self.rollup_summary_cache_limit :]:
+            retained_entries = self._filter_rollup_cache_retention(normalized_entries)
+            for entry in retained_entries[-self.rollup_summary_cache_limit :]:
                 self.rollup_summary_cache[str(entry["rollup_id"])] = entry
 
     def persist_rollup_cache(self) -> None:
@@ -1572,6 +1822,7 @@ class LuxriotManager:
             return
         with self.cache_lock:
             self.rollup_summary_cache[store_key] = normalized_payload
+            self._prune_rollup_cache_retention_locked()
             while len(self.rollup_summary_cache) > self.rollup_summary_cache_limit:
                 oldest_key = next(iter(self.rollup_summary_cache))
                 if oldest_key == store_key and len(self.rollup_summary_cache) == 1:
@@ -1911,6 +2162,9 @@ class LuxriotManager:
                     source_ids=node.get("source_ids"),
                     source_signature=str(node.get("source_signature") or "").strip(),
                     highlights=node.get("highlights"),
+                    alert_counts=node.get("alert_counts"),
+                    alert_total=node.get("alert_total"),
+                    alert_severities=node.get("alert_severities"),
                     summary_kind="llm",
                 )
                 node["summary"] = summary
@@ -1954,6 +2208,9 @@ class LuxriotManager:
                     "highlights": [headline] if headline else [],
                     "summary": summary,
                     "created_at": created,
+                    "alert_counts": dict(log.get("alert_counts") or {}),
+                    "alert_total": int(_parse_optional_int(log.get("alert_total")) or 0),
+                    "alert_severities": self._coerce_str_list(log.get("alert_severities")),
                 }
             )
         nodes.sort(key=lambda item: float(item.get("window_start") or 0.0))
@@ -2002,6 +2259,7 @@ class LuxriotManager:
                         if run_text:
                             run_ids.add(run_text)
             highlights = self._collect_highlights(children, self.rollup_highlight_limit)
+            alert_meta = self._merge_alert_metadata(children)
             source_signature = self._source_signature(source_ids)
             summary = self._compose_rollup_summary(
                 level=level,
@@ -2032,6 +2290,7 @@ class LuxriotManager:
                     "source_signature": source_signature,
                     "summary": summary,
                     "created_at": end_ts,
+                    **alert_meta,
                 }
             )
             if level in self.rollup_llm_levels:
@@ -2049,7 +2308,9 @@ class LuxriotManager:
         if not logs:
             return
         existing = self.summary_history.get(channel_id, [])
-        combined = self._combine_summary_logs(existing, logs)
+        combined = self._filter_summary_history_retention(
+            self._combine_summary_logs(existing, logs)
+        )
         if len(combined) > self.summary_history_limit:
             combined = combined[-self.summary_history_limit :]
         self.summary_history[channel_id] = combined
@@ -2067,6 +2328,80 @@ class LuxriotManager:
         dispatcher: Optional[SummaryDispatcherFn],
     ) -> None:
         self.summary_dispatcher = dispatcher
+
+    def set_summary_archive_callback(
+        self,
+        callback: Optional[SummaryArchiveFn],
+    ) -> None:
+        self.summary_archive_callback = callback
+
+    @classmethod
+    def _frame_timestamp_ms(cls, frame: Mapping[str, Any], fallback_ms: int) -> int:
+        raw_ms = _parse_optional_int(frame.get("timestamp_ms"))
+        if raw_ms is not None and raw_ms >= 0:
+            return int(raw_ms)
+        raw_value = frame.get("captured_at")
+        if not isinstance(raw_value, (int, float)):
+            raw_value = frame.get("time_sec")
+        if isinstance(raw_value, (int, float)):
+            try:
+                numeric = float(raw_value)
+                if numeric > 10_000_000_000:
+                    return int(numeric)
+                if numeric >= 0:
+                    return int(numeric * 1000.0)
+            except Exception:
+                pass
+        return int(max(0, fallback_ms))
+
+    @classmethod
+    def _summary_archive_frames(
+        cls,
+        frames: Sequence[Mapping[str, Any]],
+        *,
+        batch_start_ms: int,
+        batch_end_ms: int,
+    ) -> List[Dict[str, Any]]:
+        if not frames:
+            return []
+        last_index = len(frames) - 1
+        anchors: List[Tuple[str, int]] = [("only", 0)] if last_index == 0 else [("first", 0), ("last", last_index)]
+        out: List[Dict[str, Any]] = []
+        for role, index in anchors:
+            frame = frames[index]
+            thumbnail = str(frame.get("thumbnail") or "").strip()
+            if not thumbnail:
+                continue
+            fallback_ms = batch_start_ms if role in {"first", "only"} else batch_end_ms
+            captured_at = cls._coerce_float(frame.get("captured_at"))
+            if captured_at is None:
+                captured_at = cls._coerce_float(frame.get("time_sec"))
+            item: Dict[str, Any] = {
+                "anchor_role": role,
+                "frame_index": int(index),
+                "timestamp_ms": cls._frame_timestamp_ms(frame, fallback_ms),
+                "thumbnail": thumbnail,
+            }
+            if captured_at is not None:
+                item["captured_at"] = float(captured_at)
+            for key in ("width", "height"):
+                value = _parse_optional_int(frame.get(key))
+                if value is not None and value > 0:
+                    item[key] = int(value)
+            out.append(item)
+        return out
+
+    def _archive_summary_entry(self, entry: Mapping[str, Any]) -> Dict[str, Any]:
+        callback = self.summary_archive_callback
+        if callback is None:
+            return {}
+        try:
+            result = callback(entry)
+        except Exception as exc:
+            return {"error": str(exc)[:240] or exc.__class__.__name__}
+        if isinstance(result, Mapping):
+            return dict(result)
+        return {}
 
     def create_summary_batch(
         self,
@@ -2140,7 +2475,20 @@ class LuxriotManager:
         summary = self.lm_callback(messages, model_hint)
         submitted_at = self._coerce_float(batch.get("submitted_at"))
         created_at = submitted_at if submitted_at is not None else time.time()
-        return {
+        batch_start_ms = (
+            _parse_optional_int(batch.get("batch_start_ms"))
+            or int(created_at * 1000.0)
+        )
+        batch_end_ms = (
+            _parse_optional_int(batch.get("batch_end_ms"))
+            or int(created_at * 1000.0)
+        )
+        archive_frames = self._summary_archive_frames(
+            frame_items,
+            batch_start_ms=batch_start_ms,
+            batch_end_ms=batch_end_ms,
+        )
+        entry = {
             "channel_id": int(channel_id),
             "run_id": str(batch.get("run_id") or "").strip(),
             "summary": summary,
@@ -2150,14 +2498,8 @@ class LuxriotManager:
                 _parse_optional_int(batch.get("batch_size")) or 0,
             ),
             "created_at": float(created_at),
-            "batch_start_ms": (
-                _parse_optional_int(batch.get("batch_start_ms"))
-                or int(created_at * 1000.0)
-            ),
-            "batch_end_ms": (
-                _parse_optional_int(batch.get("batch_end_ms"))
-                or int(created_at * 1000.0)
-            ),
+            "batch_start_ms": batch_start_ms,
+            "batch_end_ms": batch_end_ms,
             "duration_sec": max(0.0, time.time() - started),
             "prompt": str(batch.get("prompt") or ""),
             "interval_sec": max(
@@ -2165,6 +2507,9 @@ class LuxriotManager:
                 self._coerce_float(batch.get("interval_sec")) or 1.0,
             ),
         }
+        if archive_frames:
+            entry["archive_frames"] = archive_frames
+        return entry
 
     def accept_summary_entry(self, entry: Mapping[str, Any]) -> Dict[str, Any]:
         normalized = self._normalize_summary_log_entry(entry)
@@ -2199,6 +2544,13 @@ class LuxriotManager:
         except Exception:
             sent_alerts = 0
         accepted["bookmarks_sent"] = sent_alerts
+
+        archive_meta = self._archive_summary_entry(accepted)
+        accepted.pop("archive_frames", None)
+        if archive_meta:
+            for key, value in archive_meta.items():
+                if key in {"attempted", "inserted", "summary_frames", "alert_frames", "error"}:
+                    accepted[f"archive_{key}"] = value
 
         with self.cache_lock:
             session = self.sessions.get(channel_id)
@@ -2470,6 +2822,7 @@ class LuxriotManager:
         prompt: str = "",
         model_hint: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        interval_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         sizes = list(getattr(self.config, "LUXRIOT_BATCH_SIZES", (12, 24, 36)))
         default_size = sizes[0] if sizes else 12
@@ -2480,9 +2833,10 @@ class LuxriotManager:
                 if candidate in sizes:
                     batch = candidate
         except Exception:
-            batch = default_size
+                batch = default_size
         prompt = prompt or ""
         normalized_model_hint = str(model_hint or "").strip() or None
+        requested_interval_sec = self._normalize_capture_interval_sec(interval_sec)
         with self.cache_lock:
             existing = self.sessions.pop(channel_id, None)
             if existing:
@@ -2503,9 +2857,16 @@ class LuxriotManager:
                 channel_overrides = dict(overrides_raw) if isinstance(overrides_raw, Mapping) else {}
             if normalized_model_hint and normalized_model_hint != str(channel_overrides.get("model_hint") or ""):
                 channel_overrides["model_hint"] = normalized_model_hint
+            if requested_interval_sec is not None:
+                current_interval = self._normalize_capture_interval_sec(
+                    channel_overrides.get("capture_interval_sec")
+                )
+                if current_interval != requested_interval_sec:
+                    channel_overrides["capture_interval_sec"] = requested_interval_sec
             if channel_overrides != dict(self.channel_prompt_overrides.get(channel_id) or {}):
                 self.channel_prompt_overrides[channel_id] = channel_overrides
                 self._persist_summary_state_locked()
+            effective_interval_sec = self._get_capture_interval_sec_locked(channel_id)
             effective_system_prompt = self._get_stream_system_prompt_locked(channel_id)
             run = self._open_run_locked(
                 channel_id=channel_id,
@@ -2513,6 +2874,7 @@ class LuxriotManager:
                 prompt=prompt,
                 model_hint=normalized_model_hint,
                 system_prompt=effective_system_prompt,
+                interval_sec=effective_interval_sec,
             )
             session = LuxriotCaptureSession(
                 self,
@@ -2522,6 +2884,7 @@ class LuxriotManager:
                 run_id=run.get("run_id"),
                 run_started_at=run.get("started_at"),
                 model_hint=normalized_model_hint,
+                interval_override=effective_interval_sec,
                 summarization_enabled=True,
                 capture_kind="video",
             )

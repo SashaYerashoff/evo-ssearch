@@ -31,6 +31,9 @@ DURABLE_APPROVALS_MIGRATION = ROOT / "migrations" / "versions" / (
 IAM_ADMIN_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260610_0004_iam_admin_and_throttle.py"
 )
+ARCHIVE_RUNTIME_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260612_0005_archive_runtime.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -290,7 +293,7 @@ class MigrationContentTests(unittest.TestCase):
         )
         iam_admin_source = IAM_ADMIN_MIGRATION.read_text(encoding="utf-8")
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260610_0004"',
             iam_admin_source,
         )
         self.assertIn(
@@ -299,6 +302,25 @@ class MigrationContentTests(unittest.TestCase):
         )
         self.assertIn("CREATE TABLE iam.login_attempts", iam_admin_source)
         self.assertIn("GRANT SELECT, INSERT, UPDATE, DELETE", iam_admin_source)
+        archive_runtime_source = ARCHIVE_RUNTIME_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            archive_runtime_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260610_0004"',
+            archive_runtime_source,
+        )
+        self.assertIn("CREATE SCHEMA IF NOT EXISTS archive", archive_runtime_source)
+        self.assertIn("CREATE TABLE archive.detections", archive_runtime_source)
+        self.assertIn("CREATE TABLE archive.probes", archive_runtime_source)
+        self.assertIn("CREATE TABLE archive.runtime_state", archive_runtime_source)
+        self.assertIn("ix_archive_detections_source_ts", archive_runtime_source)
+        self.assertIn("ix_archive_detections_source_channel_ts", archive_runtime_source)
+        self.assertIn("ENABLE ROW LEVEL SECURITY", archive_runtime_source)
+        self.assertIn("current_setting('eva.tenant_id', true)", archive_runtime_source)
 
 
 @unittest.skipUnless(

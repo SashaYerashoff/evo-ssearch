@@ -8,8 +8,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 import numpy as np
 
 
+PROBE_SOURCE_ALIASES = frozenset({"probe", "probes_run", "probes_query", "probe_daemon"})
+ARCHIVE_SOURCE_ALIASES = {
+    "probe": "probe",
+    "probes_run": "probe",
+    "probes_query": "probe",
+    "probe_daemon": "probe",
+    "vlm_summary": "vlm_summary",
+    "vlm_alert": "vlm_alert",
+}
+SOURCE_GROUP_SQL = (
+    "CASE WHEN source IN ('probe', 'probes_run', 'probes_query', 'probe_daemon') "
+    "THEN 'probe' ELSE COALESCE(NULLIF(source, ''), 'unknown') END"
+)
+
+
 class DetectionsStore:
     """SQLite-backed event store for probe detections plus optional CLIP/DINO vectors."""
+
+    backend = "sqlite"
 
     def __init__(self, path: str = "detections_store.sqlite3", max_records: int = 20000) -> None:
         self.path = Path(path)
@@ -79,6 +96,29 @@ class DetectionsStore:
             finally:
                 conn.close()
 
+    def health(self) -> Dict[str, Any]:
+        try:
+            with self.lock:
+                conn = self._connect()
+                try:
+                    conn.execute("SELECT 1").fetchone()
+                finally:
+                    conn.close()
+            return {
+                "ok": True,
+                "status": "reachable",
+                "backend": self.backend,
+                "path": str(self.path),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "backend": self.backend,
+                "path": str(self.path),
+                "error": str(exc),
+            }
+
     @staticmethod
     def _vec_to_blob(vec: Any) -> Optional[bytes]:
         if vec is None:
@@ -144,6 +184,7 @@ class DetectionsStore:
         neg_score = float(record.get("neg_score", 0.0))
         margin = float(record.get("margin", 0.0))
         source = str(record.get("source") or "probe").strip().lower()
+        source = ARCHIVE_SOURCE_ALIASES.get(source, source)
         dedupe_key = str(
             record.get("dedupe_key")
             or f"{probe_id}:{event_ts}:{pos_score:.3f}:{neg_score:.3f}:{margin:.3f}:{source}"
@@ -312,6 +353,7 @@ class DetectionsStore:
     def _build_where(
         probe_id: Optional[str] = None,
         channel_id: Optional[int] = None,
+        source: Optional[str] = None,
         since_ms: Optional[int] = None,
         until_ms: Optional[int] = None,
         only_with_clip: bool = False,
@@ -326,6 +368,15 @@ class DetectionsStore:
         if channel_id is not None:
             where.append("channel_id = ?")
             params.append(int(channel_id))
+        if source:
+            normalized_source = ARCHIVE_SOURCE_ALIASES.get(str(source).strip().lower(), str(source).strip().lower())
+            if normalized_source == "probe":
+                placeholders = ",".join("?" for _ in PROBE_SOURCE_ALIASES)
+                where.append(f"source IN ({placeholders})")
+                params.extend(sorted(PROBE_SOURCE_ALIASES))
+            else:
+                where.append("source = ?")
+                params.append(normalized_source)
         if since_ms is not None:
             where.append("event_timestamp_ms >= ?")
             params.append(int(since_ms))
@@ -355,12 +406,14 @@ class DetectionsStore:
         until_ms: Optional[int] = None,
         limit: int = 50,
         offset: int = 0,
+        source: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         limit = max(1, min(500, int(limit or 50)))
         offset = max(0, int(offset or 0))
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
         )
@@ -415,11 +468,13 @@ class DetectionsStore:
         limit: int = 20000,
         only_with_clip: bool = True,
         include_vectors: bool = False,
+        source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(100000, int(limit or 20000)))
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
             only_with_clip=only_with_clip,
@@ -619,11 +674,15 @@ class DetectionsStore:
         since_ms: Optional[int] = None,
         channel_id: Optional[int] = None,
         limit: int = 100,
+        source: Optional[str] = None,
+        until_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(500, int(limit or 100)))
         where_sql, params = self._build_where(
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
+            until_ms=until_ms,
         )
 
         with self.lock:
@@ -635,11 +694,12 @@ class DetectionsStore:
                         probe_id,
                         MAX(probe_name) AS probe_name,
                         channel_id,
+                        {SOURCE_GROUP_SQL} AS source_key,
                         COUNT(*) AS hit_count,
                         MAX(event_timestamp_ms) AS latest_timestamp_ms
                     FROM detections
                     {where_sql}
-                    GROUP BY probe_id, channel_id
+                    GROUP BY probe_id, channel_id, {SOURCE_GROUP_SQL}
                     ORDER BY latest_timestamp_ms DESC
                     LIMIT ?
                     """,
@@ -650,6 +710,7 @@ class DetectionsStore:
                         "probe_id": row["probe_id"],
                         "probe_name": row["probe_name"],
                         "channel_id": row["channel_id"],
+                        "source": row["source_key"],
                         "hit_count": int(row["hit_count"] or 0),
                         "latest_timestamp_ms": int(row["latest_timestamp_ms"] or 0),
                     }
@@ -665,11 +726,13 @@ class DetectionsStore:
         since_ms: Optional[int] = None,
         until_ms: Optional[int] = None,
         limit: int = 2000,
+        source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(5000, int(limit or 2000)))
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
         )
@@ -708,3 +771,82 @@ class DetectionsStore:
                 return out
             finally:
                 conn.close()
+
+    def summarize_by_source(
+        self,
+        since_ms: Optional[int] = None,
+        channel_id: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(100, int(limit or 20)))
+        where_sql, params = self._build_where(
+            channel_id=channel_id,
+            since_ms=since_ms,
+        )
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        COALESCE(NULLIF(source, ''), 'unknown') AS source_key,
+                        COUNT(*) AS row_count,
+                        SUM(CASE WHEN thumbnail_b64 IS NOT NULL AND thumbnail_b64 <> '' THEN 1 ELSE 0 END) AS thumbnail_count,
+                        SUM(CASE WHEN clip_vec IS NOT NULL THEN 1 ELSE 0 END) AS clip_count,
+                        SUM(CASE WHEN dino_vec IS NOT NULL THEN 1 ELSE 0 END) AS dino_count,
+                        COUNT(DISTINCT channel_id) AS channel_count,
+                        MIN(event_timestamp_ms) AS oldest_timestamp_ms,
+                        MAX(event_timestamp_ms) AS newest_timestamp_ms
+                    FROM detections
+                    {where_sql}
+                    GROUP BY source_key
+                    ORDER BY newest_timestamp_ms DESC
+                    LIMIT ?
+                    """,
+                    tuple(params + [limit]),
+                ).fetchall()
+                return [
+                    {
+                        "source": row["source_key"],
+                        "row_count": int(row["row_count"] or 0),
+                        "thumbnail_count": int(row["thumbnail_count"] or 0),
+                        "clip_count": int(row["clip_count"] or 0),
+                        "dino_count": int(row["dino_count"] or 0),
+                        "channel_count": int(row["channel_count"] or 0),
+                        "oldest_timestamp_ms": int(row["oldest_timestamp_ms"] or 0),
+                        "newest_timestamp_ms": int(row["newest_timestamp_ms"] or 0),
+                    }
+                    for row in rows
+                ]
+            finally:
+                conn.close()
+
+    def storage_summary(self) -> Dict[str, Any]:
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS row_count,
+                        COALESCE(SUM(LENGTH(thumbnail_b64)), 0) AS thumbnail_bytes,
+                        COALESCE(SUM(LENGTH(clip_vec)), 0) AS clip_vec_bytes,
+                        COALESCE(SUM(LENGTH(dino_vec)), 0) AS dino_vec_bytes,
+                        COALESCE(SUM(LENGTH(payload_json)), 0) AS payload_json_bytes,
+                        MIN(event_timestamp_ms) AS oldest_timestamp_ms,
+                        MAX(event_timestamp_ms) AS newest_timestamp_ms
+                    FROM detections
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+        return {
+            "backend": self.backend,
+            "row_count": int(row["row_count"] or 0) if row else 0,
+            "thumbnail_bytes": int(row["thumbnail_bytes"] or 0) if row else 0,
+            "clip_vec_bytes": int(row["clip_vec_bytes"] or 0) if row else 0,
+            "dino_vec_bytes": int(row["dino_vec_bytes"] or 0) if row else 0,
+            "payload_json_bytes": int(row["payload_json_bytes"] or 0) if row else 0,
+            "oldest_timestamp_ms": int(row["oldest_timestamp_ms"]) if row and row["oldest_timestamp_ms"] is not None else None,
+            "newest_timestamp_ms": int(row["newest_timestamp_ms"]) if row and row["newest_timestamp_ms"] is not None else None,
+        }

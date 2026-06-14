@@ -26,7 +26,7 @@
                     <img class="brand-logo" src="/branding/logo" alt="Luxriot logo" />
                     <div class="brand-lockup">
                         <div class="brand-main">EVA AI</div>
-                        <div class="brand-ver">α {{ app_version }}</div>
+                        <div class="brand-ver">{{ app_version }}</div>
                     </div>
                 </div>
                 <div class="brand-sub">Smart Image Search and Understanding</div>
@@ -62,7 +62,7 @@
                 <aside class="studio-rail archive-rail">
                     <div id="archiveSearchBox" class="archive-search-shell studio-scroll">
                         <div class="archive-section">
-                            <div class="archive-section-title">Detections Archive</div>
+                            <div class="archive-section-title">Frame Archive</div>
                             <div class="section-help">Load stored probe hits by stream, probe, and time window before drilling down.</div>
                             <div class="archive-filter-grid">
                                 <div class="input-group">
@@ -78,6 +78,15 @@
                                     </select>
                                 </div>
                                 <div class="input-group">
+                                    <label for="archiveSourceFilter" class="input-label">Source:</label>
+                                    <select id="archiveSourceFilter">
+                                        <option value="">All frames</option>
+                                        <option value="probe">Probe hits</option>
+                                        <option value="vlm_summary">Video descriptions</option>
+                                        <option value="vlm_alert">VLM alerts</option>
+                                    </select>
+                                </div>
+                                <div class="input-group">
                                     <label for="archiveTimeFilter" class="input-label">Time range:</label>
                                     <select id="archiveTimeFilter">
                                         <option value="1">Last 1h</option>
@@ -87,6 +96,14 @@
                                         <option value="168">Last 7d</option>
                                         <option value="0">All time</option>
                                     </select>
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveFromTime" class="input-label">From:</label>
+                                    <input type="datetime-local" id="archiveFromTime" />
+                                </div>
+                                <div class="input-group">
+                                    <label for="archiveToTime" class="input-label">To:</label>
+                                    <input type="datetime-local" id="archiveToTime" />
                                 </div>
                                 <div class="input-group">
                                     <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
@@ -101,10 +118,10 @@
                             <div class="archive-detections-actions">
                                 <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
                                 <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
-                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
+                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Archive</button>
                                 <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
                             </div>
-                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
+                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load archived frames by stream, source, item, and time range.</div>
                         </div>
 
                         <div class="archive-section archive-section-compact">
@@ -124,13 +141,6 @@
                                         {{ result_options_html | safe }}
                                     </select>
                                 </div>
-                                <div class="input-group archive-scope-control is-hidden">
-                                    <label for="searchScope" class="input-label">Scope:</label>
-                                    <select id="searchScope">
-                                        <option value="folder">Indexed Folder</option>
-                                        <option value="detections" selected>Detections Archive</option>
-                                    </select>
-                                </div>
                             </div>
                             <div class="archive-threshold-control">
                                 <div class="archive-threshold-head">
@@ -141,22 +151,22 @@
                                 <div id="archiveScoreThresholdMeta" class="archive-threshold-meta">Showing all scored matches.</div>
                             </div>
                             <div class="archive-panel-actions">
-                                <button id="showCommentedBtn" class="feature-btn is-hidden">Show Commented Images</button>
+                                <div class="status shell-status" id="indexStatus"></div>
                             </div>
                         </div>
 
                         <div class="archive-section">
                             <div class="archive-section-title">Text Query</div>
-                            <div class="section-help">Use natural language; stream, probe, and time filters apply automatically.</div>
+                            <div class="section-help">Use natural language; stream, source, item, and time filters apply automatically.</div>
                             <div id="textSearchBox" class="search-box">
-                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
+                                <input type="text" id="searchQuery" placeholder="Describe archived scene..." />
                                 <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
                             </div>
                         </div>
 
                         <div class="archive-section">
                             <div class="archive-section-title">Image Query</div>
-                            <div class="section-help">Upload a visual reference and run similarity search against the detection archive.</div>
+                            <div class="section-help">Upload a visual reference and run similarity search against archived frames.</div>
                             <div id="imageSearchBox" class="search-box image-search-box">
                                 <div id="imageQueryPanel" class="image-query-panel">
                                     <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
@@ -174,16 +184,6 @@
                                 </div>
                             </div>
                         </div>
-
-                        <div class="archive-section archive-section-compact is-hidden">
-                            <div class="archive-section-title">Index Folder</div>
-                            <div class="section-help">Point EVA at the active archive and refresh embeddings before search.</div>
-                            <div class="folder-select">
-                                <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                                <button id="indexBtn" class="feature-btn primary btn-md">Index</button>
-                            </div>
-                            <div class="status shell-status" id="indexStatus"></div>
-                        </div>
                     </div>
                 </aside>
 
@@ -192,7 +192,7 @@
                         <div class="archive-results-head studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">Search Results</div>
-                                <div class="archive-results-sub">Primary workspace for archive hits, detections, and visual search results.</div>
+                                <div class="archive-results-sub">Primary workspace for archived frames, probe hits, and visual search results.</div>
                             </div>
                         </div>
                         <div id="results" class="results-grid"></div>
@@ -235,6 +235,11 @@
                                 <select id="luxriotBatchSize" class="luxriot-mini-input">
                                     {{ luxriot_batch_options | safe }}
                                 </select>
+                            </span>
+                            <span class="luxriot-pill luxriot-cadence-pill">
+                                <label for="luxriotLiveIntervalSec">Every:</label>
+                                <input id="luxriotLiveIntervalSec" class="luxriot-mini-input luxriot-live-interval-input" type="number" min="0.2" max="300" step="0.1" value="{{ luxriot_snapshot_interval }}">
+                                <span>s</span>
                             </span>
                             <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
                         </div>
@@ -304,9 +309,49 @@
 
                 <section class="studio-workspace video-workspace">
                     <div class="luxriot-card video-live-card studio-panel">
-                        <div class="luxriot-viewport" id="luxriotViewport">
-                            <img id="luxriotPreview" src="" alt="Luxriot live preview" />
-                            <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                        <div class="luxriot-live-layout">
+                            <div class="luxriot-viewport" id="luxriotViewport">
+                                <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                                <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                            </div>
+                            <aside class="luxriot-stream-context" aria-label="Selected stream status">
+                                <div class="luxriot-stream-context-head">
+                                    <div class="luxriot-stream-context-title-wrap">
+                                        <div class="luxriot-stream-context-kicker">Selected Stream</div>
+                                        <div id="luxriotStreamName" class="luxriot-stream-context-title">No channel selected</div>
+                                    </div>
+                                    <span id="luxriotStreamState" class="luxriot-stream-state idle">idle</span>
+                                </div>
+                                <div class="luxriot-stream-context-grid">
+                                    <div class="luxriot-stream-context-metric">
+                                        <span>Channel</span>
+                                        <strong id="luxriotStreamChannel">-</strong>
+                                    </div>
+                                    <div class="luxriot-stream-context-metric">
+                                        <span>Preview</span>
+                                        <strong id="luxriotStreamResolution">waiting</strong>
+                                    </div>
+                                    <div class="luxriot-stream-context-metric">
+                                        <span>Cadence</span>
+                                        <strong id="luxriotStreamCadence">-</strong>
+                                    </div>
+                                    <div class="luxriot-stream-context-metric">
+                                        <span>Batch</span>
+                                        <strong id="luxriotStreamBatch">-</strong>
+                                    </div>
+                                </div>
+                                <div class="luxriot-stream-context-list">
+                                    <div><span>Live model</span><strong id="luxriotStreamModel">-</strong></div>
+                                    <div><span>Summary queue</span><strong id="luxriotStreamQueue">idle</strong></div>
+                                    <div><span>Probe capture</span><strong id="luxriotStreamProbes">idle</strong></div>
+                                    <div><span>Last preview</span><strong id="luxriotStreamLastFrame">never</strong></div>
+                                </div>
+                                <div class="luxriot-stream-context-actions">
+                                    <button id="luxriotContextToggleCapture" class="feature-btn primary">Start summaries</button>
+                                    <button id="luxriotContextFlushCapture" class="feature-btn">Flush</button>
+                                </div>
+                                <div id="luxriotStreamDetail" class="luxriot-stream-context-detail">Runtime state will update when the preview and stream status refresh.</div>
+                            </aside>
                         </div>
                     </div>
 
@@ -329,14 +374,22 @@
                         <div class="studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">Offline Video Analysis</div>
-                                <div class="video-analysis-sub">Run sampled-frame analysis against local video files with the current VLM backend.</div>
+                                <div class="video-analysis-sub">Run image or sampled-frame video analysis with the current VLM backend.</div>
                             </div>
                         </div>
                         <div class="video-analysis-grid">
                             <div class="video-analysis-form">
+                                <div class="input-group">
+                                    <label for="videoUpload" class="input-label">Upload Media:</label>
+                                    <div class="file-upload inline video-upload-row">
+                                        <input type="file" id="videoUpload" class="file-upload-input" accept="image/*,video/*,.mp4,.mov,.m4v,.avi,.mkv,.webm" />
+                                        <label for="videoUpload" class="feature-btn file-upload-btn btn-md">Choose File</label>
+                                        <span id="videoUploadName" class="file-upload-name is-hidden">No file selected</span>
+                                    </div>
+                                </div>
                                 <div class="video-row">
                                     <div class="input-group">
-                                        <label for="videoPath" class="input-label">Video Path:</label>
+                                        <label for="videoPath" class="input-label">Server Path:</label>
                                         <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
                                     </div>
                                     <div class="input-group">
@@ -675,8 +728,48 @@
                 </div>
                 <div class="settings-actions probe-editor-modal-actions">
                     <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
+                    <button id="probeCastBtn" class="settings-btn">Cast</button>
                     <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="probeCastModal" class="settings-modal">
+        <div class="settings-modal-content probe-cast-modal-content">
+            <div class="settings-header">
+                <h2>Cast Probe</h2>
+                <button class="close-btn" id="closeProbeCast">&times;</button>
+            </div>
+            <div class="probe-cast-body">
+                <div class="probe-cast-toolbar">
+                    <div class="probe-cast-actions">
+                        <button type="button" class="settings-btn admin-row-btn" id="probeCastCurrentBtn">Current</button>
+                        <button type="button" class="settings-btn admin-row-btn" id="probeCastAllBtn">All</button>
+                        <button type="button" class="settings-btn admin-row-btn" id="probeCastNoneBtn">None</button>
+                    </div>
+                    <span id="probeCastSelectedMeta" class="probe-meta">0 selected</span>
+                </div>
+                <div id="probeCastChannelList" class="admin-channel-list probe-cast-channel-list">
+                    <div class="admin-empty">Channel list is not loaded yet.</div>
+                </div>
+                <div class="probe-cast-options">
+                    <label class="small-label-group">Conflict:
+                        <select id="probeCastConflict" class="luxriot-mini-input">
+                            <option value="skip" selected>Skip matching</option>
+                            <option value="update">Update matching</option>
+                            <option value="create">Create copies</option>
+                        </select>
+                    </label>
+                    <label class="inline-check"><input type="checkbox" id="probeCastEnable" checked> Enabled</label>
+                    <label class="inline-check"><input type="checkbox" id="probeCastCopyRoi"> Copy ROI</label>
+                    <label class="inline-check"><input type="checkbox" id="probeCastStartStreams"> Start streams</label>
+                </div>
+                <div id="probeCastStatus" class="probe-meta">Ready.</div>
+            </div>
+            <div class="settings-actions probe-editor-modal-actions">
+                <button id="probeCastCloseBtn" class="settings-btn">Cancel</button>
+                <button id="probeCastApplyBtn" class="settings-btn primary">Cast Probe</button>
             </div>
         </div>
     </div>
@@ -981,6 +1074,14 @@
                             <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
                         </div>
                         <div class="settings-row">
+                            <label class="settings-label">Description Retention (days):</label>
+                            <input type="number" id="luxriotSummaryRetentionDays" class="settings-input" min="0" max="3650" step="0.5" placeholder="7">
+                        </div>
+                        <div class="settings-row">
+                            <label class="settings-label">Description Cap / Channel:</label>
+                            <input type="number" id="luxriotSummaryHistoryLimit" class="settings-input" min="40" max="1000000" step="100" placeholder="10080">
+                        </div>
+                        <div class="settings-row">
                             <label class="settings-label">Auto Bookmark Alerts:</label>
                             <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
                         </div>
@@ -1018,6 +1119,44 @@
                                 <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
                             </div>
                         </div>
+                        <div class="settings-subsection">
+                            <div class="settings-subsection-title">Archive Capacity</div>
+                            <div class="settings-row">
+                                <label class="settings-label">Archive Retention:</label>
+                                <input type="checkbox" id="archiveRetentionEnabled" class="settings-checkbox">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Frame Rows (days):</label>
+                                <input type="number" id="archiveRowRetentionDays" class="settings-input" min="0" max="3650" step="1" placeholder="90">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">DB Previews (days):</label>
+                                <input type="number" id="archiveThumbnailRetentionDays" class="settings-input" min="0" max="3650" step="1" placeholder="14">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Max Frame Records:</label>
+                                <input type="number" id="archiveMaxRecords" class="settings-input" min="1000" max="500000000" step="1000" placeholder="5000000">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Planned Channels:</label>
+                                <input type="number" id="archiveEstimateChannels" class="settings-input" min="1" max="10000" step="1" placeholder="50">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Frames / Batch:</label>
+                                <input type="number" id="archiveEstimateFramesPerBatch" class="settings-input" min="0" max="32" step="0.5" placeholder="2.5">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Avg JPEG (KB):</label>
+                                <input type="number" id="archiveEstimateAvgJpegKb" class="settings-input" min="1" max="5000" step="5" placeholder="100">
+                            </div>
+                            <div class="settings-row">
+                                <label class="settings-label">Probe Rows / Channel / Day:</label>
+                                <input type="number" id="archiveEstimateProbeRows" class="settings-input" min="0" max="100000" step="10" placeholder="250">
+                            </div>
+                            <div id="archiveCapacitySummary" class="archive-capacity-summary">
+                                Capacity estimate unavailable.
+                            </div>
+                        </div>
                     </div>
 
                     <div id="settings-section-users" class="settings-section settings-section-wide admin-users-section">
@@ -1039,6 +1178,7 @@
                                 </div>
                                 <div class="admin-user-editor">
                                     <div class="admin-panel-title" id="adminUserEditorTitle">New User</div>
+                                    <div id="adminUserStateSummary" class="admin-user-state-summary"></div>
                                     <div class="settings-row">
                                         <label class="settings-label" for="adminUsernameInput">Username:</label>
                                         <input type="text" id="adminUsernameInput" class="settings-input" autocomplete="off" />
@@ -1055,16 +1195,28 @@
                                         <label class="settings-label">Roles:</label>
                                         <div id="adminRolesList" class="admin-role-list"></div>
                                     </div>
-                                    <div class="settings-row">
+                                    <div class="settings-row align-start admin-channel-row">
                                         <label class="settings-label" for="adminAllowedChannelsInput">Channels:</label>
-                                        <input type="text" id="adminAllowedChannelsInput" class="settings-input" placeholder="* or 7,8,9" />
+                                        <div class="admin-channel-editor">
+                                            <input type="text" id="adminAllowedChannelsInput" class="settings-input" placeholder="* or 7,8,9" />
+                                            <div class="admin-channel-picker-head">
+                                                <button type="button" class="settings-btn admin-row-btn" id="adminChannelsAllBtn">All</button>
+                                                <button type="button" class="settings-btn admin-row-btn" id="adminChannelsNoneBtn">None</button>
+                                                <button type="button" class="settings-btn admin-row-btn" id="adminChannelsRefreshBtn">Refresh Channels</button>
+                                            </div>
+                                            <div id="adminChannelList" class="admin-channel-list">
+                                                <div class="admin-empty">Channel list is not loaded yet.</div>
+                                            </div>
+                                        </div>
                                     </div>
                                     <div class="settings-row">
-                                        <label class="settings-label" for="adminUserActiveInput">Active:</label>
+                                        <label class="settings-label" for="adminUserActiveInput">Active after save:</label>
                                         <input type="checkbox" id="adminUserActiveInput" class="settings-checkbox" checked />
                                     </div>
                                     <div class="admin-editor-actions">
                                         <button type="button" class="settings-btn primary" id="adminUserSaveBtn">Save User</button>
+                                        <button type="button" class="settings-btn" id="adminUserResetPasswordBtn">Reset Password</button>
+                                        <button type="button" class="settings-btn danger" id="adminUserToggleActiveBtn">Disable User</button>
                                         <button type="button" class="settings-btn" id="adminUserRevokeBtn">Revoke Sessions</button>
                                         <button type="button" class="settings-btn" id="adminUserClearBtn">Clear</button>
                                     </div>

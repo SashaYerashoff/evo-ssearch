@@ -510,6 +510,7 @@ class RepositoryUnitTests(unittest.TestCase):
                             "admin",
                             None,
                             True,
+                            False,
                         )
                     ),
                 ),
@@ -543,6 +544,7 @@ class RepositoryUnitTests(unittest.TestCase):
                             "operator",
                             "Operator",
                             True,
+                            False,
                         )
                     ),
                 ),
@@ -564,6 +566,40 @@ class RepositoryUnitTests(unittest.TestCase):
 
         self.assertEqual(record.allowed_channel_ids, frozenset({7, 42}))
         self.assertNotIn(ALL_CHANNELS, record.allowed_channel_ids)
+        connection.assert_finished()
+
+    def test_non_admin_identity_can_use_explicit_all_channel_grant(self):
+        connection = ScriptedConnection(
+            [
+                (
+                    "SELECT id, tenant_id, username, display_name, is_active",
+                    Result(
+                        row=(
+                            self.user_id,
+                            self.tenant_id,
+                            "operator",
+                            "Operator",
+                            True,
+                            True,
+                        )
+                    ),
+                ),
+                ("SELECT r.name", Result(rows=[(Role.OPERATOR.value,)])),
+                (
+                    "SELECT DISTINCT rp.permission_key",
+                    Result(rows=[(Permission.STREAMS_VIEW.value,)]),
+                ),
+            ]
+        )
+        repository = PostgresIdentityRepository(FakePool(), self.hasher)
+
+        record = repository._load_identity(
+            connection,
+            self.tenant_id,
+            self.user_id,
+        )
+
+        self.assertEqual(record.allowed_channel_ids, frozenset({ALL_CHANNELS}))
         connection.assert_finished()
 
 
@@ -779,6 +815,30 @@ class PostgreSQLIdentityIntegrationTests(unittest.TestCase):
                 "operator password 123",
             )
         )
+
+    def test_non_admin_user_can_have_all_channel_access(self):
+        tenant_id = uuid.uuid4()
+        repository = PostgresIdentityRepository(self.pool)
+        admin = repository.bootstrap_admin(
+            tenant_id,
+            "ScopeAdmin",
+            "correct horse battery staple",
+            "Scope Administrator",
+        )
+
+        operator = repository.create_user(
+            tenant_id,
+            actor_user_id=admin.user_id,
+            username="operator-all-" + uuid.uuid4().hex[:8],
+            password="operator password 123",
+            display_name="All Channel Operator",
+            roles=[Role.OPERATOR.value],
+            allowed_channel_ids=[ALL_CHANNELS],
+        )
+
+        self.assertEqual(operator.roles, frozenset({Role.OPERATOR.value}))
+        self.assertEqual(operator.allowed_channel_ids, frozenset({ALL_CHANNELS}))
+        self.assertIn(Permission.PROBES_RUN.value, operator.permissions)
 
 
 if __name__ == "__main__":

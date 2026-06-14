@@ -1,13 +1,18 @@
 import base64
+import inspect
 import re
 import unittest
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from unittest.mock import patch
 
+from PIL import Image
+
 from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
     _SENSITIVE_ENDPOINT_PERMISSIONS,
+    _store_vlm_summary_archive_frames,
     app,
     config,
 )
@@ -98,6 +103,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/branding/logo",
             "/agent/skills/create",
             "/detections/image",
+            "/detections/diagnostics",
             "/favicon.ico",
             "/health",
             "/auth/login",
@@ -118,6 +124,186 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
+
+    def test_vlm_summary_archive_frames_write_detection_records(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.records: List[Dict[str, Any]] = []
+
+            def add_detections(self, records: List[Dict[str, Any]]) -> int:
+                self.records.extend(records)
+                return len(records)
+
+        store = Store()
+        entry = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Observed motion near the entrance.\nALERTS_JSON: {}",
+            "frame_count": 12,
+            "batch_size": 12,
+            "created_at": 100.0,
+            "batch_start_ms": 100000,
+            "batch_end_ms": 105000,
+            "duration_sec": 1.25,
+            "prompt": "Watch for people.",
+            "alert_counts": {"normal": 1},
+            "alert_total": 1,
+            "bookmarks_sent": 1,
+            "archive_frames": [
+                {
+                    "anchor_role": "first",
+                    "frame_index": 0,
+                    "timestamp_ms": 100000,
+                    "thumbnail": "frame-one",
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
+                    "anchor_role": "last",
+                    "frame_index": 11,
+                    "timestamp_ms": 105000,
+                    "thumbnail": "frame-two",
+                    "width": 1280,
+                    "height": 720,
+                },
+            ],
+        }
+
+        with (
+            patch("oldapp.detections_store", store),
+            patch("oldapp._embed_thumbnail_b64", return_value=None),
+            patch("oldapp._apply_archive_retention", return_value={"ok": True}),
+        ):
+            result = _store_vlm_summary_archive_frames(entry)
+
+        self.assertEqual(result["attempted"], 3)
+        self.assertEqual(result["inserted"], 3)
+        self.assertEqual(result["summary_frames"], 2)
+        self.assertEqual(result["alert_frames"], 1)
+        self.assertEqual([record["source"] for record in store.records], ["vlm_summary", "vlm_summary", "vlm_alert"])
+        self.assertEqual(store.records[0]["probe_id"], "vlm_summary:7")
+        self.assertEqual(store.records[2]["probe_id"], "vlm_alert:7")
+        self.assertTrue(store.records[2]["bookmark_sent"])
+        self.assertIn("run-7", store.records[0]["dedupe_key"])
+
+    def test_detections_list_passes_archive_source_filter(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?source=vlm_summary&channel_id=7&hours=1"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["source"], "vlm_summary")
+        self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
+
+    def test_detections_list_normalizes_probe_source_aliases(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?source=probes_run&channel_id=7&since_ms=1000&until_ms=2000"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["source"], "probe")
+        self.assertEqual(captured["since_ms"], 1000)
+        self.assertEqual(captured["until_ms"], 2000)
+        self.assertEqual(response.get_json()["filters"]["source"], "probe")
+
+    def test_detection_text_search_passes_archive_source_filter(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        def _search(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        with (
+            patch("oldapp.get_clip_text_embedding", return_value=object()),
+            patch("oldapp._search_detections_archive", side_effect=_search),
+        ):
+            response = self.client.post(
+                "/detections/search_text",
+                json={
+                    "query": "person near entrance",
+                    "source": "vlm_summary",
+                    "channel_id": 7,
+                    "hours": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["source"], "vlm_summary")
+        self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
+
+    def test_detections_diagnostics_reports_sources_without_thumbnail_payloads(self) -> None:
+        class Store:
+            def summarize_by_source(self, **kwargs):
+                return [
+                    {
+                        "source": "vlm_summary",
+                        "row_count": 2,
+                        "thumbnail_count": 2,
+                        "clip_count": 2,
+                        "dino_count": 0,
+                        "channel_count": 1,
+                        "oldest_timestamp_ms": 100000,
+                        "newest_timestamp_ms": 105000,
+                    }
+                ]
+
+            def list_detections(self, **kwargs):
+                return [
+                    {
+                        "id": 11,
+                        "source": "vlm_summary",
+                        "channel_id": 7,
+                        "probe_id": "vlm_summary:7",
+                        "probe_name": "VLM summary ch 7",
+                        "timestamp_ms": 105000,
+                        "severity": "info",
+                        "thumbnail": "abcdef",
+                        "has_clip": True,
+                        "has_dino": False,
+                        "shard_key": "ch7:19700101",
+                    }
+                ], 1
+
+            def storage_summary(self):
+                return {
+                    "backend": "test",
+                    "row_count": 2,
+                    "thumbnail_bytes": 6,
+                    "clip_vec_bytes": 16,
+                    "dino_vec_bytes": 0,
+                    "payload_json_bytes": 10,
+                    "oldest_timestamp_ms": 100000,
+                    "newest_timestamp_ms": 105000,
+                }
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/diagnostics?channel_id=7&source=vlm_summary&hours=1"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["sources"][0]["source"], "vlm_summary")
+        self.assertEqual(payload["recent"][0]["thumbnail_chars"], 6)
+        self.assertTrue(payload["recent"][0]["has_thumbnail"])
+        self.assertNotIn("thumbnail", payload["recent"][0])
 
     def test_non_public_routes_are_declared_in_security_surface(self) -> None:
         public_endpoints = {
@@ -146,32 +332,66 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "auth_user_revoke_sessions",
             "auth_session_revoke",
         }
+        read_guard_markers = (
+            "_settings_guard(",
+            "_auth_admin_guard(",
+            "_session_guard(",
+        )
+        mutation_guard_markers = (
+            "_mutation_guard",
+            "_auth_admin_guard(",
+            "_settings_guard(write=True",
+        )
+        read_only_post_endpoints = {
+            "check_index",
+            "get_commented_images",
+            "video_understanding",
+            "describe_image",
+            "search",
+            "search_by_image",
+            "search_by_mask",
+            "segment_from_point",
+            "detections_search_text",
+            "detections_search_image",
+        }
         for rule in app.url_map.iter_rules():
             endpoint = str(rule.endpoint)
             if endpoint in public_endpoints:
                 continue
             methods = set(rule.methods or set()) - {"HEAD", "OPTIONS"}
-            mutating = bool(methods & {"POST", "PATCH", "PUT", "DELETE"})
-            if mutating and endpoint in internally_guarded_mutations:
-                continue
-            if not mutating and endpoint in internally_guarded_reads:
-                continue
-            if endpoint in _SENSITIVE_ENDPOINT_PERMISSIONS:
-                continue
-            if endpoint in _MUTATION_ENDPOINT_PERMISSIONS:
-                continue
-            if mutating:
-                self.assertIn(
-                    endpoint,
-                    _MUTATION_ENDPOINT_PERMISSIONS,
-                    msg=f"{endpoint} mutates but is not in mutation guard map",
-                )
-            else:
-                self.assertIn(
-                    endpoint,
-                    _SENSITIVE_ENDPOINT_PERMISSIONS,
-                    msg=f"{endpoint} reads sensitive data but is not guarded",
-                )
+            source = inspect.getsource(app.view_functions[endpoint])
+            has_get = "GET" in methods
+            for method in methods:
+                with self.subTest(endpoint=endpoint, method=method, rule=rule.rule):
+                    if method == "GET":
+                        guarded = (
+                            endpoint in _SENSITIVE_ENDPOINT_PERMISSIONS
+                            or endpoint in internally_guarded_reads
+                            or any(marker in source for marker in read_guard_markers)
+                        )
+                        self.assertTrue(
+                            guarded,
+                            f"{endpoint} GET reads sensitive data but is not guarded",
+                        )
+                        continue
+
+                    if method in {"POST", "PATCH", "PUT", "DELETE"}:
+                        mixed_route = has_get
+                        if endpoint in read_only_post_endpoints and not mixed_route:
+                            guarded = endpoint in _SENSITIVE_ENDPOINT_PERMISSIONS
+                        else:
+                            guarded = (
+                                endpoint in _MUTATION_ENDPOINT_PERMISSIONS
+                                or endpoint in internally_guarded_mutations
+                                or any(marker in source for marker in mutation_guard_markers)
+                            )
+                        self.assertTrue(
+                            guarded,
+                            f"{endpoint} {method} mutates but is not guarded",
+                        )
+                        continue
+
+                    self.fail(f"Unhandled HTTP method {method} for {endpoint}")
 
     def test_non_mutating_endpoints_return_validation_errors_not_500(self) -> None:
         config.ADMIN_TOKEN = ""
@@ -200,6 +420,42 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     self.assertLess(resp.status_code, 500)
                 self.assertIn(resp.status_code, allowed)
 
+    def test_describe_image_accepts_uploaded_file(self) -> None:
+        jpeg = BytesIO()
+        Image.new("RGB", (32, 20), (12, 34, 56)).save(jpeg, format="JPEG")
+        jpeg.seek(0)
+        profile = {
+            "id": "vlm-local",
+            "kind": "vlm",
+            "base_url": "http://localhost:1234/v1",
+            "model": "qwen-vl-test",
+            "timeout": 30,
+        }
+
+        with (
+            patch("oldapp._resolve_lm_profile", return_value=profile),
+            patch("oldapp._call_lm_chat", return_value="uploaded image summary"),
+        ):
+            resp = self.client.post(
+                "/describe_image",
+                data={
+                    "image": (jpeg, "sample.jpg"),
+                    "prompt": "Describe this upload",
+                    "model": "qwen-vl-test",
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        payload = resp.get_json()
+        self.assertEqual(payload["summary"], "uploaded image summary")
+        self.assertEqual(payload["model"], "qwen-vl-test")
+        self.assertEqual(payload["profile_id"], "vlm-local")
+        self.assertEqual(payload["filename"], "sample.jpg")
+        self.assertTrue(payload["uploaded"])
+        self.assertIsInstance(payload.get("thumbnail"), str)
+        self.assertGreater(len(payload.get("thumbnail") or ""), 100)
+
     def test_health_and_ready_payloads_are_structured(self) -> None:
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
@@ -223,6 +479,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             ("/index", {"json": {}}),
             ("/comments", {"json": {}}),
             ("/probes/save", {"json": {}}),
+            ("/probes/cast", {"json": {}}),
             ("/probes/start_capture", {"json": {}}),
             ("/probes/stop_capture", {"json": {}}),
             ("/probes/run", {"json": {}}),
@@ -326,6 +583,39 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             stop_payload = stop_resp.get_json()
             self.assertIsInstance(stop_payload, dict)
             self.assertTrue(stop_payload.get("success"))
+
+    def test_probe_cast_creates_copies_with_token(self) -> None:
+        config.ADMIN_TOKEN = "unit-token"
+        headers = {"X-Admin-Token": "unit-token"}
+        saved_probes = []
+
+        def _upsert(probe):
+            stored = dict(probe)
+            stored["id"] = stored.get("id") or f"probe-{len(saved_probes) + 1}"
+            saved_probes.append(stored)
+            return stored
+
+        with (
+            patch("oldapp.probes_store.list_probes", return_value=[]),
+            patch("oldapp.probes_store.upsert_probe", side_effect=_upsert),
+        ):
+            response = self.client.post(
+                "/probes/cast",
+                headers=headers,
+                json={
+                    "name": "Door watch",
+                    "channel_ids": [101, 102],
+                    "positives": ["person near door"],
+                    "bookmark": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["counts"]["created"], 2)
+        self.assertEqual(payload["counts"]["failed"], 0)
+        self.assertEqual([probe["channel_id"] for probe in saved_probes], [101, 102])
+        self.assertTrue(all(probe.get("cast_group_id") for probe in saved_probes))
 
 
 if __name__ == "__main__":

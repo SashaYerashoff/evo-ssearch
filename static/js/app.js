@@ -24,6 +24,8 @@
     const archiveBox = document.getElementById('archiveBox');
     const videoBox = document.getElementById('videoBox');
     const videoPathInput = document.getElementById('videoPath');
+    const videoUploadInput = document.getElementById('videoUpload');
+    const videoUploadName = document.getElementById('videoUploadName');
     const videoModelInput = document.getElementById('videoModel');
     const videoFrameCount = document.getElementById('videoFrameCount');
     const videoSampleFpsInput = document.getElementById('videoSampleFps');
@@ -38,6 +40,8 @@
     const monitorBox = document.getElementById('monitorBox');
     const agentModeBtn = document.getElementById('agentModeBtn');
     const agentBox = document.getElementById('agentBox');
+    const agentModelInput = document.getElementById('agentModelInput');
+    const agentModelApplyBtn = document.getElementById('agentModelApplyBtn');
     const agentSkillList = document.getElementById('agentSkillList');
     const agentCreateSkillBtn = document.getElementById('agentCreateSkillBtn');
     const agentSkillModal = document.getElementById('agentSkillModal');
@@ -53,10 +57,24 @@
     const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
     const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
     const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
+    const luxriotLiveIntervalInput = document.getElementById('luxriotLiveIntervalSec');
     const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
     const luxriotStatusLabel = document.getElementById('luxriotStatus');
     const luxriotPreviewImg = document.getElementById('luxriotPreview');
     const luxriotOverlay = document.getElementById('luxriotOverlay');
+    const luxriotStreamName = document.getElementById('luxriotStreamName');
+    const luxriotStreamState = document.getElementById('luxriotStreamState');
+    const luxriotStreamChannel = document.getElementById('luxriotStreamChannel');
+    const luxriotStreamResolution = document.getElementById('luxriotStreamResolution');
+    const luxriotStreamCadence = document.getElementById('luxriotStreamCadence');
+    const luxriotStreamBatch = document.getElementById('luxriotStreamBatch');
+    const luxriotStreamModel = document.getElementById('luxriotStreamModel');
+    const luxriotStreamQueue = document.getElementById('luxriotStreamQueue');
+    const luxriotStreamProbes = document.getElementById('luxriotStreamProbes');
+    const luxriotStreamLastFrame = document.getElementById('luxriotStreamLastFrame');
+    const luxriotStreamDetail = document.getElementById('luxriotStreamDetail');
+    const luxriotContextToggleCaptureBtn = document.getElementById('luxriotContextToggleCapture');
+    const luxriotContextFlushCaptureBtn = document.getElementById('luxriotContextFlushCapture');
     const luxriotToggleCaptureBtn = document.getElementById('luxriotToggleCapture');
     const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
     const luxriotPromptSettingsBtn = document.getElementById('luxriotPromptSettingsBtn');
@@ -104,11 +122,26 @@
     const probeNameInput = document.getElementById('probeName');
     const probeRunBtn = document.getElementById('probeRunBtn');
     const probeSaveBtn = document.getElementById('probeSaveBtn');
+    const probeCastBtn = document.getElementById('probeCastBtn');
     const probeDeleteBtn = document.getElementById('probeDeleteBtn');
     const probeEditBtn = document.getElementById('probeEditBtn');
     const probeEditorModal = document.getElementById('probeEditorModal');
     const closeProbeEditorBtn = document.getElementById('closeProbeEditor');
     const probeEditorCloseBtn = document.getElementById('probeEditorCloseBtn');
+    const probeCastModal = document.getElementById('probeCastModal');
+    const closeProbeCastBtn = document.getElementById('closeProbeCast');
+    const probeCastCloseBtn = document.getElementById('probeCastCloseBtn');
+    const probeCastApplyBtn = document.getElementById('probeCastApplyBtn');
+    const probeCastChannelList = document.getElementById('probeCastChannelList');
+    const probeCastSelectedMeta = document.getElementById('probeCastSelectedMeta');
+    const probeCastStatus = document.getElementById('probeCastStatus');
+    const probeCastAllBtn = document.getElementById('probeCastAllBtn');
+    const probeCastNoneBtn = document.getElementById('probeCastNoneBtn');
+    const probeCastCurrentBtn = document.getElementById('probeCastCurrentBtn');
+    const probeCastConflictInput = document.getElementById('probeCastConflict');
+    const probeCastEnableInput = document.getElementById('probeCastEnable');
+    const probeCastCopyRoiInput = document.getElementById('probeCastCopyRoi');
+    const probeCastStartStreamsInput = document.getElementById('probeCastStartStreams');
     const probeResults = document.getElementById('probeResults');
     const probeStatus = document.getElementById('probeStatus');
     const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
@@ -164,7 +197,10 @@
     const archiveInspectorEmpty = document.getElementById('archiveInspectorEmpty');
     const archiveChannelFilter = document.getElementById('archiveChannelFilter');
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
+    const archiveSourceFilter = document.getElementById('archiveSourceFilter');
     const archiveTimeFilter = document.getElementById('archiveTimeFilter');
+    const archiveFromTimeInput = document.getElementById('archiveFromTime');
+    const archiveToTimeInput = document.getElementById('archiveToTime');
     const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
     const archiveScoreThresholdInput = document.getElementById('archiveScoreThreshold');
     const archiveScoreThresholdValue = document.getElementById('archiveScoreThresholdValue');
@@ -226,7 +262,15 @@
     let luxriotSummaryRefreshQueued = null;
     let luxriotStreamsCache = [];
     const luxriotChannelNameById = {};
+    const luxriotChannelMetaById = {};
     const luxriotCaptureRunningByChannel = {};
+    let luxriotCaptureBusy = false;
+    let luxriotPreviewMeta = {
+        width: 0,
+        height: 0,
+        loadedAt: 0,
+        failed: false,
+    };
     let luxriotPromptModalTab = 'stream';
     let luxriotInitialized = false;
     const probeHitsCacheByKey = {};
@@ -241,6 +285,7 @@
     let probeRoiDraftNorm = null;
     let probeRoiDrawState = null;
     let probeSnapState = null;
+    let probeCastSelectedChannels = new Set();
     let imageProbeEnabled = false;
     let probeList = [];
     let probeCatalog = [];
@@ -258,10 +303,18 @@
     let archiveDetectionsTotal = 0;
     let archiveDetectionsHasMore = false;
     let archiveScoreThreshold = 0;
+    let archiveScoreSliderPercent = 0;
+    let archiveScoreRange = {
+        count: 0,
+        min: null,
+        max: null,
+        hasSpread: false,
+    };
     const channelCaptureConfig = {};
     const channelFpsDesired = {};
     const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
     const LUXRIOT_LIVE_MODEL_STORAGE_KEY = 'evs_luxriot_live_model';
+    const LUXRIOT_LIVE_INTERVAL_STORAGE_KEY = 'evs_luxriot_live_interval_sec_by_channel';
     const VIDEO_MODEL_STORAGE_KEY = 'evs_video_model';
     const LM_AUTO_MODEL_SELECTOR = '__auto__';
     const LM_AUTO_MODEL_LABEL = 'Auto balance';
@@ -350,6 +403,7 @@
                 || defaultModel;
             setModelSelectOptions(videoModelInput, preferredVideoModel, defaultModel);
         }
+        updateLuxriotStreamContext();
     }
 
     async function loadLmModelCatalog(force = false) {
@@ -473,6 +527,7 @@
             ) {
                 authCurrentUser = null;
                 setAuthGateVisible(true, 'Session expired. Sign in again.');
+                syncUiAccess();
             }
             return response;
         });
@@ -486,12 +541,15 @@
             if (!response.ok) throw new Error(data.error || 'Sign in required');
             authCurrentUser = data.user || null;
             setAuthGateVisible(false);
+            syncUiAccess();
             if (authTokenBtn && authCurrentUser) {
                 authTokenBtn.title = `${authCurrentUser.displayName || authCurrentUser.username} · Sign out`;
                 authTokenBtn.style.opacity = '1';
             }
         } catch (error) {
+            authCurrentUser = null;
             setAuthGateVisible(true, error.message || 'Sign in required');
+            syncUiAccess();
         }
     }
 
@@ -866,7 +924,45 @@
         videoRequestStarted = 0;
     }
 
+    function userHasPermission(permission) {
+        const clean = String(permission || '').trim();
+        if (!clean) return true;
+        if (!AUTH_ENABLED) return true;
+        if (!authCurrentUser || !Array.isArray(authCurrentUser.permissions)) return false;
+        return authCurrentUser.permissions.includes(clean);
+    }
+
+    function userHasAnyPermission(permissions = []) {
+        const values = Array.isArray(permissions) ? permissions : [];
+        if (!values.length) return true;
+        return values.some((permission) => userHasPermission(permission));
+    }
+
+    function canUseMode(mode) {
+        if (!AUTH_ENABLED) return true;
+        if (!authCurrentUser) return false;
+        switch (mode) {
+            case 'archive':
+                return userHasPermission('detections:view');
+            case 'video':
+                return userHasPermission('streams:view');
+            case 'monitor':
+                return userHasAnyPermission(['streams:view', 'reports:view', 'probes:run', 'probes:manage']);
+            case 'agent':
+                return userHasPermission('agent:use');
+            default:
+                return false;
+        }
+    }
+
+    function firstAllowedMode() {
+        return ['archive', 'video', 'monitor', 'agent'].find((mode) => canUseMode(mode)) || 'archive';
+    }
+
     function setMode(mode) {
+        if (AUTH_ENABLED && authCurrentUser && !canUseMode(mode)) {
+            mode = firstAllowedMode();
+        }
         currentMode = mode;
         archiveModeBtn.classList.toggle('active', mode === 'archive');
         videoModeBtn.classList.toggle('active', mode === 'video');
@@ -911,6 +1007,7 @@
             if (probeEditorModal) {
                 setProbeEditorModalVisibility(false);
             }
+            setProbeCastModalVisibility(false);
         }
     }
 
@@ -923,6 +1020,11 @@
             stopProbePreview();
             setProbeSnapModalVisibility(false);
         }
+    }
+
+    function setProbeCastModalVisibility(visible) {
+        if (!probeCastModal) return;
+        probeCastModal.style.display = visible ? 'block' : 'none';
     }
 
     function setProbeSnapModalVisibility(visible) {
@@ -952,12 +1054,236 @@
         }
     }
 
+    function normalizeLuxriotLiveInterval(value) {
+        const interval = Number.parseFloat(String(value ?? '').trim());
+        if (!Number.isFinite(interval) || interval <= 0) return null;
+        return Math.max(0.2, Math.min(300, interval));
+    }
+
+    function formatLuxriotLiveIntervalInput(intervalSec) {
+        const interval = normalizeLuxriotLiveInterval(intervalSec)
+            || normalizeLuxriotLiveInterval(luxriotDefaults.snapshotInterval)
+            || 5;
+        const decimals = interval < 10 && !Number.isInteger(interval) ? 1 : 0;
+        return interval.toFixed(decimals).replace(/[.]0$/, '');
+    }
+
+    function readLuxriotLiveIntervalMap() {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(LUXRIOT_LIVE_INTERVAL_STORAGE_KEY) || '{}');
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function getStoredLuxriotLiveInterval(channelId) {
+        const parsedChannel = parseInt(String(channelId || ''), 10);
+        if (!Number.isFinite(parsedChannel)) return null;
+        const stored = readLuxriotLiveIntervalMap()[String(parsedChannel)];
+        return normalizeLuxriotLiveInterval(stored);
+    }
+
+    function storeLuxriotLiveInterval(channelId, intervalSec) {
+        const parsedChannel = parseInt(String(channelId || ''), 10);
+        const interval = normalizeLuxriotLiveInterval(intervalSec);
+        if (!Number.isFinite(parsedChannel) || interval === null) return;
+        const map = readLuxriotLiveIntervalMap();
+        map[String(parsedChannel)] = Number(interval.toFixed(3));
+        localStorage.setItem(LUXRIOT_LIVE_INTERVAL_STORAGE_KEY, JSON.stringify(map));
+    }
+
+    function getLuxriotLiveIntervalInputValue() {
+        const parsed = normalizeLuxriotLiveInterval(luxriotLiveIntervalInput ? luxriotLiveIntervalInput.value : null);
+        return parsed
+            || normalizeLuxriotLiveInterval(luxriotDefaults.snapshotInterval)
+            || 5;
+    }
+
+    function formatLuxriotDuration(intervalSec) {
+        const seconds = Number(intervalSec);
+        if (!Number.isFinite(seconds) || seconds <= 0) return 'n/a';
+        if (seconds < 60) {
+            return `${seconds.toFixed(seconds < 10 && !Number.isInteger(seconds) ? 1 : 0).replace(/[.]0$/, '')}s`;
+        }
+        const minutes = seconds / 60;
+        if (minutes < 60) {
+            return `${minutes.toFixed(minutes < 10 && !Number.isInteger(minutes) ? 1 : 0).replace(/[.]0$/, '')}m`;
+        }
+        const hours = minutes / 60;
+        return `${hours.toFixed(hours < 10 && !Number.isInteger(hours) ? 1 : 0).replace(/[.]0$/, '')}h`;
+    }
+
+    function syncLuxriotLiveIntervalInput(channelIdOverride = null, options = {}) {
+        if (!luxriotLiveIntervalInput) return;
+        const channelId = Number.isFinite(channelIdOverride)
+            ? channelIdOverride
+            : getSelectedLuxriotChannel();
+        if (!Number.isFinite(channelId)) return;
+        if (!options.force && document.activeElement === luxriotLiveIntervalInput) return;
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        const interval = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
+            || getStoredLuxriotLiveInterval(channelId)
+            || normalizeLuxriotLiveInterval(luxriotDefaults.snapshotInterval)
+            || 5;
+        luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(interval);
+        updateLuxriotBatchInfo();
+    }
+
     function updateLuxriotBatchInfo() {
         if (!luxriotBatchInfo) return;
-        const intervalSec = Number(luxriotDefaults.snapshotInterval) || 1;
+        const intervalSec = getLuxriotLiveIntervalInputValue();
+        const batchSize = Number(luxriotBatchSizeSelect?.value) || Number(luxriotDefaults.batchSize) || 0;
         const fps = intervalSec > 0 ? (1 / intervalSec) : 0;
         const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
-        luxriotBatchInfo.textContent = `~${fpsLabel} fps, ${luxriotDefaults.snapshotMaxEdge}px`;
+        const summaryLabel = batchSize > 0 ? ` · batch ~${formatLuxriotDuration(intervalSec * batchSize)}` : '';
+        luxriotBatchInfo.textContent = `~${fpsLabel} fps${summaryLabel} · ${luxriotDefaults.snapshotMaxEdge}px`;
+        updateLuxriotStreamContext();
+    }
+
+    function setTextContentSafe(element, text) {
+        if (!element) return;
+        element.textContent = text;
+    }
+
+    function formatCompactCount(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return '0';
+        return Math.round(numeric).toLocaleString();
+    }
+
+    function formatLuxriotCadence(intervalSec) {
+        const interval = Number(intervalSec);
+        if (!Number.isFinite(interval) || interval <= 0) return 'n/a';
+        const fps = 1 / interval;
+        const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
+        return `${fpsLabel} fps · ${interval.toFixed(interval >= 10 ? 0 : 1).replace(/[.]0$/, '')}s`;
+    }
+
+    function formatPreviewAge(timestampMs) {
+        const ts = Number(timestampMs);
+        if (!Number.isFinite(ts) || ts <= 0) return 'never';
+        const ageSec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+        if (ageSec < 2) return 'just now';
+        if (ageSec < 60) return `${ageSec}s ago`;
+        return new Date(ts).toLocaleTimeString();
+    }
+
+    function selectedLuxriotStream(channelId, streamType) {
+        const target = parseInt(String(channelId || ''), 10);
+        if (!Number.isFinite(target)) return null;
+        const type = String(streamType || '').trim().toLowerCase();
+        return (Array.isArray(luxriotStreamsCache) ? luxriotStreamsCache : []).find((stream) => {
+            const streamChannel = parseInt(String(stream?.channel_id ?? ''), 10);
+            const streamKind = String(stream?.stream_type || '').trim().toLowerCase();
+            return streamChannel === target && streamKind === type;
+        }) || null;
+    }
+
+    function probeStatsForChannel(channelId) {
+        const target = parseInt(String(channelId || ''), 10);
+        const stats = { total: 0, enabled: 0, disabled: 0 };
+        if (!Number.isFinite(target)) return stats;
+        (Array.isArray(probeCatalog) ? probeCatalog : []).forEach((probe) => {
+            const probeChannel = parseInt(String(probe?.channel_id ?? ''), 10);
+            if (probeChannel !== target) return;
+            stats.total += 1;
+            if (probe?.enabled === false) stats.disabled += 1;
+            else stats.enabled += 1;
+        });
+        return stats;
+    }
+
+    function selectedLuxriotModelLabel(videoStream = null) {
+        const streamModel = normalizeModelId(videoStream?.model || '');
+        if (streamModel) return streamModel;
+        const selected = normalizeModelId(luxriotLiveModelInput ? luxriotLiveModelInput.value : '');
+        const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
+        const autoLabel = normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL);
+        if (selected && selected === autoSelector) return autoLabel || selected;
+        return selected || normalizeModelId(lmModelCatalog.defaultModel) || 'default';
+    }
+
+    function setLuxriotCaptureBusy(busy) {
+        luxriotCaptureBusy = Boolean(busy);
+        updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
+        updateLuxriotStreamContext();
+    }
+
+    function updateLuxriotStreamContext() {
+        if (!luxriotStreamName && !luxriotStreamState) return;
+        const channelId = getSelectedLuxriotChannel();
+        const selectedRaw = luxriotChannelSelect ? String(luxriotChannelSelect.value || '').trim() : String(channelId || '');
+        const hasChannel = Number.isFinite(channelId) && channelId > 0 && Boolean(selectedRaw);
+        const channelLabel = hasChannel ? getLuxriotChannelLabel(channelId) : 'No channel selected';
+        const videoStream = hasChannel ? selectedLuxriotStream(channelId, 'video') : null;
+        const analyticsStream = hasChannel ? selectedLuxriotStream(channelId, 'analytics') : null;
+        const running = Boolean(videoStream?.running) || (hasChannel && isLuxriotCaptureRunning(channelId));
+        const probeState = hasChannel ? String(probeChannelRuntime[String(channelId)] || '').trim() : '';
+        const probeRunning = Boolean(analyticsStream?.running) || probeState === 'running';
+        const probePaused = probeState === 'paused' || Boolean(analyticsStream?.paused);
+        const stateClass = luxriotPreviewMeta.failed ? 'error' : running ? 'running' : probeRunning ? 'running' : probePaused ? 'paused' : 'idle';
+        const stateText = luxriotPreviewMeta.failed ? 'preview error' : running ? 'summaries on' : probeRunning ? 'probes on' : probePaused ? 'probes paused' : 'idle';
+        const previewWidth = Number(luxriotPreviewMeta.width);
+        const previewHeight = Number(luxriotPreviewMeta.height);
+        const resolution = previewWidth > 0 && previewHeight > 0
+            ? `${previewWidth}x${previewHeight}`
+            : luxriotPreviewMeta.failed
+                ? 'failed'
+                : 'waiting';
+        const intervalSec = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
+            || getLuxriotLiveIntervalInputValue()
+            || Number(luxriotDefaults.snapshotInterval)
+            || 0;
+        const batchSize = Number(videoStream?.batch_size) || Number(luxriotBatchSizeSelect?.value) || Number(luxriotDefaults.batchSize) || 0;
+        const queued = Number(videoStream?.pending_frames) || 0;
+        const flushes = Number(videoStream?.flush_count) || 0;
+        const dropped = Number(videoStream?.queue_dropped_batches) || 0;
+        const probeStats = probeStatsForChannel(channelId);
+        const analyticsQueued = Number(analyticsStream?.pending_frames) || 0;
+        const analyticsInterval = Number(analyticsStream?.interval_sec);
+        const probeCadence = Number.isFinite(analyticsInterval) && analyticsInterval > 0 ? formatLuxriotCadence(analyticsInterval) : '';
+        const queueLabel = running
+            ? `${formatCompactCount(queued)}/${formatCompactCount(batchSize)} frames · ${formatCompactCount(flushes)} flushes${dropped > 0 ? ` · ${formatCompactCount(dropped)} dropped` : ''}`
+            : 'idle';
+        const probeLabel = probeRunning
+            ? `active · ${formatCompactCount(analyticsQueued)} buffered${probeCadence ? ` · ${probeCadence}` : ''}`
+            : probePaused
+                ? 'paused'
+                : probeStats.enabled > 0
+                    ? `${probeStats.enabled}/${probeStats.total} ready`
+                    : probeStats.total > 0
+                        ? 'configured, disabled'
+                        : 'not configured';
+        const detailParts = [];
+        if (videoStream?.last_error) detailParts.push(`Summary error: ${videoStream.last_error}`);
+        if (analyticsStream?.last_error) detailParts.push(`Probe error: ${analyticsStream.last_error}`);
+        if (!detailParts.length && running) detailParts.push('Live summaries are collecting frames for the selected channel.');
+        if (!detailParts.length && probeRunning) detailParts.push('Probe capture is buffering frames for semantic/image probes.');
+        if (!detailParts.length) detailParts.push('Runtime state will update when the preview and stream status refresh.');
+
+        setTextContentSafe(luxriotStreamName, channelLabel);
+        setTextContentSafe(luxriotStreamChannel, hasChannel ? `#${channelId}` : '-');
+        setTextContentSafe(luxriotStreamResolution, resolution);
+        setTextContentSafe(luxriotStreamCadence, formatLuxriotCadence(intervalSec));
+        setTextContentSafe(luxriotStreamBatch, batchSize > 0 ? formatCompactCount(batchSize) : '-');
+        setTextContentSafe(luxriotStreamModel, selectedLuxriotModelLabel(videoStream));
+        setTextContentSafe(luxriotStreamQueue, queueLabel);
+        setTextContentSafe(luxriotStreamProbes, probeLabel);
+        setTextContentSafe(luxriotStreamLastFrame, formatPreviewAge(luxriotPreviewMeta.loadedAt));
+        setTextContentSafe(luxriotStreamDetail, detailParts.join(' '));
+        if (luxriotStreamState) {
+            luxriotStreamState.className = `luxriot-stream-state ${stateClass}`;
+            luxriotStreamState.textContent = stateText;
+        }
+        if (luxriotContextToggleCaptureBtn) {
+            luxriotContextToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
+            luxriotContextToggleCaptureBtn.classList.toggle('primary', !running);
+            luxriotContextToggleCaptureBtn.disabled = !hasChannel || luxriotCaptureBusy;
+        }
+        if (luxriotContextFlushCaptureBtn) {
+            luxriotContextFlushCaptureBtn.disabled = !hasChannel || luxriotCaptureBusy || !running;
+        }
     }
 
     function stopLuxriotPreview() {
@@ -1498,11 +1824,13 @@
             }
             const channels = data.channels || [];
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
+            Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
             if (!channels.length) {
                 luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
                 if (luxriotSummaryChannelSelect) {
                     luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
                 }
+                updateLuxriotStreamContext();
                 setLuxriotStatus('No channels available', true);
                 return;
             }
@@ -1513,6 +1841,7 @@
                     if (!Number.isFinite(id)) return '';
                     const label = normalizeLuxriotChannelName(ch, id);
                     luxriotChannelNameById[String(id)] = label;
+                    luxriotChannelMetaById[String(id)] = ch;
                     const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
                     return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
                 })
@@ -1532,15 +1861,19 @@
             if (!(String(luxriotActiveChannel) in luxriotCaptureRunningByChannel)) {
                 luxriotCaptureRunningByChannel[String(luxriotActiveChannel)] = false;
             }
+            syncLuxriotLiveIntervalInput(luxriotActiveChannel);
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
+            updateLuxriotStreamContext();
             setLuxriotStatus(`Loaded ${channels.length} channels`);
         } catch (err) {
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
+            Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
             luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
             if (luxriotSummaryChannelSelect) {
                 luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
             }
             updateLuxriotCaptureToggleButton();
+            updateLuxriotStreamContext();
             setLuxriotStatus('Channel load failed: ' + err.message, true);
         }
     }
@@ -1561,6 +1894,7 @@
         const parsed = parseInt(String(channelId || ''), 10);
         if (!Number.isFinite(parsed)) return;
         luxriotCaptureRunningByChannel[String(parsed)] = Boolean(running);
+        updateLuxriotStreamContext();
     }
 
     function isLuxriotCaptureRunning(channelId) {
@@ -1570,11 +1904,20 @@
     }
 
     function updateLuxriotCaptureToggleButton(channelIdOverride = null) {
-        if (!luxriotToggleCaptureBtn) return;
         const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
+        const selectedRaw = luxriotChannelSelect ? String(luxriotChannelSelect.value || '').trim() : String(channelId || '');
+        const hasChannel = Number.isFinite(channelId) && channelId > 0 && Boolean(selectedRaw);
         const running = isLuxriotCaptureRunning(channelId);
-        luxriotToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
-        luxriotToggleCaptureBtn.classList.toggle('primary', !running);
+        [luxriotToggleCaptureBtn, luxriotContextToggleCaptureBtn].forEach((button) => {
+            if (!button) return;
+            button.textContent = running ? 'Stop summaries' : 'Start summaries';
+            button.classList.toggle('primary', !running);
+            button.disabled = luxriotCaptureBusy || !hasChannel;
+        });
+        if (luxriotContextFlushCaptureBtn) {
+            luxriotContextFlushCaptureBtn.disabled = luxriotCaptureBusy || !hasChannel || !running;
+        }
+        updateLuxriotStreamContext();
     }
 
     function getLuxriotPromptInputByTab(tab) {
@@ -1618,19 +1961,22 @@
     }
 
     function collectLuxriotPromptSettings() {
-        return {
+        const payload = {
             stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
             rollup_prompts: {
                 L1: luxriotRollupPromptL1Input ? String(luxriotRollupPromptL1Input.value || '') : '',
                 L2: luxriotRollupPromptL2Input ? String(luxriotRollupPromptL2Input.value || '') : '',
                 L3: luxriotRollupPromptL3Input ? String(luxriotRollupPromptL3Input.value || '') : '',
             },
-            json_alert_prompt: luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '',
-            bookmark_enabled: luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false,
-            bookmark_cooldown_sec: luxriotBookmarkCooldownInput
-                ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
-                : 0,
         };
+        if (userHasPermission('bookmarks:create')) {
+            payload.json_alert_prompt = luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '';
+            payload.bookmark_enabled = luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false;
+            payload.bookmark_cooldown_sec = luxriotBookmarkCooldownInput
+                ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
+                : 0;
+        }
+        return payload;
     }
 
     function applyLuxriotPromptSettingsFromPayload(payload) {
@@ -1649,6 +1995,18 @@
         }
         if (luxriotRollupPromptL3Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L3')) {
             luxriotRollupPromptL3Input.value = String(rollupPrompts.L3 || '');
+        }
+        if (luxriotLiveIntervalInput && Object.prototype.hasOwnProperty.call(settings, 'capture_interval_sec')) {
+            const payloadChannel = parseInt(String(settings.channel_id ?? ''), 10);
+            const selectedChannel = getSelectedLuxriotChannel();
+            const interval = normalizeLuxriotLiveInterval(settings.capture_interval_sec);
+            if (interval !== null && (!Number.isFinite(payloadChannel) || payloadChannel === selectedChannel)) {
+                if (document.activeElement !== luxriotLiveIntervalInput) {
+                    luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(interval);
+                }
+                storeLuxriotLiveInterval(selectedChannel, interval);
+                updateLuxriotBatchInfo();
+            }
         }
         if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
             luxriotJsonAlertPromptInput.value = String(settings.json_alert_prompt || '');
@@ -1755,6 +2113,8 @@
             setLuxriotStatus('Select a channel to preview', true);
             return;
         }
+        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, failed: false };
+        updateLuxriotStreamContext();
         const refresh = () => {
             if (luxriotOverlay) {
                 luxriotOverlay.textContent = 'Loading...';
@@ -1762,11 +2122,25 @@
             luxriotPreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
         };
         luxriotPreviewImg.onload = () => {
+            luxriotPreviewMeta = {
+                width: Number(luxriotPreviewImg.naturalWidth) || 0,
+                height: Number(luxriotPreviewImg.naturalHeight) || 0,
+                loadedAt: Date.now(),
+                failed: false,
+            };
             if (luxriotOverlay) luxriotOverlay.textContent = '';
+            updateLuxriotStreamContext();
             setLuxriotStatus(`Previewing channel ${channelId}`);
         };
         luxriotPreviewImg.onerror = () => {
+            luxriotPreviewMeta = {
+                width: 0,
+                height: 0,
+                loadedAt: 0,
+                failed: true,
+            };
             if (luxriotOverlay) luxriotOverlay.textContent = 'Preview failed';
+            updateLuxriotStreamContext();
             setLuxriotStatus('Preview failed', true);
         };
         stopLuxriotPreview();
@@ -1797,6 +2171,47 @@
         if (!luxriotSummaryMeta) return;
         luxriotSummaryMeta.textContent = text;
         luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
+    }
+
+    const SUMMARY_ALERT_SEVERITIES = ['critical', 'high', 'normal', 'low', 'info'];
+
+    function normalizeSummaryAlertCounts(row) {
+        const counts = {};
+        const rawCounts = row && typeof row === 'object'
+            ? (row.alert_counts || row.alertCounts || {})
+            : {};
+        if (rawCounts && typeof rawCounts === 'object' && !Array.isArray(rawCounts)) {
+            SUMMARY_ALERT_SEVERITIES.forEach((severity) => {
+                const value = Number(rawCounts[severity] || 0);
+                if (Number.isFinite(value) && value > 0) {
+                    counts[severity] = Math.floor(value);
+                }
+            });
+        }
+        if (!Object.keys(counts).length) {
+            const total = Number(row?.alert_total || row?.alertTotal || 0);
+            if (Number.isFinite(total) && total > 0) {
+                const severity = SUMMARY_ALERT_SEVERITIES.includes(String(row?.severity || '').toLowerCase())
+                    ? String(row.severity).toLowerCase()
+                    : 'normal';
+                counts[severity] = Math.floor(total);
+            }
+        }
+        return counts;
+    }
+
+    function renderSummaryAlertBadges(row, levelLabel = '') {
+        const counts = normalizeSummaryAlertCounts(row);
+        const parts = SUMMARY_ALERT_SEVERITIES
+            .filter((severity) => counts[severity] > 0)
+            .map((severity) => {
+                const count = counts[severity];
+                return `<span class="summary-alert-chip severity-${escapeHtml(severity)}" title="${escapeHtml(severity)} alerts">${escapeHtml(severity)} <strong>${count}</strong></span>`;
+            });
+        if (!parts.length) return '';
+        const level = String(levelLabel || row?.level || 'L0').trim().toUpperCase();
+        const title = `${level || 'Summary'} alerts`;
+        return `<span class="summary-alert-badges" title="${escapeHtml(title)}"><span class="summary-alert-level">${escapeHtml(level || 'L0')}</span>${parts.join('')}</span>`;
     }
 
     function withSummaryUpdatedMeta(text) {
@@ -1874,25 +2289,28 @@
                 const summaryParts = splitSummaryAndJson(summary);
                 const summaryMain = summaryParts.main || summary;
                 const summaryJson = summaryParts.json;
-                const canBookmark = summary.length > 0;
+                const hasSummaryText = summary.length > 0;
+                const canBookmark = userHasPermission('bookmarks:create');
                 const collapsed = isSummaryCollapsed(channelId, logKey);
+                const alertBadges = renderSummaryAlertBadges(log, 'L0');
+                const bookmarkButton = canBookmark
+                    ? `<button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${hasSummaryText ? '' : 'disabled'}>Bookmark</button>`
+                    : '';
                 return `
                     <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}">
                         <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}</div>
                             <div class="luxriot-summary-actions">
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
                                     ${collapsed ? 'Expand' : 'Collapse'}
                                 </button>
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-copy="${idx}" ${canBookmark ? '' : 'disabled'}>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-copy="${idx}" ${hasSummaryText ? '' : 'disabled'}>
                                     Copy
                                 </button>
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-export="${idx}" ${canBookmark ? '' : 'disabled'}>
+                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-export="${idx}" ${hasSummaryText ? '' : 'disabled'}>
                                     Export
                                 </button>
-                                <button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${canBookmark ? '' : 'disabled'}>
-                                    Bookmark
-                                </button>
+                                ${bookmarkButton}
                             </div>
                         </div>
                         <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
@@ -2071,10 +2489,11 @@
             const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
             const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
             const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
+            const alertBadges = renderSummaryAlertBadges(row, rowLevel);
             return `
                 <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
                     <div class="luxriot-summary-head">
-                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
+                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}${alertBadges}</div>
                         <div class="luxriot-summary-actions">
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
@@ -2225,6 +2644,7 @@
         });
         updateProbeCaptureMeta(getSelectedProbeChannelId());
         syncProbePreview(getSelectedProbeChannelId());
+        updateLuxriotStreamContext();
         if (rerender) {
             renderProbeCards();
         }
@@ -2260,6 +2680,7 @@
         );
         updateProbeChannelRuntime(data, probeList.length > 0);
         luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
+        updateLuxriotStreamContext();
         const sortedVideo = videoStreams
             .slice()
             .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
@@ -2304,6 +2725,7 @@
         probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
         if (!channelIds.size) {
             luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
+            updateLuxriotStreamContext();
             return;
         }
         const rows = Array.from(channelIds)
@@ -2445,6 +2867,7 @@
                 // Keep previous probe catalog if probe listing fails.
             }
             renderLuxriotStreams(data, probeCatalog);
+            syncLuxriotLiveIntervalInput(selectedChannelId);
         } catch (err) {
             luxriotStreams.innerHTML = `<div class="loading">Stream state unavailable: ${escapeHtml(err.message || 'Unknown error')}</div>`;
         }
@@ -2780,12 +3203,15 @@
         const batchSize = luxriotBatchSizeSelect
             ? parseInt(luxriotBatchSizeSelect.value, 10)
             : luxriotDefaults.batchSize || 12;
+        const intervalSec = getLuxriotLiveIntervalInputValue();
+        if (luxriotLiveIntervalInput) {
+            luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(intervalSec);
+        }
+        storeLuxriotLiveInterval(channelId, intervalSec);
         const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
         const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
         const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
-        if (luxriotToggleCaptureBtn) {
-            luxriotToggleCaptureBtn.disabled = true;
-        }
+        setLuxriotCaptureBusy(true);
         setLuxriotStatus('Starting summaries...');
         try {
             const resp = await fetch('/luxriot/start_capture', {
@@ -2794,6 +3220,7 @@
                 body: JSON.stringify({
                     channel_id: channelId,
                     batch_size: batchSize,
+                    interval_sec: intervalSec,
                     prompt: prompt || fallbackPrompt,
                     model: luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '',
                     system_prompt: systemPrompt
@@ -2806,7 +3233,8 @@
             setLuxriotCaptureRunning(channelId, true);
             updateLuxriotCaptureToggleButton(channelId);
             const modelLabel = data?.session?.model || (luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '') || '';
-            setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize}${modelLabel ? ` · ${modelLabel}` : ''})`);
+            const appliedInterval = normalizeLuxriotLiveInterval(data?.session?.interval_sec) || intervalSec;
+            setLuxriotStatus(`Summaries running on channel ${channelId} (${formatLuxriotCadence(appliedInterval)} · batch ${batchSize}${modelLabel ? ` · ${modelLabel}` : ''})`);
             luxriotSummaryChannel = channelId;
             luxriotSummaryFollowLive = true;
             syncLuxriotSummaryChannelSelect();
@@ -2818,17 +3246,13 @@
         } catch (err) {
             setLuxriotStatus(err.message, true);
         } finally {
-            if (luxriotToggleCaptureBtn) {
-                luxriotToggleCaptureBtn.disabled = false;
-            }
+            setLuxriotCaptureBusy(false);
         }
     }
 
     async function stopLuxriotCapture(channelIdOverride = null) {
         const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
-        if (luxriotToggleCaptureBtn) {
-            luxriotToggleCaptureBtn.disabled = true;
-        }
+        setLuxriotCaptureBusy(true);
         setLuxriotStatus('Stopping...');
         try {
             const resp = await fetch('/luxriot/stop_capture', {
@@ -2848,9 +3272,7 @@
         } catch (err) {
             setLuxriotStatus(err.message, true);
         } finally {
-            if (luxriotToggleCaptureBtn) {
-                luxriotToggleCaptureBtn.disabled = false;
-            }
+            setLuxriotCaptureBusy(false);
         }
     }
 
@@ -2921,7 +3343,7 @@
     if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
         luxriotPromptInput.value = videoPromptInput.value;
     }
-    updateLuxriotBatchInfo();
+    syncLuxriotLiveIntervalInput(luxriotActiveChannel, { force: true });
     setLuxriotPromptModalTab('stream');
     updateLuxriotCaptureToggleButton(luxriotActiveChannel);
     function syncProbeChannelSelect() {
@@ -2952,6 +3374,7 @@
     const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
     const qualityValue = document.getElementById('qualityValue');
     const embedderSelect = document.getElementById('embedder');
+    const clipModelSelect = document.getElementById('clipModel');
     const fusionEnabledInput = document.getElementById('fusionEnabled');
     const fusionAlphaInput = document.getElementById('fusionAlpha');
     const fusionAlphaValue = document.getElementById('fusionAlphaValue');
@@ -2973,7 +3396,20 @@
     const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
     const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
     const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
+    const luxriotSummaryRetentionDaysInput = document.getElementById('luxriotSummaryRetentionDays');
+    const luxriotSummaryHistoryLimitInput = document.getElementById('luxriotSummaryHistoryLimit');
+    const archiveRetentionEnabledInput = document.getElementById('archiveRetentionEnabled');
+    const archiveRowRetentionDaysInput = document.getElementById('archiveRowRetentionDays');
+    const archiveThumbnailRetentionDaysInput = document.getElementById('archiveThumbnailRetentionDays');
+    const archiveMaxRecordsInput = document.getElementById('archiveMaxRecords');
+    const archiveEstimateChannelsInput = document.getElementById('archiveEstimateChannels');
+    const archiveEstimateFramesPerBatchInput = document.getElementById('archiveEstimateFramesPerBatch');
+    const archiveEstimateAvgJpegKbInput = document.getElementById('archiveEstimateAvgJpegKb');
+    const archiveEstimateProbeRowsInput = document.getElementById('archiveEstimateProbeRows');
+    const archiveCapacitySummary = document.getElementById('archiveCapacitySummary');
     const luxriotAutoBookmarksInput = document.getElementById('luxriotAutoBookmarks');
+    let experimentalEmbeddersEnabled = false;
+    let productionClipModel = 'ViT-B/32';
     const probeBookmarkCooldownSecInput = document.getElementById('probeBookmarkCooldownSec');
     const probeBookmarkDedupeWindowSecInput = document.getElementById('probeBookmarkDedupeWindowSec');
     const probeBookmarkSimHighInput = document.getElementById('probeBookmarkSimHigh');
@@ -2999,8 +3435,15 @@
     const adminPasswordInput = document.getElementById('adminPasswordInput');
     const adminRolesList = document.getElementById('adminRolesList');
     const adminAllowedChannelsInput = document.getElementById('adminAllowedChannelsInput');
+    const adminChannelList = document.getElementById('adminChannelList');
+    const adminChannelsAllBtn = document.getElementById('adminChannelsAllBtn');
+    const adminChannelsNoneBtn = document.getElementById('adminChannelsNoneBtn');
+    const adminChannelsRefreshBtn = document.getElementById('adminChannelsRefreshBtn');
     const adminUserActiveInput = document.getElementById('adminUserActiveInput');
+    const adminUserStateSummary = document.getElementById('adminUserStateSummary');
     const adminUserSaveBtn = document.getElementById('adminUserSaveBtn');
+    const adminUserResetPasswordBtn = document.getElementById('adminUserResetPasswordBtn');
+    const adminUserToggleActiveBtn = document.getElementById('adminUserToggleActiveBtn');
     const adminUserRevokeBtn = document.getElementById('adminUserRevokeBtn');
     const adminUserClearBtn = document.getElementById('adminUserClearBtn');
     const adminSessionsActiveOnlyInput = document.getElementById('adminSessionsActiveOnlyInput');
@@ -3025,6 +3468,7 @@
     let adminRoles = [];
     let adminUsers = [];
     let adminSessions = [];
+    let adminChannelCatalog = [];
     let selectedAdminUserId = null;
     let auditEvents = [];
     let auditNextCursor = null;
@@ -3032,7 +3476,11 @@
 
     function setActiveSettingsNav(targetId) {
         settingsNavButtons.forEach((btn) => {
-            btn.classList.toggle('active', btn.dataset.settingsTarget === targetId);
+            const active = btn.dataset.settingsTarget === targetId;
+            btn.classList.toggle('active', active);
+            if (active && typeof btn.scrollIntoView === 'function') {
+                btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            }
         });
     }
 
@@ -3117,6 +3565,152 @@
         return allowed;
     }
 
+    function setElementHidden(element, hidden) {
+        if (!element) return;
+        element.classList.toggle('is-hidden', Boolean(hidden));
+    }
+
+    function setPermissionHidden(element, hidden) {
+        if (!element) return;
+        element.classList.toggle('permission-hidden', Boolean(hidden));
+    }
+
+    function setControlDisabled(element, disabled) {
+        if (!element) return;
+        element.disabled = Boolean(disabled);
+    }
+
+    function settingsTargetAllowed(targetId) {
+        if (!targetId) return false;
+        if (targetId === 'settings-section-users') return userCanManageUsers();
+        if (targetId === 'settings-section-audit') return userCanViewAudit();
+        if (targetId === 'settings-section-env') return userHasPermission('settings:manage');
+        return userHasAnyPermission(['settings:view', 'settings:manage']);
+    }
+
+    function firstVisibleSettingsTarget() {
+        const button = settingsNavButtons.find((btn) => !btn.classList.contains('is-hidden'));
+        return button ? button.dataset.settingsTarget : '';
+    }
+
+    function syncSettingsAccess() {
+        settingsNavButtons.forEach((btn) => {
+            const targetId = btn.dataset.settingsTarget;
+            const allowed = settingsTargetAllowed(targetId);
+            setElementHidden(btn, !allowed);
+            setElementHidden(document.getElementById(targetId), !allowed);
+        });
+        setAdminUsersAccess(userCanManageUsers());
+        setAuditAccess(userCanViewAudit());
+
+        const canManageSettings = userHasPermission('settings:manage');
+        setElementHidden(saveSettingsBtn, !canManageSettings);
+        setElementHidden(resetSettingsBtn, !canManageSettings);
+        setElementHidden(saveEnvBtn, !canManageSettings);
+        setElementHidden(reloadEnvBtn, !canManageSettings);
+        setControlDisabled(saveSettingsBtn, !canManageSettings);
+        setControlDisabled(resetSettingsBtn, !canManageSettings);
+        setControlDisabled(saveEnvBtn, !canManageSettings);
+
+        const firstTarget = firstVisibleSettingsTarget();
+        setElementHidden(settingsBtn, !firstTarget);
+        if (!firstTarget && settingsModal && settingsModal.style.display === 'block') {
+            settingsModal.style.display = 'none';
+        }
+        const activeNav = settingsNavButtons.find((btn) => btn.classList.contains('active'));
+        if (firstTarget && (!activeNav || activeNav.classList.contains('is-hidden'))) {
+            setActiveSettingsNav(firstTarget);
+        }
+        return Boolean(firstTarget);
+    }
+
+    function syncUiAccess() {
+        const archiveAllowed = canUseMode('archive');
+        const videoAllowed = canUseMode('video');
+        const monitorAllowed = canUseMode('monitor');
+        const agentAllowed = canUseMode('agent');
+        setElementHidden(archiveModeBtn, !archiveAllowed);
+        setElementHidden(videoModeBtn, !videoAllowed);
+        setElementHidden(monitorModeBtn, !monitorAllowed);
+        setElementHidden(agentModeBtn, !agentAllowed);
+
+        if (AUTH_ENABLED && authCurrentUser && !canUseMode(currentMode)) {
+            setMode(firstAllowedMode());
+        }
+
+        const canCapture = userHasPermission('capture:manage');
+        const canPromptManage = userHasPermission('prompts:manage');
+        const canProbeRun = userHasPermission('probes:run');
+        const canProbeManage = userHasPermission('probes:manage');
+        const canDiagnostics = userHasPermission('diagnostics:view');
+        const canModelsManage = userHasPermission('models:manage');
+        const canBookmarks = userHasPermission('bookmarks:create');
+
+        [
+            luxriotToggleCaptureBtn,
+            luxriotFlushCaptureBtn,
+            luxriotStopAllVideoBtn,
+            luxriotStopAllAnalyticsBtn,
+            probeStreamToggleBtn,
+        ].forEach((element) => {
+            setElementHidden(element, !canCapture);
+            setControlDisabled(element, !canCapture);
+        });
+        setElementHidden(luxriotPromptSettingsBtn, !canPromptManage);
+        setControlDisabled(luxriotPromptSettingsBtn, !canPromptManage);
+        setControlDisabled(luxriotPromptApplyBtn, !canPromptManage);
+        [luxriotBookmarkEnabledInput, luxriotBookmarkCooldownInput].forEach((element) => {
+            setControlDisabled(element, !canBookmarks || !canPromptManage);
+        });
+        luxriotPromptTabButtons.forEach((button) => {
+            const tab = String(button.dataset.luxriotPromptTab || '').trim().toLowerCase();
+            if (tab === 'json') setElementHidden(button, !canBookmarks);
+        });
+        if (!canBookmarks && String(luxriotPromptModalTab || '').trim().toLowerCase() === 'json') {
+            setLuxriotPromptModalTab('stream');
+        }
+        setPermissionHidden(saveSummaryBtn, !canBookmarks);
+        setControlDisabled(saveSummaryBtn, !canBookmarks);
+
+        [probeRunBtn, probeImageEnableToggle].forEach((element) => {
+            setElementHidden(element, !canProbeRun);
+            setControlDisabled(element, !canProbeRun);
+        });
+        [
+            probeSaveBtn,
+            probeCastBtn,
+            probeDeleteBtn,
+            probeEditBtn,
+            probeNewBtn,
+            probeSnapUseBtn,
+            probeRoiToggleBtn,
+            probeRoiClearBtn,
+        ].forEach((element) => {
+            setElementHidden(element, !canProbeManage);
+            setControlDisabled(element, !canProbeManage);
+        });
+        setElementHidden(probeBenchBtn, !canDiagnostics);
+        setControlDisabled(probeBenchBtn, !canDiagnostics);
+        [
+            probeBookmarkToggle,
+            probeBookmarkSeverityInput,
+            probeBookmarkCooldownLocalInput,
+            probeBookmarkDedupeWindowLocalInput,
+        ].forEach((element) => {
+            setControlDisabled(element, !canBookmarks || !canProbeManage);
+        });
+
+        setElementHidden(agentCreateSkillBtn, !canPromptManage);
+        setControlDisabled(agentCreateSkillBtn, !canPromptManage);
+        setControlDisabled(agentSkillSaveBtn, !canPromptManage);
+        setControlDisabled(agentModelApplyBtn, !canModelsManage);
+        if (agentModelInput) {
+            agentModelInput.title = canModelsManage ? '' : 'Model changes require models:manage.';
+        }
+
+        syncSettingsAccess();
+    }
+
     function setAuditStatus(message = '', type = '') {
         if (!auditEventsStatus) return;
         auditEventsStatus.textContent = message;
@@ -3166,11 +3760,156 @@
         return parsed;
     }
 
+    function selectedAdminChannelsFromInput() {
+        try {
+            return parseAllowedChannelsText(adminAllowedChannelsInput ? adminAllowedChannelsInput.value : '');
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function normalizeAdminChannelCatalog(channels = []) {
+        const seen = new Set();
+        return (Array.isArray(channels) ? channels : [])
+            .map((channel) => {
+                const id = Number.parseInt(String(channel?.channel_id ?? channel?.id ?? ''), 10);
+                if (!Number.isFinite(id) || id <= 0 || seen.has(id)) return null;
+                seen.add(id);
+                return {
+                    id,
+                    label: normalizeLuxriotChannelName(channel, id),
+                };
+            })
+            .filter((channel) => Boolean(channel))
+            .sort((left, right) => left.id - right.id);
+    }
+
+    function renderAdminChannelPicker(selectedChannels = null) {
+        if (!adminChannelList) return;
+        const selected = Array.isArray(selectedChannels) ? selectedChannels : selectedAdminChannelsFromInput();
+        const allSelected = selected.some((value) => String(value).trim() === '*');
+        const selectedSet = new Set(selected.map((value) => String(value).trim()));
+        if (!adminChannelCatalog.length) {
+            adminChannelList.innerHTML = '<div class="admin-empty">Channel list unavailable. Use IDs above.</div>';
+            return;
+        }
+        adminChannelList.innerHTML = adminChannelCatalog.map((channel) => {
+            const value = String(channel.id);
+            const checked = allSelected || selectedSet.has(value) ? ' checked' : '';
+            return `
+                <label class="admin-channel-item" title="${escapeHtml(channel.label)}">
+                    <input type="checkbox" value="${escapeHtml(value)}"${checked} />
+                    <span class="admin-channel-id">#${escapeHtml(value)}</span>
+                    <span class="admin-channel-name">${escapeHtml(channel.label)}</span>
+                </label>
+            `;
+        }).join('');
+    }
+
+    function setAdminChannelCatalog(channels = []) {
+        adminChannelCatalog = normalizeAdminChannelCatalog(channels);
+        renderAdminChannelPicker();
+    }
+
+    function syncAdminChannelTextFromPicker() {
+        if (!adminChannelList || !adminAllowedChannelsInput) return;
+        const checked = Array.from(adminChannelList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((input) => Number.parseInt(String(input.value || ''), 10))
+            .filter((id) => Number.isFinite(id) && id > 0);
+        if (checked.length && checked.length === adminChannelCatalog.length) {
+            adminAllowedChannelsInput.value = '*';
+        } else {
+            adminAllowedChannelsInput.value = checked.join(', ');
+        }
+        renderAdminChannelPicker(checked.length === adminChannelCatalog.length ? ['*'] : checked);
+    }
+
+    function syncAdminChannelPickerFromText() {
+        if (!adminAllowedChannelsInput) return;
+        try {
+            renderAdminChannelPicker(parseAllowedChannelsText(adminAllowedChannelsInput.value));
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        }
+    }
+
+    async function loadAdminChannelCatalog(force = false) {
+        if (!adminChannelList) return;
+        if (!force && adminChannelCatalog.length) {
+            renderAdminChannelPicker();
+            return;
+        }
+        adminChannelList.innerHTML = '<div class="admin-empty">Loading channels...</div>';
+        try {
+            const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`, { cache: 'no-store' });
+            const data = await parseApiJson(response, 'Failed to load channels');
+            setAdminChannelCatalog(data.channels || []);
+            if (!adminChannelCatalog.length) {
+                adminChannelList.innerHTML = '<div class="admin-empty">No channels returned by Luxriot.</div>';
+            }
+        } catch (error) {
+            adminChannelCatalog = [];
+            adminChannelList.innerHTML = `<div class="admin-empty">Channel list failed: ${escapeHtml(error.message || String(error))}</div>`;
+        }
+    }
+
     function formatDateTime(value) {
         if (!value) return 'n/a';
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return String(value);
         return date.toLocaleString();
+    }
+
+    function currentAdminUserId() {
+        return authCurrentUser ? String(authCurrentUser.id || '') : '';
+    }
+
+    function selectedAdminUser() {
+        if (!selectedAdminUserId) return null;
+        return adminUsers.find((item) => String(item.id || '') === selectedAdminUserId) || null;
+    }
+
+    function selectedAdminUserIsSelf(user = selectedAdminUser()) {
+        const currentUserId = currentAdminUserId();
+        return Boolean(user && currentUserId && String(user.id || '') === currentUserId);
+    }
+
+    function setAdminUserStateSummary(user = null) {
+        if (!adminUserStateSummary) return;
+        if (!user || !user.id) {
+            adminUserStateSummary.classList.add('is-hidden');
+            adminUserStateSummary.innerHTML = '';
+            return;
+        }
+        const active = Boolean(user.isActive);
+        const self = selectedAdminUserIsSelf(user);
+        const statusClass = active ? 'active' : 'inactive';
+        const statusText = active ? 'Active' : 'Disabled';
+        const selfText = self ? 'Current session account' : 'Managed account';
+        adminUserStateSummary.classList.remove('is-hidden');
+        adminUserStateSummary.innerHTML = `
+            <span class="admin-user-status-badge ${statusClass}">${statusText}</span>
+            <span>${escapeHtml(selfText)}</span>
+        `;
+    }
+
+    function syncAdminUserActionButtons(user = selectedAdminUser()) {
+        const isExisting = Boolean(user && user.id);
+        const isSelf = selectedAdminUserIsSelf(user);
+        if (adminUserResetPasswordBtn) {
+            adminUserResetPasswordBtn.disabled = !isExisting;
+        }
+        if (adminUserToggleActiveBtn) {
+            adminUserToggleActiveBtn.disabled = !isExisting || (isSelf && Boolean(user?.isActive));
+            adminUserToggleActiveBtn.textContent = user && !user.isActive ? 'Enable User' : 'Disable User';
+            adminUserToggleActiveBtn.classList.toggle('danger', !user || Boolean(user.isActive));
+            adminUserToggleActiveBtn.title = isSelf && Boolean(user?.isActive)
+                ? 'Cannot disable the current account.'
+                : '';
+        }
+        if (adminUserRevokeBtn) {
+            adminUserRevokeBtn.disabled = !isExisting;
+        }
     }
 
     function selectedAdminRoles() {
@@ -3218,13 +3957,13 @@
         renderAdminRoles(isExisting ? (user.roles || []) : ['viewer']);
         if (adminAllowedChannelsInput) {
             adminAllowedChannelsInput.value = isExisting ? formatAllowedChannels(user.allowedChannelIds || []) : '*';
+            syncAdminChannelPickerFromText();
         }
         if (adminUserActiveInput) {
             adminUserActiveInput.checked = isExisting ? Boolean(user.isActive) : true;
         }
-        if (adminUserRevokeBtn) {
-            adminUserRevokeBtn.disabled = !isExisting;
-        }
+        setAdminUserStateSummary(isExisting ? user : null);
+        syncAdminUserActionButtons(isExisting ? user : null);
         renderAdminUsers();
     }
 
@@ -3240,11 +3979,15 @@
             const selected = id && id === selectedAdminUserId ? ' selected' : '';
             const inactive = user.isActive ? '' : ' inactive';
             const selfBadge = id && id === currentUserId ? '<span class="admin-user-badge">you</span>' : '';
+            const stateBadge = user.isActive
+                ? '<span class="admin-user-status-badge active">active</span>'
+                : '<span class="admin-user-status-badge inactive">disabled</span>';
             const channels = formatAllowedChannels(user.allowedChannelIds || []) || 'none';
             return `
                 <button type="button" class="admin-user-row${selected}${inactive}" data-user-id="${escapeHtml(id)}">
                     <span class="admin-user-main">
                         <span class="admin-user-name">${escapeHtml(user.username || id)}</span>
+                        ${stateBadge}
                         ${selfBadge}
                     </span>
                     <span class="admin-user-meta">${escapeHtml((user.roles || []).join(', ') || 'no roles')} · channels ${escapeHtml(channels)}</span>
@@ -3337,6 +4080,7 @@
         setAdminUsersStatus('Loading users...', 'loading');
         try {
             await loadAdminRoles();
+            await loadAdminChannelCatalog(false);
             await Promise.all([loadAdminUsers(), loadAdminSessions()]);
             setAdminUsersStatus(`Loaded ${adminUsers.length} users and ${adminSessions.length} sessions.`, 'success');
         } catch (error) {
@@ -3346,6 +4090,26 @@
             }
             setAdminUsersStatus(message, 'error');
         }
+    }
+
+    function adminUserLabel(user = selectedAdminUser()) {
+        if (!user) return selectedAdminUserId || 'selected user';
+        return user.username || user.displayName || user.id || 'selected user';
+    }
+
+    async function refreshAdminIdentityPanels() {
+        await Promise.all([loadAdminUsers(), loadAdminSessions()]);
+    }
+
+    async function patchAdminUser(userId, payload, errorMessage = 'Failed to update user') {
+        const clean = String(userId || '').trim();
+        if (!clean) throw new Error('Select a user first.');
+        const response = await fetch(`/auth/users/${encodeURIComponent(clean)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        return parseApiJson(response, errorMessage);
     }
 
     async function saveAdminUser() {
@@ -3369,7 +4133,12 @@
             allowedChannelIds,
             isActive: adminUserActiveInput ? adminUserActiveInput.checked : true,
         };
+        const existingUser = selectedAdminUser();
         if (selectedAdminUserId) {
+            if (!existingUser) {
+                setAdminUsersStatus('Selected user was not found. Refresh and try again.', 'error');
+                return;
+            }
             if (password) payload.password = password;
         } else {
             payload.username = adminUsernameInput ? adminUsernameInput.value.trim() : '';
@@ -3377,6 +4146,25 @@
             if (!payload.username || !payload.password) {
                 setAdminUsersStatus('Username and password are required for a new user.', 'error');
                 return;
+            }
+        }
+        if (existingUser) {
+            const warnings = [];
+            if (existingUser.isActive && !payload.isActive) {
+                if (selectedAdminUserIsSelf(existingUser)) {
+                    setAdminUsersStatus('You cannot disable your own active account.', 'error');
+                    return;
+                }
+                warnings.push('disable the account and revoke active sessions');
+            }
+            if (password) {
+                warnings.push('reset the password and revoke active sessions');
+            }
+            if (warnings.length) {
+                const label = adminUserLabel(existingUser);
+                if (!window.confirm(`Save changes for ${label}? This will ${warnings.join(' and ')}.`)) {
+                    return;
+                }
             }
         }
 
@@ -3395,12 +4183,84 @@
                 selectedAdminUserId = String(saved.id);
             }
             if (adminPasswordInput) adminPasswordInput.value = '';
-            await loadAdminUsers();
+            await refreshAdminIdentityPanels();
             setAdminUsersStatus('User saved.', 'success');
         } catch (error) {
             setAdminUsersStatus(error.message || String(error), 'error');
         } finally {
             setButtonBusy(adminUserSaveBtn, false);
+        }
+    }
+
+    async function resetSelectedAdminUserPassword() {
+        if (!syncAdminUsersAccess()) return;
+        const user = selectedAdminUser();
+        if (!user || !selectedAdminUserId) {
+            setAdminUsersStatus('Select a user first.', 'error');
+            return;
+        }
+        const password = adminPasswordInput ? adminPasswordInput.value : '';
+        if (!password) {
+            setAdminUsersStatus('Enter a replacement password first.', 'error');
+            return;
+        }
+        const label = adminUserLabel(user);
+        if (!window.confirm(`Reset password for ${label}? Active sessions will be revoked.`)) return;
+
+        setButtonBusy(adminUserResetPasswordBtn, true);
+        setAdminUsersStatus('Resetting password...', 'loading');
+        try {
+            await patchAdminUser(
+                selectedAdminUserId,
+                { password },
+                'Failed to reset password'
+            );
+            if (adminPasswordInput) adminPasswordInput.value = '';
+            await refreshAdminIdentityPanels();
+            setAdminUsersStatus('Password reset. Active sessions revoked.', 'success');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        } finally {
+            setButtonBusy(adminUserResetPasswordBtn, false);
+        }
+    }
+
+    async function toggleSelectedAdminUserActive() {
+        if (!syncAdminUsersAccess()) return;
+        const user = selectedAdminUser();
+        if (!user || !selectedAdminUserId) {
+            setAdminUsersStatus('Select a user first.', 'error');
+            return;
+        }
+        const nextActive = !Boolean(user.isActive);
+        const label = adminUserLabel(user);
+        if (!nextActive && selectedAdminUserIsSelf(user)) {
+            setAdminUsersStatus('You cannot disable your own active account.', 'error');
+            return;
+        }
+        const message = nextActive
+            ? `Enable ${label}?`
+            : `Disable ${label}? Active sessions will be revoked.`;
+        if (!window.confirm(message)) return;
+
+        setButtonBusy(adminUserToggleActiveBtn, true);
+        setAdminUsersStatus(nextActive ? 'Enabling user...' : 'Disabling user...', 'loading');
+        try {
+            const data = await patchAdminUser(
+                selectedAdminUserId,
+                { isActive: nextActive },
+                nextActive ? 'Failed to enable user' : 'Failed to disable user'
+            );
+            const saved = data.user || null;
+            if (saved && saved.id) {
+                selectedAdminUserId = String(saved.id);
+            }
+            await refreshAdminIdentityPanels();
+            setAdminUsersStatus(nextActive ? 'User enabled.' : 'User disabled. Active sessions revoked.', 'success');
+        } catch (error) {
+            setAdminUsersStatus(error.message || String(error), 'error');
+        } finally {
+            setButtonBusy(adminUserToggleActiveBtn, false);
         }
     }
 
@@ -3573,8 +4433,47 @@
         return `${(value * 100).toFixed(1)}%`;
     }
 
+    function parseArchiveLocalDateTimeMs(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return null;
+        const parsed = new Date(raw);
+        const ms = parsed.getTime();
+        return Number.isFinite(ms) ? ms : null;
+    }
+
+    function readArchiveTimeWindow() {
+        const sinceMs = parseArchiveLocalDateTimeMs(archiveFromTimeInput ? archiveFromTimeInput.value : '');
+        const untilMs = parseArchiveLocalDateTimeMs(archiveToTimeInput ? archiveToTimeInput.value : '');
+        if (sinceMs !== null && untilMs !== null && sinceMs > untilMs) {
+            throw new Error('Archive time window is invalid: From is later than To.');
+        }
+        return {
+            since_ms: sinceMs,
+            until_ms: untilMs,
+            absolute: sinceMs !== null || untilMs !== null,
+        };
+    }
+
+    function applyArchiveTimeFilters(target) {
+        const window = readArchiveTimeWindow();
+        if (window.since_ms !== null) {
+            target.set ? target.set('since_ms', String(window.since_ms)) : (target.since_ms = window.since_ms);
+        }
+        if (window.until_ms !== null) {
+            target.set ? target.set('until_ms', String(window.until_ms)) : (target.until_ms = window.until_ms);
+        }
+        if (!window.absolute) {
+            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+            const parsedHours = Number.parseFloat(hoursRaw);
+            target.set
+                ? target.set('hours', Number.isFinite(parsedHours) && parsedHours > 0 ? String(parsedHours) : '0')
+                : (target.hours = Number.isFinite(parsedHours) ? parsedHours : 24);
+        }
+        return window;
+    }
+
     function normalizeArchiveThresholdPercent(value) {
-        const parsed = Number.parseInt(value, 10);
+        const parsed = Number.parseFloat(value);
         return Math.min(100, Math.max(0, Number.isFinite(parsed) ? parsed : 0));
     }
 
@@ -3598,6 +4497,41 @@
         return null;
     }
 
+    function formatArchiveScoreValue(score) {
+        if (!Number.isFinite(score)) return 'n/a';
+        return score.toFixed(3);
+    }
+
+    function computeArchiveScoreRange(results) {
+        const scores = (Array.isArray(results) ? results : [])
+            .map(getArchiveResultScore)
+            .filter((score) => Number.isFinite(score))
+            .sort((a, b) => a - b);
+        if (!scores.length) {
+            return { count: 0, min: null, max: null, hasSpread: false };
+        }
+        const min = scores[0];
+        const max = scores[scores.length - 1];
+        return {
+            count: scores.length,
+            min,
+            max,
+            hasSpread: (max - min) > 0.000001,
+        };
+    }
+
+    function archiveThresholdFromSlider(percent) {
+        const sliderPercent = normalizeArchiveThresholdPercent(percent);
+        if (sliderPercent <= 0 || !archiveScoreRange.hasSpread) return 0;
+        return archiveScoreRange.min + ((archiveScoreRange.max - archiveScoreRange.min) * (sliderPercent / 100));
+    }
+
+    function refreshArchiveScoreScale(results) {
+        archiveScoreRange = computeArchiveScoreRange(results);
+        archiveScoreThreshold = archiveThresholdFromSlider(archiveScoreSliderPercent);
+        updateArchiveThresholdUi();
+    }
+
     function archiveResultPassesThreshold(result) {
         if (archiveScoreThreshold <= 0) return true;
         const score = getArchiveResultScore(result);
@@ -3611,12 +4545,21 @@
     }
 
     function updateArchiveThresholdUi() {
-        const percent = Math.round(archiveScoreThreshold * 100);
+        const percent = Math.round(archiveScoreSliderPercent);
         if (archiveScoreThresholdInput) {
             archiveScoreThresholdInput.value = String(percent);
+            archiveScoreThresholdInput.disabled = !archiveScoreRange.hasSpread;
         }
         if (archiveScoreThresholdValue) {
-            archiveScoreThresholdValue.textContent = `${percent}%`;
+            if (!archiveScoreRange.count) {
+                archiveScoreThresholdValue.textContent = 'No scores';
+            } else if (!archiveScoreRange.hasSpread) {
+                archiveScoreThresholdValue.textContent = `All @ ${formatArchiveScoreValue(archiveScoreRange.min)}`;
+            } else if (archiveScoreThreshold <= 0) {
+                archiveScoreThresholdValue.textContent = 'All';
+            } else {
+                archiveScoreThresholdValue.textContent = `≥ ${formatArchiveScoreValue(archiveScoreThreshold)}`;
+            }
         }
     }
 
@@ -3624,13 +4567,10 @@
         updateArchiveThresholdUi();
         const items = Array.from(document.querySelectorAll('#results .result-item'));
         let visibleCount = 0;
-        let scoredCount = 0;
         let firstVisibleIndex = -1;
         items.forEach((item) => {
             const index = Number.parseInt(item.dataset.resultIndex || '-1', 10);
             const result = archiveRenderedResults[index];
-            const score = getArchiveResultScore(result);
-            if (Number.isFinite(score)) scoredCount += 1;
             const visible = archiveResultPassesThreshold(result);
             item.classList.toggle('is-score-hidden', !visible);
             if (visible) {
@@ -3640,13 +4580,16 @@
         });
         if (archiveScoreThresholdMeta) {
             const total = archiveRenderedResults.length;
-            const percent = Math.round(archiveScoreThreshold * 100);
             if (!total) {
                 archiveScoreThresholdMeta.textContent = 'No results loaded.';
+            } else if (!archiveScoreRange.count) {
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results. No match scores in this batch.`;
+            } else if (!archiveScoreRange.hasSpread) {
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results. All scored matches are ${formatArchiveScoreValue(archiveScoreRange.min)}.`;
             } else if (archiveScoreThreshold <= 0) {
-                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results. ${scoredCount} have match scores.`;
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results. Range ${formatArchiveScoreValue(archiveScoreRange.min)}-${formatArchiveScoreValue(archiveScoreRange.max)}.`;
             } else {
-                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results at ${percent}%+ match.`;
+                archiveScoreThresholdMeta.textContent = `Showing ${visibleCount}/${total} results at ≥ ${formatArchiveScoreValue(archiveScoreThreshold)} (${Math.round(archiveScoreSliderPercent)}% of current range ${formatArchiveScoreValue(archiveScoreRange.min)}-${formatArchiveScoreValue(archiveScoreRange.max)}).`;
             }
         }
         if (!archiveRenderedResults.length) return;
@@ -3663,7 +4606,8 @@
 
     function setArchiveScoreThresholdFromInput(value) {
         const percent = normalizeArchiveThresholdPercent(value);
-        archiveScoreThreshold = percent / 100;
+        archiveScoreSliderPercent = percent;
+        archiveScoreThreshold = archiveThresholdFromSlider(percent);
         applyArchiveScoreThreshold();
     }
 
@@ -3677,6 +4621,10 @@
 
         if (result && result.is_detection) {
             const probeName = String(result.probe_name || result.probe_id || result.filename || 'n/a').trim() || 'n/a';
+            const sourceRaw = String(result.source || '').trim().toLowerCase();
+            const logicalSource = archiveLogicalSource(sourceRaw);
+            const sourceLabel = archiveSourceLabel(sourceRaw, result.source_label);
+            const origin = String(result.origin || result.runtime_source || result?.payload?.origin || result?.payload?.source || '').trim();
             const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
             const channelId = parseInt(String(result.channel_id ?? ''), 10);
             const channelName = Number.isFinite(channelId) ? getLuxriotChannelLabel(channelId) : (
@@ -3694,11 +4642,17 @@
             const safeProbeName = escapeHtml(probeName);
             const lines = [
                 `<div class="metric-line metric-line-wrap"><span class="metric-label">Name:</span> <span class="metric-value metric-stream-name" title="${safeProbeName}">${safeProbeName}</span></div>`,
+                `<div class="metric-line"><span class="metric-label">Source:</span> ${escapeHtml(sourceLabel)}</div>`,
                 `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
                 `<div class="metric-line metric-line-wrap"><span class="metric-label">Stream:</span> <span class="metric-value metric-stream-name" title="${safeChannelName}">${safeChannelName}</span></div>`,
                 `<div class="metric-line"><span class="metric-label">Severity:</span> <span class="metric-value">${sev}</span></div>`,
-                `<div class="metric-line"><span class="metric-label">Probe:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
             ];
+            if (origin && origin !== sourceRaw && origin !== logicalSource) {
+                lines.push(`<div class="metric-line"><span class="metric-label">Origin:</span> ${escapeHtml(origin)}</div>`);
+            }
+            if (logicalSource === 'probe') {
+                lines.push(`<div class="metric-line metric-line-scores"><span class="metric-label">Scores:</span> <span class="metric-score metric-score-pos">P ${escapeHtml(pos)}</span> <span class="metric-score metric-score-neg">N ${escapeHtml(neg)}</span> <span class="metric-score metric-score-margin">M ${escapeHtml(margin)}</span></div>`);
+            }
             if (similarity) {
                 const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
                 lines.push(`<div class="metric-line"><span class="metric-label">Match:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
@@ -3748,7 +4702,16 @@
         if (!result || typeof result !== 'object') return '';
         const badges = [];
         if (result.is_detection) {
-            badges.push({ label: 'Detection', classes: '' });
+            const source = archiveLogicalSource(result.source);
+            if (source === 'vlm_summary') {
+                badges.push({ label: 'Video description', classes: 'mode-clip' });
+            } else if (source === 'vlm_alert') {
+                badges.push({ label: 'VLM alert', classes: 'warning' });
+            } else if (source === 'probe') {
+                badges.push({ label: 'Probe hit', classes: '' });
+            } else {
+                badges.push({ label: 'Archive frame', classes: '' });
+            }
         }
 
         const modeRaw = String(result.search_mode || '').trim().toLowerCase();
@@ -3808,6 +4771,31 @@
         }
     }
 
+    function archiveLogicalSource(source) {
+        const normalized = String(source || '').trim().toLowerCase();
+        if (['probe', 'probes_run', 'probes_query', 'probe_daemon'].includes(normalized)) return 'probe';
+        if (['vlm_summary', 'video_description', 'video_descriptions'].includes(normalized)) return 'vlm_summary';
+        if (['vlm_alert', 'alert', 'alerts'].includes(normalized)) return 'vlm_alert';
+        return normalized;
+    }
+
+    function archiveSourceLabel(source, fallbackLabel = '') {
+        const normalized = archiveLogicalSource(source);
+        if (normalized === 'probe') return 'Probe hit';
+        if (normalized === 'vlm_summary') return 'Video description';
+        if (normalized === 'vlm_alert') return 'VLM alert';
+        if (fallbackLabel) return String(fallbackLabel);
+        return normalized || 'Archive frame';
+    }
+
+    function archiveSourcePluralLabel(source) {
+        const normalized = archiveLogicalSource(source);
+        if (normalized === 'probe') return 'probe hits';
+        if (normalized === 'vlm_summary') return 'video descriptions';
+        if (normalized === 'vlm_alert') return 'VLM alerts';
+        return 'archive items';
+    }
+
     function applySelectOptions(selectEl, options, selected = '') {
         if (!selectEl) return;
         const previous = selected || selectEl.value || '';
@@ -3841,14 +4829,19 @@
         if (!archiveProbeFilter) return;
         try {
             const params = new URLSearchParams({ hours: '168', limit: '300' });
+            applyArchiveTimeFilters(params);
             const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+            const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
             if (channelId) {
                 params.set('channel_id', channelId);
             }
+            if (source) {
+                params.set('source', source);
+            }
             const response = await fetch(`/detections/summary?${params.toString()}`);
-            const data = await parseApiJson(response, 'Failed to load detection probes');
+            const data = await parseApiJson(response, 'Failed to load archive items');
             const summary = Array.isArray(data.summary) ? data.summary : [];
-            const options = [{ value: '', label: 'All probes' }];
+            const options = [{ value: '', label: `All ${archiveSourcePluralLabel(source)}` }];
             summary.forEach((item) => {
                 const id = String(item.probe_id || '').trim();
                 if (!id) return;
@@ -3888,6 +4881,10 @@
                 neg_score: Number.isFinite(det?.neg_score) ? det.neg_score : _coerceNumeric(det?.neg_score),
                 margin: Number.isFinite(det?.margin) ? det.margin : _coerceNumeric(det?.margin),
                 source: det?.source || '',
+                source_label: det?.source_label || '',
+                archive_item_type: det?.archive_item_type || '',
+                origin: det?.origin || det?.payload?.origin || det?.payload?.source || '',
+                payload: det?.payload || null,
                 _raw_index: idx,
             };
         });
@@ -3907,49 +4904,60 @@
         updateArchiveDetectionsNav();
         const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
         const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
-        const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+        const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
         const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
         const params = new URLSearchParams();
-        const parsedHours = Number.parseFloat(hoursRaw);
-        if (Number.isFinite(parsedHours) && parsedHours > 0) {
-            params.set('hours', String(parsedHours));
-        } else {
-            params.set('hours', '0');
+        let timeWindow;
+        try {
+            timeWindow = applyArchiveTimeFilters(params);
+        } catch (error) {
+            resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(error.message)}</div>`;
+            setArchiveDetectionsMeta(error.message, true);
+            renderArchiveInspectorEmpty(error.message);
+            updateArchiveDetectionsNav();
+            return;
         }
         if (channelId) params.set('channel_id', channelId);
         if (probeId) params.set('probe_id', probeId);
+        if (source) params.set('source', source);
         const limit = Number.parseInt(limitRaw, 10);
         params.set('limit', String(Number.isFinite(limit) ? limit : 24));
         params.set('offset', String(Math.max(0, archiveDetectionsOffset)));
 
-        resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading detections archive...</div>';
-        setArchiveDetectionsMeta('Loading detections...');
-        renderArchiveInspectorEmpty('Loading detections archive...');
+        resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading frame archive...</div>';
+        setArchiveDetectionsMeta('Loading archive frames...');
+        renderArchiveInspectorEmpty('Loading frame archive...');
         try {
             const response = await fetch(`/detections/list?${params.toString()}`);
-            const data = await parseApiJson(response, 'Failed to load detections archive');
+            const data = await parseApiJson(response, 'Failed to load frame archive');
             const detections = Array.isArray(data.detections) ? data.detections : [];
             archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
             archiveDetectionsHasMore = Boolean(data.has_more);
             const mapped = normalizeDetectionResults(detections);
             if (!mapped.length) {
                 archiveRenderedResults = [];
+                refreshArchiveScoreScale(archiveRenderedResults);
                 applyArchiveScoreThreshold();
-                resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
-                setArchiveDetectionsMeta('No detections found for selected filters.');
-                renderArchiveInspectorEmpty('No detections found for the selected filters.');
+                resultsContainer.innerHTML = '<div class="loading">No archive frames found for selected filters.</div>';
+                setArchiveDetectionsMeta('No archive frames found for selected filters.');
+                renderArchiveInspectorEmpty('No archive frames found for the selected filters.');
                 updateArchiveDetectionsNav();
                 return;
             }
             displayResults(mapped);
             const shownFrom = archiveDetectionsOffset + 1;
             const shownTo = archiveDetectionsOffset + mapped.length;
-            setArchiveDetectionsMeta(`Showing detections ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}.`);
+            const windowNote = timeWindow.absolute ? ' in selected time window' : '';
+            setArchiveDetectionsMeta(`Showing archive frames ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}${windowNote}.`);
             updateArchiveDetectionsNav();
         } catch (err) {
-            resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
-            setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
-            renderArchiveInspectorEmpty(`Detections archive error: ${err.message || String(err)}`);
+            const payload = err && err.payload ? err.payload : {};
+            const message = payload.not_ready === 'archive_store'
+                ? `Archive storage is not migrated yet. Apply database migration ${payload.required_revision || '20260612_0005'} and reload.`
+                : (err.message || String(err));
+            resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(message)}</div>`;
+            setArchiveDetectionsMeta(`Error loading archive frames: ${message}`, true);
+            renderArchiveInspectorEmpty(`Frame archive error: ${message}`);
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
         }
@@ -3959,15 +4967,11 @@
         const payload = {};
         const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
         const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
-        const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
+        const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
         if (channelId) payload.channel_id = channelId;
         if (probeId) payload.probe_id = probeId;
-        const parsedHours = Number.parseFloat(hoursRaw);
-        if (Number.isFinite(parsedHours)) {
-            payload.hours = parsedHours;
-        } else {
-            payload.hours = 24;
-        }
+        if (source) payload.source = source;
+        applyArchiveTimeFilters(payload);
         return payload;
     }
 
@@ -3979,12 +4983,11 @@
         if (searchScopeSelect && searchScopeSelect.value !== 'detections') {
             searchScopeSelect.value = 'detections';
         }
-        if (!searchScopeSelect) return;
         if (isDetectionsScope()) {
             if (searchInput) {
-                searchInput.placeholder = 'Describe detection scene (filtered by stream/probe/time)...';
+                searchInput.placeholder = 'Describe archived scene (filtered by stream/source/time)...';
             }
-            setArchiveDetectionsMeta('Detection archive active: text/image search runs over filtered detection shards.');
+            setArchiveDetectionsMeta('Archive active: text/image search runs over filtered frame shards.');
         } else if (searchInput) {
             searchInput.placeholder = "Describe what you're looking for...";
         }
@@ -4001,6 +5004,7 @@
                     await fetch('/auth/logout', { method: 'POST' });
                 } finally {
                     authCurrentUser = null;
+                    syncUiAccess();
                     setAuthGateVisible(true);
                 }
                 return;
@@ -4021,25 +5025,32 @@
         });
         authTokenBtn.style.opacity = AUTH_ENABLED || getAdminToken() ? '1' : '0.6';
     }
-    
+    syncUiAccess();
+
     // Settings modal functionality
     settingsNavButtons.forEach((btn) => {
         btn.addEventListener('click', () => {
+            if (btn.classList.contains('is-hidden')) return;
             const targetId = btn.dataset.settingsTarget;
             if (!targetId) return;
             scrollSettingsSectionIntoView(targetId);
         });
     });
 
-    settingsBtn.addEventListener('click', () => {
+    if (settingsBtn) settingsBtn.addEventListener('click', () => {
+        if (!syncSettingsAccess()) return;
         settingsModal.style.display = 'block';
         if (settingsStatus) {
             settingsStatus.textContent = '';
             settingsStatus.className = 'settings-status';
             settingsStatus.style.display = 'none';
         }
-        loadSettings();
-        loadEnvEditor();
+        if (userHasAnyPermission(['settings:view', 'settings:manage'])) {
+            loadSettings();
+        }
+        if (userHasPermission('settings:manage')) {
+            loadEnvEditor();
+        }
         if (syncAdminUsersAccess()) {
             loadAdminConsole();
         }
@@ -4049,7 +5060,7 @@
         if (settingsScrollArea) {
             settingsScrollArea.scrollTop = 0;
         }
-        const firstTarget = settingsNavButtons[0]?.dataset.settingsTarget;
+        const firstTarget = firstVisibleSettingsTarget();
         if (firstTarget) {
             setActiveSettingsNav(firstTarget);
         }
@@ -4118,9 +5129,53 @@
             }
         });
     }
+    if (adminAllowedChannelsInput) {
+        adminAllowedChannelsInput.addEventListener('change', () => {
+            syncAdminChannelPickerFromText();
+        });
+    }
+    if (adminChannelList) {
+        adminChannelList.addEventListener('change', (event) => {
+            const checkbox = event.target.closest('input[type="checkbox"]');
+            if (!checkbox) return;
+            syncAdminChannelTextFromPicker();
+        });
+    }
+    if (adminChannelsAllBtn) {
+        adminChannelsAllBtn.addEventListener('click', () => {
+            if (adminAllowedChannelsInput) adminAllowedChannelsInput.value = '*';
+            renderAdminChannelPicker(['*']);
+        });
+    }
+    if (adminChannelsNoneBtn) {
+        adminChannelsNoneBtn.addEventListener('click', () => {
+            if (adminAllowedChannelsInput) adminAllowedChannelsInput.value = '';
+            renderAdminChannelPicker([]);
+        });
+    }
+    if (adminChannelsRefreshBtn) {
+        adminChannelsRefreshBtn.addEventListener('click', async () => {
+            setButtonBusy(adminChannelsRefreshBtn, true);
+            try {
+                await loadAdminChannelCatalog(true);
+            } finally {
+                setButtonBusy(adminChannelsRefreshBtn, false);
+            }
+        });
+    }
     if (adminUserSaveBtn) {
         adminUserSaveBtn.addEventListener('click', () => {
             saveAdminUser();
+        });
+    }
+    if (adminUserResetPasswordBtn) {
+        adminUserResetPasswordBtn.addEventListener('click', () => {
+            resetSelectedAdminUserPassword();
+        });
+    }
+    if (adminUserToggleActiveBtn) {
+        adminUserToggleActiveBtn.addEventListener('click', () => {
+            toggleSelectedAdminUserActive();
         });
     }
     if (adminUserRevokeBtn) {
@@ -4276,6 +5331,25 @@
         refreshSegmentsPanels();
     });
 
+    [
+        luxriotBatchSizeSelect,
+        luxriotSnapshotIntervalInput,
+        luxriotSummaryRetentionDaysInput,
+        luxriotSummaryHistoryLimitInput,
+        archiveRetentionEnabledInput,
+        archiveRowRetentionDaysInput,
+        archiveThumbnailRetentionDaysInput,
+        archiveMaxRecordsInput,
+        archiveEstimateChannelsInput,
+        archiveEstimateFramesPerBatchInput,
+        archiveEstimateAvgJpegKbInput,
+        archiveEstimateProbeRowsInput
+    ].forEach((control) => {
+        if (!control) return;
+        control.addEventListener('input', scheduleArchiveCapacityEstimate);
+        control.addEventListener('change', scheduleArchiveCapacityEstimate);
+    });
+
     async function loadEnvEditor() {
         if (!envEditorInput) return;
         try {
@@ -4316,6 +5390,96 @@
         }
     }
 
+    function formatArchiveBytes(bytes) {
+        const value = Number(bytes);
+        if (!Number.isFinite(value) || value <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        let scaled = value;
+        let unitIndex = 0;
+        while (scaled >= 1024 && unitIndex < units.length - 1) {
+            scaled /= 1024;
+            unitIndex += 1;
+        }
+        const digits = scaled >= 100 || unitIndex === 0 ? 0 : (scaled >= 10 ? 1 : 2);
+        return `${scaled.toFixed(digits)} ${units[unitIndex]}`;
+    }
+
+    function formatArchiveCount(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return '0';
+        return Math.round(num).toLocaleString();
+    }
+
+    function archiveCapacityParams() {
+        const params = new URLSearchParams();
+        const setParam = (key, input) => {
+            if (!input) return;
+            const value = String(input.value || '').trim();
+            if (value) params.set(key, value);
+        };
+        setParam('channels', archiveEstimateChannelsInput);
+        setParam('batch_size', luxriotBatchSizeSelect);
+        setParam('snapshot_interval_sec', luxriotSnapshotIntervalInput);
+        setParam('frames_per_batch', archiveEstimateFramesPerBatchInput);
+        setParam('avg_jpeg_kb', archiveEstimateAvgJpegKbInput);
+        setParam('probe_records_per_channel_day', archiveEstimateProbeRowsInput);
+        setParam('summary_retention_days', luxriotSummaryRetentionDaysInput);
+        setParam('summary_history_limit', luxriotSummaryHistoryLimitInput);
+        setParam('frame_retention_days', archiveRowRetentionDaysInput);
+        setParam('thumbnail_retention_days', archiveThumbnailRetentionDaysInput);
+        setParam('max_records', archiveMaxRecordsInput);
+        return params;
+    }
+
+    function renderArchiveCapacity(data) {
+        if (!archiveCapacitySummary) return;
+        const estimate = data?.estimate || data?.archiveCapacityEstimate || data;
+        if (!estimate || !estimate.bytes || !estimate.daily || !estimate.retained) {
+            archiveCapacitySummary.textContent = 'Capacity estimate unavailable.';
+            return;
+        }
+        const bytes = estimate.bytes;
+        const daily = estimate.daily;
+        const retained = estimate.retained;
+        const current = data?.current || data?.archiveStorageSummary || null;
+        const capped = retained.capped_by_max_records ? ' · capped' : '';
+        const currentBits = current && current.available
+            ? `<div>Current DB rows: <strong>${formatArchiveCount(current.row_count)}</strong> · DB previews: <strong>${formatArchiveBytes(current.thumbnail_bytes)}</strong></div>`
+            : '';
+        archiveCapacitySummary.innerHTML = `
+            <div>Daily writes: <strong>${formatArchiveCount(daily.summary_rows)}</strong> descriptions · <strong>${formatArchiveCount(daily.frame_rows)}</strong> frame/probe rows</div>
+            <div>Retained: <strong>${formatArchiveCount(retained.summary_rows)}</strong> descriptions · <strong>${formatArchiveCount(retained.frame_rows)}</strong> frame rows${capped}</div>
+            <div>Database: <strong>${formatArchiveBytes(bytes.database)}</strong> · files: <strong>${formatArchiveBytes(bytes.archive_files)}</strong> · total: <strong>${formatArchiveBytes(bytes.total)}</strong></div>
+            ${currentBits}
+        `;
+    }
+
+    let archiveCapacityTimer = null;
+    async function refreshArchiveCapacityEstimate() {
+        if (!archiveCapacitySummary) return;
+        try {
+            const params = archiveCapacityParams();
+            const suffix = params.toString() ? `?${params.toString()}` : '';
+            const response = await fetch(`/settings/archive_capacity${suffix}`);
+            const data = await response.json();
+            if (data.success) {
+                renderArchiveCapacity(data);
+            } else {
+                archiveCapacitySummary.textContent = data.error || 'Capacity estimate unavailable.';
+            }
+        } catch (error) {
+            archiveCapacitySummary.textContent = error.message || 'Capacity estimate unavailable.';
+        }
+    }
+
+    function scheduleArchiveCapacityEstimate() {
+        if (!archiveCapacitySummary) return;
+        window.clearTimeout(archiveCapacityTimer);
+        archiveCapacityTimer = window.setTimeout(() => {
+            refreshArchiveCapacityEstimate();
+        }, 250);
+    }
+
     // Load current settings
     async function loadSettings() {
         try {
@@ -4324,6 +5488,8 @@
 
             if (data.success) {
                 const settings = data.settings;
+                experimentalEmbeddersEnabled = toBool(settings.experimentalEmbeddersEnabled, false);
+                productionClipModel = settings.productionClipModel || 'ViT-B/32';
                 document.getElementById('host').value = settings.host;
                 document.getElementById('port').value = settings.port;
                 document.getElementById('debug').checked = toBool(settings.debug, false);
@@ -4337,12 +5503,12 @@
                 dinoEmbedDimInput.value = settings.dinoEmbedDim || 1280;
                 dinoWeightsInput.value = settings.dinoWeightsPath || '';
                 indexModeSelect.value = settings.indexMode || 'clip';
-                updateFusionUI(fusionEnabledInput.checked);
+                applyEmbeddingPolicyUI();
                 rerankEnabledInput.checked = toBool(settings.rerankEnabled, false);
                 const parsedRerankTopK = parseInt(settings.rerankTopK, 10);
                 rerankTopKInput.value = Number.isFinite(parsedRerankTopK) ? parsedRerankTopK : 50;
                 updateRerankUI(rerankEnabledInput.checked);
-                document.getElementById('clipModel').value = settings.clipModel;
+                clipModelSelect.value = settings.clipModel || productionClipModel;
                 document.getElementById('minResults').value = settings.minResults;
                 document.getElementById('maxResults').value = settings.maxResults;
                 document.getElementById('defaultResults').value = settings.defaultResults;
@@ -4359,6 +5525,20 @@
                 if (luxriotSnapshotIntervalInput) luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
                 if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
                 if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
+                if (luxriotSummaryRetentionDaysInput) luxriotSummaryRetentionDaysInput.value = settings.luxriotSummaryRetentionDays ?? 7;
+                if (luxriotSummaryHistoryLimitInput) luxriotSummaryHistoryLimitInput.value = settings.luxriotSummaryHistoryLimit ?? 10080;
+                if (archiveRetentionEnabledInput) archiveRetentionEnabledInput.checked = toBool(settings.archiveRetentionEnabled, true);
+                if (archiveRowRetentionDaysInput) archiveRowRetentionDaysInput.value = settings.archiveRowRetentionDays ?? 90;
+                if (archiveThumbnailRetentionDaysInput) archiveThumbnailRetentionDaysInput.value = settings.archiveThumbnailRetentionDays ?? 14;
+                if (archiveMaxRecordsInput) archiveMaxRecordsInput.value = settings.archiveMaxRecords ?? 5000000;
+                if (archiveEstimateChannelsInput) archiveEstimateChannelsInput.value = settings.archiveEstimateChannels ?? 50;
+                if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = settings.archiveEstimateFramesPerBatch ?? 2.5;
+                if (archiveEstimateAvgJpegKbInput) archiveEstimateAvgJpegKbInput.value = settings.archiveEstimateAvgJpegKb ?? 100;
+                if (archiveEstimateProbeRowsInput) archiveEstimateProbeRowsInput.value = settings.archiveEstimateProbeRecordsPerChannelDay ?? 250;
+                renderArchiveCapacity({
+                    estimate: settings.archiveCapacityEstimate,
+                    current: settings.archiveStorageSummary
+                });
                 if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = toBool(settings.luxriotAutoBookmarks, false);
                 if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = settings.probeBookmarkCooldownSec ?? 8.0;
                 if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = settings.probeBookmarkDedupeWindowSec ?? 20.0;
@@ -4373,6 +5553,7 @@
                     if (luxriotSevHighInput) luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
                     if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
                 }
+                applyEmbeddingPolicyUI();
                 applyEmbedderUI(embedderSelect.value);
                 segmentsEnabledInput.checked = toBool(settings.segmentsEnabled, segmentsEnabledInput.checked);
                 segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
@@ -4404,7 +5585,7 @@
                 segmentsEnabled: segmentsEnabledInput.checked,
                 segmentMinPatches: parseInt(segmentMinPatchesInput.value),
                 segmentThreshold: segmentThreshold,
-                clipModel: document.getElementById('clipModel').value,
+                clipModel: clipModelSelect.value,
                 dinoModel: dinoModelInput.value.trim(),
                 dinoEmbedDim: parseInt(dinoEmbedDimInput.value),
                 dinoWeightsPath: dinoWeightsInput.value.trim(),
@@ -4424,6 +5605,16 @@
                 luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput ? luxriotSnapshotIntervalInput.value : config.LUXRIOT_SNAPSHOT_INTERVAL),
                 luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput ? luxriotSnapshotMaxEdgeInput.value : config.LUXRIOT_SNAPSHOT_MAX_EDGE),
                 luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput ? luxriotMaxBufferFramesInput.value : config.LUXRIOT_MAX_BUFFER_FRAMES),
+                luxriotSummaryRetentionDays: parseFloat(luxriotSummaryRetentionDaysInput ? luxriotSummaryRetentionDaysInput.value : '7'),
+                luxriotSummaryHistoryLimit: parseInt(luxriotSummaryHistoryLimitInput ? luxriotSummaryHistoryLimitInput.value : '10080'),
+                archiveRetentionEnabled: archiveRetentionEnabledInput ? archiveRetentionEnabledInput.checked : true,
+                archiveRowRetentionDays: parseFloat(archiveRowRetentionDaysInput ? archiveRowRetentionDaysInput.value : '90'),
+                archiveThumbnailRetentionDays: parseFloat(archiveThumbnailRetentionDaysInput ? archiveThumbnailRetentionDaysInput.value : '14'),
+                archiveMaxRecords: parseInt(archiveMaxRecordsInput ? archiveMaxRecordsInput.value : '5000000'),
+                archiveEstimateChannels: parseInt(archiveEstimateChannelsInput ? archiveEstimateChannelsInput.value : '50'),
+                archiveEstimateFramesPerBatch: parseFloat(archiveEstimateFramesPerBatchInput ? archiveEstimateFramesPerBatchInput.value : '2.5'),
+                archiveEstimateAvgJpegKb: parseFloat(archiveEstimateAvgJpegKbInput ? archiveEstimateAvgJpegKbInput.value : '100'),
+                archiveEstimateProbeRecordsPerChannelDay: parseFloat(archiveEstimateProbeRowsInput ? archiveEstimateProbeRowsInput.value : '250'),
                 luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
                 probeBookmarkCooldownSec: parseFloat(probeBookmarkCooldownSecInput ? probeBookmarkCooldownSecInput.value : '8'),
                 probeBookmarkDedupeWindowSec: parseFloat(probeBookmarkDedupeWindowSecInput ? probeBookmarkDedupeWindowSecInput.value : '20'),
@@ -4469,6 +5660,14 @@
                 settings.embedder = 'clip';
             }
 
+            if (!experimentalEmbeddersEnabled) {
+                settings.embedder = 'clip';
+                settings.fusionEnabled = false;
+                settings.clipModel = productionClipModel || 'ViT-B/32';
+                settings.indexMode = 'clip';
+                settings.segmentsEnabled = false;
+            }
+
             if (!Number.isFinite(settings.rerankTopK) || settings.rerankTopK < 1) {
                 const defaultTopK = parseInt(rerankTopKInput.placeholder) || 50;
                 settings.rerankTopK = Number.isFinite(defaultTopK) && defaultTopK > 0 ? defaultTopK : 50;
@@ -4498,6 +5697,33 @@
             if (!Number.isFinite(settings.probeBookmarkMaxFrameGap) || settings.probeBookmarkMaxFrameGap < 1) {
                 settings.probeBookmarkMaxFrameGap = 8;
             }
+            if (!Number.isFinite(settings.luxriotSummaryRetentionDays) || settings.luxriotSummaryRetentionDays < 0) {
+                settings.luxriotSummaryRetentionDays = 7;
+            }
+            if (!Number.isFinite(settings.luxriotSummaryHistoryLimit) || settings.luxriotSummaryHistoryLimit < 40) {
+                settings.luxriotSummaryHistoryLimit = 10080;
+            }
+            if (!Number.isFinite(settings.archiveRowRetentionDays) || settings.archiveRowRetentionDays < 0) {
+                settings.archiveRowRetentionDays = 90;
+            }
+            if (!Number.isFinite(settings.archiveThumbnailRetentionDays) || settings.archiveThumbnailRetentionDays < 0) {
+                settings.archiveThumbnailRetentionDays = 14;
+            }
+            if (!Number.isFinite(settings.archiveMaxRecords) || settings.archiveMaxRecords < 1000) {
+                settings.archiveMaxRecords = 5000000;
+            }
+            if (!Number.isFinite(settings.archiveEstimateChannels) || settings.archiveEstimateChannels < 1) {
+                settings.archiveEstimateChannels = 50;
+            }
+            if (!Number.isFinite(settings.archiveEstimateFramesPerBatch) || settings.archiveEstimateFramesPerBatch < 0) {
+                settings.archiveEstimateFramesPerBatch = 2.5;
+            }
+            if (!Number.isFinite(settings.archiveEstimateAvgJpegKb) || settings.archiveEstimateAvgJpegKb < 1) {
+                settings.archiveEstimateAvgJpegKb = 100;
+            }
+            if (!Number.isFinite(settings.archiveEstimateProbeRecordsPerChannelDay) || settings.archiveEstimateProbeRecordsPerChannelDay < 0) {
+                settings.archiveEstimateProbeRecordsPerChannelDay = 250;
+            }
 
             settings.segmentThreshold = clampSegmentThreshold(settings.segmentThreshold);
 
@@ -4518,6 +5744,7 @@
             
             if (data.success) {
                 showSettingsStatus(data.message, 'success');
+                scheduleArchiveCapacityEstimate();
             } else {
                 showSettingsStatus('Error saving settings: ' + data.error, 'error');
             }
@@ -4548,7 +5775,7 @@
             dinoEmbedDimInput.value = '1280';
             dinoWeightsInput.value = '';
             indexModeSelect.value = 'clip';
-            document.getElementById('clipModel').value = 'ViT-B/32';
+            clipModelSelect.value = productionClipModel || 'ViT-B/32';
             document.getElementById('minResults').value = '3';
             document.getElementById('maxResults').value = '48';
             document.getElementById('defaultResults').value = '12';
@@ -4565,6 +5792,16 @@
             luxriotSnapshotIntervalInput.value = '5';
             luxriotSnapshotMaxEdgeInput.value = '800';
             luxriotMaxBufferFramesInput.value = '180';
+            if (luxriotSummaryRetentionDaysInput) luxriotSummaryRetentionDaysInput.value = '7';
+            if (luxriotSummaryHistoryLimitInput) luxriotSummaryHistoryLimitInput.value = '10080';
+            if (archiveRetentionEnabledInput) archiveRetentionEnabledInput.checked = true;
+            if (archiveRowRetentionDaysInput) archiveRowRetentionDaysInput.value = '90';
+            if (archiveThumbnailRetentionDaysInput) archiveThumbnailRetentionDaysInput.value = '14';
+            if (archiveMaxRecordsInput) archiveMaxRecordsInput.value = '5000000';
+            if (archiveEstimateChannelsInput) archiveEstimateChannelsInput.value = '50';
+            if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = '2.5';
+            if (archiveEstimateAvgJpegKbInput) archiveEstimateAvgJpegKbInput.value = '100';
+            if (archiveEstimateProbeRowsInput) archiveEstimateProbeRowsInput.value = '250';
             if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
             if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = '8.0';
             if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = '20.0';
@@ -4577,11 +5814,13 @@
             if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
             if (luxriotSevHighInput) luxriotSevHighInput.value = 'high';
             if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = 'critical';
+            applyEmbeddingPolicyUI();
             updateFusionUI(false);
             updateRerankUI(false);
             updateSegmentsUI(false);
             refreshSegmentsPanels();
             applyEmbedderUI(embedderSelect.value);
+            scheduleArchiveCapacityEstimate();
         }
     });
 
@@ -4604,19 +5843,68 @@
         settingsStatus.style.display = 'block';
         
         setTimeout(() => {
+            settingsStatus.textContent = '';
             settingsStatus.style.display = 'none';
         }, 5000);
     }
 
+    function setSettingRowDisabled(control, disabled) {
+        if (!control) return;
+        control.disabled = disabled;
+        control.classList.toggle('disabled', disabled);
+        const row = control.closest('.settings-row');
+        if (row) row.classList.toggle('is-disabled', disabled);
+    }
+
+    function applyEmbeddingPolicyUI() {
+        const productionModel = productionClipModel || 'ViT-B/32';
+        Array.from(embedderSelect.options).forEach(option => {
+            const locked = !experimentalEmbeddersEnabled && option.value !== 'clip';
+            option.disabled = locked;
+            option.title = locked ? 'Experimental backend disabled for this deployment.' : '';
+        });
+        if (!experimentalEmbeddersEnabled && embedderSelect.value !== 'clip') {
+            embedderSelect.value = 'clip';
+        }
+
+        Array.from(clipModelSelect.options).forEach(option => {
+            const locked = !experimentalEmbeddersEnabled && option.value !== productionModel;
+            option.disabled = locked;
+            option.title = locked ? 'Experimental CLIP/SigLIP model disabled for this deployment.' : '';
+        });
+        if (!experimentalEmbeddersEnabled && clipModelSelect.value !== productionModel) {
+            clipModelSelect.value = productionModel;
+        }
+
+        if (!experimentalEmbeddersEnabled) {
+            fusionEnabledInput.checked = false;
+            indexModeSelect.value = 'clip';
+            segmentsEnabledInput.checked = false;
+        }
+        setSettingRowDisabled(fusionEnabledInput, !experimentalEmbeddersEnabled);
+        setSettingRowDisabled(indexModeSelect, !experimentalEmbeddersEnabled);
+        setSettingRowDisabled(segmentsEnabledInput, !experimentalEmbeddersEnabled);
+
+        [dinoModelInput, dinoEmbedDimInput, dinoWeightsInput].forEach(input => {
+            setSettingRowDisabled(input, !experimentalEmbeddersEnabled);
+        });
+
+        updateFusionUI(fusionEnabledInput.checked);
+        updateSegmentsUI(segmentsEnabledInput.checked);
+    }
+
     function updateFusionUI(enabled) {
-        fusionAlphaInput.disabled = !enabled;
+        const available = experimentalEmbeddersEnabled && enabled;
+        fusionAlphaInput.disabled = !available;
         fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
-        fusionAlphaValue.classList.toggle('disabled', !enabled);
+        fusionAlphaValue.classList.toggle('disabled', !available);
+        const fusionAlphaRow = fusionAlphaInput.closest('.settings-row');
+        if (fusionAlphaRow) fusionAlphaRow.classList.toggle('is-disabled', !available);
         const fusionOption = embedderSelect.querySelector('option[value="fusion"]');
         if (fusionOption) {
-            fusionOption.disabled = !enabled;
+            fusionOption.disabled = !available;
         }
-        if (!enabled && embedderSelect.value === 'fusion') {
+        if (!available && embedderSelect.value === 'fusion') {
             embedderSelect.value = 'clip';
             applyEmbedderUI('clip');
         }
@@ -4627,13 +5915,16 @@
         rerankTopKInput.classList.toggle('disabled', !enabled);
     }
 
-    updateFusionUI(fusionEnabledInput.checked);
+    applyEmbeddingPolicyUI();
     updateRerankUI(rerankEnabledInput.checked);
     
     function updateSegmentsUI(enabled) {
-        segmentMinPatchesInput.disabled = !enabled;
-        segmentMinPatchesInput.classList.toggle('disabled', !enabled);
-        updateSegmentControlsUI(enabled);
+        const available = experimentalEmbeddersEnabled && enabled;
+        segmentMinPatchesInput.disabled = !available;
+        segmentMinPatchesInput.classList.toggle('disabled', !available);
+        const row = segmentMinPatchesInput.closest('.settings-row');
+        if (row) row.classList.toggle('is-disabled', !available);
+        updateSegmentControlsUI(available);
     }
 
     function updateSegmentControlsUI(enabled) {
@@ -4680,6 +5971,27 @@
     }
     if (luxriotFlushCaptureBtn) {
         luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
+    }
+    if (luxriotContextToggleCaptureBtn) {
+        luxriotContextToggleCaptureBtn.addEventListener('click', toggleLuxriotCapture);
+    }
+    if (luxriotContextFlushCaptureBtn) {
+        luxriotContextFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
+    }
+    if (luxriotBatchSizeSelect) {
+        luxriotBatchSizeSelect.addEventListener('change', updateLuxriotBatchInfo);
+    }
+    if (luxriotLiveIntervalInput) {
+        luxriotLiveIntervalInput.addEventListener('input', updateLuxriotBatchInfo);
+        luxriotLiveIntervalInput.addEventListener('change', () => {
+            const intervalSec = getLuxriotLiveIntervalInputValue();
+            luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(intervalSec);
+            storeLuxriotLiveInterval(getSelectedLuxriotChannel(), intervalSec);
+            updateLuxriotBatchInfo();
+        });
+    }
+    if (luxriotLiveModelInput) {
+        luxriotLiveModelInput.addEventListener('change', updateLuxriotStreamContext);
     }
     if (luxriotPromptSettingsBtn) {
         luxriotPromptSettingsBtn.addEventListener('click', openLuxriotPromptModal);
@@ -5034,7 +6346,9 @@
             syncProbeChannelSelect();
             syncLuxriotSummaryChannelSelect();
             setSummaryBaseLevel(luxriotSummaryLevel);
+            syncLuxriotLiveIntervalInput(luxriotActiveChannel);
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
+            updateLuxriotStreamContext();
             void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
             startLuxriotPreview();
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
@@ -5052,6 +6366,156 @@
     function getSelectedProbeChannelId() {
         const parsed = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
         return Number.isFinite(parsed) ? parsed : luxriotActiveChannel;
+    }
+
+    function setProbeCastStatus(message, isError = false) {
+        if (!probeCastStatus) return;
+        probeCastStatus.textContent = message;
+        probeCastStatus.classList.toggle('error', Boolean(isError));
+    }
+
+    function getProbeCastChannelCatalog() {
+        const select = probeChannelSelect && probeChannelSelect.options?.length
+            ? probeChannelSelect
+            : luxriotChannelSelect;
+        const seen = new Set();
+        return Array.from(select?.options || [])
+            .map((option) => {
+                const id = Number.parseInt(String(option.value || ''), 10);
+                if (!Number.isFinite(id) || id <= 0 || seen.has(id)) return null;
+                seen.add(id);
+                return {
+                    id,
+                    label: String(option.textContent || '').trim() || getLuxriotChannelLabel(id),
+                };
+            })
+            .filter((channel) => Boolean(channel))
+            .sort((left, right) => left.id - right.id);
+    }
+
+    function updateProbeCastSelectionMeta() {
+        if (!probeCastSelectedMeta) return;
+        const count = probeCastSelectedChannels.size;
+        probeCastSelectedMeta.textContent = `${count} selected`;
+    }
+
+    function renderProbeCastChannels() {
+        if (!probeCastChannelList) return;
+        const channels = getProbeCastChannelCatalog();
+        if (!channels.length) {
+            probeCastChannelList.innerHTML = '<div class="admin-empty">Channel list is not loaded yet.</div>';
+            updateProbeCastSelectionMeta();
+            return;
+        }
+        probeCastChannelList.innerHTML = channels.map((channel) => {
+            const checked = probeCastSelectedChannels.has(channel.id) ? ' checked' : '';
+            return `
+                <label class="admin-channel-item" title="${escapeHtml(channel.label)}">
+                    <input type="checkbox" value="${escapeHtml(String(channel.id))}"${checked} />
+                    <span class="admin-channel-id">#${escapeHtml(String(channel.id))}</span>
+                    <span class="admin-channel-name">${escapeHtml(channel.label)}</span>
+                </label>
+            `;
+        }).join('');
+        updateProbeCastSelectionMeta();
+    }
+
+    function setProbeCastSelection(channelIds) {
+        const available = new Set(getProbeCastChannelCatalog().map((channel) => channel.id));
+        probeCastSelectedChannels = new Set(
+            (Array.isArray(channelIds) ? channelIds : [])
+                .map((value) => Number.parseInt(String(value), 10))
+                .filter((id) => Number.isFinite(id) && id > 0 && available.has(id))
+        );
+        renderProbeCastChannels();
+    }
+
+    async function openProbeCastModal() {
+        const payload = collectProbeForm();
+        const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+        if (!hasPos) {
+            setProbeStatus('Add a text positive or enable an image probe before casting.', true);
+            return;
+        }
+        if (!getProbeCastChannelCatalog().length) {
+            await fetchLuxriotChannels(true);
+            syncProbeChannelSelect();
+        }
+        const currentChannel = getSelectedProbeChannelId();
+        if (probeCastEnableInput) {
+            probeCastEnableInput.checked = probeEnableToggle ? probeEnableToggle.checked !== false : true;
+        }
+        if (probeCastCopyRoiInput) {
+            probeCastCopyRoiInput.checked = false;
+            probeCastCopyRoiInput.disabled = !Boolean(probeRoiEnabled && normalizeProbeRoiNorm(probeRoiNorm));
+        }
+        if (probeCastStartStreamsInput) probeCastStartStreamsInput.checked = false;
+        if (probeCastConflictInput) probeCastConflictInput.value = 'skip';
+        setProbeCastSelection([currentChannel]);
+        setProbeCastStatus('Ready.');
+        setProbeCastModalVisibility(true);
+    }
+
+    function selectedProbeCastChannelIds() {
+        if (!probeCastChannelList) return [];
+        return Array.from(probeCastChannelList.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((input) => Number.parseInt(String(input.value || ''), 10))
+            .filter((id) => Number.isFinite(id) && id > 0);
+    }
+
+    async function applyProbeCast() {
+        const channelIds = selectedProbeCastChannelIds();
+        if (!channelIds.length) {
+            setProbeCastStatus('Select at least one channel.', true);
+            return;
+        }
+        const payload = collectProbeForm();
+        const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
+        if (!hasPos) {
+            setProbeCastStatus('Add a text positive or enable an image probe.', true);
+            return;
+        }
+        delete payload.id;
+        payload.channel_ids = channelIds;
+        payload.enabled = probeCastEnableInput ? probeCastEnableInput.checked : payload.enabled;
+        payload.conflict = probeCastConflictInput ? probeCastConflictInput.value : 'skip';
+        payload.copy_roi = probeCastCopyRoiInput ? probeCastCopyRoiInput.checked : false;
+        if (!payload.copy_roi) {
+            payload.roi_enabled = false;
+            payload.roi_norm = null;
+        }
+        setProbeCastStatus(`Casting to ${channelIds.length} channels...`);
+        setControlDisabled(probeCastApplyBtn, true);
+        try {
+            const resp = await fetch('/probes/cast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await resp.json();
+            if (!resp.ok && !data.counts) {
+                throw new Error(data.error || 'Cast failed');
+            }
+            const counts = data.counts || {};
+            const summary = `Cast: ${counts.created || 0} created, ${counts.updated || 0} updated, ${counts.skipped || 0} skipped, ${counts.failed || 0} failed.`;
+            await loadProbeList();
+            if (probeCastStartStreamsInput?.checked) {
+                setProbeCastStatus(`${summary} Starting streams...`);
+                for (const channelId of channelIds) {
+                    await ensureProbeCapture(channelId, true, { forceStart: true });
+                }
+            }
+            const hasFailures = (counts.failed || 0) > 0;
+            setProbeStatus(summary, hasFailures);
+            setProbeCastStatus(summary, hasFailures);
+            if (!hasFailures) {
+                setProbeCastModalVisibility(false);
+            }
+        } catch (err) {
+            setProbeCastStatus(err.message, true);
+        } finally {
+            setControlDisabled(probeCastApplyBtn, false);
+        }
     }
 
     function getProbeRuntimeState(channelId) {
@@ -5659,7 +7123,7 @@
             if (row.neg?.trim()) negatives.push(row.neg.trim());
         });
         const channelId = getSelectedProbeChannelId();
-        return {
+        const payload = {
             id: activeProbeId,
             name: (probeNameInput?.value || '').trim(),
             channel_id: Number.isFinite(channelId) ? channelId : luxriotActiveChannel,
@@ -5672,9 +7136,6 @@
             window_sec: parseFloat(probeWindowSecInput?.value) || 300,
             fps: parseFloat(probeFpsInput?.value) || 0,
             severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'info',
-            bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
-            bookmark_cooldown_sec: probeBookmarkCooldownLocalInput ? (parseFloat(probeBookmarkCooldownLocalInput.value) || 0) : 8,
-            bookmark_dedupe_window_sec: probeBookmarkDedupeWindowLocalInput ? (parseFloat(probeBookmarkDedupeWindowLocalInput.value) || 0.5) : 20,
             enabled: probeEnableToggle ? probeEnableToggle.checked : true,
             image_probe: {
                 data: probeImageState?.data,
@@ -5685,6 +7146,12 @@
             roi_enabled: roiActive,
             roi_norm: roiActive ? normalizedRoi : null,
         };
+        if (userHasPermission('bookmarks:create')) {
+            payload.bookmark = probeBookmarkToggle ? probeBookmarkToggle.checked : true;
+            payload.bookmark_cooldown_sec = probeBookmarkCooldownLocalInput ? (parseFloat(probeBookmarkCooldownLocalInput.value) || 0) : 8;
+            payload.bookmark_dedupe_window_sec = probeBookmarkDedupeWindowLocalInput ? (parseFloat(probeBookmarkDedupeWindowLocalInput.value) || 0.5) : 20;
+        }
+        return payload;
     }
 
     function probeHitsKey(probeId = activeProbeId) {
@@ -6406,6 +7873,47 @@
             }
         });
     }
+    if (probeCastBtn) {
+        probeCastBtn.addEventListener('click', () => {
+            openProbeCastModal();
+        });
+    }
+    if (closeProbeCastBtn) {
+        closeProbeCastBtn.addEventListener('click', () => {
+            setProbeCastModalVisibility(false);
+        });
+    }
+    if (probeCastCloseBtn) {
+        probeCastCloseBtn.addEventListener('click', () => {
+            setProbeCastModalVisibility(false);
+        });
+    }
+    if (probeCastApplyBtn) {
+        probeCastApplyBtn.addEventListener('click', () => {
+            applyProbeCast();
+        });
+    }
+    if (probeCastAllBtn) {
+        probeCastAllBtn.addEventListener('click', () => {
+            setProbeCastSelection(getProbeCastChannelCatalog().map((channel) => channel.id));
+        });
+    }
+    if (probeCastNoneBtn) {
+        probeCastNoneBtn.addEventListener('click', () => {
+            setProbeCastSelection([]);
+        });
+    }
+    if (probeCastCurrentBtn) {
+        probeCastCurrentBtn.addEventListener('click', () => {
+            setProbeCastSelection([getSelectedProbeChannelId()]);
+        });
+    }
+    if (probeCastChannelList) {
+        probeCastChannelList.addEventListener('change', () => {
+            probeCastSelectedChannels = new Set(selectedProbeCastChannelIds());
+            updateProbeCastSelectionMeta();
+        });
+    }
     if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
         if (activeProbeId) deleteProbe(activeProbeId);
         else {
@@ -6639,6 +8147,15 @@
             refreshArchiveProbeFilter();
         });
     }
+    if (archiveSourceFilter) {
+        archiveSourceFilter.addEventListener('change', () => {
+            archiveDetectionsOffset = 0;
+            archiveDetectionsHasMore = false;
+            if (archiveProbeFilter) archiveProbeFilter.value = '';
+            updateArchiveDetectionsNav();
+            refreshArchiveProbeFilter();
+        });
+    }
     if (archiveProbeFilter) {
         archiveProbeFilter.addEventListener('change', () => {
             archiveDetectionsOffset = 0;
@@ -6653,6 +8170,14 @@
             updateArchiveDetectionsNav();
         });
     }
+    [archiveFromTimeInput, archiveToTimeInput].forEach((input) => {
+        if (!input) return;
+        input.addEventListener('change', () => {
+            archiveDetectionsOffset = 0;
+            archiveDetectionsHasMore = false;
+            updateArchiveDetectionsNav();
+        });
+    });
     if (archiveDetectionsLimit) {
         archiveDetectionsLimit.addEventListener('change', () => {
             archiveDetectionsOffset = 0;
@@ -6698,14 +8223,21 @@
         }
         if (!response.ok || data.error) {
             const message = data.error || `${fallbackMessage} (${response.status})`;
-            throw new Error(message);
+            const error = new Error(message);
+            error.status = response.status;
+            error.payload = data;
+            throw error;
         }
         return data;
     }
+
+    function activeFolderPath() {
+        return folderInput ? folderInput.value.trim() : '';
+    }
     
     // Index folder
-    indexBtn.addEventListener('click', async () => {
-        const folder = folderInput.value.trim();
+    if (indexBtn) indexBtn.addEventListener('click', async () => {
+        const folder = activeFolderPath();
         if (!folder) return;
         
         indexStatus.textContent = 'Indexing...';
@@ -6749,7 +8281,7 @@
     searchBtn.addEventListener('click', async () => {
         setMode('archive');
         const query = searchInput.value.trim();
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         const limit = resultLimitSelect.value;
         const sortBy = sortBySelect.value;
         const detectionsScope = isDetectionsScope();
@@ -6796,6 +8328,7 @@
                 }
             } else {
                 archiveRenderedResults = [];
+                refreshArchiveScoreScale(archiveRenderedResults);
                 applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 renderArchiveInspectorEmpty('No results found for this query.');
@@ -6811,7 +8344,7 @@
     // Image search
     imageSearchBtn.addEventListener('click', async () => {
         setMode('archive');
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         const file = imageUpload.files[0];
         const limit = resultLimitSelect.value;
         const sortBy = sortBySelect.value;
@@ -6861,6 +8394,7 @@
                 displayResults(renderedResults);
             } else {
                 archiveRenderedResults = [];
+                refreshArchiveScoreScale(archiveRenderedResults);
                 applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No results found</div>';
                 renderArchiveInspectorEmpty('No visual matches found for this reference image.');
@@ -6886,15 +8420,86 @@
         videoFrames.innerHTML = html;
     }
 
+    function selectedOfflineMediaFile() {
+        if (!videoUploadInput || !videoUploadInput.files || !videoUploadInput.files.length) return null;
+        return videoUploadInput.files[0] || null;
+    }
+
+    function offlineMediaKind(file) {
+        if (!file) return 'path';
+        const type = String(file.type || '').toLowerCase();
+        const name = String(file.name || '').toLowerCase();
+        if (type.startsWith('image/') || /\.(jpe?g|png|bmp|webp)$/.test(name)) return 'image';
+        if (type.startsWith('video/') || /\.(mp4|mov|m4v|avi|mkv|webm)$/.test(name)) return 'video';
+        return 'unknown';
+    }
+
+    function setVideoUploadName(file) {
+        if (!videoUploadName) return;
+        if (!file) {
+            videoUploadName.textContent = 'No file selected';
+            videoUploadName.classList.add('is-hidden');
+            return;
+        }
+        videoUploadName.textContent = file.name || 'Selected file';
+        videoUploadName.classList.remove('is-hidden');
+    }
+
+    function hideOfflineSummaryOutput() {
+        if (!videoOutput) return;
+        videoOutput.classList.add('is-hidden');
+        videoOutput.style.display = '';
+        videoOutput.innerHTML = '';
+    }
+
+    function showOfflineSummaryOutput(content, plainText = false) {
+        if (!videoOutput) return;
+        if (plainText) {
+            videoOutput.textContent = content;
+        } else {
+            videoOutput.innerHTML = content;
+        }
+        videoOutput.style.display = '';
+        videoOutput.classList.remove('is-hidden');
+    }
+
+    if (videoUploadInput) {
+        videoUploadInput.addEventListener('change', () => {
+            const file = selectedOfflineMediaFile();
+            setVideoUploadName(file);
+            if (file && videoPathInput) {
+                videoPathInput.value = '';
+            }
+        });
+    }
+
+    if (videoPathInput && videoUploadInput) {
+        videoPathInput.addEventListener('input', () => {
+            if (!videoPathInput.value.trim()) return;
+            if (videoUploadInput.value) {
+                videoUploadInput.value = '';
+                setVideoUploadName(null);
+            }
+        });
+    }
+
     async function runVideoUnderstanding() {
         const videoPath = videoPathInput.value.trim();
+        const uploadFile = selectedOfflineMediaFile();
+        const uploadKind = offlineMediaKind(uploadFile);
         const frameCount = parseInt(videoFrameCount.value, 10) || 16;
         const sampleFpsValue = Number.parseFloat(videoSampleFpsInput.value);
         const prompt = videoPromptInput.value.trim();
         const modelId = videoModelInput ? videoModelInput.value.trim() : '';
 
-        if (!videoPath) {
-            videoStatus.textContent = 'Provide a video path.';
+        if (!uploadFile && !videoPath) {
+            videoStatus.textContent = 'Choose a media file or provide a server path.';
+            videoStatus.className = 'video-status error';
+            return;
+        }
+
+        if (uploadFile && uploadKind === 'unknown') {
+            videoStatus.textContent = 'Unsupported media file type.';
             videoStatus.className = 'video-status error';
             return;
         }
@@ -6909,31 +8514,48 @@
         saveSummaryBtn.style.display = 'none';
         lastSummaryText = '';
         lastSummaryTarget = null;
-        videoStatus.dataset.base = 'Sampling frames and querying the model...';
+        videoStatus.dataset.base = uploadFile
+            ? `Uploading ${uploadKind === 'image' ? 'image' : 'video'} and querying the model...`
+            : 'Sampling frames and querying the model...';
         videoStatus.textContent = videoStatus.dataset.base;
         videoStatus.className = 'video-status';
-        videoOutput.style.display = 'none';
-        videoOutput.innerHTML = '';
+        hideOfflineSummaryOutput();
         renderVideoFrames([]);
         startVideoTimer();
 
         try {
-            const payload = {
-                video: videoPath,
-                frame_count: frameCount,
-                prompt,
-            };
-            if (modelId) {
-                payload.model = modelId;
+            let response;
+            if (uploadFile) {
+                const formData = new FormData();
+                formData.append(uploadKind === 'image' ? 'image' : 'video', uploadFile);
+                formData.append('prompt', prompt);
+                formData.append('frame_count', String(frameCount));
+                if (modelId) formData.append('model', modelId);
+                if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
+                    formData.append('sample_fps', String(sampleFpsValue));
+                }
+                response = await fetch(uploadKind === 'image' ? '/describe_image' : '/video_understanding', {
+                    method: 'POST',
+                    body: formData,
+                });
+            } else {
+                const payload = {
+                    video: videoPath,
+                    frame_count: frameCount,
+                    prompt,
+                };
+                if (modelId) {
+                    payload.model = modelId;
+                }
+                if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
+                    payload.sample_fps = sampleFpsValue;
+                }
+                response = await fetch('/video_understanding', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
             }
-            if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
-                payload.sample_fps = sampleFpsValue;
-            }
-            const response = await fetch('/video_understanding', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
             const data = await response.json();
             if (!response.ok || data.error) {
                 videoStatus.dataset.base = data.error || 'Video understanding request failed.';
@@ -6943,22 +8565,26 @@
                 return;
             }
             const durationLabel = typeof data.duration_sec === 'number' ? ` · Duration: ${formatDuration(data.duration_sec)}` : '';
-            videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
+            const framesSent = uploadKind === 'image' ? 1 : ((data.frames || []).length || frameCount);
+            const sourceLabel = uploadFile ? ` · Uploaded: ${data.filename || uploadFile.name || 'file'}` : '';
+            videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${framesSent}${durationLabel}${sourceLabel}`;
             videoStatus.textContent = videoStatus.dataset.base;
             if (data.summary) {
-                videoOutput.style.display = 'block';
-                videoOutput.innerHTML = renderMarkdown(data.summary);
+                showOfflineSummaryOutput(renderMarkdown(data.summary));
                 lastSummaryText = data.summary;
                 lastSummaryTarget = null;
-                saveSummaryBtn.style.display = 'inline-flex';
+                saveSummaryBtn.style.display = 'none';
             } else {
-                videoOutput.style.display = 'block';
-                videoOutput.textContent = '(No summary returned)';
+                showOfflineSummaryOutput('(No summary returned)', true);
                 lastSummaryText = '';
                 lastSummaryTarget = null;
                 saveSummaryBtn.style.display = 'none';
             }
-            renderVideoFrames(data.frames || []);
+            if (uploadKind === 'image' && data.thumbnail) {
+                renderVideoFrames([{ index: 0, time_sec: 0, thumbnail: data.thumbnail }]);
+            } else {
+                renderVideoFrames(data.frames || []);
+            }
             stopVideoTimer(true);
         } catch (error) {
             videoStatus.dataset.base = 'Error: ' + error.message;
@@ -6979,7 +8605,7 @@
             alert('No summary or target image available to save.');
             return;
         }
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         if (!folder) {
             alert('Please enter a folder path first.');
             return;
@@ -7010,8 +8636,8 @@
     }
     
     // Show commented images
-    showCommentedBtn.addEventListener('click', async () => {
-        const folder = folderInput.value.trim();
+    if (showCommentedBtn) showCommentedBtn.addEventListener('click', async () => {
+        const folder = activeFolderPath();
         
         if (!folder) {
             alert('Please enter a folder path first');
@@ -7034,6 +8660,9 @@
             if (data.results && data.results.length > 0) {
                 displayCommentedResults(data.results);
             } else {
+                archiveRenderedResults = [];
+                refreshArchiveScoreScale(archiveRenderedResults);
+                applyArchiveScoreThreshold();
                 resultsContainer.innerHTML = '<div class="loading">No commented images found</div>';
                 renderArchiveInspectorEmpty('No commented images found for the current archive.');
             }
@@ -7125,7 +8754,7 @@
 
         const detailImg = detailItem.querySelector('.thumbnail');
         const commentsContainer = document.getElementById(`comments-${index}`);
-        const activeFolder = folderInput.value.trim();
+        const activeFolder = activeFolderPath();
         const canUseFolderComments = Boolean(result.path && activeFolder && String(result.path).startsWith(activeFolder));
         if (!result.is_detection) {
             if (activeFolder && result.path) {
@@ -7156,7 +8785,7 @@
         const hasPath = rawPath.length > 0;
         const isDetectionResult = Boolean(result && result.is_detection);
         const showFilenameRow = !isDetectionResult;
-        const activeFolder = folderInput ? folderInput.value.trim() : '';
+        const activeFolder = activeFolderPath();
         const canUseFolderComments = Boolean(hasPath && activeFolder && rawPath.startsWith(activeFolder));
         const safePath = escapeHtml(rawPath);
         const thumb = String(result.thumbnail || '').trim();
@@ -7347,13 +8976,13 @@
 
         const saveBtn = item.querySelector(`#save-btn-${index}`);
         const commentInput = item.querySelector(`#comment-input-${index}`);
-        const activeFolder = folderInput ? folderInput.value.trim() : '';
+        const activeFolder = activeFolderPath();
         const canUseFolderComments = Boolean(result.path && activeFolder && String(result.path).startsWith(activeFolder));
 
         if (saveBtn) {
             if (canUseFolderComments || (result.path && !result.is_detection)) {
                 saveBtn.addEventListener('click', () => {
-                    saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
+                    saveComment(index, result.path, activeFolderPath(), commentInput.value.trim());
                 });
             } else {
                 saveBtn.disabled = true;
@@ -7395,6 +9024,7 @@
         segmentContextByIndex = {};
         archiveRenderedResults = Array.isArray(results) ? results : [];
         archiveRenderedCommented = false;
+        refreshArchiveScoreScale(archiveRenderedResults);
         syncArchiveResultsLayout(archiveRenderedResults);
         
         archiveRenderedResults.forEach((result, index) => {
@@ -7424,6 +9054,7 @@
         segmentContextByIndex = {};
         archiveRenderedResults = Array.isArray(results) ? results : [];
         archiveRenderedCommented = true;
+        refreshArchiveScoreScale(archiveRenderedResults);
         syncArchiveResultsLayout(archiveRenderedResults);
         
         archiveRenderedResults.forEach((result, index) => {
@@ -7515,7 +9146,7 @@
             alert('No LLM description to save yet.');
             return;
         }
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         if (!folder) {
             alert('Please enter a folder path first.');
             return;
@@ -7674,7 +9305,7 @@
         if (!result || !result.path) {
             return null;
         }
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         if (!folder) {
             return null;
         }
@@ -7824,7 +9455,7 @@
         if (!segmentsEnabledInput.checked) return;
         if (!item.classList.contains('expanded')) return;
 
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         if (!folder) {
             const panel = item.querySelector(`#segments-${index}`);
             if (panel) {
@@ -8061,14 +9692,14 @@
         const params = new URLSearchParams();
         params.set('image_path', imagePath || '');
         if (result && result.is_detection) {
-            const activeFolder = folderInput.value.trim();
+            const activeFolder = activeFolderPath();
             if (activeFolder && String(imagePath || '').startsWith(activeFolder)) {
                 params.set('folder', activeFolder);
                 return `/image?${params.toString()}`;
             }
             return `/detections/image?${params.toString()}`;
         }
-        const activeFolder = folderInput.value.trim();
+        const activeFolder = activeFolderPath();
         if (activeFolder) {
             params.set('folder', activeFolder);
         }
@@ -8076,7 +9707,7 @@
     }
 
     async function findSimilarImages(imagePath, result = null) {
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         const limit = resultLimitSelect.value;
         const sortBy = sortBySelect.value;
         const detectionResult = Boolean(result && result.is_detection);
@@ -8155,7 +9786,7 @@
             return;
         }
         const detectionResult = Boolean(result && result.is_detection);
-        const folder = folderInput.value.trim();
+        const folder = activeFolderPath();
         const useFolderContext = !detectionResult || (folder && String(imagePath).startsWith(folder));
         if (!useFolderContext && !detectionResult) {
             alert('Please enter a folder path first.');
@@ -8223,25 +9854,29 @@
         if (e.key === 'Enter') searchBtn.click();
     });
     
-    folderInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') indexBtn.click();
-    });
+    if (folderInput && indexBtn) {
+        folderInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') indexBtn.click();
+        });
+    }
     
     // Check index on folder change
-    folderInput.addEventListener('blur', async () => {
-        const folder = folderInput.value.trim();
-        if (folder) {
-            const status = await checkIndexStatus(folder);
-            if (status.indexed) {
-                indexStatus.textContent = `Folder is indexed (${(status.available_modes || []).join(', ') || embedderSelect.value})`;
-                indexStatus.className = 'status success';
-            } else {
-                const available = (status.available_modes || []).join(', ');
-                indexStatus.textContent = available ? `Folder indexed for: ${available}` : 'Folder not indexed';
-                indexStatus.className = available ? 'status warning' : 'status';
+    if (folderInput) {
+        folderInput.addEventListener('blur', async () => {
+            const folder = activeFolderPath();
+            if (folder) {
+                const status = await checkIndexStatus(folder);
+                if (status.indexed) {
+                    indexStatus.textContent = `Folder is indexed (${(status.available_modes || []).join(', ') || embedderSelect.value})`;
+                    indexStatus.className = 'status success';
+                } else {
+                    const available = (status.available_modes || []).join(', ');
+                    indexStatus.textContent = available ? `Folder indexed for: ${available}` : 'Folder not indexed';
+                    indexStatus.className = available ? 'status warning' : 'status';
+                }
             }
-        }
-    });
+        });
+    }
 
     // =====================================================================
     // AGENT TAB
