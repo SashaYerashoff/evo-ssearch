@@ -2214,16 +2214,22 @@ def _vlm_balancer_enabled() -> bool:
 
 
 def _stable_vlm_profile_for_channel(channel_id: int, profile_ids: Sequence[str]) -> Optional[str]:
+    return _stable_vlm_profile_for_key(str(int(channel_id)), profile_ids)
+
+
+def _stable_vlm_profile_for_key(key: str, profile_ids: Sequence[str]) -> Optional[str]:
     if not profile_ids:
         return None
-    digest = hashlib.sha256(f"vlm:{int(channel_id)}".encode("utf-8")).digest()
+    normalized_key = str(key or "default").strip() or "default"
+    digest = hashlib.sha256(f"vlm:{normalized_key}".encode("utf-8")).digest()
     slot = int.from_bytes(digest[:8], "big") % len(profile_ids)
     return str(profile_ids[slot])
 
 
-def _resolve_luxriot_vlm_model_hint(
-    channel_id: int,
+def _resolve_vlm_auto_model_hint(
     requested_model_hint: Optional[str],
+    *,
+    assignment_key: str,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     raw_hint = str(requested_model_hint or "").strip()
     profiles = _configured_lm_profiles()
@@ -2247,7 +2253,7 @@ def _resolve_luxriot_vlm_model_hint(
         }
 
     profile_ids = _configured_vlm_balancer_profile_ids()
-    selected_profile_id = _stable_vlm_profile_for_channel(channel_id, profile_ids)
+    selected_profile_id = _stable_vlm_profile_for_key(assignment_key, profile_ids)
     if not selected_profile_id:
         return (default_selector if raw_hint else None), {
             "mode": "default",
@@ -2264,6 +2270,23 @@ def _resolve_luxriot_vlm_model_hint(
         "balancer_enabled": True,
         "profile_count": len(profile_ids),
     }
+
+
+def _resolve_luxriot_vlm_model_hint(
+    channel_id: int,
+    requested_model_hint: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    return _resolve_vlm_auto_model_hint(
+        requested_model_hint,
+        assignment_key=str(int(channel_id)),
+    )
+
+
+def _offline_vlm_assignment_key(kind: str, value: Any) -> str:
+    raw = str(value or "").strip()
+    if len(raw) > 240:
+        raw = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"offline:{kind}:{raw or 'request'}"
 
 
 def _lm_profile_env_key(profile_id: str, suffix: str) -> str:
@@ -7213,11 +7236,29 @@ def video_understanding():
         str(data.get('profile_id') or data.get('profileId') or '').strip()
         or None
     )
+    effective_model_hint = model_hint or None
+    model_selection: Dict[str, Any] = {
+        "mode": "manual" if (model_hint or profile_hint) else "default",
+        "requested": model_hint or profile_hint or None,
+        "assigned_profile_id": profile_hint,
+        "balancer_enabled": _vlm_balancer_enabled(),
+    }
+    if profile_hint and _is_auto_lm_selector(effective_model_hint):
+        effective_model_hint = None
+    if not profile_hint:
+        assignment_key = _offline_vlm_assignment_key(
+            "video",
+            uploaded_original_name or video_path or str(video_obj),
+        )
+        effective_model_hint, model_selection = _resolve_vlm_auto_model_hint(
+            model_hint or None,
+            assignment_key=assignment_key,
+        )
 
     try:
         lm_profile = _resolve_lm_profile(
             profile_id=profile_hint,
-            model_override=model_hint or None,
+            model_override=effective_model_hint,
             kind="vlm",
         )
         frames, fps, duration = _sample_video_frames(
@@ -7244,7 +7285,7 @@ def video_understanding():
         messages = _build_video_messages(video_path or str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(
             messages,
-            model_override=model_hint or None,
+            model_override=effective_model_hint,
             profile_id=profile_hint,
         )
         audit_error = _write_completion_audit_or_error(
@@ -7259,6 +7300,10 @@ def video_understanding():
                 "prompt_supplied": bool(str(user_prompt).strip()),
                 "profile_id": str(lm_profile.get('id') or ''),
                 "model": str(lm_profile.get('model') or ''),
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
             },
         )
         if audit_error is not None:
@@ -7279,6 +7324,8 @@ def video_understanding():
                 'model': str(lm_profile.get('model') or ''),
                 'profile_id': str(lm_profile.get('id') or ''),
                 'model_selector': _lm_profile_selector_value(lm_profile),
+                'model_selection': model_selection.get("mode"),
+                'assigned_profile_id': model_selection.get("assigned_profile_id"),
                 'uploaded': bool(uploaded_temp_path),
                 'filename': uploaded_original_name or Path(video_obj).name,
             }
@@ -7321,6 +7368,15 @@ def describe_image():
         str(data.get('profile_id') or data.get('profileId') or '').strip()
         or None
     )
+    effective_model_hint = model_hint or None
+    model_selection: Dict[str, Any] = {
+        "mode": "manual" if (model_hint or profile_hint) else "default",
+        "requested": model_hint or profile_hint or None,
+        "assigned_profile_id": profile_hint,
+        "balancer_enabled": _vlm_balancer_enabled(),
+    }
+    if profile_hint and _is_auto_lm_selector(effective_model_hint):
+        effective_model_hint = None
     if upload_obj is not None and uploaded_original_name:
         try:
             uploaded_temp_path = _save_upload_to_temp(
@@ -7334,11 +7390,6 @@ def describe_image():
     elif not image_path:
         return jsonify({'error': 'image_path or image upload is required'}), 400
     try:
-        lm_profile = _resolve_lm_profile(
-            profile_id=profile_hint,
-            model_override=model_hint or None,
-            kind="vlm",
-        )
         if uploaded_temp_path is not None:
             path_obj = uploaded_temp_path
             with Image.open(path_obj) as uploaded_img:
@@ -7354,10 +7405,24 @@ def describe_image():
                 return jsonify({'error': 'image_path must be inside folder'}), 400
         else:
             path_obj = detection_archive.resolve_archive_image_path(image_path)
+        if not profile_hint:
+            assignment_key = _offline_vlm_assignment_key(
+                "image",
+                uploaded_original_name or image_path or str(path_obj),
+            )
+            effective_model_hint, model_selection = _resolve_vlm_auto_model_hint(
+                model_hint or None,
+                assignment_key=assignment_key,
+            )
+        lm_profile = _resolve_lm_profile(
+            profile_id=profile_hint,
+            model_override=effective_model_hint,
+            kind="vlm",
+        )
         messages = _build_image_messages(str(path_obj), prompt)
         summary = _call_lm_chat(
             messages,
-            model_override=model_hint or None,
+            model_override=effective_model_hint,
             profile_id=profile_hint,
             profile_kind="vlm",
         )
@@ -7374,6 +7439,10 @@ def describe_image():
                 "thumbnail_returned": bool(thumb),
                 "profile_id": str(lm_profile.get('id') or ''),
                 "model": str(lm_profile.get('model') or ''),
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
             },
         )
         if audit_error is not None:
@@ -7385,6 +7454,8 @@ def describe_image():
                 'model': str(lm_profile.get('model') or ''),
                 'profile_id': str(lm_profile.get('id') or ''),
                 'model_selector': _lm_profile_selector_value(lm_profile),
+                'model_selection': model_selection.get("mode"),
+                'assigned_profile_id': model_selection.get("assigned_profile_id"),
                 'uploaded': bool(uploaded_temp_path),
                 'filename': uploaded_original_name or Path(path_obj).name,
             }

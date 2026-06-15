@@ -456,6 +456,80 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertIsInstance(payload.get("thumbnail"), str)
         self.assertGreater(len(payload.get("thumbnail") or ""), 100)
 
+    def test_video_understanding_auto_balances_uploaded_file(self) -> None:
+        thumb_buf = BytesIO()
+        Image.new("RGB", (40, 24), (80, 120, 160)).save(thumb_buf, format="JPEG")
+        thumb_b64 = base64.b64encode(thumb_buf.getvalue()).decode("ascii")
+        profiles = {
+            "default": {
+                "id": "default",
+                "kind": "general",
+                "base_url": "http://default.local/v1",
+                "model": "default-model",
+                "api_key": "",
+                "timeout": 120,
+            },
+            "vlm-a": {
+                "id": "vlm-a",
+                "kind": "vlm",
+                "base_url": "http://vlm-a.local/v1",
+                "model": "qwen-vlm-a",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+            "vlm-b": {
+                "id": "vlm-b",
+                "kind": "vlm",
+                "base_url": "http://vlm-b.local/v1",
+                "model": "qwen-vlm-b",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+        }
+        captured: Dict[str, Any] = {}
+
+        def fake_call(messages, model_override=None, profile_id=None):
+            captured["messages"] = messages
+            captured["model_override"] = model_override
+            captured["profile_id"] = profile_id
+            return "auto balanced video summary"
+
+        with (
+            patch.object(config, "LM_PROFILES", profiles),
+            patch.object(config, "LM_VLM_PROFILE_ID", "vlm-a"),
+            patch.object(config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(config, "LM_VLM_BALANCER_PROFILES", ("vlm-a", "vlm-b")),
+            patch(
+                "oldapp._sample_video_frames",
+                return_value=(
+                    [{"index": 0, "time_sec": 0.0, "thumbnail": thumb_b64}],
+                    25.0,
+                    1.0,
+                ),
+            ),
+            patch("oldapp._call_video_understanding", side_effect=fake_call),
+        ):
+            resp = self.client.post(
+                "/video_understanding",
+                data={
+                    "video": (BytesIO(b"not-a-real-video"), "sample.mp4"),
+                    "prompt": "Describe this upload",
+                    "model": "__auto__",
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        payload = resp.get_json()
+        self.assertEqual(payload["summary"], "auto balanced video summary")
+        self.assertEqual(payload["model_selection"], "auto")
+        self.assertIn(payload["assigned_profile_id"], {"vlm-a", "vlm-b"})
+        self.assertEqual(captured["model_override"], payload["assigned_profile_id"])
+        self.assertIsNone(captured["profile_id"])
+        self.assertNotEqual(captured["model_override"], "__auto__")
+
     def test_health_and_ready_payloads_are_structured(self) -> None:
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)

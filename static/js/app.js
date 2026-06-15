@@ -398,10 +398,12 @@
             setModelSelectOptions(luxriotLiveModelInput, preferredLiveModel, defaultModel, { includeAuto: true });
         }
         if (videoModelInput) {
+            const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
             const preferredVideoModel = normalizeModelId(videoModelInput.value)
                 || normalizeModelId(localStorage.getItem(VIDEO_MODEL_STORAGE_KEY))
+                || autoSelector
                 || defaultModel;
-            setModelSelectOptions(videoModelInput, preferredVideoModel, defaultModel);
+            setModelSelectOptions(videoModelInput, preferredVideoModel, defaultModel, { includeAuto: true });
         }
         updateLuxriotStreamContext();
     }
