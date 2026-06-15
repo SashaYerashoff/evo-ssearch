@@ -186,6 +186,22 @@ EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB=100
 EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY=250
 EVOSSEARCH_DETECTIONS_ARCHIVE_DIR=/var/lib/eva-ai/detections_archive
 EVOSSEARCH_DETECTIONS_RETENTION_DROP_SKIPPED=true
+
+# Luxriot Evo integration. Заменить адрес, учетку и default channel под площадку.
+EVOSSEARCH_LUXRIOT_BASE_URL=http://LUXRIOT_EVO_HOST:9090
+EVOSSEARCH_LUXRIOT_USERNAME=admin
+EVOSSEARCH_LUXRIOT_PASSWORD=CHANGE_ME
+EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID=
+EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL=1
+EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE=800
+EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES=120
+EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS=true
+EVOSSEARCH_LUXRIOT_SEV_INFO=info
+EVOSSEARCH_LUXRIOT_SEV_LOW=low
+EVOSSEARCH_LUXRIOT_SEV_NORMAL=normal
+EVOSSEARCH_LUXRIOT_SEV_HIGH=high
+EVOSSEARCH_LUXRIOT_SEV_CRITICAL=critical
+
 EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS=7
 EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT=10080
 EVOSSEARCH_ALLOWED_ROOTS=/var/lib/eva-ai
@@ -229,9 +245,18 @@ sudo chmod 0600 /etc/eva-ai/eva-ai.env
 sudo chown root:root /etc/eva-ai/eva-ai.env
 ```
 
+Для прямого доступа к web/API по локальной сети без nginx заменить
+`EVOSSEARCH_HOST=127.0.0.1` на `EVOSSEARCH_HOST=0.0.0.0`.
+
 Важно: `EVOSSEARCH_AUTH_COOKIE_SECURE=true` требует HTTPS с точки зрения
 браузера. Для локального HTTP-only стенда временно можно поставить `false`, но
-не для клиентского демо.
+не для клиентского демо. Если EVA AI открывается через Luxriot Evo Monitor
+crosslink по HTTP, это тоже считается HTTP-only режимом для cookie.
+
+Офисный пример, который использовался при проверке: Luxriot Evo на
+`http://192.168.2.180:9090`; в том стенде default channel был не старый `112`,
+а актуальный ID из списка `/channels`. Перед деплоем всегда проверять реальные
+ID каналов через UI или `/channels`.
 
 ## 6. Первый администратор
 
