@@ -288,19 +288,21 @@ class LuxriotCaptureSession:
                     self.last_error = str(pm_exc)
                 with self.lock:
                     ready_to_summarize = len(self.frames) >= self.batch_size
+                summarized_ok = True
                 if self.summarization_enabled and ready_to_summarize:
-                    self._summarize_batch()
-                self.last_error = None
+                    summarized_ok = self._summarize_batch()
+                if summarized_ok:
+                    self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
             self.stop_event.wait(self.interval)
 
-    def _summarize_batch(self, workload_class: str = "heartbeat") -> None:
+    def _summarize_batch(self, workload_class: str = "heartbeat") -> bool:
         with self.lock:
             frames_copy = list(self.frames)
             self.frames.clear()
         if not frames_copy:
-            return
+            return True
         try:
             batch = self.manager.create_summary_batch(
                 channel_id=self.channel_id,
@@ -323,12 +325,14 @@ class LuxriotCaptureSession:
                     )
                     if not bool(outcome.get("accepted", True)):
                         self.queue_dropped_batches += 1
+            return True
         except Exception as exc:
             self.last_error = str(exc)
             with self.lock:
                 self.frames = frames_copy + self.frames
                 self._enforce_buffer_locked()
                 self.queue_dropped_batches += 1
+            return False
 
     def _enforce_buffer_locked(self) -> None:
         """Ensure frame buffer does not grow unbounded."""

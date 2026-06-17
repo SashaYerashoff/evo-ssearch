@@ -106,6 +106,36 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("database unavailable", session.last_error)
             self.assertEqual(session.queue_dropped_batches, 1)
 
+    def test_capture_loop_keeps_summary_failure_visible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+
+            def unavailable(_batch, _workload):
+                raise RuntimeError("vlm unavailable")
+
+            manager.set_summary_dispatcher(unavailable)
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=1,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            session.client = SimpleNamespace(
+                get_snapshot=lambda _channel_id: SimpleNamespace(width=1280, height=720)
+            )
+
+            def stop_after_one_wait(_interval):
+                session.stop_event.set()
+                return False
+
+            session.stop_event.wait = stop_after_one_wait
+            session._run()
+
+            self.assertEqual(len(session.frames), 1)
+            self.assertIn("vlm unavailable", session.last_error)
+            self.assertEqual(session.queue_dropped_batches, 1)
+
     def test_sync_fallback_records_summary_without_dispatcher(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
