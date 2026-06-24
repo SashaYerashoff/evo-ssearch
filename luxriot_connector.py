@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -12,10 +13,13 @@ import requests
 from PIL import Image
 from requests.auth import HTTPDigestAuth
 
+LOGGER = logging.getLogger(__name__)
+
 DEFAULT_ALERTS_JSON_PROMPT = (
-    "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
-    "- If no trigger match: emit no JSON block.\n"
-    "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
+    "Optional bookmark output for operator review:\n"
+    "- Always append exactly one block at the end, prefixed with ALERTS_JSON:.\n"
+    "- If no trigger matches, use {\"alerts\": []}.\n"
+    "- If one or more triggers match, include one alert object per distinct visible trigger, using this schema:\n"
     "ALERTS_JSON:\n"
     "{\n"
     "  \"alerts\": [\n"
@@ -29,7 +33,15 @@ DEFAULT_ALERTS_JSON_PROMPT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "Rules: max 3 alerts; do not alert routine micro-movements unless explicitly requested; "
+    "Trigger only on observable events such as physical violence, dangerous vehicle behavior, forced entry, "
+    "property damage, theft-like tampering, weapon/fire/smoke/immediate hazard, or crowd escalation. "
+    "Also emit operator-defined low/normal test triggers when the stream prompt explicitly asks for them. "
+    "Do not classify behavior as illegal/unlawful; describe visible facts requiring operator review. "
+    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, "
+    "or ambiguous movement unless the operator prompt explicitly asks for that policy. "
+    "Rules: emit one alert object per distinct trigger visible in the batch, up to 8 objects; "
+    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section; "
+    "do not alert routine micro-movements; "
     "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
 )
 
@@ -44,6 +56,35 @@ class ProbeManagerLike(Protocol):
 AlertParserFn = Callable[[str, int, Optional[int]], List[Dict[str, Any]]]
 SummaryDispatcherFn = Callable[[Mapping[str, Any], str], Mapping[str, Any]]
 SummaryArchiveFn = Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]]
+
+
+class AlertDeliveryResult(int):
+    """Integer-compatible delivery result with alert/bookmark diagnostics."""
+
+    def __new__(
+        cls,
+        sent: int = 0,
+        *,
+        parsed: int = 0,
+        failed: int = 0,
+        skipped_duplicate: int = 0,
+        last_error: Optional[str] = None,
+    ) -> "AlertDeliveryResult":
+        obj = int.__new__(cls, int(max(0, sent)))
+        obj.parsed = int(max(0, parsed))
+        obj.failed = int(max(0, failed))
+        obj.skipped_duplicate = int(max(0, skipped_duplicate))
+        obj.last_error = str(last_error or "").strip() or None
+        return obj
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "alerts_parsed": self.parsed,
+            "bookmarks_sent": int(self),
+            "bookmark_failed_count": self.failed,
+            "bookmark_skipped_duplicate_count": self.skipped_duplicate,
+            "bookmark_last_error": self.last_error,
+        }
 
 
 def _parse_optional_int(value: object) -> Optional[int]:
@@ -179,9 +220,16 @@ class LuxriotClient:
             stream=False,
             timeout=max(10, self.timeout),
         )
-        image = Image.open(BytesIO(resp.content))
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        try:
+            with Image.open(BytesIO(resp.content)) as opened:
+                opened.load()
+                image = opened.convert("RGB") if opened.mode != "RGB" else opened.copy()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Luxriot snapshot decode failed for channel {channel_id}: {exc}"
+            ) from exc
+        if image.width <= 0 or image.height <= 0:
+            raise RuntimeError(f"Luxriot snapshot for channel {channel_id} has invalid dimensions.")
         return image
 
     def create_bookmark(
@@ -396,6 +444,8 @@ class LuxriotCaptureSession:
 class LuxriotManager:
     """Coordinator for Luxriot snapshots, summaries, and channel helpers."""
 
+    DESIRED_LIVE_SESSIONS_KEY = "luxriot_live_sessions:v1"
+
     def __init__(
         self,
         config: Any,
@@ -429,6 +479,13 @@ class LuxriotManager:
             history_limit = 600
         self.summary_history_limit = max(40, history_limit)
         try:
+            archive_frames_per_batch = int(
+                getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4)
+            )
+        except Exception:
+            archive_frames_per_batch = 4
+        self.summary_archive_frames_per_batch = max(1, min(16, archive_frames_per_batch))
+        try:
             summary_retention_days = float(getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0))
         except Exception:
             summary_retention_days = 7.0
@@ -438,6 +495,14 @@ class LuxriotManager:
         self.active_summary_runs: Dict[int, str] = {}
         self.channel_routine_context: Dict[int, Dict[str, Any]] = {}
         self.channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
+        self._summary_state_last_persist = 0.0
+        self._summary_state_dirty = False
+        try:
+            persist_interval = float(getattr(config, "LUXRIOT_SUMMARY_STATE_PERSIST_INTERVAL_SEC", 15.0))
+        except Exception:
+            persist_interval = 15.0
+        self.summary_state_persist_interval_sec = max(0.0, persist_interval)
+        self.live_session_restore_errors: Dict[int, str] = {}
         self.channel_bookmark_fingerprints: Dict[int, Dict[str, int]] = {}
         self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         try:
@@ -445,6 +510,11 @@ class LuxriotManager:
         except Exception:
             cooldown_value = 60.0
         self.default_bookmark_cooldown_sec = max(0.0, cooldown_value)
+        try:
+            max_alerts_value = int(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8))
+        except Exception:
+            max_alerts_value = 8
+        self.alerts_max_per_batch = max(1, min(32, max_alerts_value))
         self.default_json_alert_prompt = str(
             getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", DEFAULT_ALERTS_JSON_PROMPT) or DEFAULT_ALERTS_JSON_PROMPT
         ).strip() or DEFAULT_ALERTS_JSON_PROMPT
@@ -480,9 +550,13 @@ class LuxriotManager:
         # Backward-compatible single-level flag is still supported, but we default to all levels.
         legacy_l1_enabled = bool(getattr(config, "LUXRIOT_ROLLUP_L1_LLM_ENABLED", True))
         llm_levels_raw = str(getattr(config, "LUXRIOT_ROLLUP_LLM_LEVELS", "L1,L2,L3") or "")
-        parsed_levels = {token.strip().upper() for token in llm_levels_raw.split(",") if token.strip()}
+        llm_level_tokens = [token.strip().upper() for token in llm_levels_raw.split(",") if token.strip()]
         allowed_levels = {"L1", "L2", "L3"}
-        self.rollup_llm_levels: Set[str] = parsed_levels.intersection(allowed_levels) if parsed_levels else {"L1", "L2", "L3"}
+        if any(token in {"NONE", "OFF"} for token in llm_level_tokens):
+            self.rollup_llm_levels: Set[str] = set()
+        else:
+            parsed_levels = set(llm_level_tokens)
+            self.rollup_llm_levels = parsed_levels.intersection(allowed_levels) if parsed_levels else {"L1", "L2", "L3"}
         if not legacy_l1_enabled and "L1" in self.rollup_llm_levels:
             self.rollup_llm_levels.discard("L1")
         try:
@@ -571,6 +645,22 @@ class LuxriotManager:
         summary = str(log.get("summary") or "").strip()
         return (created, run_id, frame_count, summary[:160])
 
+    @staticmethod
+    def _summary_log_bounds_seconds(log: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+        created = LuxriotManager._coerce_float(log.get("created_at"))
+        fallback_ms = int(float(created) * 1000.0) if created is not None else None
+        start_ms = _parse_optional_int(log.get("batch_start_ms"))
+        end_ms = _parse_optional_int(log.get("batch_end_ms"))
+        if start_ms is None:
+            start_ms = end_ms if end_ms is not None else fallback_ms
+        if end_ms is None:
+            end_ms = start_ms if start_ms is not None else fallback_ms
+        if start_ms is None or end_ms is None:
+            return None, None
+        if end_ms < start_ms:
+            start_ms, end_ms = end_ms, start_ms
+        return float(start_ms) / 1000.0, float(end_ms) / 1000.0
+
     @classmethod
     def _combine_summary_logs(
         cls,
@@ -585,13 +675,37 @@ class LuxriotManager:
             key = cls._summary_log_key(item)
             if key not in merged:
                 ordered.append(key)
-            merged[key] = dict(item)
+            incoming = dict(item)
+            existing = merged.get(key)
+            if existing is not None:
+                existing_meta = cls._alert_meta_from_counts(existing.get("alert_counts"))
+                incoming_meta = cls._alert_meta_from_counts(incoming.get("alert_counts"))
+                existing_total = int(existing_meta.get("alert_total") or 0)
+                incoming_total = int(incoming_meta.get("alert_total") or 0)
+                if existing_total > 0 and incoming_total <= 0:
+                    incoming["alert_counts"] = dict(existing_meta.get("alert_counts") or {})
+                    incoming["alert_total"] = existing_total
+                    incoming["alert_severities"] = list(existing_meta.get("alert_severities") or [])
+                if isinstance(existing.get("signal_digest"), Mapping) and not isinstance(incoming.get("signal_digest"), Mapping):
+                    incoming["signal_digest"] = dict(cast(Mapping[str, Any], existing.get("signal_digest")))
+            merged[key] = incoming
         ordered.sort(key=lambda key: float(key[0]))
         return [merged[key] for key in ordered]
 
     @staticmethod
     def _normalize_alert_severity(value: Any) -> str:
         severity = str(value or "").strip().lower()
+        severity_aliases = {
+            "information": "info",
+            "informational": "info",
+            "warn": "low",
+            "warning": "low",
+            "medium": "normal",
+            "moderate": "normal",
+            "danger": "high",
+            "emergency": "critical",
+        }
+        severity = severity_aliases.get(severity, severity)
         return severity if severity in ALERT_SEVERITY_SET else "normal"
 
     @classmethod
@@ -618,6 +732,67 @@ class LuxriotManager:
             "alert_total": total,
             "alert_severities": [severity for severity in ALERT_SEVERITY_ORDER if counts.get(severity, 0) > 0],
         }
+
+    @classmethod
+    def _format_alert_counts(cls, raw_counts: Any) -> str:
+        counts = cls._normalize_alert_counts(raw_counts)
+        if not counts:
+            return ""
+        return ", ".join(
+            f"{severity}={counts[severity]}"
+            for severity in ALERT_SEVERITY_ORDER
+            if counts.get(severity, 0) > 0
+        )
+
+    @classmethod
+    def _rollup_backend_instruction_lines(cls, level: str) -> List[str]:
+        normalized_level = cls._normalize_rollup_level(level) or str(level or "").strip().upper() or "rollup"
+        return [
+            "Context constraints:",
+            "- All source entries are from the same channel and continuous timeline window above.",
+            "- Source entries may be model-generated summaries from a lower level; avoid compounding uncertainty.",
+            "- Window signal digest is a compact routing map for alerts, deviations, watch items, missing data, and uncertainty; use it to keep continuity, but treat source summaries as evidence.",
+            "- Preserve rare but important events even if they appear once.",
+            "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
+            "- Never compress alerts, deviations, or operator-review incidents into routine.",
+            "- Alert Ledger must mention every source alert/count, including normal/info alerts, even when the event is routine or needs no action.",
+            "- Do not classify behavior as illegal/unlawful; describe observable security/safety facts.",
+            "",
+            "Task:",
+            f"- Write one concise {normalized_level} summary for operators.",
+            "- Deduplicate repeated scene descriptions and boilerplate.",
+            "- Keep meaningful changes in short timeline bullets across the full window.",
+            "- Mention risks/signals only when grounded in source text.",
+            "- If activity is routine, say so clearly without repeating identical details.",
+            "- Keep routine baseline separate from preserved deviations and alert ledger.",
+            "- Do not invent entities, times, or counts.",
+            "",
+            "Output format (Markdown):",
+            "### Window Snapshot",
+            "### Routine Baseline",
+            "### Preserved Deviations",
+            "### Alert Ledger",
+            "### Alert Tuning Notes",
+            "### Alerts/Signals",
+            "### Operator Notes",
+            "",
+            "Append exactly one compact machine-readable memory block:",
+            "MEMORY_UPDATE_JSON:",
+            "{",
+            "  \"routine_baseline\": \"normal pattern for this channel, if grounded\",",
+            "  \"active_watchlist\": [\"short-lived items to watch in the next window\"],",
+            "  \"preserved_deviations\": [",
+            "    {\"time\": \"HH:MM-HH:MM\", \"severity\": \"info|low|normal|high|critical\", \"event\": \"observable event\", \"evidence\": \"visible evidence\"}",
+            "  ],",
+            "  \"alert_tuning_notes\": [\"what should/should not trigger next time\"],",
+            "  \"ignore_as_routine\": [\"recurring benign activity/noise\"]",
+            "}",
+            "Rules for MEMORY_UPDATE_JSON: keep every field concise; use [] or \"\" when absent; preserve real deviations even if the window is mostly routine.",
+        ]
+
+    @classmethod
+    def _rollup_backend_instruction_text(cls, level: str) -> str:
+        return "\n".join(cls._rollup_backend_instruction_lines(level)).strip()
 
     def _summary_alert_metadata(
         self,
@@ -655,6 +830,226 @@ class LuxriotManager:
                 counts[severity] = counts.get(severity, 0) + 1
         return self._alert_meta_from_counts(counts)
 
+    def _summary_alert_signal_items(
+        self,
+        summary_text: object,
+        *,
+        channel_id: int,
+        timestamp_ms: int,
+        max_items: int = 5,
+    ) -> List[str]:
+        text = str(summary_text or "")
+        if not text or not self.alert_parser or not self._contains_alerts_json(text):
+            return []
+        try:
+            parsed_alerts = self.alert_parser(text, int(channel_id), int(timestamp_ms))
+        except TypeError:
+            parsed_alerts = cast(Any, self.alert_parser)(text, int(channel_id))
+        except Exception:
+            parsed_alerts = []
+        if not isinstance(parsed_alerts, Sequence) or isinstance(parsed_alerts, (str, bytes, bytearray)):
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw_alert in parsed_alerts:
+            if not isinstance(raw_alert, Mapping):
+                continue
+            severity = self._normalize_alert_severity(raw_alert.get("severity"))
+            title = self._truncate_text(raw_alert.get("title") or raw_alert.get("description"), 120)
+            description = self._truncate_text(raw_alert.get("description"), 160)
+            if not title and not description:
+                continue
+            text_item = f"{severity}: {title or description}"
+            if description and description.lower() != title.lower():
+                text_item = f"{text_item} | {description}"
+            text_item = self._truncate_text(text_item, 220)
+            key = text_item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text_item)
+            if len(out) >= max(1, int(max_items)):
+                break
+        return out
+
+    @classmethod
+    def _extract_signal_sentences(
+        cls,
+        text: object,
+        patterns: Sequence[str],
+        *,
+        max_items: int = 3,
+        max_len: int = 180,
+    ) -> List[str]:
+        raw = str(text or "")
+        if not raw:
+            return []
+        raw = re.sub(r"```.*?```", " ", raw, flags=re.DOTALL)
+        raw = re.sub(r"ALERTS_JSON:\s*\{.*", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+        raw = re.sub(r"MEMORY_UPDATE_JSON:\s*\{.*", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+        candidates = re.split(r"(?<=[.!?])\s+|\n+|;\s+", raw)
+        regexes = [re.compile(pattern, flags=re.IGNORECASE) for pattern in patterns]
+        out: List[str] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            text_item = cls._truncate_text(candidate, max_len)
+            if not text_item:
+                continue
+            if not any(regex.search(text_item) for regex in regexes):
+                continue
+            key = text_item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text_item)
+            if len(out) >= max(1, int(max_items)):
+                break
+        return out
+
+    def _summary_signal_digest(
+        self,
+        summary_text: object,
+        *,
+        channel_id: int,
+        timestamp_ms: int,
+        alert_counts: Optional[Mapping[str, Any]] = None,
+        alert_total: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        digest: Dict[str, Any] = {}
+        counts = self._normalize_alert_counts(alert_counts)
+        if not counts and int(alert_total or 0) > 0:
+            counts = self._normalize_alert_counts({"normal": int(alert_total or 0)})
+        if counts:
+            digest["alerts"] = counts
+            alert_events = self._summary_alert_signal_items(
+                summary_text,
+                channel_id=channel_id,
+                timestamp_ms=timestamp_ms,
+                max_items=5,
+            )
+            if alert_events:
+                digest["alert_events"] = alert_events
+
+        text_upper = str(summary_text or "").upper()
+        has_structured_memory = "MEMORY_UPDATE_JSON:" in text_upper or bool(
+            re.search(
+                r"^###\s*(Routine Baseline|Preserved Deviations|Active Watchlist|Alert Tuning Notes|Alerts/Signals|Operator Notes)\s*$",
+                str(summary_text or ""),
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        if has_structured_memory:
+            memory = self._extract_memory_update(summary_text)
+            routine = self._truncate_text(memory.get("routine_baseline"), 260)
+            if routine:
+                digest["routine"] = routine
+            for source_key, target_key, max_items, max_len in (
+                ("active_watchlist", "watchlist", 4, 180),
+                ("preserved_deviations", "deviations", 5, 220),
+                ("alert_tuning_notes", "tuning", 3, 180),
+                ("ignore_as_routine", "routine_noise", 3, 160),
+            ):
+                items = self._coerce_memory_items(memory.get(source_key), max_items=max_items, max_len=max_len)
+                if items:
+                    digest[target_key] = items
+
+        missing = self._extract_signal_sentences(
+            summary_text,
+            (
+                r"\b(no source|no frames|frame gap|dropped frames?|preview failed|load failed|unavailable|not loaded|not ready)\b",
+                r"\b(camera|stream|feed|snapshot|frame).{0,40}\b(failed|missing|unavailable|stale|frozen)\b",
+                r"\b(occluded|obstructed|blackout)\b",
+            ),
+            max_items=3,
+            max_len=180,
+        )
+        if missing:
+            digest["missing_data"] = missing
+
+        uncertainty = self._extract_signal_sentences(
+            summary_text,
+            (
+                r"\b(uncertain|unknown|ambiguous|unclear|possibly|probably|appears to|seems to|may be|might be)\b",
+                r"\b(cannot determine|not enough|insufficient evidence)\b",
+            ),
+            max_items=3,
+            max_len=180,
+        )
+        if uncertainty:
+            digest["uncertainty"] = uncertainty
+        return {key: value for key, value in digest.items() if value}
+
+    @classmethod
+    def _merge_signal_digest_items(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        field: str,
+        *,
+        max_items: int,
+        max_len: int = 220,
+    ) -> List[str]:
+        grouped: List[Sequence[str]] = []
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            digest = child.get("signal_digest")
+            if not isinstance(digest, Mapping):
+                continue
+            grouped.append(cls._coerce_memory_items(digest.get(field), max_items=max_items, max_len=max_len))
+        return cls._dedupe_memory_items(*grouped, max_items=max_items)
+
+    @classmethod
+    def _aggregate_signal_digest(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        alert_counts: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        digest: Dict[str, Any] = {}
+        counts = cls._normalize_alert_counts(alert_counts)
+        if counts:
+            digest["alerts"] = counts
+        for field, limit, max_len in (
+            ("alert_events", 6, 220),
+            ("deviations", 6, 220),
+            ("watchlist", 5, 180),
+            ("missing_data", 4, 180),
+            ("uncertainty", 4, 180),
+            ("tuning", 4, 180),
+            ("routine_noise", 4, 160),
+            ("routine", 2, 220),
+        ):
+            items = cls._merge_signal_digest_items(children, field, max_items=limit, max_len=max_len)
+            if items:
+                digest[field] = items if field != "routine" else items[0]
+        return {key: value for key, value in digest.items() if value}
+
+    @classmethod
+    def _render_signal_digest(cls, digest_raw: object, *, max_len: int = 1000) -> str:
+        if not isinstance(digest_raw, Mapping):
+            return ""
+        digest = cast(Mapping[str, Any], digest_raw)
+        lines: List[str] = []
+        alerts = cls._format_alert_counts(digest.get("alerts"))
+        if alerts:
+            lines.append(f"Alerts: {alerts}")
+        for key, label, limit in (
+            ("alert_events", "Alert events", 5),
+            ("deviations", "Preserved deviations", 5),
+            ("watchlist", "Watchlist", 4),
+            ("missing_data", "Missing/data-quality", 3),
+            ("uncertainty", "Uncertainty", 3),
+            ("tuning", "Alert tuning", 3),
+            ("routine_noise", "Routine/noise", 3),
+        ):
+            items = cls._coerce_memory_items(digest.get(key), max_items=limit, max_len=180)
+            if items:
+                lines.append(f"{label}: " + "; ".join(items))
+        routine = cls._truncate_text(digest.get("routine"), 220)
+        if routine:
+            lines.append(f"Routine cue: {routine}")
+        rendered = "\n".join(lines).strip()
+        return cls._truncate_text(rendered, max_len)
+
     @classmethod
     def _merge_alert_metadata(cls, nodes: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         counts: Dict[str, int] = {}
@@ -686,11 +1081,26 @@ class LuxriotManager:
         batch_size = _parse_optional_int(entry.get("batch_size")) or 0
         duration_sec = self._coerce_float(entry.get("duration_sec")) or 0.0
         created_ms = int(float(created_at) * 1000.0)
+        batch_start_ms = _parse_optional_int(entry.get("batch_start_ms"))
+        if batch_start_ms is None:
+            batch_start_ms = created_ms
+        batch_end_ms = _parse_optional_int(entry.get("batch_end_ms"))
+        if batch_end_ms is None:
+            batch_end_ms = batch_start_ms
+        if batch_end_ms < batch_start_ms:
+            batch_start_ms, batch_end_ms = batch_end_ms, batch_start_ms
         alert_meta = self._summary_alert_metadata(
             summary,
             channel_id=int(channel_id),
-            timestamp_ms=created_ms,
+            timestamp_ms=int(batch_end_ms),
             fallback=entry,
+        )
+        signal_digest = self._summary_signal_digest(
+            summary,
+            channel_id=int(channel_id),
+            timestamp_ms=int(batch_end_ms),
+            alert_counts=cast(Mapping[str, Any], alert_meta.get("alert_counts") or {}),
+            alert_total=int(alert_meta.get("alert_total") or 0),
         )
         bookmarks_sent = _parse_optional_int(entry.get("bookmarks_sent")) or 0
         return {
@@ -700,9 +1110,18 @@ class LuxriotManager:
             "frame_count": int(max(0, frame_count)),
             "batch_size": int(max(0, batch_size)),
             "created_at": float(created_at),
+            "batch_start_ms": int(batch_start_ms),
+            "batch_end_ms": int(batch_end_ms),
             "duration_sec": float(max(0.0, duration_sec)),
             "prompt": str(entry.get("prompt") or ""),
             "bookmarks_sent": int(max(0, bookmarks_sent)),
+            "alerts_parsed": int(max(0, _parse_optional_int(entry.get("alerts_parsed")) or 0)),
+            "bookmark_failed_count": int(max(0, _parse_optional_int(entry.get("bookmark_failed_count")) or 0)),
+            "bookmark_skipped_duplicate_count": int(
+                max(0, _parse_optional_int(entry.get("bookmark_skipped_duplicate_count")) or 0)
+            ),
+            "bookmark_last_error": self._truncate_text(entry.get("bookmark_last_error"), 240),
+            "signal_digest": signal_digest,
             **alert_meta,
         }
 
@@ -824,6 +1243,20 @@ class LuxriotManager:
         except Exception:
             return
 
+    def _persist_summary_state_if_due_locked(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and self.summary_state_persist_interval_sec > 0
+            and self._summary_state_last_persist > 0
+            and now - self._summary_state_last_persist < self.summary_state_persist_interval_sec
+        ):
+            self._summary_state_dirty = True
+            return
+        self._summary_state_last_persist = now
+        self._summary_state_dirty = False
+        self._persist_summary_state_locked()
+
     def _load_summary_state_from_disk(self) -> None:
         payload: Optional[Dict[str, Any]] = None
         state_store = getattr(self, "runtime_state_store", None)
@@ -900,13 +1333,18 @@ class LuxriotManager:
                 routine_text = str(routine_value.get("routine") or "").strip()
                 if not routine_text:
                     continue
-                loaded_routines[int(channel_id)] = {
+                loaded_entry: Dict[str, Any] = {
                     "channel_id": int(channel_id),
                     "rollup_id": str(routine_value.get("rollup_id") or "").strip(),
+                    "source_level": str(routine_value.get("source_level") or "").strip(),
                     "window_end": float(self._coerce_float(routine_value.get("window_end")) or 0.0),
                     "routine": routine_text,
                     "updated_at": float(self._coerce_float(routine_value.get("updated_at")) or time.time()),
                 }
+                memory_raw = routine_value.get("memory")
+                if isinstance(memory_raw, Mapping):
+                    loaded_entry["memory"] = dict(memory_raw)
+                loaded_routines[int(channel_id)] = loaded_entry
         loaded_stream_system_prompt: Optional[str] = None
         loaded_rollup_prompts: Dict[str, str] = {}
         loaded_channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
@@ -1000,6 +1438,156 @@ class LuxriotManager:
     def persist_summary_state(self) -> None:
         with self.cache_lock:
             self._persist_summary_state_locked()
+
+    def _load_desired_live_sessions(self) -> Dict[int, Dict[str, Any]]:
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is None:
+            return {}
+        payload = state_store.load_state(self.DESIRED_LIVE_SESSIONS_KEY)
+        if not isinstance(payload, Mapping):
+            return {}
+        sessions_raw = payload.get("sessions")
+        if not isinstance(sessions_raw, Mapping):
+            return {}
+        desired: Dict[int, Dict[str, Any]] = {}
+        for raw_channel_id, raw_state in sessions_raw.items():
+            channel_id = _parse_optional_int(raw_channel_id)
+            if channel_id is None or channel_id <= 0 or not isinstance(raw_state, Mapping):
+                continue
+            desired[channel_id] = dict(raw_state)
+        return desired
+
+    def _save_desired_live_sessions(self, sessions: Mapping[int, Mapping[str, Any]]) -> None:
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is None:
+            return
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "sessions": {
+                str(int(channel_id)): dict(state)
+                for channel_id, state in sessions.items()
+                if int(channel_id) > 0
+            },
+        }
+        state_store.save_state(self.DESIRED_LIVE_SESSIONS_KEY, payload)
+
+    def _set_desired_live_session(
+        self,
+        channel_id: int,
+        *,
+        enabled: bool,
+        batch_size: Optional[int] = None,
+        prompt: Optional[str] = None,
+        model_hint: Optional[str] = None,
+        interval_sec: Optional[float] = None,
+        restore_error: Optional[str] = None,
+    ) -> None:
+        desired = self._load_desired_live_sessions()
+        now = time.time()
+        current = dict(desired.get(int(channel_id)) or {})
+        current.update(
+            {
+                "enabled": bool(enabled),
+                "channel_id": int(channel_id),
+                "updated_at": now,
+            }
+        )
+        if batch_size is not None:
+            current["batch_size"] = int(batch_size)
+        if prompt is not None:
+            current["prompt"] = str(prompt)
+        if model_hint is not None:
+            current["model_hint"] = str(model_hint)
+        elif enabled:
+            current["model_hint"] = ""
+        if interval_sec is not None:
+            current["interval_sec"] = float(interval_sec)
+        if restore_error:
+            current["last_restore_error"] = str(restore_error)[:500]
+            current["last_restore_error_at"] = now
+            current["restore_attempts"] = int(current.get("restore_attempts") or 0) + 1
+        elif enabled:
+            current.pop("last_restore_error", None)
+            current.pop("last_restore_error_at", None)
+        desired[int(channel_id)] = current
+        self._save_desired_live_sessions(desired)
+
+    def restore_desired_live_sessions(self, *, max_channels: Optional[int] = None) -> Dict[str, Any]:
+        try:
+            desired = self._load_desired_live_sessions()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "desired_state_unavailable",
+                "error": type(exc).__name__,
+            }
+        enabled_items = [
+            (channel_id, state)
+            for channel_id, state in sorted(desired.items())
+            if bool(state.get("enabled"))
+        ]
+        if max_channels is not None and max_channels > 0:
+            enabled_items = enabled_items[: int(max_channels)]
+        restored: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        skipped: List[int] = []
+        for index, (channel_id, state) in enumerate(enabled_items):
+            with self.cache_lock:
+                already_running = channel_id in self.sessions
+            if already_running:
+                skipped.append(channel_id)
+                continue
+            if index:
+                time.sleep(0.2)
+            try:
+                status = self.start_session(
+                    channel_id=channel_id,
+                    batch_size=_parse_optional_int(state.get("batch_size")),
+                    prompt=str(state.get("prompt") or ""),
+                    model_hint=str(state.get("model_hint") or "").strip() or None,
+                    interval_sec=self._normalize_capture_interval_sec(state.get("interval_sec")),
+                    update_desired=True,
+                )
+                restored.append(
+                    {
+                        "channel_id": channel_id,
+                        "model": status.get("model"),
+                        "batch_size": status.get("batch_size"),
+                    }
+                )
+                with self.cache_lock:
+                    self.live_session_restore_errors.pop(channel_id, None)
+            except Exception as exc:
+                message = str(exc)[:500]
+                failed.append(
+                    {
+                        "channel_id": channel_id,
+                        "error": type(exc).__name__,
+                        "message": message,
+                    }
+                )
+                with self.cache_lock:
+                    self.live_session_restore_errors[channel_id] = message
+                try:
+                    self._set_desired_live_session(
+                        channel_id,
+                        enabled=True,
+                        restore_error=message,
+                    )
+                except Exception:
+                    pass
+        return {
+            "ok": not failed,
+            "status": "restored" if not failed else "partial",
+            "desired_count": len(enabled_items),
+            "restored_count": len(restored),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+            "restored": restored,
+            "skipped": skipped,
+            "failed": failed,
+        }
 
     @staticmethod
     def _coerce_float(value: object) -> Optional[float]:
@@ -1123,10 +1711,10 @@ class LuxriotManager:
                 item_run = str(item.get("run_id") or "").strip()
                 if item_run != normalized_run_id:
                     continue
-            created = LuxriotManager._coerce_float(item.get("created_at"))
-            if start_ts is not None and (created is None or created < start_ts):
+            item_start, item_end = LuxriotManager._summary_log_bounds_seconds(item)
+            if start_ts is not None and (item_end is None or item_end < start_ts):
                 continue
-            if end_ts is not None and (created is None or created > end_ts):
+            if end_ts is not None and (item_start is None or item_start > end_ts):
                 continue
             filtered.append(dict(item))
         return filtered
@@ -1171,6 +1759,76 @@ class LuxriotManager:
             return ""
         return self._stable_id(normalized, length=16)
 
+    @classmethod
+    def _signature_value(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._signature_value(item_value)
+                for key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return [cls._signature_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @classmethod
+    def _signature_json(cls, value: object) -> str:
+        try:
+            return json.dumps(
+                cls._signature_value(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            return str(cls._signature_value(value))
+
+    @staticmethod
+    def _text_hash(text: object, length: int = 16) -> str:
+        payload = str(text or "").strip().encode("utf-8", errors="ignore")
+        if not payload:
+            return ""
+        return hashlib.sha1(payload).hexdigest()[: max(6, int(length))]
+
+    def _rollup_source_signature(
+        self,
+        children: Sequence[Mapping[str, Any]],
+        source_ids: Sequence[str],
+    ) -> str:
+        normalized_source_ids = [
+            str(item or "").strip()
+            for item in source_ids
+            if str(item or "").strip()
+        ]
+        child_payloads: List[Dict[str, Any]] = []
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            signal_digest = child.get("signal_digest")
+            child_payloads.append(
+                {
+                    "source_id": str(child.get("rollup_id") or "").strip(),
+                    "summary_hash": self._text_hash(child.get("summary")),
+                    "alert_counts": self._normalize_alert_counts(child.get("alert_counts")),
+                    "signal_digest": signal_digest if isinstance(signal_digest, Mapping) else {},
+                    "source_signature": str(child.get("source_signature") or "").strip(),
+                }
+            )
+        if not child_payloads:
+            return self._source_signature(normalized_source_ids)
+        return self._stable_id(
+            [
+                self._signature_json(
+                    {
+                        "source_ids": normalized_source_ids,
+                        "children": child_payloads,
+                    }
+                )
+            ],
+            length=16,
+        )
+
     @staticmethod
     def _summary_headline(text: object, max_len: int = 180) -> str:
         normalized = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
@@ -1185,6 +1843,15 @@ class LuxriotManager:
         raw = str(text or "").strip()
         if not raw:
             return ""
+        upper_raw = raw.upper()
+        cut_points = [
+            idx
+            for marker in ("ALERTS_JSON:", "MEMORY_UPDATE_JSON:")
+            for idx in [upper_raw.find(marker)]
+            if idx >= 0
+        ]
+        if cut_points:
+            raw = raw[: min(cut_points)].rstrip()
         # Remove frequent boilerplate prefixes produced by VLM.
         cleaned = re.sub(
             r"^\s*As a security expert(?:[^:.\n]*[:.])\s*",
@@ -1227,25 +1894,242 @@ class LuxriotManager:
         body = match.group("body").strip()
         return body
 
-    def _extract_routine_hint(self, summary_text: object) -> str:
+    @staticmethod
+    def _truncate_text(text: object, max_len: int) -> str:
+        normalized = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+        if not normalized:
+            return ""
+        limit = max(16, int(max_len))
+        if len(normalized) <= limit:
+            return normalized
+        return f"{normalized[: limit - 3].rstrip()}..."
+
+    @classmethod
+    def _extract_json_marker_payload(cls, text: str, marker: str) -> Optional[Mapping[str, Any]]:
+        haystack = str(text or "")
+        marker_text = str(marker or "").strip()
+        if not haystack or not marker_text:
+            return None
+        idx = haystack.upper().find(marker_text.upper())
+        if idx < 0:
+            return None
+        tail = haystack[idx + len(marker_text) :].strip()
+        if not tail:
+            return None
+        try:
+            payload, _offset = json.JSONDecoder().raw_decode(tail)
+        except Exception:
+            return None
+        if isinstance(payload, Mapping):
+            return cast(Mapping[str, Any], payload)
+        return None
+
+    @staticmethod
+    def _compact_json_key(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+    @classmethod
+    def _payload_value(cls, payload: Mapping[str, Any], *aliases: str) -> Any:
+        for alias in aliases:
+            if alias in payload:
+                return payload.get(alias)
+        compact_payload = {
+            cls._compact_json_key(key): value
+            for key, value in payload.items()
+        }
+        for alias in aliases:
+            compact_alias = cls._compact_json_key(alias)
+            if compact_alias in compact_payload:
+                return compact_payload[compact_alias]
+        return None
+
+    @classmethod
+    def _coerce_memory_items(cls, value: object, *, max_items: int = 5, max_len: int = 220) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, Mapping):
+            raw_items: Sequence[object] = [value]
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            raw_items = cast(Sequence[object], value)
+        else:
+            raw_items = [value]
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw_item in raw_items:
+            if isinstance(raw_item, Mapping):
+                parts: List[str] = []
+                for key in ("time", "severity", "event", "evidence", "note", "reason"):
+                    if key not in raw_item:
+                        continue
+                    part = cls._truncate_text(raw_item.get(key), 120 if key != "event" else 180)
+                    if part:
+                        parts.append(part)
+                text = " | ".join(parts)
+            else:
+                text = cls._truncate_text(raw_item, max_len)
+            text = cls._truncate_text(text, max_len)
+            if not text:
+                continue
+            dedupe_key = text.lower()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            out.append(text)
+            if len(out) >= max(1, int(max_items)):
+                break
+        return out
+
+    @staticmethod
+    def _dedupe_memory_items(*groups: Sequence[str], max_items: int = 6) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for group in groups:
+            for item in group:
+                text = " ".join(str(item or "").split())
+                if not text:
+                    continue
+                key = text.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(text)
+                if len(out) >= max(1, int(max_items)):
+                    return out
+        return out
+
+    @classmethod
+    def _render_channel_memory_text(cls, memory: Mapping[str, Any], max_len: int = 1600) -> str:
+        routine = cls._truncate_text(memory.get("routine_baseline"), 420)
+        active = cls._coerce_memory_items(memory.get("active_watchlist"), max_items=4, max_len=180)
+        deviations = cls._coerce_memory_items(memory.get("preserved_deviations"), max_items=5, max_len=220)
+        tuning = cls._coerce_memory_items(memory.get("alert_tuning_notes"), max_items=4, max_len=200)
+        ignore = cls._coerce_memory_items(memory.get("ignore_as_routine"), max_items=4, max_len=180)
+        lines: List[str] = []
+        if routine:
+            lines.append(f"Routine baseline: {routine}")
+        if active:
+            lines.append("Active watchlist: " + "; ".join(active))
+        if deviations:
+            lines.append("Preserved deviations: " + "; ".join(deviations))
+        if tuning:
+            lines.append("Alert tuning notes: " + "; ".join(tuning))
+        if ignore:
+            lines.append("Ignore as routine/noise: " + "; ".join(ignore))
+        rendered = "\n".join(lines).strip()
+        return cls._truncate_text(rendered, max_len)
+
+    def _extract_memory_update(self, summary_text: object) -> Dict[str, Any]:
         text = str(summary_text or "").strip()
         if not text:
-            return ""
-        baseline = self._extract_markdown_section(text, "Scene Baseline")
-        notes = self._extract_markdown_section(text, "Operator Notes")
-        chunks: List[str] = []
-        if baseline:
-            chunks.append(f"Scene baseline: {' '.join(baseline.split())}")
-        if notes:
-            chunks.append(f"Operator notes: {' '.join(notes.split())}")
-        if not chunks:
-            cleaned = self._sanitize_l0_summary(text, max_len=420)
+            return {}
+        payload = self._extract_json_marker_payload(text, "MEMORY_UPDATE_JSON:")
+        if payload:
+            memory = {
+                "routine_baseline": self._truncate_text(
+                    self._payload_value(
+                        payload,
+                        "routine_baseline",
+                        "routineBaseline",
+                        "scene_baseline",
+                        "sceneBaseline",
+                        "persistent_patterns",
+                        "persistentPatterns",
+                    ),
+                    420,
+                ),
+                "active_watchlist": self._coerce_memory_items(
+                    self._payload_value(payload, "active_watchlist", "activeWatchlist", "watchlist"),
+                    max_items=4,
+                    max_len=180,
+                ),
+                "preserved_deviations": self._coerce_memory_items(
+                    self._payload_value(
+                        payload,
+                        "preserved_deviations",
+                        "preservedDeviations",
+                        "recent_deviations",
+                        "recentDeviations",
+                        "notable_events",
+                        "notableEvents",
+                    ),
+                    max_items=5,
+                    max_len=220,
+                ),
+                "alert_tuning_notes": self._coerce_memory_items(
+                    self._payload_value(
+                        payload,
+                        "alert_tuning_notes",
+                        "alertTuningNotes",
+                        "alerttuningnotes",
+                        "alert_tuning",
+                        "alertTuning",
+                    ),
+                    max_items=4,
+                    max_len=200,
+                ),
+                "ignore_as_routine": self._coerce_memory_items(
+                    self._payload_value(
+                        payload,
+                        "ignore_as_routine",
+                        "ignoreAsRoutine",
+                        "ignoreasroutine",
+                        "routine_noise",
+                        "routineNoise",
+                        "recurring_false_positives",
+                        "recurringFalsePositives",
+                    ),
+                    max_items=4,
+                    max_len=180,
+                ),
+            }
+            memory["text"] = self._render_channel_memory_text(memory)
+            return {key: value for key, value in memory.items() if value}
+
+        section_map = {
+            "routine_baseline": (
+                "Routine Baseline",
+                "Scene Baseline",
+                "Persistent Patterns",
+                "Time-of-day Routine",
+            ),
+            "active_watchlist": ("Active Watchlist",),
+            "preserved_deviations": (
+                "Preserved Deviations",
+                "Significant Changes",
+                "Key Changes",
+                "Notable Events",
+                "Risks and Follow-ups",
+            ),
+            "alert_tuning_notes": (
+                "Alert Tuning Notes",
+                "Alerts/Signals",
+                "Alert Ledger",
+                "Operator Notes",
+            ),
+            "ignore_as_routine": (
+                "Recurring False Positives",
+                "Ignore as Routine",
+            ),
+        }
+        memory: Dict[str, Any] = {}
+        for target_key, headings in section_map.items():
+            chunks: List[str] = []
+            for heading in headings:
+                body = self._extract_markdown_section(text, heading)
+                if body:
+                    chunks.append(body)
+            if not chunks:
+                continue
+            if target_key == "routine_baseline":
+                memory[target_key] = self._truncate_text(" ".join(chunks), 420)
+            else:
+                memory[target_key] = self._coerce_memory_items(chunks, max_items=4, max_len=220)
+        if not memory:
+            cleaned = self._sanitize_l0_summary(text, max_len=520)
             if cleaned:
-                chunks.append(cleaned)
-        hint = " ".join(chunks).strip()
-        if len(hint) > 900:
-            hint = f"{hint[:897].rstrip()}..."
-        return hint
+                memory["routine_baseline"] = cleaned
+        memory["text"] = self._render_channel_memory_text(memory)
+        return {key: value for key, value in memory.items() if value}
 
     def _update_channel_routine_context(
         self,
@@ -1253,30 +2137,71 @@ class LuxriotManager:
         rollup_id: str,
         summary_text: object,
         window_end: Optional[float],
+        level: Optional[str] = None,
     ) -> None:
-        routine_hint = self._extract_routine_hint(summary_text)
-        if not routine_hint:
+        extracted_memory = self._extract_memory_update(summary_text)
+        if not extracted_memory:
             return
         channel_key = int(channel_id)
         rollup_key = str(rollup_id or "").strip()
         window_end_value = self._coerce_float(window_end) or 0.0
+        source_level = self._normalize_rollup_level(level) or ""
         changed = False
         with self.cache_lock:
             current = self.channel_routine_context.get(channel_key)
             current_window_end = self._coerce_float(current.get("window_end")) if isinstance(current, Mapping) else None
+            current_window_end_value = float(current_window_end or 0.0)
+            incoming_is_older = current is not None and current_window_end is not None and window_end_value < current_window_end_value
             current_rollup_id = str(current.get("rollup_id") or "").strip() if isinstance(current, Mapping) else ""
             current_hint = str(current.get("routine") or "").strip() if isinstance(current, Mapping) else ""
-            should_replace = (
+            current_memory_raw = current.get("memory") if isinstance(current, Mapping) else None
+            current_memory = dict(current_memory_raw) if isinstance(current_memory_raw, Mapping) else {}
+            merged_memory = dict(current_memory)
+            routine_baseline = str(extracted_memory.get("routine_baseline") or "").strip()
+            current_routine_baseline = str(merged_memory.get("routine_baseline") or "").strip()
+            if routine_baseline and (not incoming_is_older or not current_routine_baseline):
+                merged_memory["routine_baseline"] = routine_baseline
+            for key, limit in (
+                ("active_watchlist", 5),
+                ("preserved_deviations", 7),
+                ("alert_tuning_notes", 5),
+                ("ignore_as_routine", 5),
+            ):
+                incoming_items = self._coerce_memory_items(extracted_memory.get(key), max_items=limit, max_len=220)
+                existing = self._coerce_memory_items(merged_memory.get(key), max_items=limit, max_len=220)
+                if incoming_is_older:
+                    merged = self._dedupe_memory_items(existing, incoming_items, max_items=limit)
+                else:
+                    merged = self._dedupe_memory_items(incoming_items, existing, max_items=limit)
+                if merged:
+                    merged_memory[key] = merged
+                elif key in merged_memory:
+                    merged_memory.pop(key, None)
+            routine_hint = self._render_channel_memory_text(merged_memory)
+            if not routine_hint:
+                routine_hint = str(extracted_memory.get("text") or "").strip()
+            should_update = (
                 current is None
-                or window_end_value > float(current_window_end or 0.0)
+                or window_end_value > current_window_end_value
                 or (current_rollup_id == rollup_key and current_hint != routine_hint)
+                or current_hint != routine_hint
             )
-            if should_replace:
+            if should_update:
+                if incoming_is_older:
+                    stored_rollup_id = current_rollup_id or rollup_key
+                    stored_source_level = str(current.get("source_level") or "").strip() if isinstance(current, Mapping) else source_level
+                    stored_window_end = current_window_end_value
+                else:
+                    stored_rollup_id = rollup_key
+                    stored_source_level = source_level
+                    stored_window_end = window_end_value
                 self.channel_routine_context[channel_key] = {
                     "channel_id": channel_key,
-                    "rollup_id": rollup_key,
-                    "window_end": window_end_value,
+                    "rollup_id": stored_rollup_id,
+                    "source_level": stored_source_level,
+                    "window_end": stored_window_end,
                     "routine": routine_hint,
+                    "memory": merged_memory,
                     "updated_at": time.time(),
                 }
                 changed = True
@@ -1292,9 +2217,11 @@ class LuxriotManager:
         if not routine:
             return ""
         return (
-            "Channel routine baseline from prior long-window summaries:\n"
+            "Active Channel Memory from prior summaries:\n"
             f"{routine}\n"
-            "Use this as context for what is typical in this stream. Preserve key deviations and anomalies."
+            "Use this memory to distinguish routine baseline from meaningful deviations. "
+            "Do not let routine baseline suppress visible security/safety alerts. "
+            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
         )
 
     def compose_live_system_prompt(self, channel_id: int, base_prompt: Optional[str]) -> str:
@@ -1383,11 +2310,10 @@ class LuxriotManager:
         with self.cache_lock:
             base_prompt = self._get_stream_system_prompt_locked(channel_id)
             bookmark_settings = self._get_channel_bookmark_settings_locked(channel_id)
-        if bool(bookmark_settings.get("bookmark_enabled")):
-            json_prompt = str(bookmark_settings.get("json_alert_prompt") or "").strip()
-            if json_prompt:
-                json_prompt = self._render_json_alert_prompt(json_prompt, int(channel_id))
-                return f"{base_prompt}\n\n{json_prompt}" if base_prompt else json_prompt
+        json_prompt = str(bookmark_settings.get("json_alert_prompt") or "").strip()
+        if json_prompt:
+            json_prompt = self._render_json_alert_prompt(json_prompt, int(channel_id))
+            return f"{base_prompt}\n\n{json_prompt}" if base_prompt else json_prompt
         return base_prompt
 
     def get_prompt_settings(self, channel_id: Optional[int] = None) -> Dict[str, Any]:
@@ -1413,9 +2339,46 @@ class LuxriotManager:
             }
             effective_capture_interval_sec = self._get_capture_interval_sec_locked(channel_id)
             effective_bookmark = self._get_channel_bookmark_settings_locked(channel_id)
+            active_memory = ""
+            if channel_id is not None:
+                current_memory = self.channel_routine_context.get(int(channel_id))
+                if isinstance(current_memory, Mapping):
+                    routine_text = str(current_memory.get("routine") or "").strip()
+                    if routine_text:
+                        active_memory = (
+                            "Active Channel Memory from prior summaries:\n"
+                            f"{routine_text}\n"
+                            "Use this memory to distinguish routine baseline from meaningful deviations. "
+                            "Do not let routine baseline suppress visible security/safety alerts. "
+                            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
+                        )
             has_channel_override = bool(
                 channel_id is not None and isinstance(self.channel_prompt_overrides.get(int(channel_id)), Mapping)
             )
+        prompt_layers = {
+            "stream": {
+                "editable_prompt": effective_stream_prompt,
+                "backend_memory": active_memory,
+                "notes": [
+                    "Live L0 summaries use the editable stream prompt.",
+                    "If channel memory exists, EVA AI appends it to help distinguish routine baseline from new deviations.",
+                    "ALERTS_JSON instructions are always appended; bookmark settings only control Luxriot bookmark side effects.",
+                ],
+            },
+            "rollups": {
+                level: {
+                    "editable_prompt": effective_rollup_prompts.get(level, ""),
+                    "backend_instructions": self._rollup_backend_instruction_text(level),
+                    "active_memory": active_memory,
+                    "notes": [
+                        "The editable prompt is the system prompt.",
+                        "Backend instructions are always appended as the user task layer.",
+                        "Alert Ledger must preserve alert counts even when a window is routine.",
+                    ],
+                }
+                for level in ("L1", "L2", "L3")
+            },
+        }
         return {
             "channel_id": int(channel_id) if channel_id is not None else None,
             "stream_system_prompt": effective_stream_prompt,
@@ -1426,6 +2389,7 @@ class LuxriotManager:
             "json_alert_prompt": str(effective_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
             "defaults": defaults,
             "has_channel_override": has_channel_override,
+            "prompt_layers": prompt_layers,
         }
 
     def update_prompt_settings(
@@ -1542,6 +2506,27 @@ class LuxriotManager:
                     return output
         return output
 
+    def _format_rollup_signal_text(self, alert_counts: object, signal_digest: object) -> str:
+        parts: List[str] = []
+        alert_text = self._format_alert_counts(alert_counts)
+        if alert_text:
+            parts.append(f"Alert counts: {alert_text}.")
+        if isinstance(signal_digest, Mapping):
+            deviations = self._coerce_memory_items(
+                signal_digest.get("deviations"),
+                max_items=5,
+                max_len=180,
+            )
+            if deviations:
+                parts.append("Preserved deviations: " + "; ".join(deviations) + ".")
+        digest_text = self._render_signal_digest(signal_digest, max_len=700)
+        if digest_text:
+            digest_line = self._truncate_text(digest_text.replace("\n", " | "), 760)
+            if digest_line and digest_line[-1] not in ".!?":
+                digest_line += "."
+            parts.append(f"Signal digest: {digest_line}")
+        return " ".join(parts).strip()
+
     def _compose_rollup_summary(
         self,
         level: str,
@@ -1551,6 +2536,8 @@ class LuxriotManager:
         run_ids: Sequence[str],
         highlights: Sequence[str],
         window_sec: int,
+        alert_counts: object = None,
+        signal_digest: object = None,
     ) -> str:
         base = (
             f"{level} rollup from {source_level}: {item_count} items over ~{max(1, int(window_sec // 60))} min"
@@ -1565,7 +2552,37 @@ class LuxriotManager:
             base += ". Highlights: " + "; ".join(highlights[: self.rollup_highlight_limit])
         else:
             base += "."
+        signal_text = self._format_rollup_signal_text(alert_counts, signal_digest)
+        if signal_text:
+            base += " " + signal_text
         return base
+
+    @classmethod
+    def _rollup_child_salience_score(cls, child: Mapping[str, Any]) -> int:
+        score = 0
+        counts = cls._normalize_alert_counts(child.get("alert_counts"))
+        score += counts.get("critical", 0) * 120
+        score += counts.get("high", 0) * 100
+        score += counts.get("normal", 0) * 70
+        score += counts.get("low", 0) * 45
+        score += counts.get("info", 0) * 30
+        digest = child.get("signal_digest")
+        if isinstance(digest, Mapping):
+            for field, weight in (
+                ("alert_events", 90),
+                ("deviations", 80),
+                ("missing_data", 55),
+                ("uncertainty", 35),
+                ("watchlist", 25),
+                ("tuning", 20),
+            ):
+                items = cls._coerce_memory_items(digest.get(field), max_items=8, max_len=120)
+                if items:
+                    score += weight + min(20, len(items) * 5)
+        summary = str(child.get("summary") or "")
+        if re.search(r"\b(alert|deviation|incident|hazard|fire|smoke|fight|drift|weapon)\b", summary, flags=re.IGNORECASE):
+            score += 20
+        return int(score)
 
     @staticmethod
     def _estimate_token_count(text: object) -> int:
@@ -1675,6 +2692,9 @@ class LuxriotManager:
             raw_total = _parse_optional_int(entry.get("alert_total")) or 0
             if raw_total > 0:
                 alert_meta = self._alert_meta_from_counts({"normal": raw_total})
+        signal_digest = entry.get("signal_digest")
+        if not isinstance(signal_digest, Mapping):
+            signal_digest = {}
         created_at = self._coerce_float(entry.get("created_at"))
         if created_at is None:
             created_at = time.time()
@@ -1696,6 +2716,7 @@ class LuxriotManager:
             "summary": summary,
             "summary_kind": summary_kind,
             "created_at": float(created_at),
+            "signal_digest": dict(signal_digest),
             **alert_meta,
         }
 
@@ -1935,14 +2956,53 @@ class LuxriotManager:
             rollup_id=rollup_id,
             summary_text=summary,
             window_end=self._coerce_float(latest.get("window_end")),
+            level="L2",
         )
+
+    def _refresh_channel_memory_from_rollups(
+        self,
+        channel_id: int,
+        rollup_rows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        candidates: List[Mapping[str, Any]] = []
+        for row in rollup_rows:
+            if not isinstance(row, Mapping):
+                continue
+            summary_kind = str(row.get("summary_kind") or "").strip().lower()
+            if summary_kind not in {"llm", "llm_cached"}:
+                continue
+            level = self._normalize_rollup_level(row.get("level"))
+            if level not in {"L1", "L2", "L3"}:
+                continue
+            summary = str(row.get("summary") or "").strip()
+            rollup_id = str(row.get("rollup_id") or "").strip()
+            if not summary or not rollup_id:
+                continue
+            candidates.append(row)
+        if not candidates:
+            return
+        candidates = sorted(
+            candidates,
+            key=lambda row: (
+                float(self._coerce_float(row.get("window_end")) or 0.0),
+                {"L1": 1, "L2": 2, "L3": 3}.get(self._normalize_rollup_level(row.get("level")), 0),
+            ),
+        )
+        for row in candidates:
+            self._update_channel_routine_context(
+                channel_id=channel_id,
+                rollup_id=str(row.get("rollup_id") or ""),
+                summary_text=row.get("summary"),
+                window_end=self._coerce_float(row.get("window_end")),
+                level=self._normalize_rollup_level(row.get("level")),
+            )
 
     def _select_rollup_source_lines(
         self,
         children: Sequence[Mapping[str, Any]],
         char_budget: int,
     ) -> List[str]:
-        items: List[Tuple[float, str]] = []
+        items: List[Tuple[float, str, int]] = []
         for child in sorted(children, key=lambda item: float(self._coerce_float(item.get("window_start")) or 0.0)):
             ts = self._coerce_float(child.get("window_start"))
             if ts is None:
@@ -1951,25 +3011,48 @@ class LuxriotManager:
             if not summary:
                 continue
             ts_label = time.strftime("%H:%M:%S", time.localtime(ts))
-            items.append((ts, f"- {ts_label} | {summary}"))
+            alert_counts = self._format_alert_counts(child.get("alert_counts"))
+            if not alert_counts:
+                raw_total = _parse_optional_int(child.get("alert_total")) or 0
+                if raw_total > 0:
+                    alert_counts = self._format_alert_counts({"normal": raw_total})
+            if alert_counts:
+                summary = f"[SOURCE_ALERTS {alert_counts}] {summary}"
+            items.append((ts, f"- {ts_label} | {summary}", self._rollup_child_salience_score(child)))
         if not items:
             return ["- No valid lower-level summaries in this window."]
         if len(items) == 1:
             return [items[0][1]]
         # First pass: keep everything if it fits.
-        joined_len = sum(len(line) + 1 for _, line in items)
+        joined_len = sum(len(line) + 1 for _, line, _score in items)
         if joined_len <= char_budget:
-            return [line for _, line in items]
-        # Second pass: even timeline sampling + first/last anchors.
-        max_lines = max(8, min(len(items), int(char_budget / 180)))
+            return [line for _, line, _score in items]
+        # Second pass: salience first, then even timeline sampling + first/last anchors.
+        max_lines = max(4, min(len(items), int(char_budget / 260)))
         if max_lines >= len(items):
             selected_indexes = list(range(len(items)))
         else:
             selected_indexes = {0, len(items) - 1}
+            salient_indexes = [
+                index
+                for index, (_ts, _line, score) in sorted(
+                    enumerate(items),
+                    key=lambda item: (-item[1][2], item[1][0]),
+                )
+                if score > 0
+            ]
+            salient_budget = max(1, min(len(salient_indexes), max_lines // 2))
+            for index in salient_indexes[:salient_budget]:
+                selected_indexes.add(index)
+                if len(selected_indexes) >= max_lines:
+                    break
             span = len(items) - 1
-            for step in range(1, max_lines - 1):
+            remaining_slots = max(0, max_lines - len(selected_indexes))
+            for step in range(1, remaining_slots + 1):
                 idx = int(round((step * span) / max(1, max_lines - 1)))
                 selected_indexes.add(max(0, min(len(items) - 1, idx)))
+                if len(selected_indexes) >= max_lines:
+                    break
             selected_indexes = sorted(selected_indexes)
         lines = [items[idx][1] for idx in cast(Sequence[int], selected_indexes)]
         # Final pass: trim trailing lines to budget.
@@ -2004,6 +3087,8 @@ class LuxriotManager:
         source_tokens = _parse_optional_int(node.get("source_tokens")) or 0
         lines = self._select_rollup_source_lines(children, self.rollup_llm_char_budget)
         routine_context = self._get_channel_routine_prompt(channel_id)
+        window_alert_counts = self._format_alert_counts(node.get("alert_counts"))
+        window_signal_digest = self._render_signal_digest(node.get("signal_digest"), max_len=1000)
         user_text = "\n".join(
             [
                 f"Channel: {channel_id}",
@@ -2014,27 +3099,12 @@ class LuxriotManager:
                 f"Frame count: {int(frame_count)}",
                 f"Runs: {run_text}",
                 f"Approx source tokens: {int(source_tokens)}",
+                f"Source alert totals: {window_alert_counts or 'none'}",
                 "",
-                "Context constraints:",
-                "- All source entries are from the same channel and continuous timeline window above.",
-                "- Source entries may be model-generated summaries from a lower level; avoid compounding uncertainty.",
-                "- Preserve rare but important events even if they appear once.",
-                "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
+                "Window signal digest (compact continuity map):",
+                window_signal_digest or "none",
                 "",
-                "Task:",
-                f"- Write one concise {level} summary for operators.",
-                "- Deduplicate repeated scene descriptions and boilerplate.",
-                "- Keep meaningful changes in short timeline bullets across the full window.",
-                "- Mention risks/signals only when grounded in source text.",
-                "- If activity is routine, say so clearly without repeating identical details.",
-                "- Do not invent entities, times, or counts.",
-                "",
-                "Output format (Markdown):",
-                "### Window Snapshot",
-                "### Scene Baseline",
-                "### Key Changes",
-                "### Alerts/Signals",
-                "### Operator Notes",
+                *self._rollup_backend_instruction_lines(level),
                 "",
                 "Window Snapshot must begin with:",
                 f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
@@ -2083,11 +3153,17 @@ class LuxriotManager:
         min_tokens: int,
         item_count: int,
         frame_count: int,
+        alert_counts: object = None,
+        signal_digest: object = None,
     ) -> str:
-        return (
+        base = (
             f"{level} pending from {source_level}: {item_count} items ({frame_count} frames). "
             f"Collecting context {source_tokens}/{min_tokens} tokens."
         )
+        signal_text = self._format_rollup_signal_text(alert_counts, signal_digest)
+        if signal_text:
+            base += " " + signal_text
+        return base
 
     def _apply_rollup_llm_summaries(
         self,
@@ -2111,7 +3187,12 @@ class LuxriotManager:
             source_tokens = _parse_optional_int(node.get("source_tokens")) or 0
             source_signature = str(node.get("source_signature") or "").strip()
             if not source_signature:
-                source_signature = self._source_signature(self._coerce_str_list(node.get("source_ids")))
+                source_signature = self._rollup_source_signature(
+                    cast(Sequence[Mapping[str, Any]], children),
+                    self._coerce_str_list(node.get("source_ids")),
+                )
+                if source_signature:
+                    node["source_signature"] = source_signature
             if (not self.rollup_time_only) and source_tokens < self.rollup_min_source_tokens:
                 node["summary"] = self._compose_pending_rollup_summary(
                     level=level,
@@ -2120,6 +3201,8 @@ class LuxriotManager:
                     min_tokens=self.rollup_min_source_tokens,
                     item_count=_parse_optional_int(node.get("item_count")) or 0,
                     frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                    alert_counts=node.get("alert_counts"),
+                    signal_digest=node.get("signal_digest"),
                 )
                 node["summary_kind"] = "pending_context"
                 continue
@@ -2130,13 +3213,13 @@ class LuxriotManager:
                 if cached_summary and cached_signature and cached_signature == source_signature:
                     node["summary"] = cached_summary
                     node["summary_kind"] = "llm_cached"
-                    if level == "L2":
-                        self._update_channel_routine_context(
-                            channel_id=channel_id,
-                            rollup_id=rollup_id,
-                            summary_text=node.get("summary"),
-                            window_end=self._coerce_float(node.get("window_end")),
-                        )
+                    self._update_channel_routine_context(
+                        channel_id=channel_id,
+                        rollup_id=rollup_id,
+                        summary_text=node.get("summary"),
+                        window_end=self._coerce_float(node.get("window_end")),
+                        level=level,
+                    )
                     continue
             if remaining_budget <= 0:
                 continue
@@ -2164,22 +3247,23 @@ class LuxriotManager:
                     source_tokens=source_tokens,
                     run_ids=node.get("run_ids"),
                     source_ids=node.get("source_ids"),
-                    source_signature=str(node.get("source_signature") or "").strip(),
+                    source_signature=source_signature,
                     highlights=node.get("highlights"),
                     alert_counts=node.get("alert_counts"),
                     alert_total=node.get("alert_total"),
                     alert_severities=node.get("alert_severities"),
+                    signal_digest=node.get("signal_digest"),
                     summary_kind="llm",
                 )
                 node["summary"] = summary
                 node["summary_kind"] = "llm"
-                if level == "L2":
-                    self._update_channel_routine_context(
-                        channel_id=channel_id,
-                        rollup_id=rollup_id,
-                        summary_text=summary,
-                        window_end=self._coerce_float(node.get("window_end")),
-                    )
+                self._update_channel_routine_context(
+                    channel_id=channel_id,
+                    rollup_id=rollup_id,
+                    summary_text=summary,
+                    window_end=self._coerce_float(node.get("window_end")),
+                    level=level,
+                )
             remaining_budget -= 1
 
     def _l0_nodes_from_logs(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -2190,12 +3274,32 @@ class LuxriotManager:
             created = self._coerce_float(log.get("created_at"))
             if created is None:
                 continue
+            created_ms = int(float(created) * 1000.0)
+            batch_start_ms = _parse_optional_int(log.get("batch_start_ms"))
+            if batch_start_ms is None:
+                batch_start_ms = created_ms
+            batch_end_ms = _parse_optional_int(log.get("batch_end_ms"))
+            if batch_end_ms is None:
+                batch_end_ms = batch_start_ms
+            if batch_end_ms < batch_start_ms:
+                batch_start_ms, batch_end_ms = batch_end_ms, batch_start_ms
+            window_start = float(batch_start_ms) / 1000.0
+            window_end = float(batch_end_ms) / 1000.0
             frame_count = _parse_optional_int(log.get("frame_count")) or 0
             run_id = str(log.get("run_id") or "").strip()
             summary = str(log.get("summary") or "").strip()
             headline = self._summary_headline(summary)
             key = self._summary_log_key(log)
             rollup_id = f"l0-ch{channel_id}-{self._stable_id(key, length=14)}"
+            alert_counts = dict(log.get("alert_counts") or {})
+            alert_total = int(_parse_optional_int(log.get("alert_total")) or 0)
+            signal_digest = self._summary_signal_digest(
+                summary,
+                channel_id=channel_id,
+                timestamp_ms=int(batch_end_ms),
+                alert_counts=alert_counts,
+                alert_total=alert_total,
+            )
             nodes.append(
                 {
                     "rollup_id": rollup_id,
@@ -2203,18 +3307,19 @@ class LuxriotManager:
                     "level": "L0",
                     "source_level": None,
                     "source_ids": [],
-                    "window_start": created,
-                    "window_end": created,
-                    "window_sec": 0,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "window_sec": max(0, int(round(window_end - window_start))),
                     "item_count": 1,
                     "frame_count": int(frame_count),
                     "run_ids": [run_id] if run_id else [],
                     "highlights": [headline] if headline else [],
                     "summary": summary,
                     "created_at": created,
-                    "alert_counts": dict(log.get("alert_counts") or {}),
-                    "alert_total": int(_parse_optional_int(log.get("alert_total")) or 0),
+                    "alert_counts": alert_counts,
+                    "alert_total": alert_total,
                     "alert_severities": self._coerce_str_list(log.get("alert_severities")),
+                    "signal_digest": signal_digest,
                 }
             )
         nodes.sort(key=lambda item: float(item.get("window_start") or 0.0))
@@ -2227,6 +3332,8 @@ class LuxriotManager:
         source_level: str,
         window_sec: int,
         source_nodes: Sequence[Mapping[str, Any]],
+        *,
+        synthesize: bool = True,
     ) -> List[Dict[str, Any]]:
         if not source_nodes:
             return []
@@ -2264,7 +3371,11 @@ class LuxriotManager:
                             run_ids.add(run_text)
             highlights = self._collect_highlights(children, self.rollup_highlight_limit)
             alert_meta = self._merge_alert_metadata(children)
-            source_signature = self._source_signature(source_ids)
+            signal_digest = self._aggregate_signal_digest(
+                children,
+                alert_counts=cast(Mapping[str, Any], alert_meta.get("alert_counts") or {}),
+            )
+            source_signature = self._rollup_source_signature(children, source_ids)
             summary = self._compose_rollup_summary(
                 level=level,
                 source_level=source_level,
@@ -2273,6 +3384,8 @@ class LuxriotManager:
                 run_ids=sorted(run_ids),
                 highlights=highlights,
                 window_sec=window_sec,
+                alert_counts=alert_meta.get("alert_counts"),
+                signal_digest=signal_digest,
             )
             end_ts = float(bucket_start + max(1, int(window_sec)))
             rollup_id = self._canonical_rollup_id(level, channel_id, float(bucket_start), int(window_sec))
@@ -2294,12 +3407,13 @@ class LuxriotManager:
                     "source_signature": source_signature,
                     "summary": summary,
                     "created_at": end_ts,
+                    "signal_digest": signal_digest,
                     **alert_meta,
                 }
             )
-            if level in self.rollup_llm_levels:
+            if synthesize and level in self.rollup_llm_levels:
                 llm_pairs.append((out[-1], children))
-        if level in self.rollup_llm_levels and llm_pairs:
+        if synthesize and level in self.rollup_llm_levels and llm_pairs:
             self._apply_rollup_llm_summaries(
                 channel_id=channel_id,
                 level=level,
@@ -2318,7 +3432,7 @@ class LuxriotManager:
         if len(combined) > self.summary_history_limit:
             combined = combined[-self.summary_history_limit :]
         self.summary_history[channel_id] = combined
-        self._persist_summary_state_locked()
+        self._persist_summary_state_if_due_locked()
 
     def record_summary_log(self, channel_id: int, entry: Mapping[str, Any]) -> None:
         normalized = self._normalize_summary_log_entry(entry)
@@ -2365,11 +3479,35 @@ class LuxriotManager:
         *,
         batch_start_ms: int,
         batch_end_ms: int,
+        sample_count: int = 4,
     ) -> List[Dict[str, Any]]:
         if not frames:
             return []
         last_index = len(frames) - 1
-        anchors: List[Tuple[str, int]] = [("only", 0)] if last_index == 0 else [("first", 0), ("last", last_index)]
+        try:
+            sample_count = int(sample_count)
+        except Exception:
+            sample_count = 4
+        sample_count = max(1, min(16, sample_count))
+        if last_index == 0:
+            anchors: List[Tuple[str, int]] = [("only", 0)]
+        elif sample_count <= 2:
+            anchors = [("first", 0), ("last", last_index)]
+        else:
+            raw_indices = {
+                int(round(last_index * (index / float(sample_count - 1))))
+                for index in range(sample_count)
+            }
+            indices = sorted(index for index in raw_indices if 0 <= index <= last_index)
+            anchors = []
+            for index in indices:
+                if index == 0:
+                    role = "first"
+                elif index == last_index:
+                    role = "last"
+                else:
+                    role = "sample"
+                anchors.append((role, index))
         out: List[Dict[str, Any]] = []
         for role, index in anchors:
             frame = frames[index]
@@ -2479,18 +3617,17 @@ class LuxriotManager:
         summary = self.lm_callback(messages, model_hint)
         submitted_at = self._coerce_float(batch.get("submitted_at"))
         created_at = submitted_at if submitted_at is not None else time.time()
-        batch_start_ms = (
-            _parse_optional_int(batch.get("batch_start_ms"))
-            or int(created_at * 1000.0)
-        )
-        batch_end_ms = (
-            _parse_optional_int(batch.get("batch_end_ms"))
-            or int(created_at * 1000.0)
-        )
+        batch_start_ms = _parse_optional_int(batch.get("batch_start_ms"))
+        if batch_start_ms is None:
+            batch_start_ms = int(created_at * 1000.0)
+        batch_end_ms = _parse_optional_int(batch.get("batch_end_ms"))
+        if batch_end_ms is None:
+            batch_end_ms = int(created_at * 1000.0)
         archive_frames = self._summary_archive_frames(
             frame_items,
             batch_start_ms=batch_start_ms,
             batch_end_ms=batch_end_ms,
+            sample_count=getattr(self, "summary_archive_frames_per_batch", 4),
         )
         entry = {
             "channel_id": int(channel_id),
@@ -2522,32 +3659,32 @@ class LuxriotManager:
         accepted = dict(entry)
         accepted.update(normalized)
         channel_id = int(normalized["channel_id"])
-        batch_start_ms = (
-            _parse_optional_int(accepted.get("batch_start_ms"))
-            or int(float(normalized["created_at"]) * 1000.0)
-        )
-        batch_end_ms = (
-            _parse_optional_int(accepted.get("batch_end_ms"))
-            or batch_start_ms
-        )
+        batch_start_ms = _parse_optional_int(accepted.get("batch_start_ms"))
+        if batch_start_ms is None:
+            batch_start_ms = int(float(normalized["created_at"]) * 1000.0)
+        batch_end_ms = _parse_optional_int(accepted.get("batch_end_ms"))
+        if batch_end_ms is None:
+            batch_end_ms = batch_start_ms
         interval_sec = max(
             0.2,
             self._coerce_float(accepted.get("interval_sec")) or 1.0,
         )
         tolerance_ms = max(1000, int(interval_sec * 1000.0))
         try:
-            sent_alerts = int(
-                self.process_summary_alerts(
-                    channel_id,
-                    str(normalized["summary"]),
-                    default_ts_ms=batch_end_ms,
-                    min_ts_ms=batch_start_ms - tolerance_ms,
-                    max_ts_ms=batch_end_ms + tolerance_ms,
-                )
+            alert_delivery = self.process_summary_alerts(
+                channel_id,
+                str(normalized["summary"]),
+                default_ts_ms=batch_end_ms,
+                min_ts_ms=batch_start_ms - tolerance_ms,
+                max_ts_ms=batch_end_ms + tolerance_ms,
             )
-        except Exception:
-            sent_alerts = 0
-        accepted["bookmarks_sent"] = sent_alerts
+        except Exception as exc:
+            alert_delivery = AlertDeliveryResult(
+                0,
+                failed=1,
+                last_error=str(exc)[:240] or exc.__class__.__name__,
+            )
+        accepted.update(alert_delivery.as_dict())
 
         archive_meta = self._archive_summary_entry(accepted)
         accepted.pop("archive_frames", None)
@@ -2613,8 +3750,59 @@ class LuxriotManager:
     def get_snapshot_base64(self, channel_id: int, stream_type: str = "mainStream") -> Tuple[str, Dict[str, Any]]:
         client = self.build_client()
         snapshot = client.get_snapshot(channel_id, stream=stream_type)
+        captured_at_ms = int(time.time() * 1000)
         encoded = self.jpeg_encoder(snapshot, max_edge=self.config.LUXRIOT_SNAPSHOT_MAX_EDGE, quality=85)
-        return encoded, {"width": snapshot.width, "height": snapshot.height}
+        return encoded, {
+            "width": snapshot.width,
+            "height": snapshot.height,
+            "captured_at_ms": captured_at_ms,
+            "sha1": hashlib.sha1(encoded.encode("ascii")).hexdigest(),
+        }
+
+    def capture_snapshot_base64(
+        self,
+        channel_id: int,
+        stream_type: str = "mainStream",
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        quality: int = 92,
+    ) -> Tuple[str, Dict[str, Any]]:
+        client = self.build_client()
+        snapshot = client.get_snapshot(channel_id, stream=stream_type)
+        captured_at_ms = int(time.time() * 1000)
+        original_width = int(snapshot.width)
+        original_height = int(snapshot.height)
+        crop_box: Optional[Tuple[int, int, int, int]] = None
+        if roi_norm is not None:
+            x, y, w, h = roi_norm
+            sx = max(0, min(original_width - 1, int(round(float(x) * original_width))))
+            sy = max(0, min(original_height - 1, int(round(float(y) * original_height))))
+            sw = max(1, min(original_width - sx, int(round(float(w) * original_width))))
+            sh = max(1, min(original_height - sy, int(round(float(h) * original_height))))
+            crop_box = (sx, sy, sx + sw, sy + sh)
+            snapshot = snapshot.crop(crop_box)
+        encoded = self.jpeg_encoder(
+            snapshot,
+            max_edge=self.config.LUXRIOT_SNAPSHOT_MAX_EDGE,
+            quality=max(60, min(95, int(quality))),
+        )
+        return encoded, {
+            "channel_id": int(channel_id),
+            "stream": stream_type,
+            "width": int(snapshot.width),
+            "height": int(snapshot.height),
+            "original_width": original_width,
+            "original_height": original_height,
+            "captured_at_ms": captured_at_ms,
+            "sha1": hashlib.sha1(encoded.encode("ascii")).hexdigest(),
+            "roi": {
+                "x": crop_box[0],
+                "y": crop_box[1],
+                "w": crop_box[2] - crop_box[0],
+                "h": crop_box[3] - crop_box[1],
+            }
+            if crop_box is not None
+            else None,
+        }
 
     def send_bookmark_event(
         self,
@@ -2724,6 +3912,14 @@ class LuxriotManager:
             return True
         if re.search(r'^\s*\{\s*["\']alerts["\']\s*:', text, flags=re.IGNORECASE | re.MULTILINE):
             return True
+        if re.search(
+            r"^\s*(?:[-*•]|\d+[.)])?\s*"
+            r"(?:info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
+            r"\s*(?:level|alert|severity)?\s*[:\-–]\s*\S+",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ):
+            return True
         return False
 
     def _bookmark_recently_sent_locked(self, channel_id: int, fingerprint: str, now_ms: int, cooldown_sec: float) -> bool:
@@ -2735,6 +3931,14 @@ class LuxriotManager:
         if isinstance(last_ts, int) and (now_ms - last_ts) < int(cooldown_sec * 1000):
             return True
         return False
+
+    @classmethod
+    def _bookmark_cooldown_for_severity(cls, base_cooldown_sec: float, severity: Any) -> float:
+        base = max(0.0, float(base_cooldown_sec or 0.0))
+        normalized = cls._normalize_alert_severity(severity)
+        if normalized in {"critical", "high"}:
+            return 0.0
+        return base
 
     def _mark_bookmark_sent_locked(self, channel_id: int, fingerprint: str, ts_ms: int) -> None:
         channel_key = int(channel_id)
@@ -2756,9 +3960,9 @@ class LuxriotManager:
         default_ts_ms: Optional[int] = None,
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
-    ) -> int:
+    ) -> AlertDeliveryResult:
         if not self.alert_parser:
-            return 0
+            return AlertDeliveryResult()
         base_ts_ms = self._normalize_alert_timestamp_ms_bounded(
             default_ts_ms,
             int(time.time() * 1000),
@@ -2768,20 +3972,24 @@ class LuxriotManager:
         with self.cache_lock:
             settings = self._get_channel_bookmark_settings_locked(channel_id)
         if not bool(settings.get("bookmark_enabled")):
-            return 0
+            return AlertDeliveryResult()
         cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
         if not self._contains_alerts_json(summary_text):
-            return 0
+            return AlertDeliveryResult()
         try:
             parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
         except TypeError:
             parsed_alerts = cast(Any, self.alert_parser)(summary_text, int(channel_id))
         if not isinstance(parsed_alerts, list) or not parsed_alerts:
-            return 0
+            return AlertDeliveryResult()
 
         sent_count = 0
+        failed_count = 0
+        skipped_duplicate_count = 0
+        last_error: Optional[str] = None
+        max_alerts = max(1, min(32, int(getattr(self, "alerts_max_per_batch", 8) or 8)))
         for raw_alert in parsed_alerts:
-            if sent_count >= 3:
+            if sent_count >= max_alerts:
                 break
             if not isinstance(raw_alert, Mapping):
                 continue
@@ -2800,8 +4008,10 @@ class LuxriotManager:
             }
             fingerprint = self._bookmark_fingerprint(alert)
             now_ms = int(time.time() * 1000)
+            alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
             with self.cache_lock:
-                if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, cooldown_sec):
+                if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, alert_cooldown_sec):
+                    skipped_duplicate_count += 1
                     continue
             try:
                 self.send_bookmark_event(
@@ -2812,12 +4022,27 @@ class LuxriotManager:
                     state=str(alert["state"]),
                     timestamp_ms=int(alert["timestamp_ms"]),
                 )
-            except Exception:
+            except Exception as exc:
+                failed_count += 1
+                last_error = str(exc)[:240] or exc.__class__.__name__
+                LOGGER.warning(
+                    "Luxriot bookmark send failed channel_id=%s title=%r severity=%s error=%s",
+                    channel_id,
+                    alert["title"],
+                    alert["severity"],
+                    last_error,
+                )
                 continue
             with self.cache_lock:
                 self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
             sent_count += 1
-        return sent_count
+        return AlertDeliveryResult(
+            sent_count,
+            parsed=len(parsed_alerts),
+            failed=failed_count,
+            skipped_duplicate=skipped_duplicate_count,
+            last_error=last_error,
+        )
 
     def start_session(
         self,
@@ -2827,6 +4052,7 @@ class LuxriotManager:
         model_hint: Optional[str] = None,
         system_prompt: Optional[str] = None,
         interval_sec: Optional[float] = None,
+        update_desired: bool = True,
     ) -> Dict[str, Any]:
         sizes = list(getattr(self.config, "LUXRIOT_BATCH_SIZES", (12, 24, 36)))
         default_size = sizes[0] if sizes else 12
@@ -2892,11 +4118,20 @@ class LuxriotManager:
                 summarization_enabled=True,
                 capture_kind="video",
             )
+            if update_desired:
+                self._set_desired_live_session(
+                    channel_id,
+                    enabled=True,
+                    batch_size=batch,
+                    prompt=prompt,
+                    model_hint=normalized_model_hint,
+                    interval_sec=effective_interval_sec,
+                )
             self.sessions[channel_id] = session
             session.start()
             return session.status()
 
-    def stop_session(self, channel_id: int) -> Dict[str, Any]:
+    def stop_session(self, channel_id: int, *, update_desired: bool = True) -> Dict[str, Any]:
         with self.cache_lock:
             session = self.sessions.pop(channel_id, None)
         if session:
@@ -2908,6 +4143,8 @@ class LuxriotManager:
                     self._merge_summary_history_locked(channel_id, logs)
                 self._close_run_locked(channel_id, status.get("run_id"))
                 archived_count = len(self.summary_history.get(channel_id, []))
+            if update_desired:
+                self._set_desired_live_session(channel_id, enabled=False)
             return {
                 "channel_id": channel_id,
                 "run_id": status.get("run_id"),
@@ -2917,6 +4154,8 @@ class LuxriotManager:
         with self.cache_lock:
             self._close_run_locked(channel_id, None)
             archived_count = len(self.summary_history.get(channel_id, []))
+        if update_desired:
+            self._set_desired_live_session(channel_id, enabled=False)
         return {
             "channel_id": channel_id,
             "running": False,
@@ -3099,6 +4338,7 @@ class LuxriotManager:
         start_ts: Optional[float] = None,
         end_ts: Optional[float] = None,
         level_limit: Optional[int] = 60,
+        synthesize: bool = True,
     ) -> Dict[str, Any]:
         status = self.session_status(
             channel_id=channel_id,
@@ -3117,6 +4357,7 @@ class LuxriotManager:
             source_level="L0",
             window_sec=self.rollup_windows["L1"],
             source_nodes=l0_nodes,
+            synthesize=synthesize,
         )
         l2_nodes = self._build_rollup_level(
             channel_id=channel_id,
@@ -3124,6 +4365,7 @@ class LuxriotManager:
             source_level="L1",
             window_sec=self.rollup_windows["L2"],
             source_nodes=l1_nodes,
+            synthesize=synthesize,
         )
         l3_nodes = self._build_rollup_level(
             channel_id=channel_id,
@@ -3131,6 +4373,7 @@ class LuxriotManager:
             source_level="L2",
             window_sec=self.rollup_windows["L3"],
             source_nodes=l2_nodes,
+            synthesize=synthesize,
         )
 
         selected_run_id = str(status.get("run_filter_id") or "").strip() or None
@@ -3152,7 +4395,10 @@ class LuxriotManager:
             l1_nodes = l1_nodes[-level_limit:]
             l2_nodes = l2_nodes[-level_limit:]
             l3_nodes = l3_nodes[-level_limit:]
-        self._refresh_channel_routine_from_l2(channel_id, l2_nodes)
+        self._refresh_channel_memory_from_rollups(
+            channel_id,
+            [*l1_nodes, *l2_nodes, *l3_nodes],
+        )
         stored_counts: Dict[str, int] = {}
         for entry in stored_rollups:
             level = str(entry.get("level") or "").strip().upper() or "UNKNOWN"
@@ -3207,15 +4453,45 @@ class LuxriotManager:
         return compact
 
     def streams_status(self) -> Dict[str, Any]:
+        try:
+            desired_live = self._load_desired_live_sessions()
+        except Exception:
+            desired_live = {}
         with self.cache_lock:
             video_items = list(self.sessions.items())
             analytics_items = list(self.probe_sessions.items())
             paused = set(self.paused_probe_channels)
             history_channels = sorted(channel_id for channel_id, logs in self.summary_history.items() if logs)
+            restore_errors = dict(self.live_session_restore_errors)
         video_streams = [
             self._compact_stream_status("video", session.status(), paused)
             for _, session in video_items
         ]
+        running_video_channels = {
+            int(item.get("channel_id") or 0)
+            for item in video_streams
+        }
+        desired_video_channels = sorted(
+            channel_id
+            for channel_id, state in desired_live.items()
+            if bool(state.get("enabled"))
+        )
+        desired_missing = [
+            {
+                "channel_id": channel_id,
+                "desired": True,
+                "running": False,
+                "last_restore_error": restore_errors.get(channel_id)
+                or str(desired_live.get(channel_id, {}).get("last_restore_error") or "").strip()
+                or None,
+            }
+            for channel_id in desired_video_channels
+            if channel_id not in running_video_channels
+        ]
+        for item in video_streams:
+            channel_id = int(item.get("channel_id") or 0)
+            item["desired"] = channel_id in desired_video_channels
+            item["last_restore_error"] = restore_errors.get(channel_id)
         analytics_streams = [
             self._compact_stream_status("analytics", session.status(), paused)
             for _, session in analytics_items
@@ -3223,20 +4499,28 @@ class LuxriotManager:
         return {
             "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
             "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
+            "desired_video_channels": desired_video_channels,
+            "desired_video_missing": desired_missing,
             "paused_analytics_channels": sorted(paused),
             "video_history_channels": history_channels,
             "running_total": len(video_streams) + len(analytics_streams),
         }
 
-    def stop_stream(self, channel_id: int, stream_type: str = "both", pause_analytics: bool = True) -> Dict[str, Any]:
+    def stop_stream(
+        self,
+        channel_id: int,
+        stream_type: str = "both",
+        pause_analytics: bool = True,
+        update_desired: bool = True,
+    ) -> Dict[str, Any]:
         normalized = (stream_type or "both").strip().lower()
         result: Dict[str, Any] = {"channel_id": channel_id, "stream_type": normalized}
         if normalized in {"video", "summary", "summaries"}:
-            result["video"] = self.stop_session(channel_id)
+            result["video"] = self.stop_session(channel_id, update_desired=update_desired)
         elif normalized in {"analytics", "probe", "probes"}:
             result["analytics"] = self.stop_probe_capture(channel_id, pause=pause_analytics)
         elif normalized in {"both", "all"}:
-            result["video"] = self.stop_session(channel_id)
+            result["video"] = self.stop_session(channel_id, update_desired=update_desired)
             result["analytics"] = self.stop_probe_capture(channel_id, pause=pause_analytics)
         else:
             raise ValueError("stream_type must be one of: video, analytics, both")
@@ -3247,11 +4531,15 @@ class LuxriotManager:
         stop_video: bool = True,
         stop_analytics: bool = True,
         pause_analytics: bool = True,
+        update_desired: bool = True,
     ) -> Dict[str, Any]:
         with self.cache_lock:
             video_channels = list(self.sessions.keys()) if stop_video else []
             analytics_channels = list(self.probe_sessions.keys()) if stop_analytics else []
-        stopped_video = [self.stop_session(ch) for ch in video_channels]
+        stopped_video = [
+            self.stop_session(ch, update_desired=update_desired)
+            for ch in video_channels
+        ]
         stopped_analytics = [self.stop_probe_capture(ch, pause=pause_analytics) for ch in analytics_channels]
         return {
             "stopped_video_count": len(stopped_video),

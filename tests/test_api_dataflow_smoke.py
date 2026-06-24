@@ -75,12 +75,21 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self._orig_auth_enabled = config.AUTH_ENABLED
         self._orig_admin_token = config.ADMIN_TOKEN
         self._orig_settings_local_only = config.SETTINGS_LOCAL_ONLY
+        self._orig_offline_video_enabled = config.OFFLINE_VIDEO_ENABLED
+        self._orig_probe_snap_enabled = config.PROBE_SNAP_ENABLED
+        self._orig_indexed_folder_enabled = config.INDEXED_FOLDER_ENABLED
         config.AUTH_ENABLED = False
+        config.OFFLINE_VIDEO_ENABLED = True
+        config.PROBE_SNAP_ENABLED = True
+        config.INDEXED_FOLDER_ENABLED = True
 
     def tearDown(self) -> None:
         config.AUTH_ENABLED = self._orig_auth_enabled
         config.ADMIN_TOKEN = self._orig_admin_token
         config.SETTINGS_LOCAL_ONLY = self._orig_settings_local_only
+        config.OFFLINE_VIDEO_ENABLED = self._orig_offline_video_enabled
+        config.PROBE_SNAP_ENABLED = self._orig_probe_snap_enabled
+        config.INDEXED_FOLDER_ENABLED = self._orig_indexed_folder_enabled
 
     def test_frontend_endpoints_map_to_backend_routes(self) -> None:
         frontend_paths, backend_routes = _collect_frontend_and_backend_paths()
@@ -103,6 +112,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/branding/logo",
             "/agent/skills/create",
             "/detections/image",
+            "/detections/thumbnail/<int:detection_id>",
             "/detections/diagnostics",
             "/favicon.ico",
             "/health",
@@ -353,6 +363,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "segment_from_point",
             "detections_search_text",
             "detections_search_image",
+            "luxriot_snapshot_capture",
         }
         for rule in app.url_map.iter_rules():
             endpoint = str(rule.endpoint)
@@ -419,6 +430,54 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 if 503 not in allowed:
                     self.assertLess(resp.status_code, 500)
                 self.assertIn(resp.status_code, allowed)
+
+    def test_deployment_feature_flags_disable_unstable_surfaces_server_side(self) -> None:
+        config.OFFLINE_VIDEO_ENABLED = False
+        config.PROBE_SNAP_ENABLED = False
+        config.INDEXED_FOLDER_ENABLED = False
+
+        with patch("oldapp.luxriot_manager.capture_snapshot_base64") as capture:
+            video = self.client.post("/video_understanding", json={})
+            snap = self.client.post("/luxriot/snapshot/7/capture", json={})
+            search = self.client.post("/search", json={"folder": "/tmp", "query": "person"})
+            folder_describe = self.client.post(
+                "/describe_image",
+                json={"folder": "/tmp", "image_path": "/tmp/frame.jpg"},
+            )
+
+        self.assertEqual(video.status_code, 404)
+        self.assertEqual(video.get_json()["error"], "offline_video_disabled")
+        self.assertEqual(snap.status_code, 404)
+        self.assertEqual(snap.get_json()["error"], "probe_snap_disabled")
+        self.assertEqual(search.status_code, 404)
+        self.assertEqual(folder_describe.status_code, 404)
+        capture.assert_not_called()
+
+    def test_indexed_folder_flag_does_not_disable_archive_image_description_uploads(self) -> None:
+        config.INDEXED_FOLDER_ENABLED = False
+        jpeg = BytesIO()
+        Image.new("RGB", (24, 16), (20, 30, 40)).save(jpeg, format="JPEG")
+        jpeg.seek(0)
+        profile = {
+            "id": "vlm-local",
+            "kind": "vlm",
+            "base_url": "http://localhost:1234/v1",
+            "model": "qwen-vl-test",
+            "timeout": 30,
+        }
+
+        with (
+            patch("oldapp._resolve_lm_profile", return_value=profile),
+            patch("oldapp._call_lm_chat", return_value="archive frame summary"),
+        ):
+            resp = self.client.post(
+                "/describe_image",
+                data={"image": (jpeg, "archive-frame.jpg")},
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json()["summary"], "archive frame summary")
 
     def test_describe_image_accepts_uploaded_file(self) -> None:
         jpeg = BytesIO()
@@ -529,6 +588,80 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["model_override"], payload["assigned_profile_id"])
         self.assertIsNone(captured["profile_id"])
         self.assertNotEqual(captured["model_override"], "__auto__")
+
+    def test_video_understanding_defaults_to_agent_profile_for_offline_media(self) -> None:
+        thumb_buf = BytesIO()
+        Image.new("RGB", (40, 24), (80, 120, 160)).save(thumb_buf, format="JPEG")
+        thumb_b64 = base64.b64encode(thumb_buf.getvalue()).decode("ascii")
+        profiles = {
+            "default": {
+                "id": "default",
+                "kind": "general",
+                "base_url": "http://default.local/v1",
+                "model": "default-model",
+                "api_key": "",
+                "timeout": 120,
+            },
+            "agent": {
+                "id": "agent",
+                "kind": "agent",
+                "base_url": "http://agent.local/v1",
+                "model": "qwen3.5-9b-mtp",
+                "api_key": "",
+                "timeout": 600,
+                "enabled": True,
+            },
+            "vlm": {
+                "id": "vlm",
+                "kind": "vlm",
+                "base_url": "http://vlm.local/v1",
+                "model": "qwen3-vl-4b",
+                "api_key": "",
+                "timeout": 300,
+                "enabled": True,
+            },
+        }
+        captured: Dict[str, Any] = {}
+
+        def fake_call(messages, model_override=None, profile_id=None):
+            captured["messages"] = messages
+            captured["model_override"] = model_override
+            captured["profile_id"] = profile_id
+            return "agent default video summary"
+
+        with (
+            patch.object(config, "LM_PROFILES", profiles),
+            patch.object(config, "LM_AGENT_PROFILE_ID", "agent"),
+            patch.object(config, "LM_VLM_PROFILE_ID", "vlm"),
+            patch.object(config, "LM_VLM_BALANCER_ENABLED", False),
+            patch(
+                "oldapp._sample_video_frames",
+                return_value=(
+                    [{"index": 0, "time_sec": 0.0, "thumbnail": thumb_b64}],
+                    25.0,
+                    1.0,
+                ),
+            ),
+            patch("oldapp._call_video_understanding", side_effect=fake_call),
+        ):
+            resp = self.client.post(
+                "/video_understanding",
+                data={
+                    "video": (BytesIO(b"not-a-real-video"), "sample.mp4"),
+                    "prompt": "Describe this upload",
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        payload = resp.get_json()
+        self.assertEqual(payload["summary"], "agent default video summary")
+        self.assertEqual(payload["model_selection"], "default_agent")
+        self.assertEqual(payload["assigned_profile_id"], "agent")
+        self.assertEqual(payload["model"], "qwen3.5-9b-mtp")
+        self.assertEqual(payload["profile_id"], "agent")
+        self.assertEqual(captured["model_override"], "agent")
+        self.assertIsNone(captured["profile_id"])
 
     def test_health_and_ready_payloads_are_structured(self) -> None:
         health = self.client.get("/health")

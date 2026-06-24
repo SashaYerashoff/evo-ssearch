@@ -34,6 +34,7 @@ from flask import Flask, g, request, jsonify, send_file, make_response, render_t
 from flask_cors import CORS
 
 from config import config
+from agent_postgres_store import PostgresAgentStore
 from archive_store import (
     ARCHIVE_RUNTIME_REVISION,
     ArchiveStoreNotReady,
@@ -41,7 +42,6 @@ from archive_store import (
     PostgresProbesStore,
     PostgresRuntimeStateStore,
 )
-from detection_store import DetectionsStore
 from embedders.dino_encoder import DINOEncoder
 from eva_db import DatabaseSettings, PsycopgPool
 from inference_queue import (
@@ -249,6 +249,7 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
 _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "serve_image": Permission.DETECTIONS_VIEW,
     "serve_detection_image": Permission.DETECTIONS_VIEW,
+    "serve_detection_thumbnail": Permission.DETECTIONS_VIEW,
     "get_comments": Permission.REPORTS_VIEW,
     "get_commented_images": Permission.REPORTS_VIEW,
     "check_index": Permission.DIAGNOSTICS_VIEW,
@@ -269,6 +270,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
     "luxriot_snapshot": Permission.STREAMS_VIEW,
+    "luxriot_snapshot_capture": Permission.STREAMS_VIEW,
     "luxriot_session_status": Permission.STREAMS_VIEW,
     "luxriot_summary_rollups": Permission.REPORTS_VIEW,
     "luxriot_streams_status": Permission.STREAMS_VIEW,
@@ -485,8 +487,7 @@ def _get_control_plane_db_pool() -> PsycopgPool:
 
 
 def _archive_store_mode() -> str:
-    mode = str(getattr(config, "ARCHIVE_STORE", "auto") or "auto").strip().lower()
-    return mode if mode in {"auto", "postgres", "sqlite"} else "auto"
+    return "postgres"
 
 
 def _archive_tenant_id() -> str:
@@ -498,34 +499,69 @@ def _archive_tenant_id() -> str:
 
 
 def _archive_store_required() -> bool:
-    return _archive_store_mode() == "postgres" or bool(
-        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
-    )
+    return True
+
+
+class _UnavailablePostgresStore:
+    """Fail-closed stand-in used when PostgreSQL runtime storage is unavailable."""
+
+    backend = "postgres"
+
+    def __init__(self, component: str, exc: Optional[Exception] = None) -> None:
+        self.component = str(component or "archive")
+        self.error = type(exc).__name__ if exc is not None else None
+        self.detail = str(exc)[:240] if exc is not None else None
+
+    def health(self) -> Dict[str, Any]:
+        status = "error" if self.error else "not_configured"
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "status": status,
+            "backend": self.backend,
+            "component": self.component,
+            "required_backend": "postgres",
+        }
+        if self.error:
+            payload["error"] = self.error
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
+
+    def load_state(self, key: str) -> Optional[Dict[str, Any]]:
+        raise ArchiveStoreNotReady(self._message())
+
+    def save_state(self, key: str, payload: Mapping[str, Any]) -> None:
+        raise ArchiveStoreNotReady(self._message())
+
+    def _message(self) -> str:
+        reason = f" ({self.error})" if self.error else ""
+        return f"PostgreSQL {self.component} store is unavailable{reason}."
+
+    def __getattr__(self, name: str) -> Any:
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            raise ArchiveStoreNotReady(self._message())
+
+        return _raise
 
 
 def _postgres_archive_enabled() -> bool:
-    mode = _archive_store_mode()
-    if mode == "sqlite":
-        return False
     if not _postgres_database_configured():
         return False
     if not _archive_tenant_id():
         return False
-    if mode == "postgres":
-        return True
-    return bool(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False))
+    return True
 
 
 def _build_luxriot_runtime_state_store() -> Optional[PostgresRuntimeStateStore]:
     if not _postgres_archive_enabled():
-        return None
+        return cast(Any, _UnavailablePostgresStore("runtime_state"))
     try:
         return PostgresRuntimeStateStore(
             _get_control_plane_db_pool(),
             _archive_tenant_id(),
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return cast(Any, _UnavailablePostgresStore("runtime_state", exc))
 
 
 def _get_identity_repository() -> Any:
@@ -664,6 +700,25 @@ def _image_channel_ids_for_request_value(value: Any) -> Set[int]:
         return set()
 
 
+def _detection_channel_ids_for_request_value(value: Any) -> Set[int]:
+    detection_id = _to_optional_int(value)
+    if detection_id is None:
+        return set()
+    try:
+        rows = detections_store.fetch_detections_by_ids([detection_id], include_vectors=False)
+    except Exception:
+        g.channel_resolution_error = "detection_owner_lookup_failed"
+        return set()
+    channel_ids: Set[int] = set()
+    for row in rows:
+        channel_id = _to_optional_int(row.get("channel_id"))
+        if channel_id is not None:
+            channel_ids.add(channel_id)
+    if not channel_ids:
+        g.channel_resolution_error = "detection_owner_missing"
+    return channel_ids
+
+
 def _request_image_channel_ids(
     endpoint: str,
     view_args: Mapping[str, Any],
@@ -671,8 +726,11 @@ def _request_image_channel_ids(
     form: Mapping[str, Any],
 ) -> Set[int]:
     values: List[Any] = []
+    detection_ids: List[Any] = []
     if endpoint == "serve_detection_image":
         values.append(request.args.get("image_path"))
+    if endpoint == "serve_detection_thumbnail":
+        detection_ids.append(view_args.get("detection_id"))
     if endpoint == "serve_image":
         values.append(request.args.get("image_path"))
         values.append(view_args.get("filepath"))
@@ -683,6 +741,8 @@ def _request_image_channel_ids(
     channel_ids: Set[int] = set()
     for value in values:
         channel_ids.update(_image_channel_ids_for_request_value(value))
+    for value in detection_ids:
+        channel_ids.update(_detection_channel_ids_for_request_value(value))
     return channel_ids
 
 
@@ -1001,7 +1061,7 @@ def _session_guard(
             raise PermissionError("an explicit authorized channel is required")
         if (
             _is_channel_scoped(context)
-            and str(request.endpoint or "") == "serve_detection_image"
+            and str(request.endpoint or "") in {"serve_detection_image", "serve_detection_thumbnail"}
             and not channel_ids
         ):
             raise PermissionError(
@@ -1045,6 +1105,46 @@ def _session_guard(
     return None
 
 
+_INDEXED_FOLDER_ENDPOINTS = {
+    "get_comments",
+    "save_comment",
+    "get_commented_images",
+    "check_index",
+    "index_folder",
+    "index_segments",
+    "search",
+    "search_by_image",
+    "search_by_mask",
+    "segment_from_point",
+}
+
+
+def _request_has_field(field: str) -> bool:
+    if field in request.args or field in request.form:
+        return True
+    data = request.get_json(silent=True) if request.is_json else None
+    return isinstance(data, Mapping) and field in data
+
+
+def _disabled_feature_response():
+    endpoint = str(request.endpoint or "")
+    if endpoint == "video_understanding" and not bool(getattr(config, "OFFLINE_VIDEO_ENABLED", False)):
+        return jsonify({"error": "offline_video_disabled"}), 404
+    if endpoint == "luxriot_snapshot_capture" and not bool(getattr(config, "PROBE_SNAP_ENABLED", False)):
+        return jsonify({"error": "probe_snap_disabled"}), 404
+
+    indexed_folder_enabled = bool(getattr(config, "INDEXED_FOLDER_ENABLED", False))
+    if indexed_folder_enabled:
+        return None
+    if endpoint in _INDEXED_FOLDER_ENDPOINTS:
+        return jsonify({"error": "indexed_folder_disabled"}), 404
+    if endpoint == "describe_image" and _request_has_field("folder"):
+        return jsonify({"error": "indexed_folder_disabled"}), 404
+    if endpoint == "serve_image" and "folder" in request.args:
+        return "Not found", 404
+    return None
+
+
 @app.before_request
 def _bind_request_security_context() -> None:
     g.request_id = _request_id()
@@ -1052,6 +1152,9 @@ def _bind_request_security_context() -> None:
     g.auth_session = None
     g.auth_resolution_error = None
     g.channel_resolution_error = None
+    disabled_feature = _disabled_feature_response()
+    if disabled_feature is not None:
+        return disabled_feature
     if not _auth_enabled():
         return
     session_token = str(
@@ -1766,6 +1869,8 @@ def home():
         luxriot_rollup_prompt_l3=getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', rollup_default) or rollup_default,
         luxriot_json_alert_prompt=getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT,
         auth_enabled=bool(config.AUTH_ENABLED),
+        offline_video_hidden_class='' if getattr(config, "OFFLINE_VIDEO_ENABLED", False) else 'deployment-hidden',
+        probe_snap_hidden_class='' if getattr(config, "PROBE_SNAP_ENABLED", False) else 'deployment-hidden',
     ))
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
@@ -1880,6 +1985,44 @@ def serve_detection_image():
         app.logger.exception(
             "Detection image serving failed request_id=%s",
             getattr(g, "request_id", ""),
+        )
+        return "Image unavailable", 500
+
+
+def _strip_image_data_url_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower().startswith("data:image/") and "," in text:
+        return text.split(",", 1)[1].strip()
+    return text
+
+
+@app.route('/detections/thumbnail/<int:detection_id>', methods=['GET'])
+def serve_detection_thumbnail(detection_id: int):
+    try:
+        rows = detections_store.fetch_detections_by_ids([detection_id], include_vectors=False)
+        if not rows:
+            return "Image not found", 404
+        thumbnail_b64 = _strip_image_data_url_prefix(rows[0].get("thumbnail"))
+        if not thumbnail_b64:
+            return "Image not found", 404
+        try:
+            image_bytes = base64.b64decode(thumbnail_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid thumbnail data") from exc
+        return Response(image_bytes, mimetype="image/jpeg")
+    except ValueError as exc:
+        app.logger.info(
+            "Detection thumbnail request rejected request_id=%s detection_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            detection_id,
+            exc,
+        )
+        return "Invalid image request", 400
+    except Exception:
+        app.logger.exception(
+            "Detection thumbnail serving failed request_id=%s detection_id=%s",
+            getattr(g, "request_id", ""),
+            detection_id,
         )
         return "Image unavailable", 500
 
@@ -2282,6 +2425,34 @@ def _resolve_luxriot_vlm_model_hint(
     )
 
 
+def _resolve_offline_lm_model_hint(
+    requested_model_hint: Optional[str],
+    *,
+    assignment_key: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    raw_hint = str(requested_model_hint or "").strip()
+    if raw_hint:
+        if _is_auto_lm_selector(raw_hint):
+            return _resolve_vlm_auto_model_hint(raw_hint, assignment_key=assignment_key)
+        profiles = _configured_lm_profiles()
+        return raw_hint, {
+            "mode": "manual",
+            "requested": raw_hint,
+            "assigned_profile_id": raw_hint if raw_hint in profiles else None,
+            "balancer_enabled": _vlm_balancer_enabled(),
+        }
+
+    agent_profile = _resolve_lm_profile(kind="agent")
+    agent_selector = _lm_profile_selector_value(agent_profile)
+    return agent_selector, {
+        "mode": "default_agent",
+        "requested": None,
+        "assigned_profile_id": str(agent_profile.get("id") or "").strip() or None,
+        "balancer_enabled": False,
+        "profile_count": 1,
+    }
+
+
 def _offline_vlm_assignment_key(kind: str, value: Any) -> str:
     raw = str(value or "").strip()
     if len(raw) > 240:
@@ -2368,6 +2539,30 @@ def _call_lm_chat(
         "temperature": float(config.LM_VIDEO_TEMPERATURE),
         "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
     }
+    response: Optional[requests.Response] = None
+
+    def _response_error_detail(resp: Any) -> str:
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if isinstance(data, Mapping):
+            error = data.get("error")
+            if isinstance(error, Mapping):
+                message = str(error.get("message") or "").strip()
+                error_type = str(error.get("type") or "").strip()
+                if message and error_type:
+                    return f"{message} ({error_type})"
+                if message:
+                    return message
+            message = str(data.get("message") or "").strip()
+            if message:
+                return message
+        text = str(getattr(resp, "text", "") or "").strip()
+        if text:
+            return text[:500]
+        return "empty error response"
+
     try:
         response = requests.post(
             endpoint,
@@ -2376,8 +2571,20 @@ def _call_lm_chat(
             timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
         )
         response.raise_for_status()
+    except requests.HTTPError as exc:
+        resp = getattr(exc, "response", None) or response
+        detail = _response_error_detail(resp) if resp is not None else str(exc)
+        status = getattr(resp, "status_code", None)
+        status_text = f"HTTP {status}" if status else "HTTP error"
+        raise RuntimeError(
+            f"LM request failed for profile {profile['id']} "
+            f"(model {payload['model']}): {status_text}; {detail}"
+        ) from exc
     except Exception as exc:
-        raise RuntimeError(f"LM request failed for profile {profile['id']}: {exc}") from exc
+        raise RuntimeError(
+            f"LM request failed for profile {profile['id']} "
+            f"(model {payload['model']}): {exc}"
+        ) from exc
 
     data = response.json()
     choice = (data.get("choices") or [{}])[0]
@@ -2420,10 +2627,21 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             return None
         title = (raw.get('title') or '').strip() or 'External event'
         description = (raw.get('description') or '').strip()
-        severity = str(raw.get('severity') or 'critical').lower()
+        severity = str(raw.get('severity') or 'normal').strip().lower()
+        severity_aliases = {
+            'information': 'info',
+            'informational': 'info',
+            'warn': 'low',
+            'warning': 'low',
+            'medium': 'normal',
+            'moderate': 'normal',
+            'danger': 'high',
+            'emergency': 'critical',
+        }
+        severity = severity_aliases.get(severity, severity)
         allowed_sev = {'info', 'low', 'normal', 'high', 'critical'}
         if severity not in allowed_sev:
-            severity = 'critical'
+            severity = 'normal'
         state = str(raw.get('state') or 'new').lower()
         allowed_state = {'none', 'new', 'inprogress', 'closed', 'hidden'}
         if state not in allowed_state:
@@ -2538,15 +2756,108 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
 
         return candidates
 
+    def _extract_prose_alerts(blob: str) -> List[Dict[str, Any]]:
+        severity_aliases = {
+            "info": "info",
+            "information": "info",
+            "informational": "info",
+            "low": "low",
+            "warn": "low",
+            "warning": "low",
+            "normal": "normal",
+            "moderate": "normal",
+            "high": "high",
+            "danger": "high",
+            "critical": "critical",
+            "emergency": "critical",
+        }
+        pattern = re.compile(
+            r"^\s*(?:[-*•]|\d+[.)])?\s*"
+            r"(?P<label>info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
+            r"\s*(?:level|alert|severity)?\s*[:\-–]\s*(?P<description>.+?)\s*$",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        out: List[Dict[str, Any]] = []
+        for match in pattern.finditer(blob or ""):
+            raw_label = str(match.group("label") or "").strip().lower()
+            severity = severity_aliases.get(raw_label, "normal")
+            description = " ".join(str(match.group("description") or "").strip().split())
+            if not description:
+                continue
+            title = re.split(r"\s*\(|[.;]\s*", description, maxsplit=1)[0].strip()
+            if not title:
+                title = description
+            if len(title) > 80:
+                title = title[:77].rstrip() + "..."
+            out.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "severity": severity,
+                    "state": "new",
+                    "channel_id": default_channel_id,
+                    "timestamp_ms": base_ts_ms,
+                }
+            )
+        return out
+
+    def _alert_token_set(raw: Dict[str, Any]) -> Set[str]:
+        text = f"{raw.get('title') or ''} {raw.get('description') or ''}".lower()
+        stop_words = {
+            "the", "and", "from", "with", "that", "this", "into", "onto", "person",
+            "detected", "observed", "visible", "snapshot", "snapshots", "approx",
+            "event", "level", "alert", "sasha",
+        }
+        tokens = {
+            token.rstrip("s")
+            for token in re.findall(r"[a-zа-яё0-9]{3,}", text, flags=re.IGNORECASE)
+            if token not in stop_words
+        }
+        return {token for token in tokens if token}
+
+    def _is_near_duplicate_alert(candidate: Dict[str, Any], existing_alerts: Sequence[Dict[str, Any]]) -> bool:
+        candidate_tokens = _alert_token_set(candidate)
+        if len(candidate_tokens) < 2:
+            return False
+        candidate_severity = str(candidate.get("severity") or "").lower()
+        for existing in existing_alerts:
+            if str(existing.get("severity") or "").lower() != candidate_severity:
+                continue
+            existing_tokens = _alert_token_set(existing)
+            if len(candidate_tokens & existing_tokens) >= 2:
+                return True
+        return False
+
     alerts: List[Dict[str, Any]] = []
+    seen_alerts: Set[str] = set()
+    raw_alerts: List[Tuple[str, Any]] = []
     for candidate in _extract_candidates(text or ''):
         if isinstance(candidate, dict) and isinstance(candidate.get('alerts'), list):
             for raw_alert in candidate['alerts']:
-                validated = _validate_alert(raw_alert)
-                if validated:
-                    alerts.append(validated)
-            if alerts:
-                break
+                raw_alerts.append(("json", raw_alert))
+    raw_alerts.extend(("prose", raw_alert) for raw_alert in _extract_prose_alerts(text or ''))
+    for source, raw_alert in raw_alerts:
+        validated = _validate_alert(raw_alert)
+        if not validated:
+            continue
+        if source == "prose" and _is_near_duplicate_alert(validated, alerts):
+            continue
+        alert_key = json.dumps(
+            {
+                "title": validated.get("title"),
+                "description": validated.get("description"),
+                "severity": validated.get("severity"),
+                "state": validated.get("state"),
+                "channel_id": validated.get("channel_id"),
+                "timestamp_ms": validated.get("timestamp_ms"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if alert_key in seen_alerts:
+            continue
+        seen_alerts.add(alert_key)
+        alerts.append(validated)
 
     return alerts
 
@@ -2572,7 +2883,80 @@ LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT = (
     "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
     "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
 )
+PREVIOUS_LUXRIOT_ROLLUP_PROMPT_DEFAULTS = {
+    "L1": (
+        "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Scene baseline\n"
+        "### Key changes\n"
+        "### Alerts/signals\n"
+        "### Operator notes\n"
+        "Rules: keep factual language; deduplicate repeated observations; include timestamps when available; "
+        "avoid phrases like 'L1 rollup from L0'."
+    ),
+    "L2": (
+        "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Routine baseline\n"
+        "### Significant changes\n"
+        "### Alerts/signals\n"
+        "### Operator notes\n"
+        "Rules: preserve meaningful deviations from routine; avoid repeating unchanged background details; "
+        "keep concise, operator-facing language."
+    ),
+    "L3": (
+        "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Persistent patterns\n"
+        "### Notable events\n"
+        "### Risks and follow-ups\n"
+        "### Operator notes\n"
+        "Rules: emphasize trend shifts and durable signals; remove duplicate wording; focus on actionable context."
+    ),
+}
+PREVIOUS_LUXRIOT_GENERIC_ROLLUP_PROMPT_DEFAULTS = {
+    "L2": (
+        "You are a CCTV operations summarizer. Consolidate multiple short L1 summaries into one clear L2 rollup. "
+        "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+    ),
+    "L3": (
+        "You are a CCTV operations summarizer. Consolidate multiple short L2 summaries into one clear L3 rollup. "
+        "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+    ),
+}
 LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "Optional bookmark output for operator review:\n"
+    "- Always append exactly one block at the end, prefixed with ALERTS_JSON:.\n"
+    "- If no trigger matches, use {\"alerts\": []}.\n"
+    "- If one or more triggers match, include one alert object per distinct visible trigger, using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 0\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Trigger only on observable events such as physical violence, dangerous vehicle behavior, forced entry, "
+    "property damage, theft-like tampering, weapon/fire/smoke/immediate hazard, or crowd escalation. "
+    "Also emit operator-defined low/normal test triggers when the stream prompt explicitly asks for them. "
+    "Do not classify behavior as illegal/unlawful; describe visible facts requiring operator review. "
+    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, "
+    "or ambiguous movement unless the operator prompt explicitly asks for that policy. "
+    "Rules: emit one alert object per distinct trigger visible in the batch, up to 8 objects; "
+    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section; "
+    "do not alert routine micro-movements; "
+    "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
+)
+PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2 = (
     "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
     "- If no trigger match: emit no JSON block.\n"
     "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
@@ -2613,6 +2997,7 @@ PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
 )
 OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS = {
     LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
+    PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2.strip(),
     PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
 }
 LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
@@ -2660,6 +3045,14 @@ try:
             'L3': str(getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', '') or '').strip(),
         }
         legacy_rollup_prompt = LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT.strip()
+        outdated_rollup_prompts = {
+            level: {
+                legacy_rollup_prompt,
+                str(PREVIOUS_LUXRIOT_ROLLUP_PROMPT_DEFAULTS.get(level, '') or '').strip(),
+                str(PREVIOUS_LUXRIOT_GENERIC_ROLLUP_PROMPT_DEFAULTS.get(level, '') or '').strip(),
+            }
+            for level in ('L1', 'L2', 'L3')
+        }
         if (
             not str(luxriot_manager.rollup_llm_system_prompt or '').strip()
             or str(luxriot_manager.rollup_llm_system_prompt or '').strip() == legacy_rollup_prompt
@@ -2672,7 +3065,7 @@ try:
         for level in ('L1', 'L2', 'L3'):
             current_level_prompt = str(luxriot_manager.rollup_llm_system_prompts.get(level) or '').strip()
             default_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompt
-            if not current_level_prompt or current_level_prompt == legacy_rollup_prompt:
+            if not current_level_prompt or current_level_prompt in outdated_rollup_prompts.get(level, set()):
                 luxriot_manager.rollup_llm_system_prompts[level] = default_level_prompt
                 changed_prompt_defaults = True
         for channel_id, raw_overrides in list(luxriot_manager.channel_prompt_overrides.items()):
@@ -2689,7 +3082,7 @@ try:
                 rollup_changed = False
                 for level in ('L1', 'L2', 'L3'):
                     raw_level_prompt = str(rollup_overrides.get(level) or '').strip()
-                    if (not raw_level_prompt) or raw_level_prompt == legacy_rollup_prompt:
+                    if (not raw_level_prompt) or raw_level_prompt in outdated_rollup_prompts.get(level, set()):
                         fallback_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompts.get(level, '')
                         if fallback_level_prompt:
                             rollup_overrides[level] = fallback_level_prompt
@@ -2796,21 +3189,23 @@ class ProbesStore:
 
 
 def _build_archive_stores() -> Tuple[Any, Any]:
-    if _postgres_archive_enabled():
-        try:
-            pool = _get_control_plane_db_pool()
-            tenant_id = _archive_tenant_id()
-            return (
-                PostgresProbesStore(pool, tenant_id),
-                PostgresDetectionsStore(
-                    pool,
-                    tenant_id,
-                    max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
-                ),
+    if not _postgres_archive_enabled():
+        unavailable = _UnavailablePostgresStore("archive")
+        return unavailable, unavailable
+    try:
+        pool = _get_control_plane_db_pool()
+        tenant_id = _archive_tenant_id()
+        return (
+            PostgresProbesStore(pool, tenant_id),
+            PostgresDetectionsStore(
+                pool,
+                tenant_id,
+                max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
             )
-        except Exception:
-            pass
-    return ProbesStore(), DetectionsStore()
+        )
+    except Exception as exc:
+        unavailable = _UnavailablePostgresStore("archive", exc)
+        return unavailable, unavailable
 
 
 probes_store, detections_store = _build_archive_stores()
@@ -2905,8 +3300,8 @@ def _check_database_ready() -> Dict[str, Any]:
     else:
         runtime_state = {
             "ok": not required_postgres,
-            "status": "file_fallback" if not required_postgres else "not_configured",
-            "backend": "json",
+            "status": "not_configured",
+            "backend": "postgres",
             "required_backend": "postgres" if required_postgres else None,
         }
     store_checks["runtime_state"] = runtime_state
@@ -3382,6 +3777,15 @@ def _check_luxriot_ready(timeout_sec: float = 2.0) -> Dict[str, Any]:
 
 
 _configure_inference_queue()
+_luxriot_restore_result: Dict[str, Any] = {}
+try:
+    _luxriot_restore_result = luxriot_manager.restore_desired_live_sessions()
+except Exception as exc:
+    _luxriot_restore_result = {
+        "ok": False,
+        "status": "error",
+        "error": type(exc).__name__,
+    }
 
 
 @app.route('/health', methods=['GET'])
@@ -3431,6 +3835,16 @@ def ready():
         "lm_profiles": _check_lm_profiles_ready(),
         "embedder": _embedder_loaded_state(),
         "luxriot": _check_luxriot_ready(),
+        "luxriot_restore": _component_result(
+            bool(_luxriot_restore_result.get("ok", True)),
+            str(_luxriot_restore_result.get("status") or "unknown"),
+            required=False,
+            **{
+                key: value
+                for key, value in _luxriot_restore_result.items()
+                if key not in {"ok", "status"}
+            },
+        ),
     }
 
     if load_embedder and details_allowed and not checks["embedder"].get("ok"):
@@ -4270,7 +4684,12 @@ def _get_agent_runner() -> Any:
     with _agent_runner_lock:
         if _agent_runner is not None:
             return _agent_runner
-        from agent import AgentRunner
+        from agent import (
+            AGENT_MAX_MESSAGES_PER_SESSION,
+            AGENT_MAX_SESSIONS,
+            AGENT_SESSION_TTL_DAYS,
+            AgentRunner,
+        )
         approval_store = None
         if _auth_enabled():
             from agent_security import PostgresPlanApprovalStore
@@ -4306,9 +4725,10 @@ def _get_agent_runner() -> Any:
             sort_by: str = "similarity",
             candidate_limit: int = 20000,
             mode: str = "clip",
-        ) -> List[Dict[str, Any]]:
+            include_coverage: bool = False,
+        ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
             vec = get_text_embedding(query)
-            return _search_detections_archive(
+            payload = _search_detections_archive(
                 clip_query_vec=vec,
                 dino_query_vec=None,
                 mode=mode,
@@ -4320,6 +4740,18 @@ def _get_agent_runner() -> Any:
                 limit=limit,
                 sort_by=sort_by,
                 candidate_limit=candidate_limit,
+                include_coverage=include_coverage,
+            )
+            if include_coverage and isinstance(payload, tuple):
+                results, coverage = payload
+                return {"results": results, "coverage": coverage}
+            return cast(List[Dict[str, Any]], payload)
+
+        def _agent_tool_lm_chat(messages: List[Dict[str, Any]]) -> str:
+            return _call_lm_chat(
+                messages,
+                model_override=_agent_runtime_model_override,
+                profile_kind="agent",
             )
 
         agent_profile = _resolve_lm_profile(
@@ -4329,7 +4761,7 @@ def _get_agent_runner() -> Any:
         _agent_runner = AgentRunner(
             embed_text_fn=lambda text: get_text_embedding(text),
             embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder='clip'),
-            call_lm_fn=_call_lm_chat,
+            call_lm_fn=_agent_tool_lm_chat,
             encode_jpeg_fn=_encode_jpeg,
             probes_store=probes_store,
             detections_store=detections_store,
@@ -4340,6 +4772,12 @@ def _get_agent_runner() -> Any:
             lm_model=str(agent_profile.get("model") or ""),
             lm_api_key=str(agent_profile.get("api_key") or ""),
             lm_timeout=int(agent_profile.get("timeout") or config.LM_TIMEOUT),
+            store=PostgresAgentStore(
+                _get_control_plane_db_pool(),
+                max_sessions=AGENT_MAX_SESSIONS,
+                max_messages_per_session=AGENT_MAX_MESSAGES_PER_SESSION,
+                session_ttl_days=AGENT_SESSION_TTL_DAYS,
+            ),
             tool_audit_callback=_write_agent_tool_audit,
             tool_plan_store=approval_store,
             tool_approval_store=approval_store,
@@ -4396,6 +4834,8 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
 
     default_profile = _resolve_lm_profile(kind="vlm")
     default_model = _lm_profile_selector_value(default_profile)
+    agent_default_profile = _resolve_lm_profile(kind="agent")
+    agent_default_model = _lm_profile_selector_value(agent_default_profile)
     fallback_models: List[str] = []
     profiles = [
         _resolve_lm_profile(profile_id=profile_id)
@@ -4416,6 +4856,10 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
         "models": fallback_models,
         "default_model": default_model,
         "default_profile_id": str(default_profile.get("id") or "").strip(),
+        "agent_default_model": agent_default_model,
+        "agent_default_profile_id": str(agent_default_profile.get("id") or "").strip(),
+        "offline_default_model": agent_default_model,
+        "offline_default_profile_id": str(agent_default_profile.get("id") or "").strip(),
         "profiles": [_public_lm_profile(profile) for profile in profiles],
         "auto_model_selector": LM_AUTO_BALANCE_SELECTOR,
         "auto_model_label": LM_AUTO_BALANCE_LABEL,
@@ -4553,7 +4997,7 @@ def _archive_item_type(value: Any) -> str:
 
 
 class _DetectionClipShardCache:
-    def __init__(self, store: DetectionsStore) -> None:
+    def __init__(self, store: Any) -> None:
         self.store = store
         self.lock = threading.RLock()
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -4600,7 +5044,7 @@ detection_clip_shard_cache = _DetectionClipShardCache(detections_store)
 
 
 def _thumbnail_to_pil_image(thumbnail_b64: Any) -> Optional[Image.Image]:
-    raw_value = str(thumbnail_b64 or "").strip()
+    raw_value = _strip_image_data_url_prefix(thumbnail_b64)
     if not raw_value:
         return None
     try:
@@ -6397,7 +6841,11 @@ def _search_detection_clip_shards(
     if len(seen) < len(candidate_map):
         remaining = [det_id for det_id in candidate_map.keys() if det_id not in seen]
         if remaining:
-            vec_rows = detections_store.fetch_detections_by_ids(remaining, include_vectors=True)
+            vec_rows = detections_store.fetch_detections_by_ids(
+                remaining,
+                include_vectors=True,
+                include_thumbnail=False,
+            )
             fallback_ranked: List[Tuple[int, float]] = []
             for row in vec_rows:
                 clip_vec = row.get("clip_vec")
@@ -6508,6 +6956,50 @@ def _build_detection_search_result(
     return result
 
 
+def _build_detection_search_coverage(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    total_candidates: Optional[int],
+    candidate_limit: int,
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    source: Optional[str],
+    channel_id: Optional[int],
+) -> Dict[str, Any]:
+    scanned = len(candidates)
+    total = max(int(total_candidates), scanned) if total_candidates is not None else scanned
+    timestamps = [
+        int(item.get("timestamp_ms") or 0)
+        for item in candidates
+        if _to_optional_int(item.get("timestamp_ms")) is not None
+    ]
+    newest_ms = max(timestamps) if timestamps else None
+    oldest_ms = min(timestamps) if timestamps else None
+    truncated = total > scanned
+    note = "Search ranked the full candidate set for the requested filters."
+    if truncated:
+        note = (
+            "Search ranked a limited newest-first candidate window; older matching archive rows "
+            "may exist outside this search pass."
+        )
+    return {
+        "candidate_limit": int(candidate_limit),
+        "scanned_candidates": int(scanned),
+        "total_candidates": int(total),
+        "truncated": bool(truncated),
+        "result_limit": int(limit),
+        "source": source,
+        "channel_id": channel_id,
+        "requested_since_ms": since_ms,
+        "requested_until_ms": until_ms,
+        "scanned_oldest_ms": oldest_ms,
+        "scanned_newest_ms": newest_ms,
+        "must_state_coverage": bool(truncated),
+        "note": note,
+    }
+
+
 def _search_detections_archive(
     *,
     clip_query_vec: np.ndarray,
@@ -6521,10 +7013,23 @@ def _search_detections_archive(
     limit: int,
     sort_by: str,
     candidate_limit: int,
-) -> List[Dict[str, Any]]:
+    include_coverage: bool = False,
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
     limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
     candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
     clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
+    total_candidates: Optional[int] = None
+    try:
+        total_candidates = detections_store.count_vector_candidates(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            only_with_clip=True,
+        )
+    except AttributeError:
+        total_candidates = None
 
     candidates = detections_store.list_vector_candidates(
         probe_id=probe_id,
@@ -6535,6 +7040,7 @@ def _search_detections_archive(
         limit=candidate_limit,
         only_with_clip=True,
         include_vectors=False,
+        include_thumbnail=False,
     )
     if not candidates:
         updated = _backfill_clip_vectors_for_filters(
@@ -6556,9 +7062,20 @@ def _search_detections_archive(
                 limit=candidate_limit,
                 only_with_clip=True,
                 include_vectors=False,
+                include_thumbnail=False,
             )
     if not candidates:
-        return []
+        coverage = _build_detection_search_coverage(
+            candidates=[],
+            total_candidates=total_candidates,
+            candidate_limit=candidate_limit,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            source=source,
+            channel_id=channel_id,
+        )
+        return ([], coverage) if include_coverage else []
 
     clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
@@ -6581,10 +7098,21 @@ def _search_detections_archive(
                 limit=candidate_limit,
                 only_with_clip=True,
                 include_vectors=False,
+                include_thumbnail=False,
             )
             clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
-        return []
+        coverage = _build_detection_search_coverage(
+            candidates=candidates,
+            total_candidates=total_candidates,
+            candidate_limit=candidate_limit,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            source=source,
+            channel_id=channel_id,
+        )
+        return ([], coverage) if include_coverage else []
 
     alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
     if mode == "clip":
@@ -6634,9 +7162,25 @@ def _search_detections_archive(
     else:
         scored.sort(key=lambda row: row[1], reverse=True)
 
+    top_scored = scored[:limit]
+    hydrated_by_id: Dict[int, Dict[str, Any]] = {}
+    try:
+        hydrated_rows = detections_store.fetch_detections_by_ids(
+            [det_id for det_id, *_rest in top_scored],
+            include_vectors=False,
+            include_thumbnail=True,
+        )
+        hydrated_by_id = {
+            int(row["id"]): row
+            for row in hydrated_rows
+            if isinstance(row, Mapping) and _to_optional_int(row.get("id")) is not None
+        }
+    except Exception:
+        hydrated_by_id = {}
+
     results: List[Dict[str, Any]] = []
-    for det_id, final_score, clip_score, dino_score, dino_fallback in scored[:limit]:
-        item = candidate_map.get(det_id)
+    for det_id, final_score, clip_score, dino_score, dino_fallback in top_scored:
+        item = hydrated_by_id.get(det_id) or candidate_map.get(det_id)
         if not item:
             continue
         results.append(
@@ -6650,7 +7194,17 @@ def _search_detections_archive(
                 dino_fallback=dino_fallback,
             )
         )
-    return results
+    coverage = _build_detection_search_coverage(
+        candidates=candidates,
+        total_candidates=total_candidates,
+        candidate_limit=candidate_limit,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=limit,
+        source=source,
+        channel_id=channel_id,
+    )
+    return (results, coverage) if include_coverage else results
 
 
 def _build_segment_search_results(
@@ -7187,31 +7741,48 @@ def video_understanding():
     upload_obj = request.files.get('video') or request.files.get('file')
     uploaded_temp_path: Optional[Path] = None
     uploaded_original_name = str(getattr(upload_obj, "filename", "") or "").strip()
+    diagnostics: Dict[str, Any] = {
+        "request_id": getattr(g, "request_id", ""),
+        "multipart": is_multipart,
+        "upload": bool(uploaded_original_name),
+    }
 
     if upload_obj is not None and uploaded_original_name:
+        diagnostics["filename"] = Path(uploaded_original_name).name
+        diagnostics["suffix"] = Path(uploaded_original_name).suffix.lower()
         try:
             uploaded_temp_path = _save_upload_to_temp(
                 upload_obj,
                 allowed_suffixes=SUPPORTED_VIDEO_EXTENSIONS,
                 prefix="eva-video-",
             )
+            diagnostics["upload_bytes"] = uploaded_temp_path.stat().st_size
         except ValueError as exc:
-            return jsonify({'error': str(exc)}), 400
+            diagnostics["stage"] = "upload"
+            diagnostics["reason"] = type(exc).__name__
+            return jsonify({'error': str(exc), 'diagnostics': diagnostics}), 400
         video_obj = uploaded_temp_path
         video_path = uploaded_original_name
     else:
         video_path = (data.get('video') or '').strip()
+        diagnostics["source"] = "server_path"
         if not video_path:
-            return jsonify({'error': 'Provide a video path or upload a video file.'}), 400
+            diagnostics["stage"] = "input"
+            return jsonify({'error': 'Provide a video path or upload a video file.', 'diagnostics': diagnostics}), 400
         video_obj = Path(video_path).expanduser().resolve()
         if not video_obj.exists() or not video_obj.is_file():
-            return jsonify({'error': 'Video file not found'}), 400
+            diagnostics["stage"] = "path"
+            return jsonify({'error': 'Video file not found', 'diagnostics': diagnostics}), 400
         if video_obj.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
-            return jsonify({'error': 'Unsupported video file type'}), 400
+            diagnostics["stage"] = "suffix"
+            diagnostics["suffix"] = video_obj.suffix.lower()
+            return jsonify({'error': 'Unsupported video file type', 'diagnostics': diagnostics}), 400
         if config.ALLOWED_ROOTS:
             allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
             if not any(_path_within(video_obj, root) for root in allowed_roots):
-                return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
+                diagnostics["stage"] = "allowed_roots"
+                diagnostics["allowed_roots_count"] = len(allowed_roots)
+                return jsonify({'error': 'Video path is outside configured allowed roots', 'diagnostics': diagnostics}), 400
 
     max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
     try:
@@ -7221,6 +7792,7 @@ def video_understanding():
     if max_frames_int < 1:
         max_frames_int = 1
     max_frames_int = min(max_frames_int, config.LM_VIDEO_MAX_FRAMES)
+    diagnostics["frame_count_requested"] = max_frames_int
 
     sample_fps_raw = data.get('sample_fps')
     try:
@@ -7229,6 +7801,8 @@ def video_understanding():
             sample_fps_val = None
     except (TypeError, ValueError):
         sample_fps_val = None
+    if sample_fps_val is not None:
+        diagnostics["sample_fps"] = sample_fps_val
 
     user_prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
@@ -7250,7 +7824,7 @@ def video_understanding():
             "video",
             uploaded_original_name or video_path or str(video_obj),
         )
-        effective_model_hint, model_selection = _resolve_vlm_auto_model_hint(
+        effective_model_hint, model_selection = _resolve_offline_lm_model_hint(
             model_hint or None,
             assignment_key=assignment_key,
         )
@@ -7261,13 +7835,22 @@ def video_understanding():
             model_override=effective_model_hint,
             kind="vlm",
         )
+        diagnostics["profile_id"] = str(lm_profile.get('id') or '')
+        diagnostics["model"] = str(lm_profile.get('model') or '')
+        diagnostics["model_selection"] = model_selection.get("mode")
+        diagnostics["assigned_profile_id"] = model_selection.get("assigned_profile_id")
         frames, fps, duration = _sample_video_frames(
             str(video_obj),
             max_frames=max_frames_int,
             sample_fps=sample_fps_val,
             max_edge=config.LM_VIDEO_MAX_EDGE,
         )
+        diagnostics["fps"] = round(float(fps or 0.0), 3)
+        if duration is not None:
+            diagnostics["duration_sec"] = round(float(duration), 3)
+        diagnostics["frames_extracted"] = len(frames)
         if not frames:
+            diagnostics["stage"] = "frame_sampling"
             audit_error = _write_completion_audit_or_error(
                 action="lm.video_understanding.completed",
                 result="failure",
@@ -7281,7 +7864,7 @@ def video_understanding():
             )
             if audit_error is not None:
                 return audit_error
-            return jsonify({'error': 'No frames could be extracted from the video.'}), 400
+            return jsonify({'error': 'No frames could be extracted from the video.', 'diagnostics': diagnostics}), 400
         messages = _build_video_messages(video_path or str(video_obj), frames, user_prompt)
         summary = _call_video_understanding(
             messages,
@@ -7328,9 +7911,12 @@ def video_understanding():
                 'assigned_profile_id': model_selection.get("assigned_profile_id"),
                 'uploaded': bool(uploaded_temp_path),
                 'filename': uploaded_original_name or Path(video_obj).name,
+                'diagnostics': diagnostics,
             }
         )
     except Exception as exc:
+        diagnostics["stage"] = "inference"
+        diagnostics["reason"] = type(exc).__name__
         audit_error = _write_completion_audit_or_error(
             action="lm.video_understanding.completed",
             result="failure",
@@ -7348,7 +7934,7 @@ def video_understanding():
             "Video understanding failed request_id=%s",
             getattr(g, "request_id", ""),
         )
-        return jsonify({'error': 'video_understanding_failed'}), 500
+        return jsonify({'error': 'video_understanding_failed', 'diagnostics': diagnostics}), 500
     finally:
         _cleanup_temp_upload(uploaded_temp_path)
 
@@ -7410,7 +7996,7 @@ def describe_image():
                 "image",
                 uploaded_original_name or image_path or str(path_obj),
             )
-            effective_model_hint, model_selection = _resolve_vlm_auto_model_hint(
+            effective_model_hint, model_selection = _resolve_offline_lm_model_hint(
                 model_hint or None,
                 assignment_key=assignment_key,
             )
@@ -8041,6 +8627,35 @@ def luxriot_snapshot(channel_id: int):
         return response
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/snapshot/<int:channel_id>/capture', methods=['POST'])
+def luxriot_snapshot_capture(channel_id: int):
+    data = _json_body()
+    stream_type = str(data.get('stream') or request.args.get('stream') or 'mainStream').strip() or 'mainStream'
+    roi_enabled, roi_norm = _parse_probe_roi(data)
+    quality = data.get('quality') or 92
+    try:
+        encoded, meta = luxriot_manager.capture_snapshot_base64(
+            channel_id,
+            stream_type=stream_type,
+            roi_norm=roi_norm if roi_enabled else None,
+            quality=int(quality),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "snapshot_b64": encoded,
+                "meta": meta,
+                "channel_id": channel_id,
+                "filename": (
+                    f"probe_snap_ch{channel_id}_"
+                    f"{int(meta.get('captured_at_ms') or int(time.time() * 1000))}.jpg"
+                ),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 
 @app.route('/luxriot/start_capture', methods=['POST'])
@@ -9279,7 +9894,7 @@ def detections_search_text():
         return jsonify({'error': 'text_embedding_failed'}), 500
 
     try:
-        results = _search_detections_archive(
+        search_payload = _search_detections_archive(
             clip_query_vec=clip_query_vec,
             dino_query_vec=None,
             mode=mode,
@@ -9291,10 +9906,17 @@ def detections_search_text():
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
+            include_coverage=True,
         )
+        if isinstance(search_payload, tuple):
+            results, coverage = search_payload
+        else:
+            results = cast(List[Dict[str, Any]], search_payload)
+            coverage = {}
         return jsonify(
             {
                 'results': results,
+                'coverage': coverage,
                 'mode_requested': mode_requested,
                 'mode_used': mode,
                 'filters': filters,
@@ -9378,7 +10000,7 @@ def detections_search_image():
             dino_query_vec = None
 
     try:
-        results = _search_detections_archive(
+        search_payload = _search_detections_archive(
             clip_query_vec=clip_query_vec,
             dino_query_vec=dino_query_vec,
             mode=mode,
@@ -9390,10 +10012,17 @@ def detections_search_image():
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
+            include_coverage=True,
         )
+        if isinstance(search_payload, tuple):
+            results, coverage = search_payload
+        else:
+            results = cast(List[Dict[str, Any]], search_payload)
+            coverage = {}
         return jsonify(
             {
                 'results': results,
+                'coverage': coverage,
                 'mode_used': mode,
                 'filters': filters,
             }
@@ -9651,10 +10280,27 @@ def detections_diagnostics():
 
 
 ENV_PREFIX = "EVOSSEARCH_"
+_ENV_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]*$")
 
 
 def _bool_to_env(value: Any) -> str:
     return "true" if bool(value) else "false"
+
+
+def _decode_env_value(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        body = text[1:-1]
+        if text[0] == '"':
+            body = (
+                body
+                .replace("\\n", "\n")
+                .replace('\\"', '"')
+                .replace("\\$", "$")
+                .replace("\\\\", "\\")
+            )
+        return body
+    return text
 
 
 def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
@@ -9674,7 +10320,7 @@ def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
         key = key_raw.strip()
         if not key:
             continue
-        env_map[key] = value_raw.strip()
+        env_map[key] = _decode_env_value(value_raw)
     return env_map
 
 
@@ -9689,13 +10335,45 @@ def _parse_env_editor_text(raw_text: Any) -> Dict[str, str]:
         key = key_raw.strip()
         if not key or not key.startswith(ENV_PREFIX):
             continue
-        parsed[key] = value_raw.strip()
+        parsed[key] = _decode_env_value(value_raw)
     return parsed
 
 
 def _serialize_env_map(env_map: Dict[str, str]) -> str:
     keys_sorted = sorted(env_map.keys())
-    return "\n".join(f"{key}={env_map[key]}" for key in keys_sorted)
+    return "\n".join(f"{key}={_quote_env_value(env_map[key])}" for key in keys_sorted)
+
+
+def _quote_env_value(value: Any) -> str:
+    text = str(value or "")
+    if text and "\n" not in text and _ENV_SAFE_VALUE_RE.fullmatch(text):
+        return text
+    escaped = (
+        text
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+    )
+    return f'"{escaped}"'
+
+
+def _write_env_file_atomic(content: str, path: Union[str, Path] = ".env") -> None:
+    env_path = Path(path)
+    if not hasattr(env_path, "with_name"):
+        env_path.write_text(content, encoding="utf-8")
+        return
+    tmp_path = env_path.with_name(f".{env_path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, env_path)
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
 
 
 ENV_SECRET_REDACTION = "__EVOSSEARCH_SECRET_SET__"
@@ -9790,6 +10468,9 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
         "EVOSSEARCH_LM_VIDEO_MAX_TOKENS": str(config.LM_VIDEO_MAX_TOKENS),
         "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
+        "EVOSSEARCH_OFFLINE_VIDEO_ENABLED": _bool_to_env(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
+        "EVOSSEARCH_PROBE_SNAP_ENABLED": _bool_to_env(getattr(config, "PROBE_SNAP_ENABLED", False)),
+        "EVOSSEARCH_INDEXED_FOLDER_ENABLED": _bool_to_env(getattr(config, "INDEXED_FOLDER_ENABLED", False)),
         "EVOSSEARCH_LUXRIOT_BASE_URL": str(config.LUXRIOT_BASE_URL),
         "EVOSSEARCH_LUXRIOT_USERNAME": str(config.LUXRIOT_USERNAME),
         "EVOSSEARCH_LUXRIOT_PASSWORD": str(config.LUXRIOT_PASSWORD),
@@ -9804,6 +10485,7 @@ def _runtime_env_map() -> Dict[str, str]:
             getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600)
         ),
         "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
+        "EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH": str(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)),
         "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
         "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
         "EVOSSEARCH_LUXRIOT_SEV_NORMAL": str(sev.get("normal", "normal")),
@@ -9911,12 +10593,12 @@ def _effective_env_map() -> Dict[str, str]:
 def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
     existing_map = _read_env_file_map(".env")
     extra_evos = [
-        f"{key}={value}"
+        f"{key}={_quote_env_value(value)}"
         for key, value in sorted(existing_map.items())
         if key.startswith(ENV_PREFIX) and key not in known_keys
     ]
     extra_other = [
-        f"{key}={value}"
+        f"{key}={_quote_env_value(value)}"
         for key, value in sorted(existing_map.items())
         if not key.startswith(ENV_PREFIX)
     ]
@@ -10190,9 +10872,8 @@ def save_settings_env():
         merged_map = dict(preserved_other)
         merged_map.update(target_env)
 
-        env_lines = [f"{key}={merged_map[key]}" for key in sorted(merged_map.keys())]
         header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
-        Path(".env").write_text(header + "\n".join(env_lines) + "\n", encoding="utf-8")
+        _write_env_file_atomic(header + _serialize_env_map(merged_map) + "\n")
 
         audit_error = _write_completion_audit_or_error(
             action="settings.env.write.completed",
@@ -10261,6 +10942,11 @@ def get_settings():
             'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
             'luxriotSummaryRetentionDays': getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0),
             'luxriotSummaryHistoryLimit': getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600),
+            'luxriotSummaryArchiveFramesPerBatch': getattr(
+                config,
+                "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH",
+                4,
+            ),
             'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
             'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
             'probeBookmarkCooldownSec': config.PROBE_BOOKMARK_COOLDOWN_SEC,
@@ -10280,6 +10966,9 @@ def get_settings():
             'indexFolderName': config.INDEX_FOLDER_NAME,
             'settingsLocalOnly': config.SETTINGS_LOCAL_ONLY,
             'adminTokenSet': bool(config.ADMIN_TOKEN),
+            'offlineVideoEnabled': bool(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
+            'probeSnapEnabled': bool(getattr(config, "PROBE_SNAP_ENABLED", False)),
+            'indexedFolderEnabled': bool(getattr(config, "INDEXED_FOLDER_ENABLED", False)),
             'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
             'allowedRoots': list(config.ALLOWED_ROOTS),
             'archiveRetentionEnabled': getattr(config, "ARCHIVE_RETENTION_ENABLED", True),
@@ -10430,6 +11119,21 @@ def save_settings():
         except (TypeError, ValueError):
             luxriot_summary_history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
         luxriot_summary_history_limit = max(40, min(1000000, luxriot_summary_history_limit))
+        try:
+            luxriot_summary_archive_frames_per_batch = int(
+                data.get(
+                    'luxriotSummaryArchiveFramesPerBatch',
+                    getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_archive_frames_per_batch = int(
+                getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4)
+            )
+        luxriot_summary_archive_frames_per_batch = max(
+            1,
+            min(16, luxriot_summary_archive_frames_per_batch),
+        )
         archive_retention_enabled = _coerce_bool(
             data.get('archiveRetentionEnabled', getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
             bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
@@ -10607,6 +11311,9 @@ EVOSSEARCH_LM_VIDEO_MAX_FRAMES={config.LM_VIDEO_MAX_FRAMES}
 EVOSSEARCH_LM_VIDEO_MAX_EDGE={config.LM_VIDEO_MAX_EDGE}
 EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
 EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
+EVOSSEARCH_OFFLINE_VIDEO_ENABLED={str(getattr(config, "OFFLINE_VIDEO_ENABLED", False)).lower()}
+EVOSSEARCH_PROBE_SNAP_ENABLED={str(getattr(config, "PROBE_SNAP_ENABLED", False)).lower()}
+EVOSSEARCH_INDEXED_FOLDER_ENABLED={str(getattr(config, "INDEXED_FOLDER_ENABLED", False)).lower()}
 
 # Luxriot Evo integration
 EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
@@ -10618,7 +11325,9 @@ EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
 EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS={luxriot_summary_retention_days}
 EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT={luxriot_summary_history_limit}
+EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH={luxriot_summary_archive_frames_per_batch}
 EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
+EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH={getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)}
 EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
 EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
@@ -10684,13 +11393,18 @@ EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
 EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
 
-        known_env_keys = set(_parse_env_editor_text(env_content).keys())
-        env_content = env_content.rstrip() + _preserve_additional_env_lines(known_env_keys)
+        parsed_env_content = _parse_env_editor_text(env_content)
+        known_env_keys = set(parsed_env_content.keys())
+        env_content = (
+            "# evo-ssearch Configuration\n"
+            "# Generated by settings panel\n\n"
+            + _serialize_env_map(parsed_env_content)
+            + _preserve_additional_env_lines(known_env_keys)
+        )
         if not env_content.endswith("\n"):
             env_content += "\n"
 
-        with open('.env', 'w', encoding='utf-8') as f:
-            f.write(env_content)
+        _write_env_file_atomic(env_content)
 
         config.HOST = data['host']
         config.PORT = port
@@ -10737,10 +11451,12 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
         config.LUXRIOT_SUMMARY_RETENTION_DAYS = luxriot_summary_retention_days
         config.LUXRIOT_SUMMARY_HISTORY_LIMIT = luxriot_summary_history_limit
+        config.LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = luxriot_summary_archive_frames_per_batch
         config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
         config.LUXRIOT_SEVERITY_MAP = merged_sev
         luxriot_manager.summary_retention_days = luxriot_summary_retention_days
         luxriot_manager.summary_history_limit = luxriot_summary_history_limit
+        luxriot_manager.summary_archive_frames_per_batch = luxriot_summary_archive_frames_per_batch
         config.ARCHIVE_RETENTION_ENABLED = archive_retention_enabled
         config.ARCHIVE_MAX_RECORDS = archive_max_records
         config.ARCHIVE_ROW_RETENTION_DAYS = archive_row_retention_days
@@ -11109,7 +11825,12 @@ def _shutdown_background_workers() -> None:
     except Exception:
         pass
     try:
-        luxriot_manager.stop_all_streams(stop_video=True, stop_analytics=True, pause_analytics=False)
+        luxriot_manager.stop_all_streams(
+            stop_video=True,
+            stop_analytics=True,
+            pause_analytics=False,
+            update_desired=False,
+        )
     except Exception:
         pass
     try:

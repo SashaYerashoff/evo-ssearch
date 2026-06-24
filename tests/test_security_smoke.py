@@ -36,8 +36,14 @@ class SecuritySmokeTests(unittest.TestCase):
             "DB_STRICT_RUNTIME_ROLES",
             False,
         )
+        self._orig_offline_video_enabled = config.OFFLINE_VIDEO_ENABLED
+        self._orig_probe_snap_enabled = config.PROBE_SNAP_ENABLED
+        self._orig_indexed_folder_enabled = config.INDEXED_FOLDER_ENABLED
         config.AUTH_ENABLED = False
         config.ALLOWED_ROOTS = []
+        config.OFFLINE_VIDEO_ENABLED = True
+        config.PROBE_SNAP_ENABLED = True
+        config.INDEXED_FOLDER_ENABLED = True
 
     def tearDown(self) -> None:
         config.AUTH_ENABLED = self._orig_auth_enabled
@@ -48,6 +54,9 @@ class SecuritySmokeTests(unittest.TestCase):
         config.ALLOWED_ROOTS = self._orig_allowed_roots
         config.LUXRIOT_PASSWORD = self._orig_luxriot_password
         config.DB_STRICT_RUNTIME_ROLES = self._orig_db_strict_runtime_roles
+        config.OFFLINE_VIDEO_ENABLED = self._orig_offline_video_enabled
+        config.PROBE_SNAP_ENABLED = self._orig_probe_snap_enabled
+        config.INDEXED_FOLDER_ENABLED = self._orig_indexed_folder_enabled
 
     def test_search_missing_json_returns_api_error(self) -> None:
         resp = self.client.post("/search")

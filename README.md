@@ -8,12 +8,12 @@ Luxriot EVA AI is a production-pilot CLIP visual search and monitoring system fo
 
 ## Version
 
-- Current version: `β 0.8.0`
+- Current version: `β 0.8.1`
 - Source of truth: `VERSION` (UI reads it at runtime; optional override via `EVOSSEARCH_APP_VERSION`)
 
 ### Versioning Policy
 
-- Release label + `major.minor.patch` (shown in UI from `VERSION`, e.g. `β 0.8.0`)
+- Release label + `major.minor.patch` (shown in UI from `VERSION`, e.g. `β 0.8.1`)
 - New feature branch work: increment `minor`
 - Minor adjustments inside a branch: increment `patch`
 - Merge to `main`: increment `major`, reset `minor` and `patch` to `0`
@@ -66,7 +66,7 @@ Note: Comments and segmentation are intentionally limited to indexed-folder imag
 
 ### Detections Archive + Retention
 
-- Probe hits are persisted in SQLite (`detections_store.sqlite3`)
+- Probe hits and archive search records are persisted in PostgreSQL in secure deployments
 - Optional adaptive retention keeps high-value snapshots and drops near-duplicates
 - Archive search returns probe metadata plus search similarity signals
 
@@ -264,7 +264,7 @@ Effective variables currently used by app/config:
 EVOSSEARCH_HOST=0.0.0.0
 EVOSSEARCH_PORT=5000
 EVOSSEARCH_DEBUG=false
-EVOSSEARCH_APP_VERSION="β 0.8.0"
+EVOSSEARCH_APP_VERSION="β 0.8.1"
 
 # Embedder/index
 EVOSSEARCH_EMBEDDER=clip              # clip|dino|fusion
@@ -298,6 +298,9 @@ EVOSSEARCH_LM_VIDEO_MAX_FRAMES=64
 EVOSSEARCH_LM_VIDEO_MAX_EDGE=960
 EVOSSEARCH_LM_VIDEO_MAX_TOKENS=1536
 EVOSSEARCH_LM_VIDEO_TEMPERATURE=0.2
+EVOSSEARCH_OFFLINE_VIDEO_ENABLED=false
+EVOSSEARCH_PROBE_SNAP_ENABLED=false
+EVOSSEARCH_INDEXED_FOLDER_ENABLED=false
 
 # Luxriot
 EVOSSEARCH_LUXRIOT_BASE_URL=http://luxriot-host:8080
@@ -384,7 +387,6 @@ Notes:
 evo-ssearch/
 ├── oldapp.py
 ├── config.py
-├── detection_store.py
 ├── luxriot_connector.py
 ├── probe_manager.py
 ├── embedders/
@@ -398,8 +400,8 @@ evo-ssearch/
 
 Runtime artifacts:
 
-- `detections_store.sqlite3` (SQLite detections DB)
-- `detections_archive/` (retained snapshots)
+- PostgreSQL schemas for archive/search/probes/agent runtime state
+- `/var/lib/eva-ai/detections_archive/` or configured retained snapshot storage
 
 ## Troubleshooting
 

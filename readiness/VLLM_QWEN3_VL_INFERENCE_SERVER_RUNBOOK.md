@@ -190,11 +190,11 @@ vllm serve /opt/eva-vllm/models/qwen3-vl-4b-fp8 \
   --served-model-name qwen3-vl-4b-fp8 \
   --host 0.0.0.0 \
   --port 8001 \
-  --max-model-len 4096 \
+  --max-model-len 8192 \
   --gpu-memory-utilization 0.82 \
   --max-num-seqs 4 \
   --limit-mm-per-prompt.video 0 \
-  --limit-mm-per-prompt.image 8 \
+  --limit-mm-per-prompt.image 16 \
   --mm-processor-cache-gb 0 \
   --trust-remote-code
 ```
@@ -261,7 +261,7 @@ Environment=HF_HUB_DISABLE_XET=1
 Environment=OMP_NUM_THREADS=1
 Environment=CUDA_VISIBLE_DEVICES=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
-ExecStart=/opt/eva-vllm/.venv/bin/vllm serve /opt/eva-vllm/models/qwen3-vl-4b-fp8 --served-model-name qwen3-vl-4b-fp8 --host 0.0.0.0 --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.82 --max-num-seqs 4 --limit-mm-per-prompt.video 0 --limit-mm-per-prompt.image 8 --mm-processor-cache-gb 0 --trust-remote-code
+ExecStart=/opt/eva-vllm/.venv/bin/vllm serve /opt/eva-vllm/models/qwen3-vl-4b-fp8 --served-model-name qwen3-vl-4b-fp8 --host 0.0.0.0 --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.82 --max-num-seqs 4 --limit-mm-per-prompt.video 0 --limit-mm-per-prompt.image 16 --mm-processor-cache-gb 0 --trust-remote-code
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
@@ -284,8 +284,9 @@ curl -sS http://127.0.0.1:8001/v1/models | jq
 
 ## 8. GPU0 systemd service
 
-GPU0 may have display or TeamViewer memory pressure. Start slightly lower than
-GPU1.
+GPU0 may have display or TeamViewer memory pressure. Keep the same image/context
+limits as GPU1, but lower GPU memory utilization if this card carries desktop
+or remote-access load.
 
 ```bash
 export EVA_VLLM_USER="$USER"
@@ -307,7 +308,7 @@ Environment=HF_HUB_DISABLE_XET=1
 Environment=OMP_NUM_THREADS=1
 Environment=CUDA_VISIBLE_DEVICES=0
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
-ExecStart=/opt/eva-vllm/.venv/bin/vllm serve /opt/eva-vllm/models/qwen3-vl-4b-fp8 --served-model-name qwen3-vl-4b-fp8 --host 0.0.0.0 --port 8002 --max-model-len 4096 --gpu-memory-utilization 0.78 --max-num-seqs 4 --limit-mm-per-prompt.video 0 --limit-mm-per-prompt.image 8 --mm-processor-cache-gb 0 --trust-remote-code
+ExecStart=/opt/eva-vllm/.venv/bin/vllm serve /opt/eva-vllm/models/qwen3-vl-4b-fp8 --served-model-name qwen3-vl-4b-fp8 --host 0.0.0.0 --port 8002 --max-model-len 8192 --gpu-memory-utilization 0.82 --max-num-seqs 4 --limit-mm-per-prompt.video 0 --limit-mm-per-prompt.image 16 --mm-processor-cache-gb 0 --trust-remote-code
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
@@ -329,10 +330,15 @@ curl -sS http://127.0.0.1:8002/v1/models | jq
 nvidia-smi
 ```
 
-If GPU0 fails due to memory pressure, reduce:
+If GPU0 fails due to memory pressure, reduce memory utilization first:
 
 ```text
---gpu-memory-utilization 0.72
+--gpu-memory-utilization 0.78
+```
+
+If it still fails, reduce concurrency:
+
+```text
 --max-num-seqs 2
 ```
 

@@ -80,6 +80,8 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         self.assertNotIn("create_bookmark", schemas)
         self.assertIn("normalize_time_window", schemas)
         self.assertIn("list_video_summary_channels", schemas)
+        self.assertIn("count_video_summary_events", schemas)
+        self.assertIn("track_visual_state_transitions", schemas)
         search = schemas["search_archive"]["function"]["parameters"]
         self.assertNotIn("folder", search["properties"])
         self.assertEqual(
@@ -107,6 +109,25 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             ["probe-7"],
         )
 
+    def test_normalize_time_window_allows_operator_relative_range(self):
+        result = self.adapter.execute(
+            "normalize_time_window",
+            {"relative_range": "last two hours"},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["relative_range"], "last two hours")
+
+    def test_normalize_time_window_does_not_require_iso_start_end(self):
+        result = self.adapter.execute(
+            "normalize_time_window",
+            {"start_time": "01:30", "end_time": "08:30"},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["start_time"], "01:30")
+        self.assertEqual(result["arguments"]["end_time"], "08:30")
+
     def test_unauthorized_channel_is_denied_and_audited(self):
         with self.assertRaises(ChannelAccessDeniedError):
             self.adapter.execute(
@@ -121,6 +142,25 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             self.audit_events[-1].code,
             "channel_access_denied",
         )
+
+    def test_visual_window_signals_are_channel_scoped(self):
+        result = self.adapter.execute(
+            "get_visual_window_signals",
+            {"positive_query": "dog without visible ear tag"},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["channel_id"], "7")
+
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "get_visual_window_signals",
+                {"channel_id": 8, "positive_query": "dog without visible ear tag"},
+                self.context,
+            )
+
+        self.assertEqual(self.legacy.calls[-1][0], "get_visual_window_signals")
+        self.assertEqual(self.audit_events[-1].phase, "deny")
 
     def test_scoped_aggregate_requires_explicit_channel(self):
         multi_channel_context = ToolExecutionContext(
@@ -172,11 +212,35 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["arguments"]["channel_ids"], ["7"])
 
+    def test_visual_state_transitions_defaults_to_scoped_channel(self):
+        result = self.adapter.execute(
+            "track_visual_state_transitions",
+            {
+                "positive_state_query": "cat on top of computer tower",
+                "negative_state_query": "empty computer tower",
+                "from_ts": 100.0,
+                "to_ts": 200.0,
+            },
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["channel_id"], "7")
+
     def test_detection_ownership_is_resolved_before_dispatch(self):
         with self.assertRaises(ChannelAccessDeniedError):
             self.adapter.execute(
                 "describe_frame",
                 {"detection_id": 80},
+                self.context,
+            )
+
+        self.assertEqual(self.legacy.calls, [])
+
+    def test_detection_ownership_overrides_caller_supplied_channel(self):
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "describe_frame",
+                {"detection_id": 80, "channel_id": 7},
                 self.context,
             )
 

@@ -157,6 +157,8 @@ class LmProfileRuntimeTests(unittest.TestCase):
             payload = oldapp._fetch_lm_model_catalog(force=True)
 
         self.assertEqual(payload["default_model"], "vlm-a")
+        self.assertEqual(payload["offline_default_model"], "agent")
+        self.assertEqual(payload["agent_default_model"], "agent")
         self.assertIn("agent", payload["models"])
         self.assertIn("vlm-a", payload["models"])
         self.assertIn("qwen-agent", payload["models"])

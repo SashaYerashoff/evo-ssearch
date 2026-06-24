@@ -370,7 +370,7 @@
                 </section>
 
                 <aside class="studio-inspector video-inspector">
-                    <div class="video-analysis-shell studio-panel">
+                    <div class="video-analysis-shell studio-panel {{ offline_video_hidden_class }}">
                         <div class="studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">Offline Video Analysis</div>
@@ -641,7 +641,7 @@
                             <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
                             <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
                             <button id="probeStreamToggle" type="button" class="feature-btn primary">Start Stream</button>
-                            <button id="probeSnapBtn" type="button" class="feature-btn">Snap</button>
+                            <button id="probeSnapBtn" type="button" class="feature-btn {{ probe_snap_hidden_class }}">Snap</button>
                         </div>
                         <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
                     </div>
@@ -801,7 +801,7 @@
         </div>
     </div>
 
-    <div id="probeSnapModal" class="settings-modal">
+    <div id="probeSnapModal" class="settings-modal {{ probe_snap_hidden_class }}">
         <div class="settings-modal-content probe-snap-modal-content">
             <div class="settings-header">
                 <h2>Probe Snapshot</h2>
@@ -851,6 +851,10 @@
                     </label>
                 </div>
                 <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>
+                <details id="luxriotPromptLayerDetails" class="prompt-layer-details">
+                    <summary>Effective prompt layers</summary>
+                    <pre id="luxriotPromptLayerContent" class="prompt-layer-content"></pre>
+                </details>
                 <div class="settings-actions">
                     <button id="luxriotPromptApplyBtn" class="settings-btn primary">Apply</button>
                     <button id="luxriotPromptCloseBtn" class="settings-btn">Close</button>
@@ -864,6 +868,40 @@
             <button class="close-btn image-lightbox-close" id="closeImageLightbox">&times;</button>
             <img id="imageLightboxImg" class="image-lightbox-img" src="" alt="Expanded preview" />
             <div id="imageLightboxMeta" class="image-lightbox-meta"></div>
+        </div>
+    </div>
+
+    <div id="archiveReviewModal" class="settings-modal archive-review-modal">
+        <div class="archive-review-shell">
+            <div class="archive-review-head">
+                <div>
+                    <div id="archiveReviewTitle" class="archive-review-title">Archive Review</div>
+                    <div id="archiveReviewQuery" class="archive-review-query">User query: -</div>
+                </div>
+                <div class="archive-review-head-right">
+                    <div id="archiveReviewMatch" class="archive-review-match">CLIP Match: -</div>
+                    <button class="close-btn archive-review-close" id="closeArchiveReview">&times;</button>
+                </div>
+            </div>
+            <div class="archive-review-frame">
+                <img id="archiveReviewImg" src="" alt="Archived frame" />
+                <div id="archiveReviewFrameEmpty" class="archive-review-empty">No frame</div>
+            </div>
+            <div class="archive-review-meta-row">
+                <div id="archiveReviewChannel">Channel: -</div>
+                <div id="archiveReviewFrameRole">Frame</div>
+                <div id="archiveReviewTimestamp">Timestamp: -</div>
+            </div>
+            <div class="archive-review-actions">
+                <button id="archiveReviewDescribeBtn" class="feature-btn">Describe frame</button>
+                <button id="archiveReviewSimilarBtn" class="feature-btn">Find similar</button>
+                <button id="archiveReviewJumpBtn" class="feature-btn primary">Open VLM feed</button>
+                <button id="archiveReviewCopyBtn" class="feature-btn">Copy summary</button>
+            </div>
+            <div class="archive-review-summary-panel">
+                <div class="archive-review-summary-title">Video description for the L0 batch</div>
+                <div id="archiveReviewSummary" class="archive-review-summary"></div>
+            </div>
         </div>
     </div>
     
@@ -1143,7 +1181,7 @@
                             </div>
                             <div class="settings-row">
                                 <label class="settings-label">Frames / Batch:</label>
-                                <input type="number" id="archiveEstimateFramesPerBatch" class="settings-input" min="0" max="32" step="0.5" placeholder="2.5">
+                                <input type="number" id="archiveEstimateFramesPerBatch" class="settings-input" min="0" max="32" step="0.5" placeholder="4">
                             </div>
                             <div class="settings-row">
                                 <label class="settings-label">Avg JPEG (KB):</label>

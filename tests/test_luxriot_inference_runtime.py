@@ -1,3 +1,4 @@
+import ast
 import os
 import stat
 import tempfile
@@ -5,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -20,13 +22,17 @@ def build_manager(
     lm_callback=None,
     alert_parser=None,
     summary_archive_callback=None,
+    runtime_state_store=None,
+    config_overrides=None,
 ) -> LuxriotManager:
     config = SimpleNamespace(
         LUXRIOT_SYSTEM_PROMPT_DEFAULT="Describe the stream.",
         LUXRIOT_ALERTS_JSON_PROMPT="",
         LUXRIOT_SUMMARY_HISTORY_LIMIT=100,
+        LUXRIOT_SUMMARY_RETENTION_DAYS=0,
         LUXRIOT_AUTO_BOOKMARKS=False,
         LUXRIOT_BOOKMARK_COOLDOWN_SEC=60.0,
+        LUXRIOT_ALERTS_MAX_PER_BATCH=8,
         LUXRIOT_SUMMARY_STATE_FILE=str(directory / "summaries.json"),
         LUXRIOT_ROLLUP_CACHE_FILE=str(directory / "rollups.json"),
         LUXRIOT_ROLLUP_L1_LLM_ENABLED=False,
@@ -39,10 +45,14 @@ def build_manager(
         LUXRIOT_SNAPSHOT_INTERVAL=5,
         LUXRIOT_SNAPSHOT_MAX_EDGE=800,
         LUXRIOT_MAX_BUFFER_FRAMES=180,
+        LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH=4,
         LUXRIOT_BASE_URL="http://luxriot.invalid",
         LUXRIOT_USERNAME="",
         LUXRIOT_PASSWORD="",
     )
+    if config_overrides:
+        for key, value in dict(config_overrides).items():
+            setattr(config, key, value)
 
     def message_builder(_channel, frames, prompt, system_prompt):
         return [
@@ -60,7 +70,19 @@ def build_manager(
         jpeg_encoder=lambda _image, **_kwargs: "jpeg",
         alert_parser=alert_parser,
         summary_archive_callback=summary_archive_callback,
+        runtime_state_store=runtime_state_store,
     )
+
+
+class MemoryRuntimeStateStore:
+    def __init__(self):
+        self.payloads = {}
+
+    def load_state(self, key):
+        return self.payloads.get(key)
+
+    def save_state(self, key, payload):
+        self.payloads[key] = payload
 
 
 def sample_frames(start: float = 100.0):
@@ -80,6 +102,26 @@ def sample_frames(start: float = 100.0):
             "height": 720,
         },
     ]
+
+
+def load_lm_alert_parser():
+    source = Path(__file__).resolve().parent.parent.joinpath("oldapp.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    namespace = {
+        "time": time,
+        "Any": Any,
+        "Dict": Dict,
+        "List": List,
+        "Optional": Optional,
+        "Sequence": Sequence,
+        "Set": Set,
+        "Tuple": Tuple,
+    }
+    for node in module.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_parse_lm_alerts":
+            exec(compile(ast.Module([node], []), "oldapp.py", "exec"), namespace)
+            return namespace["_parse_lm_alerts"]
+    raise AssertionError("_parse_lm_alerts not found")
 
 
 class LuxriotCaptureDispatchTests(unittest.TestCase):
@@ -190,6 +232,49 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual([frame["timestamp_ms"] for frame in frames], [100000, 105000])
             self.assertNotIn("archive_frames", manager.summary_history[7][0])
 
+    def test_sync_fallback_archives_period_spread_frame_anchors(self):
+        archived = []
+
+        def archive_callback(entry):
+            archived.append(dict(entry))
+            return {
+                "attempted": len(entry.get("archive_frames") or []),
+                "inserted": len(entry.get("archive_frames") or []),
+                "summary_frames": len(entry.get("archive_frames") or []),
+                "alert_frames": 0,
+            }
+
+        frames = [
+            {
+                "thumbnail": f"base64-frame-{index}",
+                "captured_at": 100.0 + index,
+                "time_sec": 100.0 + index,
+                "width": 1280,
+                "height": 720,
+            }
+            for index in range(5)
+        ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), summary_archive_callback=archive_callback)
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=5,
+                prompt="Describe activity.",
+                model_hint="model-a",
+                interval_sec=1.0,
+                frames=frames,
+            )
+
+            outcome = manager.dispatch_summary_batch(batch)
+
+            self.assertFalse(outcome["queued"])
+            saved = archived[0]["archive_frames"]
+            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 3, 4])
+            self.assertEqual([frame["anchor_role"] for frame in saved], ["first", "sample", "sample", "last"])
+            self.assertEqual([frame["timestamp_ms"] for frame in saved], [100000, 101000, 103000, 104000])
+
     def test_summary_alert_counts_roll_up_by_severity(self):
         with tempfile.TemporaryDirectory() as temp:
             def parse_alerts(text, _channel_id, _default_ts_ms=None):
@@ -230,6 +315,694 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(rollups["levels"]["L1"][0]["alert_counts"], {"critical": 1, "normal": 1, "low": 1})
             self.assertEqual(rollups["levels"]["L1"][0]["alert_total"], 3)
 
+    def test_summary_filters_and_l0_rollups_use_batch_bounds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            created_at = time.time()
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "cat returns\nALERTS_JSON:\n{\"alerts\":[]}",
+                    "frame_count": 12,
+                    "created_at": created_at,
+                    "batch_start_ms": 100_000,
+                    "batch_end_ms": 130_000,
+                },
+            )
+
+            in_window = manager.session_status(7, run_selector="all", start_ts=90.0, end_ts=140.0)
+            created_window = manager.session_status(
+                7,
+                run_selector="all",
+                start_ts=created_at - 5.0,
+                end_ts=created_at + 5.0,
+            )
+
+            self.assertEqual(len(in_window["logs"]), 1)
+            self.assertEqual(len(created_window["logs"]), 0)
+
+            rollups = manager.summary_rollups(7, run_selector="all", start_ts=90.0, end_ts=140.0)
+            l0 = rollups["levels"]["L0"][0]
+            self.assertEqual(l0["window_start"], 100.0)
+            self.assertEqual(l0["window_end"], 130.0)
+            self.assertEqual(l0["window_sec"], 30)
+
+    def test_alerts_json_prompt_is_decoupled_from_bookmark_side_effects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {"title": "test", "severity": "normal"}
+                ],
+            )
+            manager.default_bookmark_enabled = False
+
+            prompt = manager.get_effective_stream_system_prompt(7)
+            self.assertIn("ALERTS_JSON", prompt)
+
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=1,
+                prompt="Describe activity.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=[{"captured_at": 100.0, "image_b64": "ZmFrZQ=="}],
+            )
+            self.assertIn("ALERTS_JSON", batch["system_prompt"])
+            self.assertEqual(
+                manager.process_summary_alerts(
+                    7,
+                    'ALERTS_JSON:\n{"alerts":[{"title":"test","severity":"normal"}]}',
+                    default_ts_ms=100_000,
+                ),
+                0,
+            )
+
+    def test_process_summary_alerts_sends_more_than_three_distinct_alerts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [
+                    {"title": "Thumb up", "description": "Person shows thumb", "severity": "info"},
+                    {"title": "Cup drink", "description": "Person drinks from cup", "severity": "low"},
+                    {"title": "Fight", "description": "Two people fighting", "severity": "high"},
+                    {"title": "Drifting", "description": "Vehicle drifting", "severity": "normal"},
+                    {"title": "Fire", "description": "Trash bin fire", "severity": "critical"},
+                ]
+
+            manager = build_manager(Path(temp), alert_parser=parse_alerts)
+            manager.default_bookmark_enabled = True
+            manager.default_bookmark_cooldown_sec = 0.0
+            sent = []
+
+            def fake_bookmark(**kwargs):
+                sent.append(kwargs)
+                return {"success": True}
+
+            with patch.object(manager, "send_bookmark_event", side_effect=fake_bookmark):
+                count = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_000_000,
+                )
+
+            self.assertEqual(count, 5)
+            self.assertEqual(len(sent), 5)
+            self.assertEqual(
+                [item["severity"] for item in sent],
+                ["info", "low", "high", "normal", "critical"],
+            )
+
+    def test_process_summary_alerts_reports_bookmark_failures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {"title": "Fire", "description": "Visible flame", "severity": "high"}
+                ],
+            )
+            manager.default_bookmark_enabled = True
+            manager.default_bookmark_cooldown_sec = 0.0
+
+            with (
+                self.assertLogs("luxriot_connector", level="WARNING") as logs,
+                patch.object(manager, "send_bookmark_event", side_effect=RuntimeError("evo down")),
+            ):
+                result = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_000_000,
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(result.parsed, 1)
+            self.assertEqual(result.failed, 1)
+            self.assertIn("evo down", result.last_error)
+            self.assertIn("Luxriot bookmark send failed", "\n".join(logs.output))
+
+    def test_high_severity_bookmarks_bypass_info_cooldown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = {"severity": "info"}
+
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [
+                    {
+                        "title": "Repeated event",
+                        "description": "Same visual event",
+                        "severity": current["severity"],
+                    }
+                ]
+
+            manager = build_manager(Path(temp), alert_parser=parse_alerts)
+            manager.default_bookmark_enabled = True
+            manager.default_bookmark_cooldown_sec = 60.0
+            sent = []
+
+            with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
+                first = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_000_000,
+                )
+                second = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_001_000,
+                )
+                current["severity"] = "high"
+                third = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_002_000,
+                )
+                fourth = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_003_000,
+                )
+
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertEqual(second.skipped_duplicate, 1)
+            self.assertEqual(third, 1)
+            self.assertEqual(fourth, 1)
+            self.assertEqual([item["severity"] for item in sent], ["info", "high", "high"])
+
+    def test_rollup_source_selection_preserves_salient_children_under_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            base = 1_781_700_000.0
+            children = []
+            for index in range(24):
+                child = {
+                    "window_start": base + index * 30.0,
+                    "summary": f"Routine quiet corridor segment {index} with no notable changes. " * 4,
+                    "alert_counts": {},
+                    "signal_digest": {},
+                }
+                if index == 11:
+                    child["summary"] = "A vehicle performs drifting turns near the gate while traffic remains otherwise routine."
+                    child["alert_counts"] = {"high": 1}
+                    child["signal_digest"] = {
+                        "alert_events": ["high: vehicle drifting near gate"],
+                        "deviations": ["vehicle drifting near gate"],
+                    }
+                if index == 17:
+                    child["summary"] = "Camera view is partially obstructed and several frames are missing."
+                    child["signal_digest"] = {"missing_data": ["partial obstruction and missing frames"]}
+                children.append(child)
+
+            lines = manager._select_rollup_source_lines(children, char_budget=1100)
+            joined = "\n".join(lines)
+
+            self.assertLess(len(lines), len(children))
+            self.assertIn("SOURCE_ALERTS high=1", joined)
+            self.assertIn("vehicle performs drifting", joined)
+            self.assertIn("partially obstructed", joined)
+
+    def test_prose_alert_section_can_drive_alert_metadata_and_bookmarks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def parse_alerts(text, channel_id, default_ts_ms=None):
+                alerts = []
+                if "Info Level:" in text:
+                    alerts.append(
+                        {
+                            "title": "Sasha gives a clear thumbs-up gesture",
+                            "description": "Sasha gives a clear thumbs-up gesture (visible in Snapshots 6-8).",
+                            "severity": "info",
+                            "channel_id": channel_id,
+                            "timestamp_ms": default_ts_ms,
+                        }
+                    )
+                if "Warning Level:" in text:
+                    alerts.append(
+                        {
+                            "title": "Sasha drinks from the mug",
+                            "description": "Sasha drinks from the mug with the British flag design.",
+                            "severity": "low",
+                            "channel_id": channel_id,
+                            "timestamp_ms": default_ts_ms,
+                        }
+                    )
+                return alerts
+
+            manager = build_manager(Path(temp), alert_parser=parse_alerts)
+            summary = (
+                "Summary of Activity:\n"
+                "Sasha performs two distinct actions.\n\n"
+                "Alerts:\n\n"
+                "Info Level: Sasha gives a clear thumbs-up gesture (visible in Snapshots 6-8).\n"
+                "Warning Level: Sasha drinks from the mug with the British flag design (visible in Snapshots 10-12).\n"
+            )
+
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": summary,
+                    "frame_count": 12,
+                    "created_at": time.time(),
+                },
+            )
+            logs = manager.session_status(7, run_selector="all")["logs"]
+            self.assertEqual(logs[0]["alert_counts"], {"low": 1, "info": 1})
+            self.assertEqual(logs[0]["signal_digest"]["alerts"], {"low": 1, "info": 1})
+            self.assertIn("Sasha gives", " ".join(logs[0]["signal_digest"]["alert_events"]))
+
+            manager.default_bookmark_enabled = True
+            manager.default_bookmark_cooldown_sec = 0.0
+            sent = []
+            with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
+                count = manager.process_summary_alerts(
+                    7,
+                    summary,
+                    default_ts_ms=1_781_700_000_000,
+                )
+            self.assertEqual(count, 2)
+            self.assertEqual([item["severity"] for item in sent], ["info", "low"])
+
+    def test_lm_alert_parser_handles_prose_and_warning_severity(self):
+        parser = load_lm_alert_parser()
+        summary = (
+            "Activity Summary:\n"
+            "Sasha drinks from a mug and gives a thumbs-up gesture.\n\n"
+            "Alerts:\n\n"
+            "Warning Level: Sasha drinks from the mug with the British flag art.\n"
+            "Info: Sasha gives a thumbs-up gesture.\n"
+            "ALERTS_JSON:\n"
+            "{\n"
+            "  \"alerts\": [\n"
+            "    {\n"
+            "      \"title\": \"Mug Consumption Detected\",\n"
+            "      \"description\": \"Sasha drinks from a mug.\",\n"
+            "      \"severity\": \"warning\",\n"
+            "      \"state\": \"new\",\n"
+            "      \"channel_id\": 112,\n"
+            "      \"timestamp_ms\": 0\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+        )
+
+        alerts = parser(summary, 112, 1750734618000)
+
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual([alert["severity"] for alert in alerts], ["low", "info"])
+
+    def test_current_summary_log_does_not_drop_history_alert_metadata(self):
+        history = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Alerts:\nInfo: Person waves.",
+            "frame_count": 12,
+            "created_at": 100.0,
+            "alert_counts": {"info": 1},
+            "alert_total": 1,
+            "alert_severities": ["info"],
+        }
+        current = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Alerts:\nInfo: Person waves.",
+            "frame_count": 12,
+            "created_at": 100.0,
+        }
+
+        logs = LuxriotManager._combine_summary_logs([history], [current])
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["alert_counts"], {"info": 1})
+        self.assertEqual(logs[0]["alert_total"], 1)
+
+    def test_memory_update_json_feeds_next_l0_system_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l2-memory",
+                window_end=1234.0,
+                level="L2",
+                summary_text=(
+                    "### Window Snapshot\n"
+                    "Routine lot with one deviation.\n\n"
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{\n"
+                    "  \"routine_baseline\": \"parking lot is usually empty overnight\",\n"
+                    "  \"active_watchlist\": [\"watch the east gate\"],\n"
+                    "  \"preserved_deviations\": [\n"
+                    "    {\"time\": \"02:10-02:12\", \"severity\": \"high\", \"event\": \"vehicle drifting\", \"evidence\": \"repeated sliding turns\"}\n"
+                    "  ],\n"
+                    "  \"alert_tuning_notes\": [\"drifting should stay visible even when the lot is otherwise routine\"],\n"
+                    "  \"ignore_as_routine\": [\"parked maintenance vehicles\"]\n"
+                    "}"
+                ),
+            )
+
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint=None,
+                interval_sec=5.0,
+                frames=sample_frames(),
+            )
+
+            system_prompt = batch["system_prompt"]
+            self.assertIn("Active Channel Memory", system_prompt)
+            self.assertIn("parking lot is usually empty overnight", system_prompt)
+            self.assertIn("vehicle drifting", system_prompt)
+            self.assertIn("Do not let routine baseline suppress", system_prompt)
+
+    def test_memory_update_json_accepts_qwen_key_variants(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-memory",
+                window_end=1234.0,
+                level="L1",
+                summary_text=(
+                    "### Window Snapshot\n"
+                    "Routine lot with one deviation.\n\n"
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{"
+                    "\"routineBaseline\":\"quiet lot overnight\","
+                    "\"activeWatchlist\":[\"east gate\"],"
+                    "\"preservedDeviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns\"}],"
+                    "\"alerttuningnotes\":[\"keep drifting visible\"],"
+                    "\"ignoreasroutine\":[\"parked maintenance vehicles\"]"
+                    "}"
+                ),
+            )
+
+            routine_text = manager.channel_routine_context[7]["routine"]
+            self.assertIn("quiet lot overnight", routine_text)
+            self.assertIn("east gate", routine_text)
+            self.assertIn("vehicle drifting", routine_text)
+            self.assertIn("keep drifting visible", routine_text)
+            self.assertIn("parked maintenance vehicles", routine_text)
+
+    def test_rollup_prompt_layers_and_source_alerts_are_visible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            captured_user_texts = []
+
+            def lm_callback(messages, _model):
+                captured_user_texts.append(messages[1]["content"][0]["text"])
+                return (
+                    "### Window Snapshot\n"
+                    "Window with source alerts.\n\n"
+                    "### Alert Ledger\n"
+                    "- normal=1, low=1 preserved from source alerts.\n\n"
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{\"routine_baseline\":\"quiet test scene\",\"alert_tuning_notes\":[\"preserve source alerts\"]}"
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_llm_max_new_per_call = 10
+            base = 1_781_700_000.0
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Person entered the frame.",
+                    "frame_count": 12,
+                    "created_at": base,
+                    "alert_counts": {"normal": 1},
+                },
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Doorway was briefly obstructed.",
+                    "frame_count": 12,
+                    "created_at": base + 30.0,
+                    "alert_counts": {"low": 1},
+                },
+            )
+
+            settings = manager.get_prompt_settings(channel_id=7)
+            self.assertIn("prompt_layers", settings)
+            self.assertIn("Alert Ledger must mention every source alert", settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"])
+
+            manager.summary_rollups(7, run_selector="all", level_limit=10)
+            self.assertTrue(captured_user_texts)
+            user_text = captured_user_texts[0]
+            self.assertIn("Source alert totals: normal=1, low=1", user_text)
+            self.assertIn("Window signal digest (compact continuity map):", user_text)
+            self.assertIn("Alerts: normal=1, low=1", user_text)
+            self.assertIn("[SOURCE_ALERTS normal=1]", user_text)
+            self.assertIn("[SOURCE_ALERTS low=1]", user_text)
+
+    def test_summary_rollups_readonly_mode_does_not_synthesize_with_llm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(messages, _model):
+                calls.append(messages)
+                return "LLM rollup"
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1", "L2", "L3"}
+            manager.rollup_llm_max_new_per_call = 10
+            base = 1_781_700_000.0
+            for offset in (0.0, 30.0, 60.0):
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": f"Routine loading bay activity {offset}.",
+                        "frame_count": 12,
+                        "created_at": base + offset,
+                    },
+                )
+
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10, synthesize=False)
+
+            self.assertEqual(calls, [])
+            self.assertIn("L1 rollup from L0", rollups["levels"]["L1"][0]["summary"])
+
+    def test_rollup_cache_signature_changes_when_child_metadata_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(messages, _model):
+                calls.append(messages[1]["content"][0]["text"])
+                return (
+                    "### Window Snapshot\n"
+                    f"L2 cache pass {len(calls)}.\n\n"
+                    "MEMORY_UPDATE_JSON:\n"
+                    f"{{\"routine_baseline\":\"cache pass {len(calls)}\"}}"
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L2"}
+            manager.rollup_llm_max_new_per_call = 10
+            base = 1_781_700_000.0
+            for offset, summary in (
+                (0.0, "Routine door activity."),
+                (30.0, "Person crosses the doorway."),
+            ):
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": summary,
+                        "frame_count": 2,
+                        "created_at": base + offset,
+                        "alert_counts": {"info": 1},
+                    },
+                )
+
+            first = manager.summary_rollups(7, run_selector="all", level_limit=10)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("cache pass 1", first["levels"]["L2"][0]["summary"])
+
+            manager.summary_history[7][0]["alert_counts"] = {"critical": 1}
+
+            second = manager.summary_rollups(7, run_selector="all", level_limit=10)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("cache pass 2", second["levels"]["L2"][0]["summary"])
+
+    def test_fallback_rollup_summary_preserves_alerts_deviations_and_signal_digest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ROLLUP_LLM_LEVELS": "none",
+                    "LUXRIOT_ROLLUP_L1_LLM_ENABLED": True,
+                },
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "Quiet parking lot with one deviation.\n"
+                        "MEMORY_UPDATE_JSON:\n"
+                        "{\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\","
+                        "\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns\"}],"
+                        "\"active_watchlist\":[\"east gate vehicle\"],"
+                        "\"alert_tuning_notes\":[\"keep drifting visible\"]}"
+                    ),
+                    "frame_count": 2,
+                    "created_at": 1_781_700_000.0,
+                    "alert_counts": {"high": 1},
+                },
+            )
+
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
+            summary = rollups["levels"]["L1"][0]["summary"]
+
+            self.assertIn("Alert counts: high=1", summary)
+            self.assertIn("Preserved deviations:", summary)
+            self.assertIn("vehicle drifting", summary)
+            self.assertIn("Signal digest:", summary)
+            self.assertIn("Alerts: high=1", summary)
+
+    def test_summary_rollups_preserve_deviation_memory_across_levels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def lm_callback(messages, _model):
+                user_text = messages[1]["content"][0]["text"]
+                if "Target level: L3" in user_text:
+                    return (
+                        "### Window Snapshot\n"
+                        "Longer period mostly routine.\n\n"
+                        "### Routine Baseline\n"
+                        "Quiet exterior road.\n\n"
+                        "### Preserved Deviations\n"
+                        "- 02:10 vehicle drifting near the gate.\n\n"
+                        "### Alert Ledger\n"
+                        "- high | 02:10 | vehicle drifting | sliding turns visible.\n\n"
+                        "MEMORY_UPDATE_JSON:\n"
+                        "{\"routine_baseline\":\"quiet exterior road\","
+                        "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns visible\"}],"
+                        "\"alert_tuning_notes\":[\"do not collapse drifting into routine traffic\"],"
+                        "\"ignore_as_routine\":[\"normal parked cars\"]}"
+                    )
+                if "Target level: L2" in user_text:
+                    return (
+                        "### Window Snapshot\n"
+                        "Hour mostly routine with one security event.\n\n"
+                        "### Routine Baseline\n"
+                        "Low traffic near the gate.\n\n"
+                        "### Preserved Deviations\n"
+                        "- 02:10 vehicle drifting.\n\n"
+                        "MEMORY_UPDATE_JSON:\n"
+                        "{\"routine_baseline\":\"low traffic near the gate\","
+                        "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"repeated sharp turns\"}]}"
+                    )
+                return (
+                    "### Window Snapshot\n"
+                    "Short window with a drifting event.\n\n"
+                    "### Preserved Deviations\n"
+                    "- 02:10 vehicle drifting.\n\n"
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{\"active_watchlist\":[\"east gate vehicle\"],"
+                    "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns\"}]}"
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1", "L2", "L3"}
+            manager.rollup_llm_max_new_per_call = 10
+            base = 1_781_700_000.0
+            for offset, summary in (
+                (0.0, "Routine traffic."),
+                (30.0, "A vehicle performs repeated sharp turns near the gate."),
+            ):
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": summary,
+                        "frame_count": 2,
+                        "created_at": base + offset,
+                    },
+                )
+
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
+            routine_text = rollups["routine_context"]["routine"]
+            self.assertIn("quiet exterior road", routine_text)
+            self.assertIn("vehicle drifting", routine_text)
+            self.assertIn("do not collapse drifting into routine traffic", routine_text)
+
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint=None,
+                interval_sec=5.0,
+                frames=sample_frames(),
+            )
+            self.assertIn("vehicle drifting", batch["system_prompt"])
+
+    def test_older_memory_update_merges_items_without_replacing_newer_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l2-new",
+                window_end=200.0,
+                level="L2",
+                summary_text=(
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{\"routine_baseline\":\"new quiet lobby baseline\","
+                    "\"active_watchlist\":[\"north door\"]}"
+                ),
+            )
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-old",
+                window_end=100.0,
+                level="L1",
+                summary_text=(
+                    "MEMORY_UPDATE_JSON:\n"
+                    "{\"routine_baseline\":\"old busy lobby baseline\","
+                    "\"active_watchlist\":[\"east gate vehicle\"],"
+                    "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\","
+                    "\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns\"}],"
+                    "\"alert_tuning_notes\":[\"keep drifting visible\"]}"
+                ),
+            )
+
+            context = manager.channel_routine_context[7]
+            memory = context["memory"]
+            routine_text = context["routine"]
+
+            self.assertEqual(context["rollup_id"], "l2-new")
+            self.assertEqual(context["window_end"], 200.0)
+            self.assertEqual(memory["routine_baseline"], "new quiet lobby baseline")
+            self.assertIn("north door", routine_text)
+            self.assertIn("east gate vehicle", routine_text)
+            self.assertIn("vehicle drifting", routine_text)
+            self.assertIn("keep drifting visible", routine_text)
+            self.assertNotIn("old busy lobby baseline", routine_text)
+
+    def test_rollup_llm_levels_none_and_off_disable_all_rollup_llm(self):
+        for raw_value in ("none", "off"):
+            with tempfile.TemporaryDirectory() as temp:
+                manager = build_manager(
+                    Path(temp),
+                    config_overrides={
+                        "LUXRIOT_ROLLUP_LLM_LEVELS": raw_value,
+                        "LUXRIOT_ROLLUP_L1_LLM_ENABLED": True,
+                    },
+                )
+
+                self.assertEqual(manager.rollup_llm_levels, set())
+
     def test_start_session_persists_channel_interval_override(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -255,6 +1028,62 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(status["interval_sec"], 4.5)
             manager.stop_session(7)
+
+    def test_start_and_stop_session_update_desired_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime_store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=runtime_store)
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                manager.start_session(
+                    7,
+                    batch_size=12,
+                    prompt="Describe activity.",
+                    model_hint="vlm-a1",
+                    interval_sec=4.5,
+                )
+
+            state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)
+            self.assertTrue(state["sessions"]["7"]["enabled"])
+            self.assertEqual(state["sessions"]["7"]["batch_size"], 12)
+            self.assertEqual(state["sessions"]["7"]["prompt"], "Describe activity.")
+            self.assertEqual(state["sessions"]["7"]["model_hint"], "vlm-a1")
+            self.assertEqual(state["sessions"]["7"]["interval_sec"], 4.5)
+
+            manager.stop_session(7)
+
+            state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)
+            self.assertFalse(state["sessions"]["7"]["enabled"])
+
+    def test_restore_desired_live_sessions_starts_enabled_channels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime_store = MemoryRuntimeStateStore()
+            runtime_store.save_state(
+                LuxriotManager.DESIRED_LIVE_SESSIONS_KEY,
+                {
+                    "version": 1,
+                    "sessions": {
+                        "7": {
+                            "enabled": True,
+                            "batch_size": 12,
+                            "prompt": "Describe activity.",
+                            "model_hint": "vlm-a1",
+                            "interval_sec": 4.5,
+                        },
+                        "8": {"enabled": False},
+                    },
+                },
+            )
+            manager = build_manager(Path(temp), runtime_state_store=runtime_store)
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                result = manager.restore_desired_live_sessions()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["restored_count"], 1)
+            self.assertIn(7, manager.sessions)
+            self.assertEqual(manager.sessions[7].model_hint, "vlm-a1")
+            self.assertEqual(manager.sessions[7].interval, 4.5)
 
 
 class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):

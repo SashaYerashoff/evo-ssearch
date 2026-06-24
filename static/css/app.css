@@ -1929,6 +1929,34 @@
         min-height: 1.05rem;
     }
 
+    .prompt-layer-details {
+        border: 1px solid rgba(55, 78, 98, 0.88);
+        border-radius: 8px;
+        background: rgba(7, 16, 24, 0.62);
+        color: #aeb9c5;
+        font-size: 0.82rem;
+    }
+
+    .prompt-layer-details summary {
+        cursor: pointer;
+        padding: 0.6rem 0.75rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #d5dde6;
+    }
+
+    .prompt-layer-content {
+        max-height: 260px;
+        overflow: auto;
+        white-space: pre-wrap;
+        margin: 0;
+        padding: 0 0.75rem 0.75rem;
+        color: #a9bacb;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.76rem;
+        line-height: 1.45;
+    }
+
     .prompt-bookmark-controls {
         display: flex;
         align-items: center;
@@ -2128,6 +2156,51 @@
         border-color: #474747;
         background: rgba(82, 82, 82, 0.22);
         color: #c9c9c9;
+    }
+
+    .luxriot-health-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 22px;
+        width: fit-content;
+        border: 1px solid rgba(129, 147, 164, 0.3);
+        border-radius: 999px;
+        background: rgba(129, 147, 164, 0.12);
+        color: #b6c3cf;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.66rem;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        line-height: 1;
+        padding: 0 0.45rem;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+
+    .luxriot-health-badge.ok {
+        border-color: rgba(0, 214, 143, 0.28);
+        background: rgba(0, 214, 143, 0.08);
+        color: #9fe3c4;
+    }
+
+    .luxriot-health-badge.warning {
+        border-color: rgba(240, 160, 48, 0.36);
+        background: rgba(240, 160, 48, 0.09);
+        color: #f3cb87;
+    }
+
+    .luxriot-health-badge.error {
+        border-color: rgba(255, 90, 104, 0.42);
+        background: rgba(255, 90, 104, 0.1);
+        color: #ff9aa4;
+    }
+
+    .luxriot-status .luxriot-health-badge {
+        min-height: 20px;
+        padding: 0 0.4rem;
+        font-size: 0.6rem;
+        letter-spacing: 0.08em;
     }
 
     .luxriot-stream-stats {
@@ -2366,6 +2439,74 @@
         background: transparent;
         padding: 0;
         color: inherit;
+    }
+
+    .summary-json-disclosure {
+        margin: 0.45rem 0 0;
+        border: 1px solid rgba(54, 79, 99, 0.74);
+        border-radius: 7px;
+        background: rgba(7, 14, 20, 0.48);
+        overflow: hidden;
+    }
+
+    .summary-json-disclosure summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.8rem;
+        min-height: 2rem;
+        padding: 0.4rem 0.62rem;
+        color: #9fb7c7;
+        cursor: pointer;
+        user-select: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.74rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    .summary-json-disclosure summary::-webkit-details-marker {
+        display: none;
+    }
+
+    .summary-json-disclosure summary::before {
+        content: '>';
+        color: #5ca1c6;
+        margin-right: 0.18rem;
+    }
+
+    .summary-json-disclosure[open] summary::before {
+        content: 'v';
+    }
+
+    .summary-json-disclosure .summary-json-muted {
+        margin: 0;
+        border-top: 1px solid rgba(54, 79, 99, 0.55);
+        border-left: none;
+        padding: 0.55rem 0.7rem;
+    }
+
+    .summary-json-meta {
+        color: #6f8494;
+        font-size: 0.68rem;
+        letter-spacing: 0.06em;
+        white-space: nowrap;
+    }
+
+    .summary-json-hidden {
+        display: inline-flex;
+        align-items: center;
+        margin-top: 0.45rem;
+        border: 1px solid rgba(54, 79, 99, 0.55);
+        border-radius: 999px;
+        background: rgba(7, 14, 20, 0.42);
+        color: #7f94a5;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        line-height: 1;
+        padding: 0.36rem 0.58rem;
+        text-transform: uppercase;
     }
 
     .summary-body blockquote {
@@ -3675,6 +3816,15 @@
     overflow: hidden;
 }
 
+.agent-action-card-error {
+    border-color: rgba(255, 77, 109, 0.42);
+    background: rgba(255, 77, 109, 0.06);
+}
+
+.agent-action-card-error .agent-action-card-head {
+    color: #ff8fa3;
+}
+
 .agent-action-card-head {
     padding: 8px 12px;
     background: var(--agent-hover);
@@ -3752,6 +3902,67 @@
     border-radius: 2px;
     font-size: 10px;
     color: var(--agent-green);
+}
+
+.agent-thumb-open-link {
+    position: absolute;
+    left: 3px;
+    bottom: 3px;
+    z-index: 2;
+    padding: 1px 5px;
+    border-radius: 2px;
+    border: 1px solid rgba(79, 172, 254, 0.42);
+    background: rgba(4, 10, 16, 0.82);
+    color: #9fd2ff;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    line-height: 1.35;
+    text-decoration: none;
+    text-transform: uppercase;
+}
+
+.agent-thumb-open-link:hover {
+    border-color: rgba(0, 214, 143, 0.65);
+    color: var(--agent-green);
+}
+
+.agent-card-muted-note {
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.agent-coverage-note {
+    margin-bottom: 8px;
+    padding: 7px 9px;
+    border: 1px solid rgba(79, 172, 254, 0.24);
+    border-radius: 6px;
+    background: rgba(79, 172, 254, 0.06);
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.agent-coverage-partial,
+.agent-coverage-truncated,
+.agent-coverage-no_data {
+    border-color: rgba(240, 160, 48, 0.36);
+    background: rgba(240, 160, 48, 0.07);
+}
+
+.agent-evidence-title {
+    margin: 8px 0 6px;
+    color: var(--text);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.agent-evidence-grid {
+    margin-bottom: 8px;
 }
 
 .agent-report-block {
@@ -3993,19 +4204,24 @@
 /* describe_frame layout */
 .agent-describe-layout {
     display: flex;
+    flex-direction: column;
     gap: 12px;
-    align-items: flex-start;
 }
 
 .agent-frame-img-wrap {
-    flex-shrink: 0;
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--panel-border);
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.16);
+    overflow: hidden;
 }
 
 .agent-frame-img {
-    width: 180px;
+    width: 100%;
     height: auto;
-    border-radius: 3px;
-    border: 1px solid var(--panel-border);
+    max-height: min(42vh, 420px);
+    object-fit: contain;
     display: block;
     cursor: zoom-in;
 }
@@ -5254,6 +5470,46 @@ textarea::placeholder {
     background: rgba(11, 16, 21, 0.92);
     border-color: rgba(37, 51, 66, 0.92);
     border-radius: 14px;
+}
+
+.offline-diagnostics {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(37, 51, 66, 0.86);
+    color: #8fa3b4;
+    font-size: 0.78rem;
+    line-height: 1.55;
+}
+
+.offline-diagnostics h4 {
+    margin: 0 0 8px;
+    color: #d7e2ed;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.offline-diagnostics div {
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+}
+
+.offline-diagnostics span {
+    flex: 0 0 150px;
+    color: #6e8192;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.offline-diagnostics code {
+    flex: 1;
+    min-width: 0;
+    color: #b8d5c8;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .video-frame-grid img {
@@ -6942,6 +7198,189 @@ textarea::placeholder {
     line-height: 1.5;
 }
 
+.archive-review-modal {
+    background: rgba(2, 5, 8, 0.9);
+    backdrop-filter: blur(12px);
+}
+
+.archive-review-shell {
+    position: absolute;
+    inset: clamp(14px, 3vh, 28px) clamp(14px, 4vw, 44px);
+    display: grid;
+    grid-template-rows: auto minmax(260px, 1fr) auto auto minmax(180px, 0.55fr);
+    gap: 12px;
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 0;
+    border: 1px dashed rgba(74, 122, 170, 0.55);
+    border-radius: 4px;
+    background: rgba(7, 16, 24, 0.96);
+    box-shadow: 0 24px 72px rgba(0, 0, 0, 0.42);
+    overflow: hidden;
+}
+
+.archive-review-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 16px;
+    min-height: 62px;
+    padding: 12px 18px;
+    border-bottom: 1px solid rgba(37, 72, 104, 0.62);
+    background: rgba(13, 35, 53, 0.72);
+}
+
+.archive-review-title,
+.archive-review-query,
+.archive-review-match,
+.archive-review-meta-row,
+.archive-review-summary-title {
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+}
+
+.archive-review-title {
+    color: var(--text);
+    font-size: 0.82rem;
+    text-transform: uppercase;
+}
+
+.archive-review-query,
+.archive-review-match {
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 0.74rem;
+    letter-spacing: 0.04em;
+}
+
+.archive-review-head-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.archive-review-close {
+    flex: 0 0 auto;
+}
+
+.archive-review-frame {
+    position: relative;
+    min-height: 0;
+    margin: 0 18px;
+    border-left: 1px dashed rgba(74, 122, 170, 0.45);
+    border-right: 1px dashed rgba(74, 122, 170, 0.45);
+    background:
+        linear-gradient(rgba(62, 109, 151, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(62, 109, 151, 0.045) 1px, transparent 1px),
+        #050c13;
+    background-size: 18px 18px;
+    overflow: hidden;
+}
+
+.archive-review-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: rgba(1, 4, 7, 0.72);
+}
+
+.archive-review-empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.archive-review-meta-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: 16px;
+    align-items: center;
+    margin: -2px 18px 0;
+    padding: 0 24px;
+    color: var(--muted);
+    font-size: 0.74rem;
+}
+
+.archive-review-meta-row > :nth-child(2) {
+    text-align: center;
+    text-transform: uppercase;
+    color: rgba(140, 172, 203, 0.62);
+}
+
+.archive-review-meta-row > :last-child {
+    text-align: right;
+}
+
+.archive-review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 0 18px;
+}
+
+.archive-review-summary-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin: 0 18px 18px;
+    padding: 14px 18px 18px;
+    border: 1px dashed rgba(74, 122, 170, 0.5);
+    border-radius: 4px;
+    background: rgba(8, 21, 32, 0.88);
+    overflow: hidden;
+}
+
+.archive-review-summary-title {
+    margin-bottom: 12px;
+    color: var(--accent);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+}
+
+.archive-review-summary {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding-right: 8px;
+    color: var(--text);
+    font-size: 0.9rem;
+    line-height: 1.55;
+}
+
+.archive-review-note {
+    margin-top: 12px;
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+@media (max-width: 760px) {
+    .archive-review-shell {
+        inset: 10px;
+        grid-template-rows: auto minmax(220px, 0.9fr) auto auto minmax(180px, 0.6fr);
+    }
+
+    .archive-review-head,
+    .archive-review-meta-row {
+        grid-template-columns: 1fr;
+    }
+
+    .archive-review-head-right {
+        justify-content: space-between;
+    }
+
+    .archive-review-meta-row > :last-child,
+    .archive-review-meta-row > :nth-child(2) {
+        text-align: left;
+    }
+}
+
 .video-box {
     grid-template-columns: minmax(260px, 300px) minmax(0, 1fr) clamp(430px, 30vw, 560px);
     overflow: hidden;
@@ -7059,6 +7498,10 @@ textarea::placeholder {
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
+}
+
+.luxriot-stream-context-head > .luxriot-stream-state {
+    margin-left: auto;
 }
 
 .luxriot-stream-context-title-wrap {
@@ -8389,4 +8832,8 @@ body.auth-required {
     min-height: 18px;
     color: #ff9a9a;
     font-size: 12px;
+}
+
+.deployment-hidden {
+    display: none !important;
 }

@@ -1,0 +1,2759 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Luxriot EVA AI - Presales One-Pager</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1014;
+      --bg-soft: #131820;
+      --bg-panel: #171d26;
+      --bg-elevated: #1d2631;
+      --line: #2d3847;
+      --line-strong: #405066;
+      --text: #eef3f8;
+      --muted: #9ba9b8;
+      --dim: #728092;
+      --cyan: #31d3c7;
+      --cyan-soft: rgba(49, 211, 199, 0.14);
+      --amber: #f6b44b;
+      --amber-soft: rgba(246, 180, 75, 0.14);
+      --green: #67d987;
+      --green-soft: rgba(103, 217, 135, 0.14);
+      --red: #ff6f76;
+      --red-soft: rgba(255, 111, 118, 0.13);
+      --violet: #a58cff;
+      --violet-soft: rgba(165, 140, 255, 0.13);
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.36);
+      --radius: 8px;
+      --nav-h: 72px;
+      --max: 1180px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--bg);
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      overflow-x: hidden;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(14, 19, 25, 0.94), rgba(13, 16, 20, 0.99) 520px),
+        repeating-linear-gradient(90deg, rgba(255,255,255,0.028) 0 1px, transparent 1px 88px),
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 88px),
+        var(--bg);
+      line-height: 1.5;
+    }
+
+    body.light {
+      color-scheme: light;
+      --bg: #f5f7fa;
+      --bg-soft: #edf1f5;
+      --bg-panel: #ffffff;
+      --bg-elevated: #f7f9fb;
+      --line: #d7dfe7;
+      --line-strong: #bac7d4;
+      --text: #18202a;
+      --muted: #526170;
+      --dim: #718092;
+      --shadow: 0 20px 56px rgba(39, 53, 69, 0.16);
+      background:
+        linear-gradient(180deg, rgba(245, 247, 250, 0.96), rgba(245, 247, 250, 1) 520px),
+        repeating-linear-gradient(90deg, rgba(20,32,45,0.045) 0 1px, transparent 1px 88px),
+        repeating-linear-gradient(0deg, rgba(20,32,45,0.035) 0 1px, transparent 1px 88px),
+        var(--bg);
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      height: var(--nav-h);
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid rgba(120, 139, 160, 0.2);
+      background: rgba(13, 16, 20, 0.82);
+      backdrop-filter: blur(18px);
+    }
+
+    body.light .topbar {
+      background: rgba(245, 247, 250, 0.88);
+    }
+
+    .nav-inner {
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 22px;
+      align-items: center;
+    }
+
+    .brand {
+      display: inline-flex;
+      gap: 12px;
+      align-items: center;
+      min-width: 190px;
+    }
+
+    .brand-logo {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(49, 211, 199, 0.48);
+      border-radius: 7px;
+      color: var(--cyan);
+      background:
+        linear-gradient(135deg, rgba(49,211,199,0.2), rgba(246,180,75,0.08)),
+        rgba(255,255,255,0.04);
+      font-size: 17px;
+      font-weight: 860;
+      line-height: 1;
+      box-shadow: 0 8px 18px rgba(49, 211, 199, 0.14);
+    }
+
+    .brand-mark {
+      display: grid;
+      gap: 1px;
+    }
+
+    .brand-title {
+      font-weight: 780;
+      letter-spacing: 0;
+      line-height: 1;
+    }
+
+    .brand-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.15;
+    }
+
+    .nav-links {
+      display: flex;
+      justify-content: center;
+      gap: 5px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .nav-links::-webkit-scrollbar {
+      display: none;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      border: 1px solid transparent;
+      padding: 8px 10px;
+      border-radius: 7px;
+      font-size: 13px;
+      white-space: nowrap;
+      transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+    }
+
+    .nav-links a.active,
+    .nav-links a:hover {
+      color: var(--text);
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    body.light .nav-links a.active,
+    body.light .nav-links a:hover {
+      background: rgba(24, 32, 42, 0.05);
+    }
+
+    .nav-actions {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .lang-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 3px;
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .lang-btn {
+      min-width: 34px;
+      min-height: 30px;
+      border: 0;
+      border-radius: 5px;
+      color: var(--muted);
+      background: transparent;
+      padding: 5px 7px;
+      font-size: 12px;
+      font-weight: 820;
+      letter-spacing: 0.03em;
+    }
+
+    .lang-btn.active {
+      color: var(--text);
+      background: var(--cyan-soft);
+    }
+
+    .btn {
+      display: inline-flex;
+      min-height: 38px;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.035);
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 680;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--line-strong);
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .btn.primary {
+      border-color: rgba(49, 211, 199, 0.42);
+      background: linear-gradient(180deg, rgba(49, 211, 199, 0.22), rgba(49, 211, 199, 0.1));
+    }
+
+    .btn.icon-only {
+      width: 38px;
+      padding: 0;
+    }
+
+    .progress {
+      position: fixed;
+      top: var(--nav-h);
+      left: 0;
+      z-index: 35;
+      width: 100%;
+      height: 2px;
+      background: transparent;
+    }
+
+    .progress span {
+      display: block;
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--amber), var(--red));
+      transition: width 80ms linear;
+    }
+
+    .hero {
+      position: relative;
+      min-height: calc(100vh - var(--nav-h));
+      padding: 58px 0 44px;
+      overflow: hidden;
+    }
+
+    .hero canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0.56;
+    }
+
+    body.light .hero canvas {
+      opacity: 0.28;
+    }
+
+    .hero-inner {
+      position: relative;
+      z-index: 1;
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+      gap: 44px;
+      align-items: center;
+    }
+
+    .hero-inner > *,
+    .section-head > *,
+    .install-layout > *,
+    .audience-layout > *,
+    .diagram-shell > * {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--cyan);
+      font-size: 13px;
+      font-weight: 760;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 22px;
+      height: 2px;
+      background: var(--cyan);
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 18px;
+      max-width: 900px;
+      font-size: clamp(44px, 6.4vw, 86px);
+      line-height: 0.94;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+      hyphens: auto;
+    }
+
+    .hero-title-part {
+      display: inline;
+    }
+
+    .hero-copy {
+      max-width: 700px;
+      color: var(--muted);
+      font-size: clamp(18px, 1.8vw, 22px);
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 28px;
+    }
+
+    .signal-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 32px;
+      max-width: 700px;
+    }
+
+    .signal {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+
+    .signal b {
+      display: block;
+      font-size: 24px;
+      line-height: 1.1;
+    }
+
+    .signal span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .hero-visual {
+      position: relative;
+      min-height: 560px;
+      display: grid;
+      place-items: center;
+    }
+
+    .radar {
+      position: relative;
+      width: min(100%, 520px);
+      aspect-ratio: 1;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at center, rgba(49, 211, 199, 0.18) 0 2px, transparent 3px),
+        radial-gradient(circle at center, transparent 0 23%, rgba(255,255,255,0.05) 23.2% 23.5%, transparent 23.7% 46%, rgba(255,255,255,0.05) 46.2% 46.5%, transparent 46.7% 69%, rgba(255,255,255,0.05) 69.2% 69.5%, transparent 69.7%),
+        conic-gradient(from 20deg, rgba(49, 211, 199, 0.28), transparent 21%, transparent 100%),
+        rgba(19, 24, 32, 0.58);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    body.light .radar {
+      background:
+        radial-gradient(circle at center, rgba(49, 211, 199, 0.2) 0 2px, transparent 3px),
+        radial-gradient(circle at center, transparent 0 23%, rgba(24,32,42,0.07) 23.2% 23.5%, transparent 23.7% 46%, rgba(24,32,42,0.07) 46.2% 46.5%, transparent 46.7% 69%, rgba(24,32,42,0.07) 69.2% 69.5%, transparent 69.7%),
+        conic-gradient(from 20deg, rgba(49, 211, 199, 0.2), transparent 21%, transparent 100%),
+        rgba(255, 255, 255, 0.68);
+    }
+
+    .radar::before,
+    .radar::after {
+      content: "";
+      position: absolute;
+      inset: 50% auto auto 50%;
+      width: 1px;
+      height: 50%;
+      background: linear-gradient(180deg, rgba(49,211,199,0.92), transparent);
+      transform-origin: top center;
+      animation: sweep 8s linear infinite;
+    }
+
+    .radar::after {
+      animation-duration: 13s;
+      opacity: 0.48;
+    }
+
+    @keyframes sweep {
+      to { transform: rotate(360deg); }
+    }
+
+    .radar-node {
+      position: absolute;
+      width: 122px;
+      min-height: 62px;
+      display: grid;
+      align-content: center;
+      gap: 3px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(18, 23, 30, 0.88);
+      box-shadow: 0 12px 34px rgba(0,0,0,0.24);
+      animation: floaty 5.5s ease-in-out infinite;
+    }
+
+    body.light .radar-node {
+      background: rgba(255,255,255,0.9);
+    }
+
+    .radar-node b {
+      font-size: 13px;
+      line-height: 1.05;
+    }
+
+    .radar-node span {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+    }
+
+    .radar-node:nth-child(1) { left: 8%; top: 18%; border-color: rgba(49,211,199,0.4); }
+    .radar-node:nth-child(2) { right: 5%; top: 24%; border-color: rgba(246,180,75,0.4); animation-delay: -1.3s; }
+    .radar-node:nth-child(3) { left: 14%; bottom: 18%; border-color: rgba(103,217,135,0.4); animation-delay: -2.4s; }
+    .radar-node:nth-child(4) { right: 12%; bottom: 16%; border-color: rgba(165,140,255,0.44); animation-delay: -3.2s; }
+    .radar-node:nth-child(5) { left: 50%; top: 47%; transform: translate(-50%, -50%); border-color: rgba(255,111,118,0.46); animation: pulse 3.2s ease-in-out infinite; }
+
+    @keyframes floaty {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-8px); }
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: translate(-50%, -50%) scale(1); }
+      50% { transform: translate(-50%, -50%) scale(1.035); }
+    }
+
+    .section {
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      padding: 68px 0;
+      scroll-margin-top: calc(var(--nav-h) + 20px);
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 0.74fr) minmax(260px, 0.26fr);
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 26px;
+    }
+
+    .section-kicker {
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 780;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      font-size: clamp(30px, 4vw, 52px);
+      line-height: 1.03;
+      letter-spacing: 0;
+      margin-bottom: 0;
+    }
+
+    .section-lead {
+      color: var(--muted);
+      font-size: 16px;
+      margin-bottom: 0;
+    }
+
+    .formula-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .formula-card,
+    .cap-card,
+    .stack-row,
+    .roadmap-card,
+    .install-panel,
+    .constraint-card,
+    .audience-panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(23, 29, 38, 0.78);
+      box-shadow: 0 12px 34px rgba(0, 0, 0, 0.15);
+    }
+
+    body.light .formula-card,
+    body.light .cap-card,
+    body.light .stack-row,
+    body.light .roadmap-card,
+    body.light .install-panel,
+    body.light .constraint-card,
+    body.light .audience-panel {
+      background: rgba(255, 255, 255, 0.84);
+      box-shadow: 0 12px 34px rgba(39, 53, 69, 0.08);
+    }
+
+    .formula-card {
+      min-height: 188px;
+      padding: 18px;
+      display: grid;
+      align-content: space-between;
+      position: relative;
+      overflow: hidden;
+      transition: transform 180ms ease, border-color 180ms ease;
+    }
+
+    .formula-card::after {
+      content: "";
+      position: absolute;
+      left: 18px;
+      right: 18px;
+      bottom: 0;
+      height: 3px;
+      background: var(--accent);
+      opacity: 0.88;
+    }
+
+    .formula-card:hover {
+      transform: translateY(-3px);
+      border-color: var(--line-strong);
+    }
+
+    .formula-card .label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 760;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .formula-card h3 {
+      margin: 18px 0 8px;
+      font-size: 21px;
+      line-height: 1.05;
+    }
+
+    .formula-card p {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 0;
+    }
+
+    .diagram-shell {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+
+    .diagram-tabs {
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .diagram-tab {
+      min-height: 58px;
+      text-align: left;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      padding: 12px;
+      transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+    }
+
+    .diagram-tab b {
+      display: block;
+      color: var(--text);
+      font-size: 14px;
+      margin-bottom: 2px;
+    }
+
+    .diagram-tab span {
+      font-size: 12px;
+    }
+
+    .diagram-tab.active {
+      color: var(--text);
+      border-color: rgba(49, 211, 199, 0.45);
+      background: var(--cyan-soft);
+    }
+
+    .diagram-stage {
+      min-height: 520px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.04), transparent),
+        rgba(23, 29, 38, 0.78);
+      padding: 18px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    body.light .diagram-stage {
+      background:
+        linear-gradient(180deg, rgba(24,32,42,0.035), transparent),
+        rgba(255,255,255,0.84);
+    }
+
+    .diagram {
+      display: none;
+      height: 100%;
+      min-height: 480px;
+    }
+
+    .diagram.active {
+      display: grid;
+      animation: fadeUp 260ms ease both;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .flow {
+      display: grid;
+      gap: 13px;
+      align-content: center;
+    }
+
+    .flow-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: center;
+    }
+
+    .node {
+      min-height: 86px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.035);
+      padding: 13px;
+      position: relative;
+      display: grid;
+      align-content: center;
+      gap: 5px;
+    }
+
+    body.light .node {
+      background: rgba(24,32,42,0.035);
+    }
+
+    .node b {
+      font-size: 14px;
+      line-height: 1.1;
+    }
+
+    .node span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.25;
+    }
+
+    .node.cyan { border-color: rgba(49,211,199,0.42); background: var(--cyan-soft); }
+    .node.amber { border-color: rgba(246,180,75,0.42); background: var(--amber-soft); }
+    .node.green { border-color: rgba(103,217,135,0.42); background: var(--green-soft); }
+    .node.red { border-color: rgba(255,111,118,0.42); background: var(--red-soft); }
+    .node.violet { border-color: rgba(165,140,255,0.42); background: var(--violet-soft); }
+
+    .arrow {
+      height: 1px;
+      min-height: 1px;
+      background: linear-gradient(90deg, transparent, var(--line-strong), transparent);
+      position: relative;
+    }
+
+    .arrow::after {
+      content: "";
+      position: absolute;
+      right: 8px;
+      top: -4px;
+      width: 8px;
+      height: 8px;
+      border-right: 1px solid var(--line-strong);
+      border-top: 1px solid var(--line-strong);
+      transform: rotate(45deg);
+    }
+
+    .architecture-map {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-rows: repeat(3, minmax(112px, auto));
+      gap: 12px;
+      align-content: center;
+    }
+
+    .architecture-map .wide {
+      grid-column: span 2;
+    }
+
+    .architecture-map .center {
+      grid-column: 2;
+      grid-row: 2;
+      border-color: rgba(49,211,199,0.58);
+      box-shadow: inset 0 0 0 1px rgba(49,211,199,0.1);
+    }
+
+    .memory-ladder {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 18px;
+      align-items: center;
+    }
+
+    .ladder {
+      display: grid;
+      gap: 10px;
+    }
+
+    .ladder-step {
+      display: grid;
+      grid-template-columns: 70px 1fr auto;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      background: rgba(255,255,255,0.035);
+    }
+
+    .step-level {
+      display: grid;
+      place-items: center;
+      height: 44px;
+      border-radius: 7px;
+      background: var(--cyan-soft);
+      color: var(--cyan);
+      font-weight: 820;
+    }
+
+    .ladder-step:nth-child(2) .step-level { background: var(--green-soft); color: var(--green); }
+    .ladder-step:nth-child(3) .step-level { background: var(--amber-soft); color: var(--amber); }
+    .ladder-step:nth-child(4) .step-level { background: var(--violet-soft); color: var(--violet); }
+
+    .step-copy b {
+      display: block;
+      font-size: 14px;
+    }
+
+    .step-copy span,
+    .step-meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .brain-loop {
+      display: grid;
+      place-items: center;
+      min-height: 460px;
+    }
+
+    .loop-ring {
+      position: relative;
+      width: min(100%, 600px);
+      aspect-ratio: 1.4;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+    }
+
+    .loop-ring::before {
+      content: "";
+      position: absolute;
+      inset: 16%;
+      border: 1px dashed var(--line-strong);
+      border-radius: 50%;
+    }
+
+    .loop-node {
+      position: absolute;
+      width: 150px;
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(23, 29, 38, 0.95);
+      padding: 12px;
+      display: grid;
+      align-content: center;
+      gap: 3px;
+    }
+
+    body.light .loop-node {
+      background: rgba(255,255,255,0.95);
+    }
+
+    .loop-node b {
+      font-size: 14px;
+    }
+
+    .loop-node span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.2;
+    }
+
+    .loop-node:nth-child(1) { left: 50%; top: -18px; transform: translateX(-50%); border-color: rgba(49,211,199,0.45); }
+    .loop-node:nth-child(2) { right: -18px; top: 36%; border-color: rgba(246,180,75,0.45); }
+    .loop-node:nth-child(3) { left: 50%; bottom: -18px; transform: translateX(-50%); border-color: rgba(165,140,255,0.45); }
+    .loop-node:nth-child(4) { left: -18px; top: 36%; border-color: rgba(103,217,135,0.45); }
+    .loop-node.core {
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      border-color: rgba(255,111,118,0.48);
+      background: linear-gradient(180deg, rgba(255,111,118,0.16), rgba(23,29,38,0.94));
+    }
+
+    body.light .loop-node.core {
+      background: linear-gradient(180deg, rgba(255,111,118,0.14), rgba(255,255,255,0.96));
+    }
+
+    .cap-toolbar,
+    .roadmap-tabs,
+    .install-tabs,
+    .audience-tabs,
+    .stack-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .chip {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(255,255,255,0.035);
+      color: var(--muted);
+      padding: 7px 10px;
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .chip.active,
+    .chip:hover {
+      color: var(--text);
+      border-color: rgba(49,211,199,0.45);
+      background: var(--cyan-soft);
+    }
+
+    .cap-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .cap-card {
+      padding: 16px;
+      min-height: 270px;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+      transition: opacity 160ms ease, transform 160ms ease, border-color 160ms ease;
+    }
+
+    .cap-card.dimmed {
+      opacity: 0.36;
+      transform: scale(0.985);
+    }
+
+    .cap-card h3 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.1;
+    }
+
+    .cap-card p {
+      color: var(--muted);
+      font-size: 14px;
+      margin: 0;
+    }
+
+    .cap-card ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 7px;
+    }
+
+    .cap-card li {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.3;
+      padding-left: 16px;
+      position: relative;
+    }
+
+    .cap-card li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0.62em;
+      width: 7px;
+      height: 1px;
+      background: var(--cyan);
+    }
+
+    .cap-tag {
+      justify-self: start;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-weight: 760;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .stack-grid {
+      display: grid;
+      gap: 8px;
+    }
+
+    .stack-row {
+      display: grid;
+      grid-template-columns: 170px minmax(0, 1fr) minmax(220px, 0.7fr);
+      gap: 16px;
+      align-items: center;
+      min-height: 72px;
+      padding: 14px 16px;
+      transition: opacity 160ms ease;
+    }
+
+    .stack-row.hidden {
+      display: none;
+    }
+
+    .stack-layer {
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 820;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .stack-tech {
+      font-weight: 720;
+    }
+
+    .stack-role {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .audience-layout {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+      gap: 16px;
+    }
+
+    .audience-tabs {
+      display: grid;
+      align-content: start;
+      margin: 0;
+    }
+
+    .audience-panel {
+      display: none;
+      min-height: 270px;
+      padding: 24px;
+    }
+
+    .audience-panel.active {
+      display: grid;
+      gap: 18px;
+      animation: fadeUp 240ms ease both;
+    }
+
+    .audience-panel p {
+      color: var(--muted);
+      font-size: 18px;
+      max-width: 850px;
+      margin: 0;
+    }
+
+    .talk-points {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .talk-point {
+      border-left: 2px solid var(--line-strong);
+      padding: 4px 0 4px 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .roadmap-grid {
+      display: none;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .roadmap-grid.active {
+      display: grid;
+      animation: fadeUp 240ms ease both;
+    }
+
+    .roadmap-card {
+      min-height: 214px;
+      padding: 16px;
+      display: grid;
+      align-content: start;
+      gap: 12px;
+    }
+
+    .roadmap-card b {
+      font-size: 17px;
+      line-height: 1.15;
+    }
+
+    .roadmap-card span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .install-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 0.88fr) minmax(330px, 0.62fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .install-panel {
+      padding: 18px;
+    }
+
+    .install-panel h3 {
+      margin-bottom: 10px;
+    }
+
+    .install-copy {
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .branch-note {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 10px;
+      margin: 0 0 16px;
+      padding: 10px 12px;
+      border: 1px solid rgba(49,211,199,0.42);
+      border-radius: 8px;
+      background: var(--cyan-soft);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .branch-note b {
+      color: var(--cyan);
+      font-size: 11px;
+      font-weight: 820;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .branch-note code {
+      padding: 3px 6px;
+      border: 1px solid rgba(49,211,199,0.34);
+      border-radius: 6px;
+      background: rgba(6,12,18,0.62);
+      color: var(--text);
+      font-weight: 760;
+    }
+
+    body.light .branch-note code {
+      background: rgba(255,255,255,0.74);
+    }
+
+    .code-block {
+      position: relative;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0a0d11;
+      color: #dce8f2;
+      overflow: hidden;
+    }
+
+    body.light .code-block {
+      background: #111820;
+      color: #edf4fb;
+    }
+
+    pre {
+      margin: 0;
+      padding: 18px;
+      overflow-x: auto;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      min-height: 30px;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.08);
+      color: #edf4fb;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 720;
+    }
+
+    .install-code {
+      display: none;
+    }
+
+    .install-code.active {
+      display: block;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .metric-card {
+      padding: 13px 0 0;
+      min-height: 104px;
+      border-top: 1px solid var(--line);
+    }
+
+    .metric-card b {
+      display: block;
+      font-size: 24px;
+      line-height: 1.1;
+      margin-bottom: 6px;
+    }
+
+    .metric-card span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .constraints-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .constraint-card {
+      padding: 16px;
+      min-height: 150px;
+    }
+
+    .constraint-card b {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .constraint-card span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .footer {
+      border-top: 1px solid var(--line);
+      padding: 28px 0 42px;
+      color: var(--muted);
+    }
+
+    .footer-inner {
+      width: min(var(--max), calc(100% - 32px));
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(16px);
+      transition: opacity 520ms ease, transform 520ms ease;
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 1ms !important;
+      }
+    }
+
+    @media (max-width: 1100px) {
+      .hero-inner {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-visual {
+        min-height: 440px;
+      }
+
+      .formula-grid,
+      .cap-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .formula-card:last-child,
+      .cap-card:last-child {
+        grid-column: span 2;
+      }
+
+      .section-head,
+      .diagram-shell,
+      .install-layout,
+      .audience-layout {
+        grid-template-columns: 1fr;
+      }
+
+      .diagram-tabs,
+      .audience-tabs {
+        display: flex;
+        overflow-x: auto;
+      }
+
+      .diagram-tab {
+        min-width: 220px;
+      }
+
+      .roadmap-grid,
+      .constraints-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 760px) {
+      :root {
+        --nav-h: 64px;
+      }
+
+      .nav-inner {
+        width: min(100% - 20px, var(--max));
+        grid-template-columns: auto auto;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .nav-actions {
+        gap: 6px;
+      }
+
+      .brand {
+        min-width: 0;
+      }
+
+      .brand-sub,
+      .nav-links {
+        display: none;
+      }
+
+      .hero {
+        padding-top: 38px;
+      }
+
+      .hero-inner,
+      .section,
+      .footer-inner {
+        width: min(100% - 22px, var(--max));
+      }
+
+      h1 {
+        font-size: clamp(34px, 9.8vw, 40px);
+        line-height: 1.06;
+        width: calc(100vw - 22px);
+        max-width: calc(100vw - 22px);
+        white-space: normal;
+        word-break: break-word;
+      }
+
+      .hero-title-part {
+        display: block;
+      }
+
+      .hero-copy {
+        font-size: 17px;
+        width: 330px;
+        max-width: 330px;
+      }
+
+      .signal-strip,
+      .formula-grid,
+      .cap-grid,
+      .roadmap-grid,
+      .constraints-grid,
+      .metric-grid,
+      .talk-points {
+        grid-template-columns: 1fr;
+      }
+
+      .formula-card:last-child,
+      .cap-card:last-child {
+        grid-column: auto;
+      }
+
+      .hero-visual {
+        min-height: 360px;
+      }
+
+      .radar-node {
+        width: 108px;
+        min-height: 56px;
+        padding: 8px 10px;
+      }
+
+      .flow-row,
+      .architecture-map,
+      .memory-ladder,
+      .stack-row {
+        grid-template-columns: 1fr;
+      }
+
+      .diagram-stage {
+        min-height: 0;
+      }
+
+      .diagram,
+      .brain-loop {
+        min-height: 0;
+      }
+
+      .loop-ring {
+        width: 100%;
+        aspect-ratio: auto;
+        border-radius: 8px;
+        display: grid;
+        gap: 10px;
+        padding: 10px;
+      }
+
+      .loop-ring::before {
+        display: none;
+      }
+
+      .loop-node,
+      .loop-node:nth-child(1),
+      .loop-node:nth-child(2),
+      .loop-node:nth-child(3),
+      .loop-node:nth-child(4),
+      .loop-node.core {
+        position: static;
+        width: auto;
+        transform: none;
+      }
+
+      .btn {
+        min-height: 36px;
+        padding: 7px 10px;
+      }
+
+      #themeToggle {
+        display: none;
+      }
+
+      .lang-switch {
+        position: fixed;
+        top: 16px;
+        left: 112px;
+        right: auto;
+        z-index: 45;
+        gap: 2px;
+        padding: 2px;
+      }
+
+      .lang-btn {
+        min-width: 30px;
+        padding: 5px 6px;
+      }
+
+      .nav-actions .btn.primary {
+        display: none;
+      }
+
+    }
+
+    @media (max-width: 360px) {
+      .hero-copy {
+        width: 296px;
+        max-width: 296px;
+      }
+    }
+
+    @media print {
+      :root {
+        color-scheme: light;
+        --bg: #ffffff;
+        --bg-soft: #ffffff;
+        --bg-panel: #ffffff;
+        --bg-elevated: #ffffff;
+        --text: #111820;
+        --muted: #44515e;
+        --line: #cbd5df;
+      }
+
+      body {
+        background: #ffffff;
+      }
+
+      .topbar,
+      .progress,
+      .hero canvas,
+      .hero-actions,
+      .cap-toolbar,
+      .roadmap-tabs,
+      .install-tabs,
+      .audience-tabs,
+      .stack-filters,
+      .copy-btn {
+        display: none !important;
+      }
+
+      .hero {
+        min-height: auto;
+      }
+
+      .section,
+      .hero {
+        padding: 26px 0;
+      }
+
+      .reveal {
+        opacity: 1;
+        transform: none;
+      }
+
+      .diagram,
+      .audience-panel,
+      .roadmap-grid,
+      .install-code {
+        display: grid !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="nav-inner">
+      <a class="brand" href="#top" aria-label="EVA AI">
+        <span class="brand-logo" aria-hidden="true">E</span>
+        <span class="brand-mark">
+          <span class="brand-title">EVA AI</span>
+          <span class="brand-sub">Smart Image Search and Understanding</span>
+        </span>
+      </a>
+      <nav class="nav-links" aria-label="Разделы">
+        <a href="#formula">Формула</a>
+        <a href="#architecture">Схемы</a>
+        <a href="#capabilities">Возможности</a>
+        <a href="#stack">Стек</a>
+        <a href="#roadmap">Roadmap</a>
+        <a href="#install">Установка</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="btn icon-only" id="themeToggle" aria-label="Сменить тему">◐</button>
+        <div class="lang-switch" aria-label="Language">
+          <button class="lang-btn active" data-lang="ru" type="button">RU</button>
+          <button class="lang-btn" data-lang="en" type="button">EN</button>
+          <button class="lang-btn" data-lang="lv" type="button">LV</button>
+        </div>
+        <a class="btn primary" href="https://github.com/SashaYerashoff/evo-ssearch" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </div>
+  <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+  <main id="top">
+    <section class="hero" aria-labelledby="heroTitle">
+      <canvas id="heroCanvas" aria-hidden="true"></canvas>
+      <div class="hero-inner">
+        <div>
+          <div class="eyebrow">Luxriot EVA AI</div>
+          <h1 id="heroTitle">
+            <span class="hero-title-part">AI-слой</span>
+            <span class="hero-title-part">для поиска,</span>
+            <span class="hero-title-part">мониторинга</span>
+            <span class="hero-title-part">и оператора</span>
+            <span class="hero-title-part">в одном контуре</span>
+          </h1>
+          <p class="hero-copy">
+            EVA AI соединяет архив, живые камеры, semantic probes, VLM-сводки, bookmarks и агента.
+            Пресейлз-команда может объяснять систему не как набор разрозненных функций, а как управляемое внимание поверх Luxriot Evo.
+          </p>
+          <div class="hero-actions">
+            <a class="btn primary" href="#architecture">Открыть схемы</a>
+            <a class="btn" href="#capabilities">Посмотреть возможности</a>
+            <a class="btn" href="#install">Инструкция установки</a>
+          </div>
+          <div class="signal-strip" aria-label="Ключевые сигналы">
+            <div class="signal"><b>Archive</b><span>semantic search по папкам и detections archive</span></div>
+            <div class="signal"><b>Monitoring</b><span>пробы, ROI, thresholds, bookmarks</span></div>
+            <div class="signal"><b>Agent</b><span>tool-calling, skills, reports, tuning</span></div>
+          </div>
+        </div>
+        <div class="hero-visual" aria-hidden="true">
+          <div class="radar">
+            <div class="radar-node"><b>Streams</b><span>несколько каналов Luxriot</span></div>
+            <div class="radar-node"><b>Probes</b><span>активное внимание</span></div>
+            <div class="radar-node"><b>Memory</b><span>архив, rollups, docs</span></div>
+            <div class="radar-node"><b>Actions</b><span>bookmarks и отчеты</span></div>
+            <div class="radar-node"><b>Agent</b><span>управляющий слой</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section reveal" id="formula">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Product Formula</div>
+          <h2>Не отдельное видео, мониторинг и чат, а единая система внимания</h2>
+        </div>
+        <p class="section-lead">Короткая рамка, через которую удобно объяснять проект техническим и коммерческим аудиториям.</p>
+      </div>
+      <div class="formula-grid">
+        <article class="formula-card" style="--accent: var(--cyan)">
+          <div class="label">Video</div>
+          <div>
+            <h3>Голова с несколькими парами глаз</h3>
+            <p>Камеры дают поток восприятия, а система переключает фокус между каналами.</p>
+          </div>
+        </article>
+        <article class="formula-card" style="--accent: var(--amber)">
+          <div class="label">Probes</div>
+          <div>
+            <h3>Управляемое внимание</h3>
+            <p>Пробы задают, что искать, где смотреть, когда реагировать и насколько строго.</p>
+          </div>
+        </article>
+        <article class="formula-card" style="--accent: var(--green)">
+          <div class="label">Archive</div>
+          <div>
+            <h3>Зрительная память</h3>
+            <p>Детекции и индексированные изображения становятся searchable evidence.</p>
+          </div>
+        </article>
+        <article class="formula-card" style="--accent: var(--violet)">
+          <div class="label">Markdown</div>
+          <div>
+            <h3>Процедурная память</h3>
+            <p>Skills, docs и runbooks постепенно становятся рабочим knowledge layer.</p>
+          </div>
+        </article>
+        <article class="formula-card" style="--accent: var(--red)">
+          <div class="label">Agent</div>
+          <div>
+            <h3>Мозг управления</h3>
+            <p>Агент читает память, вызывает инструменты, тюнит пробы и готовит отчеты.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section reveal" id="architecture">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Interactive Schemes</div>
+          <h2>Архитектура, data flow и стратегический вектор</h2>
+        </div>
+        <p class="section-lead">Четыре схемы объясняют продукт с разных уровней: текущая реализация, пробы, видео-память и будущий loop агента.</p>
+      </div>
+
+      <div class="diagram-shell">
+        <div class="diagram-tabs" role="tablist" aria-label="Схемы">
+          <button class="diagram-tab active" data-diagram="current" role="tab" aria-selected="true"><b>Current Architecture</b><span>как сейчас связаны UI, API, Luxriot, VLM и stores</span></button>
+          <button class="diagram-tab" data-diagram="probes" role="tab" aria-selected="false"><b>Probes as Attention</b><span>как кадры превращаются в события и bookmarks</span></button>
+          <button class="diagram-tab" data-diagram="memory" role="tab" aria-selected="false"><b>Video Memory</b><span>L0-L3 summaries и routine baseline</span></button>
+          <button class="diagram-tab" data-diagram="loop" role="tab" aria-selected="false"><b>Strategic Loop</b><span>потоки, память, агент и действия</span></button>
+        </div>
+
+        <div class="diagram-stage">
+          <div class="diagram active" data-diagram-panel="current">
+            <div class="architecture-map">
+              <div class="node cyan wide"><b>Web Console</b><span>Archive / Video / Monitoring / Agent</span></div>
+              <div class="node amber"><b>Luxriot Evo</b><span>channels, snapshots, bookmarks</span></div>
+              <div class="node red center"><b>Flask API</b><span>oldapp.py как текущий application hub</span></div>
+              <div class="node green"><b>Archive Index</b><span>.clip_index + FAISS</span></div>
+              <div class="node cyan"><b>Probe Manager</b><span>CLIP buffer + ROI scoring</span></div>
+              <div class="node violet"><b>Agent Runner</b><span>tool-calling + sessions</span></div>
+              <div class="node green"><b>Detections Store</b><span>SQLite + snapshots</span></div>
+              <div class="node amber"><b>VLM</b><span>LM Studio / vLLM compatible API</span></div>
+              <div class="node violet"><b>Vision Heads</b><span>DINO / Mask2Former</span></div>
+            </div>
+          </div>
+
+          <div class="diagram" data-diagram-panel="probes">
+            <div class="flow">
+              <div class="flow-row">
+                <div class="node amber"><b>Luxriot snapshot</b><span>кадр с канала</span></div>
+                <div class="arrow"></div>
+                <div class="node cyan"><b>Probe buffer</b><span>embedding + thumbnail + timestamp</span></div>
+                <div class="node violet"><b>Probe definition</b><span>positive / negative / image / ROI</span></div>
+              </div>
+              <div class="flow-row">
+                <div class="node cyan"><b>Scoring</b><span>pos_score, neg_score, margin</span></div>
+                <div class="arrow"></div>
+                <div class="node green"><b>Detection archive</b><span>SQLite row + selected snapshot</span></div>
+                <div class="node amber"><b>Retention</b><span>drops dense near-duplicates</span></div>
+              </div>
+              <div class="flow-row">
+                <div class="node red"><b>Bookmark gate</b><span>cooldown, similarity, score deltas</span></div>
+                <div class="arrow"></div>
+                <div class="node amber"><b>Luxriot bookmark</b><span>operator-visible event</span></div>
+                <div class="node violet"><b>Agent tuning</b><span>research batch -> preview diff -> apply</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="diagram" data-diagram-panel="memory">
+            <div class="memory-ladder">
+              <div class="ladder">
+                <div class="ladder-step">
+                  <div class="step-level">L0</div>
+                  <div class="step-copy"><b>Per-batch summaries</b><span>сырые VLM-описания по live frame batch</span></div>
+                  <div class="step-meta">seconds</div>
+                </div>
+                <div class="ladder-step">
+                  <div class="step-level">L1</div>
+                  <div class="step-copy"><b>Short-window rollups</b><span>дедупликация и timeline-focused summary</span></div>
+                  <div class="step-meta">minutes</div>
+                </div>
+                <div class="ladder-step">
+                  <div class="step-level">L2</div>
+                  <div class="step-copy"><b>Hour-scale context</b><span>routine baseline и значимые изменения</span></div>
+                  <div class="step-meta">hours</div>
+                </div>
+                <div class="ladder-step">
+                  <div class="step-level">L3</div>
+                  <div class="step-copy"><b>Long-period narrative</b><span>устойчивые паттерны, события, follow-ups</span></div>
+                  <div class="step-meta">days</div>
+                </div>
+              </div>
+              <div class="node red"><b>Agent retrieval</b><span>отвечает по summaries, drill-down и evidence вместо повторного просмотра видео</span></div>
+            </div>
+          </div>
+
+          <div class="diagram" data-diagram-panel="loop">
+            <div class="brain-loop">
+              <div class="loop-ring">
+                <div class="loop-node"><b>Streams</b><span>3-4+ pairs of eyes</span></div>
+                <div class="loop-node"><b>Perception</b><span>CLIP / DINO / VLM / detectors</span></div>
+                <div class="loop-node"><b>Memory</b><span>detections / rollups / docs / skills</span></div>
+                <div class="loop-node"><b>Attention</b><span>probes / ROI / schedules</span></div>
+                <div class="loop-node core"><b>Agent</b><span>reasoning + tool control + operator interface</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section reveal" id="capabilities">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Capabilities</div>
+          <h2>Что уже можно показывать и обсуждать</h2>
+        </div>
+        <p class="section-lead">Фильтры помогают пресейлзам быстро собрать рассказ под аудиторию: архив, live, агент или интеграция.</p>
+      </div>
+      <div class="cap-toolbar" aria-label="Фильтр возможностей">
+        <button class="chip active" data-cap-filter="all">Все</button>
+        <button class="chip" data-cap-filter="archive">Архив</button>
+        <button class="chip" data-cap-filter="live">Live</button>
+        <button class="chip" data-cap-filter="agent">Агент</button>
+        <button class="chip" data-cap-filter="integration">Интеграция</button>
+      </div>
+      <div class="cap-grid">
+        <article class="cap-card" data-cap-tags="archive agent">
+          <span class="cap-tag">Archive</span>
+          <h3>Archive Research</h3>
+          <p>Семантический поиск по папкам и архиву детекций.</p>
+          <ul>
+            <li>Text/image query, find similar</li>
+            <li>CLIP, DINO, fusion modes</li>
+            <li>Comments, inspector, segmentation tools</li>
+          </ul>
+        </article>
+        <article class="cap-card" data-cap-tags="live integration">
+          <span class="cap-tag">Video</span>
+          <h3>Video Understanding</h3>
+          <p>Offline и live-сводки через OpenAI-compatible VLM.</p>
+          <ul>
+            <li>Luxriot live summaries</li>
+            <li>Run/time filters, L0-L3 rollups</li>
+            <li>Drill-down and copy/export</li>
+          </ul>
+        </article>
+        <article class="cap-card" data-cap-tags="live integration agent">
+          <span class="cap-tag">Monitoring</span>
+          <h3>Semantic Probes</h3>
+          <p>Настраиваемые триггеры, которые работают как внимание.</p>
+          <ul>
+            <li>Positive/negative text pairs</li>
+            <li>Image probe, ROI, thresholds</li>
+            <li>Severity and bookmark behavior</li>
+          </ul>
+        </article>
+        <article class="cap-card" data-cap-tags="archive live agent">
+          <span class="cap-tag">Memory</span>
+          <h3>Detections Archive</h3>
+          <p>События и кадры сохраняются как база для поиска и тюнинга.</p>
+          <ul>
+            <li>SQLite event rows</li>
+            <li>Snapshots and vector fields</li>
+            <li>Adaptive retention and dedupe</li>
+          </ul>
+        </article>
+        <article class="cap-card" data-cap-tags="agent integration archive live">
+          <span class="cap-tag">Agent</span>
+          <h3>Operator Agent</h3>
+          <p>Tool-calling агент с доступом к поиску, пробам, prompt settings и отчетам.</p>
+          <ul>
+            <li>Probe tuning and reports</li>
+            <li>Channel survey and deployment skills</li>
+            <li>Markdown playbooks as runtime behavior</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section reveal" id="stack">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Technology Stack</div>
+          <h2>Стек понятен, локален и расширяем</h2>
+        </div>
+        <p class="section-lead">Текущая реализация pragmatically собрана вокруг Python, FAISS, локальных VLM и Luxriot HTTP API.</p>
+      </div>
+      <div class="stack-filters">
+        <button class="chip active" data-stack-filter="all">Все слои</button>
+        <button class="chip" data-stack-filter="vision">Vision</button>
+        <button class="chip" data-stack-filter="runtime">Runtime</button>
+        <button class="chip" data-stack-filter="storage">Storage</button>
+        <button class="chip" data-stack-filter="integration">Integration</button>
+      </div>
+      <div class="stack-grid">
+        <div class="stack-row" data-stack-tags="runtime"><div class="stack-layer">Web/API</div><div class="stack-tech">Flask, Jinja, static JS/CSS, SSE</div><div class="stack-role">единая операторская консоль</div></div>
+        <div class="stack-row" data-stack-tags="vision"><div class="stack-layer">Embeddings</div><div class="stack-tech">CLIP, SigLIP2-compatible HF path, DINOv3</div><div class="stack-role">семантическое представление изображений и текста</div></div>
+        <div class="stack-row" data-stack-tags="vision storage"><div class="stack-layer">Vector Search</div><div class="stack-tech">FAISS IndexFlatIP</div><div class="stack-role">быстрый similarity search</div></div>
+        <div class="stack-row" data-stack-tags="vision"><div class="stack-layer">Vision Heads</div><div class="stack-tech">DINO heatmaps/segments, Mask2Former</div><div class="stack-role">уточнение областей и сегментов</div></div>
+        <div class="stack-row" data-stack-tags="vision runtime"><div class="stack-layer">Video/VLM</div><div class="stack-tech">OpenAI-compatible API, LM Studio, vLLM</div><div class="stack-role">описания кадров и rollup-сводки</div></div>
+        <div class="stack-row" data-stack-tags="integration"><div class="stack-layer">Luxriot</div><div class="stack-tech">Digest auth, channels, snapshots, createBookmark</div><div class="stack-role">интеграция с Evo workflow</div></div>
+        <div class="stack-row" data-stack-tags="storage"><div class="stack-layer">Storage</div><div class="stack-tech">SQLite, JSON stores, filesystem archive</div><div class="stack-role">detections, sessions, probes, rollup cache</div></div>
+        <div class="stack-row" data-stack-tags="runtime"><div class="stack-layer">Runtime</div><div class="stack-tech">Python threads, capture sessions, probe daemon</div><div class="stack-role">фоновые потоки обработки</div></div>
+      </div>
+    </section>
+
+    <section class="section reveal" id="audience">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Talk Tracks</div>
+          <h2>Как объяснять без продажной пены</h2>
+        </div>
+        <p class="section-lead">Три версии одного и того же продукта: для инженера, оператора и интегратора.</p>
+      </div>
+      <div class="audience-layout">
+        <div class="audience-tabs" role="tablist" aria-label="Аудитории">
+          <button class="chip active" data-audience="technical">Техническая аудитория</button>
+          <button class="chip" data-audience="operator">Оператор</button>
+          <button class="chip" data-audience="integrator">Интегратор</button>
+        </div>
+        <div>
+          <article class="audience-panel active" data-audience-panel="technical">
+            <p>Это Flask/Python приложение с FAISS-backed visual search, CLIP/SigLIP/DINO embeddings, Luxriot snapshot/bookmark integration, OpenAI-compatible VLM pipeline, SQLite event storage и tool-calling агентом.</p>
+            <div class="talk-points">
+              <div class="talk-point">Streams -> embeddings/summaries -> detections/rollups -> agent tools -> Luxriot actions.</div>
+              <div class="talk-point">Heavy vision heads изолированы и профилируются отдельно через harness.</div>
+              <div class="talk-point">Мутации защищены admin token и preview-first flow в agent tools.</div>
+            </div>
+          </article>
+          <article class="audience-panel" data-audience-panel="operator">
+            <p>Система помогает искать события по описанию, следить за выбранными сценариями на живых камерах, получать сводки по потокам и быстро создавать bookmarks.</p>
+            <div class="talk-points">
+              <div class="talk-point">Видно, какие пробы включены, по каким каналам и с какими порогами.</div>
+              <div class="talk-point">ROI делает намерение пробы явным и проверяемым.</div>
+              <div class="talk-point">Сводки можно читать по уровням: batch, окно, час, длинный период.</div>
+            </div>
+          </article>
+          <article class="audience-panel" data-audience-panel="integrator">
+            <p>EVA AI можно начинать как PoC рядом с Luxriot Evo: читать каналы и snapshots, отправлять bookmarks, хранить свой event/archive слой, затем углублять интеграцию.</p>
+            <div class="talk-points">
+              <div class="talk-point">Первый уровень интеграции: Luxriot HTTP API и bookmarks.</div>
+              <div class="talk-point">Следующий уровень: общие справочники каналов, зон и lifecycle событий.</div>
+              <div class="talk-point">Обратная связь операторов может стать материалом для тюнинга проб.</div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section reveal" id="roadmap">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Development Vector</div>
+          <h2>Roadmap: от PoC к системе эксплуатационного обучения</h2>
+        </div>
+        <p class="section-lead">Вектор не в сторону набора отдельных AI-фич, а в сторону управляемого контура внимания, памяти и действий.</p>
+      </div>
+      <div class="roadmap-tabs">
+        <button class="chip active" data-roadmap="near">Ближайший горизонт</button>
+        <button class="chip" data-roadmap="mid">Средний горизонт</button>
+        <button class="chip" data-roadmap="long">Дальний горизонт</button>
+      </div>
+      <div class="roadmap-grid active" data-roadmap-panel="near">
+        <article class="roadmap-card"><b>Доучивание и тюнинг проб</b><span>false positives / false negatives, research batches, preview diff, post-change metrics.</span></article>
+        <article class="roadmap-card"><b>Отладка агента</b><span>режимы исследования, deployment, tuning, reports и безопасные мутации.</span></article>
+        <article class="roadmap-card"><b>Сценарии и packs</b><span>периметр, очередь, зона погрузки, оставленный объект, вход/выход.</span></article>
+        <article class="roadmap-card"><b>Расписания</b><span>активность проб, thresholds день/ночь, VLM cadence, quiet hours.</span></article>
+      </div>
+      <div class="roadmap-grid" data-roadmap-panel="mid">
+        <article class="roadmap-card"><b>DETR/YOLO слой</b><span>детектор как дешевый visual prior поверх semantic probes, а не замена им.</span></article>
+        <article class="roadmap-card"><b>Глубже в Evo</b><span>общие события, lifecycle, channel/site/zone mappings, feedback loop.</span></article>
+        <article class="roadmap-card"><b>Markdown/wiki память</b><span>docs, skills, runbooks и регламенты как retrieval layer для агента.</span></article>
+        <article class="roadmap-card"><b>Persistent rollups</b><span>DB-схема, embeddings summaries, ответы по неделе без повторного просмотра видео.</span></article>
+      </div>
+      <div class="roadmap-grid" data-roadmap-panel="long">
+        <article class="roadmap-card"><b>Attention scheduler</b><span>агент решает, какие камеры смотреть чаще и где включать VLM.</span></article>
+        <article class="roadmap-card"><b>Evidence graph</b><span>связь detections, summaries, bookmarks, prompts, notes и документации.</span></article>
+        <article class="roadmap-card"><b>Scenario lifecycle</b><span>создание -> baseline -> запуск -> калибровка -> отчет -> feedback -> версия.</span></article>
+        <article class="roadmap-card"><b>Operational learning</b><span>система учится на эксплуатации, а не только на стартовой настройке.</span></article>
+      </div>
+    </section>
+
+    <section class="section reveal" id="install">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">GitHub & Install</div>
+          <h2>Ссылка на репозиторий и быстрый старт</h2>
+        </div>
+        <p class="section-lead">Инструкция компактная и честная: CLIP-only профиль быстрее всего поднимается на demo laptop, DINO/Mask2Former требуют GPU и weights.</p>
+      </div>
+      <div class="install-layout">
+        <div class="install-panel">
+          <h3>Repository</h3>
+          <p class="install-copy">Исходный код: <a href="https://github.com/SashaYerashoff/evo-ssearch" target="_blank" rel="noopener">github.com/SashaYerashoff/evo-ssearch</a></p>
+          <p class="branch-note"><b>Current branch</b><code>feature/reskin</code><span>Separate from <code>main</code> for now.</span></p>
+          <div class="install-tabs">
+            <button class="chip active" data-install="linux">Linux/macOS</button>
+            <button class="chip" data-install="windows">Windows 11</button>
+            <button class="chip" data-install="env">Stability profile</button>
+          </div>
+          <div class="install-code active" data-install-panel="linux">
+            <div class="code-block">
+              <button class="copy-btn" data-copy="#linuxInstall">Copy</button>
+              <pre id="linuxInstall">git clone https://github.com/SashaYerashoff/evo-ssearch.git
+cd evo-ssearch
+git checkout feature/reskin
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+
+python oldapp.py</pre>
+            </div>
+          </div>
+          <div class="install-code" data-install-panel="windows">
+            <div class="code-block">
+              <button class="copy-btn" data-copy="#windowsInstall">Copy</button>
+              <pre id="windowsInstall">git clone https://github.com/SashaYerashoff/evo-ssearch.git
+cd evo-ssearch
+git checkout feature/reskin
+
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+python oldapp.py</pre>
+            </div>
+          </div>
+          <div class="install-code" data-install-panel="env">
+            <div class="code-block">
+              <button class="copy-btn" data-copy="#envInstall">Copy</button>
+              <pre id="envInstall">EVOSSEARCH_EMBEDDER=clip
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_M2F_ENABLED=false
+
+# Optional VLM:
+EVOSSEARCH_LM_BASE_URL=http://127.0.0.1:1234/v1
+EVOSSEARCH_LM_MODEL=qwen/qwen3-vl-4b
+
+# Optional Luxriot:
+EVOSSEARCH_LUXRIOT_BASE_URL=http://luxriot-host:8080
+EVOSSEARCH_LUXRIOT_USERNAME=
+EVOSSEARCH_LUXRIOT_PASSWORD=</pre>
+            </div>
+          </div>
+        </div>
+        <aside class="install-panel">
+          <h3>Prerequisites</h3>
+          <div class="metric-grid">
+            <div class="metric-card"><b>Python 3.10+</b><span>Текущая ветка также поддерживает Python 3.13.</span></div>
+            <div class="metric-card"><b>CUDA GPU</b><span>Рекомендуется для DINO, Mask2Former и плотных probe workloads.</span></div>
+            <div class="metric-card"><b>LM Studio/vLLM</b><span>Опционально для VLM summaries и agent vision flows.</span></div>
+            <div class="metric-card"><b>Luxriot Evo S</b><span>Опционально для live monitoring, snapshots и bookmarks.</span></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section reveal" id="constraints">
+      <div class="section-head">
+        <div>
+          <div class="section-kicker">Engineering Honesty</div>
+          <h2>Что важно проговорить заранее</h2>
+        </div>
+        <p class="section-lead">Эти ограничения помогают удерживать доверие: проект сильнее выглядит, когда его не продают как магию.</p>
+      </div>
+      <div class="constraints-grid">
+        <div class="constraint-card"><b>Alpha PoC</b><span>Это рабочий exhibition PoC, а не сертифицированная safety/security-система.</span></div>
+        <div class="constraint-card"><b>GPU budget</b><span>DINO и Mask2Former нужно профилировать под конкретное железо; CLIP-only быстрее для первого запуска.</span></div>
+        <div class="constraint-card"><b>Prompt quality</b><span>VLM-сводки зависят от модели, промпта, sampling cadence и камеры.</span></div>
+        <div class="constraint-card"><b>Storage evolution</b><span>SQLite/JSON/файлы достаточны для PoC, но мультисайт потребует более формальной схемы.</span></div>
+        <div class="constraint-card"><b>Probe calibration</b><span>Semantic probes требуют калибровки на реальных камерах и обратной связи от операторов.</span></div>
+        <div class="constraint-card"><b>Bookmark hygiene</b><span>Cooldown/dedupe gates обязательны, иначе журнал событий быстро становится шумным.</span></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>Luxriot EVA AI presales one-pager. Built from project docs and current codebase context.</span>
+      <a class="btn" href="#top">Наверх</a>
+    </div>
+  </footer>
+
+  <script>
+    (() => {
+      const qs = (sel, root = document) => root.querySelector(sel);
+      const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+      const I18N = {
+        ru: {
+          title: 'Luxriot EVA AI - Presales One-Pager',
+          themeLabel: 'Сменить тему',
+          nav: ['Формула', 'Схемы', 'Возможности', 'Стек', 'Roadmap', 'Установка'],
+          github: 'GitHub',
+          heroKicker: 'Luxriot EVA AI',
+          heroTitle: ['AI-слой', 'для поиска,', 'мониторинга', 'и оператора', 'в одном контуре'],
+          heroCopy: 'EVA AI соединяет архив, живые камеры, semantic probes, VLM-сводки, bookmarks и агента. Пресейлз-команда может объяснять систему не как набор разрозненных функций, а как управляемое внимание поверх Luxriot Evo.',
+          heroButtons: ['Открыть схемы', 'Посмотреть возможности', 'Инструкция установки'],
+          signals: [
+            ['Archive', 'semantic search по папкам и detections archive'],
+            ['Monitoring', 'пробы, ROI, thresholds, bookmarks'],
+            ['Agent', 'tool-calling, skills, reports, tuning'],
+          ],
+          radar: [
+            ['Streams', 'несколько каналов Luxriot'],
+            ['Probes', 'активное внимание'],
+            ['Memory', 'архив, rollups, docs'],
+            ['Actions', 'bookmarks и отчеты'],
+            ['Agent', 'управляющий слой'],
+          ],
+          formulaHead: ['Product Formula', 'Не отдельное видео, мониторинг и чат, а единая система внимания', 'Короткая рамка, через которую удобно объяснять проект техническим и коммерческим аудиториям.'],
+          formula: [
+            ['Video', 'Голова с несколькими парами глаз', 'Камеры дают поток восприятия, а система переключает фокус между каналами.'],
+            ['Probes', 'Управляемое внимание', 'Пробы задают, что искать, где смотреть, когда реагировать и насколько строго.'],
+            ['Archive', 'Зрительная память', 'Детекции и индексированные изображения становятся searchable evidence.'],
+            ['Markdown', 'Процедурная память', 'Skills, docs и runbooks постепенно становятся рабочим knowledge layer.'],
+            ['Agent', 'Мозг управления', 'Агент читает память, вызывает инструменты, тюнит пробы и готовит отчеты.'],
+          ],
+          architectureHead: ['Interactive Schemes', 'Архитектура, data flow и стратегический вектор', 'Четыре схемы объясняют продукт с разных уровней: текущая реализация, пробы, видео-память и будущий loop агента.'],
+          diagramTabs: [
+            ['Current Architecture', 'как сейчас связаны UI, API, Luxriot, VLM и stores'],
+            ['Probes as Attention', 'как кадры превращаются в события и bookmarks'],
+            ['Video Memory', 'L0-L3 summaries и routine baseline'],
+            ['Strategic Loop', 'потоки, память, агент и действия'],
+          ],
+          diagramCurrent: [
+            ['Web Console', 'Archive / Video / Monitoring / Agent'],
+            ['Luxriot Evo', 'channels, snapshots, bookmarks'],
+            ['Flask API', 'oldapp.py как текущий application hub'],
+            ['Archive Index', '.clip_index + FAISS'],
+            ['Probe Manager', 'CLIP buffer + ROI scoring'],
+            ['Agent Runner', 'tool-calling + sessions'],
+            ['Detections Store', 'SQLite + snapshots'],
+            ['VLM', 'LM Studio / vLLM compatible API'],
+            ['Vision Heads', 'DINO / Mask2Former'],
+          ],
+          diagramProbes: [
+            ['Luxriot snapshot', 'кадр с канала'],
+            ['Probe buffer', 'embedding + thumbnail + timestamp'],
+            ['Probe definition', 'positive / negative / image / ROI'],
+            ['Scoring', 'pos_score, neg_score, margin'],
+            ['Detection archive', 'SQLite row + selected snapshot'],
+            ['Retention', 'drops dense near-duplicates'],
+            ['Bookmark gate', 'cooldown, similarity, score deltas'],
+            ['Luxriot bookmark', 'operator-visible event'],
+            ['Agent tuning', 'research batch -> preview diff -> apply'],
+          ],
+          diagramMemory: [
+            ['Per-batch summaries', 'сырые VLM-описания по live frame batch', 'seconds'],
+            ['Short-window rollups', 'дедупликация и timeline-focused summary', 'minutes'],
+            ['Hour-scale context', 'routine baseline и значимые изменения', 'hours'],
+            ['Long-period narrative', 'устойчивые паттерны, события, follow-ups', 'days'],
+          ],
+          diagramMemoryAgent: ['Agent retrieval', 'отвечает по summaries, drill-down и evidence вместо повторного просмотра видео'],
+          diagramLoop: [
+            ['Streams', '3-4+ pairs of eyes'],
+            ['Perception', 'CLIP / DINO / VLM / detectors'],
+            ['Memory', 'detections / rollups / docs / skills'],
+            ['Attention', 'probes / ROI / schedules'],
+            ['Agent', 'reasoning + tool control + operator interface'],
+          ],
+          capabilitiesHead: ['Capabilities', 'Что уже можно показывать и обсуждать', 'Фильтры помогают пресейлзам быстро собрать рассказ под аудиторию: архив, live, агент или интеграция.'],
+          capFilters: ['Все', 'Архив', 'Live', 'Агент', 'Интеграция'],
+          caps: [
+            ['Archive', 'Archive Research', 'Семантический поиск по папкам и архиву детекций.', ['Text/image query, find similar', 'CLIP, DINO, fusion modes', 'Comments, inspector, segmentation tools']],
+            ['Video', 'Video Understanding', 'Offline и live-сводки через OpenAI-compatible VLM.', ['Luxriot live summaries', 'Run/time filters, L0-L3 rollups', 'Drill-down and copy/export']],
+            ['Monitoring', 'Semantic Probes', 'Настраиваемые триггеры, которые работают как внимание.', ['Positive/negative text pairs', 'Image probe, ROI, thresholds', 'Severity and bookmark behavior']],
+            ['Memory', 'Detections Archive', 'События и кадры сохраняются как база для поиска и тюнинга.', ['SQLite event rows', 'Snapshots and vector fields', 'Adaptive retention and dedupe']],
+            ['Agent', 'Operator Agent', 'Tool-calling агент с доступом к поиску, пробам, prompt settings и отчетам.', ['Probe tuning and reports', 'Channel survey and deployment skills', 'Markdown playbooks as runtime behavior']],
+          ],
+          stackHead: ['Technology Stack', 'Стек понятен, локален и расширяем', 'Текущая реализация pragmatically собрана вокруг Python, FAISS, локальных VLM и Luxriot HTTP API.'],
+          stackFilters: ['Все слои', 'Vision', 'Runtime', 'Storage', 'Integration'],
+          stackRoles: ['единая операторская консоль', 'семантическое представление изображений и текста', 'быстрый similarity search', 'уточнение областей и сегментов', 'описания кадров и rollup-сводки', 'интеграция с Evo workflow', 'detections, sessions, probes, rollup cache', 'фоновые потоки обработки'],
+          audienceHead: ['Talk Tracks', 'Как объяснять без продажной пены', 'Три версии одного и того же продукта: для инженера, оператора и интегратора.'],
+          audienceTabs: ['Техническая аудитория', 'Оператор', 'Интегратор'],
+          audience: [
+            ['Это Flask/Python приложение с FAISS-backed visual search, CLIP/SigLIP/DINO embeddings, Luxriot snapshot/bookmark integration, OpenAI-compatible VLM pipeline, SQLite event storage и tool-calling агентом.', ['Streams -> embeddings/summaries -> detections/rollups -> agent tools -> Luxriot actions.', 'Heavy vision heads изолированы и профилируются отдельно через harness.', 'Мутации защищены admin token и preview-first flow в agent tools.']],
+            ['Система помогает искать события по описанию, следить за выбранными сценариями на живых камерах, получать сводки по потокам и быстро создавать bookmarks.', ['Видно, какие пробы включены, по каким каналам и с какими порогами.', 'ROI делает намерение пробы явным и проверяемым.', 'Сводки можно читать по уровням: batch, окно, час, длинный период.']],
+            ['EVA AI можно начинать как PoC рядом с Luxriot Evo: читать каналы и snapshots, отправлять bookmarks, хранить свой event/archive слой, затем углублять интеграцию.', ['Первый уровень интеграции: Luxriot HTTP API и bookmarks.', 'Следующий уровень: общие справочники каналов, зон и lifecycle событий.', 'Обратная связь операторов может стать материалом для тюнинга проб.']],
+          ],
+          roadmapHead: ['Development Vector', 'Roadmap: от PoC к системе эксплуатационного обучения', 'Вектор не в сторону набора отдельных AI-фич, а в сторону управляемого контура внимания, памяти и действий.'],
+          roadmapTabs: ['Ближайший горизонт', 'Средний горизонт', 'Дальний горизонт'],
+          roadmap: [
+            [['Доучивание и тюнинг проб', 'false positives / false negatives, research batches, preview diff, post-change metrics.'], ['Отладка агента', 'режимы исследования, deployment, tuning, reports и безопасные мутации.'], ['Сценарии и packs', 'периметр, очередь, зона погрузки, оставленный объект, вход/выход.'], ['Расписания', 'активность проб, thresholds день/ночь, VLM cadence, quiet hours.']],
+            [['DETR/YOLO слой', 'детектор как дешевый visual prior поверх semantic probes, а не замена им.'], ['Глубже в Evo', 'общие события, lifecycle, channel/site/zone mappings, feedback loop.'], ['Markdown/wiki память', 'docs, skills, runbooks и регламенты как retrieval layer для агента.'], ['Persistent rollups', 'DB-схема, embeddings summaries, ответы по неделе без повторного просмотра видео.']],
+            [['Attention scheduler', 'агент решает, какие камеры смотреть чаще и где включать VLM.'], ['Evidence graph', 'связь detections, summaries, bookmarks, prompts, notes и документации.'], ['Scenario lifecycle', 'создание -> baseline -> запуск -> калибровка -> отчет -> feedback -> версия.'], ['Operational learning', 'система учится на эксплуатации, а не только на стартовой настройке.']],
+          ],
+          installHead: ['GitHub & Install', 'Ссылка на репозиторий и быстрый старт', 'Инструкция компактная и честная: CLIP-only профиль быстрее всего поднимается на demo laptop, DINO/Mask2Former требуют GPU и weights.'],
+          install: ['Repository', 'Исходный код:', ['Текущая ветка', 'Пока отдельно от main.'], ['Linux/macOS', 'Windows 11', 'Stability profile'], 'Prerequisites'],
+          metrics: [
+            ['Python 3.10+', 'Текущая ветка также поддерживает Python 3.13.'],
+            ['CUDA GPU', 'Рекомендуется для DINO, Mask2Former и плотных probe workloads.'],
+            ['LM Studio/vLLM', 'Опционально для VLM summaries и agent vision flows.'],
+            ['Luxriot Evo S', 'Опционально для live monitoring, snapshots и bookmarks.'],
+          ],
+          constraintsHead: ['Engineering Honesty', 'Что важно проговорить заранее', 'Эти ограничения помогают удерживать доверие: проект сильнее выглядит, когда его не продают как магию.'],
+          constraints: [
+            ['Alpha PoC', 'Это рабочий exhibition PoC, а не сертифицированная safety/security-система.'],
+            ['GPU budget', 'DINO и Mask2Former нужно профилировать под конкретное железо; CLIP-only быстрее для первого запуска.'],
+            ['Prompt quality', 'VLM-сводки зависят от модели, промпта, sampling cadence и камеры.'],
+            ['Storage evolution', 'SQLite/JSON/файлы достаточны для PoC, но мультисайт потребует более формальной схемы.'],
+            ['Probe calibration', 'Semantic probes требуют калибровки на реальных камерах и обратной связи от операторов.'],
+            ['Bookmark hygiene', 'Cooldown/dedupe gates обязательны, иначе журнал событий быстро становится шумным.'],
+          ],
+          footer: ['Luxriot EVA AI presales one-pager. Built from project docs and current codebase context.', 'Наверх'],
+        },
+        en: {
+          title: 'Luxriot EVA AI - Presales One-Pager',
+          themeLabel: 'Toggle theme',
+          nav: ['Formula', 'Schemes', 'Capabilities', 'Stack', 'Roadmap', 'Install'],
+          github: 'GitHub',
+          heroKicker: 'Luxriot EVA AI',
+          heroTitle: ['AI layer', 'for search,', 'monitoring', 'and operators', 'in one loop'],
+          heroCopy: 'EVA AI connects archives, live cameras, semantic probes, VLM summaries, bookmarks, and an operator agent. Presales can explain it not as separate features, but as managed attention on top of Luxriot Evo.',
+          heroButtons: ['Open schemes', 'View capabilities', 'Install guide'],
+          signals: [
+            ['Archive', 'semantic search across folders and detections archive'],
+            ['Monitoring', 'probes, ROI, thresholds, bookmarks'],
+            ['Agent', 'tool-calling, skills, reports, tuning'],
+          ],
+          radar: [
+            ['Streams', 'several Luxriot channels'],
+            ['Probes', 'active attention'],
+            ['Memory', 'archive, rollups, docs'],
+            ['Actions', 'bookmarks and reports'],
+            ['Agent', 'control layer'],
+          ],
+          formulaHead: ['Product Formula', 'Not separate video, monitoring, and chat, but one attention system', 'A compact framing for technical and commercial conversations.'],
+          formula: [
+            ['Video', 'A head with several pairs of eyes', 'Cameras provide perception streams, while the system shifts focus between channels.'],
+            ['Probes', 'Managed attention', 'Probes define what to look for, where to look, when to react, and how strict to be.'],
+            ['Archive', 'Visual memory', 'Detections and indexed images become searchable evidence.'],
+            ['Markdown', 'Procedural memory', 'Skills, docs, and runbooks gradually become an operational knowledge layer.'],
+            ['Agent', 'Control brain', 'The agent reads memory, calls tools, tunes probes, and prepares reports.'],
+          ],
+          architectureHead: ['Interactive Schemes', 'Architecture, data flow, and strategic vector', 'Four schemes explain the product at different levels: current implementation, probes, video memory, and the future agent loop.'],
+          diagramTabs: [
+            ['Current Architecture', 'how UI, API, Luxriot, VLM, and stores are connected today'],
+            ['Probes as Attention', 'how frames become detections and bookmarks'],
+            ['Video Memory', 'L0-L3 summaries and routine baseline'],
+            ['Strategic Loop', 'streams, memory, agent, and actions'],
+          ],
+          diagramCurrent: [
+            ['Web Console', 'Archive / Video / Monitoring / Agent'],
+            ['Luxriot Evo', 'channels, snapshots, bookmarks'],
+            ['Flask API', 'oldapp.py as the current application hub'],
+            ['Archive Index', '.clip_index + FAISS'],
+            ['Probe Manager', 'CLIP buffer + ROI scoring'],
+            ['Agent Runner', 'tool-calling + sessions'],
+            ['Detections Store', 'SQLite + snapshots'],
+            ['VLM', 'LM Studio / vLLM compatible API'],
+            ['Vision Heads', 'DINO / Mask2Former'],
+          ],
+          diagramProbes: [
+            ['Luxriot snapshot', 'frame from a channel'],
+            ['Probe buffer', 'embedding + thumbnail + timestamp'],
+            ['Probe definition', 'positive / negative / image / ROI'],
+            ['Scoring', 'pos_score, neg_score, margin'],
+            ['Detection archive', 'SQLite row + selected snapshot'],
+            ['Retention', 'drops dense near-duplicates'],
+            ['Bookmark gate', 'cooldown, similarity, score deltas'],
+            ['Luxriot bookmark', 'operator-visible event'],
+            ['Agent tuning', 'research batch -> preview diff -> apply'],
+          ],
+          diagramMemory: [
+            ['Per-batch summaries', 'raw VLM descriptions for live frame batches', 'seconds'],
+            ['Short-window rollups', 'deduplication and timeline-focused summary', 'minutes'],
+            ['Hour-scale context', 'routine baseline and significant changes', 'hours'],
+            ['Long-period narrative', 'persistent patterns, events, follow-ups', 'days'],
+          ],
+          diagramMemoryAgent: ['Agent retrieval', 'answers from summaries, drill-down, and evidence instead of rewatching video'],
+          diagramLoop: [
+            ['Streams', '3-4+ pairs of eyes'],
+            ['Perception', 'CLIP / DINO / VLM / detectors'],
+            ['Memory', 'detections / rollups / docs / skills'],
+            ['Attention', 'probes / ROI / schedules'],
+            ['Agent', 'reasoning + tool control + operator interface'],
+          ],
+          capabilitiesHead: ['Capabilities', 'What can already be shown and discussed', 'Filters help presales quickly shape the story for archive, live monitoring, agent, or integration audiences.'],
+          capFilters: ['All', 'Archive', 'Live', 'Agent', 'Integration'],
+          caps: [
+            ['Archive', 'Archive Research', 'Semantic search across folders and the detections archive.', ['Text/image query, find similar', 'CLIP, DINO, fusion modes', 'Comments, inspector, segmentation tools']],
+            ['Video', 'Video Understanding', 'Offline and live summaries through an OpenAI-compatible VLM.', ['Luxriot live summaries', 'Run/time filters, L0-L3 rollups', 'Drill-down and copy/export']],
+            ['Monitoring', 'Semantic Probes', 'Configurable triggers that behave like attention.', ['Positive/negative text pairs', 'Image probe, ROI, thresholds', 'Severity and bookmark behavior']],
+            ['Memory', 'Detections Archive', 'Events and frames are stored as material for search and tuning.', ['SQLite event rows', 'Snapshots and vector fields', 'Adaptive retention and dedupe']],
+            ['Agent', 'Operator Agent', 'A tool-calling agent with access to search, probes, prompt settings, and reports.', ['Probe tuning and reports', 'Channel survey and deployment skills', 'Markdown playbooks as runtime behavior']],
+          ],
+          stackHead: ['Technology Stack', 'The stack is understandable, local, and extensible', 'The current implementation is pragmatically built around Python, FAISS, local VLMs, and the Luxriot HTTP API.'],
+          stackFilters: ['All layers', 'Vision', 'Runtime', 'Storage', 'Integration'],
+          stackRoles: ['single operator console', 'semantic representation for images and text', 'fast similarity search', 'region and segment refinement', 'frame descriptions and rollup summaries', 'integration with Evo workflow', 'detections, sessions, probes, rollup cache', 'background processing loops'],
+          audienceHead: ['Talk Tracks', 'How to explain it without sales gloss', 'Three versions of the same product: for engineers, operators, and integrators.'],
+          audienceTabs: ['Technical audience', 'Operator', 'Integrator'],
+          audience: [
+            ['It is a Flask/Python application with FAISS-backed visual search, CLIP/SigLIP/DINO embeddings, Luxriot snapshot/bookmark integration, an OpenAI-compatible VLM pipeline, SQLite event storage, and a tool-calling agent.', ['Streams -> embeddings/summaries -> detections/rollups -> agent tools -> Luxriot actions.', 'Heavy vision heads are isolated and profiled through a harness.', 'Mutations are protected by an admin token and preview-first agent flows.']],
+            ['The system helps operators search for events by description, monitor selected scenarios on live cameras, read stream summaries, and create bookmarks quickly.', ['It is clear which probes are enabled, on which channels, and with which thresholds.', 'ROI makes the probe intent explicit and verifiable.', 'Summaries can be read by level: batch, window, hour, long period.']],
+            ['EVA AI can start as a PoC next to Luxriot Evo: read channels and snapshots, send bookmarks, store its own event/archive layer, and then deepen the integration.', ['First integration level: Luxriot HTTP API and bookmarks.', 'Next level: shared channel, site, zone, and event lifecycle references.', 'Operator feedback can become training material for probe tuning.']],
+          ],
+          roadmapHead: ['Development Vector', 'Roadmap: from PoC to operational learning system', 'The direction is not a pile of AI features, but a managed loop of attention, memory, and action.'],
+          roadmapTabs: ['Near term', 'Mid term', 'Long term'],
+          roadmap: [
+            [['Probe learning and tuning', 'false positives / false negatives, research batches, preview diff, post-change metrics.'], ['Agent behavior hardening', 'research, deployment, tuning, reporting modes and safe mutations.'], ['Scenario packs', 'perimeter, queue, loading zone, abandoned object, entry/exit.'], ['Schedules', 'probe activity windows, day/night thresholds, VLM cadence, quiet hours.']],
+            [['DETR/YOLO layer', 'detectors as a cheap visual prior over semantic probes, not a replacement.'], ['Deeper Evo integration', 'shared events, lifecycle, channel/site/zone mappings, feedback loop.'], ['Markdown/wiki memory', 'docs, skills, runbooks, and procedures as an agent retrieval layer.'], ['Persistent rollups', 'DB schema, summary embeddings, weekly answers without rewatching video.']],
+            [['Attention scheduler', 'the agent decides which cameras to watch more often and where to enable VLM.'], ['Evidence graph', 'links between detections, summaries, bookmarks, prompts, notes, and documentation.'], ['Scenario lifecycle', 'create -> baseline -> run -> calibrate -> report -> feedback -> version.'], ['Operational learning', 'the system learns from real operation, not only from initial setup.']],
+          ],
+          installHead: ['GitHub & Install', 'Repository link and quick start', 'The guide is compact and honest: CLIP-only is fastest on a demo laptop, while DINO/Mask2Former need GPU and weights.'],
+          install: ['Repository', 'Source code:', ['Current branch', 'Separate from main for now.'], ['Linux/macOS', 'Windows 11', 'Stability profile'], 'Prerequisites'],
+          metrics: [
+            ['Python 3.10+', 'The current branch also supports Python 3.13.'],
+            ['CUDA GPU', 'Recommended for DINO, Mask2Former, and dense probe workloads.'],
+            ['LM Studio/vLLM', 'Optional for VLM summaries and agent vision flows.'],
+            ['Luxriot Evo S', 'Optional for live monitoring, snapshots, and bookmarks.'],
+          ],
+          constraintsHead: ['Engineering Honesty', 'What should be stated upfront', 'These constraints build trust: the project looks stronger when it is not presented as magic.'],
+          constraints: [
+            ['Alpha PoC', 'This is a working exhibition PoC, not a certified safety/security system.'],
+            ['GPU budget', 'DINO and Mask2Former must be profiled on the target hardware; CLIP-only is faster for first launch.'],
+            ['Prompt quality', 'VLM summaries depend on the model, prompt, sampling cadence, and camera quality.'],
+            ['Storage evolution', 'SQLite/JSON/files are enough for PoC, but multi-site production needs a more formal schema.'],
+            ['Probe calibration', 'Semantic probes need calibration on real cameras and operator feedback.'],
+            ['Bookmark hygiene', 'Cooldown/dedupe gates are required, otherwise the event log becomes noisy.'],
+          ],
+          footer: ['Luxriot EVA AI presales one-pager. Built from project docs and current codebase context.', 'Back to top'],
+        },
+        lv: {
+          title: 'Luxriot EVA AI - pirmspārdošanas vienlapa',
+          themeLabel: 'Pārslēgt tēmu',
+          nav: ['Formula', 'Shēmas', 'Iespējas', 'Steks', 'Ceļa karte', 'Instalācija'],
+          github: 'GitHub',
+          heroKicker: 'Luxriot EVA AI',
+          heroTitle: ['AI slānis', 'meklēšanai,', 'monitoringam', 'un operatoriem', 'vienā ciklā'],
+          heroCopy: 'EVA AI savieno arhīvu, dzīvas kameras, semantiskās probes, VLM kopsavilkumus, grāmatzīmes un operatora aģentu. Pirmspārdošana var skaidrot sistēmu ne kā atsevišķu funkciju kopu, bet kā vadāmu uzmanību virs Luxriot Evo.',
+          heroButtons: ['Atvērt shēmas', 'Skatīt iespējas', 'Instalēt'],
+          signals: [
+            ['Archive', 'semantiskā meklēšana mapēs un detekciju arhīvā'],
+            ['Monitoring', 'probes, ROI, sliekšņi, grāmatzīmes'],
+            ['Agent', 'tool-calling, skills, atskaites, regulēšana'],
+          ],
+          radar: [
+            ['Streams', 'vairāki Luxriot kanāli'],
+            ['Probes', 'aktīva uzmanība'],
+            ['Memory', 'arhīvs, rollups, docs'],
+            ['Actions', 'bookmarks un atskaites'],
+            ['Agent', 'vadības slānis'],
+          ],
+          formulaHead: ['Produkta formula', 'Ne atsevišķs video, monitorings un čats, bet viena uzmanības sistēma', 'Īss ietvars tehniskām un komerciālām sarunām.'],
+          formula: [
+            ['Video', 'Galva ar vairākām acu pāru grupām', 'Kameras dod uztveres plūsmas, bet sistēma pārslēdz fokusu starp kanāliem.'],
+            ['Probes', 'Vadāma uzmanība', 'Probes nosaka, ko meklēt, kur skatīties, kad reaģēt un cik stingri.'],
+            ['Archive', 'Vizuālā atmiņa', 'Detekcijas un indeksēti attēli kļūst par meklējamiem pierādījumiem.'],
+            ['Markdown', 'Procedurālā atmiņa', 'Skills, dokumenti un runbooks pakāpeniski kļūst par operacionālu zināšanu slāni.'],
+            ['Agent', 'Vadības smadzenes', 'Aģents lasa atmiņu, izsauc rīkus, regulē probes un sagatavo atskaites.'],
+          ],
+          architectureHead: ['Interaktīvās shēmas', 'Arhitektūra, datu plūsma un stratēģiskais virziens', 'Četras shēmas skaidro produktu dažādos līmeņos: pašreizējā realizācija, probes, video atmiņa un nākotnes aģenta cikls.'],
+          diagramTabs: [
+            ['Pašreizējā arhitektūra', 'kā šobrīd savienoti UI, API, Luxriot, VLM un krātuves'],
+            ['Probes kā uzmanība', 'kā kadri pārtop detekcijās un grāmatzīmēs'],
+            ['Video atmiņa', 'L0-L3 kopsavilkumi un rutīnas bāzlīnija'],
+            ['Stratēģiskais cikls', 'plūsmas, atmiņa, aģents un darbības'],
+          ],
+          diagramCurrent: [
+            ['Web Console', 'Archive / Video / Monitoring / Agent'],
+            ['Luxriot Evo', 'kanāli, snapshots, bookmarks'],
+            ['Flask API', 'oldapp.py kā pašreizējais lietotnes centrs'],
+            ['Archive Index', '.clip_index + FAISS'],
+            ['Probe Manager', 'CLIP buffer + ROI scoring'],
+            ['Agent Runner', 'tool-calling + sessions'],
+            ['Detections Store', 'SQLite + snapshots'],
+            ['VLM', 'LM Studio / vLLM savietojams API'],
+            ['Vision Heads', 'DINO / Mask2Former'],
+          ],
+          diagramProbes: [
+            ['Luxriot snapshot', 'kadrs no kanāla'],
+            ['Probe buffer', 'embedding + thumbnail + timestamp'],
+            ['Probe definition', 'positive / negative / image / ROI'],
+            ['Scoring', 'pos_score, neg_score, margin'],
+            ['Detection archive', 'SQLite rinda + izvēlēts snapshot'],
+            ['Retention', 'izmet blīvus gandrīz dublikātus'],
+            ['Bookmark gate', 'cooldown, similarity, score deltas'],
+            ['Luxriot bookmark', 'operatoram redzams notikums'],
+            ['Agent tuning', 'research batch -> preview diff -> apply'],
+          ],
+          diagramMemory: [
+            ['Per-batch summaries', 'neapstrādāti VLM apraksti live kadru batch', 'sekundes'],
+            ['Short-window rollups', 'deduplikācija un timeline-focused summary', 'minūtes'],
+            ['Hour-scale context', 'routine baseline un nozīmīgas izmaiņas', 'stundas'],
+            ['Long-period narrative', 'noturīgi raksti, notikumi, follow-ups', 'dienas'],
+          ],
+          diagramMemoryAgent: ['Agent retrieval', 'atbild no summaries, drill-down un evidence, nepārlūkojot video no jauna'],
+          diagramLoop: [
+            ['Streams', '3-4+ acu pāri'],
+            ['Perception', 'CLIP / DINO / VLM / detectors'],
+            ['Memory', 'detections / rollups / docs / skills'],
+            ['Attention', 'probes / ROI / schedules'],
+            ['Agent', 'reasoning + tool control + operator interface'],
+          ],
+          capabilitiesHead: ['Iespējas', 'Ko jau var rādīt un apspriest', 'Filtri palīdz pirmspārdošanai ātri pielāgot stāstu arhīvam, live monitoringam, aģentam vai integrācijai.'],
+          capFilters: ['Visas', 'Arhīvs', 'Live', 'Aģents', 'Integrācija'],
+          caps: [
+            ['Archive', 'Arhīva izpēte', 'Semantiskā meklēšana mapēs un detekciju arhīvā.', ['Teksta/attēla vaicājums, find similar', 'CLIP, DINO, fusion režīmi', 'Komentāri, inspektors, segmentācijas rīki']],
+            ['Video', 'Video izpratne', 'Offline un live kopsavilkumi caur OpenAI-savietojamu VLM.', ['Luxriot live kopsavilkumi', 'Run/time filtri, L0-L3 rollups', 'Drill-down un copy/export']],
+            ['Monitoring', 'Semantiskās probes', 'Konfigurējami trigeri, kas darbojas kā uzmanība.', ['Pozitīvie/negatīvie teksta pāri', 'Attēla probe, ROI, sliekšņi', 'Severity un bookmark uzvedība']],
+            ['Memory', 'Detekciju arhīvs', 'Notikumi un kadri tiek glabāti meklēšanai un regulēšanai.', ['SQLite notikumu rindas', 'Snapshots un vektoru lauki', 'Adaptīva saglabāšana un deduplikācija']],
+            ['Agent', 'Operatora aģents', 'Tool-calling aģents ar piekļuvi meklēšanai, probes, prompt iestatījumiem un atskaitēm.', ['Probe tuning un atskaites', 'Kanālu survey un deployment skills', 'Markdown playbooks kā runtime uzvedība']],
+          ],
+          stackHead: ['Tehnoloģiju steks', 'Steks ir saprotams, lokāls un paplašināms', 'Pašreizējā realizācija pragmatiski balstās uz Python, FAISS, lokāliem VLM un Luxriot HTTP API.'],
+          stackFilters: ['Visi slāņi', 'Vision', 'Runtime', 'Storage', 'Integration'],
+          stackRoles: ['vienota operatora konsole', 'semantiska attēlu un teksta reprezentācija', 'ātra līdzības meklēšana', 'reģionu un segmentu precizēšana', 'kadru apraksti un rollup kopsavilkumi', 'integrācija ar Evo workflow', 'detections, sessions, probes, rollup cache', 'fona apstrādes cikli'],
+          audienceHead: ['Sarunu līnijas', 'Kā skaidrot bez pārdošanas trokšņa', 'Trīs viena produkta versijas: inženieriem, operatoriem un integratoriem.'],
+          audienceTabs: ['Tehniskā auditorija', 'Operators', 'Integrators'],
+          audience: [
+            ['Tā ir Flask/Python lietotne ar FAISS-backed vizuālo meklēšanu, CLIP/SigLIP/DINO embeddings, Luxriot snapshot/bookmark integrāciju, OpenAI-savietojamu VLM pipeline, SQLite notikumu krātuvi un tool-calling aģentu.', ['Streams -> embeddings/summaries -> detections/rollups -> agent tools -> Luxriot actions.', 'Smagie vision heads ir izolēti un profilēti caur harness.', 'Mutācijas aizsargā admin token un preview-first aģenta plūsmas.']],
+            ['Sistēma palīdz operatoriem meklēt notikumus pēc apraksta, uzraudzīt izvēlētos scenārijus dzīvajās kamerās, lasīt plūsmu kopsavilkumus un ātri veidot grāmatzīmes.', ['Ir skaidrs, kuras probes ir ieslēgtas, kuros kanālos un ar kādiem sliekšņiem.', 'ROI padara probe nodomu redzamu un pārbaudāmu.', 'Kopsavilkumus var lasīt pa līmeņiem: batch, logs, stunda, ilgāks periods.']],
+            ['EVA AI var sākt kā PoC blakus Luxriot Evo: lasīt kanālus un snapshots, sūtīt grāmatzīmes, glabāt savu event/archive slāni un pēc tam padziļināt integrāciju.', ['Pirmais integrācijas līmenis: Luxriot HTTP API un bookmarks.', 'Nākamais līmenis: kopīgi kanālu, objektu, zonu un notikumu lifecycle atsauces dati.', 'Operatoru atgriezeniskā saite var kļūt par materiālu probe tuning.']],
+          ],
+          roadmapHead: ['Attīstības virziens', 'Ceļa karte: no PoC līdz operacionālas mācīšanās sistēmai', 'Virziens nav atsevišķu AI funkciju kaudze, bet vadāms uzmanības, atmiņas un darbību cikls.'],
+          roadmapTabs: ['Tuvākais posms', 'Vidējais posms', 'Tālākais posms'],
+          roadmap: [
+            [['Probe mācīšana un regulēšana', 'false positives / false negatives, research batches, preview diff, post-change metrics.'], ['Aģenta uzvedības nostiprināšana', 'research, deployment, tuning, reporting režīmi un drošas mutācijas.'], ['Scenāriju pakas', 'perimetrs, rinda, iekraušanas zona, atstāts objekts, ieeja/izeja.'], ['Grafiki', 'probe aktivitātes logi, dienas/nakts sliekšņi, VLM cadence, quiet hours.']],
+            [['DETR/YOLO slānis', 'detektori kā lēts vizuāls prior virs semantic probes, nevis aizvietotājs.'], ['Dziļāka Evo integrācija', 'kopīgi notikumi, lifecycle, channel/site/zone mappings, feedback loop.'], ['Markdown/wiki atmiņa', 'docs, skills, runbooks un procedūras kā aģenta retrieval slānis.'], ['Pastāvīgi rollups', 'DB shēma, summary embeddings, nedēļas atbildes bez video pārlūkošanas.']],
+            [['Uzmanības plānotājs', 'aģents lemj, kuras kameras skatīties biežāk un kur ieslēgt VLM.'], ['Evidence graph', 'saites starp detections, summaries, bookmarks, prompts, notes un dokumentāciju.'], ['Scenārija lifecycle', 'izveidot -> baseline -> palaist -> kalibrēt -> atskaite -> feedback -> versija.'], ['Operacionālā mācīšanās', 'sistēma mācās no reālas ekspluatācijas, ne tikai sākotnējās iestatīšanas.']],
+          ],
+          installHead: ['GitHub & instalācija', 'Repozitorija saite un ātrais starts', 'Ceļvedis ir kompakts un godīgs: CLIP-only profils visātrāk palaižas uz demo laptopa, bet DINO/Mask2Former vajag GPU un weights.'],
+          install: ['Repozitorijs', 'Pirmkods:', ['Pašreizējais zars', 'Pagaidām atsevišķi no main.'], ['Linux/macOS', 'Windows 11', 'Stability profile'], 'Priekšnosacījumi'],
+          metrics: [
+            ['Python 3.10+', 'Pašreizējais zars atbalsta arī Python 3.13.'],
+            ['CUDA GPU', 'Ieteicams DINO, Mask2Former un blīvām probe slodzēm.'],
+            ['LM Studio/vLLM', 'Neobligāti VLM kopsavilkumiem un aģenta vision plūsmām.'],
+            ['Luxriot Evo S', 'Neobligāti live monitoringam, snapshots un bookmarks.'],
+          ],
+          constraintsHead: ['Inženiertehniska godīgums', 'Kas jāpasaka uzreiz', 'Šie ierobežojumi palīdz noturēt uzticību: projekts izskatās spēcīgāks, kad tas netiek pasniegts kā maģija.'],
+          constraints: [
+            ['Alpha PoC', 'Tas ir strādājošs exhibition PoC, nevis sertificēta safety/security sistēma.'],
+            ['GPU budžets', 'DINO un Mask2Former jāprofilē uz mērķa dzelžiem; CLIP-only ir ātrāks pirmajai palaišanai.'],
+            ['Prompt kvalitāte', 'VLM kopsavilkumi ir atkarīgi no modeļa, prompt, sampling cadence un kameras kvalitātes.'],
+            ['Krātuves evolūcija', 'SQLite/JSON/faili pietiek PoC, bet multi-site produkcijai vajadzīga formālāka shēma.'],
+            ['Probe kalibrācija', 'Semantic probes vajag kalibrēt uz reālām kamerām un operatoru atgriezeniskās saites.'],
+            ['Bookmark higiēna', 'Cooldown/dedupe gates ir obligāti, citādi notikumu žurnāls kļūst trokšņains.'],
+          ],
+          footer: ['Luxriot EVA AI pirmspārdošanas vienlapa. Veidota no projekta dokumentiem un aktuālā koda konteksta.', 'Uz augšu'],
+        },
+      };
+
+      function setText(selector, value) {
+        qsa(selector).forEach((el) => { el.textContent = value; });
+      }
+
+      function setHead(section, values) {
+        setText(`${section} .section-kicker`, values[0]);
+        setText(`${section} h2`, values[1]);
+        setText(`${section} .section-lead`, values[2]);
+      }
+
+      function setCardTriples(selector, rows) {
+        qsa(selector).forEach((card, idx) => {
+          const row = rows[idx];
+          if (!row) return;
+          const label = qs('.label, .cap-tag', card);
+          const h3 = qs('h3', card);
+          const p = qs('p', card);
+          if (label) label.textContent = row[0];
+          if (h3) h3.textContent = row[1];
+          if (p) p.textContent = row[2];
+          if (Array.isArray(row[3])) {
+            qsa('li', card).forEach((li, liIdx) => { li.textContent = row[3][liIdx] || ''; });
+          }
+        });
+      }
+
+      function setNodePairs(selector, rows) {
+        qsa(selector).forEach((node, idx) => {
+          const row = rows[idx];
+          if (!row) return;
+          const b = qs('b', node);
+          const span = qs('span', node);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+      }
+
+      function applyLanguage(lang) {
+        const pack = I18N[lang] || I18N.en;
+        document.documentElement.lang = lang;
+        document.title = pack.title;
+        localStorage.setItem('eva-presales-lang', lang);
+
+        qsa('[data-lang]').forEach((btn) => {
+          const active = btn.dataset.lang === lang;
+          btn.classList.toggle('active', active);
+          btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+
+        setText('#themeToggle', '◐');
+        const themeToggleBtn = qs('#themeToggle');
+        if (themeToggleBtn) themeToggleBtn.setAttribute('aria-label', pack.themeLabel);
+        qsa('.nav-links a').forEach((a, idx) => { a.textContent = pack.nav[idx] || a.textContent; });
+        setText('.nav-actions .btn.primary', pack.github);
+        setText('.eyebrow', pack.heroKicker);
+        qsa('.hero-title-part').forEach((el, idx) => { el.textContent = pack.heroTitle[idx] || ''; });
+        setText('.hero-copy', pack.heroCopy);
+        qsa('.hero-actions .btn').forEach((btn, idx) => { btn.textContent = pack.heroButtons[idx] || btn.textContent; });
+        qsa('.signal').forEach((signal, idx) => {
+          const row = pack.signals[idx];
+          if (!row) return;
+          const b = qs('b', signal);
+          const span = qs('span', signal);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+        qsa('.radar-node').forEach((node, idx) => {
+          const row = pack.radar[idx];
+          if (!row) return;
+          const b = qs('b', node);
+          const span = qs('span', node);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+
+        setHead('#formula', pack.formulaHead);
+        setCardTriples('.formula-card', pack.formula);
+        setHead('#architecture', pack.architectureHead);
+        qsa('.diagram-tab').forEach((tab, idx) => {
+          const row = pack.diagramTabs[idx];
+          if (!row) return;
+          const b = qs('b', tab);
+          const span = qs('span', tab);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+        setNodePairs('[data-diagram-panel="current"] .node', pack.diagramCurrent);
+        setNodePairs('[data-diagram-panel="probes"] .node', pack.diagramProbes);
+        qsa('[data-diagram-panel="memory"] .ladder-step').forEach((step, idx) => {
+          const row = pack.diagramMemory[idx];
+          if (!row) return;
+          const b = qs('.step-copy b', step);
+          const span = qs('.step-copy span', step);
+          const meta = qs('.step-meta', step);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+          if (meta) meta.textContent = row[2];
+        });
+        setNodePairs('[data-diagram-panel="memory"] > .memory-ladder > .node', [pack.diagramMemoryAgent]);
+        setNodePairs('[data-diagram-panel="loop"] .loop-node', pack.diagramLoop);
+
+        setHead('#capabilities', pack.capabilitiesHead);
+        qsa('[data-cap-filter]').forEach((btn, idx) => { btn.textContent = pack.capFilters[idx] || btn.textContent; });
+        setCardTriples('.cap-card', pack.caps);
+        setHead('#stack', pack.stackHead);
+        qsa('[data-stack-filter]').forEach((btn, idx) => { btn.textContent = pack.stackFilters[idx] || btn.textContent; });
+        qsa('.stack-row').forEach((row, idx) => {
+          const role = qs('.stack-role', row);
+          if (role) role.textContent = pack.stackRoles[idx] || role.textContent;
+        });
+
+        setHead('#audience', pack.audienceHead);
+        qsa('[data-audience]').forEach((btn, idx) => { btn.textContent = pack.audienceTabs[idx] || btn.textContent; });
+        qsa('.audience-panel').forEach((panel, idx) => {
+          const row = pack.audience[idx];
+          if (!row) return;
+          const p = qs('p', panel);
+          if (p) p.textContent = row[0];
+          qsa('.talk-point', panel).forEach((point, pointIdx) => { point.textContent = row[1][pointIdx] || ''; });
+        });
+
+        setHead('#roadmap', pack.roadmapHead);
+        qsa('[data-roadmap]').forEach((btn, idx) => { btn.textContent = pack.roadmapTabs[idx] || btn.textContent; });
+        qsa('[data-roadmap-panel]').forEach((panel, panelIdx) => {
+          qsa('.roadmap-card', panel).forEach((card, cardIdx) => {
+            const row = pack.roadmap[panelIdx] && pack.roadmap[panelIdx][cardIdx];
+            if (!row) return;
+            const b = qs('b', card);
+            const span = qs('span', card);
+            if (b) b.textContent = row[0];
+            if (span) span.textContent = row[1];
+          });
+        });
+
+        setHead('#install', pack.installHead);
+        const installPanels = qsa('#install .install-panel');
+        const repoTitle = qs('h3', installPanels[0]);
+        const prereqTitle = qs('h3', installPanels[1]);
+        if (repoTitle) repoTitle.textContent = pack.install[0];
+        const installCopy = qs('.install-copy');
+        if (installCopy) {
+          const link = installCopy.querySelector('a');
+          installCopy.firstChild.textContent = `${pack.install[1]} `;
+          if (link) link.textContent = 'github.com/SashaYerashoff/evo-ssearch';
+        }
+        const branchNote = qs('.branch-note');
+        if (branchNote) {
+          const label = qs('b', branchNote);
+          const copy = qs('span', branchNote);
+          if (label) label.textContent = pack.install[2][0];
+          if (copy) {
+            copy.innerHTML = pack.install[2][1].replace('main', '<code>main</code>');
+          }
+        }
+        qsa('[data-install]').forEach((btn, idx) => { btn.textContent = pack.install[3][idx] || btn.textContent; });
+        if (prereqTitle) prereqTitle.textContent = pack.install[4];
+        qsa('.metric-card').forEach((card, idx) => {
+          const row = pack.metrics[idx];
+          if (!row) return;
+          const b = qs('b', card);
+          const span = qs('span', card);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+
+        setHead('#constraints', pack.constraintsHead);
+        qsa('.constraint-card').forEach((card, idx) => {
+          const row = pack.constraints[idx];
+          if (!row) return;
+          const b = qs('b', card);
+          const span = qs('span', card);
+          if (b) b.textContent = row[0];
+          if (span) span.textContent = row[1];
+        });
+        const footerText = qs('.footer-inner > span');
+        const footerTop = qs('.footer-inner .btn');
+        if (footerText) footerText.textContent = pack.footer[0];
+        if (footerTop) footerTop.textContent = pack.footer[1];
+      }
+
+      qsa('[data-lang]').forEach((btn) => {
+        btn.addEventListener('click', () => applyLanguage(btn.dataset.lang || 'ru'));
+      });
+
+      const queryLang = new URLSearchParams(window.location.search).get('lang');
+      const initialLang = ['ru', 'en', 'lv'].includes(queryLang || '')
+        ? queryLang
+        : 'en';
+      applyLanguage(initialLang);
+
+      const progress = qs('#progressBar');
+      const navLinks = qsa('.nav-links a');
+      const sections = navLinks.map((link) => qs(link.getAttribute('href'))).filter(Boolean);
+
+      function updateProgress() {
+        const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+        const pct = Math.min(1, Math.max(0, window.scrollY / max));
+        if (progress) progress.style.width = `${pct * 100}%`;
+
+        let activeId = '';
+        for (const section of sections) {
+          if (section.getBoundingClientRect().top <= 120) activeId = section.id;
+        }
+        navLinks.forEach((link) => {
+          link.classList.toggle('active', link.getAttribute('href') === `#${activeId}`);
+        });
+      }
+
+      window.addEventListener('scroll', updateProgress, { passive: true });
+      window.addEventListener('resize', updateProgress);
+      updateProgress();
+
+      const revealObserver = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) entry.target.classList.add('visible');
+        });
+      }, { threshold: 0.14 });
+      qsa('.reveal').forEach((el) => revealObserver.observe(el));
+
+      qsa('[data-diagram]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.diagram;
+          qsa('[data-diagram]').forEach((item) => {
+            const active = item === btn;
+            item.classList.toggle('active', active);
+            item.setAttribute('aria-selected', active ? 'true' : 'false');
+          });
+          qsa('[data-diagram-panel]').forEach((panel) => {
+            panel.classList.toggle('active', panel.dataset.diagramPanel === key);
+          });
+        });
+      });
+
+      function bindFilter(buttonSelector, itemSelector, buttonKey, itemTagsKey, hiddenClass = 'hidden', dimInstead = false) {
+        qsa(buttonSelector).forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const key = btn.dataset[buttonKey];
+            qsa(buttonSelector).forEach((item) => item.classList.toggle('active', item === btn));
+            qsa(itemSelector).forEach((item) => {
+              const tags = String(item.dataset[itemTagsKey] || '').split(/\s+/);
+              const match = key === 'all' || tags.includes(key);
+              if (dimInstead) {
+                item.classList.toggle('dimmed', !match);
+              } else {
+                item.classList.toggle(hiddenClass, !match);
+              }
+            });
+          });
+        });
+      }
+
+      bindFilter('[data-cap-filter]', '.cap-card', 'capFilter', 'capTags', 'dimmed', true);
+      bindFilter('[data-stack-filter]', '.stack-row', 'stackFilter', 'stackTags', 'hidden', false);
+
+      qsa('[data-audience]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.audience;
+          qsa('[data-audience]').forEach((item) => item.classList.toggle('active', item === btn));
+          qsa('[data-audience-panel]').forEach((panel) => {
+            panel.classList.toggle('active', panel.dataset.audiencePanel === key);
+          });
+        });
+      });
+
+      qsa('[data-roadmap]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.roadmap;
+          qsa('[data-roadmap]').forEach((item) => item.classList.toggle('active', item === btn));
+          qsa('[data-roadmap-panel]').forEach((panel) => {
+            panel.classList.toggle('active', panel.dataset.roadmapPanel === key);
+          });
+        });
+      });
+
+      qsa('[data-install]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const key = btn.dataset.install;
+          qsa('[data-install]').forEach((item) => item.classList.toggle('active', item === btn));
+          qsa('[data-install-panel]').forEach((panel) => {
+            panel.classList.toggle('active', panel.dataset.installPanel === key);
+          });
+        });
+      });
+
+      qsa('[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const target = qs(btn.dataset.copy);
+          if (!target) return;
+          const text = target.textContent || '';
+          try {
+            await navigator.clipboard.writeText(text);
+            const old = btn.textContent;
+            btn.textContent = 'Copied';
+            setTimeout(() => { btn.textContent = old; }, 1200);
+          } catch (_) {
+            btn.textContent = 'Select';
+          }
+        });
+      });
+
+      const themeToggle = qs('#themeToggle');
+      const storedTheme = localStorage.getItem('eva-presales-theme');
+      if (storedTheme === 'light') document.body.classList.add('light');
+      themeToggle?.addEventListener('click', () => {
+        document.body.classList.toggle('light');
+        localStorage.setItem('eva-presales-theme', document.body.classList.contains('light') ? 'light' : 'dark');
+      });
+
+      const canvas = qs('#heroCanvas');
+      const ctx = canvas?.getContext('2d');
+      const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      let points = [];
+
+      function resizeCanvas() {
+        if (!canvas || !ctx) return;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = Math.min(2, window.devicePixelRatio || 1);
+        canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+        canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const count = Math.max(28, Math.min(74, Math.floor(rect.width / 18)));
+        points = Array.from({ length: count }, () => ({
+          x: Math.random() * rect.width,
+          y: Math.random() * rect.height,
+          vx: (Math.random() - 0.5) * 0.26,
+          vy: (Math.random() - 0.5) * 0.26,
+          r: 1 + Math.random() * 1.8
+        }));
+      }
+
+      function drawCanvas() {
+        if (!canvas || !ctx) return;
+        const rect = canvas.getBoundingClientRect();
+        ctx.clearRect(0, 0, rect.width, rect.height);
+        const light = document.body.classList.contains('light');
+        const line = light ? 'rgba(24, 32, 42, 0.12)' : 'rgba(49, 211, 199, 0.14)';
+        const dot = light ? 'rgba(24, 32, 42, 0.32)' : 'rgba(49, 211, 199, 0.55)';
+
+        for (let i = 0; i < points.length; i += 1) {
+          const p = points[i];
+          if (!reduceMotion) {
+            p.x += p.vx;
+            p.y += p.vy;
+            if (p.x < 0 || p.x > rect.width) p.vx *= -1;
+            if (p.y < 0 || p.y > rect.height) p.vy *= -1;
+          }
+
+          for (let j = i + 1; j < points.length; j += 1) {
+            const q = points[j];
+            const dx = p.x - q.x;
+            const dy = p.y - q.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 145) {
+              ctx.globalAlpha = (145 - dist) / 145;
+              ctx.strokeStyle = line;
+              ctx.beginPath();
+              ctx.moveTo(p.x, p.y);
+              ctx.lineTo(q.x, q.y);
+              ctx.stroke();
+            }
+          }
+
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = dot;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        requestAnimationFrame(drawCanvas);
+      }
+
+      if (canvas && ctx) {
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        drawCanvas();
+      }
+    })();
+  </script>
+</body>
+</html>

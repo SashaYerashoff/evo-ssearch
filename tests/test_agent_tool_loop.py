@@ -15,13 +15,13 @@ class _FakeStore:
     def create_session(self, **_owner):
         return "session-1"
 
-    def touch_session(self, _session_id, title=None):
+    def touch_session(self, _session_id, title=None, **_owner):
         return None
 
     def add_message(self, session_id, **message):
         self.messages.append({"session_id": session_id, **message})
 
-    def load_history(self, _session_id):
+    def load_history(self, _session_id, **_owner):
         return [{"role": "user", "content": "test"}]
 
 

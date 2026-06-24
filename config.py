@@ -123,7 +123,7 @@ def _get_lm_profiles(
     return profiles
 
 
-def _get_app_version(default: str = "β 0.8.0") -> str:
+def _get_app_version(default: str = "β 0.8.1") -> str:
     env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
     if env_value:
         return env_value
@@ -265,9 +265,9 @@ class Config:
         'EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED',
         'False',
     )
-    ARCHIVE_STORE = os.getenv('EVOSSEARCH_ARCHIVE_STORE', 'auto').strip().lower() or 'auto'
-    if ARCHIVE_STORE not in {'auto', 'postgres', 'sqlite'}:
-        ARCHIVE_STORE = 'auto'
+    ARCHIVE_STORE = os.getenv('EVOSSEARCH_ARCHIVE_STORE', 'postgres').strip().lower() or 'postgres'
+    if ARCHIVE_STORE != 'postgres':
+        ARCHIVE_STORE = 'postgres'
     ARCHIVE_TENANT_ID = (
         os.getenv('EVOSSEARCH_ARCHIVE_TENANT_ID', AUTH_TENANT_ID).strip()
     )
@@ -481,16 +481,29 @@ class Config:
         LUXRIOT_SUMMARY_HISTORY_LIMIT = _SUMMARY_DEFAULT_LIMIT
     LUXRIOT_SUMMARY_HISTORY_LIMIT = max(40, LUXRIOT_SUMMARY_HISTORY_LIMIT)
     try:
+        LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH', '4')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = 4
+    LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = max(
+        1,
+        min(16, LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH),
+    )
+    try:
         ARCHIVE_ESTIMATE_CHANNELS = int(os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS', '50'))
     except (TypeError, ValueError):
         ARCHIVE_ESTIMATE_CHANNELS = 50
     ARCHIVE_ESTIMATE_CHANNELS = max(1, min(10000, ARCHIVE_ESTIMATE_CHANNELS))
     try:
         ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = float(
-            os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH', '2.5')
+            os.getenv(
+                'EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH',
+                str(float(LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH)),
+            )
         )
     except (TypeError, ValueError):
-        ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = 2.5
+        ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = float(LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH)
     ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = max(0.0, min(32.0, ARCHIVE_ESTIMATE_FRAMES_PER_BATCH))
     try:
         ARCHIVE_ESTIMATE_AVG_JPEG_KB = float(
@@ -520,11 +533,19 @@ class Config:
     if LUXRIOT_MAX_BUFFER_FRAMES < 12:
         LUXRIOT_MAX_BUFFER_FRAMES = 12
     LUXRIOT_AUTO_BOOKMARKS = _get_bool_env('EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS', 'False')
+    OFFLINE_VIDEO_ENABLED = _get_bool_env('EVOSSEARCH_OFFLINE_VIDEO_ENABLED', 'False')
+    PROBE_SNAP_ENABLED = _get_bool_env('EVOSSEARCH_PROBE_SNAP_ENABLED', 'False')
+    INDEXED_FOLDER_ENABLED = _get_bool_env('EVOSSEARCH_INDEXED_FOLDER_ENABLED', 'False')
     try:
         LUXRIOT_BOOKMARK_COOLDOWN_SEC = float(os.getenv('EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC', '60.0'))
     except (TypeError, ValueError):
         LUXRIOT_BOOKMARK_COOLDOWN_SEC = 60.0
     LUXRIOT_BOOKMARK_COOLDOWN_SEC = max(0.0, LUXRIOT_BOOKMARK_COOLDOWN_SEC)
+    try:
+        LUXRIOT_ALERTS_MAX_PER_BATCH = int(os.getenv('EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH', '8'))
+    except (TypeError, ValueError):
+        LUXRIOT_ALERTS_MAX_PER_BATCH = 8
+    LUXRIOT_ALERTS_MAX_PER_BATCH = max(1, min(32, LUXRIOT_ALERTS_MAX_PER_BATCH))
     LUXRIOT_SYSTEM_PROMPT_DEFAULT = os.getenv('EVOSSEARCH_LUXRIOT_SYSTEM_PROMPT_DEFAULT', '').strip()
     LUXRIOT_ALERTS_JSON_PROMPT = os.getenv('EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT', '').strip()
     LUXRIOT_SEVERITY_MAP = {
@@ -568,13 +589,17 @@ class Config:
         (
             "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
             "Return Markdown using exactly these sections:\n"
-            "### Window snapshot\n"
-            "### Scene baseline\n"
-            "### Key changes\n"
-            "### Alerts/signals\n"
-            "### Operator notes\n"
-            "Rules: keep factual language; deduplicate repeated observations; include timestamps when available; "
-            "avoid phrases like 'L1 rollup from L0'."
+            "### Window Snapshot\n"
+            "### Routine Baseline\n"
+            "### Preserved Deviations\n"
+            "### Alert Ledger\n"
+            "### Alert Tuning Notes\n"
+            "### Alerts/Signals\n"
+            "### Operator Notes\n"
+            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
+            "alert_tuning_notes, and ignore_as_routine. Rules: keep factual language; preserve every grounded "
+            "alert/deviation even when the rest of the window is routine; do not classify behavior as illegal; "
+            "describe observable security/safety facts requiring operator review; avoid phrases like 'L1 rollup from L0'."
         ),
     ).strip()
     LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT = os.getenv(
@@ -582,12 +607,16 @@ class Config:
         (
             "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
             "Return Markdown using exactly these sections:\n"
-            "### Window snapshot\n"
-            "### Routine baseline\n"
-            "### Significant changes\n"
-            "### Alerts/signals\n"
-            "### Operator notes\n"
-            "Rules: preserve meaningful deviations from routine; avoid repeating unchanged background details; "
+            "### Window Snapshot\n"
+            "### Routine Baseline\n"
+            "### Preserved Deviations\n"
+            "### Alert Ledger\n"
+            "### Alert Tuning Notes\n"
+            "### Alerts/Signals\n"
+            "### Operator Notes\n"
+            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
+            "alert_tuning_notes, and ignore_as_routine. Rules: preserve meaningful deviations from routine; "
+            "never compress alerts or operator-review incidents into routine; avoid repeating unchanged background details; "
             "keep concise, operator-facing language."
         ),
     ).strip()
@@ -596,12 +625,16 @@ class Config:
         (
             "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
             "Return Markdown using exactly these sections:\n"
-            "### Window snapshot\n"
-            "### Persistent patterns\n"
-            "### Notable events\n"
-            "### Risks and follow-ups\n"
-            "### Operator notes\n"
-            "Rules: emphasize trend shifts and durable signals; remove duplicate wording; focus on actionable context."
+            "### Window Snapshot\n"
+            "### Routine Baseline\n"
+            "### Preserved Deviations\n"
+            "### Alert Ledger\n"
+            "### Alert Tuning Notes\n"
+            "### Alerts/Signals\n"
+            "### Operator Notes\n"
+            "Append MEMORY_UPDATE_JSON with durable routine_baseline, active_watchlist, preserved_deviations, "
+            "alert_tuning_notes, and ignore_as_routine. Rules: emphasize trend shifts and durable signals; "
+            "preserve real security/safety deviations; remove duplicate wording; focus on actionable context."
         ),
     ).strip()
     LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'

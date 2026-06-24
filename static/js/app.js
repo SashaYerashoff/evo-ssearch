@@ -84,6 +84,8 @@
     const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
     const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
     const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
+    const luxriotPromptLayerDetails = document.getElementById('luxriotPromptLayerDetails');
+    const luxriotPromptLayerContent = document.getElementById('luxriotPromptLayerContent');
     const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
     const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
     const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
@@ -220,6 +222,21 @@
     const closeImageLightboxBtn = document.getElementById('closeImageLightbox');
     const imageLightboxImg = document.getElementById('imageLightboxImg');
     const imageLightboxMeta = document.getElementById('imageLightboxMeta');
+    const archiveReviewModal = document.getElementById('archiveReviewModal');
+    const closeArchiveReviewBtn = document.getElementById('closeArchiveReview');
+    const archiveReviewTitle = document.getElementById('archiveReviewTitle');
+    const archiveReviewQuery = document.getElementById('archiveReviewQuery');
+    const archiveReviewMatch = document.getElementById('archiveReviewMatch');
+    const archiveReviewImg = document.getElementById('archiveReviewImg');
+    const archiveReviewFrameEmpty = document.getElementById('archiveReviewFrameEmpty');
+    const archiveReviewChannel = document.getElementById('archiveReviewChannel');
+    const archiveReviewFrameRole = document.getElementById('archiveReviewFrameRole');
+    const archiveReviewTimestamp = document.getElementById('archiveReviewTimestamp');
+    const archiveReviewSummary = document.getElementById('archiveReviewSummary');
+    const archiveReviewDescribeBtn = document.getElementById('archiveReviewDescribeBtn');
+    const archiveReviewSimilarBtn = document.getElementById('archiveReviewSimilarBtn');
+    const archiveReviewJumpBtn = document.getElementById('archiveReviewJumpBtn');
+    const archiveReviewCopyBtn = document.getElementById('archiveReviewCopyBtn');
     
     let currentFolder = '';
     let currentMode = 'archive';
@@ -272,6 +289,7 @@
         failed: false,
     };
     let luxriotPromptModalTab = 'stream';
+    let luxriotPromptLayers = null;
     let luxriotInitialized = false;
     const probeHitsCacheByKey = {};
     const probeHitsOffsetByKey = {};
@@ -304,6 +322,8 @@
     let archiveDetectionsHasMore = false;
     let archiveScoreThreshold = 0;
     let archiveScoreSliderPercent = 0;
+    let archiveLastQueryText = '';
+    let archiveReviewContext = null;
     let archiveScoreRange = {
         count: 0,
         min: null,
@@ -389,6 +409,7 @@
 
     function applyLmModelCatalogToUi() {
         const defaultModel = normalizeModelId(lmModelCatalog.defaultModel);
+        const offlineDefaultModel = normalizeModelId(lmModelCatalog.offlineDefaultModel || lmModelCatalog.agentDefaultModel || defaultModel);
         if (luxriotLiveModelInput) {
             const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
             const preferredLiveModel = normalizeModelId(luxriotLiveModelInput.value)
@@ -399,11 +420,12 @@
         }
         if (videoModelInput) {
             const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
+            const storedVideoModel = normalizeModelId(localStorage.getItem(VIDEO_MODEL_STORAGE_KEY));
             const preferredVideoModel = normalizeModelId(videoModelInput.value)
-                || normalizeModelId(localStorage.getItem(VIDEO_MODEL_STORAGE_KEY))
-                || autoSelector
+                || (storedVideoModel === autoSelector ? '' : storedVideoModel)
+                || offlineDefaultModel
                 || defaultModel;
-            setModelSelectOptions(videoModelInput, preferredVideoModel, defaultModel, { includeAuto: true });
+            setModelSelectOptions(videoModelInput, preferredVideoModel, offlineDefaultModel || defaultModel, { includeAuto: true });
         }
         updateLuxriotStreamContext();
     }
@@ -423,6 +445,8 @@
                 lmModelCatalog = {
                     models: uniqueModelIds(data.models || []),
                     defaultModel: normalizeModelId(data.default_model),
+                    agentDefaultModel: normalizeModelId(data.agent_default_model),
+                    offlineDefaultModel: normalizeModelId(data.offline_default_model),
                     autoModelSelector: normalizeModelId(data.auto_model_selector || LM_AUTO_MODEL_SELECTOR),
                     autoModelLabel: normalizeModelId(data.auto_model_label || LM_AUTO_MODEL_LABEL),
                     vlmBalancer: {
@@ -440,6 +464,8 @@
                         videoModelInput ? videoModelInput.value : '',
                     ),
                     defaultModel: normalizeModelId(lmModelCatalog.defaultModel || ''),
+                    agentDefaultModel: normalizeModelId(lmModelCatalog.agentDefaultModel || ''),
+                    offlineDefaultModel: normalizeModelId(lmModelCatalog.offlineDefaultModel || ''),
                     autoModelSelector: normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR),
                     autoModelLabel: normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL),
                     vlmBalancer: lmModelCatalog.vlmBalancer || { enabled: false, profileIds: [] },
@@ -606,6 +632,7 @@
         if (!value || value === '#') return false;
         if (/^data:image\//i.test(value)) return true;
         if (/\/detections\/image\?/i.test(value)) return true;
+        if (/\/detections\/thumbnail\/\d+/i.test(value)) return true;
         if (/^\/image\//i.test(value)) return true;
         if (/\/luxriot\/snapshot/i.test(value)) return true;
         return /\.(?:png|jpe?g|webp|gif|bmp|svg)(?:[?#].*)?$/i.test(value);
@@ -852,13 +879,14 @@
             return { main: mainText, json: jsonBlock };
         }
 
-        const marker = 'ALERTS_JSON:';
-        const markerIndex = full.toUpperCase().indexOf(marker);
-        if (markerIndex >= 0) {
-            const mainText = full.slice(0, markerIndex).trim();
-            const jsonBlock = full.slice(markerIndex + marker.length).trim();
-            if (jsonBlock) {
-                return { main: mainText, json: jsonBlock };
+        for (const marker of ['ALERTS_JSON:', 'MEMORY_UPDATE_JSON:']) {
+            const markerIndex = full.toUpperCase().indexOf(marker);
+            if (markerIndex >= 0) {
+                const mainText = full.slice(0, markerIndex).trim();
+                const jsonBlock = full.slice(markerIndex + marker.length).trim();
+                if (jsonBlock) {
+                    return { main: mainText, json: jsonBlock };
+                }
             }
         }
 
@@ -938,6 +966,35 @@
         const values = Array.isArray(permissions) ? permissions : [];
         if (!values.length) return true;
         return values.some((permission) => userHasPermission(permission));
+    }
+
+    function userHasAnyRole(roles = []) {
+        const values = Array.isArray(roles) ? roles.map((role) => String(role || '').trim().toLowerCase()).filter(Boolean) : [];
+        if (!values.length) return true;
+        if (!AUTH_ENABLED) return true;
+        if (!authCurrentUser || !Array.isArray(authCurrentUser.roles)) return false;
+        const currentRoles = authCurrentUser.roles.map((role) => String(role || '').trim().toLowerCase()).filter(Boolean);
+        return values.some((role) => currentRoles.includes(role));
+    }
+
+    function canViewVlmMachineJson() {
+        return userHasAnyRole(['admin', 'engineer']);
+    }
+
+    function renderSummaryMachineJson(jsonText, label = 'Machine JSON') {
+        const raw = String(jsonText || '').trim();
+        if (!raw) return '';
+        if (!canViewVlmMachineJson()) {
+            return '<div class="summary-json-hidden" title="Visible to admin and engineer roles">Machine data hidden</div>';
+        }
+        const lineCount = raw.split(/\r?\n/).filter((line) => line.trim()).length;
+        const sizeLabel = `${lineCount || 1} line${lineCount === 1 ? '' : 's'}`;
+        return `
+            <details class="summary-json-disclosure">
+                <summary><span>${escapeHtml(label)}</span><span class="summary-json-meta">${escapeHtml(sizeLabel)}</span></summary>
+                <div class="summary-json-muted">${renderMarkdown(raw)}</div>
+            </details>
+        `;
     }
 
     function canUseMode(mode) {
@@ -1154,6 +1211,89 @@
         return Math.round(numeric).toLocaleString();
     }
 
+    function luxriotHealthCount(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+        return Math.round(numeric);
+    }
+
+    function truncateLuxriotHealthText(value, maxLength = 180) {
+        const text = String(value || '').trim();
+        if (!text || text.length <= maxLength) return text;
+        return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+    }
+
+    function getLuxriotStreamHealth(stream) {
+        if (!stream || typeof stream !== 'object') return null;
+        const pending = luxriotHealthCount(stream.pending_frames);
+        const maxBuffer = luxriotHealthCount(stream.max_buffer_frames);
+        const droppedFrames = luxriotHealthCount(stream.dropped_frames);
+        const droppedBatches = luxriotHealthCount(stream.queue_dropped_batches);
+        const logsTotalRaw = stream.logs_total ?? (Array.isArray(stream.logs) ? stream.logs.length : null);
+        const logsTotal = logsTotalRaw === null || logsTotalRaw === undefined ? null : luxriotHealthCount(logsTotalRaw);
+        const lastError = String(stream.last_error || '').trim();
+        const lagThreshold = maxBuffer > 0 ? Math.max(1, Math.ceil(maxBuffer * 0.8)) : 0;
+        const titleParts = [
+            `state ${stream.running ? 'running' : 'stopped'}`,
+            maxBuffer > 0
+                ? `pending ${formatCompactCount(pending)}/${formatCompactCount(maxBuffer)}`
+                : `pending ${formatCompactCount(pending)}`,
+        ];
+        if (droppedFrames > 0) titleParts.push(`dropped frames ${formatCompactCount(droppedFrames)}`);
+        if (droppedBatches > 0) titleParts.push(`queue drops ${formatCompactCount(droppedBatches)}`);
+        if (logsTotal !== null) titleParts.push(`logs ${formatCompactCount(logsTotal)}`);
+        if (lastError) {
+            titleParts.unshift(`error ${truncateLuxriotHealthText(lastError)}`);
+            return { label: 'error', tone: 'error', title: titleParts.join(' | ') };
+        }
+        if (droppedFrames > 0 || droppedBatches > 0) {
+            return { label: 'drops', tone: 'warning', title: titleParts.join(' | ') };
+        }
+        if (lagThreshold > 0 && pending >= lagThreshold) {
+            titleParts.push(`lag threshold ${formatCompactCount(lagThreshold)}`);
+            return { label: 'lag', tone: 'warning', title: titleParts.join(' | ') };
+        }
+        return { label: 'ok', tone: 'ok', title: titleParts.join(' | ') };
+    }
+
+    function renderLuxriotHealthBadge(health) {
+        if (!health) return '';
+        const label = health.label || 'ok';
+        const tone = health.tone || 'ok';
+        return `<span class="luxriot-health-badge ${escapeHtml(tone)} luxriot-health-${escapeHtml(label)}" title="${escapeHtml(health.title || label)}">${escapeHtml(label)}</span>`;
+    }
+
+    function updateLuxriotStreamHealthBadge(stream) {
+        if (!luxriotStreamState) return;
+        let badge = document.getElementById('luxriotStreamHealth');
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.id = 'luxriotStreamHealth';
+            luxriotStreamState.insertAdjacentElement('afterend', badge);
+        }
+        const health = getLuxriotStreamHealth(stream);
+        if (!health) {
+            badge.className = 'luxriot-health-badge is-hidden';
+            badge.textContent = '';
+            badge.removeAttribute('title');
+            return;
+        }
+        badge.className = `luxriot-health-badge ${health.tone || 'ok'} luxriot-health-${health.label || 'ok'}`;
+        badge.textContent = health.label || 'ok';
+        badge.title = health.title || health.label || 'ok';
+    }
+
+    function appendLuxriotStatusHealthBadge(stream) {
+        if (!luxriotStatusLabel) return;
+        const health = getLuxriotStreamHealth(stream);
+        if (!health) return;
+        const badge = document.createElement('span');
+        badge.className = `luxriot-health-badge ${health.tone || 'ok'} luxriot-health-${health.label || 'ok'}`;
+        badge.textContent = health.label || 'ok';
+        badge.title = health.title || health.label || 'ok';
+        luxriotStatusLabel.appendChild(badge);
+    }
+
     function formatLuxriotCadence(intervalSec) {
         const interval = Number(intervalSec);
         if (!Number.isFinite(interval) || interval <= 0) return 'n/a';
@@ -1278,6 +1418,7 @@
             luxriotStreamState.className = `luxriot-stream-state ${stateClass}`;
             luxriotStreamState.textContent = stateText;
         }
+        updateLuxriotStreamHealthBadge(videoStream);
         if (luxriotContextToggleCaptureBtn) {
             luxriotContextToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
             luxriotContextToggleCaptureBtn.classList.toggle('primary', !running);
@@ -1962,6 +2103,47 @@
         return 'Editing system prompt.';
     }
 
+    function getLuxriotPromptLayerForTab(tab) {
+        const layers = luxriotPromptLayers && typeof luxriotPromptLayers === 'object' ? luxriotPromptLayers : null;
+        if (!layers) return null;
+        const normalized = String(tab || '').trim().toLowerCase();
+        if (normalized === 'stream') {
+            return layers.stream && typeof layers.stream === 'object' ? layers.stream : null;
+        }
+        const rollups = layers.rollups && typeof layers.rollups === 'object' ? layers.rollups : {};
+        const level = normalized.toUpperCase();
+        return rollups[level] && typeof rollups[level] === 'object' ? rollups[level] : null;
+    }
+
+    function updateLuxriotPromptLayerDetails() {
+        if (!luxriotPromptLayerDetails || !luxriotPromptLayerContent) return;
+        const layer = getLuxriotPromptLayerForTab(luxriotPromptModalTab);
+        if (!layer) {
+            luxriotPromptLayerDetails.classList.add('is-hidden');
+            luxriotPromptLayerContent.textContent = '';
+            return;
+        }
+        const lines = [];
+        const notes = Array.isArray(layer.notes) ? layer.notes : [];
+        lines.push('Editable prompt: the text box above.');
+        notes.forEach((note) => {
+            const text = String(note || '').trim();
+            if (text) lines.push(`- ${text}`);
+        });
+        const backendInstructions = String(layer.backend_instructions || '').trim();
+        if (backendInstructions) {
+            lines.push(`Backend instructions appended by EVA AI:\n${backendInstructions}`);
+        }
+        const backendMemory = String(layer.backend_memory || layer.active_memory || '').trim();
+        if (backendMemory) {
+            lines.push(`Active channel memory appended by EVA AI:\n${backendMemory}`);
+        } else {
+            lines.push('Active channel memory: none for the selected channel yet.');
+        }
+        luxriotPromptLayerContent.textContent = lines.join('\n\n');
+        luxriotPromptLayerDetails.classList.remove('is-hidden');
+    }
+
     function collectLuxriotPromptSettings() {
         const payload = {
             stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
@@ -2020,10 +2202,14 @@
             const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
             luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
         }
+        luxriotPromptLayers = settings.prompt_layers && typeof settings.prompt_layers === 'object'
+            ? settings.prompt_layers
+            : null;
         const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
         if (luxriotPromptModalInput && activeInput) {
             luxriotPromptModalInput.value = String(activeInput.value || '');
         }
+        updateLuxriotPromptLayerDetails();
     }
 
     async function refreshLuxriotPromptSettings(showError = false, channelIdOverride = null) {
@@ -2084,6 +2270,7 @@
             const channelLabel = getLuxriotChannelLabel(getSelectedLuxriotChannel());
             luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`;
         }
+        updateLuxriotPromptLayerDetails();
     }
 
     function openLuxriotPromptModal() {
@@ -2315,7 +2502,7 @@
                                 ${bookmarkButton}
                             </div>
                         </div>
-                        <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
+                        <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson)}</div>
                     </div>
                 `;
             })
@@ -2503,7 +2690,7 @@
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                         </div>
                     </div>
-                    <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
+                    <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson)}</div>
                 </div>
             `;
         }).join('');
@@ -2783,6 +2970,7 @@
                 const videoTag = isVideoRunning
                     ? '<span class="luxriot-stream-tag">video active</span>'
                     : '<span class="luxriot-stream-tag idle">video idle</span>';
+                const videoHealthBadge = renderLuxriotHealthBadge(getLuxriotStreamHealth(video));
                 const probeTag = isProbeRunning
                     ? '<span class="luxriot-stream-tag">probes active</span>'
                     : isProbePaused
@@ -2806,7 +2994,7 @@
                                 <div class="luxriot-stream-kind">Channel</div>
                                 <div class="luxriot-stream-title">${escapeHtml(channelLabel)}</div>
                             </div>
-                            <div class="luxriot-stream-tags">${videoTag} ${probeTag}</div>
+                            <div class="luxriot-stream-tags">${videoTag} ${videoHealthBadge} ${probeTag}</div>
                         </div>
                         <div class="luxriot-stream-stats">
                             <span class="luxriot-stream-stat">${escapeHtml(probesLine)}</span>
@@ -3180,6 +3368,7 @@
             if (data.last_error) {
                 luxriotStatusLabel.title = data.last_error;
             }
+            appendLuxriotStatusHealthBadge(data);
         } catch (err) {
             setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
@@ -4745,6 +4934,9 @@
         return (results || []).map((raw) => {
             if (!raw || typeof raw !== 'object') return raw;
             const item = { ...raw };
+            if (!item.archive_query) {
+                item.archive_query = archiveLastQueryText;
+            }
             if (modeUsed && !item.search_mode) {
                 item.search_mode = String(modeUsed).trim().toLowerCase();
             }
@@ -4796,6 +4988,132 @@
         if (normalized === 'vlm_summary') return 'video descriptions';
         if (normalized === 'vlm_alert') return 'VLM alerts';
         return 'archive items';
+    }
+
+    function archiveResultPayload(result) {
+        return result && typeof result.payload === 'object' && result.payload !== null
+            ? result.payload
+            : {};
+    }
+
+    function isVideoArchiveResult(result) {
+        const source = archiveLogicalSource(result && result.source);
+        return source === 'vlm_summary' || source === 'vlm_alert';
+    }
+
+    function archiveResultHasImage(result) {
+        return Boolean(result && (String(result.path || '').trim() || String(result.thumbnail || '').trim()));
+    }
+
+    function archiveResultImageSrc(result) {
+        if (!result) return '';
+        const thumb = String(result.thumbnail || '').trim();
+        if (thumb) {
+            return thumb.startsWith('data:') ? thumb : `data:image/jpeg;base64,${thumb}`;
+        }
+        const path = String(result.path || '').trim();
+        return path ? buildImageFetchUrl(path, result) : '';
+    }
+
+    function base64ToBlob(base64, mimeType = 'image/jpeg') {
+        const clean = stripBase64Payload(base64);
+        if (!clean) return null;
+        const binary = atob(clean);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let idx = 0; idx < len; idx += 1) {
+            bytes[idx] = binary.charCodeAt(idx);
+        }
+        return new Blob([bytes], { type: mimeType });
+    }
+
+    async function archiveResultImageBlob(result) {
+        if (!result) throw new Error('No archive result selected.');
+        const thumb = String(result.thumbnail || '').trim();
+        if (thumb) {
+            const blob = base64ToBlob(thumb, 'image/jpeg');
+            if (!blob) throw new Error('Archived frame thumbnail is empty.');
+            return blob;
+        }
+        const path = String(result.path || '').trim();
+        if (!path) throw new Error('No image is available for this archive result.');
+        const imageResponse = await fetch(buildImageFetchUrl(path, result));
+        if (!imageResponse.ok) throw new Error('Failed to load archived image.');
+        return imageResponse.blob();
+    }
+
+    function archiveFrameTimestampMs(result) {
+        const payload = archiveResultPayload(result);
+        const candidates = [
+            payload.frame_timestamp_ms,
+            payload.anchor_frame_timestamp_ms,
+            result && result.timestamp_ms,
+            payload.batch_start_ms,
+        ];
+        for (const value of candidates) {
+            const numeric = Number(value);
+            if (Number.isFinite(numeric) && numeric > 0) return numeric;
+        }
+        return null;
+    }
+
+    function formatArchiveTimestamp(ms) {
+        const numeric = Number(ms);
+        if (!Number.isFinite(numeric) || numeric <= 0) return 'n/a';
+        return new Date(numeric).toLocaleString();
+    }
+
+    function archiveChannelLabel(result) {
+        const channelId = Number(result && result.channel_id);
+        const channelText = Number.isFinite(channelId) ? `#${channelId}` : '#?';
+        const name = Number.isFinite(channelId)
+            ? (luxriotChannelNameById[String(channelId)] || '')
+            : '';
+        return name ? `${channelText} | ${name}` : channelText;
+    }
+
+    function archiveReviewMatchText(result) {
+        const source = archiveSourceLabel(result && result.source, result && result.source_label);
+        const clip = Number(result && (result.clip_similarity ?? result.similarity));
+        const dino = Number(result && result.dino_similarity);
+        const pos = Number(result && result.pos_score);
+        const neg = Number(result && result.neg_score);
+        const margin = Number(result && result.margin);
+        const parts = [];
+        if (Number.isFinite(clip)) parts.push(`CLIP ${formatPercent(clip)}`);
+        if (Number.isFinite(dino) && dino > 0) parts.push(`DINO ${formatPercent(dino)}`);
+        const hasMeaningfulProbeScores = !isVideoArchiveResult(result)
+            || [pos, neg, margin].some((value) => Number.isFinite(value) && Math.abs(value) > 0.000001);
+        if (hasMeaningfulProbeScores && (Number.isFinite(pos) || Number.isFinite(neg) || Number.isFinite(margin))) {
+            parts.push(`P/N/M ${formatPercent(pos || 0)}/${formatPercent(neg || 0)}/${formatPercent(margin || 0)}`);
+        }
+        const payload = archiveResultPayload(result);
+        const role = String(payload.anchor_role || payload.anchor_source_role || '').trim();
+        parts.push(`Source: ${role ? `${source}/${role}` : source}`);
+        return parts.join(' · ');
+    }
+
+    function archiveReviewQueryText(result) {
+        const query = String(result?.archive_query || archiveLastQueryText || '').trim();
+        return query || 'Archive result';
+    }
+
+    function archiveSummaryText(result) {
+        const payload = archiveResultPayload(result);
+        const text = String(payload.summary || result?.summary || '').trim();
+        if (text) return text;
+        if (isVideoArchiveResult(result)) return 'No L0 summary excerpt is stored for this frame.';
+        return 'No summary is associated with this archive result.';
+    }
+
+    function archiveFrameRoleText(result) {
+        const payload = archiveResultPayload(result);
+        const role = String(payload.anchor_role || payload.anchor_source_role || '').trim();
+        const frameIndex = Number(payload.frame_index ?? payload.anchor_frame_index);
+        const parts = [];
+        if (role) parts.push(role.replace(/_/g, ' '));
+        if (Number.isFinite(frameIndex)) parts.push(`frame ${frameIndex}`);
+        return parts.length ? parts.join(' · ') : 'Frame';
     }
 
     function applySelectOptions(selectEl, options, selected = '') {
@@ -4867,9 +5185,25 @@
     function normalizeDetectionResults(detections) {
         return (detections || []).map((det, idx) => {
             const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
+            const source = archiveLogicalSource(det?.source || det?.payload?.source || '');
+            const payload = det?.payload || null;
+            const channelId = det?.channel_id;
             const probeLabel = det?.probe_name || det?.probe_id || 'probe';
+            const frameRole = payload && typeof payload === 'object'
+                ? String(payload.anchor_role || payload.anchor_source_role || '').trim()
+                : '';
+            const frameIndex = payload && typeof payload === 'object'
+                ? Number(payload.frame_index ?? payload.anchor_frame_index)
+                : NaN;
+            let filename = String(probeLabel);
+            if (source === 'vlm_summary' || source === 'vlm_alert') {
+                const timeLabel = ts ? formatArchiveTimestamp(ts) : 'n/a';
+                const roleLabel = frameRole ? ` · ${frameRole.replace(/_/g, ' ')}` : '';
+                const indexLabel = Number.isFinite(frameIndex) ? ` · frame ${frameIndex}` : '';
+                filename = `${archiveSourceLabel(source)} ch #${channelId ?? '?'}${indexLabel}${roleLabel} · ${timeLabel}`;
+            }
             return {
-                filename: String(probeLabel),
+                filename,
                 path: det?.image_path || det?.payload?.image_path || '',
                 thumbnail: det?.thumbnail || '',
                 is_detection: true,
@@ -4886,7 +5220,8 @@
                 source_label: det?.source_label || '',
                 archive_item_type: det?.archive_item_type || '',
                 origin: det?.origin || det?.payload?.origin || det?.payload?.source || '',
-                payload: det?.payload || null,
+                payload,
+                archive_query: archiveLastQueryText,
                 _raw_index: idx,
             };
         });
@@ -4909,6 +5244,7 @@
         const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
         const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
         const params = new URLSearchParams();
+        archiveLastQueryText = 'Loaded archive frames';
         let timeWindow;
         try {
             timeWindow = applyArchiveTimeFilters(params);
@@ -5084,6 +5420,46 @@
             }
         });
     }
+    if (closeArchiveReviewBtn) {
+        closeArchiveReviewBtn.addEventListener('click', () => {
+            closeArchiveReviewModal();
+        });
+    }
+    if (archiveReviewModal) {
+        archiveReviewModal.addEventListener('click', (e) => {
+            if (e.target === archiveReviewModal) {
+                closeArchiveReviewModal();
+            }
+        });
+    }
+    if (archiveReviewDescribeBtn) {
+        archiveReviewDescribeBtn.addEventListener('click', () => {
+            const context = archiveReviewContext;
+            if (!context) return;
+            closeArchiveReviewModal();
+            describeImageWithLM(context.index, context.result.path || '', null, context.result);
+        });
+    }
+    if (archiveReviewSimilarBtn) {
+        archiveReviewSimilarBtn.addEventListener('click', () => {
+            const context = archiveReviewContext;
+            if (!context) return;
+            closeArchiveReviewModal();
+            findSimilarImages(context.result.path || '', context.result);
+        });
+    }
+    if (archiveReviewJumpBtn) {
+        archiveReviewJumpBtn.addEventListener('click', () => {
+            const context = archiveReviewContext;
+            if (!context) return;
+            jumpToVideoSummaryFromArchive(context.result);
+        });
+    }
+    if (archiveReviewCopyBtn) {
+        archiveReviewCopyBtn.addEventListener('click', () => {
+            copyArchiveReviewSummary();
+        });
+    }
     
     // Close modal when clicking outside
     settingsModal.addEventListener('click', (e) => {
@@ -5096,6 +5472,10 @@
         if (e.key !== 'Escape') return;
         if (imageLightboxModal && imageLightboxModal.style.display === 'block') {
             closeImageLightbox();
+            return;
+        }
+        if (archiveReviewModal && archiveReviewModal.style.display === 'block') {
+            closeArchiveReviewModal();
             return;
         }
         if (settingsModal && settingsModal.style.display === 'block') {
@@ -5268,7 +5648,7 @@
     }
     if (probeSnapBtn) {
         probeSnapBtn.addEventListener('click', () => {
-            openProbeSnapModalFromPreview();
+            void openProbeSnapModalFromPreview();
         });
     }
     if (closeProbeSnapBtn) {
@@ -5534,7 +5914,7 @@
                 if (archiveThumbnailRetentionDaysInput) archiveThumbnailRetentionDaysInput.value = settings.archiveThumbnailRetentionDays ?? 14;
                 if (archiveMaxRecordsInput) archiveMaxRecordsInput.value = settings.archiveMaxRecords ?? 5000000;
                 if (archiveEstimateChannelsInput) archiveEstimateChannelsInput.value = settings.archiveEstimateChannels ?? 50;
-                if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = settings.archiveEstimateFramesPerBatch ?? 2.5;
+                if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = settings.archiveEstimateFramesPerBatch ?? 4;
                 if (archiveEstimateAvgJpegKbInput) archiveEstimateAvgJpegKbInput.value = settings.archiveEstimateAvgJpegKb ?? 100;
                 if (archiveEstimateProbeRowsInput) archiveEstimateProbeRowsInput.value = settings.archiveEstimateProbeRecordsPerChannelDay ?? 250;
                 renderArchiveCapacity({
@@ -5614,7 +5994,7 @@
                 archiveThumbnailRetentionDays: parseFloat(archiveThumbnailRetentionDaysInput ? archiveThumbnailRetentionDaysInput.value : '14'),
                 archiveMaxRecords: parseInt(archiveMaxRecordsInput ? archiveMaxRecordsInput.value : '5000000'),
                 archiveEstimateChannels: parseInt(archiveEstimateChannelsInput ? archiveEstimateChannelsInput.value : '50'),
-                archiveEstimateFramesPerBatch: parseFloat(archiveEstimateFramesPerBatchInput ? archiveEstimateFramesPerBatchInput.value : '2.5'),
+                archiveEstimateFramesPerBatch: parseFloat(archiveEstimateFramesPerBatchInput ? archiveEstimateFramesPerBatchInput.value : '4'),
                 archiveEstimateAvgJpegKb: parseFloat(archiveEstimateAvgJpegKbInput ? archiveEstimateAvgJpegKbInput.value : '100'),
                 archiveEstimateProbeRecordsPerChannelDay: parseFloat(archiveEstimateProbeRowsInput ? archiveEstimateProbeRowsInput.value : '250'),
                 luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
@@ -5718,7 +6098,7 @@
                 settings.archiveEstimateChannels = 50;
             }
             if (!Number.isFinite(settings.archiveEstimateFramesPerBatch) || settings.archiveEstimateFramesPerBatch < 0) {
-                settings.archiveEstimateFramesPerBatch = 2.5;
+                settings.archiveEstimateFramesPerBatch = 4;
             }
             if (!Number.isFinite(settings.archiveEstimateAvgJpegKb) || settings.archiveEstimateAvgJpegKb < 1) {
                 settings.archiveEstimateAvgJpegKb = 100;
@@ -5801,7 +6181,7 @@
             if (archiveThumbnailRetentionDaysInput) archiveThumbnailRetentionDaysInput.value = '14';
             if (archiveMaxRecordsInput) archiveMaxRecordsInput.value = '5000000';
             if (archiveEstimateChannelsInput) archiveEstimateChannelsInput.value = '50';
-            if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = '2.5';
+            if (archiveEstimateFramesPerBatchInput) archiveEstimateFramesPerBatchInput.value = '4';
             if (archiveEstimateAvgJpegKbInput) archiveEstimateAvgJpegKbInput.value = '100';
             if (archiveEstimateProbeRowsInput) archiveEstimateProbeRowsInput.value = '250';
             if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
@@ -6911,22 +7291,68 @@
         };
     }
 
-    function openProbeSnapModalFromPreview() {
+    async function captureProbeSnapshotFromServer() {
+        const channelId = getSelectedProbeChannelId();
+        if (!Number.isFinite(channelId) || channelId <= 0) {
+            throw new Error('Select a channel before snapping.');
+        }
+        const roiNorm = probeRoiEnabled ? normalizeProbeRoiNorm(probeRoiNorm) : null;
+        if (probeRoiEnabled && !roiNorm) {
+            throw new Error('ROI is enabled. Draw ROI before snapping.');
+        }
+        const payload = {
+            roi_enabled: Boolean(roiNorm),
+            quality: 92,
+        };
+        if (roiNorm) {
+            payload.roi_norm = roiNorm;
+        }
+        const response = await fetch(`/luxriot/snapshot/${channelId}/capture`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await parseApiJson(response, 'Snapshot capture failed');
+        const base64 = String(data.snapshot_b64 || '').trim();
+        if (!base64) {
+            throw new Error('Snapshot capture returned no image.');
+        }
+        const meta = data.meta || {};
+        const timestampMs = Number(meta.captured_at_ms) || Date.now();
+        const width = Number(meta.width) || 0;
+        const height = Number(meta.height) || 0;
+        return {
+            dataUrl: `data:image/jpeg;base64,${base64}`,
+            base64,
+            width,
+            height,
+            timestampMs,
+            channelId,
+            roi: Boolean(roiNorm),
+            sha1: meta.sha1 || '',
+            filename: data.filename || _buildProbeSnapFilename(channelId, timestampMs, Boolean(roiNorm)),
+        };
+    }
+
+    async function openProbeSnapModalFromPreview() {
         try {
-            const snap = captureProbeSnapshotFromPreview();
+            setProbeStatus('Capturing fresh snapshot...');
+            const snap = await captureProbeSnapshotFromServer();
             probeSnapState = snap;
             if (probeSnapImg) {
                 probeSnapImg.src = snap.dataUrl;
             }
             if (probeSnapMeta) {
                 const mode = snap.roi ? 'ROI snapshot' : 'Full-frame snapshot';
-                probeSnapMeta.textContent = `${mode} · ${snap.width}×${snap.height} · Channel #${snap.channelId}`;
+                const digest = snap.sha1 ? ` · ${String(snap.sha1).slice(0, 8)}` : '';
+                probeSnapMeta.textContent = `${mode} · ${snap.width}×${snap.height} · Channel #${snap.channelId}${digest}`;
             }
             if (probeSnapActualSizeInput) {
                 probeSnapActualSizeInput.checked = false;
             }
             updateProbeSnapScaleMode();
             setProbeSnapModalVisibility(true);
+            setProbeStatus('Fresh snapshot captured.');
         } catch (err) {
             setProbeStatus(err.message || 'Failed to capture snapshot.', true);
         }
@@ -8289,6 +8715,7 @@
         const detectionsScope = isDetectionsScope();
         
         if (!query || (!detectionsScope && !folder)) return;
+        archiveLastQueryText = query;
         
         setButtonBusy(searchBtn, true);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
@@ -8360,6 +8787,7 @@
             alert('Please select a folder and upload an image file.');
             return;
         }
+        archiveLastQueryText = `Image query: ${file.name || 'uploaded reference image'}`;
         
         setButtonBusy(imageSearchBtn, true);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
@@ -8465,6 +8893,15 @@
         videoOutput.classList.remove('is-hidden');
     }
 
+    function renderOfflineDiagnostics(diag) {
+        if (!diag || typeof diag !== 'object') return '';
+        const rows = Object.entries(diag)
+            .filter(([, value]) => value !== undefined && value !== null && value !== '')
+            .map(([key, value]) => `<div><span>${escapeHtml(key)}</span>: <code>${escapeHtml(String(value))}</code></div>`);
+        if (!rows.length) return '';
+        return `<div class="offline-diagnostics"><h4>Diagnostics</h4>${rows.join('')}</div>`;
+    }
+
     if (videoUploadInput) {
         videoUploadInput.addEventListener('change', () => {
             const file = selectedOfflineMediaFile();
@@ -8563,6 +9000,10 @@
                 videoStatus.dataset.base = data.error || 'Video understanding request failed.';
                 videoStatus.textContent = videoStatus.dataset.base;
                 videoStatus.className = 'video-status error';
+                const diagHtml = renderOfflineDiagnostics(data.diagnostics);
+                if (diagHtml) {
+                    showOfflineSummaryOutput(diagHtml);
+                }
                 stopVideoTimer();
                 return;
             }
@@ -8572,12 +9013,12 @@
             videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${framesSent}${durationLabel}${sourceLabel}`;
             videoStatus.textContent = videoStatus.dataset.base;
             if (data.summary) {
-                showOfflineSummaryOutput(renderMarkdown(data.summary));
+                showOfflineSummaryOutput(`${renderMarkdown(data.summary)}${renderOfflineDiagnostics(data.diagnostics)}`);
                 lastSummaryText = data.summary;
                 lastSummaryTarget = null;
                 saveSummaryBtn.style.display = 'none';
             } else {
-                showOfflineSummaryOutput('(No summary returned)', true);
+                showOfflineSummaryOutput(`(No summary returned)${renderOfflineDiagnostics(data.diagnostics)}`);
                 lastSummaryText = '';
                 lastSummaryTarget = null;
                 saveSummaryBtn.style.display = 'none';
@@ -8722,6 +9163,131 @@
         if (imageLightboxMeta) imageLightboxMeta.textContent = '';
     }
 
+    function closeArchiveReviewModal() {
+        if (!archiveReviewModal) return;
+        archiveReviewModal.style.display = 'none';
+        archiveReviewContext = null;
+        if (archiveReviewImg) archiveReviewImg.src = '';
+    }
+
+    function openArchiveReviewModal(index, result) {
+        if (!archiveReviewModal || !result) return;
+        archiveReviewContext = { index, result };
+        if (archiveReviewTitle) {
+            archiveReviewTitle.textContent = 'Archive research review for video description streams';
+        }
+        if (archiveReviewQuery) {
+            archiveReviewQuery.textContent = `User query: ${archiveReviewQueryText(result)}`;
+        }
+        if (archiveReviewMatch) {
+            archiveReviewMatch.textContent = archiveReviewMatchText(result);
+        }
+        const imageSrc = archiveResultImageSrc(result);
+        if (archiveReviewImg) {
+            archiveReviewImg.src = imageSrc || '';
+            archiveReviewImg.classList.toggle('is-hidden', !imageSrc);
+        }
+        if (archiveReviewFrameEmpty) {
+            archiveReviewFrameEmpty.classList.toggle('is-hidden', Boolean(imageSrc));
+        }
+        if (archiveReviewChannel) {
+            archiveReviewChannel.textContent = `Channel: ID: ${archiveChannelLabel(result)}`;
+        }
+        if (archiveReviewFrameRole) {
+            archiveReviewFrameRole.textContent = archiveFrameRoleText(result);
+        }
+        if (archiveReviewTimestamp) {
+            archiveReviewTimestamp.textContent = `Timestamp: ${formatArchiveTimestamp(archiveFrameTimestampMs(result))}`;
+        }
+        if (archiveReviewSummary) {
+            const summary = archiveSummaryText(result);
+            const truncated = archiveResultPayload(result).summary_truncated;
+            archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
+        }
+        if (archiveReviewJumpBtn) {
+            archiveReviewJumpBtn.disabled = !isVideoArchiveResult(result) || !Number.isFinite(Number(result.channel_id));
+        }
+        if (archiveReviewDescribeBtn) {
+            archiveReviewDescribeBtn.disabled = !archiveResultHasImage(result);
+        }
+        if (archiveReviewSimilarBtn) {
+            archiveReviewSimilarBtn.disabled = !archiveResultHasImage(result);
+        }
+        archiveReviewModal.style.display = 'block';
+    }
+
+    async function copyArchiveReviewSummary() {
+        const result = archiveReviewContext && archiveReviewContext.result;
+        if (!result) return;
+        const text = archiveSummaryText(result);
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                textArea.style.position = 'fixed';
+                textArea.style.left = '-999999px';
+                textArea.style.top = '-999999px';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                document.execCommand('copy');
+                textArea.remove();
+            }
+        } catch (error) {
+            console.error('Failed to copy summary:', error);
+        }
+    }
+
+    function jumpToVideoSummaryFromArchive(result) {
+        if (!result || !isVideoArchiveResult(result)) return;
+        const channelId = Number(result.channel_id);
+        if (!Number.isFinite(channelId)) return;
+        const payload = archiveResultPayload(result);
+        closeArchiveReviewModal();
+        setMode('video');
+        if (luxriotChannelSelect) {
+            luxriotChannelSelect.value = String(channelId);
+        }
+        luxriotSummaryChannel = channelId;
+        if (luxriotSummaryChannelSelect) {
+            syncLuxriotSummaryChannelSelect();
+            luxriotSummaryChannelSelect.value = String(channelId);
+        }
+        setSummaryBaseLevel('L0');
+        luxriotSummaryFollowLive = false;
+        luxriotSummaryAutoRefresh = false;
+        luxriotSummaryRunFilter = String(payload.run_id || '').trim() || 'all';
+        if (luxriotSummaryRunSelect) {
+            const hasRunValue = Array.from(luxriotSummaryRunSelect.options || [])
+                .some((opt) => String(opt.value) === luxriotSummaryRunFilter);
+            luxriotSummaryRunSelect.value = hasRunValue ? luxriotSummaryRunFilter : 'all';
+        }
+        const startMs = Number(payload.batch_start_ms || result.timestamp_ms || 0);
+        const endMs = Number(payload.batch_end_ms || result.timestamp_ms || startMs || 0);
+        if (Number.isFinite(startMs) && startMs > 0) {
+            luxriotSummaryRangePreset = 'custom';
+            luxriotSummaryFromTs = Math.max(0, (startMs / 1000) - 60);
+            luxriotSummaryToTs = Math.max(
+                luxriotSummaryFromTs + 1,
+                ((Number.isFinite(endMs) && endMs > 0 ? endMs : startMs) / 1000) + 60,
+            );
+            if (luxriotSummaryRangeSelect) {
+                luxriotSummaryRangeSelect.value = 'custom';
+            }
+            if (luxriotSummaryFromInput) {
+                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+            }
+            if (luxriotSummaryToInput) {
+                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+            }
+            syncSummaryRangeUI();
+        }
+        setSummaryUnread(0);
+        refreshLuxriotSummaryView(channelId, true, false);
+    }
+
     function showArchiveInspector(index) {
         if (!archiveInspectorBody || !Array.isArray(archiveRenderedResults) || !archiveRenderedResults.length) {
             renderArchiveInspectorEmpty();
@@ -8785,30 +9351,39 @@
         const safeFilename = escapeHtml(result.filename || 'unnamed');
         const rawPath = String(result.path || '');
         const hasPath = rawPath.length > 0;
+        const hasImage = archiveResultHasImage(result);
         const isDetectionResult = Boolean(result && result.is_detection);
+        const isVideoResult = isVideoArchiveResult(result);
         const showFilenameRow = !isDetectionResult;
         const activeFolder = activeFolderPath();
         const canUseFolderComments = Boolean(hasPath && activeFolder && rawPath.startsWith(activeFolder));
         const safePath = escapeHtml(rawPath);
-        const thumb = String(result.thumbnail || '').trim();
         const fallbackSvg = encodeURIComponent(
             '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="260">' +
             '<rect width="100%" height="100%" fill="#1f2026"/>' +
             '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#9aa0ad" font-size="18">No thumbnail</text>' +
             '</svg>'
         );
-        const thumbnailSrc = thumb ? `data:image/jpeg;base64,${thumb}` : `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
-        const detailImageSrc = hasPath ? buildImageFetchUrl(rawPath, result) : thumbnailSrc;
+        const imageSrc = archiveResultImageSrc(result);
+        const thumbnailSrc = imageSrc || `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
+        const detailImageSrc = imageSrc || thumbnailSrc;
         const overlayIcon = variant === 'detail'
             ? '<path d="M240-240v-200h80v120h120v80H240Zm400-400v-80h80v200H520v-80h120v-40Z"/>'
             : '<path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>';
+        const reviewButtonMarkup = isVideoResult ? `
+            <button class="action-icon archive-review-icon" data-index="${index}" title="Review VLM frame">
+                <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
+                    <path d="M480-320q75 0 127.5-52.5T660-500q0-75-52.5-127.5T480-680q-75 0-127.5 52.5T300-500q0 75 52.5 127.5T480-320Zm0-72q-45 0-76.5-31.5T372-500q0-45 31.5-76.5T480-608q45 0 76.5 31.5T588-500q0 45-31.5 76.5T480-392Zm0 192q-146 0-266-81.5T40-500q54-137 174-218.5T480-800q146 0 266 81.5T920-500q-54 137-174 218.5T480-200Zm0-300Zm0 220q113 0 207.5-59.5T832-500q-50-101-144.5-160.5T480-720q-113 0-207.5 59.5T128-500q50 101 144.5 160.5T480-280Z"/>
+                </svg>
+            </button>
+        ` : '';
 
         if (variant === 'card') {
             return `
                 <div class="image-container">
                     <img src="${thumbnailSrc}" class="thumbnail" alt="" />
                     <div class="image-overlay">
-                        ${hasPath ? `
+                        ${hasImage ? `
                             <div class="expand-collapse-icon" data-index="${index}" title="Inspect result">
                                 <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                                     ${overlayIcon}
@@ -8829,6 +9404,7 @@
                     ${badgesMarkup}
                     <div class="similarity">${similarityMarkup}</div>
                     <div class="result-actions">
+                        ${reviewButtonMarkup}
                         <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
                             <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                                 <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
@@ -8849,7 +9425,7 @@
                 <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
             </div>
         ` : '';
-        const commentsPanelMarkup = hasPath ? `
+        const commentsPanelMarkup = hasImage ? `
             <div class="comment-section">
                 <div class="lm-description" id="lm-desc-${index}">
                     <div class="no-comments">No LLM description yet.</div>
@@ -8877,7 +9453,7 @@
             <div class="image-container">
                 <img src="${detailImageSrc}" class="thumbnail" alt="" />
                 <div class="image-overlay">
-                    ${hasPath ? `
+                    ${hasImage ? `
                         <div class="expand-collapse-icon" data-index="${index}" title="Open full preview">
                             <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
                                 ${overlayIcon}
@@ -8898,6 +9474,7 @@
                 ${badgesMarkup}
                 <div class="similarity">${similarityMarkup}</div>
                 <div class="result-actions">
+                    ${reviewButtonMarkup}
                     <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
                         <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
                             <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
@@ -8918,13 +9495,14 @@
     // Setup event handlers for result item
     function setupResultItemEventHandlers(item, result, index, options = {}) {
         const variant = options.variant || 'card';
+        const hasImage = archiveResultHasImage(result);
 
         const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-        if (expandCollapseIcon && result.path) {
+        if (expandCollapseIcon && hasImage) {
             expandCollapseIcon.addEventListener('click', (e) => {
                 e.stopPropagation();
                 if (variant === 'detail') {
-                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                    openImageLightbox(archiveResultImageSrc(result), result.filename || result.path || 'Preview');
                 } else {
                     showArchiveInspector(index);
                 }
@@ -8954,10 +9532,10 @@
 
         const findSimilarIcon = item.querySelector('.find-similar-icon');
         if (findSimilarIcon) {
-            if (result.path) {
+            if (hasImage) {
                 findSimilarIcon.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    findSimilarImages(result.path, result);
+                    findSimilarImages(result.path || '', result);
                 });
             } else {
                 findSimilarIcon.style.display = 'none';
@@ -8966,13 +9544,25 @@
 
         const describeIcon = item.querySelector('.describe-icon');
         if (describeIcon) {
-            if (result.path) {
+            if (hasImage) {
                 describeIcon.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    describeImageWithLM(index, result.path, item, result);
+                    describeImageWithLM(index, result.path || '', item, result);
                 });
             } else {
                 describeIcon.style.display = 'none';
+            }
+        }
+
+        const archiveReviewIcon = item.querySelector('.archive-review-icon');
+        if (archiveReviewIcon) {
+            if (isVideoArchiveResult(result)) {
+                archiveReviewIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    openArchiveReviewModal(index, result);
+                });
+            } else {
+                archiveReviewIcon.style.display = 'none';
             }
         }
 
@@ -9003,18 +9593,18 @@
         }
 
         const img = item.querySelector('.thumbnail');
-        if (img && result.path && variant === 'detail') {
-            if (!result.is_detection) {
+        if (img && hasImage && variant === 'detail') {
+            if (!result.is_detection && result.path) {
                 img.addEventListener('click', (e) => {
                     if (segmentsEnabledInput.checked) {
                         handleSegmentClick(e, result, index, item);
                         return;
                     }
-                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                    openImageLightbox(archiveResultImageSrc(result), result.filename || result.path || 'Preview');
                 });
             } else {
                 img.addEventListener('click', () => {
-                    openImageLightbox(buildImageFetchUrl(result.path, result), result.filename || result.path || 'Preview');
+                    openImageLightbox(archiveResultImageSrc(result), result.filename || result.path || 'Preview');
                 });
             }
         }
@@ -9713,9 +10303,14 @@
         const limit = resultLimitSelect.value;
         const sortBy = sortBySelect.value;
         const detectionResult = Boolean(result && result.is_detection);
+        const hasArchiveImage = archiveResultHasImage(result);
         
         if (!detectionResult && !folder) {
             alert('Please enter a folder path first');
+            return;
+        }
+        if (!hasArchiveImage && !imagePath) {
+            alert('No image is available for similarity search.');
             return;
         }
         
@@ -9723,12 +10318,19 @@
         indexStatus.className = 'status';
         
         try {
-            const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
-            if (!imageResponse.ok) {
-                throw new Error('Failed to load image file');
-            }
-            
-            const imageBlob = await imageResponse.blob();
+            const shouldUseStoredBlob = hasArchiveImage && (!imagePath || isVideoArchiveResult(result));
+            const imageBlob = shouldUseStoredBlob
+                ? await archiveResultImageBlob(result)
+                : await (async () => {
+                    const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
+                    if (!imageResponse.ok) {
+                        if (hasArchiveImage) {
+                            return archiveResultImageBlob(result);
+                        }
+                        throw new Error('Failed to load image file');
+                    }
+                    return imageResponse.blob();
+                })();
             const formData = new FormData();
             formData.append('image', imageBlob, 'reference_image.jpg');
             formData.append('limit', limit);
@@ -9783,8 +10385,9 @@
     }
 
     async function describeImageWithLM(index, imagePath, item = null, result = null) {
-        if (!imagePath) {
-            alert('No filesystem path is available for this image.');
+        const hasArchiveImage = archiveResultHasImage(result);
+        if (!imagePath && !hasArchiveImage) {
+            alert('No image is available for this result.');
             return;
         }
         const detectionResult = Boolean(result && result.is_detection);
@@ -9813,24 +10416,37 @@
         saveBtn.dataset.summary = '';
 
         try {
-            const response = await fetch('/describe_image', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(
-                    useFolderContext
-                        ? {
-                            folder,
-                            image_path: imagePath,
-                            prompt,
-                            model: modelId
-                        }
-                        : {
-                            image_path: imagePath,
-                            prompt,
-                            model: modelId
-                        }
-                ),
-            });
+            let response;
+            const shouldUploadArchiveBlob = hasArchiveImage && (!imagePath || isVideoArchiveResult(result));
+            if (shouldUploadArchiveBlob) {
+                const formData = new FormData();
+                formData.append('image', await archiveResultImageBlob(result), 'archive_frame.jpg');
+                formData.append('prompt', prompt);
+                if (modelId) formData.append('model', modelId);
+                response = await fetch('/describe_image', {
+                    method: 'POST',
+                    body: formData,
+                });
+            } else {
+                response = await fetch('/describe_image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(
+                        useFolderContext
+                            ? {
+                                folder,
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                            : {
+                                image_path: imagePath,
+                                prompt,
+                                model: modelId
+                            }
+                    ),
+                });
+            }
             const data = await parseApiJson(response, 'Describe request failed');
             if (data.summary) {
                 renderLmDescription(index, data.summary, data.model || modelId || 'LM Studio');
@@ -9885,6 +10501,7 @@
     // =====================================================================
     (function() {
         const AGENT_LS_SESSION = 'evs_agent_session_id';
+        const AGENT_EVIDENCE_ID_LIMIT = 12;
         let _agentInitDone = false;
         let _agentCurrentSession = null;    // session_id string or null
         let _agentStreaming = false;
@@ -10108,8 +10725,10 @@
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
+            const bubble = { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
+            syncAgentEvidenceIdCard(bubble);
             scrollToBottom(true);
-            return { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
+            return bubble;
         }
 
         function isAgentNearBottom(threshold = 72) {
@@ -10167,6 +10786,7 @@
             } else {
                 bubble.bodyEl.innerHTML = rendered;
             }
+            syncAgentEvidenceIdCard(bubble);
             scrollToBottom(stickToBottom);
         }
 
@@ -10218,20 +10838,45 @@
         }
 
         // ---- Action card builders ----
-        // Helper: build a thumbnail element using image_url (backend-provided) or fallback
+        function agentImageUrlForItem(item) {
+            if (!item || typeof item !== 'object') return '';
+            const direct = item.image_url || item.imageUrl || item.url || null;
+            if (direct) return sanitizeUrl(direct);
+            const imagePath = item.image_path || item.path || null;
+            if (imagePath && String(imagePath).startsWith('/')) {
+                return `/detections/image?image_path=${encodeURIComponent(String(imagePath))}`;
+            }
+            const thumbnail = String(item.thumbnail || item.thumbnail_b64 || '').trim();
+            if (thumbnail) {
+                return sanitizeUrl(/^data:image\//i.test(thumbnail) ? thumbnail : `data:image/jpeg;base64,${thumbnail}`);
+            }
+            return '';
+        }
+
+        function agentThumbTitle(item) {
+            if (!item || typeof item !== 'object') return 'Preview';
+            const ts = item.timestamp_ms || item.event_timestamp_ms || item.recorded_at_ms || null;
+            const tsText = ts ? fmtDate(ts) : '';
+            const source = item.source_label || item.source || item.archive_item_type || '';
+            const id = item.id || item.detection_id || item.probe_id || item.path || item.image_path || '';
+            return [source, id ? `#${id}` : '', tsText].filter(Boolean).join(' · ') || 'Preview';
+        }
+
+        // Helper: build a thumbnail element using image_url (backend-provided) or fallback.
+        // The tile opens the in-app lightbox; the "open" link is a real href for copying/new tab.
         function _makeThumb(item, cls, scoreVal) {
             const div = document.createElement('div');
             div.className = cls;
-            const url = item.image_url || null;
+            const url = agentImageUrlForItem(item);
             const score = scoreVal != null ? String(scoreVal) : '';
-            const previewTitle = item.filename || item.name || item.path || item.image_path || item.id || 'Preview';
+            const previewTitle = item.filename || item.name || agentThumbTitle(item);
             if (url) {
                 div.dataset.previewImage = String(url);
                 div.dataset.previewTitle = String(previewTitle);
                 div.title = String(previewTitle);
             }
             if (url) {
-                div.innerHTML = `<img src="${escapeHtml(url)}" alt="" loading="lazy" />${score ? `<div class="${cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score'}">${escapeHtml(score)}</div>` : ''}`;
+                div.innerHTML = `<img src="${escapeHtml(url)}" alt="${escapeHtml(previewTitle)}" loading="lazy" />${score ? `<div class="${cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score'}">${escapeHtml(score)}</div>` : ''}<a class="agent-thumb-open-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="Open image" data-open-image-link>open</a>`;
             } else {
                 div.textContent = item.id ? `#${item.id}` : '—';
                 if (score) {
@@ -10242,6 +10887,125 @@
                 }
             }
             return div;
+        }
+
+        function appendAgentThumbGrid(body, items, options = {}) {
+            const rows = Array.isArray(items) ? items.filter(Boolean) : [];
+            if (!rows.length) return false;
+            const grid = document.createElement('div');
+            grid.className = options.gridClass || 'agent-det-grid';
+            rows.slice(0, options.limit || 8).forEach((item) => {
+                let score = null;
+                if (options.scoreFormatter) {
+                    score = options.scoreFormatter(item);
+                } else if (item && item.score != null) {
+                    score = Number(item.score).toFixed(3);
+                } else if (item && item.margin != null) {
+                    score = Number(item.margin).toFixed(3);
+                } else if (item && item.severity) {
+                    score = String(item.severity);
+                }
+                grid.appendChild(_makeThumb(item, options.thumbClass || 'agent-det-thumb', score));
+            });
+            body.appendChild(grid);
+            if (rows.length > (options.limit || 8)) {
+                const more = document.createElement('div');
+                more.className = 'agent-card-muted-note';
+                more.textContent = `+${rows.length - (options.limit || 8)} more`;
+                body.appendChild(more);
+            }
+            return true;
+        }
+
+        function extractAgentEvidenceIds(text) {
+            const source = String(text || '');
+            if (!source) return [];
+            const ids = [];
+            const seen = new Set();
+            const mdWrap = '[`*_~]*';
+            const idAtom = `${mdWrap}\\d{2,9}${mdWrap}`;
+            const idList = `(?:${idAtom}(?:\\s*(?:,|and|&|/)\\s*)?){1,12}`;
+            const addId = (raw) => {
+                const value = String(raw || '').trim();
+                const match = value.match(/\b\d{2,9}\b/);
+                if (!match) return;
+                const id = Number(match[0]);
+                if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) return;
+                seen.add(id);
+                ids.push(id);
+            };
+            const parseList = (raw) => {
+                const matches = String(raw || '').match(/\b\d{2,9}\b/g) || [];
+                matches.forEach(addId);
+            };
+            const directPatterns = [
+                new RegExp(`\\b(?:detections?|frames?|candidates?|images?|snapshots?)\\s+ids?\\s*[:#-]?\\s*(${idList})`, 'gi'),
+                new RegExp(`\\b(?:detection|frame|image|snapshot)\\s+(?:id|#)\\s*[:#-]?\\s*(${idAtom})(?=\\W|$)`, 'gi'),
+                new RegExp(`\\b(?:candidate)\\s+\\d+\\s*[:#-]\\s*(?:detection\\s+id\\s*)?(${idAtom})(?=\\W|$)`, 'gi'),
+                new RegExp(`\\b(?:detection_id|frame_id|snapshot_id|image_id)\\s*[:=]\\s*(${idAtom})(?=\\W|$)`, 'gi'),
+                /\b(?:detections?|frames?|candidates?|images?|snapshots?)\s*#?\s*(\d{2,9})\b/gi,
+            ];
+            directPatterns.forEach((pattern) => {
+                let match;
+                while ((match = pattern.exec(source)) && ids.length < AGENT_EVIDENCE_ID_LIMIT) {
+                    parseList(match[1] || '');
+                }
+            });
+
+            const contextualIdList = new RegExp(`\\bids?\\s*[:#-]?\\s*(${idList})`, 'gi');
+            let match;
+            while ((match = contextualIdList.exec(source)) && ids.length < AGENT_EVIDENCE_ID_LIMIT) {
+                const start = Math.max(0, match.index - 90);
+                const end = Math.min(source.length, match.index + match[0].length + 60);
+                const context = source.slice(start, end);
+                if (/\b(?:detections?|frames?|candidates?|evidence|probes?|visual|snapshots?|thumbnails?|images?)\b/i.test(context)) {
+                    parseList(match[1] || '');
+                }
+            }
+            return ids.slice(0, AGENT_EVIDENCE_ID_LIMIT);
+        }
+
+        function buildAgentEvidenceIdCard(ids) {
+            const cleanIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
+            if (!cleanIds.length) return null;
+            const card = document.createElement('div');
+            card.className = 'agent-action-card agent-evidence-id-card';
+            card.innerHTML = `<div class="agent-action-card-head">&#9670; EVIDENCE LINKS — ${cleanIds.length} ID${cleanIds.length === 1 ? '' : 'S'}</div>`;
+            const body = document.createElement('div');
+            body.className = 'agent-action-card-body';
+            appendAgentThumbGrid(body, cleanIds.map((id) => ({
+                id,
+                detection_id: id,
+                image_url: `/detections/thumbnail/${id}`,
+                filename: `Detection #${id}`,
+                source_label: 'Evidence',
+            })), {
+                gridClass: 'agent-search-results-grid',
+                thumbClass: 'agent-search-thumb',
+                limit: AGENT_EVIDENCE_ID_LIMIT,
+                scoreFormatter: (item) => item && item.detection_id ? `#${item.detection_id}` : null,
+            });
+            const note = document.createElement('div');
+            note.className = 'agent-card-muted-note';
+            note.textContent = 'Click a preview to inspect the frame; open uses the archive thumbnail link with your current access rights.';
+            body.appendChild(note);
+            card.appendChild(body);
+            return card;
+        }
+
+        function syncAgentEvidenceIdCard(bubble) {
+            if (!bubble || !bubble.bodyEl) return;
+            const ids = extractAgentEvidenceIds(bubble.text || '');
+            const key = ids.join(',');
+            const existing = bubble.bodyEl.querySelector('.agent-evidence-id-card');
+            if (bubble.evidenceIdsKey === key && existing) return;
+            bubble.evidenceIdsKey = key;
+            bubble.bodyEl.querySelectorAll('.agent-evidence-id-card').forEach((node) => node.remove());
+            if (!ids.length) return;
+            const card = buildAgentEvidenceIdCard(ids);
+            if (!card) return;
+            const before = bubble.traceEl && bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
+            bubble.bodyEl.insertBefore(card, before);
         }
 
         function appendApprovalControl(card, toolName, result) {
@@ -10287,9 +11051,172 @@
             card.appendChild(footer);
         }
 
+        function agentResultList(value) {
+            if (Array.isArray(value)) return value.filter(Boolean);
+            if (value && typeof value === 'object') {
+                const itemKeys = [
+                    'type', 'transition_type', 'state', 'visual_state', 'summary', 'description',
+                    'time', 'time_range', 'start_time', 'end_time', 'thumbnail', 'thumbnail_b64',
+                    'image_url', 'image_path', 'path', 'before', 'after', 'frame', 'boundary_frame',
+                    'evidence_frame',
+                ];
+                if (itemKeys.some((key) => value[key] !== undefined && value[key] !== null)) return [value];
+                return Object.values(value).filter(Boolean);
+            }
+            if (typeof value === 'string' && value.trim()) return [value];
+            return [];
+        }
+
+        function agentFirstValue(item, keys) {
+            if (!item || typeof item !== 'object') return '';
+            for (const key of keys) {
+                const value = item[key];
+                if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+            }
+            return '';
+        }
+
+        function agentHumanizeKey(key) {
+            return String(key || '')
+                .replace(/[_-]+/g, ' ')
+                .replace(/\b\w/g, (ch) => ch.toUpperCase());
+        }
+
+        function agentFormatScalar(value) {
+            if (value === undefined || value === null || value === '') return '';
+            if (typeof value === 'number') {
+                if (!Number.isFinite(value)) return String(value);
+                if (Number.isInteger(value)) return String(value);
+                const abs = Math.abs(value);
+                return abs > 0 && abs < 1 ? value.toFixed(3) : value.toFixed(2);
+            }
+            if (typeof value === 'boolean') return value ? 'yes' : 'no';
+            return String(value);
+        }
+
+        function agentCompactValue(value) {
+            if (value === undefined || value === null || value === '') return '';
+            if (Array.isArray(value)) {
+                return value.map((item) => agentCompactValue(item)).filter(Boolean).join(' · ');
+            }
+            if (typeof value === 'object') return JSON.stringify(value);
+            return agentFormatScalar(value);
+        }
+
+        function agentTimeLabel(item) {
+            if (!item || typeof item !== 'object') return '';
+            const direct = agentFirstValue(item, [
+                'time_range', 'range', 'window', 'time', 'timestamp',
+                'boundary_time', 'boundary_time_text', 'at',
+            ]);
+            if (direct !== '') return agentCompactValue(direct);
+            const start = agentFirstValue(item, ['start_time', 'start', 'from_time', 'start_ts', 'start_timestamp']);
+            const end = agentFirstValue(item, ['end_time', 'end', 'to_time', 'end_ts', 'end_timestamp']);
+            if (start !== '' || end !== '') {
+                return `${agentCompactValue(start || '?')} - ${agentCompactValue(end || '?')}`;
+            }
+            const ms = agentFirstValue(item, ['timestamp_ms', 'event_timestamp_ms', 'boundary_timestamp_ms', 'recorded_at_ms']);
+            if (ms !== '') return fmtDate(ms);
+            return '';
+        }
+
+        function agentStateChangeText(item) {
+            const from = agentFirstValue(item, ['from_state', 'from', 'previous_state', 'before_state', 'negative_state']);
+            const to = agentFirstValue(item, ['to_state', 'to', 'next_state', 'after_state', 'positive_state']);
+            if (from !== '' || to !== '') return `${agentCompactValue(from || '?')} -> ${agentCompactValue(to || '?')}`;
+            return '';
+        }
+
+        function agentTransitionTypeLabel(item) {
+            const type = agentFirstValue(item, ['transition_type', 'type', 'kind']);
+            if (type !== '') return agentHumanizeKey(type);
+            const stateChange = agentStateChangeText(item);
+            return stateChange || 'Transition';
+        }
+
+        function agentScoreSummary(item) {
+            if (!item || typeof item !== 'object') return '';
+            return ['score', 'confidence', 'positive_score', 'negative_score', 'margin']
+                .filter((key) => item[key] !== undefined && item[key] !== null && String(item[key]).trim() !== '')
+                .map((key) => `${agentHumanizeKey(key)}: ${agentCompactValue(item[key])}`)
+                .join(' · ');
+        }
+
+        function agentCoverageText(coverage) {
+            if (!coverage) return '';
+            if (typeof coverage === 'string') return coverage;
+            if (typeof coverage !== 'object') return String(coverage);
+            if (coverage.note) return String(coverage.note);
+            const parts = ['status', 'start_time', 'end_time', 'covered_entries', 'total_entries', 'sampled_frames']
+                .filter((key) => coverage[key] !== undefined && coverage[key] !== null && String(coverage[key]).trim() !== '')
+                .map((key) => `${agentHumanizeKey(key)}: ${agentCompactValue(coverage[key])}`);
+            return parts.length ? `Coverage: ${parts.join(' · ')}` : '';
+        }
+
+        function agentCoverageClass(coverage) {
+            const status = coverage && typeof coverage === 'object' ? String(coverage.status || 'unknown') : 'unknown';
+            return status.toLowerCase().replace(/[^a-z0-9_-]+/g, '_') || 'unknown';
+        }
+
+        function agentTransitionCountEntries(counts) {
+            if (!counts || typeof counts !== 'object' || Array.isArray(counts)) return [];
+            const nested = ['transition_types', 'by_transition_type', 'by_type', 'types']
+                .map((key) => counts[key])
+                .find((value) => value && typeof value === 'object' && !Array.isArray(value));
+            const source = nested || counts;
+            return Object.entries(source)
+                .filter(([, value]) => value !== undefined && value !== null && String(agentCompactValue(value)).trim() !== '');
+        }
+
+        function agentBoundaryFrameItem(frame, index, role, parent) {
+            const item = {
+                ...(parent && typeof parent === 'object' ? parent : {}),
+                ...(frame && typeof frame === 'object' ? frame : {}),
+            };
+            const time = agentTimeLabel(item);
+            const type = agentTransitionTypeLabel(item);
+            const title = [type !== 'Transition' ? type : '', role, time].filter(Boolean).join(' · ') || `Boundary frame ${index + 1}`;
+            return {
+                ...item,
+                filename: item.filename || item.name || title,
+                source_label: item.source_label || 'Boundary',
+                role: item.role || role,
+            };
+        }
+
+        function agentBoundaryFrames(boundaryFrames) {
+            const rows = agentResultList(boundaryFrames);
+            const out = [];
+            rows.forEach((frame, index) => {
+                if (!frame || typeof frame !== 'object') return;
+                const nested = [
+                    ['Before', frame.before || frame.pre || frame.previous || frame.from_frame],
+                    ['After', frame.after || frame.post || frame.next || frame.to_frame],
+                    ['Boundary', frame.frame || frame.boundary_frame || frame.evidence_frame],
+                ].filter(([, value]) => value && typeof value === 'object');
+                if (nested.length) {
+                    nested.forEach(([role, nestedFrame]) => {
+                        out.push(agentBoundaryFrameItem(nestedFrame, out.length, role, frame));
+                    });
+                } else {
+                    out.push(agentBoundaryFrameItem(frame, out.length, 'Boundary', null));
+                }
+            });
+            return out;
+        }
+
         function buildActionCard(toolName, result) {
             const card = document.createElement('div');
             card.className = 'agent-action-card';
+            if (result && result.error) {
+                card.classList.add('agent-action-card-error');
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(String(toolName || 'TOOL').toUpperCase())} ERROR</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                body.innerHTML = `<div class="agent-inline-msg error">${escapeHtml(String(result.error))}</div>`;
+                card.appendChild(body);
+                return card;
+            }
 
             if (toolName === 'search_archive') {
                 // backend returns result.results (not result.hits)
@@ -10301,19 +11228,15 @@
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
                 if (hits.length) {
-                    const grid = document.createElement('div');
-                    grid.className = 'agent-search-results-grid';
-                    hits.slice(0, 8).forEach(h => {
-                        const score = h.score != null ? (h.score * 100).toFixed(0) + '%' : '';
-                        grid.appendChild(_makeThumb(h, 'agent-search-thumb', score || null));
+                    appendAgentThumbGrid(body, hits.map((h) => ({
+                        ...h,
+                        score: h.score != null ? h.score : null,
+                    })), {
+                        gridClass: 'agent-search-results-grid',
+                        thumbClass: 'agent-search-thumb',
+                        limit: 8,
+                        scoreFormatter: (h) => h && h.score != null ? `${(Number(h.score) * 100).toFixed(0)}%` : null,
                     });
-                    body.appendChild(grid);
-                    if (hits.length > 8) {
-                        const more = document.createElement('div');
-                        more.style.cssText = 'margin-top:6px;font-size:12px;color:var(--muted)';
-                        more.textContent = `+${hits.length - 8} more results`;
-                        body.appendChild(more);
-                    }
                 } else {
                     body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No results found.</div>';
                 }
@@ -10329,19 +11252,11 @@
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
                 if (detections.length) {
-                    const grid = document.createElement('div');
-                    grid.className = 'agent-det-grid';
-                    detections.slice(0, 8).forEach(d => {
-                        const score = d.score != null ? d.score.toFixed(3) : (d.margin != null ? d.margin.toFixed(3) : null);
-                        grid.appendChild(_makeThumb(d, 'agent-det-thumb', score));
+                    appendAgentThumbGrid(body, detections, {
+                        gridClass: 'agent-det-grid',
+                        thumbClass: 'agent-det-thumb',
+                        limit: 8,
                     });
-                    body.appendChild(grid);
-                    if (detections.length > 8) {
-                        const more = document.createElement('div');
-                        more.style.cssText = 'margin-top:6px;font-size:12px;color:var(--muted)';
-                        more.textContent = `+${detections.length - 8} more`;
-                        body.appendChild(more);
-                    }
                 } else {
                     body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No detections found.</div>';
                 }
@@ -10500,10 +11415,13 @@
                 card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(headLabel)}</div>`;
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body agent-describe-layout';
+                const resultImageUrl = result && result.image_url;
                 const b64 = result && result.snapshot_b64;
                 const imgPath = result && result.image_path;
                 let imgSrc = null;
-                if (b64) {
+                if (resultImageUrl) {
+                    imgSrc = resultImageUrl;
+                } else if (b64) {
                     imgSrc = `data:image/jpeg;base64,${b64}`;
                 } else if (imgPath) {
                     imgSrc = `/detections/image?image_path=${encodeURIComponent(imgPath)}`;
@@ -10518,21 +11436,257 @@
 
             } else if (toolName === 'get_video_summaries') {
                 const entries = (result && result.entries) || [];
+                const evidenceFrames = (result && result.evidence_frames) || [];
+                const coverage = (result && result.coverage) || {};
                 const depth = (result && result.depth) || '';
                 const ch = (result && result.channel_id) || '';
                 const label = `VIDEO SUMMARIES — CH ${ch} · ${depth} · ${entries.length} entries`;
                 card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
+                if (coverage && coverage.note) {
+                    const cov = document.createElement('div');
+                    cov.className = `agent-coverage-note agent-coverage-${escapeHtml(String(coverage.status || 'unknown'))}`;
+                    cov.textContent = coverage.note;
+                    body.appendChild(cov);
+                }
+                if (evidenceFrames.length) {
+                    const head = document.createElement('div');
+                    head.className = 'agent-evidence-title';
+                    head.textContent = `Archive snaps · ${evidenceFrames.length}`;
+                    body.appendChild(head);
+                    appendAgentThumbGrid(body, evidenceFrames, {
+                        gridClass: 'agent-det-grid agent-evidence-grid',
+                        thumbClass: 'agent-det-thumb agent-evidence-thumb',
+                        limit: 8,
+                    });
+                }
                 if (entries.length) {
-                    body.innerHTML = entries.map(e => {
+                    const summaryWrap = document.createElement('div');
+                    summaryWrap.innerHTML = entries.map(e => {
                         const t = escapeHtml(e.time || '');
                         const s = escapeHtml(e.summary || '');
                         return `<div class="agent-summary-entry"><span class="agent-summary-ts">${t}</span><span class="agent-summary-text">${s}</span></div>`;
                     }).join('');
+                    body.appendChild(summaryWrap);
                 } else {
-                    body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No summaries in this time range.</div>';
+                    const empty = document.createElement('div');
+                    empty.className = 'agent-card-muted-note';
+                    empty.textContent = 'No summaries in this time range.';
+                    body.appendChild(empty);
                 }
+                card.appendChild(body);
+
+            } else if (toolName === 'count_video_summary_events') {
+                const counts = (result && result.counts) || {};
+                const coverage = (result && result.coverage) || {};
+                const events = (result && result.transition_events) || [];
+                const entity = result && result.entity_query ? ` · ${result.entity_query}` : '';
+                const ch = result && result.channel_id != null ? `CH ${result.channel_id}` : 'CH ?';
+                const label = `EVENT COUNT — ${ch}${entity}`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const countRows = [
+                    ['Appearances', counts.appearance_count],
+                    ['Disappearances', counts.disappearance_count],
+                    ['Explicit', `${counts.explicit_appearance_count || 0} in / ${counts.explicit_disappearance_count || 0} out`],
+                    ['Inferred', `${counts.inferred_appearance_count || 0} in / ${counts.inferred_disappearance_count || 0} out`],
+                ];
+                body.innerHTML = `<div class="agent-probe-update-row">${
+                    countRows.map(([key, value]) => `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${escapeHtml(key)}:</span><span class="agent-probe-update-val">${escapeHtml(String(value ?? 0))}</span></div>`).join('')
+                }</div>`;
+                if (coverage && coverage.note) {
+                    const cov = document.createElement('div');
+                    cov.className = `agent-coverage-note agent-coverage-${escapeHtml(String(coverage.status || 'unknown'))}`;
+                    cov.textContent = coverage.note;
+                    body.appendChild(cov);
+                }
+                if (events.length) {
+                    const wrap = document.createElement('div');
+                    wrap.innerHTML = events.slice(0, 8).map((event) => {
+                        const type = escapeHtml(event.type || 'event');
+                        const basis = escapeHtml(event.basis || '');
+                        const time = escapeHtml(event.time || '');
+                        const summary = escapeHtml(event.summary || '');
+                        return `<div class="agent-summary-entry"><span class="agent-summary-ts">${time} · ${type}</span><span class="agent-summary-text">${basis}${basis ? ' · ' : ''}${summary}</span></div>`;
+                    }).join('');
+                    body.appendChild(wrap);
+                    if (events.length > 8) {
+                        const more = document.createElement('div');
+                        more.className = 'agent-card-muted-note';
+                        more.textContent = `+${events.length - 8} more transition events`;
+                        body.appendChild(more);
+                    }
+                } else {
+                    const empty = document.createElement('div');
+                    empty.className = 'agent-card-muted-note';
+                    empty.textContent = 'No transition events counted in returned summaries.';
+                    body.appendChild(empty);
+                }
+                card.appendChild(body);
+
+            } else if (toolName === 'track_visual_state_transitions') {
+                const counts = (result && result.counts) || {};
+                const coverage = (result && result.coverage) || {};
+                const transitions = agentResultList(result && result.transitions);
+                const segments = agentResultList(result && result.segments);
+                const boundaryFrames = agentBoundaryFrames(result && result.boundary_frames);
+                const candidateFrames = agentBoundaryFrames(result && result.candidate_frames);
+                const warnings = agentResultList(result && result.warnings);
+                const ch = result && result.channel_id != null ? `CH ${result.channel_id}` : 'CH ?';
+                const transitionTotal = counts.transition_count ?? counts.total_transitions ?? counts.transition_total ?? counts.total ?? transitions.length;
+                const label = `VISUAL STATE TRANSITIONS — ${ch} · ${transitionTotal} transition${Number(transitionTotal) === 1 ? '' : 's'}`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                const addTitle = (text) => {
+                    const title = document.createElement('div');
+                    title.className = 'agent-evidence-title';
+                    title.textContent = text;
+                    body.appendChild(title);
+                };
+
+                const queryRows = [
+                    ['Subject', result && result.subject_query],
+                    ['Positive state', result && result.positive_state_query],
+                    ['Negative state', result && result.negative_state_query],
+                    ['Effective negative', result && result.negative_state_query_effective],
+                ].filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '');
+                if (queryRows.length) {
+                    const queryWrap = document.createElement('div');
+                    queryWrap.className = 'agent-probe-update-row';
+                    queryWrap.innerHTML = queryRows.map(([key, value]) => (
+                        `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${escapeHtml(key)}:</span><span class="agent-probe-update-val">${escapeHtml(agentCompactValue(value))}</span></div>`
+                    )).join('');
+                    body.appendChild(queryWrap);
+                }
+
+                addTitle('Transition counts');
+                const countEntries = agentTransitionCountEntries(counts);
+                if (countEntries.length) {
+                    const countWrap = document.createElement('div');
+                    countWrap.className = 'agent-probe-update-row';
+                    countWrap.innerHTML = countEntries.map(([key, value]) => (
+                        `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${escapeHtml(agentHumanizeKey(key))}:</span><span class="agent-probe-update-val">${escapeHtml(agentCompactValue(value))}</span></div>`
+                    )).join('');
+                    body.appendChild(countWrap);
+                } else {
+                    const emptyCounts = document.createElement('div');
+                    emptyCounts.className = 'agent-card-muted-note';
+                    emptyCounts.textContent = 'No transition counts returned.';
+                    body.appendChild(emptyCounts);
+                }
+
+                const coverageText = agentCoverageText(coverage);
+                if (coverageText) {
+                    const cov = document.createElement('div');
+                    cov.className = `agent-coverage-note agent-coverage-${agentCoverageClass(coverage)}`;
+                    cov.textContent = coverageText;
+                    body.appendChild(cov);
+                }
+
+                if (boundaryFrames.length) {
+                    addTitle(`Boundary frames · ${boundaryFrames.length}`);
+                    appendAgentThumbGrid(body, boundaryFrames, {
+                        gridClass: 'agent-det-grid agent-evidence-grid',
+                        thumbClass: 'agent-det-thumb agent-evidence-thumb',
+                        limit: 8,
+                        scoreFormatter: (item) => {
+                            const role = agentFirstValue(item, ['role', 'state', 'transition_type', 'type']);
+                            return role !== '' ? agentHumanizeKey(role) : null;
+                        },
+                    });
+                }
+                if (candidateFrames.length) {
+                    addTitle(`Top candidate frames · ${candidateFrames.length}`);
+                    appendAgentThumbGrid(body, candidateFrames, {
+                        gridClass: 'agent-det-grid agent-evidence-grid',
+                        thumbClass: 'agent-det-thumb agent-evidence-thumb',
+                        limit: 8,
+                        scoreFormatter: (item) => {
+                            const p = Number(item && item.positive_score);
+                            if (Number.isFinite(p)) return `P ${p.toFixed(3)}`;
+                            const state = agentFirstValue(item, ['state', 'role']);
+                            return state !== '' ? agentHumanizeKey(state) : null;
+                        },
+                    });
+                }
+
+                if (transitions.length) {
+                    const transitionLimit = 8;
+                    addTitle(`Transitions · ${Math.min(transitions.length, transitionLimit)} of ${transitions.length}`);
+                    const wrap = document.createElement('div');
+                    wrap.innerHTML = transitions.slice(0, transitionLimit).map((transition, idx) => {
+                        const time = agentTimeLabel(transition);
+                        const type = agentTransitionTypeLabel(transition);
+                        const head = [time, type].filter(Boolean).join(' · ') || `#${idx + 1}`;
+                        const stateChange = agentStateChangeText(transition);
+                        const basis = agentFirstValue(transition, ['basis', 'evidence', 'method', 'source']);
+                        const summary = agentFirstValue(transition, ['summary', 'description', 'note', 'reason']);
+                        const score = agentScoreSummary(transition);
+                        const text = [stateChange, basis, summary, score]
+                            .map((value) => agentCompactValue(value))
+                            .filter(Boolean)
+                            .join(' · ') || 'No transition details.';
+                        return `<div class="agent-summary-entry"><span class="agent-summary-ts">${escapeHtml(head)}</span><span class="agent-summary-text">${escapeHtml(text)}</span></div>`;
+                    }).join('');
+                    body.appendChild(wrap);
+                    if (transitions.length > transitionLimit) {
+                        const more = document.createElement('div');
+                        more.className = 'agent-card-muted-note';
+                        more.textContent = `+${transitions.length - transitionLimit} more transitions`;
+                        body.appendChild(more);
+                    }
+                } else {
+                    const emptyTransitions = document.createElement('div');
+                    emptyTransitions.className = 'agent-card-muted-note';
+                    emptyTransitions.textContent = 'No transitions returned.';
+                    body.appendChild(emptyTransitions);
+                }
+
+                if (segments.length) {
+                    const segmentLimit = 6;
+                    addTitle(`Segments · ${Math.min(segments.length, segmentLimit)} of ${segments.length}`);
+                    const wrap = document.createElement('div');
+                    wrap.innerHTML = segments.slice(0, segmentLimit).map((segment, idx) => {
+                        const time = agentTimeLabel(segment) || `#${idx + 1}`;
+                        const state = agentFirstValue(segment, ['state', 'visual_state', 'label', 'classification']);
+                        const head = [time, state !== '' ? agentCompactValue(state) : ''].filter(Boolean).join(' · ');
+                        const summary = agentFirstValue(segment, ['summary', 'description', 'note']);
+                        const frameCount = agentFirstValue(segment, ['frame_count', 'frames', 'sample_count', 'entries']);
+                        const frameCountText = Array.isArray(frameCount) ? String(frameCount.length) : agentCompactValue(frameCount);
+                        const score = agentScoreSummary(segment);
+                        const details = [
+                            summary,
+                            frameCount !== '' ? `Frames: ${frameCountText}` : '',
+                            score,
+                        ].map((value) => agentCompactValue(value)).filter(Boolean).join(' · ') || 'No segment details.';
+                        return `<div class="agent-summary-entry"><span class="agent-summary-ts">${escapeHtml(head)}</span><span class="agent-summary-text">${escapeHtml(details)}</span></div>`;
+                    }).join('');
+                    body.appendChild(wrap);
+                    if (segments.length > segmentLimit) {
+                        const more = document.createElement('div');
+                        more.className = 'agent-card-muted-note';
+                        more.textContent = `+${segments.length - segmentLimit} more segments`;
+                        body.appendChild(more);
+                    }
+                }
+
+                if (result && result.score_semantics) {
+                    const scoreNote = document.createElement('div');
+                    scoreNote.className = 'agent-card-muted-note';
+                    scoreNote.textContent = `Score semantics: ${result.score_semantics}`;
+                    body.appendChild(scoreNote);
+                }
+
+                if (warnings.length) {
+                    const warn = document.createElement('div');
+                    warn.className = 'agent-coverage-note agent-coverage-partial';
+                    warn.textContent = `Warnings: ${warnings.map((item) => agentCompactValue(item)).filter(Boolean).join(' · ')}`;
+                    body.appendChild(warn);
+                }
+
                 card.appendChild(body);
 
             } else if (toolName === 'create_bookmark') {
@@ -10719,6 +11873,7 @@
                 const hasActions = Number(bubble.actionCount || 0) > 0;
                 bubble.traceEl.open = hasActions && !hasText;
             }
+            syncAgentEvidenceIdCard(bubble);
         }
 
         function appendAgentNotice(msg, tone = 'info') {
@@ -10986,6 +12141,7 @@
                 messagesEl.addEventListener('click', (event) => {
                     const target = event.target;
                     if (!(target instanceof Element)) return;
+                    if (target.closest('[data-open-image-link]')) return;
                     const previewEl = target.closest('[data-preview-image], .agent-search-thumb, .agent-det-thumb');
                     if (!(previewEl instanceof HTMLElement)) return;
                     let src = '';

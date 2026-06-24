@@ -292,10 +292,16 @@ class HttpAuthRouteTests(unittest.TestCase):
             "AUTH_ENABLED": oldapp.config.AUTH_ENABLED,
             "AUTH_TENANT_ID": oldapp.config.AUTH_TENANT_ID,
             "AUTH_COOKIE_SECURE": oldapp.config.AUTH_COOKIE_SECURE,
+            "OFFLINE_VIDEO_ENABLED": oldapp.config.OFFLINE_VIDEO_ENABLED,
+            "PROBE_SNAP_ENABLED": oldapp.config.PROBE_SNAP_ENABLED,
+            "INDEXED_FOLDER_ENABLED": oldapp.config.INDEXED_FOLDER_ENABLED,
         }
         oldapp.config.AUTH_ENABLED = True
         oldapp.config.AUTH_TENANT_ID = TENANT_ID
         oldapp.config.AUTH_COOKIE_SECURE = False
+        oldapp.config.OFFLINE_VIDEO_ENABLED = True
+        oldapp.config.PROBE_SNAP_ENABLED = True
+        oldapp.config.INDEXED_FOLDER_ENABLED = True
         self.repository = _Repository()
         self.audit = _AuditWriter()
         oldapp._auth_service = AuthenticationService(
@@ -312,6 +318,9 @@ class HttpAuthRouteTests(unittest.TestCase):
         oldapp.config.AUTH_ENABLED = self.original["AUTH_ENABLED"]
         oldapp.config.AUTH_TENANT_ID = self.original["AUTH_TENANT_ID"]
         oldapp.config.AUTH_COOKIE_SECURE = self.original["AUTH_COOKIE_SECURE"]
+        oldapp.config.OFFLINE_VIDEO_ENABLED = self.original["OFFLINE_VIDEO_ENABLED"]
+        oldapp.config.PROBE_SNAP_ENABLED = self.original["PROBE_SNAP_ENABLED"]
+        oldapp.config.INDEXED_FOLDER_ENABLED = self.original["INDEXED_FOLDER_ENABLED"]
         oldapp._auth_service = None
         oldapp._identity_repository = None
         oldapp._audit_writer = None
@@ -1068,6 +1077,28 @@ class HttpAuthRouteTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_detection_thumbnail_requires_owned_metadata(self) -> None:
+        self._login()
+        with patch(
+            "oldapp.detections_store.fetch_detections_by_ids",
+            return_value=[{"id": 501, "channel_id": 8, "thumbnail": "ZmFrZQ=="}],
+        ):
+            response = self.client.get("/detections/thumbnail/501")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_detection_thumbnail_serves_authorized_thumbnail(self) -> None:
+        self._login()
+        with patch(
+            "oldapp.detections_store.fetch_detections_by_ids",
+            return_value=[{"id": 501, "channel_id": 7, "thumbnail": "ZmFrZQ=="}],
+        ):
+            response = self.client.get("/detections/thumbnail/501")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/jpeg")
+        self.assertEqual(response.data, b"fake")
 
     def test_audit_outage_blocks_mutation_before_handler(self) -> None:
         _, csrf_token = self._login()

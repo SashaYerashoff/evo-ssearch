@@ -34,6 +34,7 @@ _HIDDEN_UNTIL_APPROVALS = frozenset({"create_bookmark"})
 _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
     {
         "search_archive",
+        "get_visual_window_signals",
         "get_detections",
         "get_detection_summary",
         "build_research_batch",
@@ -41,12 +42,15 @@ _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
         "get_prompt_settings",
         "update_prompt_settings",
         "get_video_summaries",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
         "generate_report",
     }
 )
 
 _TOOL_PERMISSIONS: dict[str, Permission] = {
     "search_archive": Permission.DETECTIONS_VIEW,
+    "get_visual_window_signals": Permission.DETECTIONS_VIEW,
     "get_detections": Permission.DETECTIONS_VIEW,
     "get_detection_summary": Permission.DETECTIONS_VIEW,
     "list_channels": Permission.STREAMS_VIEW,
@@ -63,6 +67,8 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "get_prompt_settings": Permission.STREAMS_VIEW,
     "update_prompt_settings": Permission.PROMPTS_MANAGE,
     "get_video_summaries": Permission.STREAMS_VIEW,
+    "count_video_summary_events": Permission.STREAMS_VIEW,
+    "track_visual_state_transitions": Permission.DETECTIONS_VIEW,
     "create_bookmark": Permission.BOOKMARKS_CREATE,
     "generate_report": Permission.REPORTS_VIEW,
 }
@@ -74,6 +80,9 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "delete_probes",
         "update_probe",
         "get_video_summaries",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+        "get_visual_window_signals",
         "create_bookmark",
     }
 )
@@ -131,6 +140,16 @@ class EvaAgentToolAdapter:
                 channel_required=name in _CHANNEL_REQUIRED_TOOLS,
                 max_rows=self._max_rows(name),
                 default_rows=self._default_rows(name),
+                time_window_arguments=() if name == "normalize_time_window" else (
+                    ("start_time", "end_time"),
+                    ("since", "until"),
+                    ("from", "to"),
+                ),
+                time_window_object_arguments=() if name == "normalize_time_window" else ("time_window", "window"),
+                duration_arguments=() if name == "normalize_time_window" else (
+                    "time_window_seconds",
+                    "window_seconds",
+                ),
                 max_output_bytes=96_000,
                 max_output_items=500,
                 max_output_string_chars=24_000,
@@ -162,6 +181,8 @@ class EvaAgentToolAdapter:
             "get_detections": 100,
             "list_video_summary_channels": 100,
             "get_video_summaries": 100,
+            "count_video_summary_events": 120,
+            "track_visual_state_transitions": 120,
         }.get(name)
 
     @staticmethod
@@ -171,6 +192,8 @@ class EvaAgentToolAdapter:
             "get_detections": 20,
             "list_video_summary_channels": 16,
             "get_video_summaries": 20,
+            "count_video_summary_events": 40,
+            "track_visual_state_transitions": 40,
         }.get(name)
 
     @staticmethod
@@ -179,8 +202,11 @@ class EvaAgentToolAdapter:
             "survey_channels": 300.0,
             "describe_frame": 120.0,
             "search_archive": 90.0,
+            "get_visual_window_signals": 90.0,
             "build_research_batch": 90.0,
             "get_video_summaries": 90.0,
+            "count_video_summary_events": 90.0,
+            "track_visual_state_transitions": 90.0,
             "list_video_summary_channels": 90.0,
             "generate_report": 90.0,
         }.get(name, 45.0)
@@ -434,8 +460,6 @@ class EvaAgentToolAdapter:
             arguments["channel_id"] = channel_id
 
     def _resolve_detection_channel(self, arguments: dict[str, Any]) -> None:
-        if arguments.get("channel_id") is not None:
-            return
         detection_id = arguments.get("detection_id")
         if detection_id is None:
             return

@@ -9,21 +9,28 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 
-from detection_store import (
-    ARCHIVE_SOURCE_ALIASES,
-    PROBE_SOURCE_ALIASES,
-    SOURCE_GROUP_SQL,
-    DetectionsStore,
-)
 from eva_db import PsycopgPool, TransactionContext
 
 
 NIL_UUID = uuid.UUID(int=0)
 ARCHIVE_RUNTIME_REVISION = "20260612_0005"
+PROBE_SOURCE_ALIASES = frozenset({"probe", "probes_run", "probes_query", "probe_daemon"})
+ARCHIVE_SOURCE_ALIASES = {
+    "probe": "probe",
+    "probes_run": "probe",
+    "probes_query": "probe",
+    "probe_daemon": "probe",
+    "vlm_summary": "vlm_summary",
+    "vlm_alert": "vlm_alert",
+}
+SOURCE_GROUP_SQL = (
+    "CASE WHEN source IN ('probe', 'probes_run', 'probes_query', 'probe_daemon') "
+    "THEN 'probe' ELSE COALESCE(NULLIF(source, ''), 'unknown') END"
+)
 
 
 class ArchiveStoreNotReady(RuntimeError):
@@ -46,6 +53,118 @@ def _archive_not_ready(exc: Exception) -> ArchiveStoreNotReady:
     )
 
 
+def _vec_to_blob(vec: Any) -> Optional[bytes]:
+    if vec is None:
+        return None
+    try:
+        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm > 0:
+        arr = arr / norm
+    return arr.astype(np.float32, copy=False).tobytes()
+
+
+def _blob_to_vec(blob: Optional[bytes]) -> Optional[np.ndarray]:
+    if not blob:
+        return None
+    arr = np.frombuffer(blob, dtype=np.float32)
+    if arr.size == 0:
+        return None
+    return arr.astype(np.float32, copy=True)
+
+
+def _detection_shard_key(channel_id: int, event_ts_ms: int) -> str:
+    ts_sec = max(0.0, float(event_ts_ms) / 1000.0)
+    date_key = time.strftime("%Y%m%d", time.localtime(ts_sec))
+    return f"ch{channel_id}:{date_key}"
+
+
+def _decode_detection_payload(payload_json: Optional[str]) -> Optional[Any]:
+    if not payload_json:
+        return None
+    try:
+        return json.loads(payload_json)
+    except Exception:
+        return None
+
+
+def _normalize_detection(record: Dict[str, Any]) -> Dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    event_ts = int(record.get("timestamp_ms") or now_ms)
+    probe_id = str(record.get("probe_id") or "").strip()
+    if not probe_id:
+        raise ValueError("probe_id is required")
+    channel_raw = record.get("channel_id")
+    if channel_raw is None:
+        raise ValueError("channel_id is required")
+    try:
+        channel_id = int(cast(Any, channel_raw))
+    except Exception as exc:
+        raise ValueError("channel_id is required") from exc
+
+    pos_score = float(record.get("pos_score", 0.0))
+    neg_score = float(record.get("neg_score", 0.0))
+    margin = float(record.get("margin", 0.0))
+    source = str(record.get("source") or "probe").strip().lower()
+    source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    dedupe_key = str(
+        record.get("dedupe_key")
+        or f"{probe_id}:{event_ts}:{pos_score:.3f}:{neg_score:.3f}:{margin:.3f}:{source}"
+    )
+
+    payload_obj = record.get("payload")
+    payload_json = (
+        json.dumps(payload_obj, ensure_ascii=True)
+        if isinstance(payload_obj, (dict, list))
+        else None
+    )
+
+    image_path = str(record.get("image_path") or "").strip() or None
+    if image_path is None and isinstance(payload_obj, dict):
+        image_path = str(payload_obj.get("image_path") or "").strip() or None
+
+    clip_value = record.get("clip_vec")
+    if clip_value is None:
+        clip_value = record.get("clip_embedding")
+    dino_value = record.get("dino_vec")
+    if dino_value is None:
+        dino_value = record.get("dino_embedding")
+    clip_vec_blob = _vec_to_blob(clip_value)
+    dino_vec_blob = _vec_to_blob(dino_value)
+
+    shard_key = (
+        str(record.get("shard_key") or "").strip()
+        or _detection_shard_key(channel_id, event_ts)
+    )
+
+    return {
+        "dedupe_key": dedupe_key,
+        "event_timestamp_ms": event_ts,
+        "recorded_at_ms": int(record.get("recorded_at_ms") or now_ms),
+        "probe_id": probe_id,
+        "probe_name": str(record.get("probe_name") or "").strip() or None,
+        "channel_id": channel_id,
+        "severity": str(record.get("severity") or "").strip().lower() or None,
+        "bookmark_enabled": 1 if bool(record.get("bookmark_enabled", False)) else 0,
+        "bookmark_sent": 1 if bool(record.get("bookmark_sent", False)) else 0,
+        "pos_score": pos_score,
+        "neg_score": neg_score,
+        "margin": margin,
+        "thumbnail_b64": str(record.get("thumbnail_b64") or "").strip() or None,
+        "source": source,
+        "payload_json": payload_json,
+        "shard_key": shard_key,
+        "image_path": image_path,
+        "clip_vec": clip_vec_blob,
+        "dino_vec": dino_vec_blob,
+        "dino_ready": 1 if dino_vec_blob is not None else 0,
+    }
+
+
 class _TenantRepository:
     backend = "postgres"
 
@@ -60,16 +179,19 @@ class _TenantRepository:
 
 
 class PostgresDetectionsStore(_TenantRepository):
-    """PostgreSQL implementation matching the SQLite DetectionsStore API."""
+    """PostgreSQL implementation for archived detection/search records."""
 
     def __init__(
         self,
         pool: PsycopgPool,
         tenant_id: str | uuid.UUID,
         max_records: int = 20000,
+        cap_check_interval_sec: float = 60.0,
     ) -> None:
         super().__init__(pool, tenant_id)
         self.max_records = max(1000, int(max_records or 20000))
+        self.cap_check_interval_sec = max(0.0, float(cap_check_interval_sec or 0.0))
+        self._last_cap_check_monotonic = 0.0
 
     @staticmethod
     def _row_to_dict(row: Sequence[Any], include_vectors: bool = False) -> Dict[str, Any]:
@@ -97,8 +219,8 @@ class PostgresDetectionsStore(_TenantRepository):
             "has_dino": dino_blob is not None,
         }
         if include_vectors:
-            data["clip_vec"] = DetectionsStore._blob_to_vec(clip_blob)
-            data["dino_vec"] = DetectionsStore._blob_to_vec(dino_blob)
+            data["clip_vec"] = _blob_to_vec(clip_blob)
+            data["dino_vec"] = _blob_to_vec(dino_blob)
         return data
 
     def health(self) -> Dict[str, Any]:
@@ -129,7 +251,7 @@ class PostgresDetectionsStore(_TenantRepository):
             }
 
     def add_detection(self, record: Dict[str, Any]) -> bool:
-        normalized = DetectionsStore._normalize_detection(record)
+        normalized = _normalize_detection(record)
         with self.lock:
             with self.pool.transaction(self._context()) as connection:
                 inserted = self._insert_normalized(connection, normalized)
@@ -140,7 +262,7 @@ class PostgresDetectionsStore(_TenantRepository):
         normalized_rows: List[Dict[str, Any]] = []
         for record in records:
             try:
-                normalized_rows.append(DetectionsStore._normalize_detection(record))
+                normalized_rows.append(_normalize_detection(record))
             except Exception:
                 continue
         if not normalized_rows:
@@ -158,7 +280,7 @@ class PostgresDetectionsStore(_TenantRepository):
         return inserted
 
     def _insert_normalized(self, connection: Any, normalized: Mapping[str, Any]) -> bool:
-        payload = DetectionsStore._decode_payload(
+        payload = _decode_detection_payload(
             normalized.get("payload_json") if isinstance(normalized.get("payload_json"), str) else None
         )
         cursor = connection.execute(
@@ -219,6 +341,14 @@ class PostgresDetectionsStore(_TenantRepository):
         return int(cursor.rowcount or 0) > 0
 
     def _trim_to_cap(self, connection: Any) -> None:
+        now = time.monotonic()
+        if (
+            self.cap_check_interval_sec > 0
+            and self._last_cap_check_monotonic > 0
+            and now - self._last_cap_check_monotonic < self.cap_check_interval_sec
+        ):
+            return
+        self._last_cap_check_monotonic = now
         row = connection.execute(
             "SELECT COUNT(*) FROM archive.detections WHERE tenant_id = %s",
             (self.tenant_id,),
@@ -490,6 +620,7 @@ class PostgresDetectionsStore(_TenantRepository):
         limit: int = 20000,
         only_with_clip: bool = True,
         include_vectors: bool = False,
+        include_thumbnail: bool = True,
         source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(100000, int(limit or 20000)))
@@ -506,7 +637,7 @@ class PostgresDetectionsStore(_TenantRepository):
                 with self.pool.transaction(self._context(), readonly=True) as connection:
                     rows = connection.execute(
                         f"""
-                        SELECT {self._select_columns()}
+                        SELECT {self._select_columns(include_thumbnail=include_thumbnail)}
                         FROM archive.detections
                         {where_sql}
                         ORDER BY event_timestamp_ms DESC, id DESC
@@ -520,10 +651,41 @@ class PostgresDetectionsStore(_TenantRepository):
             raise
         return [self._row_to_dict(row, include_vectors=include_vectors) for row in rows]
 
+    def count_vector_candidates(
+        self,
+        probe_id: Optional[str] = None,
+        channel_id: Optional[int] = None,
+        since_ms: Optional[int] = None,
+        until_ms: Optional[int] = None,
+        only_with_clip: bool = True,
+        source: Optional[str] = None,
+    ) -> int:
+        where_sql, params = self._build_where(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            only_with_clip=only_with_clip,
+        )
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    row = connection.execute(
+                        f"SELECT COUNT(*) FROM archive.detections {where_sql}",
+                        tuple(params),
+                    ).fetchone()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _archive_not_ready(exc) from exc
+            raise
+        return int(row[0] or 0) if row else 0
+
     def fetch_detections_by_ids(
         self,
         ids: Sequence[int],
         include_vectors: bool = True,
+        include_thumbnail: bool = True,
     ) -> List[Dict[str, Any]]:
         ids_clean = [int(item) for item in ids if item is not None]
         if not ids_clean:
@@ -534,7 +696,7 @@ class PostgresDetectionsStore(_TenantRepository):
                 with self.pool.transaction(self._context(), readonly=True) as connection:
                     rows = connection.execute(
                         f"""
-                        SELECT {self._select_columns()}
+                        SELECT {self._select_columns(include_thumbnail=include_thumbnail)}
                         FROM archive.detections
                         {where_sql}
                         """,
@@ -584,7 +746,7 @@ class PostgresDetectionsStore(_TenantRepository):
             raise ValueError("unsupported vector column")
         payload: List[Tuple[bytes, int]] = []
         for det_id, vec in rows:
-            blob = DetectionsStore._vec_to_blob(vec)
+            blob = _vec_to_blob(vec)
             if blob is not None:
                 payload.append((blob, int(det_id)))
         if not payload:
@@ -664,7 +826,7 @@ class PostgresDetectionsStore(_TenantRepository):
         vectors: List[np.ndarray] = []
         target_dim: Optional[int] = None
         for row in rows:
-            vec = DetectionsStore._blob_to_vec(_blob_bytes(row[1]))
+            vec = _blob_to_vec(_blob_bytes(row[1]))
             if vec is None:
                 continue
             if target_dim is None:
@@ -782,11 +944,12 @@ class PostgresDetectionsStore(_TenantRepository):
         ]
 
     @staticmethod
-    def _select_columns() -> str:
+    def _select_columns(*, include_thumbnail: bool = True) -> str:
+        thumbnail_expr = "thumbnail_b64" if include_thumbnail else "NULL::text AS thumbnail_b64"
         return (
             "id, event_timestamp_ms, recorded_at_ms, probe_id, probe_name, "
             "channel_id, severity, bookmark_enabled, bookmark_sent, pos_score, "
-            "neg_score, margin, thumbnail_b64, source, payload_json, shard_key, "
+            f"neg_score, margin, {thumbnail_expr}, source, payload_json, shard_key, "
             "image_path, clip_vec, dino_vec"
         )
 

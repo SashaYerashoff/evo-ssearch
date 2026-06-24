@@ -213,6 +213,13 @@ EVOSSEARCH_LM_BASE_URL=http://127.0.0.1:1234/v1
 EVOSSEARCH_LM_MODEL=
 EVOSSEARCH_LM_API_KEY=
 
+# Deployment feature gates. Для клиентского 50-channel пилота оставляем
+# выключенными проблемные/необещанные поверхности. Archive Research и описание
+# найденного кадра через /describe_image продолжают работать.
+EVOSSEARCH_OFFLINE_VIDEO_ENABLED=false
+EVOSSEARCH_PROBE_SNAP_ENABLED=false
+EVOSSEARCH_INDEXED_FOLDER_ENABLED=false
+
 # OpenAI-compatible inference profiles.
 # Для демо-схемы: один endpoint под агента и четыре VLM endpoint-а под live summaries.
 # Profile id `vlm-1` в EVOSSEARCH_LM_PROFILES превращается в env prefix
