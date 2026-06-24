@@ -1169,6 +1169,21 @@ class LuxriotManager:
             out.append(normalized)
         return out
 
+    def _filter_normalized_summary_history_retention(
+        self,
+        logs: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        cutoff = self._summary_retention_cutoff()
+        out: List[Dict[str, Any]] = []
+        for log in logs:
+            if not isinstance(log, Mapping):
+                continue
+            created = self._coerce_float(log.get("created_at"))
+            if cutoff is not None and created is not None and created < cutoff:
+                continue
+            out.append(dict(log))
+        return out
+
     def _filter_summary_runs_retention(
         self,
         runs: Sequence[Mapping[str, Any]],
@@ -3425,13 +3440,62 @@ class LuxriotManager:
     def _merge_summary_history_locked(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> None:
         if not logs:
             return
-        existing = self.summary_history.get(channel_id, [])
-        combined = self._filter_summary_history_retention(
-            self._combine_summary_logs(existing, logs)
+        existing = self._filter_normalized_summary_history_retention(
+            self.summary_history.get(channel_id, [])
         )
-        if len(combined) > self.summary_history_limit:
-            combined = combined[-self.summary_history_limit :]
-        self.summary_history[channel_id] = combined
+        merged: List[Dict[str, Any]] = []
+        key_to_index: Dict[Tuple[str, str, str, str], int] = {}
+        last_created: Optional[float] = None
+        out_of_order = False
+
+        for item in existing:
+            key = self._summary_log_key(item)
+            if key in key_to_index:
+                continue
+            key_to_index[key] = len(merged)
+            merged.append(item)
+            created = self._coerce_float(item.get("created_at"))
+            if created is not None:
+                if last_created is not None and created < last_created:
+                    out_of_order = True
+                last_created = created
+
+        for raw_log in logs:
+            if not isinstance(raw_log, Mapping):
+                continue
+            incoming = dict(raw_log)
+            key = self._summary_log_key(incoming)
+            index = key_to_index.get(key)
+            if index is not None:
+                existing_item = merged[index]
+                existing_meta = self._alert_meta_from_counts(existing_item.get("alert_counts"))
+                incoming_meta = self._alert_meta_from_counts(incoming.get("alert_counts"))
+                existing_total = int(existing_meta.get("alert_total") or 0)
+                incoming_total = int(incoming_meta.get("alert_total") or 0)
+                if existing_total > 0 and incoming_total <= 0:
+                    incoming["alert_counts"] = dict(existing_meta.get("alert_counts") or {})
+                    incoming["alert_total"] = existing_total
+                    incoming["alert_severities"] = list(existing_meta.get("alert_severities") or [])
+                if (
+                    isinstance(existing_item.get("signal_digest"), Mapping)
+                    and not isinstance(incoming.get("signal_digest"), Mapping)
+                ):
+                    incoming["signal_digest"] = dict(cast(Mapping[str, Any], existing_item.get("signal_digest")))
+                merged[index] = incoming
+                continue
+            created = self._coerce_float(incoming.get("created_at"))
+            if created is not None and last_created is not None and created < last_created:
+                out_of_order = True
+            if created is not None:
+                last_created = created
+            key_to_index[key] = len(merged)
+            merged.append(incoming)
+
+        if out_of_order:
+            merged.sort(key=lambda item: float(self._coerce_float(item.get("created_at")) or 0.0))
+        if len(merged) > self.summary_history_limit:
+            merged = merged[-self.summary_history_limit :]
+        self.summary_history[channel_id] = merged
         self._persist_summary_state_if_due_locked()
 
     def record_summary_log(self, channel_id: int, entry: Mapping[str, Any]) -> None:

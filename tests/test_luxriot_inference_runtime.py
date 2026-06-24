@@ -315,6 +315,77 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(rollups["levels"]["L1"][0]["alert_counts"], {"critical": 1, "normal": 1, "low": 1})
             self.assertEqual(rollups["levels"]["L1"][0]["alert_total"], 3)
 
+    def test_summary_history_merge_normalizes_only_new_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            base = 1_781_700_000.0
+            existing = []
+            for index in range(5):
+                normalized = manager._normalize_summary_log_entry(
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": f"existing summary {index}",
+                        "frame_count": 12,
+                        "created_at": base + index,
+                    }
+                )
+                self.assertIsNotNone(normalized)
+                existing.append(normalized)
+            manager.summary_history[7] = existing
+
+            with patch.object(
+                manager,
+                "_normalize_summary_log_entry",
+                wraps=manager._normalize_summary_log_entry,
+            ) as normalize:
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": "new summary",
+                        "frame_count": 12,
+                        "created_at": base + 10.0,
+                    },
+                )
+
+            self.assertEqual(normalize.call_count, 1)
+            self.assertEqual(len(manager.summary_history[7]), 6)
+            self.assertEqual(manager.summary_history[7][-1]["summary"], "new summary")
+
+    def test_summary_history_duplicate_preserves_existing_alert_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            entry = {
+                "channel_id": 7,
+                "run_id": "run-7",
+                "summary": "door opens",
+                "frame_count": 12,
+                "created_at": 1_781_700_000.0,
+            }
+            existing = manager._normalize_summary_log_entry(entry)
+            incoming = manager._normalize_summary_log_entry(entry)
+            self.assertIsNotNone(existing)
+            self.assertIsNotNone(incoming)
+            existing["alert_counts"] = {"high": 1}
+            existing["alert_total"] = 1
+            existing["alert_severities"] = ["high"]
+            existing["signal_digest"] = {"alerts": {"high": 1}}
+            incoming["alert_counts"] = {}
+            incoming["alert_total"] = 0
+            incoming["alert_severities"] = []
+            incoming.pop("signal_digest", None)
+            manager.summary_history[7] = [existing]
+
+            manager._merge_summary_history_locked(7, [incoming])
+
+            merged = manager.summary_history[7][0]
+            self.assertEqual(merged["alert_counts"], {"high": 1})
+            self.assertEqual(merged["alert_total"], 1)
+            self.assertEqual(merged["alert_severities"], ["high"])
+            self.assertEqual(merged["signal_digest"], {"alerts": {"high": 1}})
+
     def test_summary_filters_and_l0_rollups_use_batch_bounds(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

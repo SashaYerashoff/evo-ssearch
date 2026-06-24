@@ -13,6 +13,8 @@ Previous baseline: `β 0.8.0`
 - Added automatic evidence thumbnails for agent answers that mention detection/frame IDs.
 - Made agent video-summary reads use read-only rollup mode so investigation tools do not trigger LLM rollup synthesis.
 - Added coverage and truncation contracts for video-summary and visual-state workflows.
+- Reduced live-summary persistence hot-path cost: new batches no longer re-normalize the full per-channel history under the capture lock.
+- Added Gunicorn worker shutdown hooks to flush live summary/rollup runtime state during graceful service restarts.
 - Removed demo-specific prompt/schema examples from agent-visible tool contracts.
 - Improved VLM feed JSON handling, UI layout stability, stream health visibility, and archive/agent evidence cards.
 - Extended PostgreSQL/archive/security test coverage and kept SQLite legacy tests out of the production path.
@@ -29,7 +31,8 @@ Previous baseline: `β 0.8.0`
 Last local verification before commit:
 
 - `python -m py_compile agent.py luxriot_connector.py agent_security/eva_adapter.py`
+- `python -m py_compile gunicorn_conf.py`
+- `bash -n run_prod.sh`
 - `node --check static/js/app.js`
 - `python -m pytest -q`
 - `git diff --check`
-

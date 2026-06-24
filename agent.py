@@ -3192,7 +3192,17 @@ class AgentTools:
                 confirmed_state_counts[state] = confirmed_state_counts.get(state, 0) + 1
         warnings = [*fetch_warnings, *negative_query_warnings]
         if negative_vec is None:
-            warnings.append("negative_state_query was not provided; unknown/positive separation is weaker.")
+            if not negative_query:
+                warnings.append("negative_state_query was not provided; unknown/positive separation is weaker.")
+            elif not negative_query_effective:
+                warnings.append(
+                    "negative_state_query was removed by CLIP negation cleanup; "
+                    "unknown/positive separation is weaker."
+                )
+            else:
+                warnings.append(
+                    "negative_state_query could not be embedded; unknown/positive separation is weaker."
+                )
         if truncated:
             warnings.append("Frame candidate scan was truncated by candidate_limit; counts apply to scanned frames only.")
         if not samples:

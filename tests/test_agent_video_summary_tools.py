@@ -1082,6 +1082,48 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["candidate_frames"][0]["image_url"], "/detections/thumbnail/4")
         self.assertEqual(compact["transitions"][0]["after_frame"]["image_url"], "/detections/thumbnail/3")
 
+    def test_track_visual_state_transition_negative_embedding_warning_is_specific(self):
+        store = _DetectionStore(
+            [
+                {
+                    "id": 1,
+                    "channel_id": 7,
+                    "source": "vlm_summary",
+                    "event_timestamp_ms": 100_000,
+                    "clip_vec": [1.0, 0.0],
+                    "thumbnail": "unused-positive",
+                },
+            ]
+        )
+
+        def embed_text(text):
+            value = str(text).lower()
+            if "empty" in value:
+                return None
+            return [1.0, 0.0]
+
+        result = _tools(detections_store=store, embed_text_fn=embed_text).execute(
+            "track_visual_state_transitions",
+            {
+                "channel_id": 7,
+                "subject_query": "object",
+                "positive_state_query": "object on table",
+                "negative_state_query": "empty table",
+                "sources": ["vlm_summary"],
+                "from_ts": 100.0,
+                "to_ts": 101.0,
+            },
+        )
+
+        self.assertIn(
+            "negative_state_query could not be embedded; unknown/positive separation is weaker.",
+            result["warnings"],
+        )
+        self.assertNotIn(
+            "negative_state_query was not provided; unknown/positive separation is weaker.",
+            result["warnings"],
+        )
+
     def test_get_detections_sorts_by_timestamp_fallbacks_and_compacts_vlm_semantics(self):
         rows = [
             {

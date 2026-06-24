@@ -7,6 +7,7 @@ WORKERS="${EVOSSEARCH_GUNICORN_WORKERS:-1}"
 THREADS="${EVOSSEARCH_GUNICORN_THREADS:-4}"
 TIMEOUT="${EVOSSEARCH_GUNICORN_TIMEOUT:-180}"
 GUNICORN_BIN="${EVOSSEARCH_GUNICORN_BIN:-}"
+GUNICORN_CONFIG="${EVOSSEARCH_GUNICORN_CONFIG:-gunicorn_conf.py}"
 SECURE_REQUIRED="${EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED:-false}"
 
 case "${SECURE_REQUIRED,,}" in
@@ -29,10 +30,19 @@ if [[ -z "${GUNICORN_BIN}" ]]; then
   fi
 fi
 
-exec "${GUNICORN_BIN}" \
+GUNICORN_ARGS=()
+
+if [[ -n "${GUNICORN_CONFIG}" ]]; then
+  GUNICORN_ARGS+=(--config "${GUNICORN_CONFIG}")
+fi
+
+GUNICORN_ARGS+=(
   "wsgi:app" \
   --bind "${HOST}:${PORT}" \
   --workers "${WORKERS}" \
   --threads "${THREADS}" \
   --timeout "${TIMEOUT}" \
   --worker-class gthread
+)
+
+exec "${GUNICORN_BIN}" "${GUNICORN_ARGS[@]}"
