@@ -48,6 +48,7 @@ AGENT_MAX_MESSAGES_PER_SESSION = 200  # messages kept per session (prune oldest)
 AGENT_MAX_RUNTIME_SKILLS_CHARS = 3_500
 AGENT_MAX_ACTIVE_SKILL_CHARS   = 6_000
 AGENT_MAX_PROBES_IN_PROMPT     = 12
+AGENT_MAX_VIDEO_STREAMS_IN_PROMPT = 16
 AGENT_MAX_TOOL_CALLS_PER_TURN  = 64
 AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN = 8
 AGENT_VIDEO_SUMMARY_DEFAULT_LEVEL_LIMIT = 500
@@ -1210,25 +1211,42 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "generate_report",
             "description": (
-                "Compile a structured detection report for a time period. "
-                "Aggregates per-probe statistics, highlights peak activity hours, "
-                "and lists the most significant detection events. "
-                "Use for daily/weekly summaries or to answer 'give me a report on this week'."
+                "Compile an operator report for a time period. Defaults to live video-description "
+                "coverage, VLM alerts, stream health, quiet channels, and evidence frames. "
+                "Use report_type='probes' only when the operator explicitly asks for probe statistics."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "report_type": {
+                        "type": "string",
+                        "enum": ["video_descriptions", "probes"],
+                        "description": "Default: video_descriptions. Use probes only for explicit probe reports.",
+                    },
                     "since_hours": {
                         "type": "number",
-                        "description": "Report covers detections from the past N hours. Default: 24.",
+                        "description": "Report covers data from the past N hours. Default: 24.",
                     },
                     "until_hours": {
                         "type": "number",
                         "description": "Optional upper bound. Omit for up-to-now.",
                     },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
                     "channel_id": {
                         "type": "integer",
                         "description": "Optional. Restrict report to one channel.",
+                    },
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional channel IDs for a multi-channel video-description report.",
                     },
                     "channel_ref": {
                         "type": "string",
@@ -1237,11 +1255,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "include_probes": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Probe names to include. If omitted, includes all active probes.",
+                        "description": "Probe names to include when report_type='probes'.",
                     },
                     "top_events": {
                         "type": "integer",
-                        "description": "Include the N highest-margin events per probe. Default: 5.",
+                        "description": "Include up to N representative evidence events. Default: 5.",
                     },
                 },
                 "required": [],
@@ -1986,6 +2004,32 @@ class AgentTools:
             channels = self._lxm.get_channels(force=False)
         except Exception as exc:
             raise ToolError(f"Could not fetch channels: {exc}") from exc
+        runtime_by_channel: Dict[int, Dict[str, Any]] = {}
+        desired_video_channels: set[int] = set()
+        desired_missing_by_channel: Dict[int, Dict[str, Any]] = {}
+        try:
+            streams_status = self._lxm.streams_status() if hasattr(self._lxm, "streams_status") else {}
+        except Exception:
+            streams_status = {}
+        if isinstance(streams_status, Mapping):
+            for item in streams_status.get("video_streams") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                runtime_channel_id = _opt_int(item.get("channel_id"))
+                if runtime_channel_id is not None and runtime_channel_id > 0:
+                    runtime_by_channel[int(runtime_channel_id)] = dict(item)
+            desired_video_channels = {
+                int(item)
+                for item in streams_status.get("desired_video_channels") or []
+                if _opt_int(item) is not None and int(item) > 0
+            }
+            desired_missing_by_channel = {
+                int(row.get("channel_id")): dict(row)
+                for row in streams_status.get("desired_video_missing") or []
+                if isinstance(row, Mapping)
+                and _opt_int(row.get("channel_id")) is not None
+                and int(row.get("channel_id")) > 0
+            }
 
         valid_channel_ids: set[int] = set()
         for channel in channels if isinstance(channels, list) else []:
@@ -2027,11 +2071,16 @@ class AgentTools:
                 continue
             starts: List[float] = []
             ends: List[float] = []
+            spans: List[Tuple[float, float]] = []
             frame_count = 0
             alert_counts: Dict[str, int] = {}
+            log_run_ids: set[str] = set()
             for log in logs:
                 if not isinstance(log, dict):
                     continue
+                run_id = str(log.get("run_id") or "").strip()
+                if run_id:
+                    log_run_ids.add(run_id)
                 created = _coerce_epoch_seconds(log.get("created_at"))
                 batch_start_ms = _opt_int(log.get("batch_start_ms"))
                 batch_end_ms = _opt_int(log.get("batch_end_ms"))
@@ -2043,11 +2092,15 @@ class AgentTools:
                     if batch_start_ms is not None and batch_end_ms is not None:
                         if batch_end_ms < batch_start_ms:
                             batch_start_ms, batch_end_ms = batch_end_ms, batch_start_ms
-                        starts.append(float(batch_start_ms) / 1000.0)
-                        ends.append(float(batch_end_ms) / 1000.0)
+                        span_start = float(batch_start_ms) / 1000.0
+                        span_end = float(batch_end_ms) / 1000.0
+                        starts.append(span_start)
+                        ends.append(span_end)
+                        spans.append((span_start, span_end))
                 elif created is not None:
                     starts.append(created)
                     ends.append(created)
+                    spans.append((created, created))
                 frame_count += int(_opt_int(log.get("frame_count")) or 0)
                 raw_counts = log.get("alert_counts")
                 if isinstance(raw_counts, dict):
@@ -2062,6 +2115,63 @@ class AgentTools:
             latest_ts = max(ends) if ends else None
             first_ts = min(starts) if starts else None
             alert_total = int(sum(alert_counts.values()))
+            spans.sort(key=lambda item: (item[0], item[1]))
+            start_deltas = [
+                spans[index][0] - spans[index - 1][0]
+                for index in range(1, len(spans))
+                if spans[index][0] > spans[index - 1][0]
+            ]
+            sorted_deltas = sorted(start_deltas)
+            median_delta = (
+                sorted_deltas[len(sorted_deltas) // 2]
+                if sorted_deltas
+                else 0.0
+            )
+            gap_threshold_sec = max(120.0, median_delta * 3.0) if median_delta > 0 else 120.0
+            internal_gaps: List[float] = []
+            previous_end: Optional[float] = None
+            for span_start, span_end in spans:
+                if previous_end is not None:
+                    gap = max(0.0, span_start - previous_end)
+                    if gap > gap_threshold_sec:
+                        internal_gaps.append(gap)
+                previous_end = max(previous_end if previous_end is not None else span_end, span_end)
+            leading_gap_sec = max(0.0, float(first_ts or from_ts) - float(from_ts)) if first_ts is not None else 0.0
+            trailing_gap_sec = max(0.0, float(to_ts) - float(latest_ts or to_ts)) if latest_ts is not None else 0.0
+            edge_gaps = [
+                gap for gap in (leading_gap_sec, trailing_gap_sec)
+                if gap > gap_threshold_sec
+            ]
+            coverage_gap_count = len(internal_gaps) + len(edge_gaps)
+            largest_gap_sec = max(internal_gaps + edge_gaps + [0.0])
+            requested_span = max(0.0, float(to_ts) - float(from_ts))
+            observed_span = max(0.0, float(latest_ts or 0.0) - float(first_ts or 0.0)) if first_ts is not None and latest_ts is not None else 0.0
+            coverage_ratio = 1.0 if requested_span <= 0 else max(0.0, min(1.0, observed_span / requested_span))
+            runtime = runtime_by_channel.get(channel_id, {})
+            desired = channel_id in desired_video_channels
+            runtime_running = bool(runtime.get("running"))
+            running = bool(status.get("running")) if isinstance(status, dict) else runtime_running
+            silent_since_sec = trailing_gap_sec if latest_ts is not None else None
+            quiet = bool(latest_ts is not None and trailing_gap_sec > gap_threshold_sec and not running)
+            runs_raw = status.get("runs") if isinstance(status, dict) and isinstance(status.get("runs"), list) else []
+            overlapping_runs = 0
+            for run in runs_raw:
+                if not isinstance(run, Mapping):
+                    continue
+                started = _coerce_epoch_seconds(run.get("started_at") or run.get("run_started_at"))
+                ended = _coerce_epoch_seconds(run.get("ended_at") or run.get("stopped_at"))
+                if ended is None and bool(run.get("running")):
+                    ended = float(to_ts)
+                if started is None and ended is None:
+                    continue
+                if started is None:
+                    started = float(from_ts)
+                if ended is None:
+                    ended = float(to_ts)
+                if float(ended) >= float(from_ts) and float(started) <= float(to_ts):
+                    overlapping_runs += 1
+            run_count = max(overlapping_runs, len(log_run_ids), 1 if logs else 0)
+            coverage_status = "partial" if coverage_gap_count else "covered"
             channel_rows.append(
                 {
                     "channel_id": channel_id,
@@ -2075,7 +2185,25 @@ class AgentTools:
                     "frame_count": frame_count,
                     "alert_total": alert_total,
                     "alert_counts": alert_counts,
-                    "running": bool(status.get("running")) if isinstance(status, dict) else False,
+                    "running": running,
+                    "desired": desired,
+                    "runtime_running": runtime_running,
+                    "pending_frames": runtime.get("pending_frames"),
+                    "dropped_frames": runtime.get("dropped_frames", status.get("dropped_frames") if isinstance(status, dict) else 0),
+                    "queue_dropped_batches": runtime.get("queue_dropped_batches", status.get("queue_dropped_batches") if isinstance(status, dict) else 0),
+                    "last_error": runtime.get("last_error") or (status.get("last_error") if isinstance(status, dict) else None),
+                    "last_restore_error": runtime.get("last_restore_error"),
+                    "run_count": run_count,
+                    "coverage_status": coverage_status,
+                    "coverage_ratio": coverage_ratio,
+                    "coverage_gap_count": coverage_gap_count,
+                    "internal_gap_count": len(internal_gaps),
+                    "largest_gap_sec": round(largest_gap_sec, 3),
+                    "gap_threshold_sec": round(gap_threshold_sec, 3),
+                    "leading_gap_sec": round(leading_gap_sec, 3),
+                    "trailing_gap_sec": round(trailing_gap_sec, 3),
+                    "silent_since_sec": round(silent_since_sec, 3) if silent_since_sec is not None else None,
+                    "quiet": quiet,
                     "selected_run": status.get("selected_run") if isinstance(status, dict) else None,
                 }
             )
@@ -2102,6 +2230,17 @@ class AgentTools:
             else []
         )
         unchecked_count = len(unchecked_channel_ids)
+        quiet_channel_ids = [
+            int(row["channel_id"])
+            for row in channel_rows
+            if row.get("quiet") and _opt_int(row.get("channel_id")) is not None
+        ]
+        gapped_channel_ids = [
+            int(row["channel_id"])
+            for row in channel_rows
+            if int(_opt_int(row.get("coverage_gap_count")) or 0) > 0
+            and _opt_int(row.get("channel_id")) is not None
+        ]
         return {
             "depth": depth,
             "from_ts": from_ts,
@@ -2123,6 +2262,16 @@ class AgentTools:
                 f"{active_count} active channel(s) have summaries in this window. "
                 f"Reviewing more than {per_turn_limit} channels should be confirmed and chunked."
             ),
+            "desired_video_channels": sorted(desired_video_channels),
+            "desired_video_missing": [
+                desired_missing_by_channel[channel_id]
+                for channel_id in sorted(desired_missing_by_channel)
+            ],
+            "running_video_channels": sorted(runtime_by_channel),
+            "quiet_count": len(quiet_channel_ids),
+            "quiet_channel_ids": quiet_channel_ids,
+            "gapped_count": len(gapped_channel_ids),
+            "gapped_channel_ids": gapped_channel_ids,
             "candidate_channels": candidate_channels,
             "errors": errors[:8],
         }
@@ -3296,6 +3445,225 @@ class AgentTools:
     # ── generate_report ─────────────────────────────────────────────────────
 
     def _generate_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        requested_type = str(args.get("report_type") or args.get("source") or "").strip().lower()
+        if not requested_type:
+            if args.get("include_probes") or args.get("probe_id") or args.get("probe_name"):
+                requested_type = "probes"
+            else:
+                requested_type = "video_descriptions"
+        if requested_type in {"probe", "probes", "detections", "detection"}:
+            return self._generate_probe_report(args)
+        return self._generate_video_description_report(args)
+
+    def _report_time_window_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        report_args = dict(args)
+        if report_args.get("from_ts") is not None or report_args.get("to_ts") is not None:
+            return report_args
+        since_hours = float(args.get("since_hours") or 24)
+        until_hours = _opt_float(args.get("until_hours"))
+        if until_hours is not None:
+            to_ts = time.time() - until_hours * 3600.0
+            report_args["to_ts"] = to_ts
+            report_args["from_ts"] = max(0.0, to_ts - since_hours * 3600.0)
+        return report_args
+
+    def _generate_video_description_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        report_args = self._report_time_window_args(args)
+        channel_id  = self._resolve_channel_id(args, required=False)
+        if channel_id is not None:
+            report_args["channel_ids"] = [channel_id]
+        top_events = max(1, min(20, int(args.get("top_events") or 5)))
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(report_args, default_since_hours=24.0)
+        report_args["from_ts"] = from_ts
+        report_args["to_ts"] = to_ts
+        report_args["limit"] = max(1, min(100, int(args.get("limit") or 24)))
+
+        inventory = self._list_video_summary_channels(report_args)
+        channels = inventory.get("candidate_channels") if isinstance(inventory.get("candidate_channels"), list) else []
+        desired_missing = (
+            inventory.get("desired_video_missing")
+            if isinstance(inventory.get("desired_video_missing"), list)
+            else []
+        )
+        desired_inventory = (
+            inventory.get("desired_video_channels")
+            if isinstance(inventory.get("desired_video_channels"), list)
+            else []
+        )
+        alert_counts: Dict[str, int] = {}
+        quiet_channels: List[Dict[str, Any]] = []
+        gapped_channels: List[Dict[str, Any]] = []
+        running_count = 0
+        desired_count = 0
+        dropped_frames_total = 0
+        dropped_batches_total = 0
+        for row in channels:
+            if not isinstance(row, dict):
+                continue
+            if row.get("running"):
+                running_count += 1
+            if row.get("desired"):
+                desired_count += 1
+            dropped_frames_total += int(_opt_int(row.get("dropped_frames")) or 0)
+            dropped_batches_total += int(_opt_int(row.get("queue_dropped_batches")) or 0)
+            raw_counts = row.get("alert_counts")
+            if isinstance(raw_counts, dict):
+                for key, value in raw_counts.items():
+                    severity = str(key or "normal").strip().lower() or "normal"
+                    alert_counts[severity] = alert_counts.get(severity, 0) + int(_opt_int(value) or 0)
+            if row.get("quiet"):
+                quiet_channels.append(row)
+            if int(_opt_int(row.get("coverage_gap_count")) or 0) > 0:
+                gapped_channels.append(row)
+        if desired_inventory:
+            desired_count = len(desired_inventory)
+
+        since_ms = int(float(from_ts) * 1000.0)
+        until_ms = int(float(to_ts) * 1000.0)
+        alert_frames: List[Dict[str, Any]] = []
+        try:
+            raw_channel_ids = report_args.get("channel_ids") if isinstance(report_args.get("channel_ids"), list) else None
+            frame_channel_ids = [
+                int(item) for item in (raw_channel_ids or [])
+                if _opt_int(item) is not None and int(item) > 0
+            ]
+            if channel_id is not None and not frame_channel_ids:
+                frame_channel_ids = [int(channel_id)]
+            frame_rows: List[Dict[str, Any]] = []
+            if frame_channel_ids:
+                per_channel_limit = max(1, top_events)
+                for frame_channel_id in frame_channel_ids:
+                    rows, _total = self._ds.list_detections(
+                        probe_id=None,
+                        channel_id=frame_channel_id,
+                        source="vlm_alert",
+                        since_ms=since_ms,
+                        until_ms=until_ms,
+                        limit=per_channel_limit,
+                        offset=0,
+                    )
+                    frame_rows.extend(r for r in rows if isinstance(r, dict))
+            else:
+                rows, _total = self._ds.list_detections(
+                    probe_id=None,
+                    channel_id=None,
+                    source="vlm_alert",
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                    limit=top_events,
+                    offset=0,
+                )
+                frame_rows.extend(r for r in rows if isinstance(r, dict))
+            frame_rows.sort(key=_detection_timestamp_ms, reverse=True)
+            alert_frames = [
+                _safe_detection(_annotate_archive_row(r))
+                for r in frame_rows[:top_events]
+                if isinstance(r, dict)
+            ]
+        except Exception:
+            alert_frames = []
+
+        checked = int(inventory.get("total_channels_checked") or 0)
+        active_count = int(inventory.get("active_count") or 0)
+        inactive_count = int(inventory.get("inactive_count") or 0)
+        error_count = int(inventory.get("error_count") or 0)
+        deferred_count = int(inventory.get("deferred_count") or 0)
+        coverage_status = "covered"
+        if active_count == 0:
+            coverage_status = "no_data"
+        elif deferred_count or error_count or gapped_channels or desired_missing:
+            coverage_status = "partial"
+        coverage_note = (
+            f"Video-description report covers {len(channels)} returned channel(s) "
+            f"inside {time_meta.get('from_time')} to {time_meta.get('to_time')}. "
+            f"Active with summaries: {active_count}; inactive/no summaries: {inactive_count}; "
+            f"errors: {error_count}; deferred: {deferred_count}."
+        )
+        if desired_missing:
+            coverage_note += f" Desired-but-not-running channels: {len(desired_missing)}."
+        if gapped_channels:
+            coverage_note += f" Channels with coverage gaps: {len(gapped_channels)}."
+
+        lines = [
+            "Video-description report",
+            f"Period: {time_meta.get('from_time')} -> {time_meta.get('to_time')}",
+            (
+                f"Channels: {len(channels)} returned / {active_count} active with summaries; "
+                f"{inactive_count} inactive; {error_count} errors; {deferred_count} deferred."
+            ),
+            (
+                f"Runtime: {running_count} running, {desired_count} desired, "
+                f"{len(desired_missing)} desired but not running."
+            ),
+        ]
+        if alert_counts:
+            alert_text = ", ".join(f"{sev}:{count}" for sev, count in sorted(alert_counts.items()))
+            lines.append(f"VLM alerts: {sum(alert_counts.values())} total ({alert_text}).")
+        else:
+            lines.append("VLM alerts: none in the returned channel set.")
+        if dropped_frames_total or dropped_batches_total:
+            lines.append(
+                f"Runtime drops: {dropped_frames_total} frame(s), {dropped_batches_total} batch(es)."
+            )
+        if quiet_channels:
+            quiet_text = ", ".join(
+                f"CH {row.get('channel_id')} since {row.get('latest_time') or 'unknown'}"
+                for row in quiet_channels[:8]
+            )
+            lines.append(f"Quiet channels: {quiet_text}.")
+        if gapped_channels:
+            gap_text = ", ".join(
+                f"CH {row.get('channel_id')} gaps={row.get('coverage_gap_count')}"
+                for row in gapped_channels[:8]
+            )
+            lines.append(f"Coverage gaps: {gap_text}.")
+        if alert_frames:
+            frame_text = ", ".join(
+                f"#{row.get('detection_id') or row.get('id')} CH {row.get('channel_id')} {row.get('time') or row.get('timestamp_ms')}"
+                for row in alert_frames[:top_events]
+            )
+            lines.append(f"Evidence frames: {frame_text}.")
+        if deferred_count:
+            lines.append("This is a chunked report; ask to continue for deferred channels.")
+        if coverage_status != "covered":
+            lines.append("Treat missing or gapped windows as unreviewed coverage, not as no activity.")
+
+        return {
+            "report_type": "video_descriptions",
+            "period": {
+                **time_meta,
+                "since_hours": float(args.get("since_hours") or 24),
+            },
+            "coverage": {
+                "status": coverage_status,
+                "note": coverage_note,
+                "checked_channels": checked,
+                "active_count": active_count,
+                "inactive_count": inactive_count,
+                "error_count": error_count,
+                "deferred_count": deferred_count,
+                "must_state_coverage": True,
+            },
+            "summary": {
+                "returned_channels": len(channels),
+                "running_count": running_count,
+                "desired_count": desired_count,
+                "desired_missing_count": len(desired_missing),
+                "alert_total": int(sum(alert_counts.values())),
+                "alert_counts": alert_counts,
+                "quiet_count": len(quiet_channels),
+                "gapped_count": len(gapped_channels),
+                "dropped_frames": dropped_frames_total,
+                "dropped_batches": dropped_batches_total,
+            },
+            "channels": channels,
+            "desired_video_missing": desired_missing,
+            "vlm_alert_frames": alert_frames,
+            "inventory": inventory,
+            "report": "\n".join(lines),
+        }
+
+    def _generate_probe_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
         since_hours = float(args.get("since_hours") or 24)
         until_hours = _opt_float(args.get("until_hours"))
         channel_id  = self._resolve_channel_id(args, required=False)
@@ -3360,6 +3728,7 @@ class AgentTools:
             })
 
         return {
+            "report_type": "probes",
             "period": {
                 "since_ms": since_ms,
                 "until_ms": until_ms,
@@ -3369,6 +3738,10 @@ class AgentTools:
             "probe_count": len(probes_data),
             "probes": probes_data,
             "activity_by_hour": dict(sorted(activity_by_hour.items())),
+            "report": (
+                f"Probe report: {total_detections} detection(s) across "
+                f"{len(probes_data)} probe(s) in the selected period."
+            ),
         }
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -4145,6 +4518,89 @@ def _format_active_skill_docs_for_prompt(skill_slugs: Sequence[str]) -> str:
 # System prompt builder
 # ---------------------------------------------------------------------------
 
+def _format_agent_video_streams(
+    luxriot_manager: Any,
+    allowed_channels: Optional[set[str]],
+) -> str:
+    try:
+        status = luxriot_manager.streams_status()
+    except Exception:
+        return "  (video-description runtime unavailable)"
+    if not isinstance(status, Mapping):
+        return "  (video-description runtime unavailable)"
+
+    def allowed(channel_id: Any) -> bool:
+        if allowed_channels is None:
+            return True
+        return str(channel_id) in allowed_channels
+
+    streams = [
+        stream
+        for stream in status.get("video_streams") or []
+        if isinstance(stream, Mapping) and allowed(stream.get("channel_id"))
+    ]
+    desired_missing = [
+        row
+        for row in status.get("desired_video_missing") or []
+        if isinstance(row, Mapping) and allowed(row.get("channel_id"))
+    ]
+    history_channels = [
+        channel_id
+        for channel_id in status.get("video_history_channels") or []
+        if allowed(channel_id)
+    ]
+
+    def channel_sort_key(item: Mapping[str, Any]) -> int:
+        try:
+            return int(item.get("channel_id") or 0)
+        except Exception:
+            return 0
+
+    lines: List[str] = []
+    for idx, stream in enumerate(sorted(streams, key=channel_sort_key)):
+        if idx >= AGENT_MAX_VIDEO_STREAMS_IN_PROMPT:
+            break
+        channel_id = stream.get("channel_id", "?")
+        running = bool(stream.get("running"))
+        last_error = str(stream.get("last_error") or stream.get("last_restore_error") or "").strip()
+        state = "error" if last_error else ("running" if running else "stopped")
+        model = str(stream.get("model") or "").strip() or "default"
+        pending = stream.get("pending_frames", 0)
+        dropped = stream.get("dropped_frames", 0)
+        queue_dropped = stream.get("queue_dropped_batches", 0)
+        logs = stream.get("log_count", 0)
+        alert_total = stream.get("last_alert_total")
+        alert_counts = stream.get("last_alert_counts")
+        alert_text = ""
+        if isinstance(alert_counts, Mapping) and alert_counts:
+            alert_text = ", alerts=" + ", ".join(
+                f"{key}:{value}" for key, value in alert_counts.items()
+            )
+        elif alert_total not in (None, "", 0, "0"):
+            alert_text = f", alerts={alert_total}"
+        error_text = f", last_error={last_error[:120]!r}" if last_error else ""
+        lines.append(
+            f"  - CH {channel_id}: {state}, model={model}, "
+            f"pending={pending}, dropped_frames={dropped}, dropped_batches={queue_dropped}, "
+            f"summaries={logs}{alert_text}{error_text}"
+        )
+    if len(streams) > len(lines):
+        lines.append(f"  - ... {len(streams) - len(lines)} more video stream(s) not expanded here")
+    for row in desired_missing[: max(0, AGENT_MAX_VIDEO_STREAMS_IN_PROMPT - len(lines))]:
+        channel_id = row.get("channel_id", "?")
+        error = str(row.get("last_restore_error") or "").strip()
+        error_text = f", last_restore_error={error[:120]!r}" if error else ""
+        lines.append(f"  - CH {channel_id}: desired but not running{error_text}")
+    if not lines:
+        if history_channels:
+            return (
+                "  (no video-description streams currently running; "
+                f"history exists for channels: {', '.join(str(ch) for ch in history_channels[:12])})"
+            )
+        return "  (no video-description streams currently running)"
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     probes_store: Any,
     detections_store: Any,
@@ -4155,7 +4611,7 @@ def build_system_prompt(
 ) -> str:
     now_str = time.strftime("%Y-%m-%d %H:%M")
 
-    # Active probes
+    # Configured probes are secondary semantic sensors in the current pilot.
     try:
         probes = probes_store.list_probes()
     except Exception:
@@ -4202,6 +4658,8 @@ def build_system_prompt(
     except Exception:
         channels_str = "unknown"
 
+    video_stream_block = _format_agent_video_streams(luxriot_manager, allowed_channels)
+
     probe_lines = []
     for idx, p in enumerate(probes):
         if idx >= AGENT_MAX_PROBES_IN_PROMPT:
@@ -4235,14 +4693,20 @@ def build_system_prompt(
 
     return (
         f"You are the AI operations assistant for Luxriot EVA AI — a CCTV intelligent "
-        f"monitoring platform. You have tools to search the archive, inspect detections, "
-        f"assemble research batches, tune probes, adjust prompt settings, describe frames, "
+        f"monitoring platform. Your primary operational center is live video descriptions: "
+        f"VLM summaries, VLM alerts, coverage windows, stream health, and archived evidence frames. "
+        f"You also have tools to search the archive, inspect probe hits, use CLIP P/N/M as a semantic "
+        f"attention signal, tune probes when explicitly requested, adjust prompt settings, describe frames, "
         f"create bookmarks, and compile reports.\n"
         f"Be concise and operator-focused. Never fabricate detection data.\n\n"
         f"Current time: {now_str}\n\n"
-        f"Active probes ({len(probes)} total):\n{probe_block}\n\n"
+        f"Video-description runtime:\n{video_stream_block}\n\n"
+        f"Configured semantic probes ({len(probes)} total; secondary/internal unless explicitly requested):\n{probe_block}\n\n"
         f"Available channels: {channels_str}\n\n"
         f"Rules:\n"
+        f"- Default reports and status answers must be video-description-first: active/running summary streams, VLM alerts, coverage gaps, channels that went quiet, dropped frames/batches, last errors, and archived VLM evidence frames.\n"
+        f"- For questions about whether streams were active, disconnected, reconnected, or quiet over a period, combine the current Video-description runtime snapshot with list_video_summary_channels/get_video_summaries coverage. Report observed coverage gaps as gaps, not proven network outages unless a tool returns an error.\n"
+        f"- Use probe tools only when the operator explicitly asks about probes, when a configured probe is named, or as a secondary semantic signal for large archive searches. Do not make probe status the default report center.\n"
         f"- For probe modifications: always call update_probe with preview=true first, "
         f"show the user the diff, and only apply after explicit confirmation.\n"
         f"- For prompt-setting modifications: always call update_prompt_settings with preview=true first, "
@@ -4338,6 +4802,14 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
                 prepared["since_ms"] = time_window.get("since_ms")
             if time_window.get("until_ms") is not None:
                 prepared["until_ms"] = time_window.get("until_ms")
+        if tool_name == "generate_report" and not _has_any_arg(
+            prepared,
+            ("from_ts", "to_ts", "since_hours", "until_hours"),
+        ):
+            if time_window.get("from_ts") is not None:
+                prepared["from_ts"] = time_window.get("from_ts")
+            if time_window.get("to_ts") is not None:
+                prepared["to_ts"] = time_window.get("to_ts")
 
     channel_id = context.get("channel_id")
     should_default_channel = not (
@@ -4352,6 +4824,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "describe_frame",
         "count_video_summary_events",
         "track_visual_state_transitions",
+        "generate_report",
     } and not _has_any_arg(prepared, ("channel_id", "channel_ref", "channel", "channel_title", "channel_name")):
         prepared["channel_id"] = channel_id
 
@@ -6469,6 +6942,78 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "by_probe": compact_rows,
         }
 
+    if tool_name == "generate_report":
+        channels = result.get("channels") if isinstance(result.get("channels"), list) else []
+        missing = (
+            result.get("desired_video_missing")
+            if isinstance(result.get("desired_video_missing"), list)
+            else []
+        )
+        frames = result.get("vlm_alert_frames") if isinstance(result.get("vlm_alert_frames"), list) else []
+        probes = result.get("probes") if isinstance(result.get("probes"), list) else []
+        compact: Dict[str, Any] = {
+            "report_type": result.get("report_type"),
+            "period": result.get("period"),
+            "coverage": result.get("coverage"),
+            "summary": result.get("summary"),
+            "report": result.get("report"),
+        }
+        if result.get("report_type") == "probes":
+            compact.update({
+                "total_detections": result.get("total_detections"),
+                "probe_count": result.get("probe_count"),
+                "activity_by_hour": result.get("activity_by_hour"),
+                "probes": [
+                    {
+                        "probe_id": row.get("probe_id"),
+                        "probe_name": row.get("probe_name"),
+                        "channel_id": row.get("channel_id"),
+                        "hit_count": row.get("hit_count"),
+                        "latest_ts": row.get("latest_ts"),
+                    }
+                    for row in probes[:8]
+                    if isinstance(row, dict)
+                ],
+            })
+            return compact
+        compact.update({
+            "channels": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "summary_count": row.get("summary_count"),
+                    "first_time": row.get("first_time"),
+                    "latest_time": row.get("latest_time"),
+                    "running": row.get("running"),
+                    "desired": row.get("desired"),
+                    "alert_total": row.get("alert_total"),
+                    "alert_counts": row.get("alert_counts"),
+                    "coverage_status": row.get("coverage_status"),
+                    "coverage_gap_count": row.get("coverage_gap_count"),
+                    "quiet": row.get("quiet"),
+                    "dropped_frames": row.get("dropped_frames"),
+                    "queue_dropped_batches": row.get("queue_dropped_batches"),
+                    "last_error": row.get("last_error"),
+                }
+                for row in channels[:AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN]
+                if isinstance(row, dict)
+            ],
+            "desired_video_missing": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "last_restore_error": row.get("last_restore_error"),
+                }
+                for row in missing[:8]
+                if isinstance(row, dict)
+            ],
+            "vlm_alert_frames": [
+                _compact_detection_for_model(row)
+                for row in frames[:8]
+                if isinstance(row, dict)
+            ],
+        })
+        return compact
+
     if tool_name == "list_channels":
         rows = result.get("channels") if isinstance(result.get("channels"), list) else []
         return {
@@ -6534,7 +7079,18 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "first_time": row.get("first_time"),
                     "latest_time": row.get("latest_time"),
                     "alert_total": row.get("alert_total"),
+                    "alert_counts": row.get("alert_counts"),
                     "running": row.get("running"),
+                    "desired": row.get("desired"),
+                    "run_count": row.get("run_count"),
+                    "coverage_status": row.get("coverage_status"),
+                    "coverage_ratio": row.get("coverage_ratio"),
+                    "coverage_gap_count": row.get("coverage_gap_count"),
+                    "quiet": row.get("quiet"),
+                    "silent_since_sec": row.get("silent_since_sec"),
+                    "dropped_frames": row.get("dropped_frames"),
+                    "queue_dropped_batches": row.get("queue_dropped_batches"),
+                    "last_error": row.get("last_error"),
                 }
                 for row in rows[:AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN]
                 if isinstance(row, dict)

@@ -11,7 +11,7 @@ Default order:
    - behavioral bookmark / alert rules = lines inside `stream_system_prompt`
    - `json_alert_prompt` = structured alert-output template only
 3. Read `get_video_summaries` across the relevant depth levels (`L0`, `L1`, `L2`, `L3`) for the target period.
-4. Compare the generated summaries with the operator's intent and with observed detections.
+4. Compare the generated summaries with the operator's intent, VLM alert frames, and archive evidence from the same channel/time. Use probe hits only as secondary corroboration when explicitly relevant.
 5. Identify whether the problem is:
    - stream prompt quality
    - rollup prompt quality at a specific level
@@ -24,5 +24,6 @@ Rules:
 - Tune the smallest surface first: one level or one channel before changing global defaults.
 - When a request is about descriptions over a date range, prefer absolute `from_ts`/`to_ts`.
 - If summaries are missing, stale, or too sparse, say so explicitly instead of pretending the prompt is wrong.
+- For the current pilot, optimize stream prompts and rollup prompts for video-description reporting first. Do not convert a prompt-tuning request into probe tuning unless the operator explicitly asks for probes.
 - Do not say a bookmark rule exists unless `update_prompt_settings` actually applied the underlying `stream_system_prompt` change.
 - Do not rewrite `json_alert_prompt` unless the operator explicitly asks to change the structured alert/parsing template.

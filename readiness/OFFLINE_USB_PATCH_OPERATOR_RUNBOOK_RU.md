@@ -158,6 +158,8 @@ sudo journalctl -u eva-ai -n 120 --no-pager
 - `/ready` зелёный или показывает только заранее известные внешние зависимости;
 - Luxriot live preview работает на тестовом канале;
 - VLM/agent endpoints доступны, если они должны быть включены на этом стенде.
+- В `Agent` нажмите `Stream status`: ответ должен быть про active video-description streams, модели, pending/dropped/last_error. Если агент отвечает в основном про probes, зафиксируйте это как regression.
+- В `Agent` нажмите `Video report` после накопления summaries: отчет должен начинаться с video summaries/VLM alerts/coverage gaps, а probes упоминать только как вторичный semantic signal.
 
 Для текущей архитектуры live video descriptions должны работать в одном
 `gunicorn` worker на EVA AI host. Не увеличивайте

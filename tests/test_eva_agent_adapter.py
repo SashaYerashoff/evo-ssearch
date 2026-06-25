@@ -212,6 +212,15 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["arguments"]["channel_ids"], ["7"])
 
+    def test_generate_report_defaults_to_scoped_channels(self):
+        result = self.adapter.execute(
+            "generate_report",
+            {"report_type": "video_descriptions", "from_ts": 100.0, "to_ts": 200.0},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+
     def test_visual_state_transitions_defaults_to_scoped_channel(self):
         result = self.adapter.execute(
             "track_visual_state_transitions",

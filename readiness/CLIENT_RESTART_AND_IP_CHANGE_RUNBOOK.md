@@ -164,6 +164,16 @@ Expected:
 - If the agent LM Studio endpoint is not running yet, agent calls will fail even
   if live video descriptions work.
 
+Primary pilot signal after restart is live video descriptions, not probe counts.
+In the UI open `Video` and `Agent`:
+
+- `Video` -> confirm selected channels can `Start summaries`;
+- `Agent` -> `Stream status` chip should report active video-description streams,
+  assigned models, pending frames, dropped frames/batches, and last errors;
+- if a channel was configured before restart but is not running now, treat it as
+  `desired but not running` and check `/ready`, Luxriot snapshot access, and VLM
+  endpoint reachability before looking at probes.
+
 ## 5. Verify All Four VLM Endpoints From EVA AI
 
 Run on the EVA AI server:

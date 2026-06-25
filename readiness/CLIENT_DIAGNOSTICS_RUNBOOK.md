@@ -20,6 +20,8 @@ sudo EVA_BASE_URL=http://127.0.0.1:5000 scripts/client_diagnostics.sh
 
 Такой запуск соберет `/health`, `/ready`, `/lm/models`, состояние `eva-ai.service`, journal и vLLM endpoints из доступного env. `/luxriot/channels`, `/luxriot/streams` и snapshot digests будут пропущены, потому что им нужна cookie авторизованного пользователя.
 
+Для текущего пилота `/luxriot/streams` - главный read-only снимок video-description runtime: какие каналы пишут summaries, какая модель назначена, сколько кадров в очереди, были ли dropped frames/batches, last_error и desired-but-not-running каналы. Probe status вторичен и нужен только для задач, где явно включены probes.
+
 ## Запуск с временной cookie
 
 Используйте учетную запись с правом видеть нужные каналы. Для полной диагностики лучше admin/operator с `allowedChannelIds: ["*"]`.
@@ -43,7 +45,7 @@ sudo EVA_BASE_URL="${BASE_URL}" \
 rm -f /tmp/eva.cookies
 ```
 
-Скрипт не кладет сами JPEG snapshot'ы в пакет. Для первых `EVA_DIAG_SNAPSHOT_COUNT` каналов из `/luxriot/channels` он сохраняет только `channel_id`, HTTP status, размер ответа, SHA1, latency и image headers.
+Скрипт не кладет сами JPEG snapshot'ы в пакет. Для первых `EVA_DIAG_SNAPSHOT_COUNT` каналов из `/luxriot/channels` он сохраняет только `channel_id`, HTTP status, размер ответа, SHA1, latency и image headers. Для расследования "отваливались ли video descriptions" сопоставляйте `/luxriot/streams` с agent/video-summary coverage: отсутствие summaries за период означает gap покрытия, а не доказанный сетевой outage без `last_error` или journal evidence.
 
 ## Если vLLM endpoints не найдены
 

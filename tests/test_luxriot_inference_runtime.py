@@ -386,6 +386,37 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(merged["alert_severities"], ["high"])
             self.assertEqual(merged["signal_digest"], {"alerts": {"high": 1}})
 
+    def test_stream_status_compact_exposes_latest_alert_metadata_without_logs(self):
+        compact = LuxriotManager._compact_stream_status(
+            "video",
+            {
+                "channel_id": 7,
+                "running": True,
+                "logs": [
+                    {"created_at": 100.0, "summary": "routine"},
+                    {
+                        "created_at": 101.0,
+                        "batch_end_ms": 101_000,
+                        "summary": "alert",
+                        "alert_total": 2,
+                        "alert_counts": {"low": 1, "normal": 1},
+                        "alert_severities": ["low", "normal"],
+                        "bookmark_failed_count": 1,
+                        "bookmark_last_error": "bookmark rejected",
+                    },
+                ],
+            },
+        )
+
+        self.assertNotIn("logs", compact)
+        self.assertEqual(compact["log_count"], 2)
+        self.assertEqual(compact["last_summary_at"], 101.0)
+        self.assertEqual(compact["last_summary_batch_end_ms"], 101_000)
+        self.assertEqual(compact["last_alert_total"], 2)
+        self.assertEqual(compact["last_alert_counts"], {"low": 1, "normal": 1})
+        self.assertEqual(compact["last_bookmark_failed_count"], 1)
+        self.assertEqual(compact["last_bookmark_last_error"], "bookmark rejected")
+
     def test_summary_filters_and_l0_rollups_use_batch_bounds(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

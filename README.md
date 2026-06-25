@@ -4,7 +4,8 @@ Luxriot EVA AI is a production-pilot CLIP visual search and monitoring system fo
 
 - Archive research over indexed folders and detections archive
 - Video understanding via OpenAI-compatible vision models (LM Studio/vLLM)
-- Live monitoring with probe-based tracking and bookmark actions
+- Live video-description monitoring with VLM alerts, coverage-aware reports, and bookmark actions
+- Probe-based CLIP/P/N/M tracking as a secondary semantic signal for tuning and large archive comparison
 
 ## Version
 
@@ -25,7 +26,7 @@ This branch is a beta production-pilot build focused on:
 - Stable end-to-end UX in 3 tabs: `Archive Research`, `Video Understanding`, `Monitoring`
 - Secure mutation paths via admin token
 - Runtime configuration through Settings + `.env` editor
-- Detection retention to reduce redundant archive frames while keeping useful snapshots
+- Video-description archive evidence, VLM alert frames, and retention controls for useful snapshots
 
 ## Core Features
 
@@ -34,7 +35,7 @@ This branch is a beta production-pilot build focused on:
 - Text and image query in one workspace
 - Search scope switch:
   - `Indexed Folder`: FAISS search over local `.clip_index`
-  - `Detections Archive`: search over persisted probe detections
+  - `Detections Archive`: search over persisted probe hits, VLM summary frames, and VLM alert frames
 - Search modes: CLIP, DINO, or fusion (when enabled)
 - Sort by similarity or time
 - Expand result, copy path, and run "find similar"
@@ -66,9 +67,9 @@ Note: Comments and segmentation are intentionally limited to indexed-folder imag
 
 ### Detections Archive + Retention
 
-- Probe hits and archive search records are persisted in PostgreSQL in secure deployments
+- Probe hits, VLM-sampled summary frames, and VLM alert frames are persisted in PostgreSQL in secure deployments
 - Optional adaptive retention keeps high-value snapshots and drops near-duplicates
-- Archive search returns probe metadata plus search similarity signals
+- Archive search returns source labels, visual evidence URLs, and search similarity signals
 
 ## Prerequisites
 
@@ -367,19 +368,23 @@ Notes:
 3. In `Archive Research`, keep scope = `Indexed Folder`.
 4. Run text query or image upload query.
 
-### 2) Search Probe Detections
+### 2) Search Video-Description Evidence
 
 1. In `Archive Research`, set scope = `Detections Archive`.
-2. Filter by stream, probe, and time range.
-3. Load detections and run text/image search over filtered pool.
+2. Filter by stream, source (`Video descriptions` / `VLM alerts`), and time range.
+3. Run text/image search over saved VLM frames and open evidence thumbnails.
 
-### 3) Monitoring + Probes
+### 3) Live Video Descriptions
 
-1. Open `Monitoring`.
-2. Start stream capture for the target channel.
-3. Create probe in modal and save.
-4. Run probe manually or leave background daemon active.
-5. Review latest detections and optional bookmarks.
+1. Open `Video`.
+2. Select a Luxriot channel, cadence, batch size, and VLM model/profile.
+3. Click `Start summaries`.
+4. Review `VLM Feed`, alert badges, archive frames, and stream health.
+5. Use `Agent` -> `Stream status` / `Video report` for operator-facing status and reports.
+
+### 4) Monitoring + Probes
+
+Use `Monitoring` when an engineer explicitly needs CLIP/P/N/M probes for semantic comparison, threshold tuning, or secondary corroboration. Probe state is not the default operator report center for the current pilot.
 
 ## Project Layout
 

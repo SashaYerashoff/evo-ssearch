@@ -10677,7 +10677,7 @@
             if (!el) return;
             el.innerHTML = `<div class="agent-msg-welcome">
                 <div class="agent-msg-welcome-title">EVA Agent</div>
-                <div class="agent-msg-welcome-sub">Ask me about your camera streams, detections, and probes. I can search archives, analyze detections, and tune probe settings.</div>
+                <div class="agent-msg-welcome-sub">Ask me about video summaries, VLM alerts, coverage gaps, archive evidence, and live frames. I use probes as secondary semantic signals when the task needs them.</div>
             </div>`;
         }
 
@@ -11891,31 +11891,55 @@
             appendAgentNotice(msg, 'error');
         }
 
-        // ---- Probe list (context sidebar) ----
-        async function agentLoadProbes() {
+        // ---- Video stream list (context sidebar) ----
+        async function agentLoadVideoStreams() {
             const el = elProbeList();
             if (!el) return;
             try {
-                const r = await fetch(`/probes/list?t=${Date.now()}`, { cache: 'no-store' });
-                if (!r.ok) return;
-                const data = await r.json();
-                const probes = data.probes || [];
-                if (!probes.length) {
-                    el.innerHTML = '<div class="agent-probe-empty">No probes configured</div>';
+                const r = await fetch(`/luxriot/streams?t=${Date.now()}`, { cache: 'no-store' });
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok || data.error) {
+                    throw new Error(data.error || 'Failed to load video streams');
+                }
+                const streams = Array.isArray(data.video_streams) ? data.video_streams : [];
+                const missing = Array.isArray(data.desired_video_missing) ? data.desired_video_missing : [];
+                if (!streams.length && !missing.length) {
+                    el.innerHTML = '<div class="agent-probe-empty">No video-description streams running</div>';
                     return;
                 }
-                el.innerHTML = probes.map(p => {
-                    const running = p.status === 'running' || p.enabled !== false;
-                    const dotCls = running ? 'on' : 'off';
-                    const score = p.last_score != null ? p.last_score.toFixed(3) : '—';
+                const streamRows = streams.map(stream => {
+                    const running = Boolean(stream.running);
+                    const lastError = String(stream.last_error || stream.last_restore_error || '').trim();
+                    const dotCls = lastError ? 'warn' : (running ? 'on' : 'off');
+                    const channel = stream.channel_id ?? '?';
+                    const model = String(stream.model || 'default');
+                    const pending = Number(stream.pending_frames || 0);
+                    const dropped = Number(stream.dropped_frames || 0) + Number(stream.queue_dropped_batches || 0);
+                    const logs = Number(stream.log_count || 0);
+                    const alertCounts = stream.last_alert_counts && typeof stream.last_alert_counts === 'object'
+                        ? Object.entries(stream.last_alert_counts).map(([key, val]) => `${key}:${val}`).join(',')
+                        : '';
+                    const score = lastError
+                        ? 'error'
+                        : `${pending}q · ${logs}s${dropped ? ` · ${dropped}d` : ''}${alertCounts ? ` · ${alertCounts}` : ''}`;
                     return `<div class="agent-probe-mini">
                         <div class="agent-probe-dot ${dotCls}"></div>
-                        <span class="agent-probe-name">${escapeHtml(p.name || 'unnamed')}</span>
-                        <span class="agent-probe-score">${score}</span>
+                        <span class="agent-probe-name">CH ${escapeHtml(String(channel))} · ${escapeHtml(model)}</span>
+                        <span class="agent-probe-score" title="${escapeHtml(lastError || 'pending · summaries · dropped · alerts')}">${escapeHtml(score)}</span>
                     </div>`;
-                }).join('');
+                });
+                const missingRows = missing.map(row => {
+                    const channel = row.channel_id ?? '?';
+                    const err = String(row.last_restore_error || '').trim();
+                    return `<div class="agent-probe-mini">
+                        <div class="agent-probe-dot warn"></div>
+                        <span class="agent-probe-name">CH ${escapeHtml(String(channel))} · desired</span>
+                        <span class="agent-probe-score" title="${escapeHtml(err || 'desired but not running')}">missing</span>
+                    </div>`;
+                });
+                el.innerHTML = [...streamRows, ...missingRows].join('');
             } catch(e) {
-                el.innerHTML = '<div class="agent-probe-empty">Failed to load probes</div>';
+                el.innerHTML = '<div class="agent-probe-empty">Failed to load video streams</div>';
             }
         }
 
@@ -12215,7 +12239,7 @@
                 }
             });
 
-            agentLoadProbes();
+            agentLoadVideoStreams();
         }
 
         // Expose agentInit to outer scope

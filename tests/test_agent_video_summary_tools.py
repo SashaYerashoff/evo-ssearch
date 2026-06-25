@@ -34,6 +34,27 @@ class _SummaryManager:
     def get_channels(self, force=False):
         return list(self.channels)
 
+    def streams_status(self):
+        return {
+            "video_streams": [
+                {
+                    "channel_id": 7,
+                    "running": True,
+                    "model": "vlm-a1",
+                    "pending_frames": 3,
+                    "dropped_frames": 1,
+                    "queue_dropped_batches": 0,
+                    "log_count": 12,
+                    "last_alert_counts": {"low": 1},
+                },
+            ],
+            "desired_video_channels": [7, 8],
+            "desired_video_missing": [
+                {"channel_id": 8, "last_restore_error": "snapshot timeout"},
+            ],
+            "video_history_channels": [7, 8],
+        }
+
     @staticmethod
     def _log_bounds(row):
         created = float(row["created_at"])
@@ -225,7 +246,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
     def test_system_prompt_reframes_sensitive_visible_evidence_instead_of_refusing(self):
         class _ProbeStore:
             def list_probes(self):
-                return []
+                return [{"id": "probe-1", "name": "legacy probe", "channel_id": 7}]
 
         prompt = build_system_prompt(
             _ProbeStore(),
@@ -233,6 +254,12 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             _SummaryManager(),
         )
 
+        self.assertIn("Video-description runtime:", prompt)
+        self.assertIn("CH 7: running, model=vlm-a1", prompt)
+        self.assertIn("CH 8: desired but not running", prompt)
+        self.assertIn("Configured semantic probes (1 total; secondary/internal", prompt)
+        self.assertLess(prompt.index("Video-description runtime:"), prompt.index("Configured semantic probes"))
+        self.assertIn("Default reports and status answers must be video-description-first", prompt)
         self.assertIn("do not refuse when the request can be reframed", prompt)
         self.assertIn("smoking weed/pipe/joint", prompt)
         self.assertIn("person holding a small cylindrical object", prompt)
@@ -1306,6 +1333,103 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["unchecked_count"], 1)
         self.assertEqual(compact["error_count"], 1)
         self.assertEqual(compact["errors"][0]["channel_id"], 8)
+
+    def test_generate_report_defaults_to_video_descriptions_and_avoids_probe_summary(self):
+        class VideoReportStore(_DetectionStore):
+            def summarize_by_probe(self, *args, **kwargs):
+                raise AssertionError("default video report should not query probe summaries")
+
+        store = VideoReportStore(
+            [
+                {
+                    "id": 501,
+                    "detection_id": 501,
+                    "source": "vlm_alert",
+                    "channel_id": 7,
+                    "timestamp_ms": 150_000,
+                    "thumbnail": "inline-should-not-leak",
+                }
+            ]
+        )
+        result = _tools(detections_store=store).execute(
+            "generate_report",
+            {
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "channel_ids": [7, 8],
+            },
+        )
+
+        self.assertEqual(result["report_type"], "video_descriptions")
+        self.assertIn("Video-description report", result["report"])
+        self.assertEqual(result["summary"]["alert_total"], 1)
+        self.assertEqual(result["summary"]["desired_missing_count"], 1)
+        self.assertEqual(result["coverage"]["status"], "partial")
+        self.assertEqual(result["vlm_alert_frames"][0]["image_url"], "/detections/thumbnail/501")
+        self.assertNotIn("thumbnail", result["vlm_alert_frames"][0])
+
+        compact = _compact_tool_result_for_model("generate_report", result)
+        self.assertEqual(compact["report_type"], "video_descriptions")
+        self.assertIn("report", compact)
+        self.assertEqual(compact["vlm_alert_frames"][0]["image_url"], "/detections/thumbnail/501")
+
+    def test_generate_report_probe_type_keeps_legacy_probe_shape(self):
+        class ProbeReportStore(_DetectionStore):
+            def summarize_by_probe(self, *args, **kwargs):
+                self.summary_kwargs = kwargs
+                return [
+                    {
+                        "probe_id": "probe-1",
+                        "probe_name": "door",
+                        "channel_id": 7,
+                        "hit_count": 2,
+                        "latest_timestamp_ms": 200_000,
+                    }
+                ]
+
+        store = ProbeReportStore(
+            [
+                {
+                    "id": 1,
+                    "probe_id": "probe-1",
+                    "probe_name": "door",
+                    "source": "probe",
+                    "channel_id": 7,
+                    "timestamp_ms": 200_000,
+                    "margin": 0.2,
+                }
+            ]
+        )
+        result = _tools(detections_store=store).execute(
+            "generate_report",
+            {
+                "report_type": "probes",
+                "since_hours": 24,
+                "channel_id": 7,
+            },
+        )
+
+        self.assertEqual(result["report_type"], "probes")
+        self.assertEqual(result["total_detections"], 2)
+        self.assertEqual(result["probe_count"], 1)
+        self.assertEqual(result["probes"][0]["probe_name"], "door")
+        self.assertEqual(store.summary_kwargs["source"], "probe")
+
+    def test_turn_context_applies_normalized_time_window_to_generate_report(self):
+        context = _seed_turn_tool_context("Generate a video report for the selected channel.")
+        context["channel_id"] = 7
+        context["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+
+        args = _apply_turn_tool_context("generate_report", {}, context)
+
+        self.assertEqual(args["channel_id"], 7)
+        self.assertEqual(args["from_ts"], 100.0)
+        self.assertEqual(args["to_ts"], 200.0)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ Previous baseline: `β 0.8.0`
 - Added coverage and truncation contracts for video-summary and visual-state workflows.
 - Reduced live-summary persistence hot-path cost: new batches no longer re-normalize the full per-channel history under the capture lock.
 - Added Gunicorn worker shutdown hooks to flush live summary/rollup runtime state during graceful service restarts.
+- Shifted Agent quick actions, runtime context, and system prompt to video-description-first status/reporting; probes remain available as secondary CLIP/P/N/M semantic signals.
+- Made the agent `generate_report` tool video-description-first by default, with probe reports available only through explicit `report_type=probes`.
 - Removed demo-specific prompt/schema examples from agent-visible tool contracts.
 - Improved VLM feed JSON handling, UI layout stability, stream health visibility, and archive/agent evidence cards.
 - Extended PostgreSQL/archive/security test coverage and kept SQLite legacy tests out of the production path.

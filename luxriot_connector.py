@@ -4510,6 +4510,15 @@ class LuxriotManager:
         compact = dict(status)
         logs = compact.pop("logs", None)
         compact["log_count"] = len(logs) if isinstance(logs, list) else 0
+        latest_log = logs[-1] if isinstance(logs, list) and logs else None
+        if isinstance(latest_log, Mapping):
+            compact["last_summary_at"] = latest_log.get("created_at")
+            compact["last_summary_batch_end_ms"] = latest_log.get("batch_end_ms")
+            compact["last_alert_total"] = latest_log.get("alert_total")
+            compact["last_alert_counts"] = latest_log.get("alert_counts")
+            compact["last_alert_severities"] = latest_log.get("alert_severities")
+            compact["last_bookmark_failed_count"] = latest_log.get("bookmark_failed_count")
+            compact["last_bookmark_last_error"] = latest_log.get("bookmark_last_error")
         compact["stream_type"] = stream_type
         if paused_channels is not None:
             channel_id = compact.get("channel_id")

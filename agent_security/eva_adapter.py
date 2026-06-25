@@ -428,6 +428,8 @@ class EvaAgentToolAdapter:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif name == "list_video_summary_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
+        elif name == "generate_report" and scoped_channels is not None:
+            prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif (
             name in _SINGLE_CHANNEL_FOR_SCOPED_ACTORS
             and scoped_channels is not None

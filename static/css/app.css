@@ -4330,6 +4330,11 @@
     background: var(--muted);
 }
 
+.agent-probe-dot.warn {
+    background: #ffb86b;
+    box-shadow: 0 0 4px rgba(255, 184, 107, 0.85);
+}
+
 .agent-probe-name {
     flex: 1;
     overflow: hidden;

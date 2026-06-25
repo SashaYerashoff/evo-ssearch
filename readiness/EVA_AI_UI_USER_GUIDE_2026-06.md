@@ -11,7 +11,7 @@ EVA AI - единая панель для поиска по архиву кад�
 - `Archive` - поиск и просмотр сохраненных кадров из архива.
 - `Video` - live-превью Luxriot-каналов, запуск video descriptions, просмотр VLM feed.
 - `Monitoring` - создание, настройка и запуск probes.
-- `Agent` - агентный чат с инструментами поиска, анализа каналов, отчетов и настройки probes.
+- `Agent` - агентный чат с инструментами анализа video descriptions, VLM alerts, archive evidence, отчетов и осторожной настройки probes.
 
 Доступ к вкладкам зависит от роли пользователя. Если у пользователя нет нужного права, вкладка или часть настроек скрывается. Каналы также фильтруются по `allowedChannelIds`: пользователь видит только свои каналы, а `*` означает доступ ко всем каналам.
 
@@ -295,34 +295,47 @@ ROI полезен, когда объект важен только в конк�
 Основные возможности:
 
 - поиск по архиву;
-- последние detections;
-- summary по detections;
+- review video summaries L0-L3 за период;
+- VLM alerts и notable events из video descriptions;
+- coverage/status: какие каналы писали summaries, где были gaps, какие streams сейчас активны или отвалились;
+- визуальные доказательства через `VLM summary` / `VLM alert` frames;
 - список каналов;
-- список probes и их статусы;
 - описание текущего кадра с канала;
-- получение video summaries за период;
 - генерация отчетов;
 - создание bookmarks;
-- preview/apply для изменения probes и prompt settings;
-- survey каналов перед настройкой probes.
+- preview/apply для изменения prompt settings;
+- probes как вторичный semantic signal: tuning/thresholds только если оператор явно просит про probes или агенту нужно сравнить большие объемы архива по CLIP P/N/M.
 
 В UI есть готовые chips:
 
 - `Image`
-- `Latest detections`
-- `Probe status`
-- `Daily report`
-- `Archive search`
+- `VLM alerts`
+- `Stream status`
+- `Video report`
+- `Archive evidence`
 - `Describe frame`
+
+Правая context-панель `Video Streams` показывает текущий снимок video-description runtime:
+
+- `CH <id> · <model>` - канал и назначенный VLM/балансер profile;
+- `q` - pending frames в очереди канала;
+- `s` - сколько summaries уже есть в текущей live session;
+- `d` - dropped frames/batches;
+- `info/low/normal/high/critical:n` - alerts в последнем summary, если они были;
+- `missing/error` - stream должен работать или был запущен, но сейчас не пишет summaries.
+
+Эта панель не заменяет `Video -> Channel Runtime`, но помогает перед агентным запросом быстро понять, где live summaries реально активны.
 
 ### 6.1 Как правильно задавать период и канал
 
 Лучшие запросы агенту:
 
 - "Покажи video summaries по каналу 105 за последние 6 часов."
-- "Найди в архиве по каналам 105,109 людей у входа с 22:00 до 02:00."
+- "Какие VLM alerts были по активным каналам за последний час? Дай кадры."
+- "Проверь, какие video-description streams сейчас активны, какие модели используются, где pending/dropped/error."
+- "Найди в video-description archive по каналам 105,109 людей у входа с 22:00 до 02:00."
 - "Сделай краткий отчет по L0/L1 summaries канала TVT за ночь."
-- "Проверь последние detections по probe `person-at-door` за 24 часа."
+- "Проверь, были ли gaps покрытия или каналы без summaries за ночь."
 
 Если канал не указан, агент должен сначала выяснить доступные/активные каналы. Для большого числа каналов он не должен молча делать полный обход: он должен предложить кандидатов и попросить подтверждение на полное исследование, потому что такой запрос может занять много времени и несколько turns.
 
@@ -332,7 +345,7 @@ ROI полезен, когда объект важен только в конк�
 
 Используйте `Agent`, если нужен текстовый отчет, cross-channel reasoning или "найди и объясни" по нескольким источникам.
 
-Для настройки probes агент полезен как помощник: попросить оценить noisy hits, предложить positive/negative формулировки и margin. Изменения probes должны идти через preview/apply, чтобы оператор видел, что именно будет изменено.
+В текущем клиентском деплое агентный центр - video descriptions. Probes остаются вспомогательным CLIP/P/N/M слоем: агент может использовать их для semantic comparison больших архивных объемов или для probe tuning по явному запросу инженера. Изменения probes должны идти через preview/apply, чтобы оператор видел, что именно будет изменено.
 
 ## 7. Settings, Admin, Audit
 
@@ -469,6 +482,8 @@ Audit нужен для принципа "нельзя коснуться сис
 
 ### Настроить noisy text probe
 
+Используйте этот сценарий как инженерную настройку вторичного CLIP/P/N/M слоя, а не как основной клиентский отчетный workflow.
+
 1. Открыть `Monitoring`.
 2. Создать probe или открыть существующую.
 3. Добавить positive и negative examples.
@@ -512,7 +527,7 @@ Audit нужен для принципа "нельзя коснуться сис
 - `Offline Video Analysis` скрыт и не обещан клиенту.
 - `Probe Snap` скрыт и не обещан клиенту.
 - DINO/Fusion не являются основным клиентским режимом без отдельной проверки.
-- Live summaries после restart `eva-ai` надо запускать заново.
+- После restart `eva-ai` desired live summaries должны восстановиться автоматически, но это надо проверить через `Agent -> Stream status` или `Video -> Selected Stream`. Если канал отмечен как `desired but not running`, перезапустите summaries вручную и проверьте Luxriot/VLM endpoints.
 - Auto balance распределяет каналы по настроенным VLM profiles; при диагностике проблем используйте ручной выбор профиля.
 - Archive search показывает то, что уже было сохранено: если summaries/probes не работали или retention очистила данные, искать будет нечего.
 

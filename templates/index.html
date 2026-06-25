@@ -554,7 +554,7 @@
                     <div class="agent-chat-topbar">
                         <div>
                             <div class="agent-chat-title">EVA Agent</div>
-                            <div class="agent-chat-sub">Ask about detections, probe behavior, bookmarks, reports, and live frames.</div>
+                            <div class="agent-chat-sub">Ask about video summaries, VLM alerts, coverage gaps, archive evidence, and live frames.</div>
                         </div>
                         <div class="agent-model-controls">
                             <label for="agentModelInput" class="agent-model-label">Model</label>
@@ -579,10 +579,10 @@
                                 &#128247; Image
                                 <input type="file" id="agentImageFile" accept="image/*" style="display:none" />
                             </label>
-                            <button class="agent-chip" data-prompt="Show latest detections">Latest detections</button>
-                            <button class="agent-chip" data-prompt="List all probes and their status">Probe status</button>
-                            <button class="agent-chip" data-prompt="Generate a daily report for all probes">Daily report</button>
-                            <button class="agent-chip" data-prompt="Search the archive for">Archive search</button>
+                            <button class="agent-chip" data-prompt="Show recent VLM alerts and notable video-summary events for the last hour">VLM alerts</button>
+                            <button class="agent-chip" data-prompt="List active video-description streams, models, queues, dropped frames, and last errors">Stream status</button>
+                            <button class="agent-chip" data-prompt="Generate a video-summary report for active channels for the last day, including VLM alerts, coverage gaps, and channels that went quiet">Video report</button>
+                            <button class="agent-chip" data-prompt="Search the video-description archive for">Archive evidence</button>
                             <button class="agent-chip" data-prompt="Describe the current frame from channel">Describe frame</button>
                         </div>
                     </div>
@@ -592,9 +592,9 @@
                 <aside class="studio-inspector agent-inspector">
                     <div class="agent-context studio-panel studio-panel--workspace">
                     <div class="agent-ctx-section">
-                        <div class="agent-ctx-title">Active Probes</div>
+                        <div class="agent-ctx-title">Video Streams</div>
                         <div id="agentProbeList" class="agent-probe-list">
-                            <div class="agent-probe-empty">Loading probes...</div>
+                            <div class="agent-probe-empty">Loading video streams...</div>
                         </div>
                     </div>
                     <div class="agent-ctx-section">

@@ -2,6 +2,8 @@
 
 Goal: tune probes using evidence from short-term, medium-term, and broader history.
 
+Use this skill only when the operator explicitly asks to tune, inspect, create, cast, or report on probes. For ordinary status reports, incident reports, channel-health checks, and video-history questions, use video-summary workflows first and treat probes only as a secondary CLIP/P/N/M corroboration signal.
+
 Default order:
 
 1. Read `get_detection_summary` for the last 24h and for the target channel if known.
