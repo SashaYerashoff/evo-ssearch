@@ -346,7 +346,16 @@ class PostgresAgentStore:
         for row in rows:
             role = str(row[0] or "")
             content = str(row[1] or "").strip()
-            if role not in {"user", "assistant"} or not content:
+            trusted_system_receipt = (
+                role == "system"
+                and content.startswith("Trusted server action receipt:")
+            )
+            if role not in {"user", "assistant"} and not trusted_system_receipt:
+                continue
+            if not content:
+                continue
+            if trusted_system_receipt:
+                messages.append({"role": "system", "content": content})
                 continue
             if messages and str(messages[-1].get("role") or "") == role:
                 prev_content = str(messages[-1].get("content") or "")

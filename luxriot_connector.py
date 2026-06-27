@@ -16,10 +16,10 @@ from requests.auth import HTTPDigestAuth
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_ALERTS_JSON_PROMPT = (
-    "Optional bookmark output for operator review:\n"
+    "Machine-readable alert output for operator review:\n"
     "- Always append exactly one block at the end, prefixed with ALERTS_JSON:.\n"
     "- If no trigger matches, use {\"alerts\": []}.\n"
-    "- If one or more triggers match, include one alert object per distinct visible trigger, using this schema:\n"
+    "- If one or more triggers match, include one alert object per distinct visible trigger using this schema:\n"
     "ALERTS_JSON:\n"
     "{\n"
     "  \"alerts\": [\n"
@@ -33,16 +33,52 @@ DEFAULT_ALERTS_JSON_PROMPT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "Trigger only on observable events such as physical violence, dangerous vehicle behavior, forced entry, "
-    "property damage, theft-like tampering, weapon/fire/smoke/immediate hazard, or crowd escalation. "
-    "Also emit operator-defined low/normal test triggers when the stream prompt explicitly asks for them. "
+    "Alert candidates are defined by the Alert review policy and by visible immediate safety/security hazards. "
+    "General hazards include physical violence, a person falling/collapsing or appearing to need urgent help, "
+    "dangerous vehicle behavior, forced entry, property damage, theft-like tampering, weapon/fire/smoke, "
+    "critical camera obstruction, or crowd escalation. "
     "Do not classify behavior as illegal/unlawful; describe visible facts requiring operator review. "
-    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, "
-    "or ambiguous movement unless the operator prompt explicitly asks for that policy. "
-    "Rules: emit one alert object per distinct trigger visible in the batch, up to 8 objects; "
-    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section; "
-    "do not alert routine micro-movements; "
+    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, or ambiguous movement "
+    "unless the Alert review policy explicitly asks for that review signal. "
+    "Rules: emit one alert object per distinct visible trigger in the batch, up to 8 objects; "
+    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section or Warning Level list; "
+    "if a matching event is described anywhere in the prose summary, it must also appear in ALERTS_JSON; "
+    "evaluate every operator-defined trigger independently against the current snapshots; "
+    "if two distinct triggers are visible in the same batch, emit two alert objects; "
     "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
+)
+
+DEFAULT_ALERT_POLICY_PROMPT = (
+    "Alert review policy:\n"
+    "- Evaluate general safety/security hazards even if the operator did not list them explicitly. "
+    "Use severity high/critical only for immediate visible danger; use low/normal for review-worthy but non-urgent events.\n"
+    "- Evaluate channel-specific operator criteria as first-class alert triggers. Operator criteria may describe "
+    "non-security review signals, vulnerable-person monitoring, site-specific rules, or temporary watch items.\n"
+    "- If operator criteria mention health, age, impairment, intent, legality, or identity, do not diagnose or accuse. "
+    "Alert only on visible facts such as falling, collapse, distress, immobility, unsafe movement, obstruction, "
+    "or a requested visible object/action.\n"
+    "- If evidence is ambiguous but relevant to an explicit operator criterion, emit a low/info alert with uncertainty "
+    "instead of silently dropping it.\n"
+    "Channel-specific operator alert criteria:\n"
+    "{operator_alert_policy}"
+)
+
+LIVE_OBSERVATION_STATE_PROMPT = (
+    "Current-batch observation contract:\n"
+    "- Treat prior channel memory as context only, never as visual evidence for the current batch.\n"
+    "- Evaluate every watched entity and operator-defined trigger independently against the CURRENT snapshots.\n"
+    "- Before ALERTS_JSON, include a concise 'Current observed state' section for watched entities/triggers: "
+    "present|absent|uncertain with snapshot numbers or timestamps as evidence.\n"
+    "- If two distinct triggers are visible in the same batch, report both and emit two alert objects.\n"
+    "- Claim enter/leave only when the current snapshots show a before/after transition; otherwise report the "
+    "current state and let backend continuity tools compare adjacent batches."
+)
+
+_OUTDATED_ALERT_PROMPT_MARKERS = (
+    "if no trigger match: emit no json block",
+    "rules: max 3 alerts",
+    "\"timestamp_ms\": 1772202050000",
+    "also emit operator-defined low/normal test triggers when the stream prompt explicitly asks",
 )
 
 ALERT_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
@@ -66,24 +102,69 @@ class AlertDeliveryResult(int):
         sent: int = 0,
         *,
         parsed: int = 0,
+        json_alert_count: int = 0,
+        prose_alert_count: int = 0,
         failed: int = 0,
         skipped_duplicate: int = 0,
         last_error: Optional[str] = None,
+        alerts_detected: bool = False,
+        parser_error: Optional[str] = None,
+        alert_events: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> "AlertDeliveryResult":
         obj = int.__new__(cls, int(max(0, sent)))
         obj.parsed = int(max(0, parsed))
+        obj.json_alert_count = int(max(0, json_alert_count))
+        obj.prose_alert_count = int(max(0, prose_alert_count))
         obj.failed = int(max(0, failed))
         obj.skipped_duplicate = int(max(0, skipped_duplicate))
         obj.last_error = str(last_error or "").strip() or None
+        obj.alerts_detected = bool(alerts_detected)
+        obj.parser_error = str(parser_error or "").strip() or None
+        cleaned_events: List[Dict[str, Any]] = []
+        if isinstance(alert_events, Sequence) and not isinstance(alert_events, (str, bytes, bytearray)):
+            for raw_event in alert_events[:32]:
+                if not isinstance(raw_event, Mapping):
+                    continue
+                title = str(raw_event.get("title") or "Event").strip()[:120] or "Event"
+                description = str(raw_event.get("description") or "").strip()[:300]
+                severity = str(raw_event.get("severity") or "normal").strip().lower()[:20] or "normal"
+                state = str(raw_event.get("state") or "new").strip().lower()[:20] or "new"
+                event: Dict[str, Any] = {
+                    "title": title,
+                    "description": description,
+                    "severity": severity,
+                    "state": state,
+                }
+                channel_id = _parse_optional_int(raw_event.get("channel_id"))
+                if channel_id is not None:
+                    event["channel_id"] = int(channel_id)
+                timestamp_ms = _parse_optional_int(raw_event.get("timestamp_ms"))
+                if timestamp_ms is not None:
+                    event["timestamp_ms"] = int(timestamp_ms)
+                status = str(raw_event.get("delivery_status") or "").strip().lower()
+                if status:
+                    event["delivery_status"] = status[:40]
+                error = str(raw_event.get("error") or "").strip()
+                if error:
+                    event["error"] = error[:240]
+                cleaned_events.append(event)
+        obj.alert_events = cleaned_events
         return obj
 
     def as_dict(self) -> Dict[str, Any]:
         return {
+            "alerts_detected": self.alerts_detected,
             "alerts_parsed": self.parsed,
+            "parser_alert_count": self.parsed,
+            "json_alert_count": self.json_alert_count,
+            "prose_alert_count": self.prose_alert_count,
             "bookmarks_sent": int(self),
             "bookmark_failed_count": self.failed,
             "bookmark_skipped_duplicate_count": self.skipped_duplicate,
+            "bookmark_cooldown_skipped_count": self.skipped_duplicate,
             "bookmark_last_error": self.last_error,
+            "alert_parser_error": self.parser_error,
+            "alert_events": list(self.alert_events),
         }
 
 
@@ -446,6 +527,164 @@ class LuxriotManager:
 
     DESIRED_LIVE_SESSIONS_KEY = "luxriot_live_sessions:v1"
 
+    @staticmethod
+    def _normalize_json_alert_prompt(prompt_text: object) -> str:
+        text = str(prompt_text or "").strip()
+        if not text:
+            return DEFAULT_ALERTS_JSON_PROMPT
+        lowered = text.lower()
+        if any(marker in lowered for marker in _OUTDATED_ALERT_PROMPT_MARKERS):
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if (
+            "do not merge unrelated triggers into one alert" in lowered
+            and "evaluate every operator-defined trigger independently" not in lowered
+        ):
+            return DEFAULT_ALERTS_JSON_PROMPT
+        return text
+
+    @staticmethod
+    def _render_channel_memory_prompt(routine_text: str) -> str:
+        routine = str(routine_text or "").strip()
+        if not routine:
+            return ""
+        return (
+            "Active Channel Memory - Prior Context (not a current observation):\n"
+            f"{routine}\n"
+            "Use this memory only as prior context for routine-vs-deviation judgment. "
+            "Current snapshots override this memory. Do not assert that a person, animal, vehicle, "
+            "object, or action is present from memory alone; verify presence in the current snapshots. "
+            "Do not let routine baseline suppress visible security/safety alerts or operator-defined triggers. "
+            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
+        )
+
+    @staticmethod
+    def _strip_suffix_prompt(prompt_text: str, suffix: str) -> str:
+        prompt = str(prompt_text or "").rstrip()
+        rendered_suffix = str(suffix or "").strip()
+        if not prompt or not rendered_suffix:
+            return prompt
+        if prompt.endswith(rendered_suffix):
+            return prompt[: len(prompt) - len(rendered_suffix)].rstrip()
+        return prompt
+
+    @staticmethod
+    def _render_alert_policy_prompt(prompt_text: object) -> str:
+        criteria = str(prompt_text or "").strip()
+        rendered_criteria = criteria if criteria else "None provided. Use only the general safety/security hazards above."
+        return DEFAULT_ALERT_POLICY_PROMPT.replace("{operator_alert_policy}", rendered_criteria).strip()
+
+    @staticmethod
+    def _compact_prompt_text(text: object) -> str:
+        lines = [line.rstrip() for line in str(text or "").splitlines()]
+        compacted: List[str] = []
+        blank = False
+        for line in lines:
+            if not line.strip():
+                if not blank and compacted:
+                    compacted.append("")
+                blank = True
+                continue
+            compacted.append(line)
+            blank = False
+        return "\n".join(compacted).strip()
+
+    @staticmethod
+    def _strip_prompt_bullet(line: str) -> str:
+        return re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", str(line or "")).strip()
+
+    @classmethod
+    def _legacy_alert_prompt_health(
+        cls,
+        stream_prompt: object,
+        alert_policy_prompt: object,
+    ) -> Dict[str, Any]:
+        stream_text = str(stream_prompt or "")
+        current_policy = str(alert_policy_prompt or "").strip()
+        if not stream_text.strip():
+            return {
+                "needs_migration": False,
+                "legacy_prose_alert_format": False,
+                "legacy_alert_criteria_in_stream": False,
+                "warnings": [],
+            }
+
+        legacy_format = False
+        legacy_criteria = False
+        candidate_policy_lines: List[str] = []
+        cleaned_lines: List[str] = []
+        for raw_line in stream_text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            lowered = stripped.lower()
+            is_json_contract = "alerts_json" in lowered or '"alerts"' in lowered
+            is_prose_alert_heading = bool(
+                re.match(r"^\s*(?:#{1,6}\s*)?(?:alerts?|alerts/signals)\s*:?\s*$", stripped, flags=re.IGNORECASE)
+            )
+            is_prose_level_line = bool(
+                re.match(
+                    r"^\s*(?:[-*•]|\d+[.)])?\s*"
+                    r"(?:info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
+                    r"\s*(?:level|alert|severity)\s*[:\-–]",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+            )
+            is_alert_section_instruction = bool(
+                re.search(r"\breturn\s+markdown\b", lowered)
+                and re.search(r"\balerts?(?:/signals)?\b", lowered)
+            )
+            criteria_hint = bool(
+                re.search(
+                    r"\b(alert|alerts|trigger|triggers|watch|flag|bookmark|notify|raise|pay attention|look for|monitor)\b",
+                    lowered,
+                )
+            )
+            if is_json_contract or is_prose_alert_heading or is_prose_level_line or is_alert_section_instruction:
+                legacy_format = True
+                continue
+            if criteria_hint:
+                clean_candidate = cls._strip_prompt_bullet(line)
+                if clean_candidate and clean_candidate not in candidate_policy_lines:
+                    candidate_policy_lines.append(clean_candidate)
+                legacy_criteria = True
+                continue
+            cleaned_lines.append(line)
+
+        suggested_policy = current_policy
+        if candidate_policy_lines:
+            existing_lower = suggested_policy.lower()
+            new_lines = [
+                line
+                for line in candidate_policy_lines
+                if line.lower() not in existing_lower
+            ]
+            if new_lines:
+                suggested_policy = cls._compact_prompt_text(
+                    "\n".join([part for part in (suggested_policy, "\n".join(f"- {line}" for line in new_lines)) if part.strip()])
+                )
+        suggested_stream = cls._compact_prompt_text("\n".join(cleaned_lines))
+        needs_migration = bool(legacy_format or legacy_criteria)
+        warnings: List[str] = []
+        if legacy_format:
+            warnings.append(
+                "Legacy prose alert formatting was detected in the stream prompt. "
+                "Move alert output requirements to the backend ALERTS_JSON contract."
+            )
+        if legacy_criteria:
+            warnings.append(
+                "Alert/watch criteria were detected inside the stream prompt. "
+                "Move them to Alert Criteria so L0 role text does not compete with machine-readable alerts."
+            )
+        return {
+            "needs_migration": needs_migration,
+            "legacy_prose_alert_format": legacy_format,
+            "legacy_alert_criteria_in_stream": legacy_criteria,
+            "warnings": warnings,
+            "candidate_alert_policy_lines": candidate_policy_lines[:24],
+            "suggested_stream_system_prompt": suggested_stream,
+            "suggested_alert_policy_prompt": suggested_policy,
+        }
+
     def __init__(
         self,
         config: Any,
@@ -467,6 +706,7 @@ class LuxriotManager:
         self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
         self.summary_archive_callback: Optional[SummaryArchiveFn] = summary_archive_callback
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
+        self.alert_policy_prompt = str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "") or "")
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
@@ -494,6 +734,7 @@ class LuxriotManager:
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
         self.channel_routine_context: Dict[int, Dict[str, Any]] = {}
+        self.channel_observed_state_tracker: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self.channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
         self._summary_state_last_persist = 0.0
         self._summary_state_dirty = False
@@ -515,9 +756,32 @@ class LuxriotManager:
         except Exception:
             max_alerts_value = 8
         self.alerts_max_per_batch = max(1, min(32, max_alerts_value))
-        self.default_json_alert_prompt = str(
-            getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", DEFAULT_ALERTS_JSON_PROMPT) or DEFAULT_ALERTS_JSON_PROMPT
-        ).strip() or DEFAULT_ALERTS_JSON_PROMPT
+        self.default_json_alert_prompt = self._normalize_json_alert_prompt(
+            getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", DEFAULT_ALERTS_JSON_PROMPT)
+        )
+        self.state_transitions_enabled = bool(
+            getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)
+        )
+        try:
+            confirm_batches = int(getattr(config, "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES", 2))
+        except Exception:
+            confirm_batches = 2
+        self.state_transition_confirm_batches = max(1, min(6, confirm_batches))
+        self.state_transition_alert_events_enabled = bool(
+            getattr(config, "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS", True)
+        )
+        try:
+            self.lm_input_warning_chars = int(getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000))
+        except (TypeError, ValueError):
+            self.lm_input_warning_chars = 24000
+        self.lm_input_warning_chars = max(1, self.lm_input_warning_chars)
+        try:
+            self.lm_image_payload_warning_chars = int(
+                getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)
+            )
+        except (TypeError, ValueError):
+            self.lm_image_payload_warning_chars = 2500000
+        self.lm_image_payload_warning_chars = max(1, self.lm_image_payload_warning_chars)
         self.rollup_time_only = bool(getattr(config, "LUXRIOT_ROLLUP_TIME_ONLY", True))
         summary_state_raw = str(getattr(config, "LUXRIOT_SUMMARY_STATE_FILE", "luxriot_summary_state.json") or "").strip()
         if not summary_state_raw:
@@ -688,9 +952,48 @@ class LuxriotManager:
                     incoming["alert_severities"] = list(existing_meta.get("alert_severities") or [])
                 if isinstance(existing.get("signal_digest"), Mapping) and not isinstance(incoming.get("signal_digest"), Mapping):
                     incoming["signal_digest"] = dict(cast(Mapping[str, Any], existing.get("signal_digest")))
+                cls._preserve_summary_provenance_on_merge(existing, incoming)
             merged[key] = incoming
         ordered.sort(key=lambda key: float(key[0]))
         return [merged[key] for key in ordered]
+
+    @staticmethod
+    def _has_non_empty_sequence_field(item: Mapping[str, Any], key: str) -> bool:
+        value = item.get(key)
+        return bool(isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and len(value) > 0)
+
+    @staticmethod
+    def _has_positive_count_field(item: Mapping[str, Any], key: str) -> bool:
+        return int(_parse_optional_int(item.get(key)) or 0) > 0
+
+    @classmethod
+    def _preserve_summary_provenance_on_merge(
+        cls,
+        existing: Mapping[str, Any],
+        incoming: Dict[str, Any],
+    ) -> None:
+        for key in ("alert_events", "state_observations", "state_transition_events"):
+            if cls._has_non_empty_sequence_field(existing, key) and not cls._has_non_empty_sequence_field(incoming, key):
+                incoming[key] = list(cast(Sequence[Any], existing.get(key)))
+        for key in (
+            "parser_alert_count",
+            "json_alert_count",
+            "prose_alert_count",
+            "bookmark_failed_count",
+            "bookmark_skipped_duplicate_count",
+            "bookmark_cooldown_skipped_count",
+            "state_transition_total",
+            "bookmarks_sent",
+            "alerts_parsed",
+        ):
+            if cls._has_positive_count_field(existing, key) and not cls._has_positive_count_field(incoming, key):
+                incoming[key] = existing.get(key)
+        for key in ("bookmark_last_error", "alert_parser_error"):
+            if str(existing.get(key) or "").strip() and not str(incoming.get(key) or "").strip():
+                incoming[key] = existing.get(key)
+        for key in ("llm_input_stats", "alert_delivery_breakdown", "alert_parser_breakdown"):
+            if isinstance(existing.get(key), Mapping) and not isinstance(incoming.get(key), Mapping):
+                incoming[key] = dict(cast(Mapping[str, Any], existing.get(key)))
 
     @staticmethod
     def _normalize_alert_severity(value: Any) -> str:
@@ -829,6 +1132,207 @@ class LuxriotManager:
                 severity = self._normalize_alert_severity(raw_alert.get("severity"))
                 counts[severity] = counts.get(severity, 0) + 1
         return self._alert_meta_from_counts(counts)
+
+    @staticmethod
+    def _normalize_observed_state_key(label: str) -> str:
+        text = str(label or "").strip().lower()
+        text = re.sub(r"[*_`#]+", " ", text)
+        text = re.sub(r"\([^)]*\)", " ", text)
+        text = text.replace("/", " ")
+        text = re.sub(r"[^a-zа-яё0-9]+", " ", text, flags=re.IGNORECASE).strip()
+        if not text:
+            return ""
+        return text[:80]
+
+    @staticmethod
+    def _normalize_observed_state_value(text: str) -> Optional[str]:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return None
+        if re.search(r"\b(?:uncertain|unknown|unclear|ambiguous|not sure|cannot determine|can't determine)\b", lowered):
+            return "unknown"
+        if re.search(
+            r"\b(?:absent|not\s+visible|not\s+present|no\s+visible|none\s+visible|missing|gone|out\s+of\s+frame|not\s+detected)\b",
+            lowered,
+        ):
+            return "absent"
+        if re.search(r"\b(?:present|visible|detected|observed|seen|yes|active|in\s+frame)\b", lowered):
+            return "present"
+        return None
+
+    @classmethod
+    def _extract_current_observed_states(cls, summary_text: str) -> List[Dict[str, Any]]:
+        text = str(summary_text or "")
+        if not text.strip():
+            return []
+        header = re.search(
+            r"^\s*(?:#{1,6}\s*)?current observed state\b.*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if not header:
+            return []
+        tail = text[header.end() :]
+        stop = re.search(
+            r"^\s*(?:#{1,6}\s+\S|ALERTS_JSON:|MEMORY_UPDATE_JSON:)",
+            tail,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        section = tail[: stop.start()] if stop else tail
+        observations: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for raw_line in section.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line)
+            line = re.sub(r"^\s*\|", "", line).strip()
+            if not line or line.lower().startswith(("alert", "summary", "scene", "activity")):
+                continue
+            match = re.match(
+                r"^\s*\**(?P<label>[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 _/().,'-]{1,90}?)\**\s*(?:[:|–-])\s*(?P<state>.+?)\s*$",
+                line,
+            )
+            if not match:
+                continue
+            label = " ".join(str(match.group("label") or "").split()).strip(" -*_`|")
+            state_text = str(match.group("state") or "").strip()
+            state = cls._normalize_observed_state_value(state_text)
+            key = cls._normalize_observed_state_key(label)
+            if not key or state is None or key in seen:
+                continue
+            seen.add(key)
+            observations.append(
+                {
+                    "key": key,
+                    "label": label[:120],
+                    "state": state,
+                    "evidence": state_text[:300],
+                }
+            )
+        return observations
+
+    def _update_observed_state_tracker(
+        self,
+        channel_id: int,
+        observations: Sequence[Mapping[str, Any]],
+        timestamp_ms: int,
+    ) -> List[Dict[str, Any]]:
+        if not self.state_transitions_enabled:
+            return []
+        transitions: List[Dict[str, Any]] = []
+        if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes, bytearray)):
+            return transitions
+        confirm_required = max(1, int(self.state_transition_confirm_batches or 1))
+        with self.cache_lock:
+            channel_states = self.channel_observed_state_tracker.setdefault(int(channel_id), {})
+            for raw_obs in observations[:64]:
+                if not isinstance(raw_obs, Mapping):
+                    continue
+                key = str(raw_obs.get("key") or "").strip()
+                label = str(raw_obs.get("label") or key).strip() or key
+                state = str(raw_obs.get("state") or "").strip().lower()
+                if not key or state not in {"present", "absent", "unknown"}:
+                    continue
+                tracker = channel_states.get(key)
+                if tracker is None:
+                    channel_states[key] = {
+                        "key": key,
+                        "label": label,
+                        "stable_state": state,
+                        "last_observed_state": state,
+                        "last_observed_ms": int(timestamp_ms),
+                        "last_changed_ms": int(timestamp_ms),
+                        "candidate_state": None,
+                        "candidate_count": 0,
+                        "updated_at": time.time(),
+                    }
+                    continue
+                tracker["label"] = label or tracker.get("label") or key
+                tracker["last_observed_state"] = state
+                tracker["last_observed_ms"] = int(timestamp_ms)
+                tracker["updated_at"] = time.time()
+                if state == "unknown":
+                    tracker["candidate_state"] = None
+                    tracker["candidate_count"] = 0
+                    continue
+                stable_state = str(tracker.get("stable_state") or "unknown")
+                if stable_state == "unknown":
+                    tracker["stable_state"] = state
+                    tracker["last_changed_ms"] = int(timestamp_ms)
+                    tracker["candidate_state"] = None
+                    tracker["candidate_count"] = 0
+                    continue
+                if state == stable_state:
+                    tracker["candidate_state"] = None
+                    tracker["candidate_count"] = 0
+                    continue
+                candidate_state = str(tracker.get("candidate_state") or "")
+                if candidate_state == state:
+                    candidate_count = int(_parse_optional_int(tracker.get("candidate_count")) or 0) + 1
+                else:
+                    candidate_count = 1
+                tracker["candidate_state"] = state
+                tracker["candidate_count"] = candidate_count
+                if candidate_count < confirm_required:
+                    continue
+                event_type = "state_change"
+                if stable_state != "present" and state == "present":
+                    event_type = "appearance"
+                elif stable_state == "present" and state == "absent":
+                    event_type = "disappearance"
+                transition = {
+                    "key": key,
+                    "label": label,
+                    "event_type": event_type,
+                    "from_state": stable_state,
+                    "to_state": state,
+                    "timestamp_ms": int(timestamp_ms),
+                    "confirmations": candidate_count,
+                    "required_confirmations": confirm_required,
+                    "evidence": str(raw_obs.get("evidence") or "").strip()[:300],
+                    "source": "vlm_current_observed_state",
+                }
+                transitions.append(transition)
+                tracker["stable_state"] = state
+                tracker["last_changed_ms"] = int(timestamp_ms)
+                tracker["candidate_state"] = None
+                tracker["candidate_count"] = 0
+        return transitions
+
+    @staticmethod
+    def _transition_alert_events(transitions: Sequence[Mapping[str, Any]], channel_id: int) -> List[Dict[str, Any]]:
+        if not isinstance(transitions, Sequence) or isinstance(transitions, (str, bytes, bytearray)):
+            return []
+        events: List[Dict[str, Any]] = []
+        for transition in transitions[:32]:
+            if not isinstance(transition, Mapping):
+                continue
+            event_type = str(transition.get("event_type") or "state_change").strip().lower()
+            label = str(transition.get("label") or transition.get("key") or "Observed state").strip() or "Observed state"
+            title = f"{label} {event_type.replace('_', ' ')}".strip()
+            evidence = str(transition.get("evidence") or "").strip()
+            from_state = str(transition.get("from_state") or "unknown")
+            to_state = str(transition.get("to_state") or "unknown")
+            description = (
+                f"Backend state tracker confirmed {label}: {from_state} -> {to_state} "
+                f"from current observed state."
+            )
+            if evidence:
+                description = f"{description} Evidence: {evidence}"
+            timestamp_ms = _parse_optional_int(transition.get("timestamp_ms")) or int(time.time() * 1000)
+            events.append(
+                {
+                    "title": title[:120],
+                    "description": description[:300],
+                    "severity": "info",
+                    "state": "new",
+                    "channel_id": int(channel_id),
+                    "timestamp_ms": int(timestamp_ms),
+                    "delivery_status": "state_tracker",
+                }
+            )
+        return events
 
     def _summary_alert_signal_items(
         self,
@@ -1067,6 +1571,223 @@ class LuxriotManager:
                 counts[severity] = counts.get(severity, 0) + total
         return cls._alert_meta_from_counts(counts)
 
+    @staticmethod
+    def _compact_llm_input_stats(value: object) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        out: Dict[str, Any] = {}
+        for key in (
+            "phase",
+            "level",
+            "source_level",
+            "frame_count",
+            "batch_size",
+            "message_count",
+            "text_chars",
+            "image_parts",
+            "high_detail_images",
+            "image_url_chars",
+            "total_payload_chars",
+            "system_prompt_chars",
+            "task_prompt_chars",
+            "total_image_base64_chars",
+            "largest_frame_base64_chars",
+            "source_lines_selected",
+            "source_lines_available",
+            "source_chars_selected",
+            "source_char_budget",
+            "backend_instruction_chars",
+            "routine_context_chars",
+            "signal_digest_chars",
+            "warning_text_chars",
+            "warning_image_payload_chars",
+        ):
+            if key not in value:
+                continue
+            item = value.get(key)
+            if isinstance(item, str):
+                out[key] = item[:120]
+            elif isinstance(item, (int, float, bool)) or item is None:
+                out[key] = item
+            else:
+                parsed = _parse_optional_int(item)
+                if parsed is not None:
+                    out[key] = parsed
+        warnings = value.get("warnings")
+        if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes, bytearray)):
+            out["warnings"] = [str(item)[:180] for item in warnings[:6] if str(item or "").strip()]
+        return out
+
+    @staticmethod
+    def _compact_alert_events(value: object) -> List[Dict[str, Any]]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return []
+        events: List[Dict[str, Any]] = []
+        for raw_event in value[:32]:
+            if not isinstance(raw_event, Mapping):
+                continue
+            title = str(raw_event.get("title") or "Event").strip()[:120] or "Event"
+            description = str(raw_event.get("description") or "").strip()[:300]
+            severity = str(raw_event.get("severity") or "normal").strip().lower()[:20] or "normal"
+            state = str(raw_event.get("state") or "new").strip().lower()[:20] or "new"
+            event: Dict[str, Any] = {
+                "title": title,
+                "description": description,
+                "severity": severity,
+                "state": state,
+            }
+            channel_id = _parse_optional_int(raw_event.get("channel_id"))
+            if channel_id is not None:
+                event["channel_id"] = int(channel_id)
+            timestamp_ms = _parse_optional_int(raw_event.get("timestamp_ms"))
+            if timestamp_ms is not None:
+                event["timestamp_ms"] = int(timestamp_ms)
+            status = str(raw_event.get("delivery_status") or "").strip().lower()
+            if status:
+                event["delivery_status"] = status[:40]
+            error = str(raw_event.get("error") or "").strip()
+            if error:
+                event["error"] = error[:240]
+            events.append(event)
+        return events
+
+    @staticmethod
+    def _compact_state_observations(value: object) -> List[Dict[str, Any]]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return []
+        out: List[Dict[str, Any]] = []
+        for raw_obs in value[:64]:
+            if not isinstance(raw_obs, Mapping):
+                continue
+            key = str(raw_obs.get("key") or "").strip()[:80]
+            state = str(raw_obs.get("state") or "").strip().lower()
+            if not key or state not in {"present", "absent", "unknown"}:
+                continue
+            out.append(
+                {
+                    "key": key,
+                    "label": str(raw_obs.get("label") or key).strip()[:120],
+                    "state": state,
+                    "evidence": str(raw_obs.get("evidence") or "").strip()[:300],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _compact_state_transition_events(value: object) -> List[Dict[str, Any]]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return []
+        out: List[Dict[str, Any]] = []
+        for raw_event in value[:32]:
+            if not isinstance(raw_event, Mapping):
+                continue
+            key = str(raw_event.get("key") or "").strip()[:80]
+            event_type = str(raw_event.get("event_type") or "").strip().lower()
+            if not key or event_type not in {"appearance", "disappearance", "state_change"}:
+                continue
+            event: Dict[str, Any] = {
+                "key": key,
+                "label": str(raw_event.get("label") or key).strip()[:120],
+                "event_type": event_type,
+                "from_state": str(raw_event.get("from_state") or "unknown").strip().lower()[:20],
+                "to_state": str(raw_event.get("to_state") or "unknown").strip().lower()[:20],
+                "evidence": str(raw_event.get("evidence") or "").strip()[:300],
+                "source": str(raw_event.get("source") or "vlm_current_observed_state").strip()[:80],
+            }
+            timestamp_ms = _parse_optional_int(raw_event.get("timestamp_ms"))
+            if timestamp_ms is not None:
+                event["timestamp_ms"] = int(timestamp_ms)
+            for field in ("confirmations", "required_confirmations"):
+                parsed = _parse_optional_int(raw_event.get(field))
+                if parsed is not None:
+                    event[field] = int(parsed)
+            out.append(event)
+        return out
+
+    @staticmethod
+    def _compact_count_breakdown(value: object) -> Dict[str, int]:
+        if not isinstance(value, Mapping):
+            return {}
+        out: Dict[str, int] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip().lower()
+            if not key:
+                continue
+            parsed = _parse_optional_int(raw_value)
+            if parsed is None or parsed <= 0:
+                continue
+            out[key[:80]] = out.get(key[:80], 0) + int(parsed)
+        return out
+
+    @classmethod
+    def _alert_parser_breakdown_from_entry(cls, entry: Mapping[str, Any]) -> Dict[str, int]:
+        parser_count = _parse_optional_int(entry.get("parser_alert_count"))
+        if parser_count is None:
+            parser_count = _parse_optional_int(entry.get("alerts_parsed")) or 0
+        json_count = _parse_optional_int(entry.get("json_alert_count")) or 0
+        prose_count = _parse_optional_int(entry.get("prose_alert_count")) or 0
+        breakdown = {
+            "parser_alert_count": int(max(0, parser_count or 0)),
+            "json_alert_count": int(max(0, json_count)),
+            "prose_alert_count": int(max(0, prose_count)),
+            "prose_only_signal_count": int(max(0, prose_count - json_count)),
+        }
+        return {key: value for key, value in breakdown.items() if value > 0}
+
+    @classmethod
+    def _alert_delivery_breakdown_from_entry(cls, entry: Mapping[str, Any]) -> Dict[str, int]:
+        breakdown: Dict[str, int] = {}
+        for event in cls._compact_alert_events(entry.get("alert_events")):
+            status = str(event.get("delivery_status") or "unknown").strip().lower() or "unknown"
+            breakdown[status] = breakdown.get(status, 0) + 1
+        if not breakdown:
+            for source_key, status in (
+                ("bookmarks_sent", "sent"),
+                ("bookmark_failed_count", "failed"),
+                ("bookmark_cooldown_skipped_count", "cooldown_skipped"),
+                ("bookmark_skipped_duplicate_count", "cooldown_skipped"),
+            ):
+                parsed = _parse_optional_int(entry.get(source_key)) or 0
+                if parsed > 0:
+                    breakdown[status] = breakdown.get(status, 0) + int(parsed)
+        total = sum(value for value in breakdown.values() if isinstance(value, int) and value > 0)
+        if total > 0:
+            breakdown["total"] = total
+        return breakdown
+
+    @classmethod
+    def _merge_count_breakdowns(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        field: str,
+    ) -> Dict[str, int]:
+        merged: Dict[str, int] = {}
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            breakdown = cls._compact_count_breakdown(child.get(field))
+            for key, value in breakdown.items():
+                merged[key] = merged.get(key, 0) + int(value)
+        return merged
+
+    @classmethod
+    def _aggregate_provenance_metadata(cls, children: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        delivery = cls._merge_count_breakdowns(children, "alert_delivery_breakdown")
+        parser = cls._merge_count_breakdowns(children, "alert_parser_breakdown")
+        state_transition_total = 0
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            state_transition_total += int(_parse_optional_int(child.get("state_transition_total")) or 0)
+        meta: Dict[str, Any] = {}
+        if delivery:
+            meta["alert_delivery_breakdown"] = delivery
+        if parser:
+            meta["alert_parser_breakdown"] = parser
+        if state_transition_total > 0:
+            meta["state_transition_total"] = int(state_transition_total)
+        return meta
+
     def _normalize_summary_log_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         channel_id = _parse_optional_int(entry.get("channel_id"))
         if channel_id is None:
@@ -1103,6 +1824,14 @@ class LuxriotManager:
             alert_total=int(alert_meta.get("alert_total") or 0),
         )
         bookmarks_sent = _parse_optional_int(entry.get("bookmarks_sent")) or 0
+        alerts_parsed_count = int(max(0, _parse_optional_int(entry.get("alerts_parsed")) or 0))
+        parser_alert_count = _parse_optional_int(entry.get("parser_alert_count"))
+        if parser_alert_count is None:
+            parser_alert_count = alerts_parsed_count
+        duplicate_skip_count = int(max(0, _parse_optional_int(entry.get("bookmark_skipped_duplicate_count")) or 0))
+        cooldown_skip_count = _parse_optional_int(entry.get("bookmark_cooldown_skipped_count"))
+        if cooldown_skip_count is None:
+            cooldown_skip_count = duplicate_skip_count
         return {
             "channel_id": int(channel_id),
             "run_id": str(entry.get("run_id") or "").strip(),
@@ -1115,12 +1844,21 @@ class LuxriotManager:
             "duration_sec": float(max(0.0, duration_sec)),
             "prompt": str(entry.get("prompt") or ""),
             "bookmarks_sent": int(max(0, bookmarks_sent)),
-            "alerts_parsed": int(max(0, _parse_optional_int(entry.get("alerts_parsed")) or 0)),
+            "alerts_detected": bool(entry.get("alerts_detected")),
+            "alerts_parsed": alerts_parsed_count,
+            "parser_alert_count": int(max(0, parser_alert_count)),
+            "json_alert_count": int(max(0, _parse_optional_int(entry.get("json_alert_count")) or 0)),
+            "prose_alert_count": int(max(0, _parse_optional_int(entry.get("prose_alert_count")) or 0)),
             "bookmark_failed_count": int(max(0, _parse_optional_int(entry.get("bookmark_failed_count")) or 0)),
-            "bookmark_skipped_duplicate_count": int(
-                max(0, _parse_optional_int(entry.get("bookmark_skipped_duplicate_count")) or 0)
-            ),
+            "bookmark_skipped_duplicate_count": duplicate_skip_count,
+            "bookmark_cooldown_skipped_count": int(max(0, cooldown_skip_count)),
             "bookmark_last_error": self._truncate_text(entry.get("bookmark_last_error"), 240),
+            "alert_parser_error": self._truncate_text(entry.get("alert_parser_error"), 240),
+            "alert_events": self._compact_alert_events(entry.get("alert_events")),
+            "state_observations": self._compact_state_observations(entry.get("state_observations")),
+            "state_transition_events": self._compact_state_transition_events(entry.get("state_transition_events")),
+            "state_transition_total": int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0)),
+            "llm_input_stats": self._compact_llm_input_stats(entry.get("llm_input_stats")),
             "signal_digest": signal_digest,
             **alert_meta,
         }
@@ -1220,6 +1958,7 @@ class LuxriotManager:
             routine_payload[str(channel_id)] = dict(routine)
         prompt_payload = {
             "stream_system_prompt": str(self.system_prompt or ""),
+            "alert_policy_prompt": str(self.alert_policy_prompt or ""),
             "rollup_prompts": {
                 "L1": str(self.rollup_llm_system_prompts.get("L1") or ""),
                 "L2": str(self.rollup_llm_system_prompts.get("L2") or ""),
@@ -1361,6 +2100,7 @@ class LuxriotManager:
                     loaded_entry["memory"] = dict(memory_raw)
                 loaded_routines[int(channel_id)] = loaded_entry
         loaded_stream_system_prompt: Optional[str] = None
+        loaded_alert_policy_prompt: Optional[str] = None
         loaded_rollup_prompts: Dict[str, str] = {}
         loaded_channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
         loaded_default_bookmark_enabled: Optional[bool] = None
@@ -1371,13 +2111,17 @@ class LuxriotManager:
                 loaded_stream_system_prompt = str(prompt_settings_raw.get("stream_system_prompt") or "")
             elif "system_prompt" in prompt_settings_raw:
                 loaded_stream_system_prompt = str(prompt_settings_raw.get("system_prompt") or "")
+            if "alert_policy_prompt" in prompt_settings_raw:
+                loaded_alert_policy_prompt = str(prompt_settings_raw.get("alert_policy_prompt") or "")
             if "bookmark_enabled" in prompt_settings_raw:
                 loaded_default_bookmark_enabled = bool(prompt_settings_raw.get("bookmark_enabled"))
             if "bookmark_cooldown_sec" in prompt_settings_raw:
                 raw_cooldown = self._coerce_float(prompt_settings_raw.get("bookmark_cooldown_sec"))
                 loaded_default_bookmark_cooldown_sec = max(0.0, raw_cooldown if raw_cooldown is not None else 0.0)
             if "json_alert_prompt" in prompt_settings_raw:
-                loaded_default_json_alert_prompt = str(prompt_settings_raw.get("json_alert_prompt") or "").strip()
+                loaded_default_json_alert_prompt = self._normalize_json_alert_prompt(
+                    prompt_settings_raw.get("json_alert_prompt")
+                )
             rollup_prompts_raw = prompt_settings_raw.get("rollup_prompts")
             if isinstance(rollup_prompts_raw, Mapping):
                 for raw_level, raw_prompt in rollup_prompts_raw.items():
@@ -1400,6 +2144,8 @@ class LuxriotManager:
                     parsed_channel_payload: Dict[str, Any] = {}
                     if "stream_system_prompt" in channel_payload:
                         parsed_channel_payload["stream_system_prompt"] = str(channel_payload.get("stream_system_prompt") or "")
+                    if "alert_policy_prompt" in channel_payload:
+                        parsed_channel_payload["alert_policy_prompt"] = str(channel_payload.get("alert_policy_prompt") or "")
                     if "bookmark_enabled" in channel_payload:
                         parsed_channel_payload["bookmark_enabled"] = bool(channel_payload.get("bookmark_enabled"))
                     if "bookmark_cooldown_sec" in channel_payload:
@@ -1414,7 +2160,9 @@ class LuxriotManager:
                         if channel_interval is not None:
                             parsed_channel_payload["capture_interval_sec"] = channel_interval
                     if "json_alert_prompt" in channel_payload:
-                        parsed_channel_payload["json_alert_prompt"] = str(channel_payload.get("json_alert_prompt") or "")
+                        parsed_channel_payload["json_alert_prompt"] = self._normalize_json_alert_prompt(
+                            channel_payload.get("json_alert_prompt")
+                        )
                     channel_rollup_prompts_raw = channel_payload.get("rollup_prompts")
                     if isinstance(channel_rollup_prompts_raw, Mapping):
                         parsed_rollup_prompts: Dict[str, str] = {}
@@ -1441,6 +2189,8 @@ class LuxriotManager:
             self.channel_prompt_overrides = loaded_channel_prompt_overrides
             if loaded_stream_system_prompt is not None:
                 self.system_prompt = loaded_stream_system_prompt
+            if loaded_alert_policy_prompt is not None:
+                self.alert_policy_prompt = loaded_alert_policy_prompt
             if loaded_default_bookmark_enabled is not None:
                 self.default_bookmark_enabled = loaded_default_bookmark_enabled
             if loaded_default_bookmark_cooldown_sec is not None:
@@ -2229,22 +2979,19 @@ class LuxriotManager:
         if not isinstance(current, Mapping):
             return ""
         routine = str(current.get("routine") or "").strip()
-        if not routine:
-            return ""
-        return (
-            "Active Channel Memory from prior summaries:\n"
-            f"{routine}\n"
-            "Use this memory to distinguish routine baseline from meaningful deviations. "
-            "Do not let routine baseline suppress visible security/safety alerts. "
-            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
-        )
+        return self._render_channel_memory_prompt(routine)
 
     def compose_live_system_prompt(self, channel_id: int, base_prompt: Optional[str]) -> str:
-        base = str(base_prompt or "").strip()
+        rendered_json_prompt = self._get_rendered_json_alert_prompt(channel_id)
+        base = self._strip_suffix_prompt(str(base_prompt or ""), rendered_json_prompt).strip()
+        alert_policy = self._get_rendered_alert_policy_prompt(channel_id)
         routine = self._get_channel_routine_prompt(channel_id)
-        if routine:
-            return f"{base}\n\n{routine}" if base else routine
-        return base
+        parts = [
+            part
+            for part in (base, alert_policy, routine, LIVE_OBSERVATION_STATE_PROMPT, rendered_json_prompt)
+            if str(part or "").strip()
+        ]
+        return "\n\n".join(str(part).strip() for part in parts)
 
     def _default_rollup_prompt_for_level_locked(self, level: str) -> str:
         normalized_level = self._normalize_rollup_level(level)
@@ -2259,10 +3006,17 @@ class LuxriotManager:
                 return str(overrides.get("stream_system_prompt") or "")
         return str(self.system_prompt or "")
 
+    def _get_alert_policy_prompt_locked(self, channel_id: Optional[int] = None) -> str:
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping) and "alert_policy_prompt" in overrides:
+                return str(overrides.get("alert_policy_prompt") or "")
+        return str(self.alert_policy_prompt or "")
+
     def _get_channel_bookmark_settings_locked(self, channel_id: Optional[int] = None) -> Dict[str, Any]:
         enabled = bool(self.default_bookmark_enabled)
         cooldown_sec = float(max(0.0, self.default_bookmark_cooldown_sec))
-        json_prompt = str(self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT)
+        json_prompt = self._normalize_json_alert_prompt(self.default_json_alert_prompt)
         if channel_id is not None:
             overrides = self.channel_prompt_overrides.get(int(channel_id))
             if isinstance(overrides, Mapping):
@@ -2273,10 +3027,11 @@ class LuxriotManager:
                     cooldown_sec = max(0.0, raw_cooldown if raw_cooldown is not None else 0.0)
                 if "json_alert_prompt" in overrides:
                     json_prompt = str(overrides.get("json_alert_prompt") or "")
+        json_prompt = self._normalize_json_alert_prompt(json_prompt)
         return {
             "bookmark_enabled": enabled,
             "bookmark_cooldown_sec": cooldown_sec,
-            "json_alert_prompt": json_prompt or DEFAULT_ALERTS_JSON_PROMPT,
+            "json_alert_prompt": json_prompt,
         }
 
     @staticmethod
@@ -2289,6 +3044,19 @@ class LuxriotManager:
             .replace("{CHANNEL_ID}", replacement)
             .replace("<CHANNEL_ID>", replacement)
         )
+
+    def _get_rendered_json_alert_prompt(self, channel_id: int) -> str:
+        with self.cache_lock:
+            bookmark_settings = self._get_channel_bookmark_settings_locked(channel_id)
+        json_prompt = str(bookmark_settings.get("json_alert_prompt") or "").strip()
+        if not json_prompt:
+            return ""
+        return self._render_json_alert_prompt(json_prompt, int(channel_id)).strip()
+
+    def _get_rendered_alert_policy_prompt(self, channel_id: int) -> str:
+        with self.cache_lock:
+            policy_prompt = self._get_alert_policy_prompt_locked(channel_id)
+        return self._render_alert_policy_prompt(policy_prompt)
 
     def _get_rollup_system_prompt_locked(self, level: str, channel_id: Optional[int] = None) -> str:
         normalized_level = self._normalize_rollup_level(level)
@@ -2336,6 +3104,7 @@ class LuxriotManager:
             defaults_bookmark = self._get_channel_bookmark_settings_locked(None)
             defaults = {
                 "stream_system_prompt": str(self.system_prompt or ""),
+                "alert_policy_prompt": str(self.alert_policy_prompt or ""),
                 "rollup_prompts": {
                     "L1": self._default_rollup_prompt_for_level_locked("L1"),
                     "L2": self._default_rollup_prompt_for_level_locked("L2"),
@@ -2347,6 +3116,11 @@ class LuxriotManager:
                 "json_alert_prompt": str(defaults_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
             }
             effective_stream_prompt = self._get_stream_system_prompt_locked(channel_id)
+            effective_alert_policy_prompt = self._get_alert_policy_prompt_locked(channel_id)
+            prompt_health = self._legacy_alert_prompt_health(
+                effective_stream_prompt,
+                effective_alert_policy_prompt,
+            )
             effective_rollup_prompts = {
                 "L1": self._get_rollup_system_prompt_locked("L1", channel_id),
                 "L2": self._get_rollup_system_prompt_locked("L2", channel_id),
@@ -2360,13 +3134,7 @@ class LuxriotManager:
                 if isinstance(current_memory, Mapping):
                     routine_text = str(current_memory.get("routine") or "").strip()
                     if routine_text:
-                        active_memory = (
-                            "Active Channel Memory from prior summaries:\n"
-                            f"{routine_text}\n"
-                            "Use this memory to distinguish routine baseline from meaningful deviations. "
-                            "Do not let routine baseline suppress visible security/safety alerts. "
-                            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
-                        )
+                        active_memory = self._render_channel_memory_prompt(routine_text)
             has_channel_override = bool(
                 channel_id is not None and isinstance(self.channel_prompt_overrides.get(int(channel_id)), Mapping)
             )
@@ -2374,10 +3142,31 @@ class LuxriotManager:
             "stream": {
                 "editable_prompt": effective_stream_prompt,
                 "backend_memory": active_memory,
+                "warnings": list(prompt_health.get("warnings") or []),
                 "notes": [
                     "Live L0 summaries use the editable stream prompt.",
-                    "If channel memory exists, EVA AI appends it to help distinguish routine baseline from new deviations.",
-                    "ALERTS_JSON instructions are always appended; bookmark settings only control Luxriot bookmark side effects.",
+                    "If channel memory exists, EVA AI appends it as prior context, not current visual evidence.",
+                    "Current-batch observation instructions follow memory, and ALERTS_JSON instructions are appended last.",
+                    "Bookmark settings only control Luxriot bookmark side effects.",
+                ],
+            },
+            "alerts": {
+                "editable_prompt": effective_alert_policy_prompt,
+                "backend_instructions": self._render_alert_policy_prompt(effective_alert_policy_prompt),
+                "warnings": list(prompt_health.get("warnings") or []),
+                "notes": [
+                    "Use this layer for channel-specific alert criteria and temporary watch items.",
+                    "General safety/security hazards are always evaluated by EVA AI.",
+                    "Do not put JSON schema text here; EVA AI appends the machine-readable ALERTS_JSON contract last.",
+                    "Visible facts should be alerted; diagnoses, accusations, and hidden intent should not.",
+                ],
+            },
+            "json": {
+                "editable_prompt": str(effective_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
+                "notes": [
+                    "Advanced machine-readable output contract.",
+                    "Use Alert Criteria for ordinary operator watch conditions.",
+                    "This JSON layer is appended last and is parsed for VLM alert events.",
                 ],
             },
             "rollups": {
@@ -2397,6 +3186,7 @@ class LuxriotManager:
         return {
             "channel_id": int(channel_id) if channel_id is not None else None,
             "stream_system_prompt": effective_stream_prompt,
+            "alert_policy_prompt": effective_alert_policy_prompt,
             "rollup_prompts": effective_rollup_prompts,
             "capture_interval_sec": effective_capture_interval_sec,
             "bookmark_enabled": bool(effective_bookmark.get("bookmark_enabled")),
@@ -2405,12 +3195,14 @@ class LuxriotManager:
             "defaults": defaults,
             "has_channel_override": has_channel_override,
             "prompt_layers": prompt_layers,
+            "prompt_health": prompt_health,
         }
 
     def update_prompt_settings(
         self,
         channel_id: Optional[int] = None,
         stream_system_prompt: Optional[str] = None,
+        alert_policy_prompt: Optional[str] = None,
         rollup_prompts: Optional[Mapping[str, Any]] = None,
         json_alert_prompt: Optional[str] = None,
         bookmark_enabled: Optional[bool] = None,
@@ -2426,8 +3218,13 @@ class LuxriotManager:
                     if next_stream_prompt != str(self.system_prompt or ""):
                         self.system_prompt = next_stream_prompt
                         changed = True
+                if alert_policy_prompt is not None:
+                    next_alert_policy_prompt = str(alert_policy_prompt)
+                    if next_alert_policy_prompt != str(self.alert_policy_prompt or ""):
+                        self.alert_policy_prompt = next_alert_policy_prompt
+                        changed = True
                 if json_alert_prompt is not None:
-                    next_json_prompt = str(json_alert_prompt)
+                    next_json_prompt = self._normalize_json_alert_prompt(json_alert_prompt)
                     if next_json_prompt != str(self.default_json_alert_prompt):
                         self.default_json_alert_prompt = next_json_prompt
                         changed = True
@@ -2449,8 +3246,13 @@ class LuxriotManager:
                     if next_stream_prompt != str(channel_overrides.get("stream_system_prompt") or ""):
                         channel_overrides["stream_system_prompt"] = next_stream_prompt
                         changed = True
+                if alert_policy_prompt is not None:
+                    next_alert_policy_prompt = str(alert_policy_prompt)
+                    if next_alert_policy_prompt != str(channel_overrides.get("alert_policy_prompt") or ""):
+                        channel_overrides["alert_policy_prompt"] = next_alert_policy_prompt
+                        changed = True
                 if json_alert_prompt is not None:
-                    next_json_prompt = str(json_alert_prompt)
+                    next_json_prompt = self._normalize_json_alert_prompt(json_alert_prompt)
                     if next_json_prompt != str(channel_overrides.get("json_alert_prompt") or ""):
                         channel_overrides["json_alert_prompt"] = next_json_prompt
                         changed = True
@@ -2710,10 +3512,13 @@ class LuxriotManager:
         signal_digest = entry.get("signal_digest")
         if not isinstance(signal_digest, Mapping):
             signal_digest = {}
+        alert_delivery_breakdown = self._compact_count_breakdown(entry.get("alert_delivery_breakdown"))
+        alert_parser_breakdown = self._compact_count_breakdown(entry.get("alert_parser_breakdown"))
+        state_transition_total = int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0))
         created_at = self._coerce_float(entry.get("created_at"))
         if created_at is None:
             created_at = time.time()
-        return {
+        normalized = {
             "rollup_id": rollup_id,
             "channel_id": int(channel_id),
             "level": level,
@@ -2734,6 +3539,13 @@ class LuxriotManager:
             "signal_digest": dict(signal_digest),
             **alert_meta,
         }
+        if alert_delivery_breakdown:
+            normalized["alert_delivery_breakdown"] = alert_delivery_breakdown
+        if alert_parser_breakdown:
+            normalized["alert_parser_breakdown"] = alert_parser_breakdown
+        if state_transition_total > 0:
+            normalized["state_transition_total"] = state_transition_total
+        return normalized
 
     def _filter_rollup_cache_retention(
         self,
@@ -3104,6 +3916,7 @@ class LuxriotManager:
         routine_context = self._get_channel_routine_prompt(channel_id)
         window_alert_counts = self._format_alert_counts(node.get("alert_counts"))
         window_signal_digest = self._render_signal_digest(node.get("signal_digest"), max_len=1000)
+        backend_instruction_lines = self._rollup_backend_instruction_lines(level)
         user_text = "\n".join(
             [
                 f"Channel: {channel_id}",
@@ -3119,7 +3932,7 @@ class LuxriotManager:
                 "Window signal digest (compact continuity map):",
                 window_signal_digest or "none",
                 "",
-                *self._rollup_backend_instruction_lines(level),
+                *backend_instruction_lines,
                 "",
                 "Window Snapshot must begin with:",
                 f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
@@ -3131,10 +3944,33 @@ class LuxriotManager:
                 *lines,
             ]
         )
-        return [
+        messages = [
             {"role": "system", "content": [{"type": "text", "text": system_msg}]},
             {"role": "user", "content": [{"type": "text", "text": user_text}]},
         ]
+        input_stats = self._estimate_message_payload_chars(cast(Sequence[Mapping[str, Any]], messages))
+        input_stats.update(
+            {
+                "phase": "rollup_request_built",
+                "level": level,
+                "source_level": source_level,
+                "source_lines_selected": len(lines),
+                "source_lines_available": len(children),
+                "source_chars_selected": int(sum(len(line) + 1 for line in lines)),
+                "source_char_budget": int(self.rollup_llm_char_budget),
+                "system_prompt_chars": len(system_msg),
+                "backend_instruction_chars": sum(len(line) + 1 for line in backend_instruction_lines),
+                "routine_context_chars": len(routine_context),
+                "signal_digest_chars": len(window_signal_digest),
+                "warning_text_chars": self.lm_input_warning_chars,
+            }
+        )
+        warnings = self._summary_input_warnings(input_stats)
+        if warnings:
+            input_stats["warnings"] = warnings
+        if isinstance(node, dict):
+            node["llm_input_stats"] = self._compact_llm_input_stats(input_stats)
+        return messages
 
     def _synthesize_rollup_summary(
         self,
@@ -3268,6 +4104,9 @@ class LuxriotManager:
                     alert_total=node.get("alert_total"),
                     alert_severities=node.get("alert_severities"),
                     signal_digest=node.get("signal_digest"),
+                    alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
+                    alert_parser_breakdown=node.get("alert_parser_breakdown"),
+                    state_transition_total=node.get("state_transition_total"),
                     summary_kind="llm",
                 )
                 node["summary"] = summary
@@ -3308,6 +4147,17 @@ class LuxriotManager:
             rollup_id = f"l0-ch{channel_id}-{self._stable_id(key, length=14)}"
             alert_counts = dict(log.get("alert_counts") or {})
             alert_total = int(_parse_optional_int(log.get("alert_total")) or 0)
+            alert_events = self._compact_alert_events(log.get("alert_events"))
+            state_observations = self._compact_state_observations(log.get("state_observations"))
+            state_transition_events = self._compact_state_transition_events(log.get("state_transition_events"))
+            state_transition_total = int(
+                max(
+                    0,
+                    _parse_optional_int(log.get("state_transition_total")) or len(state_transition_events),
+                )
+            )
+            alert_delivery_breakdown = self._alert_delivery_breakdown_from_entry(log)
+            alert_parser_breakdown = self._alert_parser_breakdown_from_entry(log)
             signal_digest = self._summary_signal_digest(
                 summary,
                 channel_id=channel_id,
@@ -3315,28 +4165,39 @@ class LuxriotManager:
                 alert_counts=alert_counts,
                 alert_total=alert_total,
             )
-            nodes.append(
-                {
-                    "rollup_id": rollup_id,
-                    "channel_id": channel_id,
-                    "level": "L0",
-                    "source_level": None,
-                    "source_ids": [],
-                    "window_start": window_start,
-                    "window_end": window_end,
-                    "window_sec": max(0, int(round(window_end - window_start))),
-                    "item_count": 1,
-                    "frame_count": int(frame_count),
-                    "run_ids": [run_id] if run_id else [],
-                    "highlights": [headline] if headline else [],
-                    "summary": summary,
-                    "created_at": created,
-                    "alert_counts": alert_counts,
-                    "alert_total": alert_total,
-                    "alert_severities": self._coerce_str_list(log.get("alert_severities")),
-                    "signal_digest": signal_digest,
-                }
-            )
+            node = {
+                "rollup_id": rollup_id,
+                "channel_id": channel_id,
+                "level": "L0",
+                "source_level": None,
+                "source_ids": [],
+                "window_start": window_start,
+                "window_end": window_end,
+                "window_sec": max(0, int(round(window_end - window_start))),
+                "item_count": 1,
+                "frame_count": int(frame_count),
+                "run_ids": [run_id] if run_id else [],
+                "highlights": [headline] if headline else [],
+                "summary": summary,
+                "created_at": created,
+                "alert_counts": alert_counts,
+                "alert_total": alert_total,
+                "alert_severities": self._coerce_str_list(log.get("alert_severities")),
+                "signal_digest": signal_digest,
+            }
+            if alert_events:
+                node["alert_events"] = alert_events
+            if state_observations:
+                node["state_observations"] = state_observations
+            if state_transition_events:
+                node["state_transition_events"] = state_transition_events
+            if state_transition_total > 0:
+                node["state_transition_total"] = state_transition_total
+            if alert_delivery_breakdown:
+                node["alert_delivery_breakdown"] = alert_delivery_breakdown
+            if alert_parser_breakdown:
+                node["alert_parser_breakdown"] = alert_parser_breakdown
+            nodes.append(node)
         nodes.sort(key=lambda item: float(item.get("window_start") or 0.0))
         return nodes
 
@@ -3390,6 +4251,7 @@ class LuxriotManager:
                 children,
                 alert_counts=cast(Mapping[str, Any], alert_meta.get("alert_counts") or {}),
             )
+            provenance_meta = self._aggregate_provenance_metadata(children)
             source_signature = self._rollup_source_signature(children, source_ids)
             summary = self._compose_rollup_summary(
                 level=level,
@@ -3424,6 +4286,7 @@ class LuxriotManager:
                     "created_at": end_ts,
                     "signal_digest": signal_digest,
                     **alert_meta,
+                    **provenance_meta,
                 }
             )
             if synthesize and level in self.rollup_llm_levels:
@@ -3481,6 +4344,7 @@ class LuxriotManager:
                     and not isinstance(incoming.get("signal_digest"), Mapping)
                 ):
                     incoming["signal_digest"] = dict(cast(Mapping[str, Any], existing_item.get("signal_digest")))
+                self._preserve_summary_provenance_on_merge(existing_item, incoming)
                 merged[index] = incoming
                 continue
             created = self._coerce_float(incoming.get("created_at"))
@@ -3609,6 +4473,69 @@ class LuxriotManager:
             return dict(result)
         return {}
 
+    @staticmethod
+    def _estimate_message_payload_chars(messages: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        text_chars = 0
+        image_parts = 0
+        high_detail_images = 0
+        image_url_chars = 0
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                text_chars += len(content)
+                continue
+            if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+                continue
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                part_type = str(part.get("type") or "")
+                if part_type == "text":
+                    text_chars += len(str(part.get("text") or ""))
+                    continue
+                if part_type == "image_url":
+                    image_parts += 1
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, Mapping):
+                        if str(image_url.get("detail") or "").lower() == "high":
+                            high_detail_images += 1
+                        image_url_chars += len(str(image_url.get("url") or ""))
+        try:
+            total_payload_chars = len(
+                json.dumps(
+                    list(messages),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
+        except Exception:
+            total_payload_chars = text_chars + image_url_chars
+        return {
+            "message_count": len(messages),
+            "text_chars": int(text_chars),
+            "image_parts": int(image_parts),
+            "high_detail_images": int(high_detail_images),
+            "image_url_chars": int(image_url_chars),
+            "total_payload_chars": int(total_payload_chars),
+        }
+
+    def _summary_input_warnings(self, stats: Mapping[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        text_chars = _parse_optional_int(stats.get("text_chars")) or 0
+        image_url_chars = _parse_optional_int(stats.get("image_url_chars")) or 0
+        if text_chars >= self.lm_input_warning_chars:
+            warnings.append(
+                f"text_input_chars {text_chars} >= warning {self.lm_input_warning_chars}"
+            )
+        if image_url_chars >= self.lm_image_payload_warning_chars:
+            warnings.append(
+                f"image_payload_chars {image_url_chars} >= warning {self.lm_image_payload_warning_chars}"
+            )
+        return warnings
+
     def create_summary_batch(
         self,
         *,
@@ -3636,6 +4563,22 @@ class LuxriotManager:
         submitted_at_ms = int(submitted_at * 1000.0)
         base_system_prompt = self.get_effective_stream_system_prompt(channel_id)
         system_prompt = self.compose_live_system_prompt(channel_id, base_system_prompt)
+        frame_b64_lengths = [
+            len(str(frame.get("thumbnail") or ""))
+            for frame in frame_items
+            if isinstance(frame, Mapping)
+        ]
+        llm_input_stats = {
+            "phase": "summary_batch_created",
+            "frame_count": len(frame_items),
+            "batch_size": int(batch_size),
+            "system_prompt_chars": len(system_prompt),
+            "task_prompt_chars": len(str(prompt or "")),
+            "total_image_base64_chars": int(sum(frame_b64_lengths)),
+            "largest_frame_base64_chars": int(max(frame_b64_lengths) if frame_b64_lengths else 0),
+            "warning_text_chars": self.lm_input_warning_chars,
+            "warning_image_payload_chars": self.lm_image_payload_warning_chars,
+        }
         return {
             "version": 1,
             "channel_id": int(channel_id),
@@ -3650,6 +4593,7 @@ class LuxriotManager:
             "batch_start_ms": min(frame_ts_ms) if frame_ts_ms else submitted_at_ms,
             "batch_end_ms": max(frame_ts_ms) if frame_ts_ms else submitted_at_ms,
             "submitted_at": submitted_at,
+            "llm_input_stats": llm_input_stats,
         }
 
     def run_summary_batch(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
@@ -3677,6 +4621,22 @@ class LuxriotManager:
             str(batch.get("prompt") or ""),
             str(batch.get("system_prompt") or ""),
         )
+        llm_input_stats = dict(batch.get("llm_input_stats") or {})
+        message_stats = self._estimate_message_payload_chars(cast(Sequence[Mapping[str, Any]], messages))
+        llm_input_stats.update(
+            {
+                "phase": "summary_request_built",
+                "message_count": message_stats.get("message_count"),
+                "text_chars": message_stats.get("text_chars"),
+                "image_parts": message_stats.get("image_parts"),
+                "high_detail_images": message_stats.get("high_detail_images"),
+                "image_url_chars": message_stats.get("image_url_chars"),
+                "total_payload_chars": message_stats.get("total_payload_chars"),
+            }
+        )
+        warnings = self._summary_input_warnings(llm_input_stats)
+        if warnings:
+            llm_input_stats["warnings"] = warnings
         model_hint = str(batch.get("model_hint") or "").strip() or None
         summary = self.lm_callback(messages, model_hint)
         submitted_at = self._coerce_float(batch.get("submitted_at"))
@@ -3711,6 +4671,7 @@ class LuxriotManager:
                 0.2,
                 self._coerce_float(batch.get("interval_sec")) or 1.0,
             ),
+            "llm_input_stats": llm_input_stats,
         }
         if archive_frames:
             entry["archive_frames"] = archive_frames
@@ -3749,6 +4710,29 @@ class LuxriotManager:
                 last_error=str(exc)[:240] or exc.__class__.__name__,
             )
         accepted.update(alert_delivery.as_dict())
+
+        state_observations = self._extract_current_observed_states(str(normalized["summary"]))
+        state_transitions = self._update_observed_state_tracker(
+            channel_id,
+            state_observations,
+            int(batch_end_ms),
+        )
+        if state_observations:
+            accepted["state_observations"] = state_observations
+        if state_transitions:
+            accepted["state_transition_events"] = state_transitions
+            accepted["state_transition_total"] = len(state_transitions)
+            if self.state_transition_alert_events_enabled:
+                transition_alert_events = self._transition_alert_events(state_transitions, channel_id)
+                if transition_alert_events:
+                    existing_events = self._compact_alert_events(accepted.get("alert_events"))
+                    accepted["alert_events"] = existing_events + transition_alert_events
+                    counts = self._normalize_alert_counts(accepted.get("alert_counts"))
+                    for event in transition_alert_events:
+                        severity = self._normalize_alert_severity(event.get("severity"))
+                        counts[severity] = counts.get(severity, 0) + 1
+                    alert_meta = self._alert_meta_from_counts(counts)
+                    accepted.update(alert_meta)
 
         archive_meta = self._archive_summary_entry(accepted)
         accepted.pop("archive_frames", None)
@@ -3969,6 +4953,110 @@ class LuxriotManager:
         return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
 
     @staticmethod
+    def _extract_balanced_json_blob(blob: str, start_idx: int) -> Optional[Tuple[str, int]]:
+        if not isinstance(blob, str) or start_idx < 0 or start_idx >= len(blob):
+            return None
+        idx = start_idx
+        while idx < len(blob) and blob[idx] != "{":
+            idx += 1
+        if idx >= len(blob):
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        end_idx = idx
+        while end_idx < len(blob):
+            ch = blob[end_idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return blob[idx : end_idx + 1], end_idx + 1
+            end_idx += 1
+        return None
+
+    @classmethod
+    def _alert_output_diagnostics(cls, summary_text: str) -> Dict[str, Any]:
+        text = str(summary_text or "")
+        json_count = 0
+        seen_json: Set[str] = set()
+
+        def add_json_candidate(raw: Any) -> None:
+            nonlocal json_count
+            if not isinstance(raw, Mapping):
+                return
+            alerts = raw.get("alerts")
+            if not isinstance(alerts, Sequence) or isinstance(alerts, (str, bytes, bytearray)):
+                return
+            try:
+                key = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                key = repr(raw)
+            if key in seen_json:
+                return
+            seen_json.add(key)
+            json_count += sum(1 for alert in alerts if isinstance(alert, Mapping))
+
+        for match in re.finditer(r"```json(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                add_json_candidate(json.loads(match.group(1)))
+            except Exception:
+                continue
+
+        lowered = text.lower()
+        marker = "alerts_json:"
+        search_pos = 0
+        while True:
+            marker_idx = lowered.find(marker, search_pos)
+            if marker_idx < 0:
+                break
+            chunk = cls._extract_balanced_json_blob(text, marker_idx + len(marker))
+            if not chunk:
+                search_pos = marker_idx + 1
+                continue
+            json_blob, next_idx = chunk
+            try:
+                add_json_candidate(json.loads(json_blob))
+            except Exception:
+                pass
+            search_pos = max(next_idx, marker_idx + 1)
+
+        for match in re.finditer(r"\{\s*\"alerts\"\s*:", text, flags=re.IGNORECASE):
+            chunk = cls._extract_balanced_json_blob(text, match.start())
+            if not chunk:
+                continue
+            try:
+                add_json_candidate(json.loads(chunk[0]))
+            except Exception:
+                continue
+
+        prose_count = len(
+            re.findall(
+                r"^\s*(?:[-*•]|\d+[.)])?\s*"
+                r"(?:info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
+                r"\s*(?:level|alert|severity)?\s*[:\-–]\s*\S+",
+                text,
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+        )
+        return {
+            "alerts_detected": cls._contains_alerts_json(text),
+            "json_alert_count": int(max(0, json_count)),
+            "prose_alert_count": int(max(0, prose_count)),
+        }
+
+    @staticmethod
     def _contains_alerts_json(summary_text: str) -> bool:
         text = str(summary_text or "")
         lowered = text.lower()
@@ -4025,8 +5113,13 @@ class LuxriotManager:
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
     ) -> AlertDeliveryResult:
+        diagnostics = self._alert_output_diagnostics(summary_text)
         if not self.alert_parser:
-            return AlertDeliveryResult()
+            return AlertDeliveryResult(
+                alerts_detected=bool(diagnostics.get("alerts_detected")),
+                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+            )
         base_ts_ms = self._normalize_alert_timestamp_ms_bounded(
             default_ts_ms,
             int(time.time() * 1000),
@@ -4035,25 +5128,47 @@ class LuxriotManager:
         )
         with self.cache_lock:
             settings = self._get_channel_bookmark_settings_locked(channel_id)
-        if not bool(settings.get("bookmark_enabled")):
-            return AlertDeliveryResult()
         cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
-        if not self._contains_alerts_json(summary_text):
-            return AlertDeliveryResult()
+        if not bool(diagnostics.get("alerts_detected")):
+            return AlertDeliveryResult(
+                alerts_detected=False,
+                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+            )
         try:
             parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
         except TypeError:
-            parsed_alerts = cast(Any, self.alert_parser)(summary_text, int(channel_id))
+            try:
+                parsed_alerts = cast(Any, self.alert_parser)(summary_text, int(channel_id))
+            except Exception as exc:
+                return AlertDeliveryResult(
+                    alerts_detected=True,
+                    json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+                    prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+                    parser_error=str(exc)[:240] or exc.__class__.__name__,
+                )
+        except Exception as exc:
+            return AlertDeliveryResult(
+                alerts_detected=True,
+                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+                parser_error=str(exc)[:240] or exc.__class__.__name__,
+            )
         if not isinstance(parsed_alerts, list) or not parsed_alerts:
-            return AlertDeliveryResult()
+            return AlertDeliveryResult(
+                alerts_detected=True,
+                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+            )
 
         sent_count = 0
         failed_count = 0
         skipped_duplicate_count = 0
         last_error: Optional[str] = None
+        alert_events: List[Dict[str, Any]] = []
         max_alerts = max(1, min(32, int(getattr(self, "alerts_max_per_batch", 8) or 8)))
         for raw_alert in parsed_alerts:
-            if sent_count >= max_alerts:
+            if len(alert_events) >= max_alerts:
                 break
             if not isinstance(raw_alert, Mapping):
                 continue
@@ -4070,12 +5185,16 @@ class LuxriotManager:
                     max_ts_ms=max_ts_ms,
                 ),
             }
+            if not bool(settings.get("bookmark_enabled")):
+                alert_events.append({**alert, "delivery_status": "bookmark_disabled"})
+                continue
             fingerprint = self._bookmark_fingerprint(alert)
             now_ms = int(time.time() * 1000)
             alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
             with self.cache_lock:
                 if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, alert_cooldown_sec):
                     skipped_duplicate_count += 1
+                    alert_events.append({**alert, "delivery_status": "cooldown_skipped"})
                     continue
             try:
                 self.send_bookmark_event(
@@ -4089,6 +5208,7 @@ class LuxriotManager:
             except Exception as exc:
                 failed_count += 1
                 last_error = str(exc)[:240] or exc.__class__.__name__
+                alert_events.append({**alert, "delivery_status": "failed", "error": last_error})
                 LOGGER.warning(
                     "Luxriot bookmark send failed channel_id=%s title=%r severity=%s error=%s",
                     channel_id,
@@ -4100,12 +5220,17 @@ class LuxriotManager:
             with self.cache_lock:
                 self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
             sent_count += 1
+            alert_events.append({**alert, "delivery_status": "sent"})
         return AlertDeliveryResult(
             sent_count,
             parsed=len(parsed_alerts),
+            json_alert_count=int(diagnostics.get("json_alert_count") or 0),
+            prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
             failed=failed_count,
             skipped_duplicate=skipped_duplicate_count,
             last_error=last_error,
+            alerts_detected=True,
+            alert_events=alert_events,
         )
 
     def start_session(

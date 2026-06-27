@@ -1,87 +1,147 @@
-# Design: Agent Self-Help over Operator Docs (BM25)
+# Design: Agent Self-Help over Operator/Admin Docs (BM25)
 
-Goal: let the agent answer "how do I do X in the UI?" / "what does this scenario
-mean?" by retrieving from EVA's **own vetted operator docs**, so an operator (or
-the intern) can ask the agent how to push the right button to get things working —
-not just click and observe.
+Goal: let the agent answer "how do I do X in the UI / what does this scenario
+mean / what's the product status capability" by retrieving from EVA's **own
+vetted, role-appropriate docs** — so an operator can ask the agent how to push the
+right button to get things working.
 
-Status: design proposal for implementation (codex). Connects to the
-[cognitive_architecture](cognitive_architecture.md) idea of the operator guide as
-another signal source the agent can bring into context.
+Status: **finalized spec** (incorporates codex review). Ready for implementation.
+Read-only, low-risk: retrieval over a first-party allowlisted corpus, behind the
+existing agent gateway. No web, no actions, no new dependency.
 
-## Why this is low-risk (no catastrophic avoidance needed)
+## 1. Corpus — allowlist only
 
-This is **read-only retrieval over a small, curated, first-party corpus** —
-markdown we wrote and control. It is not web access, not user-generated content,
-not an action. The realistic failure mode is "unhelpful answer," not "harmful
-action." Concretely:
+**Index (allowlist):**
+- `docs/operator/*.md` — audience: `operator`
+- `docs/00_CANON/glossary.md` — audience: `operator`
+- `docs/known_limitations.md` — audience: `operator`
+- `docs/admin/observability.md` — audience: `operator` (monitoring/health is
+  operator-relevant, not privileged). Section-level overrides are a possible
+  future extension, not implemented.
+- `docs/admin/admin_guide.md` — audience: `admin`, required_permission `users:manage`
+- `docs/admin/backup_recovery.md` — audience: `admin`, required_permission `settings:manage`
+- `docs/install/deployment_guide.md`, `docs/install/inference_topology.md` —
+  audience: `engineer`, required_permission `settings:manage`
 
-- No tool side effects: retrieval only, returns text passages.
-- Corpus is our own docs → no new injection surface beyond content we author.
-- Behind the existing tool gateway (authz, rate limit, audit) like any tool.
-- Output is labelled as **operator-guide help**, kept separate from incident data
-  so the agent never confuses "how-to" text with facts about a scene.
+**Never index (exclude):**
+- `readiness/history/`, `docs/gtm/`, `docs/legal/`
+- `install/field_rollout_demo.md`, `.env`, anything with `[FIELD]` values, real
+  IPs, credentials, or secrets.
 
-The one real precaution: **do not index secret/field-specific docs.** Index only
-the sanitized operator docs; exclude `install/field_rollout_demo.md`, `.env`,
-anything with `[FIELD]` credentials/topology.
+The allowlist is an explicit config (file path → default audience + optional
+section overrides), reviewed in code — not "scan everything under docs/".
 
-## Simplest safe solution: BM25 over chunked markdown
+## 2. Chunking & metadata
 
-BM25 (lexical) is ideal here: the corpus is tiny, queries are keyword-ish ("where
-is the min match slider", "how to start a video-description channel"), and it needs
-no embedding model or DB. CLIP stays for images; this is plain text.
+Split each allowlisted doc by `##`/`###` headings. Each chunk record:
 
-### Corpus (index these)
-- `docs/operator/*.md` (operator_guide, operator_scenarios, agent_capabilities, demo_runbook)
-- `docs/00_CANON/glossary.md`
-- (optionally) `docs/admin/observability.md` for operator-relevant health checks
+```
+{
+  doc_path,            # e.g. docs/admin/admin_guide.md
+  heading,             # the section heading
+  section,             # short path/label for citation
+  audience,            # operator | engineer | admin  (deterministic, from allowlist + overrides)
+  required_permission, # optional, from the Permission enum where known
+  text                 # chunk body, markdown-stripped for scoring
+}
+```
 
-### Chunking
-- Split each doc by `##` / `###` headings → records of
-  `{doc_path, section_heading, text}`. Headings make great citations and keep
-  chunks focused.
+`audience` and `required_permission` are assigned deterministically per file from
+the allowlist (section-level overrides are a possible future extension, not yet
+implemented). `required_permission` is None for operator docs and, for
+admin/engineer docs, references the real `Permission` gate
+(`users:manage`, `settings:manage`).
 
-### Index
-- `rank_bm25` `BM25Okapi` over tokenized chunks, built **in-memory at startup**.
-- Rebuild when a source file's mtime changes (cheap; corpus is small).
-- No persistence/DB needed.
+Permissions are **never** read from model/tool arguments. The secure adapter sets
+them on a trusted execution-context channel (`_set_trusted_permissions` from
+`ToolExecutionContext.permissions`) and strips any model-supplied
+`_granted_permissions`; the legacy/non-secure path defaults to operator-only.
 
-### Tool
-- New read-only agent tool: `lookup_help(query: str, top_k: int = 3)`.
-- Returns: list of `{doc, section, snippet, score}` (snippet trimmed to a budget).
-- Register in `agent_security/eva_adapter.py`: permission `agent:use` (any agent
-  user), modest rate limit, no channel scope, audited like other tools.
+## 3. In-repo BM25 (no new dependency)
 
-### Prompt rule (add to `build_system_prompt`)
-> For UI / how-to / "where is the button" / scenario-meaning questions, call
-> `lookup_help` first and answer from the returned passages, citing the doc and
-> section. Do not invent UI steps or menu names; if `lookup_help` returns nothing
-> relevant, say so and suggest the closest documented action.
+Implement a tiny Okapi BM25 in `agent_help_index.py` — no pip dependency (closed
+network + license-audited; ~40 lines beats a wheelhouse update):
 
-### Result handling
-- Label results clearly as **operator-guide help** in the UI tool-result card.
-- The agent paraphrases + cites (e.g., "Operator Guide § Video tab"), so the
-  operator can open the doc.
+- **Tokenize:** strip code fences and markdown markers; lowercase; `[a-z0-9]+`;
+  drop a small stopword list.
+- **Index:** per-chunk term frequencies; corpus document frequencies; average doc
+  length. Built **at startup (deterministic rebuild)**; optional mtime-based
+  refresh is an optimization, not required.
+- **Score (Okapi BM25, k1=1.5, b=0.75):**
+  `idf(t) = ln(1 + (N - df + 0.5)/(df + 0.5))`,
+  `score = Σ idf(t) · tf·(k1+1) / (tf + k1·(1 - b + b·dl/avgdl))`.
 
-## Integration checklist (codex)
-1. Add a small `agent_help_index.py` (chunk + BM25 build + query); pure-python dep
-   `rank_bm25` (or a trivial TF-IDF if avoiding a dep).
-2. Build the index at app startup from the corpus list; mtime-based refresh.
-3. Add `lookup_help` tool + schema in `agent.py`, dispatch entry, and a compact
-   UI result formatter.
-4. Register authz/limits in `eva_adapter.py`.
-5. Add the prompt rule; add 1–2 tests (query → expected section retrieved;
-   excluded-doc never returned).
+## 4. Tool contract
 
-## Consequence: docs become load-bearing
-Once the agent answers from these docs, **doc accuracy is operational.** This
-raises the value of the canon + anti-drift discipline
-([config_reference](../00_CANON/config_reference.md), facts, and the planned CI
-grep-guard): a wrong instruction in a doc becomes a wrong answer from the agent.
-Keep the operator docs current as part of the release checklist.
+`lookup_help(query: str, top_k: int = 3)` →
 
-## Optional later upgrade
-If lexical recall proves weak on paraphrased questions, add CLIP/text-embedding
-reranking of the BM25 top-N (reuse the existing embedder). Not needed for the
-pilot — BM25 over a curated corpus is enough and simpler/safer.
+```
+{
+  "results": [            # allowed for the caller's role
+    {doc, section, heading, snippet, score}
+  ],
+  "restricted_matches": [ # admin/engineer-only hits, NO detailed procedure
+    {section, heading, required_permission}
+  ],
+  "indexed_docs": [...],  # optional
+  "refreshed_at": ...     # optional
+}
+```
+
+- **Snippets bounded** (~400–600 chars); never return whole large markdown blocks.
+- `restricted_matches` lets the agent acknowledge an admin answer exists and
+  redirect, without exposing steps.
+
+## 5. Authorization & gateway
+
+- Read-only tool behind the existing agent gateway: permission `agent:use`,
+  **audited**, **rate-limited**, no side effects, no channel scope.
+- Role/permission filtering uses the caller's role/permissions from
+  `tool_context`: a chunk is in `results` only if the caller's audience/permission
+  covers it; otherwise it goes to `restricted_matches`.
+- **The security boundary is the gateway/RBAC, not the corpus.** Knowing a
+  procedure ≠ being able to run it (admin tools/routes stay gated independently).
+  Corpus role-gating is for accuracy + defensibility, not secrecy.
+
+## 6. Redirect behavior
+
+If the best match for a non-privileged caller is admin/engineer-only, the agent
+must **not** recite steps. It answers: *"That's an admin/engineer action — ask a
+user with permission `<X>`."* (Name the role/permission from
+`required_permission`/audience.)
+
+## 7. Prompt rule (add to `build_system_prompt`)
+
+> For UI / how-to / product-status / scenario-meaning questions, call `lookup_help`
+> first and answer from the returned passages, citing doc + section. Do not mix
+> help-doc passages with incident evidence. If a match is in `restricted_matches`,
+> tell the operator it's an admin/engineer action and name the required permission
+> — do not invent the steps. If `lookup_help` returns nothing relevant, say it's
+> **not documented** rather than inventing UI paths.
+
+## 8. Tests (required)
+
+- Operator query → expected operator section returned.
+- Admin query (admin caller) → expected admin section returned.
+- **Operator query hitting an admin section → `restricted_matches` redirect, not
+  the procedure.**
+- Excluded docs (`field_rollout_demo`, `docs/gtm`, `docs/legal`, history) **never**
+  appear in any result.
+- Deterministic startup rebuild produces a stable index (and mtime refresh if
+  implemented).
+- Gateway path: `agent:use` required, audited, rate-limited; no side effects.
+
+## 9. Anti-drift tie-in
+
+The corpus is now agent-load-bearing — a wrong instruction becomes a wrong agent
+answer. Add the allowlist to the release/doc checklist
+([../maintenance.md](../maintenance.md)); optionally extend
+`scripts/check_docs_drift.sh` to assert every allowlisted file exists.
+
+## Implementation checklist (codex)
+1. `agent_help_index.py` — allowlist config + chunker + in-repo BM25 + role filter.
+2. Build index at startup; expose `query(text, top_k, caller_audience/perms)`.
+3. `lookup_help` tool + schema in `agent.py`; dispatch entry; compact UI formatter.
+4. Register in `agent_security/eva_adapter.py`: `agent:use`, rate limit, audit.
+5. Prompt rule in `build_system_prompt`.
+6. Tests per §8.

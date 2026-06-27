@@ -32,4 +32,5 @@ Rules:
 - Never say "all channels were checked" unless the tool results cover all requested channels.
 - If the event is sensitive or accusatory, phrase results as candidates for operator review.
 - P/N/M can rank channels/windows, but it cannot confirm an event by itself.
+- Do not run `calibrate_probe_from_archive` during a normal sweep unless the operator explicitly asks to create, duplicate, or tune probes for the event class.
 - Do not say "confirmed visually" unless `describe_frame` analyzed the relevant frame(s) in this turn.

@@ -196,6 +196,64 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertTrue(store.records[2]["bookmark_sent"])
         self.assertIn("run-7", store.records[0]["dedupe_key"])
 
+    def test_vlm_summary_archive_frames_write_one_record_per_alert_event(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.records: List[Dict[str, Any]] = []
+
+            def add_detections(self, records: List[Dict[str, Any]]) -> int:
+                self.records.extend(records)
+                return len(records)
+
+        store = Store()
+        entry = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Two independent test triggers.",
+            "frame_count": 12,
+            "batch_size": 12,
+            "created_at": 100.0,
+            "batch_start_ms": 100000,
+            "batch_end_ms": 105000,
+            "alert_counts": {"info": 1, "low": 1},
+            "alert_total": 2,
+            "bookmarks_sent": 2,
+            "alert_events": [
+                {
+                    "title": "Thumbs up",
+                    "description": "Person shows a thumbs-up gesture.",
+                    "severity": "info",
+                    "timestamp_ms": 100100,
+                    "delivery_status": "sent",
+                },
+                {
+                    "title": "Union Jack mug drink",
+                    "description": "Person drinks from a mug with Union Jack art.",
+                    "severity": "low",
+                    "timestamp_ms": 104900,
+                    "delivery_status": "sent",
+                },
+            ],
+            "archive_frames": [
+                {"anchor_role": "first", "frame_index": 0, "timestamp_ms": 100000, "thumbnail": "frame-one"},
+                {"anchor_role": "last", "frame_index": 11, "timestamp_ms": 105000, "thumbnail": "frame-two"},
+            ],
+        }
+
+        with (
+            patch("oldapp.detections_store", store),
+            patch("oldapp._embed_thumbnail_b64", return_value=None),
+            patch("oldapp._apply_archive_retention", return_value={"ok": True}),
+        ):
+            result = _store_vlm_summary_archive_frames(entry)
+
+        alert_records = [record for record in store.records if record["source"] == "vlm_alert"]
+        self.assertEqual(result["alert_frames"], 2)
+        self.assertEqual(len(alert_records), 2)
+        self.assertEqual([record["severity"] for record in alert_records], ["info", "low"])
+        self.assertEqual(alert_records[0]["payload"]["alert_event"]["title"], "Thumbs up")
+        self.assertEqual(alert_records[1]["payload"]["alert_event"]["title"], "Union Jack mug drink")
+
     def test_detections_list_passes_archive_source_filter(self) -> None:
         captured: Dict[str, Any] = {}
 

@@ -63,7 +63,7 @@
                     <div id="archiveSearchBox" class="archive-search-shell studio-scroll">
                         <div class="archive-section">
                             <div class="archive-section-title">Frame Archive</div>
-                            <div class="section-help">Load stored probe hits by stream, probe, and time window before drilling down.</div>
+                            <div class="section-help">Load archived frames from video descriptions, VLM alerts, and secondary CLIP probe hits before drilling down.</div>
                             <div class="archive-filter-grid">
                                 <div class="input-group">
                                     <label for="archiveChannelFilter" class="input-label">Stream:</label>
@@ -74,16 +74,16 @@
                                 <div class="input-group">
                                     <label for="archiveProbeFilter" class="input-label">Probe:</label>
                                     <select id="archiveProbeFilter">
-                                        <option value="">All probes</option>
+                                        <option value="">All CLIP probes</option>
                                     </select>
                                 </div>
                                 <div class="input-group">
                                     <label for="archiveSourceFilter" class="input-label">Source:</label>
                                     <select id="archiveSourceFilter">
-                                        <option value="">All frames</option>
-                                        <option value="probe">Probe hits</option>
+                                        <option value="">All evidence</option>
                                         <option value="vlm_summary">Video descriptions</option>
                                         <option value="vlm_alert">VLM alerts</option>
+                                        <option value="probe">Secondary CLIP probes</option>
                                     </select>
                                 </div>
                                 <div class="input-group">
@@ -192,7 +192,7 @@
                         <div class="archive-results-head studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">Search Results</div>
-                                <div class="archive-results-sub">Primary workspace for archived frames, probe hits, and visual search results.</div>
+                                <div class="archive-results-sub">Primary workspace for video-description frames, VLM alerts, secondary probe hits, and visual search results.</div>
                             </div>
                         </div>
                         <div id="results" class="results-grid"></div>
@@ -299,6 +299,7 @@
                         <div class="luxriot-hidden-prompts">
                             <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
                             <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
+                            <textarea id="luxriotAlertPolicyPrompt" class="luxriot-prompt" placeholder="Channel-specific alert criteria">{{ luxriot_alert_policy_prompt }}</textarea>
                             <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{{ luxriot_rollup_prompt_l1 }}</textarea>
                             <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{{ luxriot_rollup_prompt_l2 }}</textarea>
                             <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{{ luxriot_rollup_prompt_l3 }}</textarea>
@@ -343,7 +344,7 @@
                                 <div class="luxriot-stream-context-list">
                                     <div><span>Live model</span><strong id="luxriotStreamModel">-</strong></div>
                                     <div><span>Summary queue</span><strong id="luxriotStreamQueue">idle</strong></div>
-                                    <div><span>Probe capture</span><strong id="luxriotStreamProbes">idle</strong></div>
+                                    <div id="luxriotStreamProbesRow"><span>Diagnostic capture</span><strong id="luxriotStreamProbes">idle</strong></div>
                                     <div><span>Last preview</span><strong id="luxriotStreamLastFrame">never</strong></div>
                                 </div>
                                 <div class="luxriot-stream-context-actions">
@@ -446,7 +447,7 @@
                             <div class="luxriot-actions">
                                 <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
                                 <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
-                                <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
+                                <button id="luxriotStopAllAnalytics" class="feature-btn">Pause CLIP probes</button>
                             </div>
                         </div>
                         <div id="luxriotStreams" class="luxriot-stream-list">
@@ -461,20 +462,20 @@
                     <div class="monitor-command-panel studio-panel">
                         <div class="studio-panel-head">
                             <div>
-                                <div class="studio-panel-title">Saved Probes</div>
-                                <div class="studio-panel-sub">Select, run, disable, or edit probes without leaving the board.</div>
+                                <div class="studio-panel-title">CLIP Probes</div>
+                                <div class="studio-panel-sub">Engineer diagnostics for secondary semantic signals.</div>
                             </div>
                         </div>
                         <div class="monitor-command-actions">
                             <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
-                            <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
+                            <button id="probeNewBtn" class="feature-btn primary">+ New CLIP Probe</button>
                         </div>
                     </div>
 
                     <div class="bench-card studio-panel">
                         <div>
                             <div class="bench-title">CLIP Throughput Benchmark</div>
-                            <div class="bench-meta">GPU embed throughput estimate for sizing simultaneous streams and probes.</div>
+                            <div class="bench-meta">GPU embed throughput estimate for sizing archive indexing and secondary CLIP probes.</div>
                             <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
                         </div>
                         <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
@@ -485,8 +486,8 @@
                     <div class="monitor-board-panel studio-panel studio-panel--workspace">
                         <div class="studio-panel-head">
                             <div>
-                                <div class="studio-panel-title">Probe Board</div>
-                                <div class="studio-panel-sub">Operational grid of active, paused, and draft probes.</div>
+                                <div class="studio-panel-title">CLIP Probe Board</div>
+                                <div class="studio-panel-sub">Secondary visual-similarity signals for engineer tuning and agent-assisted checks.</div>
                             </div>
                         </div>
                         <div class="probe-shell">
@@ -499,18 +500,18 @@
                     <div class="monitor-selection-panel studio-panel">
                         <div class="studio-panel-head">
                             <div>
-                                <div class="studio-panel-title">Selected Probe</div>
-                                <div class="studio-panel-sub">Current state, last signal, and direct probe actions.</div>
+                                <div class="studio-panel-title">Selected CLIP Probe</div>
+                                <div class="studio-panel-sub">Current state, last signal, and direct engineer actions.</div>
                             </div>
                             <div id="monitorSelectionStatus" class="probe-meta">No probe selected</div>
                         </div>
                         <div id="monitorProbeSummary" class="monitor-probe-summary">
-                            <div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>
+                            <div class="studio-empty-state">Select a CLIP probe card to inspect its live state and operate it from here.</div>
                         </div>
                         <div class="monitor-actions-bar">
                             <div class="monitor-actions-main">
-                                <button id="probeEditBtn" class="feature-btn">Probe settings</button>
-                                <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
+                                <button id="probeEditBtn" class="feature-btn">CLIP probe settings</button>
+                                <button id="probeRunBtn" class="feature-btn primary">Run CLIP probe</button>
                             </div>
                             <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
                         </div>
@@ -519,8 +520,8 @@
                     <div class="monitor-panel monitor-detections-panel studio-panel studio-panel--workspace">
                         <div class="studio-panel-head">
                             <div>
-                                <div class="studio-panel-title">Latest Detections</div>
-                                <div class="studio-panel-sub">Recent hits from the active probe window.</div>
+                                <div class="studio-panel-title">Latest CLIP Hits</div>
+                                <div class="studio-panel-sub">Recent secondary hits from the active probe window.</div>
                             </div>
                             <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
                         </div>
@@ -834,6 +835,7 @@
             <div class="prompt-modal-body">
                 <div class="prompt-modal-tabs">
                     <button type="button" class="feature-btn prompt-tab active" data-luxriot-prompt-tab="stream">Stream System Prompt</button>
+                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="alerts">Alert Criteria</button>
                     <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L1">L1</button>
                     <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L2">L2</button>
                     <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L3">L3</button>

@@ -70,6 +70,7 @@
     const luxriotStreamBatch = document.getElementById('luxriotStreamBatch');
     const luxriotStreamModel = document.getElementById('luxriotStreamModel');
     const luxriotStreamQueue = document.getElementById('luxriotStreamQueue');
+    const luxriotStreamProbesRow = document.getElementById('luxriotStreamProbesRow');
     const luxriotStreamProbes = document.getElementById('luxriotStreamProbes');
     const luxriotStreamLastFrame = document.getElementById('luxriotStreamLastFrame');
     const luxriotStreamDetail = document.getElementById('luxriotStreamDetail');
@@ -111,6 +112,7 @@
     const luxriotPromptInput = document.getElementById('luxriotPrompt');
     const luxriotLiveModelInput = document.getElementById('luxriotLiveModel');
     const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
+    const luxriotAlertPolicyPromptInput = document.getElementById('luxriotAlertPolicyPrompt');
     const luxriotRollupPromptL1Input = document.getElementById('luxriotRollupPromptL1');
     const luxriotRollupPromptL2Input = document.getElementById('luxriotRollupPromptL2');
     const luxriotRollupPromptL3Input = document.getElementById('luxriotRollupPromptL3');
@@ -199,6 +201,7 @@
     const archiveInspectorEmpty = document.getElementById('archiveInspectorEmpty');
     const archiveChannelFilter = document.getElementById('archiveChannelFilter');
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
+    const archiveProbeFilterGroup = archiveProbeFilter ? archiveProbeFilter.closest('.input-group') : null;
     const archiveSourceFilter = document.getElementById('archiveSourceFilter');
     const archiveTimeFilter = document.getElementById('archiveTimeFilter');
     const archiveFromTimeInput = document.getElementById('archiveFromTime');
@@ -981,6 +984,11 @@
         return userHasAnyRole(['admin', 'engineer']);
     }
 
+    function canUseProbeDiagnostics() {
+        return userHasAnyRole(['admin', 'engineer'])
+            || userHasAnyPermission(['probes:manage', 'diagnostics:view']);
+    }
+
     function renderSummaryMachineJson(jsonText, label = 'Machine JSON') {
         const raw = String(jsonText || '').trim();
         if (!raw) return '';
@@ -1006,7 +1014,7 @@
             case 'video':
                 return userHasPermission('streams:view');
             case 'monitor':
-                return userHasAnyPermission(['streams:view', 'reports:view', 'probes:run', 'probes:manage']);
+                return canUseProbeDiagnostics();
             case 'agent':
                 return userHasPermission('agent:use');
             default:
@@ -1031,7 +1039,7 @@
             const statusByMode = {
                 archive: 'Archive Research Ready',
                 video: 'Live Video Ops',
-                monitor: 'Probe Monitoring',
+                monitor: 'CLIP Probe Diagnostics',
                 agent: 'Agent Session Active',
             };
             headerStatusText.textContent = statusByMode[mode] || 'Command Center Online';
@@ -1360,12 +1368,29 @@
         const channelLabel = hasChannel ? getLuxriotChannelLabel(channelId) : 'No channel selected';
         const videoStream = hasChannel ? selectedLuxriotStream(channelId, 'video') : null;
         const analyticsStream = hasChannel ? selectedLuxriotStream(channelId, 'analytics') : null;
+        const showProbeDiagnostics = canUseProbeDiagnostics();
         const running = Boolean(videoStream?.running) || (hasChannel && isLuxriotCaptureRunning(channelId));
         const probeState = hasChannel ? String(probeChannelRuntime[String(channelId)] || '').trim() : '';
         const probeRunning = Boolean(analyticsStream?.running) || probeState === 'running';
         const probePaused = probeState === 'paused' || Boolean(analyticsStream?.paused);
-        const stateClass = luxriotPreviewMeta.failed ? 'error' : running ? 'running' : probeRunning ? 'running' : probePaused ? 'paused' : 'idle';
-        const stateText = luxriotPreviewMeta.failed ? 'preview error' : running ? 'summaries on' : probeRunning ? 'probes on' : probePaused ? 'probes paused' : 'idle';
+        const stateClass = luxriotPreviewMeta.failed
+            ? 'error'
+            : running
+                ? 'running'
+                : showProbeDiagnostics && probeRunning
+                    ? 'running'
+                    : showProbeDiagnostics && probePaused
+                        ? 'paused'
+                        : 'idle';
+        const stateText = luxriotPreviewMeta.failed
+            ? 'preview error'
+            : running
+                ? 'summaries on'
+                : showProbeDiagnostics && probeRunning
+                    ? 'diagnostics on'
+                    : showProbeDiagnostics && probePaused
+                        ? 'diagnostics paused'
+                        : 'idle';
         const previewWidth = Number(luxriotPreviewMeta.width);
         const previewHeight = Number(luxriotPreviewMeta.height);
         const resolution = previewWidth > 0 && previewHeight > 0
@@ -1399,9 +1424,9 @@
                         : 'not configured';
         const detailParts = [];
         if (videoStream?.last_error) detailParts.push(`Summary error: ${videoStream.last_error}`);
-        if (analyticsStream?.last_error) detailParts.push(`Probe error: ${analyticsStream.last_error}`);
+        if (showProbeDiagnostics && analyticsStream?.last_error) detailParts.push(`Diagnostic probe error: ${analyticsStream.last_error}`);
         if (!detailParts.length && running) detailParts.push('Live summaries are collecting frames for the selected channel.');
-        if (!detailParts.length && probeRunning) detailParts.push('Probe capture is buffering frames for semantic/image probes.');
+        if (!detailParts.length && showProbeDiagnostics && probeRunning) detailParts.push('Diagnostic capture is buffering frames for semantic/image probes.');
         if (!detailParts.length) detailParts.push('Runtime state will update when the preview and stream status refresh.');
 
         setTextContentSafe(luxriotStreamName, channelLabel);
@@ -1411,7 +1436,10 @@
         setTextContentSafe(luxriotStreamBatch, batchSize > 0 ? formatCompactCount(batchSize) : '-');
         setTextContentSafe(luxriotStreamModel, selectedLuxriotModelLabel(videoStream));
         setTextContentSafe(luxriotStreamQueue, queueLabel);
-        setTextContentSafe(luxriotStreamProbes, probeLabel);
+        setElementHidden(luxriotStreamProbesRow, !showProbeDiagnostics);
+        if (showProbeDiagnostics) {
+            setTextContentSafe(luxriotStreamProbes, probeLabel);
+        }
         setTextContentSafe(luxriotStreamLastFrame, formatPreviewAge(luxriotPreviewMeta.loadedAt));
         setTextContentSafe(luxriotStreamDetail, detailParts.join(' '));
         if (luxriotStreamState) {
@@ -2066,6 +2094,7 @@
     function getLuxriotPromptInputByTab(tab) {
         const normalized = String(tab || '').trim().toLowerCase();
         if (normalized === 'stream') return luxriotSystemPromptInput;
+        if (normalized === 'alerts') return luxriotAlertPolicyPromptInput;
         if (normalized === 'l1') return luxriotRollupPromptL1Input;
         if (normalized === 'l2') return luxriotRollupPromptL2Input;
         if (normalized === 'l3') return luxriotRollupPromptL3Input;
@@ -2076,6 +2105,7 @@
     function getLuxriotPromptTabLabel(tab) {
         const normalized = String(tab || '').trim().toLowerCase();
         if (normalized === 'stream') return 'Stream system prompt';
+        if (normalized === 'alerts') return 'Alert criteria';
         if (normalized === 'l1') return 'L1 rollup prompt';
         if (normalized === 'l2') return 'L2 rollup prompt';
         if (normalized === 'l3') return 'L3 rollup prompt';
@@ -2088,6 +2118,9 @@
         if (normalized === 'stream') {
             return 'Editing stream system prompt used for live summaries.';
         }
+        if (normalized === 'alerts') {
+            return 'Editing channel-specific alert criteria. EVA AI still keeps the general safety baseline active.';
+        }
         if (normalized === 'l1') {
             return 'Editing L1 rollup prompt (stored for rollup workflow tuning).';
         }
@@ -2098,7 +2131,7 @@
             return 'Editing L3 rollup prompt (stored for rollup workflow tuning).';
         }
         if (normalized === 'json') {
-            return 'Editing optional bookmark JSON block. It should only be emitted when a Task-defined trigger is observed.';
+            return 'Advanced: editing the machine-readable ALERTS_JSON contract. Do this only when changing parser/schema behavior.';
         }
         return 'Editing system prompt.';
     }
@@ -2109,6 +2142,12 @@
         const normalized = String(tab || '').trim().toLowerCase();
         if (normalized === 'stream') {
             return layers.stream && typeof layers.stream === 'object' ? layers.stream : null;
+        }
+        if (normalized === 'alerts') {
+            return layers.alerts && typeof layers.alerts === 'object' ? layers.alerts : null;
+        }
+        if (normalized === 'json') {
+            return layers.json && typeof layers.json === 'object' ? layers.json : null;
         }
         const rollups = layers.rollups && typeof layers.rollups === 'object' ? layers.rollups : {};
         const level = normalized.toUpperCase();
@@ -2124,6 +2163,11 @@
             return;
         }
         const lines = [];
+        const warnings = Array.isArray(layer.warnings) ? layer.warnings : [];
+        warnings.forEach((warning) => {
+            const text = String(warning || '').trim();
+            if (text) lines.push(`WARNING: ${text}`);
+        });
         const notes = Array.isArray(layer.notes) ? layer.notes : [];
         lines.push('Editable prompt: the text box above.');
         notes.forEach((note) => {
@@ -2147,6 +2191,7 @@
     function collectLuxriotPromptSettings() {
         const payload = {
             stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
+            alert_policy_prompt: luxriotAlertPolicyPromptInput ? String(luxriotAlertPolicyPromptInput.value || '') : '',
             rollup_prompts: {
                 L1: luxriotRollupPromptL1Input ? String(luxriotRollupPromptL1Input.value || '') : '',
                 L2: luxriotRollupPromptL2Input ? String(luxriotRollupPromptL2Input.value || '') : '',
@@ -2167,6 +2212,9 @@
         const settings = payload && typeof payload === 'object' ? payload : {};
         if (luxriotSystemPromptInput && Object.prototype.hasOwnProperty.call(settings, 'stream_system_prompt')) {
             luxriotSystemPromptInput.value = String(settings.stream_system_prompt || '');
+        }
+        if (luxriotAlertPolicyPromptInput && Object.prototype.hasOwnProperty.call(settings, 'alert_policy_prompt')) {
+            luxriotAlertPolicyPromptInput.value = String(settings.alert_policy_prompt || '');
         }
         const rollupPrompts = settings.rollup_prompts && typeof settings.rollup_prompts === 'object'
             ? settings.rollup_prompts
@@ -2256,7 +2304,9 @@
         if (luxriotPromptModalInput && previousInput) {
             previousInput.value = luxriotPromptModalInput.value || '';
         }
-        const tabValue = normalized === 'stream' ? 'stream' : normalized.toUpperCase();
+        const tabValue = (normalized === 'stream' || normalized === 'alerts' || normalized === 'json')
+            ? normalized
+            : normalized.toUpperCase();
         luxriotPromptModalTab = tabValue;
         luxriotPromptTabButtons.forEach((button) => {
             const buttonTab = String(button.dataset.luxriotPromptTab || '').trim();
@@ -2842,10 +2892,7 @@
     async function refreshProbeRuntimeState(rerender = false) {
         try {
             const resp = await fetch('/luxriot/streams');
-            const data = await resp.json();
-            if (!resp.ok || data.error) {
-                throw new Error(data.error || 'Failed to fetch runtime stream state');
-            }
+            const data = await parseApiJson(resp, 'Failed to fetch runtime stream state');
             updateProbeChannelRuntime(data, rerender);
         } catch (_) {
             // Keep previous runtime snapshot when stream endpoint is unavailable.
@@ -2854,6 +2901,7 @@
 
     function renderLuxriotStreams(payload, probes = probeCatalog) {
         if (!luxriotStreams) return;
+        const showProbeDiagnostics = canUseProbeDiagnostics();
         const data = payload && typeof payload === 'object' ? payload : {};
         const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
         const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
@@ -2883,35 +2931,43 @@
             videoByChannel.set(channelId, stream);
         });
         const analyticsByChannel = new Map();
-        sortedAnalytics.forEach((stream) => {
-            const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-            if (!Number.isFinite(channelId)) return;
-            analyticsByChannel.set(channelId, stream);
-        });
+        if (showProbeDiagnostics) {
+            sortedAnalytics.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                analyticsByChannel.set(channelId, stream);
+            });
+        }
         const probeStatsByChannel = new Map();
-        (Array.isArray(probes) ? probes : []).forEach((probe) => {
-            const channelId = parseInt(String(probe?.channel_id ?? ''), 10);
-            if (!Number.isFinite(channelId)) return;
-            if (!probeStatsByChannel.has(channelId)) {
-                probeStatsByChannel.set(channelId, { total: 0, enabled: 0, disabled: 0 });
-            }
-            const stats = probeStatsByChannel.get(channelId);
-            stats.total += 1;
-            if (probe?.enabled === false) stats.disabled += 1;
-            else stats.enabled += 1;
-        });
+        if (showProbeDiagnostics) {
+            (Array.isArray(probes) ? probes : []).forEach((probe) => {
+                const channelId = parseInt(String(probe?.channel_id ?? ''), 10);
+                if (!Number.isFinite(channelId)) return;
+                if (!probeStatsByChannel.has(channelId)) {
+                    probeStatsByChannel.set(channelId, { total: 0, enabled: 0, disabled: 0 });
+                }
+                const stats = probeStatsByChannel.get(channelId);
+                stats.total += 1;
+                if (probe?.enabled === false) stats.disabled += 1;
+                else stats.enabled += 1;
+            });
+        }
         const channelIds = new Set();
         sortedVideo.forEach((stream) => {
             const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
             if (Number.isFinite(channelId)) channelIds.add(channelId);
         });
-        sortedAnalytics.forEach((stream) => {
-            const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-            if (Number.isFinite(channelId)) channelIds.add(channelId);
-        });
-        pausedChannels.forEach((channelId) => channelIds.add(channelId));
+        if (showProbeDiagnostics) {
+            sortedAnalytics.forEach((stream) => {
+                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
+                if (Number.isFinite(channelId)) channelIds.add(channelId);
+            });
+            pausedChannels.forEach((channelId) => channelIds.add(channelId));
+        }
         historyChannels.forEach((channelId) => channelIds.add(channelId));
-        probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
+        if (showProbeDiagnostics) {
+            probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
+        }
         if (!channelIds.size) {
             luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
             updateLuxriotStreamContext();
@@ -2980,13 +3036,22 @@
                             : hasProbes
                                 ? '<span class="luxriot-stream-tag idle">probes disabled</span>'
                                 : '<span class="luxriot-stream-tag idle">no probes</span>';
-                const pauseLabel = isProbePaused ? 'Resume probes' : 'Pause probes';
+                const pauseLabel = isProbePaused ? 'Resume CLIP probes' : 'Pause CLIP probes';
                 const pauseAction = isProbePaused ? 'resume' : 'pause';
                 const canPauseProbes = !isProbePaused && (isProbeRunning || enabledCount > 0);
                 const canResumeProbes = isProbePaused;
                 const canProbeAction = canPauseProbes || canResumeProbes;
                 const canStopAll = isVideoRunning || isProbeRunning;
                 const channelLabel = getLuxriotChannelLabel(channelId);
+                const diagnosticsTags = showProbeDiagnostics ? ` ${probeTag}` : '';
+                const diagnosticsStats = showProbeDiagnostics
+                    ? `<span class="luxriot-stream-stat">${escapeHtml(probesLine)}</span>
+                            <span class="luxriot-stream-stat">${escapeHtml(probeLine)}</span>`
+                    : '';
+                const diagnosticsControls = showProbeDiagnostics
+                    ? `<button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
+                            <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>`
+                    : '';
                 return `
                     <div class="luxriot-stream-item">
                         <div class="luxriot-stream-head">
@@ -2994,18 +3059,16 @@
                                 <div class="luxriot-stream-kind">Channel</div>
                                 <div class="luxriot-stream-title">${escapeHtml(channelLabel)}</div>
                             </div>
-                            <div class="luxriot-stream-tags">${videoTag} ${videoHealthBadge} ${probeTag}</div>
+                            <div class="luxriot-stream-tags">${videoTag} ${videoHealthBadge}${diagnosticsTags}</div>
                         </div>
                         <div class="luxriot-stream-stats">
-                            <span class="luxriot-stream-stat">${escapeHtml(probesLine)}</span>
                             <span class="luxriot-stream-stat">${escapeHtml(videoLine)}</span>
-                            <span class="luxriot-stream-stat">${escapeHtml(probeLine)}</span>
+                            ${diagnosticsStats}
                         </div>
                         <div class="luxriot-stream-controls">
                             <button class="feature-btn" data-summary-channel="${channelId}" title="Open this channel in summaries panel">View summaries</button>
-                            <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
                             <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video" ${isVideoRunning ? '' : 'disabled'}>Stop video</button>
-                            <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>
+                            ${diagnosticsControls}
                         </div>
                     </div>
                 `;
@@ -3017,10 +3080,7 @@
         if (!luxriotStreams) return;
         try {
             const resp = await fetch('/luxriot/streams');
-            const data = await resp.json();
-            if (!resp.ok || data.error) {
-                throw new Error(data.error || 'Failed to fetch stream state');
-            }
+            const data = await parseApiJson(resp, 'Failed to fetch stream state');
             const nextCaptureState = {};
             const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
             videoStreams.forEach((stream) => {
@@ -3047,14 +3107,18 @@
                 }
             }
             updateLuxriotCaptureToggleButton(selectedChannelId);
-            try {
-                const probesResp = await fetch('/probes/list');
-                const probesData = await probesResp.json();
-                if (probesResp.ok && !probesData.error && Array.isArray(probesData.probes)) {
-                    probeCatalog = probesData.probes;
+            if (canUseProbeDiagnostics()) {
+                try {
+                    const probesResp = await fetch('/probes/list');
+                    const probesData = await parseApiJson(probesResp, 'Failed to load CLIP probes');
+                    if (Array.isArray(probesData.probes)) {
+                        probeCatalog = probesData.probes;
+                    }
+                } catch (_) {
+                    // Keep previous probe catalog if probe listing fails.
                 }
-            } catch (_) {
-                // Keep previous probe catalog if probe listing fails.
+            } else {
+                probeCatalog = [];
             }
             renderLuxriotStreams(data, probeCatalog);
             syncLuxriotLiveIntervalInput(selectedChannelId);
@@ -3841,12 +3905,14 @@
             luxriotToggleCaptureBtn,
             luxriotFlushCaptureBtn,
             luxriotStopAllVideoBtn,
-            luxriotStopAllAnalyticsBtn,
             probeStreamToggleBtn,
         ].forEach((element) => {
             setElementHidden(element, !canCapture);
             setControlDisabled(element, !canCapture);
         });
+        const canOperateProbeDiagnostics = canCapture && (canProbeManage || canDiagnostics);
+        setElementHidden(luxriotStopAllAnalyticsBtn, !canOperateProbeDiagnostics);
+        setControlDisabled(luxriotStopAllAnalyticsBtn, !canOperateProbeDiagnostics);
         setElementHidden(luxriotPromptSettingsBtn, !canPromptManage);
         setControlDisabled(luxriotPromptSettingsBtn, !canPromptManage);
         setControlDisabled(luxriotPromptApplyBtn, !canPromptManage);
@@ -3898,6 +3964,7 @@
         if (agentModelInput) {
             agentModelInput.title = canModelsManage ? '' : 'Model changes require models:manage.';
         }
+        syncArchiveDiagnosticSourceVisibility();
 
         syncSettingsAccess();
     }
@@ -4814,6 +4881,7 @@
             const probeName = String(result.probe_name || result.probe_id || result.filename || 'n/a').trim() || 'n/a';
             const sourceRaw = String(result.source || '').trim().toLowerCase();
             const logicalSource = archiveLogicalSource(sourceRaw);
+            const showDiagnostics = canUseProbeDiagnostics();
             const sourceLabel = archiveSourceLabel(sourceRaw, result.source_label);
             const origin = String(result.origin || result.runtime_source || result?.payload?.origin || result?.payload?.source || '').trim();
             const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
@@ -4841,14 +4909,14 @@
             if (origin && origin !== sourceRaw && origin !== logicalSource) {
                 lines.push(`<div class="metric-line"><span class="metric-label">Origin:</span> ${escapeHtml(origin)}</div>`);
             }
-            if (logicalSource === 'probe') {
+            if (showDiagnostics && logicalSource === 'probe') {
                 lines.push(`<div class="metric-line metric-line-scores"><span class="metric-label">Scores:</span> <span class="metric-score metric-score-pos">P ${escapeHtml(pos)}</span> <span class="metric-score metric-score-neg">N ${escapeHtml(neg)}</span> <span class="metric-score metric-score-margin">M ${escapeHtml(margin)}</span></div>`);
             }
             if (similarity) {
                 const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
                 lines.push(`<div class="metric-line"><span class="metric-label">Match:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
             }
-            if (clipSearch || dinoSearch) {
+            if (showDiagnostics && (clipSearch || dinoSearch)) {
                 lines.push(`<div class="metric-line"><span class="metric-label">Match C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
             }
             return lines.join('');
@@ -4899,14 +4967,17 @@
             } else if (source === 'vlm_alert') {
                 badges.push({ label: 'VLM alert', classes: 'warning' });
             } else if (source === 'probe') {
-                badges.push({ label: 'Probe hit', classes: '' });
+                badges.push({
+                    label: canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence',
+                    classes: '',
+                });
             } else {
                 badges.push({ label: 'Archive frame', classes: '' });
             }
         }
 
         const modeRaw = String(result.search_mode || '').trim().toLowerCase();
-        if (modeRaw) {
+        if (modeRaw && canUseProbeDiagnostics()) {
             if (modeRaw === 'clip') {
                 badges.push({ label: 'CLIP', classes: 'mode-clip' });
             } else if (modeRaw === 'fusion') {
@@ -4975,7 +5046,7 @@
 
     function archiveSourceLabel(source, fallbackLabel = '') {
         const normalized = archiveLogicalSource(source);
-        if (normalized === 'probe') return 'Probe hit';
+        if (normalized === 'probe') return canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence';
         if (normalized === 'vlm_summary') return 'Video description';
         if (normalized === 'vlm_alert') return 'VLM alert';
         if (fallbackLabel) return String(fallbackLabel);
@@ -4984,10 +5055,41 @@
 
     function archiveSourcePluralLabel(source) {
         const normalized = archiveLogicalSource(source);
-        if (normalized === 'probe') return 'probe hits';
+        if (normalized === 'probe') return canUseProbeDiagnostics() ? 'CLIP probe hits' : 'archive evidence';
         if (normalized === 'vlm_summary') return 'video descriptions';
         if (normalized === 'vlm_alert') return 'VLM alerts';
         return 'archive items';
+    }
+
+    function archiveProbeFilterActive() {
+        const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
+        return archiveLogicalSource(source) === 'probe';
+    }
+
+    function syncArchiveProbeFilterVisibility() {
+        const active = archiveProbeFilterActive();
+        setElementHidden(archiveProbeFilterGroup, !active);
+        if (archiveProbeFilter) {
+            archiveProbeFilter.disabled = !active;
+            if (!active) {
+                archiveProbeFilter.value = '';
+            }
+        }
+        return active;
+    }
+
+    function syncArchiveDiagnosticSourceVisibility() {
+        if (!archiveSourceFilter) return;
+        const canDiagnostics = canUseProbeDiagnostics();
+        const probeOption = archiveSourceFilter.querySelector('option[value="probe"]');
+        if (probeOption) {
+            setElementHidden(probeOption, !canDiagnostics);
+            probeOption.disabled = !canDiagnostics;
+        }
+        if (!canDiagnostics && archiveLogicalSource(archiveSourceFilter.value) === 'probe') {
+            archiveSourceFilter.value = '';
+        }
+        syncArchiveProbeFilterVisibility();
     }
 
     function archiveResultPayload(result) {
@@ -5147,6 +5249,10 @@
 
     async function refreshArchiveProbeFilter() {
         if (!archiveProbeFilter) return;
+        if (!syncArchiveProbeFilterVisibility()) {
+            applySelectOptions(archiveProbeFilter, [{ value: '', label: 'Probe filter available for CLIP probe hits' }], '');
+            return;
+        }
         try {
             const params = new URLSearchParams({ hours: '168', limit: '300' });
             applyArchiveTimeFilters(params);
@@ -5171,7 +5277,7 @@
             });
             applySelectOptions(archiveProbeFilter, options, archiveProbeFilter.value);
         } catch (_) {
-            applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All probes' }], '');
+            applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All CLIP probes' }], '');
         }
     }
 
@@ -5240,8 +5346,8 @@
         archiveDetectionsHasMore = false;
         updateArchiveDetectionsNav();
         const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
-        const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
         const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
+        const probeId = archiveProbeFilterActive() && archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
         const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
         const params = new URLSearchParams();
         archiveLastQueryText = 'Loaded archive frames';
@@ -5304,8 +5410,8 @@
     function buildDetectionSearchFilters() {
         const payload = {};
         const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
-        const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
         const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
+        const probeId = archiveProbeFilterActive() && archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
         if (channelId) payload.channel_id = channelId;
         if (probeId) payload.probe_id = probeId;
         if (source) payload.source = source;
@@ -5325,7 +5431,7 @@
             if (searchInput) {
                 searchInput.placeholder = 'Describe archived scene (filtered by stream/source/time)...';
             }
-            setArchiveDetectionsMeta('Archive active: text/image search runs over filtered frame shards.');
+            setArchiveDetectionsMeta('Archive active: text/image search runs over video descriptions, VLM alerts, and evidence frames.');
         } else if (searchInput) {
             searchInput.placeholder = "Describe what you're looking for...";
         }
@@ -8579,6 +8685,7 @@
         archiveSourceFilter.addEventListener('change', () => {
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
+            syncArchiveDiagnosticSourceVisibility();
             if (archiveProbeFilter) archiveProbeFilter.value = '';
             updateArchiveDetectionsNav();
             refreshArchiveProbeFilter();
@@ -10464,7 +10571,7 @@
     updateArchiveDetectionsNav();
     updateSearchScopeUI();
     refreshArchiveFilters().catch(() => {
-        setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
+        setArchiveDetectionsMeta('Archive filters unavailable. Start video descriptions or CLIP probes to populate archive frames.');
     });
     
     // Enter key support

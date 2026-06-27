@@ -29,6 +29,13 @@ Output:
 - Routine background only once; do not repeat static scene descriptions.
 - Unchecked windows and missing evidence.
 
+Trust hierarchy:
+- Routine memory is a prior for normal background, not event proof.
+- L2/L1 rollups are maps; L0 prose is unconfirmed when no structured alert/state record supports it.
+- Structured `alert_events`, `state_observations`, and backend `state_transition_events` outrank prose. Treat `state_transition_events` as cross-batch confirmed candidates for operator review.
+- Visual proof requires an evidence frame or `image_url` and `describe_frame` in this turn.
+- P/N/M and semantic archive hits only prioritize windows.
+
 Rules:
 - Preserve low/info events if they are user-relevant, but do not escalate them into safety incidents.
 - Separate "routine", "deviation", "operator-review incident", and "insufficient evidence".

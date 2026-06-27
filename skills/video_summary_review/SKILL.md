@@ -31,6 +31,13 @@ Default order:
 11. Use `search_archive` only for semantic discovery. Keep archive detections separate from VLM summary evidence.
 12. Return a report with: scope, coverage, timeline, direct observations, indirect indicators, archive corroboration, gaps, and confidence.
 
+Trust hierarchy:
+- Routine memory or repeated background is a prior, not proof of a new event.
+- L2/L1 rollups are maps; L0 prose is an unconfirmed candidate if structured alert/state data is missing.
+- Structured `alert_events`, `state_observations`, and `state_transition_events` are stronger than prose. Backend `state_transition_events` are confirmed across batches, but still operator-review candidates.
+- VLM summary/alert frames anchor exact times. Visual proof requires a returned frame or `image_url` plus `describe_frame` in this turn.
+- P/N/M and archive semantic search are attention signals, not conclusions.
+
 Rules:
 - Always state the resolved local time window in the report.
 - Never include summaries outside the requested time window.
@@ -41,12 +48,13 @@ Rules:
 - Do not say "confirmed visually" unless `describe_frame` analyzed the relevant frame(s) in this turn.
 - For presence questions, separate:
   - direct person sightings
-  - indirect occupancy indicators such as lighting changes, object movement, doors, devices, screens, or appliances
+  - indirect activity indicators such as lighting changes, object movement, gates, barriers, signage, or vehicles
   - no-evidence windows
   - unreviewed or missing-coverage windows
 - If no channel is specified and many channels are active, ask for confirmation before broad review.
 - When broad review is confirmed, work in channel chunks and end with unchecked channels plus the next recommended chunk.
+- Do not auto-calibrate probes from ordinary review/report questions. Use `calibrate_probe_from_archive` only if the operator explicitly asks to create, duplicate, or tune probes from the reviewed events.
 - Do not accuse or infer hidden state. Rephrase sensitive operator wording into visible candidate evidence:
-  - "unvaccinated dog" -> "dog without visible ear tag / vaccination marker"
   - "criminal act" -> "visible operator-review incident"
-  - "drunk/unconscious" -> "person lying still / unstable movement / needs review"
+  - "illegal dumping" -> "person leaving an object or waste behind"
+  - "intoxicated/unconscious" -> "person lying still / unstable movement / needs review"

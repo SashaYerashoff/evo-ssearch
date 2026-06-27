@@ -58,9 +58,20 @@ prompt settings, desired live sessions, and summary state (see
 
 ## Video-description & alert settings
 
-- Stream/L0 prompt, rollup prompts (L1/L2/L3), and the structured `ALERTS_JSON`
-  template are editable per-channel or as defaults (Settings, or agent
-  `update_prompt_settings` — preview-only in secure mode).
+- Stream/L0 prompt controls description style; rollup prompts (L1/L2/L3) control
+  summary aggregation.
+- **Alert Criteria** (`alert_policy_prompt`) is the plain-language per-channel or
+  default watch policy. Put "watch for / alert on" conditions here, not in the
+  L0 stream prompt.
+- The structured `ALERTS_JSON` / `json_alert_prompt` template is only the
+  machine-readable alert-output contract, not the place for operator criteria.
+- These fields are editable per-channel or as defaults (Settings, or agent
+  `update_prompt_settings` — preview-only in secure mode). If `prompt_health`
+  reports legacy alert/watch text in the stream prompt, preview
+  `migrate_legacy_alert_policy` before other prompt edits.
+- In secure mode, a chat confirmation is not an apply operation. The operator
+  commits prompt/probe previews with the UI Apply button; the server records a
+  trusted action receipt for the next agent turn.
 - `bookmark_enabled` gates pushing alerts to Luxriot; alert **extraction** (badges,
   counts) is always on regardless.
 - Watch the bookmark delivery metrics (observability) to confirm alerts reach
@@ -71,6 +82,9 @@ prompt settings, desired live sessions, and summary state (see
 - Probes are primarily an agent/engineer tool now. Engineers can create/tune via
   the probe editor (preview the diff before applying). A curated watch-list probe
   set may be cast across demo channels as a parallel detector.
+- Probe calibration from archive is read-only and audited. It proposes thresholds
+  from archived CLIP P/N/M evidence, then requires the normal preview/apply flow
+  before any probe setting changes.
 
 ## Secrets rotation
 

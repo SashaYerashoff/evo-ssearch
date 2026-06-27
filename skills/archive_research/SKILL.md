@@ -17,3 +17,4 @@ Rules:
 - Separate `Video-description frame`, `VLM alert frame`, and `Probe hit` in the answer; do not call VLM frames probe detections.
 - If results are sparse or ambiguous, ask the operator a clarifying question before making claims.
 - When returning findings, separate: what matched, what did not match, and what remains uncertain.
+- Do not run `calibrate_probe_from_archive` during ordinary archive research unless the operator explicitly pivots to creating/tuning probes or duplicating VLM alerts with probes.

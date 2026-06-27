@@ -28,7 +28,9 @@ Terminology: see [glossary](../00_CANON/glossary.md). Invariants:
    not *blind*.
 4. **Watch-list probes** for the public-order set are cast on the demo channels
    (fighting, vehicle burnout/drift, crowd brawl, fire/smoke, person on ground)
-   — this is the VLM-independent safety net for the demo.
+   — this is the VLM-independent safety net for the demo. If archive coverage
+   exists, mark each probe set as calibrated from archive P/N/M or explicitly
+   uncalibrated.
 5. There is at least one real or seeded incident in the window. If the live
    window is thin, pick a window that contains known activity (see §4 fallback).
 

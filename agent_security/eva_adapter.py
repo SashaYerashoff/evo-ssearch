@@ -35,6 +35,8 @@ _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
     {
         "search_archive",
         "get_visual_window_signals",
+        "calibrate_probe_from_archive",
+        "prepare_probe_calibration_batch",
         "get_detections",
         "get_detection_summary",
         "build_research_batch",
@@ -51,10 +53,13 @@ _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
 _TOOL_PERMISSIONS: dict[str, Permission] = {
     "search_archive": Permission.DETECTIONS_VIEW,
     "get_visual_window_signals": Permission.DETECTIONS_VIEW,
+    "calibrate_probe_from_archive": Permission.DETECTIONS_VIEW,
+    "prepare_probe_calibration_batch": Permission.DETECTIONS_VIEW,
     "get_detections": Permission.DETECTIONS_VIEW,
     "get_detection_summary": Permission.DETECTIONS_VIEW,
     "list_channels": Permission.STREAMS_VIEW,
     "normalize_time_window": Permission.AGENT_USE,
+    "lookup_help": Permission.AGENT_USE,
     "list_video_summary_channels": Permission.STREAMS_VIEW,
     "list_probes": Permission.REPORTS_VIEW,
     "survey_channels": Permission.STREAMS_VIEW,
@@ -183,6 +188,8 @@ class EvaAgentToolAdapter:
             "get_video_summaries": 100,
             "count_video_summary_events": 120,
             "track_visual_state_transitions": 120,
+            "calibrate_probe_from_archive": 120,
+            "prepare_probe_calibration_batch": 120,
         }.get(name)
 
     @staticmethod
@@ -194,6 +201,8 @@ class EvaAgentToolAdapter:
             "get_video_summaries": 20,
             "count_video_summary_events": 40,
             "track_visual_state_transitions": 40,
+            "calibrate_probe_from_archive": 24,
+            "prepare_probe_calibration_batch": 24,
         }.get(name)
 
     @staticmethod
@@ -203,6 +212,8 @@ class EvaAgentToolAdapter:
             "describe_frame": 120.0,
             "search_archive": 90.0,
             "get_visual_window_signals": 90.0,
+            "calibrate_probe_from_archive": 90.0,
+            "prepare_probe_calibration_batch": 90.0,
             "build_research_batch": 90.0,
             "get_video_summaries": 90.0,
             "count_video_summary_events": 90.0,
@@ -302,12 +313,32 @@ class EvaAgentToolAdapter:
         self._local.progress_cb = progress_cb
         try:
             approval = self.gateway.approve(plan_id, context)
-            return self.gateway.execute(
+            result = self.gateway.execute(
                 plan.action,
                 None,
                 context,
                 approval_id=approval.approval_id,
             )
+            receipt = {
+                "type": "agent_action_applied",
+                "plan_id": plan.plan_id,
+                "tool": plan.action,
+                "status": "applied",
+                "result_status": (
+                    str(result.get("status"))
+                    if isinstance(result, Mapping) and result.get("status") is not None
+                    else None
+                ),
+            }
+            if isinstance(result, Mapping):
+                enriched = dict(result)
+                enriched["action_receipt"] = receipt
+                return enriched
+            return {
+                "status": "applied",
+                "result": result,
+                "action_receipt": receipt,
+            }
         finally:
             self._local.progress_cb = None
 
@@ -385,12 +416,20 @@ class EvaAgentToolAdapter:
             context: ToolExecutionContext,
             arguments: Mapping[str, Any],
         ) -> Any:
-            result = self._legacy_tools.execute(
-                name,
-                dict(arguments),
-                progress_cb=getattr(self._local, "progress_cb", None),
-            )
-            return self._filter_result(name, result, context)
+            set_perms = getattr(self._legacy_tools, "_set_trusted_permissions", None)
+            clear_perms = getattr(self._legacy_tools, "_clear_trusted_permissions", None)
+            if callable(set_perms):
+                set_perms(context.permissions)
+            try:
+                result = self._legacy_tools.execute(
+                    name,
+                    dict(arguments),
+                    progress_cb=getattr(self._local, "progress_cb", None),
+                )
+                return self._filter_result(name, result, context)
+            finally:
+                if callable(clear_perms):
+                    clear_perms()
 
         return execute_legacy
 
@@ -403,6 +442,11 @@ class EvaAgentToolAdapter:
         if name not in self._schemas:
             return dict(arguments)
         prepared = copy.deepcopy(dict(arguments))
+
+        if name == "lookup_help":
+            # Permissions never travel through model/tool args; strip any attempt.
+            # Trusted permissions are passed to the tool via execution context.
+            prepared.pop("_granted_permissions", None)
 
         if name == "search_archive":
             scope = str(prepared.get("scope") or "detections").strip()
@@ -428,6 +472,10 @@ class EvaAgentToolAdapter:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif name == "list_video_summary_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
+        elif name in {"calibrate_probe_from_archive", "prepare_probe_calibration_batch"} and scoped_channels is not None:
+            prepared.setdefault("channel_ids", sorted(scoped_channels))
+            if name == "prepare_probe_calibration_batch":
+                self._filter_probe_batch_items_for_scope(prepared, scoped_channels)
         elif name == "generate_report" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif (
@@ -537,6 +585,34 @@ class EvaAgentToolAdapter:
         )
 
     @staticmethod
+    def _filter_probe_batch_items_for_scope(
+        arguments: dict[str, Any],
+        scoped_channels: frozenset[str],
+    ) -> None:
+        items = arguments.get("items")
+        if not isinstance(items, list):
+            return
+        filtered_items: list[dict[str, Any]] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            item = copy.deepcopy(raw)
+            if item.get("channel_ids"):
+                allowed = [
+                    channel_id
+                    for channel_id in item.get("channel_ids") or []
+                    if str(channel_id) in scoped_channels
+                ]
+                item["channel_ids"] = allowed
+                if not allowed:
+                    continue
+            elif item.get("channel_id") is not None:
+                if str(item.get("channel_id")) not in scoped_channels:
+                    continue
+            filtered_items.append(item)
+        arguments["items"] = filtered_items
+
+    @staticmethod
     def _argument_has_channel(arguments: Mapping[str, Any]) -> bool:
         return (
             arguments.get("channel_id") is not None
@@ -593,8 +669,9 @@ class EvaAgentToolAdapter:
                 "type": "boolean",
                 "enum": [True],
                 "description": (
-                    "Must be true. Applying changes requires a separate "
-                    "stored approval workflow."
+                    "Must be true for model calls. The UI may show an Apply "
+                    "button for the returned approval.plan_id; the model must "
+                    "not call this tool with preview=false."
                 ),
             }
         return schema

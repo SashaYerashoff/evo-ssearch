@@ -16,6 +16,7 @@ import base64
 import collections
 import copy
 import json
+import os
 import queue
 import re
 import threading
@@ -25,7 +26,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Generator, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, cast
 from urllib.parse import quote
 
 import numpy as np
@@ -53,6 +54,27 @@ AGENT_MAX_TOOL_CALLS_PER_TURN  = 64
 AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN = 8
 AGENT_VIDEO_SUMMARY_DEFAULT_LEVEL_LIMIT = 500
 AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
+TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
+
+
+def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+AGENT_CONTEXT_CHARS_PER_TOKEN = _int_env("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", 4, minimum=1, maximum=12)
+AGENT_CONTEXT_HISTORY_BUDGET_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", 12_000, minimum=1_000)
+AGENT_CONTEXT_WARNING_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", 45_000, minimum=4_000)
+AGENT_CONTEXT_HARD_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", 60_000, minimum=8_000)
+if AGENT_CONTEXT_HARD_TOKENS <= AGENT_CONTEXT_WARNING_TOKENS:
+    AGENT_CONTEXT_HARD_TOKENS = AGENT_CONTEXT_WARNING_TOKENS + 1_000
+
 ARCHIVE_SOURCE_LABELS = {
     "probe": "Probe hit",
     "vlm_summary": "Video-description frame",
@@ -100,6 +122,38 @@ def _image_data_url(value: Any, default_mime: str = "image/jpeg") -> Optional[st
 
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_help",
+            "description": (
+                "Look up how to use EVA AI from its own operator/admin documentation: "
+                "UI steps, workflows, scenario meaning, and product capabilities/limits. "
+                "Use this for 'how do I...', 'where is...', 'what does X mean', and "
+                "product-status questions; use top_k=8 for broad guide summaries. "
+                "This is the agent's access path to first-party operator/admin docs, "
+                "not internet browsing. NOT for incident facts about a scene. "
+                "Returns documentation passages with citations. Admin/engineer-only "
+                "matches come back as restricted_matches (no steps) when the caller "
+                "lacks the permission; in that case tell the operator it is an "
+                "admin/engineer action, do not invent the steps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What the operator wants to do or understand.",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max passages to return (1-8, default 3).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -241,6 +295,156 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["positive_query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calibrate_probe_from_archive",
+            "description": (
+                "Read-only CLIP P/N/M calibration for a proposed probe over archived frames. "
+                "Use before creating/updating probes from VLM alerts, archive searches, or "
+                "cross-channel sweeps. It scans real archived frames, compares a positive "
+                "event query against a visible contrast query, suggests initial pos_floor/margin "
+                "thresholds, and returns representative frames. Processes only a bounded channel "
+                "batch per call and returns deferred_channel_ids for continuation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_query": {
+                        "type": "string",
+                        "description": "Positive visible event/action/state, e.g. 'two people fighting' or 'person lying on ground'.",
+                    },
+                    "positive_query": {
+                        "type": "string",
+                        "description": "Alias for event_query.",
+                    },
+                    "contrast_query": {
+                        "type": "string",
+                        "description": "Visible background/contrast state, e.g. 'people walking normally' or 'clear roadway with normal traffic'. Do not use literal negation.",
+                    },
+                    "negative_query": {
+                        "type": "string",
+                        "description": "Alias for contrast_query.",
+                    },
+                    "channel_id": {"type": "integer", "description": "Optional single Luxriot channel ID."},
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
+                    },
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional channel IDs to calibrate. The tool processes only the first max_channels_per_call and defers the rest.",
+                    },
+                    "sources": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["vlm_summary", "vlm_alert", "probe"]},
+                        "description": "Archive frame sources to scan. Default: ['vlm_alert','vlm_summary'].",
+                    },
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Scan frames from the past N hours. Default: 24.",
+                    },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted.",
+                    },
+                    "candidate_limit": {
+                        "type": "integer",
+                        "description": "Max archive frames to scan per channel across sources. Default: 20000, max: 100000.",
+                    },
+                    "max_channels_per_call": {
+                        "type": "integer",
+                        "description": "Max channels to process in this call. Default: 8, max: 8.",
+                    },
+                    "evidence_limit": {
+                        "type": "integer",
+                        "description": "Representative frames per channel. Default: 8, max: 24.",
+                    },
+                    "min_frames": {
+                        "type": "integer",
+                        "description": "Minimum archived frames before suggestions are considered reliable. Default: 8.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "prepare_probe_calibration_batch",
+            "description": (
+                "Stateful batch workflow for probe P/N/M calibration. Use instead of "
+                "manually faning out calibrate_probe_from_archive when reviewing multiple "
+                "probes, multiple VLM-alert classes, or multiple channels. The server holds "
+                "the item list in a job and returns a compact decision ledger plus "
+                "recommended create_probe/update_probe preview arguments. To continue, call "
+                "again with job_id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Existing batch job id to continue.",
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": (
+                            "Optional event/probe items. If omitted, configured probes are used. "
+                            "Each item can include event_query, contrast_query, name/probe_name, "
+                            "probe_id, channel_id or channel_ids, severity, bookmark_enabled."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "event_query": {"type": "string"},
+                                "positive_query": {"type": "string"},
+                                "contrast_query": {"type": "string"},
+                                "negative_query": {"type": "string"},
+                                "name": {"type": "string"},
+                                "probe_name": {"type": "string"},
+                                "probe_id": {"type": "string"},
+                                "channel_id": {"type": "integer"},
+                                "channel_ids": {"type": "array", "items": {"type": "integer"}},
+                                "severity": {"type": "string"},
+                                "bookmark_enabled": {"type": "boolean"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "probe_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional configured probe names to calibrate when items are omitted.",
+                    },
+                    "channel_id": {"type": "integer"},
+                    "channel_ref": {"type": "string"},
+                    "channel_ids": {"type": "array", "items": {"type": "integer"}},
+                    "sources": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["vlm_summary", "vlm_alert", "probe"]},
+                    },
+                    "since_hours": {"type": "number"},
+                    "from_ts": {"type": "number"},
+                    "to_ts": {"type": "number"},
+                    "candidate_limit": {"type": "integer"},
+                    "items_per_call": {
+                        "type": "integer",
+                        "description": "Max job items to process in this call. Default 4, max 8.",
+                    },
+                    "evidence_limit": {"type": "integer"},
+                    "min_frames": {"type": "integer"},
+                },
+                "required": [],
             },
         },
     },
@@ -607,7 +811,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "create_probe",
             "description": (
                 "Create a new probe with text pairs and thresholds. "
-                "IMPORTANT: call with preview=true first unless the operator explicitly authorized direct deployment."
+                "Use CLIP-friendly generic visual descriptors, not private names "
+                "or abstract logic. For VLM-alert follow-up, create one named probe "
+                "per distinct visible event and use update_existing=true to avoid duplicates. "
+                "IMPORTANT: model calls must use preview=true. The UI Apply button commits "
+                "the returned action plan outside chat."
             ),
             "parameters": {
                 "type": "object",
@@ -618,8 +826,24 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "string",
                         "description": "Optional channel reference such as '#115', '115', or a title like 'stream'.",
                     },
-                    "positives": {"type": "array", "items": {"type": "string"}},
-                    "negatives": {"type": "array", "items": {"type": "string"}},
+                    "positives": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Positive CLIP text prompts. Use visible object/action/state language "
+                            "such as 'two people fighting', 'vehicle doing a burnout', "
+                            "or 'person lying on ground'. Avoid personal names and legal/intent claims."
+                        ),
+                    },
+                    "negatives": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Visible contrast/background states for P/N/M. Do not write literal negation "
+                            "such as 'no person', 'no vehicle', or 'without smoke'. Use positive alternatives "
+                            "such as 'clear sidewalk', 'parked vehicles on clear roadway', or 'people walking normally'."
+                        ),
+                    },
                     "pos_floor": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "margin_thr": {"type": "number", "minimum": 0.0},
                     "top_k": {"type": "integer", "minimum": 1},
@@ -687,7 +911,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "delete_probes",
             "description": (
                 "Delete one or more probes, or all probes. "
-                "IMPORTANT: call with preview=true first unless the operator explicitly authorized destructive deployment."
+                "IMPORTANT: model calls must use preview=true. The UI Apply button commits "
+                "the returned action plan outside chat."
             ),
             "parameters": {
                 "type": "object",
@@ -717,8 +942,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Modify a probe's configuration: text pairs (positives/negatives), "
                 "detection thresholds, or enabled state. "
-                "IMPORTANT: always call with preview=true first to show the user a diff. "
-                "Only call with preview=false after the user has explicitly confirmed."
+                "Use generic CLIP-visible wording; negatives are visible contrast states, "
+                "not logical 'no X' clauses. "
+                "IMPORTANT: model calls must use preview=true to show the user a diff. "
+                "The UI Apply button commits the returned action plan outside chat."
             ),
             "parameters": {
                 "type": "object",
@@ -738,12 +965,20 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                             "positives": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "New list of positive text descriptions (replaces current list).",
+                                "description": (
+                                    "New positive CLIP text descriptions (replaces current list). "
+                                    "Use visible object/action/state language and avoid private names, "
+                                    "intent, legality, or other hidden-state claims."
+                                ),
                             },
                             "negatives": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "New list of negative/exclusion text descriptions.",
+                                "description": (
+                                    "New visible contrast/background text descriptions. Avoid literal "
+                                    "negation like 'no person'/'without smoke'; describe what the frame "
+                                    "does show when the target event is absent."
+                                ),
                             },
                             "pos_floor": {
                                 "type": "number",
@@ -849,7 +1084,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "name": "update_prompt_settings",
             "description": (
                 "Modify Luxriot VLM prompt settings for either global defaults or a single channel. "
-                "IMPORTANT: always call with preview=true first and apply only after explicit confirmation."
+                "IMPORTANT: model calls must use preview=true. The UI Apply button commits "
+                "the returned action plan outside chat."
             ),
             "parameters": {
                 "type": "object",
@@ -867,18 +1103,29 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "description": (
                             "Partial prompt/settings update. "
                             "L0/live descriptions use stream_system_prompt. "
+                            "Channel-specific alert/watch criteria use alert_policy_prompt. "
                             "L1/L2/L3 summaries use rollup_prompts. "
-                            "Behavioral bookmark instructions belong inside the L0/live prompt. "
                             "json_alert_prompt is only the structured alert-output template."
                         ),
                         "properties": {
                             "stream_system_prompt": {"type": "string"},
+                            "alert_policy_prompt": {
+                                "type": "string",
+                                "description": "Channel-specific alert/watch criteria in plain language; use this for 'watch for this situation'.",
+                            },
                             "l0_prompt": {"type": "string"},
                             "live_prompt": {"type": "string"},
                             "json_alert_prompt": {"type": "string"},
                             "bookmark_rule_prompt": {
                                 "type": "string",
-                                "description": "A bookmark/alert instruction line to add to the L0/live stream prompt.",
+                                "description": "Deprecated alias for alert_policy_prompt.",
+                            },
+                            "migrate_legacy_alert_policy": {
+                                "type": "boolean",
+                                "description": (
+                                    "Use current prompt_health suggestions to move legacy alert/watch criteria "
+                                    "out of stream_system_prompt and into alert_policy_prompt."
+                                ),
                             },
                             "bookmark_enabled": {"type": "boolean"},
                             "bookmark_cooldown_sec": {"type": "number", "minimum": 0.0},
@@ -1398,6 +1645,18 @@ class ToolError(Exception):
     """Raised by AgentTools to signal a user-facing error to the model."""
 
 
+@dataclass
+class _WorkflowJob:
+    job_id: str
+    workflow_type: str
+    created_at: float
+    updated_at: float
+    items: List[Dict[str, Any]]
+    cursor: int = 0
+    processed: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Tool implementation
 # ---------------------------------------------------------------------------
@@ -1431,6 +1690,69 @@ class AgentTools:
         self._search_folder    = search_indexed_folder_fn
         self._search_det       = search_detections_fn
         self._local = threading.local()
+        self._workflow_jobs: Dict[str, _WorkflowJob] = {}
+        self._workflow_jobs_lock = threading.RLock()
+
+    def _set_trusted_permissions(self, permissions: Optional[Sequence[str]]) -> None:
+        """Authz set by the secure adapter from the execution context only.
+
+        Never sourced from model/tool arguments. Used for per-chunk help gating.
+        """
+        self._local.granted_permissions = frozenset(
+            str(item) for item in (permissions or ())
+        )
+
+    def _clear_trusted_permissions(self) -> None:
+        self._local.granted_permissions = None
+
+    def _prune_workflow_jobs_locked(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else float(now)
+        expired_before = now - 6 * 60 * 60
+        for job_id, job in list(self._workflow_jobs.items()):
+            if job.updated_at < expired_before:
+                self._workflow_jobs.pop(job_id, None)
+        if len(self._workflow_jobs) <= 100:
+            return
+        overflow = len(self._workflow_jobs) - 100
+        oldest = sorted(
+            self._workflow_jobs.values(),
+            key=lambda job: job.updated_at,
+        )[:overflow]
+        for job in oldest:
+            self._workflow_jobs.pop(job.job_id, None)
+
+    def _create_workflow_job(
+        self,
+        *,
+        workflow_type: str,
+        items: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> _WorkflowJob:
+        now = time.time()
+        job = _WorkflowJob(
+            job_id=f"job-{uuid.uuid4().hex[:12]}",
+            workflow_type=workflow_type,
+            created_at=now,
+            updated_at=now,
+            items=items,
+            metadata=dict(metadata or {}),
+        )
+        with self._workflow_jobs_lock:
+            self._prune_workflow_jobs_locked(now)
+            self._workflow_jobs[job.job_id] = job
+        return job
+
+    def _get_workflow_job(self, job_id: str, workflow_type: Optional[str] = None) -> _WorkflowJob:
+        with self._workflow_jobs_lock:
+            self._prune_workflow_jobs_locked()
+            job = self._workflow_jobs.get(str(job_id or "").strip())
+            if job is None:
+                raise ToolError(
+                    "Workflow job was not found or expired. Start a new batch instead of reconstructing from chat."
+                )
+            if workflow_type and job.workflow_type != workflow_type:
+                raise ToolError(f"Workflow job is {job.workflow_type!r}, not {workflow_type!r}.")
+            return job
 
     def execute(
         self,
@@ -1440,8 +1762,11 @@ class AgentTools:
     ) -> Dict[str, Any]:
         """Dispatch to the named tool. Returns a dict always."""
         dispatch = {
+            "lookup_help":          self._lookup_help,
             "search_archive":       self._search_archive,
             "get_visual_window_signals": self._get_visual_window_signals,
+            "calibrate_probe_from_archive": self._calibrate_probe_from_archive,
+            "prepare_probe_calibration_batch": self._prepare_probe_calibration_batch,
             "get_detections":       self._get_detections,
             "get_detection_summary": self._get_detection_summary,
             "list_channels":        self._list_channels,
@@ -1699,6 +2024,482 @@ class AgentTools:
                 "P/N/M is a CLIP attention signal, not visual proof. Use returned frame image_url "
                 "with describe_frame before saying an event was visually confirmed."
             ),
+        }
+
+    # ── calibrate_probe_from_archive ───────────────────────────────────────
+
+    def _calibrate_probe_from_archive(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        event_query = str(args.get("event_query") or args.get("positive_query") or "").strip()
+        if not event_query:
+            raise ToolError("'event_query' or 'positive_query' is required.")
+        contrast_query = str(args.get("contrast_query") or args.get("negative_query") or "").strip()
+        contrast_effective, contrast_warnings = _clip_effective_negative_state_query(
+            contrast_query,
+            subject_query=event_query,
+        )
+
+        channel_ids: List[int] = []
+        raw_channel_ids = args.get("channel_ids")
+        if isinstance(raw_channel_ids, Sequence) and not isinstance(raw_channel_ids, (str, bytes, bytearray)):
+            for raw_channel_id in raw_channel_ids:
+                parsed = _opt_int(raw_channel_id)
+                if parsed is not None and parsed not in channel_ids:
+                    channel_ids.append(int(parsed))
+        single_channel = self._resolve_channel_id(args, required=False)
+        if single_channel is not None and single_channel not in channel_ids:
+            channel_ids.insert(0, int(single_channel))
+        if not channel_ids:
+            if not hasattr(self._lxm, "get_channels"):
+                raise ToolError("Provide channel_id/channel_ref/channel_ids, or configure Luxriot channels.")
+            try:
+                channels = self._lxm.get_channels(force=False)
+            except Exception as exc:
+                raise ToolError(f"Could not fetch channels for calibration: {exc}") from exc
+            for channel in channels if isinstance(channels, list) else []:
+                if not isinstance(channel, Mapping):
+                    continue
+                parsed = _opt_int(channel.get("id"))
+                if parsed is not None and parsed not in channel_ids:
+                    channel_ids.append(int(parsed))
+        if not channel_ids:
+            raise ToolError("No channels were available for calibration.")
+
+        max_channels = max(1, min(
+            AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN,
+            int(args.get("max_channels_per_call") or AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN),
+        ))
+        processed_channel_ids = channel_ids[:max_channels]
+        deferred_channel_ids = channel_ids[max_channels:]
+        candidate_limit = max(1, min(100_000, int(args.get("candidate_limit") or 20_000)))
+        evidence_limit = max(1, min(24, int(args.get("evidence_limit") or 8)))
+        min_frames = max(1, min(500, int(args.get("min_frames") or 8)))
+
+        raw_sources = args.get("sources")
+        sources: List[str] = []
+        if isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes, bytearray)):
+            for raw_source in raw_sources:
+                normalized = _normalize_archive_source(raw_source)
+                if normalized and normalized not in sources:
+                    sources.append(normalized)
+        else:
+            normalized = _normalize_archive_source(args.get("source"))
+            if normalized:
+                sources.append(normalized)
+        if not sources:
+            sources = ["vlm_alert", "vlm_summary"]
+
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(args, default_since_hours=24.0)
+        since_ms = int(from_ts * 1000.0)
+        until_ms = int(to_ts * 1000.0)
+
+        positive_vec = _agent_normalized_vec(self._emb_text(event_query))
+        if positive_vec is None:
+            raise ToolError("CLIP text embedder did not return an event query vector.")
+        contrast_vec = _agent_normalized_vec(self._emb_text(contrast_effective)) if contrast_effective else None
+
+        channel_results: List[Dict[str, Any]] = []
+        for channel_id in processed_channel_ids:
+            rows, source_totals, source_returned, fetch_warnings = self._list_vector_frame_window(
+                channel_id=channel_id,
+                sources=sources,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                candidate_limit=candidate_limit,
+            )
+            samples: List[Dict[str, Any]] = []
+            for row in rows:
+                pos_score = _agent_dot_score(positive_vec, row.get("clip_vec"))
+                if pos_score is None:
+                    continue
+                neg_score = _agent_dot_score(contrast_vec, row.get("clip_vec")) if contrast_vec is not None else None
+                margin = float(pos_score) - float(neg_score) if neg_score is not None else None
+                ts_ms = _detection_timestamp_ms(row)
+                samples.append({
+                    "raw": row,
+                    "detection_id": row.get("detection_id") or row.get("id"),
+                    "timestamp_ms": ts_ms,
+                    "time": _format_epoch_minute(ts_ms / 1000.0) if ts_ms else None,
+                    "source": row.get("source"),
+                    "source_label": _archive_source_label(row.get("source")),
+                    "positive_score": float(pos_score),
+                    "negative_score": neg_score,
+                    "margin": margin,
+                    "pnm_state": _visual_signal_state(pos_score, neg_score),
+                    "image_url": _detection_image_url(row),
+                })
+            samples.sort(key=lambda sample: (int(sample.get("timestamp_ms") or 0), int(sample.get("detection_id") or 0)))
+            truncated = any(int(source_totals.get(source) or 0) > int(source_returned.get(source) or 0) for source in sources)
+            frame_nodes = [
+                {
+                    "window_start": float(sample["timestamp_ms"]) / 1000.0,
+                    "window_end": float(sample["timestamp_ms"]) / 1000.0,
+                }
+                for sample in samples
+                if int(sample.get("timestamp_ms") or 0) > 0
+            ]
+            coverage = _video_summary_coverage_contract(
+                available_nodes=frame_nodes,
+                returned_nodes=frame_nodes,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                truncated=truncated,
+                selection_strategy="archive_clip_calibration_scan",
+            )
+            warnings = [*fetch_warnings, *contrast_warnings]
+            if contrast_query and not contrast_effective:
+                warnings.append("contrast_query was removed by CLIP negation cleanup; margin calibration is unavailable.")
+            if not contrast_query:
+                warnings.append("contrast_query was not provided; margin calibration is unavailable.")
+            if len(samples) < min_frames:
+                warnings.append(
+                    f"Only {len(samples)} archived frame(s) were available; threshold suggestions are weak."
+                )
+            if truncated:
+                warnings.append("Frame candidate scan was truncated by candidate_limit; calibration applies only to scanned frames.")
+
+            distributions = {
+                "positive_score": _score_distribution([sample.get("positive_score") for sample in samples]),
+                "negative_score": _score_distribution([sample.get("negative_score") for sample in samples]),
+                "margin": _score_distribution([sample.get("margin") for sample in samples]),
+            }
+            channel_results.append({
+                "channel_id": channel_id,
+                "sources": sources,
+                "frame_count": len(samples),
+                "source_totals": source_totals,
+                "source_returned": source_returned,
+                "coverage": coverage,
+                "distributions": distributions,
+                "suggested_thresholds": _suggest_probe_thresholds_from_samples(
+                    samples,
+                    min_frames=min_frames,
+                    has_contrast=contrast_vec is not None,
+                ),
+                "representative_frames": _calibration_representative_frames(samples, evidence_limit=evidence_limit),
+                "warnings": warnings[:12],
+            })
+
+        return {
+            "event_query": event_query,
+            "contrast_query": contrast_query or None,
+            "contrast_query_effective": contrast_effective or None,
+            "sources": sources,
+            "time_window": time_meta,
+            "since_ms": since_ms,
+            "until_ms": until_ms,
+            "candidate_limit": candidate_limit,
+            "max_channels_per_call": max_channels,
+            "requested_channel_ids": channel_ids,
+            "processed_channel_ids": processed_channel_ids,
+            "deferred_channel_ids": deferred_channel_ids,
+            "processed_count": len(processed_channel_ids),
+            "deferred_count": len(deferred_channel_ids),
+            "requires_continue": bool(deferred_channel_ids),
+            "next_batch_hint": (
+                f"Continue calibration for next {min(max_channels, len(deferred_channel_ids))} channel(s): "
+                + ", ".join(str(item) for item in deferred_channel_ids[:max_channels])
+                if deferred_channel_ids else None
+            ),
+            "score_semantics": "clip_pnm_archive_calibration_not_ground_truth",
+            "operator_note": (
+                "Calibration estimates initial probe thresholds from archived CLIP vectors. "
+                "It is a secondary attention signal, not proof; inspect representative frames "
+                "before applying probe changes."
+            ),
+            "channels": channel_results,
+        }
+
+    # ── prepare_probe_calibration_batch ────────────────────────────────────
+
+    def _probe_calibration_channel_filter(self, args: Mapping[str, Any]) -> List[int]:
+        channel_ids: List[int] = []
+        raw_channel_ids = args.get("channel_ids")
+        if isinstance(raw_channel_ids, Sequence) and not isinstance(raw_channel_ids, (str, bytes, bytearray)):
+            for raw_channel_id in raw_channel_ids:
+                parsed = _opt_int(raw_channel_id)
+                if parsed is not None and parsed not in channel_ids:
+                    channel_ids.append(int(parsed))
+        single_channel = self._resolve_channel_id(dict(args), required=False)
+        if single_channel is not None and single_channel not in channel_ids:
+            channel_ids.insert(0, int(single_channel))
+        return channel_ids
+
+    def _probe_batch_items_from_args(self, args: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        channel_filter = self._probe_calibration_channel_filter(args)
+        items: List[Dict[str, Any]] = []
+        raw_items = args.get("items")
+        if isinstance(raw_items, Sequence) and not isinstance(raw_items, (str, bytes, bytearray)):
+            for idx, raw in enumerate(raw_items, start=1):
+                if not isinstance(raw, Mapping):
+                    continue
+                event_query = str(raw.get("event_query") or raw.get("positive_query") or "").strip()
+                contrast_query = str(raw.get("contrast_query") or raw.get("negative_query") or "").strip()
+                item_channels = self._probe_calibration_channel_filter(raw) or channel_filter
+                if not item_channels:
+                    parsed = _opt_int(raw.get("channel_id"))
+                    if parsed is not None:
+                        item_channels = [parsed]
+                for channel_id in item_channels or [None]:
+                    items.append({
+                        "item_id": f"item-{idx}-{channel_id or 'any'}",
+                        "source": "explicit_item",
+                        "probe_id": str(raw.get("probe_id") or "").strip() or None,
+                        "probe_name": str(raw.get("probe_name") or raw.get("name") or event_query or f"probe item {idx}").strip(),
+                        "event_query": event_query,
+                        "contrast_query": contrast_query,
+                        "channel_id": channel_id,
+                        "severity": str(raw.get("severity") or "normal").strip().lower(),
+                        "bookmark_enabled": bool(raw.get("bookmark_enabled", True)),
+                    })
+        if items:
+            return items
+
+        wanted_names = {
+            str(name).strip().lower()
+            for name in (args.get("probe_names") or [])
+            if str(name).strip()
+        }
+        probes = self._ps.list_probes()
+        for probe in probes if isinstance(probes, list) else []:
+            if not isinstance(probe, Mapping):
+                continue
+            probe_channel = _opt_int(probe.get("channel_id"))
+            if channel_filter and probe_channel not in channel_filter:
+                continue
+            probe_name = str(probe.get("name") or "").strip()
+            if wanted_names and probe_name.lower() not in wanted_names:
+                continue
+            positives = [str(item).strip() for item in (probe.get("positives") or []) if str(item).strip()]
+            negatives = [str(item).strip() for item in (probe.get("negatives") or []) if str(item).strip()]
+            items.append({
+                "item_id": str(probe.get("id") or f"{probe_name}:{probe_channel}"),
+                "source": "configured_probe",
+                "probe_id": str(probe.get("id") or "").strip() or None,
+                "probe_name": probe_name or str(probe.get("id") or "probe"),
+                "event_query": positives[0] if positives else probe_name,
+                "contrast_query": negatives[0] if negatives else "",
+                "channel_id": probe_channel,
+                "severity": str(probe.get("severity") or "normal").strip().lower(),
+                "bookmark_enabled": bool(probe.get("bookmark", True)),
+                "current": _probe_summary(dict(probe)),
+            })
+        return items
+
+    def _probe_calibration_recommended_args(
+        self,
+        item: Mapping[str, Any],
+        channel_result: Mapping[str, Any],
+        contrast_effective: Optional[str],
+    ) -> Dict[str, Any]:
+        thresholds = channel_result.get("suggested_thresholds") if isinstance(channel_result.get("suggested_thresholds"), Mapping) else {}
+        positive = str(item.get("event_query") or item.get("probe_name") or "").strip()
+        negative = str(contrast_effective or item.get("contrast_query") or "").strip()
+        changes: Dict[str, Any] = {
+            "positives": [positive] if positive else [],
+            "negatives": [negative] if negative else [],
+        }
+        if thresholds.get("pos_floor") is not None:
+            changes["pos_floor"] = thresholds.get("pos_floor")
+        if thresholds.get("margin_thr") is not None:
+            changes["margin_thr"] = thresholds.get("margin_thr")
+        probe_id = item.get("probe_id")
+        if probe_id:
+            return {
+                "tool": "update_probe",
+                "args": {
+                    "probe_id": probe_id,
+                    "changes": changes,
+                    "preview": True,
+                },
+            }
+        return {
+            "tool": "create_probe",
+            "args": {
+                "name": str(item.get("probe_name") or positive or "calibrated probe").strip(),
+                "channel_id": item.get("channel_id"),
+                "positives": changes["positives"],
+                "negatives": changes["negatives"],
+                "pos_floor": changes.get("pos_floor"),
+                "margin_thr": changes.get("margin_thr"),
+                "severity": item.get("severity") or "normal",
+                "bookmark_enabled": bool(item.get("bookmark_enabled", True)),
+                "update_existing": True,
+                "preview": True,
+            },
+        }
+
+    def _compact_probe_calibration_item(
+        self,
+        item: Mapping[str, Any],
+        calibration: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        channels = calibration.get("channels") if isinstance(calibration.get("channels"), list) else []
+        channel_result = channels[0] if channels and isinstance(channels[0], Mapping) else {}
+        representatives = channel_result.get("representative_frames") if isinstance(channel_result.get("representative_frames"), Mapping) else {}
+        compact_frames: Dict[str, Any] = {}
+        for key in ("top_margin", "top_positive", "ambiguous"):
+            frames = representatives.get(key) if isinstance(representatives, Mapping) else None
+            if not isinstance(frames, list):
+                continue
+            compact_frames[key] = [
+                _compact_detection_for_model(frame)
+                | {
+                    "positive_score": frame.get("positive_score"),
+                    "negative_score": frame.get("negative_score"),
+                    "margin": frame.get("margin"),
+                    "pnm_state": frame.get("pnm_state"),
+                }
+                for frame in frames[:2]
+                if isinstance(frame, dict)
+            ]
+        recommended = self._probe_calibration_recommended_args(
+            item,
+            channel_result,
+            calibration.get("contrast_query_effective"),
+        )
+        warnings = []
+        if isinstance(channel_result.get("warnings"), list):
+            warnings.extend(str(item) for item in channel_result.get("warnings")[:8])
+        return {
+            "item_id": item.get("item_id"),
+            "source": item.get("source"),
+            "probe_id": item.get("probe_id"),
+            "probe_name": item.get("probe_name"),
+            "channel_id": item.get("channel_id"),
+            "event_query": calibration.get("event_query") or item.get("event_query"),
+            "contrast_query": calibration.get("contrast_query") or item.get("contrast_query"),
+            "contrast_query_effective": calibration.get("contrast_query_effective"),
+            "frame_count": channel_result.get("frame_count"),
+            "coverage": channel_result.get("coverage"),
+            "source_totals": channel_result.get("source_totals"),
+            "source_returned": channel_result.get("source_returned"),
+            "suggested_thresholds": channel_result.get("suggested_thresholds"),
+            "warnings": warnings,
+            "representative_frames": compact_frames,
+            "recommended_probe_args": recommended,
+            "next_action": "preview_probe_update" if item.get("probe_id") else "preview_probe_create",
+            "score_semantics": calibration.get("score_semantics"),
+        }
+
+    def _prepare_probe_calibration_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        calibration_context_keys = (
+            "sources",
+            "since_hours",
+            "from_ts",
+            "to_ts",
+            "candidate_limit",
+            "evidence_limit",
+            "min_frames",
+        )
+        job_id = str(args.get("job_id") or "").strip()
+        if job_id:
+            job = self._get_workflow_job(job_id, "probe_calibration")
+        else:
+            items = self._probe_batch_items_from_args(args)
+            if not items:
+                raise ToolError("No probe calibration items were available. Provide items or configured probe names.")
+            job = self._create_workflow_job(
+                workflow_type="probe_calibration",
+                items=items,
+                metadata={
+                    "created_from": "prepare_probe_calibration_batch",
+                    **{
+                        key: args.get(key)
+                        for key in calibration_context_keys
+                        if args.get(key) is not None
+                    },
+                },
+            )
+
+        items_per_call = max(1, min(8, int(args.get("items_per_call") or 4)))
+        processed: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        with self._workflow_jobs_lock:
+            start_cursor = job.cursor
+            item_slice = job.items[start_cursor:start_cursor + items_per_call]
+
+        common_args: Dict[str, Any] = {}
+        for key in calibration_context_keys:
+            value = args.get(key)
+            if value is None:
+                value = job.metadata.get(key)
+            if value is not None:
+                common_args[key] = value
+        evidence_limit = max(1, min(6, int(common_args.get("evidence_limit") or 4)))
+        for item in item_slice:
+            event_query = str(item.get("event_query") or "").strip()
+            channel_id = _opt_int(item.get("channel_id"))
+            if not event_query or channel_id is None:
+                error = {
+                    "item_id": item.get("item_id"),
+                    "probe_name": item.get("probe_name"),
+                    "channel_id": item.get("channel_id"),
+                    "error": "item requires event_query and channel_id",
+                }
+                errors.append(error)
+                processed.append({**error, "status": "skipped"})
+                continue
+            try:
+                calibration = self._calibrate_probe_from_archive({
+                    **common_args,
+                    "event_query": event_query,
+                    "contrast_query": item.get("contrast_query") or "",
+                    "channel_id": channel_id,
+                    "max_channels_per_call": 1,
+                    "evidence_limit": evidence_limit,
+                })
+                processed.append({
+                    "status": "processed",
+                    **self._compact_probe_calibration_item(item, calibration),
+                })
+            except Exception as exc:
+                error = {
+                    "item_id": item.get("item_id"),
+                    "probe_name": item.get("probe_name"),
+                    "channel_id": channel_id,
+                    "error": str(exc),
+                }
+                errors.append(error)
+                processed.append({**error, "status": "error"})
+
+        with self._workflow_jobs_lock:
+            job.cursor = min(len(job.items), start_cursor + len(item_slice))
+            job.updated_at = time.time()
+            job.processed.extend(processed)
+            remaining_items = job.items[job.cursor:]
+            remaining_count = len(remaining_items)
+
+        return {
+            "job_id": job.job_id,
+            "workflow_type": job.workflow_type,
+            "status": "running" if remaining_count else "complete",
+            "processed_items": processed,
+            "processed_this_call": len(processed),
+            "processed_total": len(job.processed),
+            "total_items": len(job.items),
+            "remaining_count": remaining_count,
+            "remaining_items": [
+                {
+                    "item_id": item.get("item_id"),
+                    "probe_name": item.get("probe_name"),
+                    "channel_id": item.get("channel_id"),
+                    "event_query": item.get("event_query"),
+                }
+                for item in remaining_items[:12]
+            ],
+            "requires_continue": remaining_count > 0,
+            "next_batch_hint": (
+                f"Continue with prepare_probe_calibration_batch job_id={job.job_id}; "
+                f"{remaining_count} item(s) remain."
+                if remaining_count else None
+            ),
+            "errors": errors,
+            "output_contract": {
+                "model_view": "bounded_decision_ledger",
+                "raw_calibration_omitted": True,
+                "recommended_probe_args_are_pass_through": True,
+                "apply_path": "preview_only_then_ui_apply_receipt",
+            },
         }
 
     # ── get_detections ──────────────────────────────────────────────────────
@@ -2074,6 +2875,9 @@ class AgentTools:
             spans: List[Tuple[float, float]] = []
             frame_count = 0
             alert_counts: Dict[str, int] = {}
+            parser_breakdown: Dict[str, int] = {}
+            delivery_breakdown: Dict[str, int] = {}
+            state_transition_total = 0
             log_run_ids: set[str] = set()
             for log in logs:
                 if not isinstance(log, dict):
@@ -2112,6 +2916,11 @@ class AgentTools:
                     if total > 0:
                         severity = str(log.get("severity") or "normal").strip().lower() or "normal"
                         alert_counts[severity] = alert_counts.get(severity, 0) + total
+                for key, value in _summary_log_parser_breakdown(log).items():
+                    parser_breakdown[key] = parser_breakdown.get(key, 0) + int(value)
+                for key, value in _summary_log_delivery_breakdown(log).items():
+                    delivery_breakdown[key] = delivery_breakdown.get(key, 0) + int(value)
+                state_transition_total += int(_opt_int(log.get("state_transition_total")) or 0)
             latest_ts = max(ends) if ends else None
             first_ts = min(starts) if starts else None
             alert_total = int(sum(alert_counts.values()))
@@ -2185,6 +2994,9 @@ class AgentTools:
                     "frame_count": frame_count,
                     "alert_total": alert_total,
                     "alert_counts": alert_counts,
+                    "alert_parser_breakdown": parser_breakdown,
+                    "alert_delivery_breakdown": delivery_breakdown,
+                    "state_transition_total": state_transition_total,
                     "running": running,
                     "desired": desired,
                     "runtime_running": runtime_running,
@@ -2904,6 +3716,18 @@ class AgentTools:
         except Exception as exc:
             raise ToolError(f"Could not fetch current prompt settings: {exc}") from exc
 
+        if bool(changes.get("migrate_legacy_alert_policy")):
+            health = current.get("prompt_health") if isinstance(current.get("prompt_health"), dict) else {}
+            changes = dict(changes)
+            changes.pop("migrate_legacy_alert_policy", None)
+            if isinstance(health, dict) and health.get("needs_migration"):
+                if "stream_system_prompt" not in changes and "suggested_stream_system_prompt" in health:
+                    changes["stream_system_prompt"] = str(health.get("suggested_stream_system_prompt") or "")
+                if "alert_policy_prompt" not in changes and "suggested_alert_policy_prompt" in health:
+                    changes["alert_policy_prompt"] = str(health.get("suggested_alert_policy_prompt") or "")
+            if not changes:
+                raise ToolError("No legacy alert prompt migration suggestion is available for this channel.")
+
         proposed = _merge_prompt_settings_snapshot(current, changes)
         diff = _prompt_settings_diff(current, proposed)
         if not diff:
@@ -2928,6 +3752,7 @@ class AgentTools:
             applied = self._lxm.update_prompt_settings(
                 channel_id=channel_id,
                 stream_system_prompt=changes.get("stream_system_prompt"),
+                alert_policy_prompt=changes.get("alert_policy_prompt"),
                 rollup_prompts=changes.get("rollup_prompts"),
                 json_alert_prompt=changes.get("json_alert_prompt"),
                 bookmark_enabled=changes.get("bookmark_enabled"),
@@ -3021,6 +3846,30 @@ class AgentTools:
             for key in ("level", "frame_count", "item_count", "alert_total", "alert_counts", "alert_severities"):
                 if key in node:
                     entry[key] = node.get(key)
+            parser_breakdown = _compact_int_breakdown(node.get("alert_parser_breakdown"))
+            delivery_breakdown = _compact_int_breakdown(node.get("alert_delivery_breakdown"))
+            state_transition_total = int(_opt_int(node.get("state_transition_total")) or 0)
+            if parser_breakdown:
+                entry["alert_parser_breakdown"] = parser_breakdown
+            if delivery_breakdown:
+                entry["alert_delivery_breakdown"] = delivery_breakdown
+            if state_transition_total > 0:
+                entry["state_transition_total"] = state_transition_total
+            if str(node.get("level") or "").strip().upper() == "L0":
+                alert_events = _compact_vlm_alert_events_for_model(node.get("alert_events"), limit=6)
+                state_observations = _compact_state_observations_for_model(node.get("state_observations"), limit=8)
+                state_transitions = _compact_state_transitions_for_model(node.get("state_transition_events"), limit=8)
+                if alert_events:
+                    entry["alert_events"] = alert_events
+                if state_observations:
+                    entry["state_observations"] = state_observations
+                if state_transitions:
+                    entry["state_transition_events"] = state_transitions
+            if parser_breakdown.get("prose_only_signal_count"):
+                entry["unconfirmed_prose_signal_count"] = parser_breakdown.get("prose_only_signal_count")
+                entry["unconfirmed_prose_note"] = (
+                    "Prose-only alert-like text requires frame or structured-signal corroboration."
+                )
             text = str(node.get("summary") or "").strip()
             if text:
                 entry["summary"] = text[:800]
@@ -3028,6 +3877,8 @@ class AgentTools:
                 entries.append(entry)
 
         truncated = len(filtered_nodes) > len(returned_nodes)
+        provenance_totals = _summary_provenance_totals(filtered_nodes)
+        returned_provenance_totals = _summary_provenance_totals(returned_nodes)
         coverage = _video_summary_coverage_contract(
             available_nodes=filtered_nodes,
             returned_nodes=returned_nodes,
@@ -3092,6 +3943,8 @@ class AgentTools:
             "total_in_window": len(filtered_nodes),
             "truncated": truncated,
             "selection_strategy": selection_strategy,
+            "provenance_totals": provenance_totals,
+            "returned_provenance_totals": returned_provenance_totals,
             "selected_run": rollups.get("selected_run"),
             "run_filter_id": rollups.get("run_filter_id"),
             "running": bool(rollups.get("running")),
@@ -3213,6 +4066,34 @@ class AgentTools:
             "notes": notes,
             **count_result,
         }
+
+    # ── lookup_help ─────────────────────────────────────────────────────────
+
+    def _lookup_help(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        from agent_help_index import build_help_response, get_help_index
+
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ToolError("'query' is required.")
+        try:
+            top_k = int(args.get("top_k") or 3)
+        except (TypeError, ValueError):
+            top_k = 3
+        top_k = max(1, min(8, top_k))
+        # Granted permissions come ONLY from the trusted execution context the
+        # secure adapter sets; never from model/tool args. Absent (non-secure/dev)
+        # -> operator-only (None-permission) chunks.
+        granted = getattr(self._local, "granted_permissions", None) or frozenset()
+        index = get_help_index()
+        candidates = index.query(query, pool=max(24, top_k * 4))
+        response = build_help_response(query, candidates, granted, top_k=top_k)
+        response["indexed_docs"] = index.indexed_docs
+        response["note"] = (
+            "Operator-guide help, not incident data. Cite doc + section. If "
+            "best_match_restricted is true, tell the operator it is an "
+            "admin/engineer action requiring the named permission; do not invent steps."
+        )
+        return response
 
     # ── track_visual_state_transitions ──────────────────────────────────────
 
@@ -3491,12 +4372,15 @@ class AgentTools:
             else []
         )
         alert_counts: Dict[str, int] = {}
+        parser_breakdown: Dict[str, int] = {}
+        delivery_breakdown: Dict[str, int] = {}
         quiet_channels: List[Dict[str, Any]] = []
         gapped_channels: List[Dict[str, Any]] = []
         running_count = 0
         desired_count = 0
         dropped_frames_total = 0
         dropped_batches_total = 0
+        state_transition_total = 0
         for row in channels:
             if not isinstance(row, dict):
                 continue
@@ -3511,6 +4395,11 @@ class AgentTools:
                 for key, value in raw_counts.items():
                     severity = str(key or "normal").strip().lower() or "normal"
                     alert_counts[severity] = alert_counts.get(severity, 0) + int(_opt_int(value) or 0)
+            for key, value in _compact_int_breakdown(row.get("alert_parser_breakdown")).items():
+                parser_breakdown[key] = parser_breakdown.get(key, 0) + int(value)
+            for key, value in _compact_int_breakdown(row.get("alert_delivery_breakdown")).items():
+                delivery_breakdown[key] = delivery_breakdown.get(key, 0) + int(value)
+            state_transition_total += int(_opt_int(row.get("state_transition_total")) or 0)
             if row.get("quiet"):
                 quiet_channels.append(row)
             if int(_opt_int(row.get("coverage_gap_count")) or 0) > 0:
@@ -3605,6 +4494,14 @@ class AgentTools:
             lines.append(
                 f"Runtime drops: {dropped_frames_total} frame(s), {dropped_batches_total} batch(es)."
             )
+        if parser_breakdown or delivery_breakdown or state_transition_total:
+            parser_text = ", ".join(f"{key}:{value}" for key, value in sorted(parser_breakdown.items())) or "none"
+            delivery_text = ", ".join(f"{key}:{value}" for key, value in sorted(delivery_breakdown.items())) or "none"
+            lines.append(
+                "Detection pipeline health: "
+                f"parser={parser_text}; delivery={delivery_text}; "
+                f"state_tracker_transitions={state_transition_total}."
+            )
         if quiet_channels:
             quiet_text = ", ".join(
                 f"CH {row.get('channel_id')} since {row.get('latest_time') or 'unknown'}"
@@ -3655,6 +4552,12 @@ class AgentTools:
                 "gapped_count": len(gapped_channels),
                 "dropped_frames": dropped_frames_total,
                 "dropped_batches": dropped_batches_total,
+            },
+            "pipeline_health": {
+                "alert_parser_breakdown": parser_breakdown,
+                "alert_delivery_breakdown": delivery_breakdown,
+                "state_transition_total": state_transition_total,
+                "note": "Pipeline health describes extraction/delivery reliability, not incident counts.",
             },
             "channels": channels,
             "desired_video_missing": desired_missing,
@@ -4263,16 +5166,22 @@ def _probe_pairs_from_lists(positives: Sequence[str], negatives: Sequence[str]) 
 
 def _merge_prompt_settings_snapshot(current: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:
     merged = copy.deepcopy(current)
-    for field_name in ("stream_system_prompt", "json_alert_prompt", "bookmark_enabled", "bookmark_cooldown_sec"):
+    for field_name in (
+        "stream_system_prompt",
+        "alert_policy_prompt",
+        "json_alert_prompt",
+        "bookmark_enabled",
+        "bookmark_cooldown_sec",
+    ):
         if field_name in changes:
             merged[field_name] = changes[field_name]
     bookmark_rule_prompt = str(changes.get("bookmark_rule_prompt") or "").strip()
     if bookmark_rule_prompt:
-        current_stream_prompt = str(merged.get("stream_system_prompt") or "").strip()
-        if bookmark_rule_prompt not in current_stream_prompt:
-            merged["stream_system_prompt"] = (
-                f"{current_stream_prompt}\n- {bookmark_rule_prompt}"
-                if current_stream_prompt else bookmark_rule_prompt
+        current_alert_policy = str(merged.get("alert_policy_prompt") or "").strip()
+        if bookmark_rule_prompt not in current_alert_policy:
+            merged["alert_policy_prompt"] = (
+                f"{current_alert_policy}\n- {bookmark_rule_prompt}"
+                if current_alert_policy else bookmark_rule_prompt
             )
     if isinstance(changes.get("rollup_prompts"), dict):
         rollups = dict(merged.get("rollup_prompts") or {})
@@ -4295,6 +5204,9 @@ def _normalize_prompt_setting_changes(changes: Dict[str, Any]) -> Dict[str, Any]
                 normalized["stream_system_prompt"] = normalized[alias]
                 break
 
+    if "alert_policy_prompt" not in normalized and "bookmark_rule_prompt" in normalized:
+        normalized["alert_policy_prompt"] = normalized["bookmark_rule_prompt"]
+
     rollups = dict(normalized.get("rollup_prompts") or {}) if isinstance(normalized.get("rollup_prompts"), dict) else {}
     for alias, level in (("l1_prompt", "L1"), ("l2_prompt", "L2"), ("l3_prompt", "L3")):
         if alias in normalized:
@@ -4312,6 +5224,7 @@ def _prompt_settings_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict
     diff: Dict[str, Any] = {}
     for field_name in (
         "stream_system_prompt",
+        "alert_policy_prompt",
         "json_alert_prompt",
         "bookmark_enabled",
         "bookmark_cooldown_sec",
@@ -4445,6 +5358,80 @@ def _extract_text_from_message_content(message: Any) -> str:
                 chunks.append(str(item.get("text") or ""))
         return "\n".join(chunks)
     return str(message or "")
+
+
+def _stable_prompt_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _estimate_context_chars(value: Any) -> int:
+    try:
+        return len(_stable_prompt_json(value))
+    except Exception:
+        return len(str(value or ""))
+
+
+def _estimate_context_tokens(value: Any) -> int:
+    chars = _estimate_context_chars(value)
+    return int((chars + AGENT_CONTEXT_CHARS_PER_TOKEN - 1) / AGENT_CONTEXT_CHARS_PER_TOKEN)
+
+
+def _context_budget_snapshot(messages: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    chars = _estimate_context_chars(list(messages))
+    return {
+        "message_count": len(messages),
+        "estimated_chars": chars,
+        "estimated_tokens": int((chars + AGENT_CONTEXT_CHARS_PER_TOKEN - 1) / AGENT_CONTEXT_CHARS_PER_TOKEN),
+        "chars_per_token": AGENT_CONTEXT_CHARS_PER_TOKEN,
+        "warning_tokens": AGENT_CONTEXT_WARNING_TOKENS,
+        "hard_tokens": AGENT_CONTEXT_HARD_TOKENS,
+    }
+
+
+def _trim_history_for_context_budget(
+    history: Sequence[Mapping[str, Any]],
+    *,
+    token_budget: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if token_budget is None:
+        token_budget = AGENT_CONTEXT_HISTORY_BUDGET_TOKENS
+    normalized = [dict(message) for message in history if isinstance(message, Mapping)]
+    original_count = len(normalized)
+    if not normalized:
+        return [], {
+            "original_messages": 0,
+            "kept_messages": 0,
+            "trimmed_messages": 0,
+            "estimated_tokens": 0,
+            "budget_tokens": token_budget,
+        }
+
+    kept = list(normalized[-AGENT_MAX_HISTORY_MESSAGES:])
+    trimmed_by_count = max(0, original_count - len(kept))
+    while kept and _estimate_context_tokens(kept) > token_budget:
+        kept.pop(0)
+    while kept and str(kept[0].get("role") or "") != "user":
+        kept.pop(0)
+
+    estimated_tokens = _estimate_context_tokens(kept)
+    trimmed_total = max(0, original_count - len(kept))
+    return kept, {
+        "original_messages": original_count,
+        "kept_messages": len(kept),
+        "trimmed_messages": trimmed_total,
+        "trimmed_by_count": trimmed_by_count,
+        "trimmed_by_budget": max(0, trimmed_total - trimmed_by_count),
+        "estimated_tokens": estimated_tokens,
+        "estimated_chars": _estimate_context_chars(kept),
+        "budget_tokens": token_budget,
+        "chars_per_token": AGENT_CONTEXT_CHARS_PER_TOKEN,
+    }
 
 
 def _normalize_probe_match_text(value: Any) -> str:
@@ -4684,9 +5671,12 @@ def build_system_prompt(
     active_skills_block = _format_active_skill_docs_for_prompt(active_skill_slugs or [])
     secure_rules = (
         "\n- Tool-driven probe and prompt changes are preview-only in this "
-        "deployment. Never request preview=false or claim that a preview was applied."
-        "\n- Bookmark creation is unavailable until the stored approval workflow "
-        "is enabled."
+        "deployment: create/update/delete tools can prepare previews/action plans, "
+        "but the chat model must not request preview=false. The operator applies "
+        "the prepared plan with the UI Apply button; a later trusted action receipt "
+        "is the only evidence that it was applied."
+        "\n- Bookmark creation is unavailable until the bookmark approval workflow "
+        "is enabled. Do not transfer bookmark approval wording to probe or prompt previews."
         if secure_tool_mode
         else ""
     )
@@ -4707,15 +5697,30 @@ def build_system_prompt(
         f"- Default reports and status answers must be video-description-first: active/running summary streams, VLM alerts, coverage gaps, channels that went quiet, dropped frames/batches, last errors, and archived VLM evidence frames.\n"
         f"- For questions about whether streams were active, disconnected, reconnected, or quiet over a period, combine the current Video-description runtime snapshot with list_video_summary_channels/get_video_summaries coverage. Report observed coverage gaps as gaps, not proven network outages unless a tool returns an error.\n"
         f"- Use probe tools only when the operator explicitly asks about probes, when a configured probe is named, or as a secondary semantic signal for large archive searches. Do not make probe status the default report center.\n"
-        f"- For probe modifications: always call update_probe with preview=true first, "
-        f"show the user the diff, and only apply after explicit confirmation.\n"
-        f"- For prompt-setting modifications: always call update_prompt_settings with preview=true first, "
-        f"show the user the diff, and only apply after explicit confirmation.\n"
-        f"- Prompt field mapping: L0/live feed prompt = stream_system_prompt. L1/L2/L3 rollups = rollup_prompts.L1/L2/L3. Behavioral bookmark instructions belong inside the L0/live prompt. json_alert_prompt is only the structured alert-output template.\n"
-        f"- There is no separate bookmark-rule registry. A bookmark rule only exists after update_prompt_settings applies the underlying L0/live prompt change.\n"
+        f"- If the operator asks to double-check video-description alerts with probes, turn VLM alerts into a secondary CLIP attention layer: inspect the current L0/live prompt or relevant VLM alerts first, extract distinct visible event classes, create one preview probe per event/channel with create_probe(update_existing=true, preview=true), and clearly say these probes are corroborating candidates, not proof.\n"
+        f"- When translating VLM alert text into probe prompts, remove private names and abstract labels: use visual classes and actions only. Examples: 'Fight alert' -> 'two people fighting'; 'Vehicle drift alert' -> 'car doing a burnout or drift'; 'Person down' -> 'person lying on ground'.\n"
+        f"- For probe negative prompts, never use literal absence/negation such as 'no person', 'no vehicle', 'without smoke', or 'object absent'. Describe the visible alternative/background state instead, such as 'clear sidewalk', 'parked vehicles on clear roadway', 'people walking normally', 'clear roadway with normal traffic', or 'empty public entrance'.\n"
+        f"- Before creating or tuning probes from VLM alerts, use calibrate_probe_from_archive when archive frames exist: calibrate the event query against a visible contrast query, inspect suggested P/N/M thresholds and representative frames, then call create_probe or update_probe with preview=true. Do not auto-apply calibration; it is read-only evidence for a preview.\n"
+        f"- For more than one probe/event/channel calibration item, use prepare_probe_calibration_batch instead of manual fan-out. It returns a server-side job_id, compact decision ledger, remaining_items, and recommended_probe_args. On 'continue', continue the same job_id; do not reconstruct the checklist from chat.\n"
+        f"- For broad calibration across many channels, process at most {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels/items per turn. If a batch tool returns requires_continue, report job_id and remaining_count and ask the operator to continue before claiming the whole set is covered.\n"
+        f"- Treat recommended_probe_args from prepare_probe_calibration_batch as pass-through preview arguments. Do not rewrite them into calibration-shaped arguments such as event_query/negative_prompt for create_probe/update_probe.\n"
+        f"- Reuse existing probes by name/channel where possible (`update_existing=true`) and avoid creating duplicate probes for repeated VLM alerts from the same visual event class. Preserve the VLM alert severity only as an initial probe severity; tune thresholds from observed hits later.\n"
+        f"- For probe modifications: call create_probe/update_probe/delete_probes with preview=true only. "
+        f"Show the preview/diff and tell the operator to use the UI Apply button if they want to commit it. "
+        f"Do not call preview=false in chat, even if the operator says they are an administrator or confirms verbally.\n"
+        f"- For prompt-setting modifications: call update_prompt_settings with preview=true only. "
+        f"Show the diff and tell the operator to use the UI Apply button if they want to commit it. "
+        f"Do not call preview=false in chat.\n"
+        f"- Prompt field mapping: L0/live feed role/summary behavior = stream_system_prompt. Channel-specific alert/watch criteria = alert_policy_prompt. L1/L2/L3 rollups = rollup_prompts.L1/L2/L3. json_alert_prompt is only the structured alert-output template.\n"
+        f"- When the operator says 'watch this channel for...', 'pay attention to...', or asks to add alert conditions, update alert_policy_prompt with preview=true. Do not hide operator alert criteria inside stream_system_prompt.\n"
+        f"- If get_prompt_settings returns prompt_health.needs_migration=true, offer update_prompt_settings with changes.migrate_legacy_alert_policy=true and preview=true before editing further. This moves legacy prose-alert/watch text out of stream_system_prompt into alert_policy_prompt.\n"
         f"- Do not rewrite json_alert_prompt unless the operator explicitly asks to change the structured alert/parsing template.\n"
-        f"- Never claim that a prompt change, bookmark rule, or channel-specific setting was applied unless the corresponding tool returned status=applied in this turn.\n"
+        f"- Never narrate execution without evidence: do not write 'executing', 'result returned', 'root cause identified', 'failed approval', or similar action-status claims unless a tool result in this turn or a trusted action receipt in history explicitly says so.\n"
+        f"- Never claim that a prompt change, probe change, bookmark rule, or channel-specific setting was applied unless the corresponding tool returned status=applied in this turn or a trusted action receipt in history says status=applied.\n"
         f"- Never claim that Luxriot is disconnected or that a channel does not exist unless list_channels or another Luxriot tool in this turn confirmed that failure.\n"
+        f"- You can access EVA AI's first-party operator/admin documentation through lookup_help. If asked whether documentation, guides, manuals, operator guide, or admin guide are reachable, call lookup_help and answer from those results. Never answer that you cannot access the operator/admin docs, external files, or browse the internet when lookup_help is the correct first-party documentation path.\n"
+        f"- For UI / how-to / 'where is the button' / product-status / scenario-meaning questions, including questions about L0/L1/L2/L3 prompts or settings, call lookup_help first and answer from the returned passages, citing the doc and section. For broad requests to summarize the guides or documentation, call lookup_help with top_k=8. Do not mix help-doc passages with incident evidence. If best_match_restricted is true (or the only relevant match is in restricted_matches), tell the operator it is an admin/engineer action and name the required permission instead of inventing steps — even if weaker allowed results exist. If lookup_help returns nothing relevant, say it is not documented rather than inventing UI paths.\n"
+        f"- When translating or summarizing documentation from lookup_help, say that it is an adapted summary/translation of the cited sections, not a verbatim manual translation. Cite the source sections inline. Keep source terms precise: source=probe means CLIP probe hits, not sensors; missing image_url means no frame was returned in that result set, not proof that visual evidence does not exist. For Georgian or other languages you are not certain about, label the output as a machine translation draft that should be checked by a native speaker before client-facing use.\n"
         f"- Probe-threshold semantics are strict: raising pos_floor or raising margin makes a probe stricter; lowering pos_floor or lowering margin makes it more permissive. Never describe lowering margin as tightening, filtering more, or reducing noise.\n"
         f"- Detection hit counts over 24h are historical archive summaries. After a probe threshold change, do not claim that the 24h hit count already improved, dropped, or 'took effect' unless you explicitly measured a fresh post-change window.\n"
         f"- If the operator asks for probe status immediately after an update, report the saved settings and explain that effect on live volume still requires post-change observation unless a fresh post-change query was run.\n"
@@ -4727,6 +5732,9 @@ def build_system_prompt(
         f"- If the operator asks for video-summary review without naming channel(s), call list_video_summary_channels for the normalized period before reading full summaries. If active_count exceeds the per_turn_channel_limit, present candidate channels and ask the operator to choose channels or confirm full multi-turn research.\n"
         f"- Do not review more than {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels of video summaries in one turn unless the operator explicitly confirmed broad research. For broad research, work in chunks and report unchecked channels.\n"
         f"- For video event investigations over a non-trivial period, use rollups as a map before detail: L2 for broad context, L1 for candidate windows, and live/L0 only to verify exact events and evidence. Do not treat L2/L1 as visual proof.\n"
+        f"- Rank video-summary signals by provenance. Routine memory/baseline is prior context, not current evidence. L0 prose is a current VLM description but can be contaminated by prior memory. Structured L0 alert_events/state_observations are stronger than prose. Backend state_transition_events are confirmed cross-batch state changes from structured L0 observations, but still require frame evidence for final visual confirmation. Archive frame plus describe_frame is the strongest visual proof available in chat.\n"
+        f"- If L0 prose mentions an event or entity but structured alert_events/state_observations do not confirm it, do not drop it and do not call it false. Mark it as unconfirmed prose-only evidence: possible memory contamination, structured-output miss, or real event needing frame review. For important safety/security findings, drill into VLM summary/alert frames and describe_frame before concluding.\n"
+        f"- Treat parser/delivery diagnostics as pipeline health, not incident counts: json/prose/parser counts explain extraction quality; delivery_status sent/cooldown_skipped/bookmark_disabled/failed explains Luxriot bookmark side effects.\n"
         f"- For count/state-change questions that can be checked visually, such as 'how many times did X appear/disappear', 'when did the door open/close', or 'did the object leave/return', prefer track_visual_state_transitions after normalize_time_window. Provide positive_state_query and a visible-background negative_state_query; avoid literal negation like 'no X'/'without X' because CLIP does not reliably understand negation. Use L2/L1 summaries as a map and use count_video_summary_events only as summary-text fallback when archived CLIP frames are unavailable. Report that CLIP P/N/M state transitions are candidates and cite boundary frame evidence before strong conclusions.\n"
         f"- For count questions over video summaries, such as counting mentions in summaries, use count_video_summary_events after normalize_time_window. If the operator did not name a channel, call list_video_summary_channels first and then call count_video_summary_events separately for each returned candidate channel, up to the per-turn channel limit. Never call count_video_summary_events without channel_id/channel_ref. Do not call get_detections with probe_name unless the operator named an actual configured probe. Report counts with coverage and distinguish explicit summary mentions from inferred adjacent-window state changes.\n"
         f"- Archive source semantics: source=probe rows are real probe hits/detections; source=vlm_summary rows are sampled frames saved from video-description batches; source=vlm_alert rows are frames anchored to VLM alerts from video descriptions.\n"
@@ -4786,7 +5794,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     prepared = dict(args or {})
     time_window = context.get("time_window") if isinstance(context.get("time_window"), dict) else {}
     if time_window:
-        if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions", "list_video_summary_channels"} and not _has_any_arg(
+        if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions", "calibrate_probe_from_archive", "prepare_probe_calibration_batch", "list_video_summary_channels"} and not _has_any_arg(
             prepared,
             ("from_ts", "to_ts", "since_hours"),
         ):
@@ -4824,9 +5832,14 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "describe_frame",
         "count_video_summary_events",
         "track_visual_state_transitions",
+        "calibrate_probe_from_archive",
+        "prepare_probe_calibration_batch",
         "generate_report",
-    } and not _has_any_arg(prepared, ("channel_id", "channel_ref", "channel", "channel_title", "channel_name")):
+    } and not _has_any_arg(prepared, ("channel_id", "channel_ids", "channel_ref", "channel", "channel_title", "channel_name")):
         prepared["channel_id"] = channel_id
+
+    if tool_name == "prepare_probe_calibration_batch" and not prepared.get("job_id") and context.get("workflow_job_id"):
+        prepared["job_id"] = context.get("workflow_job_id")
 
     if tool_name == "get_video_summaries" and context.get("wants_video_evidence"):
         prepared.setdefault("include_evidence_frames", True)
@@ -4861,6 +5874,11 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             }
         return
 
+    if tool_name == "prepare_probe_calibration_batch":
+        if result.get("job_id") and result.get("requires_continue"):
+            context["workflow_job_id"] = result.get("job_id")
+        return
+
     if tool_name == "list_video_summary_channels":
         time_window = result.get("time_window")
         if isinstance(time_window, Mapping) and time_window.get("from_ts") is not None and time_window.get("to_ts") is not None:
@@ -4877,8 +5895,12 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 context["channel_id"] = channel_id
         return
 
-    if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions"}:
+    if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions", "calibrate_probe_from_archive"}:
         channel_id = _opt_int(result.get("channel_id"))
+        if channel_id is None and tool_name == "calibrate_probe_from_archive":
+            processed = result.get("processed_channel_ids") if isinstance(result.get("processed_channel_ids"), list) else []
+            if len(processed) == 1:
+                channel_id = _opt_int(processed[0])
         if channel_id is not None:
             context["channel_id"] = channel_id
         time_window = result.get("time_window")
@@ -4890,6 +5912,529 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "until_ms": time_window.get("until_ms"),
             }
         return
+
+
+def _signal_ledger_append(
+    ledger: Dict[str, Any],
+    key: str,
+    item: Any,
+    *,
+    limit: int = 8,
+) -> None:
+    rows = ledger.setdefault(key, [])
+    if isinstance(rows, list) and len(rows) < limit:
+        rows.append(item)
+
+
+def _compact_signal_value(value: Any, max_len: int = 180) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = str(value)
+    if len(text) > max_len:
+        return text[: max(0, max_len - 1)].rstrip() + "…"
+    return text
+
+
+def _trusted_action_receipt_from_result(plan_id: str, result: Any) -> Dict[str, Any]:
+    if isinstance(result, Mapping):
+        raw_receipt = result.get("action_receipt")
+        receipt = dict(raw_receipt) if isinstance(raw_receipt, Mapping) else {}
+        receipt.setdefault("tool", result.get("action"))
+        receipt.setdefault("result_status", result.get("status"))
+        if result.get("probe_id") is not None:
+            receipt.setdefault("probe_id", result.get("probe_id"))
+        if result.get("probe_name") is not None:
+            receipt.setdefault("probe_name", result.get("probe_name"))
+        if result.get("channel_id") is not None:
+            receipt.setdefault("channel_id", result.get("channel_id"))
+    else:
+        receipt = {}
+    safe: Dict[str, Any] = {
+        "type": "agent_action_applied",
+        "plan_id": str(receipt.get("plan_id") or plan_id),
+        "tool": (
+            str(receipt.get("tool")).strip()
+            if receipt.get("tool") is not None and str(receipt.get("tool")).strip()
+            else None
+        ),
+        "status": (
+            str(receipt.get("status")).strip()
+            if receipt.get("status") is not None and str(receipt.get("status")).strip()
+            else "applied"
+        ),
+        "result_status": (
+            str(receipt.get("result_status")).strip()
+            if receipt.get("result_status") is not None and str(receipt.get("result_status")).strip()
+            else None
+        ),
+    }
+    for key in ("probe_id", "probe_name", "channel_id"):
+        value = receipt.get(key)
+        if value is not None and str(value).strip():
+            safe[key] = _compact_signal_value(value, 120)
+    return safe
+
+
+def _format_trusted_action_receipt_for_model(receipt: Mapping[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in {
+            "type": receipt.get("type") or "agent_action_applied",
+            "plan_id": receipt.get("plan_id"),
+            "tool": receipt.get("tool"),
+            "status": receipt.get("status") or "applied",
+            "result_status": receipt.get("result_status"),
+            "probe_id": receipt.get("probe_id"),
+            "probe_name": receipt.get("probe_name"),
+            "channel_id": receipt.get("channel_id"),
+        }.items()
+        if value is not None
+    }
+    return (
+        f"{TRUSTED_ACTION_RECEIPT_PREFIX} "
+        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}. "
+        "This is server-side ground truth from the UI Apply path. Do not infer any "
+        "other action as applied without a tool result or trusted receipt."
+    )
+
+
+def _compact_action_plan_hint(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    approval = result.get("approval")
+    if not isinstance(approval, Mapping):
+        return None
+    plan_id = str(approval.get("plan_id") or "").strip()
+    if not plan_id:
+        return None
+    return {
+        "plan_id": plan_id,
+        "action": approval.get("action"),
+        "status": "awaiting_ui_apply",
+        "next_step_hint": (
+            "Preview prepared; tell the operator to use the UI Apply button. "
+            "Do not call preview=false from chat."
+        ),
+    }
+
+
+def _attach_action_plan_hint(target: Dict[str, Any], result: Mapping[str, Any]) -> Dict[str, Any]:
+    hint = _compact_action_plan_hint(result)
+    if hint:
+        target["action_plan"] = hint
+    return target
+
+
+def _new_turn_signal_ledger(user_text: Any = "") -> Dict[str, Any]:
+    return {
+        "user_query": _compact_signal_value(_extract_text_from_message_content(user_text), 220),
+        "tool_counts": {},
+        "context_budget": [],
+        "time_windows": [],
+        "coverage": [],
+        "evidence": [],
+        "semantic_signals": [],
+        "help_docs": [],
+        "restricted_help": [],
+        "actions": [],
+        "errors": [],
+    }
+
+
+def _record_turn_signal_ledger(
+    ledger: Dict[str, Any],
+    tool_name: str,
+    result: Any,
+    *,
+    error: Any = None,
+) -> None:
+    tool_counts = ledger.setdefault("tool_counts", {})
+    tool_counts[tool_name] = int(tool_counts.get(tool_name) or 0) + 1
+
+    if error is not None:
+        _signal_ledger_append(
+            ledger,
+            "errors",
+            {"tool": tool_name, "error": _compact_signal_value(error, 220)},
+        )
+        return
+    if not isinstance(result, Mapping):
+        return
+    if result.get("error"):
+        _signal_ledger_append(
+            ledger,
+            "errors",
+            {"tool": tool_name, "error": _compact_signal_value(result.get("error"), 220)},
+        )
+        return
+
+    if tool_name == "normalize_time_window":
+        _signal_ledger_append(
+            ledger,
+            "time_windows",
+            {
+                "from": result.get("from_local") or result.get("from_ts"),
+                "to": result.get("to_local") or result.get("to_ts"),
+                "duration_sec": result.get("duration_sec"),
+                "timezone": result.get("timezone"),
+            },
+            limit=4,
+        )
+        return
+
+    if tool_name == "lookup_help":
+        docs = result.get("results") if isinstance(result.get("results"), list) else []
+        restricted = result.get("restricted_matches") if isinstance(result.get("restricted_matches"), list) else []
+        for row in docs[:5]:
+            if not isinstance(row, Mapping):
+                continue
+            _signal_ledger_append(
+                ledger,
+                "help_docs",
+                {
+                    "section": row.get("section") or row.get("heading"),
+                    "doc": row.get("doc"),
+                    "score": row.get("score"),
+                },
+                limit=6,
+            )
+        if result.get("best_match_restricted"):
+            _signal_ledger_append(
+                ledger,
+                "restricted_help",
+                {
+                    "section": result.get("best_restricted_section"),
+                    "required_permission": result.get("best_required_permission"),
+                    "reason": "best_match_restricted",
+                },
+                limit=4,
+            )
+        for row in restricted[:4]:
+            if not isinstance(row, Mapping):
+                continue
+            _signal_ledger_append(
+                ledger,
+                "restricted_help",
+                {
+                    "section": row.get("section") or row.get("heading"),
+                    "required_permission": row.get("required_permission"),
+                    "score": row.get("score"),
+                },
+                limit=4,
+            )
+        return
+
+    if tool_name == "list_video_summary_channels":
+        candidates = result.get("candidate_channels") if isinstance(result.get("candidate_channels"), list) else []
+        _signal_ledger_append(
+            ledger,
+            "coverage",
+            {
+                "tool": tool_name,
+                "active": result.get("active_count"),
+                "inactive": result.get("inactive_count"),
+                "errors": result.get("error_count"),
+                "unchecked": result.get("unchecked_count"),
+                "deferred": result.get("deferred_count"),
+                "requires_confirmation": result.get("requires_confirmation"),
+                "quiet": result.get("quiet_channel_ids"),
+                "gapped": result.get("gapped_channel_ids"),
+                "desired_missing": [
+                    row.get("channel_id")
+                    for row in (result.get("desired_video_missing") or [])[:8]
+                    if isinstance(row, Mapping)
+                ],
+                "candidate_channels": [
+                    {
+                        "channel_id": row.get("channel_id"),
+                        "running": row.get("running"),
+                        "summary_count": row.get("summary_count"),
+                        "alert_total": row.get("alert_total"),
+                        "alert_parser_breakdown": row.get("alert_parser_breakdown"),
+                        "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                        "state_transition_total": row.get("state_transition_total"),
+                        "coverage_status": row.get("coverage_status"),
+                        "quiet": row.get("quiet"),
+                        "dropped_frames": row.get("dropped_frames"),
+                        "queue_dropped_batches": row.get("queue_dropped_batches"),
+                        "last_error": _compact_signal_value(row.get("last_error"), 120),
+                    }
+                    for row in candidates[:8]
+                    if isinstance(row, Mapping)
+                ],
+            },
+        )
+        errors = result.get("errors") if isinstance(result.get("errors"), list) else []
+        for row in errors[:4]:
+            if isinstance(row, Mapping):
+                _signal_ledger_append(
+                    ledger,
+                    "errors",
+                    {
+                        "tool": tool_name,
+                        "channel_id": row.get("channel_id"),
+                        "error": _compact_signal_value(row.get("error"), 220),
+                    },
+                )
+        return
+
+    if tool_name == "get_video_summaries":
+        coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
+        evidence_frames = result.get("evidence_frames") if isinstance(result.get("evidence_frames"), list) else []
+        _signal_ledger_append(
+            ledger,
+            "coverage",
+            {
+                "tool": tool_name,
+                "channel_id": result.get("channel_id"),
+                "depth": result.get("depth"),
+                "entries": result.get("count"),
+                "total_in_window": result.get("total_in_window"),
+                "status": coverage.get("status"),
+                "truncated": result.get("truncated") or result.get("backend_truncated") or coverage.get("truncated"),
+                "coverage_note": _compact_signal_value(coverage.get("operator_note") or coverage.get("note"), 220),
+                "provenance_totals": result.get("provenance_totals"),
+                "returned_provenance_totals": result.get("returned_provenance_totals"),
+            },
+        )
+        if evidence_frames or result.get("evidence_frame_totals") or result.get("totals"):
+            _signal_ledger_append(
+                ledger,
+                "evidence",
+                {
+                    "tool": tool_name,
+                    "channel_id": result.get("channel_id"),
+                    "returned_frames": len(evidence_frames),
+                    "totals": result.get("evidence_frame_totals") or result.get("totals"),
+                    "image_url_count": sum(1 for row in evidence_frames if isinstance(row, Mapping) and row.get("image_url")),
+                    "note": "missing image_url means no frame returned in this result set, not proof none exists",
+                },
+            )
+        return
+
+    if tool_name in {"search_archive", "get_detections", "build_research_batch"}:
+        rows_key = "results" if tool_name == "search_archive" else "detections"
+        rows = result.get(rows_key) if isinstance(result.get(rows_key), list) else []
+        _signal_ledger_append(
+            ledger,
+            "evidence",
+            {
+                "tool": tool_name,
+                "source": result.get("source"),
+                "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
+                "count": result.get("count") or result.get("returned") or len(rows),
+                "total": result.get("total_in_window"),
+                "image_url_count": sum(1 for row in rows if isinstance(row, Mapping) and row.get("image_url")),
+                "sample_ids": [
+                    row.get("id") or row.get("detection_id")
+                    for row in rows[:5]
+                    if isinstance(row, Mapping)
+                ],
+            },
+        )
+        return
+
+    if tool_name == "calibrate_probe_from_archive":
+        channels = result.get("channels") if isinstance(result.get("channels"), list) else []
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "score_semantics": result.get("score_semantics"),
+                "event_query": result.get("event_query"),
+                "contrast_query_effective": result.get("contrast_query_effective"),
+                "processed_channel_ids": result.get("processed_channel_ids"),
+                "deferred_channel_ids": result.get("deferred_channel_ids"),
+                "requires_continue": result.get("requires_continue"),
+                "channel_suggestions": [
+                    {
+                        "channel_id": row.get("channel_id"),
+                        "frame_count": row.get("frame_count"),
+                        "coverage_status": (row.get("coverage") or {}).get("status") if isinstance(row.get("coverage"), Mapping) else None,
+                        "suggested_thresholds": row.get("suggested_thresholds"),
+                    }
+                    for row in channels[:8]
+                    if isinstance(row, Mapping)
+                ],
+                "note": "Archive CLIP calibration is an initial threshold cue, not proof.",
+            },
+        )
+        image_count = 0
+        for row in channels:
+            if not isinstance(row, Mapping):
+                continue
+            reps = row.get("representative_frames") if isinstance(row.get("representative_frames"), Mapping) else {}
+            for frames in reps.values():
+                if isinstance(frames, list):
+                    image_count += sum(1 for frame in frames if isinstance(frame, Mapping) and frame.get("image_url"))
+        _signal_ledger_append(
+            ledger,
+            "evidence",
+            {
+                "tool": tool_name,
+                "processed_channels": result.get("processed_channel_ids"),
+                "image_url_count": image_count,
+                "note": "Representative frames should be inspected before applying probe thresholds.",
+            },
+        )
+        return
+
+    if tool_name == "prepare_probe_calibration_batch":
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "job_id": result.get("job_id"),
+                "status": result.get("status"),
+                "processed_this_call": result.get("processed_this_call"),
+                "processed_total": result.get("processed_total"),
+                "total_items": result.get("total_items"),
+                "remaining_count": result.get("remaining_count"),
+                "requires_continue": result.get("requires_continue"),
+                "next_batch_hint": result.get("next_batch_hint"),
+                "processed_items": [
+                    {
+                        "probe_name": row.get("probe_name"),
+                        "channel_id": row.get("channel_id"),
+                        "event_query": row.get("event_query"),
+                        "status": row.get("status"),
+                        "next_action": row.get("next_action"),
+                        "thresholds": row.get("suggested_thresholds"),
+                    }
+                    for row in (result.get("processed_items") or [])[:8]
+                    if isinstance(row, Mapping)
+                ],
+                "note": "Server-side batch state; continue with job_id instead of reconstructing from chat.",
+            },
+        )
+        return
+
+    if tool_name in {"get_visual_window_signals", "track_visual_state_transitions"}:
+        coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "channel_id": result.get("channel_id"),
+                "score_semantics": result.get("score_semantics"),
+                "pnm": result.get("pnm"),
+                "counts": result.get("counts"),
+                "frame_count": result.get("frame_count"),
+                "coverage_status": coverage.get("status"),
+                "warnings": result.get("warnings"),
+                "note": "CLIP/P-N-M/state transitions are candidate signals, not proof",
+            },
+        )
+        boundary_frames = result.get("boundary_frames") if isinstance(result.get("boundary_frames"), list) else []
+        candidate_frames = result.get("candidate_frames") if isinstance(result.get("candidate_frames"), list) else []
+        if boundary_frames or candidate_frames:
+            _signal_ledger_append(
+                ledger,
+                "evidence",
+                {
+                    "tool": tool_name,
+                    "boundary_frames": len(boundary_frames),
+                    "candidate_frames": len(candidate_frames),
+                    "image_url_count": sum(
+                        1
+                        for row in (boundary_frames + candidate_frames)
+                        if isinstance(row, Mapping) and row.get("image_url")
+                    ),
+                },
+            )
+        return
+
+    if tool_name == "count_video_summary_events":
+        coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "channel_id": result.get("channel_id"),
+                "score_semantics": result.get("score_semantics"),
+                "counts": result.get("counts"),
+                "total_in_window": result.get("total_in_window"),
+                "coverage_status": coverage.get("status"),
+                "note": "summary-text count, not exhaustive frame-level reanalysis",
+            },
+        )
+        return
+
+    if tool_name == "describe_frame":
+        _signal_ledger_append(
+            ledger,
+            "evidence",
+            {
+                "tool": tool_name,
+                "channel_id": result.get("channel_id"),
+                "source": result.get("source"),
+                "has_description": bool(str(result.get("description") or "").strip()),
+                "note": _compact_signal_value(result.get("note"), 180),
+            },
+        )
+        return
+
+    if tool_name in {"create_bookmark", "create_probe", "update_probe", "delete_probes", "update_prompt_settings"}:
+        _signal_ledger_append(
+            ledger,
+            "actions",
+            {
+                "tool": tool_name,
+                "status": result.get("status"),
+                "channel_id": result.get("channel_id"),
+                "action": result.get("action"),
+            },
+        )
+
+
+def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[str]:
+    tool_counts = ledger.get("tool_counts")
+    context_budget = ledger.get("context_budget")
+    has_context_budget = isinstance(context_budget, list) and bool(context_budget)
+    if (not isinstance(tool_counts, Mapping) or not tool_counts) and not has_context_budget:
+        return None
+    lines = [
+        "Internal per-turn signal ledger. Use it to balance the final answer; do not present it as a separate report unless the operator asks.",
+        "Treat this ledger as metadata about tool results, not as new scene evidence.",
+        "Tools used: "
+        + (
+            ", ".join(
+                f"{name}×{count}"
+                for name, count in sorted(tool_counts.items(), key=lambda item: str(item[0]))
+            )
+            if isinstance(tool_counts, Mapping) and tool_counts
+            else "none"
+        ),
+    ]
+    sections = [
+        ("Context budget signals", "context_budget"),
+        ("Time window signals", "time_windows"),
+        ("Coverage/health signals", "coverage"),
+        ("Evidence/frame signals", "evidence"),
+        ("Semantic/CLIP/count signals", "semantic_signals"),
+        ("Documentation/help signals", "help_docs"),
+        ("Restricted-help signals", "restricted_help"),
+        ("Mutation/action signals", "actions"),
+        ("Tool errors", "errors"),
+    ]
+    for label, key in sections:
+        rows = ledger.get(key)
+        if not isinstance(rows, list) or not rows:
+            continue
+        compact_rows = rows[:6]
+        text = json.dumps(compact_rows, ensure_ascii=False, default=str)
+        if len(text) > 1200:
+            text = text[:1199].rstrip() + "…"
+        lines.append(f"{label}: {text}")
+    lines.append(
+        "Answer discipline: report coverage/truncation/errors when present; separate visual evidence from summary text and CLIP candidates; cite docs for help answers; ask to narrow/continue when scope or tool budget is incomplete."
+    )
+    message = "\n".join(lines)
+    if len(message) > 4200:
+        message = message[:4100].rstrip() + "\n[ledger truncated: use detailed tool results for specifics]"
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -4967,7 +6512,40 @@ class AgentRunner:
     ) -> Any:
         if self._secure_tools is None:
             raise ToolGatewayError("Authorized agent tools are unavailable.")
-        return self._secure_tools.approve_and_execute(plan_id, tool_context)
+        result = self._secure_tools.approve_and_execute(plan_id, tool_context)
+        self._record_action_plan_receipt(plan_id, tool_context, result)
+        return result
+
+    def _record_action_plan_receipt(
+        self,
+        plan_id: str,
+        tool_context: ToolExecutionContext,
+        result: Any,
+    ) -> None:
+        session_id = tool_context.session_id
+        if not session_id:
+            return
+        owner = {
+            "tenant_id": tool_context.tenant_id,
+            "actor_id": tool_context.actor_id,
+        }
+        try:
+            if not self.store.session_exists(session_id, **owner):
+                return
+            receipt = _trusted_action_receipt_from_result(plan_id, result)
+            self.store.add_message(
+                session_id,
+                role="system",
+                content=_format_trusted_action_receipt_for_model(receipt),
+                tool_name="action_receipt",
+                tool_result=json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+                **owner,
+            )
+        except Exception:
+            # The action already executed. Receipt persistence is diagnostic context,
+            # not part of the approval transaction, so do not turn a successful apply
+            # into an operator-visible failure.
+            return
 
     def stream_chat(
         self,
@@ -5047,6 +6625,7 @@ class AgentRunner:
         # ── build messages for LM ──────────────────────────────────────────
         requested_skill_slugs = _extract_requested_skill_slugs(user_content)
         user_text = _extract_text_from_message_content(user_content)
+        turn_signal_ledger = _new_turn_signal_ledger(user_text)
         if "probe_tuning" in requested_skill_slugs:
             normalized_user_text = _normalize_probe_match_text(user_text)
             wants_all_probes = any(
@@ -5107,12 +6686,27 @@ class AgentRunner:
             secure_tool_mode=tool_context is not None,
         )
         history = self.store.load_history(session_id, **store_owner)
+        history_prefix, history_budget = _trim_history_for_context_budget(history[:-1])
+        if history_budget.get("trimmed_messages"):
+            _signal_ledger_append(
+                turn_signal_ledger,
+                "context_budget",
+                {"phase": "history_trim", **history_budget},
+                limit=4,
+            )
 
         # Replace the stored user content with the full (possibly image-bearing) one
         in_flight: List[Dict[str, Any]] = (
             [{"role": "system", "content": system_prompt}]
-            + history[:-1]                          # all but the just-added user msg
+            + history_prefix                         # all but the just-added user msg, trimmed by budget
             + [{"role": "user", "content": user_content}]
+        )
+        initial_budget = _context_budget_snapshot(in_flight)
+        _signal_ledger_append(
+            turn_signal_ledger,
+            "context_budget",
+            {"phase": "initial_prompt", **initial_budget},
+            limit=4,
         )
 
         # Accumulated messages from this turn (to persist after streaming)
@@ -5135,6 +6729,8 @@ class AgentRunner:
 
         # ── tool loop ──────────────────────────────────────────────────────
         tool_calls_used = 0
+        context_warning_sent = False
+        context_hard_stop_sent = False
         while True:
             if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
                 in_flight.append(
@@ -5158,6 +6754,67 @@ class AgentRunner:
                     }
                 )
                 break
+            active_budget = _context_budget_snapshot(in_flight)
+            if (
+                active_budget["estimated_tokens"] >= AGENT_CONTEXT_HARD_TOKENS
+                and not context_hard_stop_sent
+            ):
+                context_hard_stop_sent = True
+                _signal_ledger_append(
+                    turn_signal_ledger,
+                    "context_budget",
+                    {"phase": "hard_stop", **active_budget},
+                    limit=4,
+                )
+                in_flight.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Agent context budget is near the configured hard limit. "
+                            "Stop using tools in this turn. Give a concise partial answer, "
+                            "state what remains unchecked, and ask the operator to continue "
+                            "with a narrower channel/time scope if needed."
+                        ),
+                    }
+                )
+                yield _sse(
+                    {
+                        "type": "context_budget",
+                        "status": "hard_stop",
+                        "estimated_tokens": active_budget["estimated_tokens"],
+                        "hard_tokens": AGENT_CONTEXT_HARD_TOKENS,
+                    }
+                )
+                break
+            if (
+                active_budget["estimated_tokens"] >= AGENT_CONTEXT_WARNING_TOKENS
+                and not context_warning_sent
+            ):
+                context_warning_sent = True
+                _signal_ledger_append(
+                    turn_signal_ledger,
+                    "context_budget",
+                    {"phase": "warning", **active_budget},
+                    limit=4,
+                )
+                in_flight.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Agent context budget is high. Prefer compact summaries, "
+                            "avoid broad additional searches, and report any remaining "
+                            "unchecked scope explicitly."
+                        ),
+                    }
+                )
+                yield _sse(
+                    {
+                        "type": "context_budget",
+                        "status": "warning",
+                        "estimated_tokens": active_budget["estimated_tokens"],
+                        "warning_tokens": AGENT_CONTEXT_WARNING_TOKENS,
+                    }
+                )
             # Run the blocking LM call in a thread so we can emit heartbeats
             lm_response: _LMResponse
             try:
@@ -5213,6 +6870,12 @@ class AgentRunner:
                     }
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}
+                    _record_turn_signal_ledger(
+                        turn_signal_ledger,
+                        tc.name,
+                        error_payload,
+                        error=error_payload["error"],
+                    )
                     yield _sse({"type": "tool_result", "name": tc.name,
                                 "result": error_payload, "error": error_payload["error"]})
                     in_flight.append(result_msg)
@@ -5244,6 +6907,7 @@ class AgentRunner:
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(result_for_model, default=str)}
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
+                    _record_turn_signal_ledger(turn_signal_ledger, tc.name, result_for_model)
                     yield _sse({
                         "type": "tool_result",
                         "name": tc.name,
@@ -5251,14 +6915,34 @@ class AgentRunner:
                     })
                 except (ToolError, ToolGatewayError) as exc:
                     error_payload = {"error": str(exc)}
+                    code = getattr(exc, "code", None)
+                    if code:
+                        error_payload["code"] = str(code)
+                        if str(code) == "approval_required":
+                            error_payload["next_step_hint"] = (
+                                "Do not retry with preview=false from chat. "
+                                "Use the UI Apply button for an existing preview/action plan."
+                            )
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}
+                    _record_turn_signal_ledger(
+                        turn_signal_ledger,
+                        tc.name,
+                        error_payload,
+                        error=str(exc),
+                    )
                     yield _sse({"type": "tool_result", "name": tc.name,
                                 "result": error_payload, "error": str(exc)})
                 except Exception as exc:
                     error_payload = {"error": f"Internal tool error: {exc}"}
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}
+                    _record_turn_signal_ledger(
+                        turn_signal_ledger,
+                        tc.name,
+                        error_payload,
+                        error=str(exc),
+                    )
                     yield _sse({"type": "tool_result", "name": tc.name,
                                 "result": error_payload, "error": str(exc)})
 
@@ -5266,6 +6950,10 @@ class AgentRunner:
                 new_assistant_messages.append(result_msg)
 
         # ── final streaming text response ──────────────────────────────────
+        signal_ledger_message = _format_turn_signal_ledger_message(turn_signal_ledger)
+        if signal_ledger_message:
+            in_flight.append({"role": "system", "content": signal_ledger_message})
+
         full_text_parts: List[str] = []
         try:
             for chunk in self._lm_client.stream_text(in_flight):
@@ -5575,6 +7263,153 @@ def _normalize_summary_depth(value: Any) -> str:
     return "L1"
 
 
+def _compact_int_breakdown(value: Any) -> Dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: Dict[str, int] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key or "").strip().lower()
+        if not key:
+            continue
+        parsed = _opt_int(raw_value)
+        if parsed is None or parsed <= 0:
+            continue
+        out[key[:80]] = out.get(key[:80], 0) + int(parsed)
+    return out
+
+
+def _merge_int_breakdowns(values: Iterable[Any]) -> Dict[str, int]:
+    merged: Dict[str, int] = {}
+    for value in values:
+        for key, count in _compact_int_breakdown(value).items():
+            merged[key] = merged.get(key, 0) + int(count)
+    return merged
+
+
+def _compact_vlm_alert_events_for_model(value: Any, limit: int = 6) -> List[Dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        event: Dict[str, Any] = {
+            "title": _compact_signal_value(raw.get("title") or raw.get("description") or "Event", 120),
+            "severity": str(raw.get("severity") or "normal").strip().lower()[:20] or "normal",
+            "delivery_status": str(raw.get("delivery_status") or "unknown").strip().lower()[:40] or "unknown",
+        }
+        description = _compact_signal_value(raw.get("description"), 180)
+        if description:
+            event["description"] = description
+        timestamp_ms = _opt_int(raw.get("timestamp_ms"))
+        if timestamp_ms is not None:
+            event["timestamp_ms"] = int(timestamp_ms)
+        error = _compact_signal_value(raw.get("error"), 160)
+        if error:
+            event["error"] = error
+        rows.append(event)
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows
+
+
+def _compact_state_observations_for_model(value: Any, limit: int = 8) -> List[Dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        key = str(raw.get("key") or "").strip()[:80]
+        state = str(raw.get("state") or "").strip().lower()[:20]
+        if not key or state not in {"present", "absent", "unknown"}:
+            continue
+        rows.append(
+            {
+                "key": key,
+                "label": _compact_signal_value(raw.get("label") or key, 120),
+                "state": state,
+                "evidence": _compact_signal_value(raw.get("evidence"), 180),
+            }
+        )
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows
+
+
+def _compact_state_transitions_for_model(value: Any, limit: int = 8) -> List[Dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            continue
+        key = str(raw.get("key") or "").strip()[:80]
+        event_type = str(raw.get("event_type") or "").strip().lower()[:40]
+        if not key or event_type not in {"appearance", "disappearance", "state_change"}:
+            continue
+        event: Dict[str, Any] = {
+            "key": key,
+            "label": _compact_signal_value(raw.get("label") or key, 120),
+            "event_type": event_type,
+            "from_state": str(raw.get("from_state") or "unknown").strip().lower()[:20],
+            "to_state": str(raw.get("to_state") or "unknown").strip().lower()[:20],
+            "evidence": _compact_signal_value(raw.get("evidence"), 180),
+            "source": str(raw.get("source") or "vlm_current_observed_state").strip()[:80],
+        }
+        timestamp_ms = _opt_int(raw.get("timestamp_ms"))
+        if timestamp_ms is not None:
+            event["timestamp_ms"] = int(timestamp_ms)
+        for field in ("confirmations", "required_confirmations"):
+            parsed = _opt_int(raw.get(field))
+            if parsed is not None:
+                event[field] = int(parsed)
+        rows.append(event)
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows
+
+
+def _summary_log_parser_breakdown(row: Mapping[str, Any]) -> Dict[str, int]:
+    parser_count = _opt_int(row.get("parser_alert_count"))
+    if parser_count is None:
+        parser_count = _opt_int(row.get("alerts_parsed")) or 0
+    json_count = _opt_int(row.get("json_alert_count")) or 0
+    prose_count = _opt_int(row.get("prose_alert_count")) or 0
+    breakdown = {
+        "parser_alert_count": int(max(0, parser_count or 0)),
+        "json_alert_count": int(max(0, json_count)),
+        "prose_alert_count": int(max(0, prose_count)),
+        "prose_only_signal_count": int(max(0, prose_count - json_count)),
+    }
+    return {key: value for key, value in breakdown.items() if value > 0}
+
+
+def _summary_log_delivery_breakdown(row: Mapping[str, Any]) -> Dict[str, int]:
+    breakdown: Dict[str, int] = {}
+    events = row.get("alert_events")
+    if isinstance(events, Sequence) and not isinstance(events, (str, bytes, bytearray)):
+        for raw_event in events:
+            if not isinstance(raw_event, Mapping):
+                continue
+            status = str(raw_event.get("delivery_status") or "unknown").strip().lower() or "unknown"
+            breakdown[status[:80]] = breakdown.get(status[:80], 0) + 1
+    if not breakdown:
+        for key, status in (
+            ("bookmarks_sent", "sent"),
+            ("bookmark_failed_count", "failed"),
+            ("bookmark_cooldown_skipped_count", "cooldown_skipped"),
+            ("bookmark_skipped_duplicate_count", "cooldown_skipped"),
+        ):
+            parsed = _opt_int(row.get(key)) or 0
+            if parsed > 0:
+                breakdown[status] = breakdown.get(status, 0) + int(parsed)
+    total = sum(value for value in breakdown.values() if value > 0)
+    if total > 0:
+        breakdown["total"] = total
+    return breakdown
+
+
 def _summary_node_bounds(node: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     start = _coerce_epoch_seconds(node.get("window_start"))
     if start is None:
@@ -5602,6 +7437,56 @@ def _summary_node_overlaps(node: Mapping[str, Any], from_ts: float, to_ts: float
     if start_f == end_f:
         return from_f <= start_f <= to_f
     return end_f > from_f and start_f < to_f
+
+
+def _summary_provenance_totals(nodes: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not nodes:
+        return {}
+    parser_breakdown = _merge_int_breakdowns(node.get("alert_parser_breakdown") for node in nodes if isinstance(node, Mapping))
+    delivery_breakdown = _merge_int_breakdowns(node.get("alert_delivery_breakdown") for node in nodes if isinstance(node, Mapping))
+    state_transition_total = 0
+    l0_alert_event_entries = 0
+    l0_state_observation_entries = 0
+    l0_state_transition_entries = 0
+    structured_alert_event_count = 0
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            continue
+        level = str(node.get("level") or "").strip().upper()
+        state_transition_total += int(_opt_int(node.get("state_transition_total")) or 0)
+        alert_events = node.get("alert_events")
+        state_observations = node.get("state_observations")
+        state_transition_events = node.get("state_transition_events")
+        if isinstance(alert_events, Sequence) and not isinstance(alert_events, (str, bytes, bytearray)):
+            structured_alert_event_count += len([item for item in alert_events if isinstance(item, Mapping)])
+            if level == "L0" and alert_events:
+                l0_alert_event_entries += 1
+        if level == "L0" and isinstance(state_observations, Sequence) and not isinstance(state_observations, (str, bytes, bytearray)) and state_observations:
+            l0_state_observation_entries += 1
+        if level == "L0" and isinstance(state_transition_events, Sequence) and not isinstance(state_transition_events, (str, bytes, bytearray)) and state_transition_events:
+            l0_state_transition_entries += 1
+    out: Dict[str, Any] = {}
+    if parser_breakdown:
+        out["alert_parser_breakdown"] = parser_breakdown
+    if delivery_breakdown:
+        out["alert_delivery_breakdown"] = delivery_breakdown
+    if state_transition_total > 0:
+        out["state_transition_total"] = int(state_transition_total)
+    if structured_alert_event_count > 0:
+        out["structured_alert_event_count"] = int(structured_alert_event_count)
+    if l0_alert_event_entries > 0:
+        out["l0_alert_event_entries"] = int(l0_alert_event_entries)
+    if l0_state_observation_entries > 0:
+        out["l0_state_observation_entries"] = int(l0_state_observation_entries)
+    if l0_state_transition_entries > 0:
+        out["l0_state_transition_entries"] = int(l0_state_transition_entries)
+    prose_only = int(parser_breakdown.get("prose_only_signal_count") or 0)
+    if prose_only > 0:
+        out["unconfirmed_prose_signal_count"] = prose_only
+        out["unconfirmed_prose_note"] = (
+            "Prose-only alert-like text may be memory contamination or a structured-output miss; verify important cases with frames."
+        )
+    return out
 
 
 def _summary_coverage_from_nodes(
@@ -6160,6 +8045,193 @@ def _visual_signal_pnm(
         "state": state,
         "score_semantics": "clip_retrieval_signal_not_proof",
         "note": notes.get(state, "Use this as attention signal only."),
+    }
+
+
+def _score_distribution(values: Sequence[Any]) -> Dict[str, Any]:
+    clean = sorted(
+        float(parsed)
+        for value in values
+        for parsed in [_opt_float(value)]
+        if parsed is not None and np.isfinite(float(parsed))
+    )
+    if not clean:
+        return {"count": 0}
+    arr = np.asarray(clean, dtype=np.float32)
+    return {
+        "count": int(arr.size),
+        "min": float(np.min(arr)),
+        "q10": float(np.quantile(arr, 0.10)),
+        "q25": float(np.quantile(arr, 0.25)),
+        "median": float(np.quantile(arr, 0.50)),
+        "q75": float(np.quantile(arr, 0.75)),
+        "q90": float(np.quantile(arr, 0.90)),
+        "max": float(np.max(arr)),
+        "mean": float(np.mean(arr)),
+    }
+
+
+def _calibration_frame_public(sample: Mapping[str, Any]) -> Dict[str, Any]:
+    row = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
+    public = _compact_detection_for_model(cast(Dict[str, Any], row)) if row else {}
+    for key in (
+        "positive_score",
+        "negative_score",
+        "margin",
+        "pnm_state",
+        "timestamp_ms",
+        "time",
+        "source",
+        "source_label",
+        "image_url",
+        "detection_id",
+    ):
+        if key in sample:
+            public[key] = sample.get(key)
+    public["needs_describe_frame"] = bool(public.get("image_url"))
+    return public
+
+
+def _unique_calibration_samples(samples: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    seen: set[Any] = set()
+    unique: List[Mapping[str, Any]] = []
+    for sample in samples:
+        key = sample.get("detection_id") or (sample.get("timestamp_ms"), sample.get("source"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(sample)
+    return unique
+
+
+def _calibration_representative_frames(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    evidence_limit: int,
+) -> Dict[str, List[Dict[str, Any]]]:
+    per_bucket = max(1, min(6, evidence_limit // 3 or 1))
+
+    def take(rows: Sequence[Mapping[str, Any]], key: Callable[[Mapping[str, Any]], Any], *, reverse: bool = True) -> List[Dict[str, Any]]:
+        ordered = sorted(rows, key=key, reverse=reverse)
+        return [
+            _calibration_frame_public(row)
+            for row in _unique_calibration_samples(ordered)[:per_bucket]
+        ]
+
+    with_margin = [row for row in samples if _opt_float(row.get("margin")) is not None]
+    return {
+        "top_positive": take(
+            samples,
+            lambda row: (float(row.get("positive_score") or -999.0), int(row.get("timestamp_ms") or 0)),
+        ),
+        "top_margin": take(
+            with_margin,
+            lambda row: (float(row.get("margin") or -999.0), float(row.get("positive_score") or -999.0)),
+        ),
+        "ambiguous": take(
+            with_margin,
+            lambda row: (abs(float(row.get("margin") or 0.0)), -float(row.get("positive_score") or 0.0)),
+            reverse=False,
+        ),
+        "background_like": take(
+            with_margin,
+            lambda row: (-float(row.get("margin") or 0.0), float(row.get("negative_score") or -999.0)),
+        ),
+    }
+
+
+def _suggest_probe_thresholds_from_samples(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    min_frames: int,
+    has_contrast: bool,
+) -> Dict[str, Any]:
+    pos_values = [
+        float(value)
+        for sample in samples
+        for value in [_opt_float(sample.get("positive_score"))]
+        if value is not None
+    ]
+    margins = [
+        float(value)
+        for sample in samples
+        for value in [_opt_float(sample.get("margin"))]
+        if value is not None
+    ]
+    positive_like = [
+        sample for sample in samples
+        if _opt_float(sample.get("margin")) is not None and float(sample.get("margin") or 0.0) >= 0.0
+    ]
+    background_like = [
+        sample for sample in samples
+        if _opt_float(sample.get("margin")) is not None and float(sample.get("margin") or 0.0) < 0.0
+    ]
+    warnings: List[str] = []
+    if len(samples) < min_frames:
+        warnings.append("few_frames")
+    if not has_contrast:
+        warnings.append("no_contrast_margin")
+    if not pos_values:
+        return {
+            "pos_floor": 0.20,
+            "margin_thr": 0.03,
+            "confidence": "low",
+            "warnings": ["no_scored_frames", *warnings],
+            "rationale": "No scored archive frames were available; using conservative defaults.",
+        }
+
+    if positive_like:
+        positive_scores = [float(sample.get("positive_score") or 0.0) for sample in positive_like]
+        positive_margins = [float(sample.get("margin") or 0.0) for sample in positive_like]
+        pos_floor = float(np.quantile(np.asarray(positive_scores, dtype=np.float32), 0.25))
+        margin_thr = float(np.quantile(np.asarray(positive_margins, dtype=np.float32), 0.25))
+    else:
+        pos_floor = float(np.quantile(np.asarray(pos_values, dtype=np.float32), 0.75))
+        margin_thr = 0.03
+        warnings.append("no_positive_separation")
+
+    pos_floor = max(0.05, min(0.95, pos_floor * 0.98))
+    if not has_contrast:
+        margin_thr = 0.0
+    else:
+        margin_thr = max(0.0, min(0.50, margin_thr * 0.85))
+        if margin_thr < 0.01 and positive_like:
+            warnings.append("weak_margin_separation")
+
+    median_margin = float(np.median(np.asarray(margins, dtype=np.float32))) if margins else None
+    top_margin = max(margins) if margins else None
+    positive_ratio = len(positive_like) / max(1, len(samples))
+    confidence = "low"
+    if len(samples) >= min_frames and has_contrast and top_margin is not None:
+        if top_margin >= 0.08 and positive_ratio >= 0.10:
+            confidence = "medium"
+        if median_margin is not None and median_margin >= 0.03 and positive_ratio >= 0.25:
+            confidence = "high"
+    if background_like and positive_like:
+        bg_margin_q75 = float(np.quantile(
+            np.asarray([float(sample.get("margin") or 0.0) for sample in background_like], dtype=np.float32),
+            0.75,
+        ))
+        pos_margin_q25 = float(np.quantile(
+            np.asarray([float(sample.get("margin") or 0.0) for sample in positive_like], dtype=np.float32),
+            0.25,
+        ))
+        if pos_margin_q25 <= bg_margin_q75 + 0.02:
+            warnings.append("overlapping_positive_background_margins")
+            confidence = "low" if confidence == "medium" else confidence
+
+    return {
+        "pos_floor": round(float(pos_floor), 4),
+        "margin_thr": round(float(margin_thr), 4),
+        "confidence": confidence,
+        "positive_like_count": len(positive_like),
+        "background_like_count": len(background_like),
+        "ambiguous_count": sum(1 for value in margins if abs(float(value)) < 0.03),
+        "warnings": warnings,
+        "rationale": (
+            "Suggested from archive CLIP P/N/M quantiles. Use as initial preview "
+            "thresholds only; inspect representative frames and observe post-change hits."
+        ),
     }
 
 
@@ -6806,13 +8878,65 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
     current = result.get("current") if isinstance(result.get("current"), dict) else result
     rollups = current.get("rollup_prompts") if isinstance(current.get("rollup_prompts"), dict) else {}
     stream_prompt = str(current.get("stream_system_prompt") or "")
+    alert_policy_prompt = str(current.get("alert_policy_prompt") or "")
     json_prompt = str(current.get("json_alert_prompt") or "")
+    health = current.get("prompt_health") if isinstance(current.get("prompt_health"), dict) else {}
+    prompt_layers = current.get("prompt_layers") if isinstance(current.get("prompt_layers"), Mapping) else {}
+    compact_layers: Dict[str, Any] = {}
+    layer_semantics = {
+        "stream": "L0 live-description role/style; not channel-specific alert criteria.",
+        "alerts": "Operator watch/alert criteria; EVA appends backend alert instructions around this layer.",
+        "json": "Machine-readable ALERTS_JSON extraction contract; do not edit for ordinary watch conditions.",
+        "rollups": "L1/L2/L3 compressed memory maps; context for investigation, not visual proof.",
+    }
+    for layer_name in ("stream", "alerts", "json"):
+        raw_layer = prompt_layers.get(layer_name) if isinstance(prompt_layers, Mapping) else None
+        if not isinstance(raw_layer, Mapping):
+            continue
+        compact_layers[layer_name] = {
+            "semantics": layer_semantics[layer_name],
+            "notes": [
+                _compact_signal_value(note, 180)
+                for note in list(raw_layer.get("notes") or [])[:3]
+                if str(note or "").strip()
+            ],
+            "warnings": [
+                _compact_signal_value(warning, 180)
+                for warning in list(raw_layer.get("warnings") or [])[:3]
+                if str(warning or "").strip()
+            ],
+        }
+    rollup_layers = prompt_layers.get("rollups") if isinstance(prompt_layers.get("rollups"), Mapping) else {}
+    if isinstance(rollup_layers, Mapping):
+        compact_layers["rollups"] = {
+            "semantics": layer_semantics["rollups"],
+            "levels": {
+                level: {
+                    "notes": [
+                        _compact_signal_value(note, 160)
+                        for note in list((layer or {}).get("notes") or [])[:2]
+                        if isinstance(layer, Mapping) and str(note or "").strip()
+                    ]
+                }
+                for level, layer in rollup_layers.items()
+                if str(level).strip().upper() in {"L1", "L2", "L3"} and isinstance(layer, Mapping)
+            },
+        }
     return {
         "scope": current.get("scope") or result.get("scope"),
         "channel_id": current.get("channel_id") or result.get("channel_id"),
         "stream_system_prompt": stream_prompt[:1000],
         "L0_live_prompt": stream_prompt[:1000],
+        "alert_policy_prompt": alert_policy_prompt[:1000],
         "json_alert_prompt": json_prompt[:800],
+        "prompt_health": {
+            "needs_migration": bool(health.get("needs_migration")),
+            "warnings": list(health.get("warnings") or [])[:4],
+            "candidate_alert_policy_lines": list(health.get("candidate_alert_policy_lines") or [])[:8],
+            "suggested_stream_system_prompt": str(health.get("suggested_stream_system_prompt") or "")[:1000],
+            "suggested_alert_policy_prompt": str(health.get("suggested_alert_policy_prompt") or "")[:1000],
+        },
+        "prompt_layers": compact_layers,
         "rollup_prompts": {
             level: str(prompt or "")[:600]
             for level, prompt in rollups.items()
@@ -6956,6 +9080,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "period": result.get("period"),
             "coverage": result.get("coverage"),
             "summary": result.get("summary"),
+            "pipeline_health": result.get("pipeline_health"),
             "report": result.get("report"),
         }
         if result.get("report_type") == "probes":
@@ -6988,6 +9113,9 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "desired": row.get("desired"),
                     "alert_total": row.get("alert_total"),
                     "alert_counts": row.get("alert_counts"),
+                    "alert_parser_breakdown": row.get("alert_parser_breakdown"),
+                    "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                    "state_transition_total": row.get("state_transition_total"),
                     "coverage_status": row.get("coverage_status"),
                     "coverage_gap_count": row.get("coverage_gap_count"),
                     "quiet": row.get("quiet"),
@@ -7080,6 +9208,9 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "latest_time": row.get("latest_time"),
                     "alert_total": row.get("alert_total"),
                     "alert_counts": row.get("alert_counts"),
+                    "alert_parser_breakdown": row.get("alert_parser_breakdown"),
+                    "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                    "state_transition_total": row.get("state_transition_total"),
                     "running": row.get("running"),
                     "desired": row.get("desired"),
                     "run_count": row.get("run_count"),
@@ -7120,6 +9251,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "attempted_sources": result.get("attempted_sources"),
             "evidence_frame_totals": result.get("evidence_frame_totals"),
             "totals": result.get("totals"),
+            "provenance_totals": result.get("provenance_totals"),
+            "returned_provenance_totals": result.get("returned_provenance_totals"),
             "evidence_frames": [
                 _compact_detection_for_model(row)
                 for row in evidence_frames[:8]
@@ -7137,6 +9270,14 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "alert_total": row.get("alert_total"),
                     "alert_counts": row.get("alert_counts"),
                     "alert_severities": row.get("alert_severities"),
+                    "alert_parser_breakdown": row.get("alert_parser_breakdown"),
+                    "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                    "state_transition_total": row.get("state_transition_total"),
+                    "alert_events": row.get("alert_events"),
+                    "state_observations": row.get("state_observations"),
+                    "state_transition_events": row.get("state_transition_events"),
+                    "unconfirmed_prose_signal_count": row.get("unconfirmed_prose_signal_count"),
+                    "unconfirmed_prose_note": row.get("unconfirmed_prose_note"),
                     "summary": row.get("summary"),
                 }
                 for row in entries[:20]
@@ -7265,6 +9406,100 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             ],
         }
 
+    if tool_name == "calibrate_probe_from_archive":
+        channels = result.get("channels") if isinstance(result.get("channels"), list) else []
+
+        def compact_reps(representatives: Any) -> Dict[str, List[Dict[str, Any]]]:
+            if not isinstance(representatives, Mapping):
+                return {}
+            compacted: Dict[str, List[Dict[str, Any]]] = {}
+            for key, frames in representatives.items():
+                if not isinstance(frames, list):
+                    continue
+                compacted[str(key)] = [
+                    _compact_detection_for_model(frame)
+                    | {
+                        "positive_score": frame.get("positive_score"),
+                        "negative_score": frame.get("negative_score"),
+                        "margin": frame.get("margin"),
+                        "pnm_state": frame.get("pnm_state"),
+                    }
+                    for frame in frames[:3]
+                    if isinstance(frame, dict)
+                ]
+            return compacted
+
+        return {
+            "event_query": result.get("event_query"),
+            "contrast_query": result.get("contrast_query"),
+            "contrast_query_effective": result.get("contrast_query_effective"),
+            "sources": result.get("sources"),
+            "time_window": result.get("time_window"),
+            "score_semantics": result.get("score_semantics"),
+            "processed_channel_ids": result.get("processed_channel_ids"),
+            "deferred_channel_ids": result.get("deferred_channel_ids"),
+            "deferred_count": result.get("deferred_count"),
+            "requires_continue": result.get("requires_continue"),
+            "next_batch_hint": result.get("next_batch_hint"),
+            "operator_note": result.get("operator_note"),
+            "channels": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "frame_count": row.get("frame_count"),
+                    "source_totals": row.get("source_totals"),
+                    "source_returned": row.get("source_returned"),
+                    "coverage": row.get("coverage"),
+                    "distributions": row.get("distributions"),
+                    "suggested_thresholds": row.get("suggested_thresholds"),
+                    "warnings": row.get("warnings"),
+                    "representative_frames": compact_reps(row.get("representative_frames")),
+                }
+                for row in channels[:AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN]
+                if isinstance(row, dict)
+            ],
+        }
+
+    if tool_name == "prepare_probe_calibration_batch":
+        processed_items = result.get("processed_items") if isinstance(result.get("processed_items"), list) else []
+        return {
+            "job_id": result.get("job_id"),
+            "workflow_type": result.get("workflow_type"),
+            "status": result.get("status"),
+            "processed_this_call": result.get("processed_this_call"),
+            "processed_total": result.get("processed_total"),
+            "total_items": result.get("total_items"),
+            "remaining_count": result.get("remaining_count"),
+            "remaining_items": result.get("remaining_items"),
+            "requires_continue": result.get("requires_continue"),
+            "next_batch_hint": result.get("next_batch_hint"),
+            "output_contract": result.get("output_contract"),
+            "errors": result.get("errors"),
+            "processed_items": [
+                {
+                    "status": row.get("status"),
+                    "item_id": row.get("item_id"),
+                    "probe_id": row.get("probe_id"),
+                    "probe_name": row.get("probe_name"),
+                    "channel_id": row.get("channel_id"),
+                    "event_query": row.get("event_query"),
+                    "contrast_query_effective": row.get("contrast_query_effective"),
+                    "frame_count": row.get("frame_count"),
+                    "coverage": row.get("coverage"),
+                    "suggested_thresholds": row.get("suggested_thresholds"),
+                    "warnings": row.get("warnings"),
+                    "next_action": row.get("next_action"),
+                    "recommended_probe_args": row.get("recommended_probe_args"),
+                    "representative_frames": {
+                        key: frames[:2]
+                        for key, frames in (row.get("representative_frames") or {}).items()
+                        if isinstance(frames, list)
+                    },
+                }
+                for row in processed_items[:8]
+                if isinstance(row, dict)
+            ],
+        }
+
     if tool_name == "list_probes":
         rows = result.get("probes") if isinstance(result.get("probes"), list) else []
         return {
@@ -7310,7 +9545,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if tool_name == "create_probe":
         probe = result.get("probe") if isinstance(result.get("probe"), dict) else result.get("proposed")
         conflicts = result.get("conflicts") if isinstance(result.get("conflicts"), list) else []
-        return {
+        return _attach_action_plan_hint({
             "status": result.get("status"),
             "action": result.get("action"),
             "exists": result.get("exists"),
@@ -7322,11 +9557,11 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 for row in conflicts[:8]
                 if isinstance(row, dict)
             ],
-        }
+        }, result)
 
     if tool_name == "delete_probes":
         rows = result.get("targets") if isinstance(result.get("targets"), list) else []
-        return {
+        return _attach_action_plan_hint({
             "status": result.get("status"),
             "delete_all": result.get("delete_all"),
             "deleted": result.get("deleted"),
@@ -7336,7 +9571,15 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 for row in rows[:12]
                 if isinstance(row, dict)
             ],
-        }
+        }, result)
+
+    if tool_name == "update_probe":
+        return _attach_action_plan_hint({
+            "status": result.get("status"),
+            "probe_id": result.get("probe_id"),
+            "probe_name": result.get("probe_name"),
+            "diff": _strip_thumbnails_deep(result.get("diff")),
+        }, result)
 
     if tool_name == "describe_frame":
         return {
@@ -7353,6 +9596,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if tool_name == "update_prompt_settings":
         compact = dict(result)
         compact.pop("approval", None)
+        _attach_action_plan_hint(compact, result)
         if isinstance(compact.get("current"), dict):
             compact["current"] = _compact_prompt_settings_for_model({"current": compact["current"]})
         if isinstance(compact.get("proposed"), dict):

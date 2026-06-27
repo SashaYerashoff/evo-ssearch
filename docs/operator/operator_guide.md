@@ -52,6 +52,10 @@ This is the main investigation surface.
   fresh read.
 - For "how many times X happened" questions, the agent returns **candidates** with
   boundary frames — confirm visually before treating as fact.
+- Trust evidence by provenance: routine background is context; L0/L1/L2 prose is
+  a candidate unless structured alert/state data supports it; backend
+  `state_transition_events` are stronger cross-batch candidates; visual proof
+  requires a frame plus a fresh `describe_frame` read.
 
 Good asks (see [operator_scenarios](operator_scenarios.md) for more):
 - "Across active channels, were there public-order alerts today? List the worst."
@@ -81,10 +85,26 @@ can view the Probe Board; creating/tuning probes is an engineer/agent task. (A
 curated watch-list probe set may be cast on demo channels as a safety-net
 detector — see the demo runbook.)
 
+If you want a second layer for video-description alerts, ask the agent to create
+**probe previews** from the alert classes. The agent should translate the alert
+into generic visual wording (not private names) and use visible background states
+as contrasts. Example: *"Create preview probes to double-check the current
+video-description alerts on active channels."* Review the preview before any
+change is applied.
+
+For higher confidence, ask for calibration first: *"Calibrate preview probes for
+fighting alerts on active channels using the last 24 hours of archive evidence."*
+The agent will process up to 8 channels at a time, show which channels were
+deferred, and propose thresholds from archive P/N/M signals. Calibration is still
+a candidate signal — inspect representative frames before applying changes.
+
 ## 6. Settings / Admin
 
 Server, Search, Models, Advanced, plus user/role/audit for admins. See
 [admin_guide](../admin/admin_guide.md). Most demo operation needs none of this.
+For alert behavior, **Alert Criteria** is the plain-language watch policy
+(`alert_policy_prompt`); it is separate from the L0 description prompt and the
+structured alert-output template.
 
 ## 7. Run your first investigation in 5 minutes
 

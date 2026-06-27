@@ -4,7 +4,11 @@ from agent import (
     AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN,
     AgentTools,
     _apply_turn_tool_context,
+    _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
+    _format_turn_signal_ledger_message,
+    _new_turn_signal_ledger,
+    _record_turn_signal_ledger,
     _remember_turn_tool_result,
     _seed_turn_tool_context,
     _tool_result_for_ui,
@@ -228,10 +232,18 @@ class _DetectionStore:
         return prepared
 
 
-def _tools(manager=None, search_detections_fn=None, detections_store=None, call_lm_fn=None, embed_text_fn=None):
+class _ProbeStore:
+    def __init__(self, probes=None):
+        self.probes = probes or []
+
+    def list_probes(self):
+        return [dict(probe) for probe in self.probes]
+
+
+def _tools(manager=None, search_detections_fn=None, detections_store=None, call_lm_fn=None, embed_text_fn=None, probes_store=None):
     return AgentTools(
         detections_store=detections_store or _DetectionStore(),
-        probes_store=object(),
+        probes_store=probes_store or _ProbeStore(),
         luxriot_manager=manager or _SummaryManager(),
         embed_text_fn=embed_text_fn or (lambda _text: None),
         embed_image_fn=lambda _image: None,
@@ -242,7 +254,114 @@ def _tools(manager=None, search_detections_fn=None, detections_store=None, call_
     )
 
 
+class TurnSignalLedgerTests(unittest.TestCase):
+    def test_lookup_help_ledger_keeps_citations_without_snippets(self):
+        ledger = _new_turn_signal_ledger("how do I backup the database?")
+        _record_turn_signal_ledger(
+            ledger,
+            "lookup_help",
+            {
+                "results": [
+                    {
+                        "doc": "docs/operator/operator_guide.md",
+                        "section": "Video description status",
+                        "score": 3.4,
+                        "snippet": "OPERATOR_SNIPPET_SHOULD_NOT_BE_DUPLICATED",
+                    }
+                ],
+                "best_match_restricted": True,
+                "best_restricted_section": "Backup and recovery",
+                "best_required_permission": "settings:manage",
+                "restricted_matches": [
+                    {
+                        "doc": "docs/admin/backup_recovery.md",
+                        "section": "Backup and recovery",
+                        "required_permission": "settings:manage",
+                        "score": 9.1,
+                        "snippet": "RESTRICTED_STEPS_SHOULD_NOT_LEAK",
+                    }
+                ],
+            },
+        )
+
+        message = _format_turn_signal_ledger_message(ledger)
+
+        self.assertIsNotNone(message)
+        self.assertIn("Documentation/help signals", message)
+        self.assertIn("Restricted-help signals", message)
+        self.assertIn("settings:manage", message)
+        self.assertNotIn("OPERATOR_SNIPPET_SHOULD_NOT_BE_DUPLICATED", message)
+        self.assertNotIn("RESTRICTED_STEPS_SHOULD_NOT_LEAK", message)
+
+    def test_visual_state_ledger_labels_clip_as_candidate_signal(self):
+        ledger = _new_turn_signal_ledger("count appearances")
+        _record_turn_signal_ledger(
+            ledger,
+            "track_visual_state_transitions",
+            {
+                "channel_id": 112,
+                "score_semantics": "clip_pnm_state_machine_not_ground_truth",
+                "counts": {"transition": 2, "appearance": 1, "disappearance": 1},
+                "frame_count": 120,
+                "coverage": {"status": "partial"},
+                "boundary_frames": [
+                    {"detection_id": 77, "image_url": "/detections/thumbnail/77"}
+                ],
+            },
+        )
+
+        message = _format_turn_signal_ledger_message(ledger)
+
+        self.assertIsNotNone(message)
+        self.assertIn("Semantic/CLIP/count signals", message)
+        self.assertIn("candidate signals, not proof", message)
+        self.assertIn("Evidence/frame signals", message)
+        self.assertIn("coverage/truncation/errors", message)
+
+
 class AgentVideoSummaryToolTests(unittest.TestCase):
+    def test_compact_prompt_settings_preserves_layer_semantics_and_migration(self):
+        compact = _compact_prompt_settings_for_model(
+            {
+                "channel_id": 7,
+                "stream_system_prompt": "Describe public space activity.",
+                "alert_policy_prompt": "Flag people fighting.",
+                "json_alert_prompt": "ALERTS_JSON contract",
+                "prompt_layers": {
+                    "stream": {
+                        "notes": ["Live L0 summaries use the editable stream prompt."],
+                        "warnings": [],
+                    },
+                    "alerts": {
+                        "notes": ["Use this layer for channel-specific alert criteria."],
+                        "warnings": ["legacy criteria found"],
+                    },
+                    "json": {
+                        "notes": ["This JSON layer is appended last."],
+                    },
+                    "rollups": {
+                        "L1": {
+                            "notes": ["Alert Ledger must preserve alert counts."]
+                        }
+                    },
+                },
+                "prompt_health": {
+                    "needs_migration": True,
+                    "warnings": ["move alert criteria"],
+                    "candidate_alert_policy_lines": ["Flag people fighting"],
+                    "suggested_stream_system_prompt": "Describe public space activity.",
+                    "suggested_alert_policy_prompt": "Flag people fighting.",
+                },
+            }
+        )
+
+        self.assertTrue(compact["prompt_health"]["needs_migration"])
+        self.assertEqual(compact["prompt_health"]["suggested_alert_policy_prompt"], "Flag people fighting.")
+        self.assertIn("L0 live-description role/style", compact["prompt_layers"]["stream"]["semantics"])
+        self.assertIn("Operator watch/alert criteria", compact["prompt_layers"]["alerts"]["semantics"])
+        self.assertIn("Machine-readable ALERTS_JSON", compact["prompt_layers"]["json"]["semantics"])
+        self.assertIn("compressed memory maps", compact["prompt_layers"]["rollups"]["semantics"])
+
     def test_system_prompt_reframes_sensitive_visible_evidence_instead_of_refusing(self):
         class _ProbeStore:
             def list_probes(self):
@@ -260,6 +379,33 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertIn("Configured semantic probes (1 total; secondary/internal", prompt)
         self.assertLess(prompt.index("Video-description runtime:"), prompt.index("Configured semantic probes"))
         self.assertIn("Default reports and status answers must be video-description-first", prompt)
+        self.assertIn("double-check video-description alerts with probes", prompt)
+        self.assertIn("turn VLM alerts into a secondary CLIP attention layer", prompt)
+        self.assertIn("create one preview probe per event/channel", prompt)
+        self.assertIn("remove private names and abstract labels", prompt)
+        self.assertIn("Fight alert", prompt)
+        self.assertIn("two people fighting", prompt)
+        self.assertIn("Vehicle drift alert", prompt)
+        self.assertIn("car doing a burnout or drift", prompt)
+        self.assertIn("For probe negative prompts, never use literal absence/negation", prompt)
+        self.assertIn("clear roadway with normal traffic", prompt)
+        self.assertIn("empty public entrance", prompt)
+        self.assertIn("use calibrate_probe_from_archive when archive frames exist", prompt)
+        self.assertIn("For broad calibration across many channels", prompt)
+        self.assertIn("server-side job_id", prompt)
+        self.assertIn("remaining_items", prompt)
+        self.assertIn("recommended_probe_args", prompt)
+        self.assertIn("update_existing=true", prompt)
+        self.assertIn("first-party operator/admin documentation through lookup_help", prompt)
+        self.assertIn("Never answer that you cannot access the operator/admin docs", prompt)
+        self.assertIn("L0/L1/L2/L3 prompts or settings", prompt)
+        self.assertIn("adapted summary/translation of the cited sections", prompt)
+        self.assertIn("source=probe means CLIP probe hits, not sensors", prompt)
+        self.assertIn("machine translation draft", prompt)
+        self.assertIn("Rank video-summary signals by provenance", prompt)
+        self.assertIn("Routine memory/baseline is prior context, not current evidence", prompt)
+        self.assertIn("unconfirmed prose-only evidence", prompt)
+        self.assertIn("parser/delivery diagnostics as pipeline health, not incident counts", prompt)
         self.assertIn("do not refuse when the request can be reframed", prompt)
         self.assertIn("smoking weed/pipe/joint", prompt)
         self.assertIn("person holding a small cylindrical object", prompt)
@@ -779,6 +925,97 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["source_counts"]["L1"], 500)
         self.assertTrue(compact["backend_truncated"])
 
+    def test_get_video_summaries_compacts_provenance_bundle(self):
+        manager = _SummaryManager()
+
+        def rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            return {
+                "running": False,
+                "selected_run": None,
+                "run_filter_id": None,
+                "levels": {
+                    "L0": [
+                        {
+                            "level": "L0",
+                            "window_start": 100.0,
+                            "window_end": 112.0,
+                            "summary": "Prose says a public safety event happened.",
+                            "frame_count": 12,
+                            "alert_counts": {"high": 1},
+                            "alert_total": 1,
+                            "alert_parser_breakdown": {
+                                "parser_alert_count": 2,
+                                "json_alert_count": 1,
+                                "prose_alert_count": 2,
+                                "prose_only_signal_count": 1,
+                            },
+                            "alert_delivery_breakdown": {
+                                "cooldown_skipped": 1,
+                                "total": 1,
+                            },
+                            "alert_events": [
+                                {
+                                    "title": "Person down",
+                                    "description": "Person lying on ground near entrance.",
+                                    "severity": "high",
+                                    "delivery_status": "cooldown_skipped",
+                                    "timestamp_ms": 108000,
+                                }
+                            ],
+                            "state_observations": [
+                                {
+                                    "key": "person near entrance",
+                                    "label": "Person near entrance",
+                                    "state": "present",
+                                    "evidence": "visible near entrance",
+                                }
+                            ],
+                            "state_transition_events": [
+                                {
+                                    "key": "person near entrance",
+                                    "label": "Person near entrance",
+                                    "event_type": "appearance",
+                                    "from_state": "absent",
+                                    "to_state": "present",
+                                    "timestamp_ms": 108000,
+                                    "evidence": "current observed state",
+                                }
+                            ],
+                            "state_transition_total": 1,
+                        }
+                    ],
+                    "L1": [],
+                    "L2": [],
+                    "L3": [],
+                },
+            }
+
+        manager.summary_rollups = rollups
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L0",
+                "from_ts": 90.0,
+                "to_ts": 120.0,
+                "limit": 5,
+            },
+        )
+
+        self.assertEqual(result["provenance_totals"]["unconfirmed_prose_signal_count"], 1)
+        entry = result["entries"][0]
+        self.assertEqual(entry["alert_events"][0]["delivery_status"], "cooldown_skipped")
+        self.assertEqual(entry["state_observations"][0]["state"], "present")
+        self.assertEqual(entry["state_transition_events"][0]["event_type"], "appearance")
+        self.assertEqual(entry["unconfirmed_prose_signal_count"], 1)
+
+        compact = _compact_tool_result_for_model("get_video_summaries", result)
+        compact_entry = compact["entries"][0]
+        self.assertEqual(compact["provenance_totals"]["alert_delivery_breakdown"]["cooldown_skipped"], 1)
+        self.assertEqual(compact_entry["alert_parser_breakdown"]["prose_only_signal_count"], 1)
+        self.assertEqual(compact_entry["alert_events"][0]["delivery_status"], "cooldown_skipped")
+        self.assertEqual(compact_entry["state_transition_events"][0]["event_type"], "appearance")
+
     def test_get_video_summaries_returns_evidence_frames_from_vlm_archive(self):
         rows = [
             {
@@ -1109,6 +1346,171 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["candidate_frames"][0]["image_url"], "/detections/thumbnail/4")
         self.assertEqual(compact["transitions"][0]["after_frame"]["image_url"], "/detections/thumbnail/3")
 
+    def test_calibrate_probe_from_archive_batches_channels_and_suggests_thresholds(self):
+        rows = []
+        for idx, vec in enumerate(
+            (
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.8, 0.2],
+                [0.2, 0.8],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ),
+            start=1,
+        ):
+            rows.append(
+                {
+                    "id": idx,
+                    "channel_id": 7,
+                    "source": "vlm_summary",
+                    "event_timestamp_ms": 100_000 + idx * 1_000,
+                    "clip_vec": vec,
+                    "thumbnail": f"thumb-{idx}",
+                }
+            )
+        rows.append(
+            {
+                "id": 20,
+                "channel_id": 8,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 101_000,
+                "clip_vec": [0.0, 1.0],
+                "thumbnail": "other-channel",
+            }
+        )
+
+        def embed_text(text):
+            value = str(text).lower()
+            if "walking normally" in value or "clear sidewalk" in value:
+                return [0.0, 1.0]
+            return [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "two people fighting",
+                "contrast_query": "people walking normally on clear sidewalk",
+                "channel_ids": [7, 8, 9],
+                "sources": ["vlm_summary"],
+                "from_ts": 100.0,
+                "to_ts": 120.0,
+                "max_channels_per_call": 2,
+                "candidate_limit": 100,
+                "evidence_limit": 6,
+            },
+        )
+
+        self.assertEqual(result["processed_channel_ids"], [7, 8])
+        self.assertEqual(result["deferred_channel_ids"], [9])
+        self.assertTrue(result["requires_continue"])
+        self.assertIn("Continue calibration", result["next_batch_hint"])
+        self.assertEqual(result["score_semantics"], "clip_pnm_archive_calibration_not_ground_truth")
+        channel7 = result["channels"][0]
+        self.assertEqual(channel7["channel_id"], 7)
+        self.assertEqual(channel7["frame_count"], 8)
+        self.assertEqual(channel7["coverage"]["status"], "covered")
+        self.assertGreater(channel7["distributions"]["margin"]["max"], 0.9)
+        self.assertGreaterEqual(channel7["suggested_thresholds"]["pos_floor"], 0.05)
+        self.assertIn(channel7["suggested_thresholds"]["confidence"], {"medium", "high"})
+        self.assertTrue(channel7["representative_frames"]["top_margin"][0]["image_url"].startswith("/detections/thumbnail/"))
+        self.assertNotIn("thumbnail", channel7["representative_frames"]["top_margin"][0])
+
+        compact = _compact_tool_result_for_model("calibrate_probe_from_archive", result)
+        self.assertEqual(compact["processed_channel_ids"], [7, 8])
+        self.assertEqual(compact["deferred_channel_ids"], [9])
+        self.assertEqual(compact["channels"][0]["suggested_thresholds"]["confidence"], channel7["suggested_thresholds"]["confidence"])
+        self.assertTrue(compact["channels"][0]["representative_frames"]["top_margin"][0]["image_url"].startswith("/detections/thumbnail/"))
+
+    def test_prepare_probe_calibration_batch_keeps_server_side_job_state(self):
+        rows = [
+            {
+                "id": 1,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000,
+                "clip_vec": [1.0, 0.0],
+            },
+            {
+                "id": 2,
+                "channel_id": 8,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000,
+                "clip_vec": [1.0, 0.0],
+            },
+        ]
+
+        def embed_text(text):
+            value = str(text).lower()
+            if "walking" in value or "normal" in value:
+                return [0.0, 1.0]
+            return [1.0, 0.0]
+
+        tools = _tools(
+            detections_store=_DetectionStore(rows),
+            embed_text_fn=embed_text,
+        )
+
+        first = tools.execute(
+            "prepare_probe_calibration_batch",
+            {
+                "items": [
+                    {
+                        "name": "person down",
+                        "event_query": "person lying on ground",
+                        "contrast_query": "people walking normally",
+                        "channel_id": 7,
+                    },
+                    {
+                        "name": "person down",
+                        "event_query": "person lying on ground",
+                        "contrast_query": "people walking normally",
+                        "channel_id": 8,
+                    },
+                ],
+                "items_per_call": 1,
+                "sources": ["vlm_summary"],
+                "from_ts": 99.0,
+                "to_ts": 101.0,
+            },
+        )
+
+        self.assertEqual(first["processed_this_call"], 1)
+        self.assertEqual(first["remaining_count"], 1)
+        self.assertTrue(first["requires_continue"])
+        item = first["processed_items"][0]
+        self.assertEqual(item["recommended_probe_args"]["tool"], "create_probe")
+        self.assertTrue(item["recommended_probe_args"]["args"]["preview"])
+        self.assertEqual(item["recommended_probe_args"]["args"]["positives"], ["person lying on ground"])
+
+        context = _seed_turn_tool_context("continue")
+        _remember_turn_tool_result("prepare_probe_calibration_batch", first, context)
+        next_args = _apply_turn_tool_context("prepare_probe_calibration_batch", {}, context)
+        self.assertEqual(next_args["job_id"], first["job_id"])
+
+        calibration_calls = []
+        original_calibrate = tools._calibrate_probe_from_archive
+
+        def record_calibration(call_args):
+            calibration_calls.append(dict(call_args))
+            return original_calibrate(call_args)
+
+        tools._calibrate_probe_from_archive = record_calibration
+        second = tools.execute("prepare_probe_calibration_batch", {"job_id": first["job_id"]})
+        self.assertEqual(second["status"], "complete")
+        self.assertEqual(second["processed_total"], 2)
+        self.assertEqual(second["remaining_count"], 0)
+        self.assertEqual(calibration_calls[-1]["sources"], ["vlm_summary"])
+        self.assertEqual(calibration_calls[-1]["from_ts"], 99.0)
+        self.assertEqual(calibration_calls[-1]["to_ts"], 101.0)
+
+        compact = _compact_tool_result_for_model("prepare_probe_calibration_batch", first)
+        self.assertEqual(compact["job_id"], first["job_id"])
+        self.assertTrue(compact["output_contract"]["recommended_probe_args_are_pass_through"])
+        self.assertEqual(compact["processed_items"][0]["recommended_probe_args"]["tool"], "create_probe")
+
     def test_track_visual_state_transition_negative_embedding_warning_is_specific(self):
         store = _DetectionStore(
             [
@@ -1339,6 +1741,28 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             def summarize_by_probe(self, *args, **kwargs):
                 raise AssertionError("default video report should not query probe summaries")
 
+        class PipelineHealthManager(_SummaryManager):
+            def __init__(self):
+                super().__init__()
+                self.logs_by_channel[7] = [
+                    {
+                        "created_at": 150.0,
+                        "summary": "inside",
+                        "frame_count": 3,
+                        "alert_counts": {"normal": 1},
+                        "parser_alert_count": 2,
+                        "json_alert_count": 1,
+                        "prose_alert_count": 2,
+                        "alert_events": [
+                            {
+                                "title": "Visible event",
+                                "delivery_status": "sent",
+                            }
+                        ],
+                        "state_transition_total": 1,
+                    }
+                ]
+
         store = VideoReportStore(
             [
                 {
@@ -1351,7 +1775,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                 }
             ]
         )
-        result = _tools(detections_store=store).execute(
+        result = _tools(manager=PipelineHealthManager(), detections_store=store).execute(
             "generate_report",
             {
                 "from_ts": 100.0,
@@ -1365,12 +1789,17 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["summary"]["alert_total"], 1)
         self.assertEqual(result["summary"]["desired_missing_count"], 1)
         self.assertEqual(result["coverage"]["status"], "partial")
+        self.assertIn("Detection pipeline health", result["report"])
+        self.assertEqual(result["pipeline_health"]["alert_parser_breakdown"]["prose_only_signal_count"], 1)
+        self.assertEqual(result["pipeline_health"]["alert_delivery_breakdown"]["sent"], 1)
+        self.assertEqual(result["pipeline_health"]["state_transition_total"], 1)
         self.assertEqual(result["vlm_alert_frames"][0]["image_url"], "/detections/thumbnail/501")
         self.assertNotIn("thumbnail", result["vlm_alert_frames"][0])
 
         compact = _compact_tool_result_for_model("generate_report", result)
         self.assertEqual(compact["report_type"], "video_descriptions")
         self.assertIn("report", compact)
+        self.assertEqual(compact["pipeline_health"]["alert_delivery_breakdown"]["sent"], 1)
         self.assertEqual(compact["vlm_alert_frames"][0]["image_url"], "/detections/thumbnail/501")
 
     def test_generate_report_probe_type_keeps_legacy_probe_shape(self):

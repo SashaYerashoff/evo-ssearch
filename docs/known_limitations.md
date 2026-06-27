@@ -12,6 +12,9 @@ for a government buyer. Each item has the mitigation in place. Pairs with
   always human-confirmed on evidence frames. Do not promise exhaustive detection.
 - **CLIP state-transition counts are candidates, not ground truth.** *Mitigation:*
   boundary-frame evidence + "describe to confirm". Do not present counts as facts.
+- **Archive probe calibration is evidence-based, not labeled ground truth.** It
+  estimates thresholds from stored CLIP vectors and can inherit archive/source
+  bias. *Mitigation:* representative frames + preview-only probe changes.
 - **CLIP does not understand negation** ("no vehicle"). *Mitigation:* visible-
   background contrast phrasing ("empty gate").
 

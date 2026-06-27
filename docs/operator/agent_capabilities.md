@@ -15,7 +15,7 @@ uses to dig through volume.
 - `list_video_summary_channels` — which channels are producing descriptions,
   alert counts by severity, active/inactive, over a period.
 - `get_video_summaries` — L0–L3 timeline for a channel/period, with evidence
-  frames and a coverage contract.
+  frames, structured alert/state fields, and a coverage contract.
 - `count_video_summary_events` — count mentions/events in summaries for a channel.
 
 **Find in the archive (semantic)**
@@ -32,13 +32,31 @@ uses to dig through volume.
 **Act (gated)**
 - `create_bookmark` — push an event to Luxriot Evo (subject to the approval
   workflow; may be unavailable in secure mode until approval is enabled).
-- `update_prompt_settings`, `update_probe` — **preview-only** in secure mode;
-  shows a diff, never applies silently.
+- `update_prompt_settings`, `update_probe` — **preview-only** from chat in
+  secure mode; the UI Apply button commits the server-owned action plan and
+  writes a trusted receipt.
+- Prompt settings are split by purpose: L0 description behavior is
+  `stream_system_prompt`; **Alert Criteria** is `alert_policy_prompt`; the
+  structured alert parser contract is `json_alert_prompt`.
 
 **Internal tools (agent-invoked, for semantic bulk comparison)**
 - `query_probe` / `list_probes` / `get_visual_window_signals` — CLIP P/N/M
   signals and probe matching. These serve the agent's search; they are not the
   operator's primary workflow.
+- The agent can turn concrete video-description alert classes into preview
+  probes as a second attention layer. It translates names and prose into generic
+  visible classes/actions (for example, "two people fighting", "vehicle burnout
+  or drift", or "person lying on ground") and uses visible contrast states
+  instead of negation. These probes are corroborating candidates, not proof.
+- `calibrate_probe_from_archive` — read-only archive calibration for proposed
+  probe text. It scores archived frames with CLIP P/N/M, suggests initial
+  `pos_floor`/`margin_thr` values, and returns representative frames. For 50
+  channels it works in chunks of at most 8 channels and reports deferred channels.
+- `prepare_probe_calibration_batch` — stateful multi-probe/multi-channel
+  calibration. It returns a `job_id`, compact decision ledger, remaining items,
+  and pass-through preview args so the agent does not reconstruct a long
+  checklist from chat. For multiple alert classes or many channels, the agent
+  should continue by `job_id` instead of dumping raw P/N/M traces.
 
 **Time & scope helpers**
 - `normalize_time_window` — turns "last 2 hours", "yesterday evening" into exact
@@ -56,6 +74,19 @@ uses to dig through volume.
 - Read its **coverage line**: it states the period requested, period inspected,
   entries returned, and whether the result was truncated.
 
+## Evidence confidence
+
+- Routine memory/background is only a prior.
+- L0/L1/L2 prose is useful for discovery; L0 prose is unconfirmed when no
+  structured alert/state data exists.
+- Structured `alert_events`, `state_observations`, and backend
+  `state_transition_events` are stronger. `state_transition_events` are confirmed
+  across batches, but remain candidates for operator review.
+- Visual proof requires an evidence frame or `image_url` and a fresh
+  `describe_frame` result in the same turn.
+- CLIP P/N/M, probes, and semantic archive search are attention signals, not
+  standalone proof.
+
 ## What it cannot do (do not promise these)
 
 - **No** PDF / CSV / email export, no async/background report queues, no file
@@ -63,8 +94,8 @@ uses to dig through volume.
 - **No** ground-truth counting from CLIP — state transitions are candidates.
 - **No** complete recall on unscoped broad searches — bounded by the candidate
   window.
-- **No** silent changes — probe/prompt edits are preview-only; bookmark creation
-  is approval-gated.
+- **No** chat-side apply — probe/prompt edits are preview-only from chat. Apply
+  happens via the UI Apply button and a trusted server receipt.
 - **No** autonomous sensitive actions — by design the agent proposes, a human
   confirms (see safety posture).
 

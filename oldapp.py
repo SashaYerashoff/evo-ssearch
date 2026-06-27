@@ -1864,6 +1864,7 @@ def home():
         luxriot_snapshot_max_edge=config.LUXRIOT_SNAPSHOT_MAX_EDGE,
         video_frame_options_html=video_frame_options_html,
         luxriot_system_prompt_default=LUXRIOT_SYSTEM_PROMPT_DEFAULT or '',
+        luxriot_alert_policy_prompt=getattr(config, 'LUXRIOT_ALERT_POLICY_PROMPT', '') or '',
         luxriot_rollup_prompt_l1=getattr(config, 'LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT', rollup_default) or rollup_default,
         luxriot_rollup_prompt_l2=getattr(config, 'LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT', rollup_default) or rollup_default,
         luxriot_rollup_prompt_l3=getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', rollup_default) or rollup_default,
@@ -2806,7 +2807,7 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
         stop_words = {
             "the", "and", "from", "with", "that", "this", "into", "onto", "person",
             "detected", "observed", "visible", "snapshot", "snapshots", "approx",
-            "event", "level", "alert", "sasha",
+            "event", "level", "alert",
         }
         tokens = {
             token.rstrip("s")
@@ -2928,10 +2929,10 @@ PREVIOUS_LUXRIOT_GENERIC_ROLLUP_PROMPT_DEFAULTS = {
     ),
 }
 LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
-    "Optional bookmark output for operator review:\n"
+    "Machine-readable alert output for operator review:\n"
     "- Always append exactly one block at the end, prefixed with ALERTS_JSON:.\n"
     "- If no trigger matches, use {\"alerts\": []}.\n"
-    "- If one or more triggers match, include one alert object per distinct visible trigger, using this schema:\n"
+    "- If one or more triggers match, include one alert object per distinct visible trigger using this schema:\n"
     "ALERTS_JSON:\n"
     "{\n"
     "  \"alerts\": [\n"
@@ -2945,15 +2946,18 @@ LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "Trigger only on observable events such as physical violence, dangerous vehicle behavior, forced entry, "
-    "property damage, theft-like tampering, weapon/fire/smoke/immediate hazard, or crowd escalation. "
-    "Also emit operator-defined low/normal test triggers when the stream prompt explicitly asks for them. "
+    "Alert candidates are defined by the Alert review policy and by visible immediate safety/security hazards. "
+    "General hazards include physical violence, a person falling/collapsing or appearing to need urgent help, "
+    "dangerous vehicle behavior, forced entry, property damage, theft-like tampering, weapon/fire/smoke, "
+    "critical camera obstruction, or crowd escalation. "
     "Do not classify behavior as illegal/unlawful; describe visible facts requiring operator review. "
-    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, "
-    "or ambiguous movement unless the operator prompt explicitly asks for that policy. "
-    "Rules: emit one alert object per distinct trigger visible in the batch, up to 8 objects; "
-    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section; "
-    "do not alert routine micro-movements; "
+    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, or ambiguous movement "
+    "unless the Alert review policy explicitly asks for that review signal. "
+    "Rules: emit one alert object per distinct visible trigger in the batch, up to 8 objects; "
+    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section or Warning Level list; "
+    "if a matching event is described anywhere in the prose summary, it must also appear in ALERTS_JSON; "
+    "evaluate every operator-defined trigger independently against the current snapshots; "
+    "if two distinct triggers are visible in the same batch, emit two alert objects; "
     "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
 )
 PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2 = (
@@ -3010,7 +3014,7 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "### Worth to remember\n"
     "2-6 concise bullet points with context useful for future rollups.\n"
     "Rules: separate routine baseline from deviations; keep it factual and concise; avoid repetition; "
-    "emit alerts JSON only when a Task-defined trigger is observed in this batch."
+    "the backend appends current-observation and ALERTS_JSON instructions; follow that final output contract."
 )
 
 current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()
@@ -5906,6 +5910,39 @@ def _vlm_archive_top_severity(alert_counts: Mapping[str, int]) -> str:
     return "normal"
 
 
+def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str, Any]]:
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes, bytearray)):
+        return []
+    events: List[Dict[str, Any]] = []
+    for raw_event in raw_events[:32]:
+        if not isinstance(raw_event, Mapping):
+            continue
+        title = str(raw_event.get("title") or "Event").strip()[:120] or "Event"
+        description = str(raw_event.get("description") or "").strip()[:300]
+        severity = str(raw_event.get("severity") or "normal").strip().lower()
+        if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+            severity = "normal"
+        state = str(raw_event.get("state") or "new").strip().lower()[:20] or "new"
+        timestamp_ms = _to_optional_int(raw_event.get("timestamp_ms"))
+        event: Dict[str, Any] = {
+            "title": title,
+            "description": description,
+            "severity": severity,
+            "state": state,
+            "channel_id": channel_id,
+        }
+        if timestamp_ms is not None:
+            event["timestamp_ms"] = int(max(0, timestamp_ms))
+        status = str(raw_event.get("delivery_status") or "").strip().lower()
+        if status:
+            event["delivery_status"] = status[:40]
+        error = str(raw_event.get("error") or "").strip()
+        if error:
+            event["error"] = error[:240]
+        events.append(event)
+    return events
+
+
 def _vlm_archive_excerpt(value: Any, limit: int) -> Tuple[str, bool]:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -5935,6 +5972,7 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
     alert_counts = _vlm_archive_alert_counts(entry.get("alert_counts"))
     alert_total = _to_int(entry.get("alert_total"), sum(alert_counts.values()))
     bookmarks_sent = _to_int(entry.get("bookmarks_sent"), 0)
+    alert_events = _vlm_archive_alert_events(entry.get("alert_events"), channel_id)
     frame_count = _to_int(entry.get("frame_count"), 0)
     batch_size = _to_int(entry.get("batch_size"), 0)
 
@@ -5952,6 +5990,15 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         "alert_counts": alert_counts,
         "alert_total": alert_total,
         "bookmarks_sent": bookmarks_sent,
+        "state_observations": list(entry.get("state_observations") or [])[:64]
+        if isinstance(entry.get("state_observations"), Sequence)
+        and not isinstance(entry.get("state_observations"), (str, bytes, bytearray))
+        else [],
+        "state_transition_events": list(entry.get("state_transition_events") or [])[:32]
+        if isinstance(entry.get("state_transition_events"), Sequence)
+        and not isinstance(entry.get("state_transition_events"), (str, bytes, bytearray))
+        else [],
+        "state_transition_total": _to_int(entry.get("state_transition_total"), 0),
     }
 
     records: List[Dict[str, Any]] = []
@@ -6014,41 +6061,76 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
 
     summary_count = len(records)
     alert_count = 0
-    if valid_frames and (alert_total > 0 or bookmarks_sent > 0):
-        anchor = valid_frames[-1]
-        severity = _vlm_archive_top_severity(alert_counts)
-        alert_payload = {
-            **base_payload,
-            "source": "vlm_alert",
-            "severity": severity,
-            "anchor_role": "alert_anchor",
-            "anchor_frame_index": anchor["frame_index"],
-            "anchor_frame_timestamp_ms": anchor["timestamp_ms"],
-            "anchor_source_role": anchor["anchor_role"],
-        }
-        records.append(
-            {
-                "dedupe_key": (
-                    f"vlm_alert:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
-                    f"{anchor['timestamp_ms']}:{severity}:{alert_total}:{bookmarks_sent}"
-                ),
-                "timestamp_ms": int(anchor["timestamp_ms"]),
-                "probe_id": f"vlm_alert:{channel_id}",
-                "probe_name": f"VLM alert ch {channel_id}",
-                "channel_id": channel_id,
+    if valid_frames and (alert_total > 0 or bookmarks_sent > 0 or alert_events):
+        events_for_archive = list(alert_events)
+        if not events_for_archive:
+            events_for_archive = [
+                {
+                    "title": "VLM alert batch",
+                    "description": "",
+                    "severity": _vlm_archive_top_severity(alert_counts),
+                    "state": "new",
+                    "channel_id": channel_id,
+                    "timestamp_ms": int(valid_frames[-1]["timestamp_ms"]),
+                    "delivery_status": "aggregate",
+                }
+            ]
+        for event_index, alert_event in enumerate(events_for_archive[:32]):
+            event_ts = _to_int(alert_event.get("timestamp_ms"), int(valid_frames[-1]["timestamp_ms"]))
+            anchor = min(
+                valid_frames,
+                key=lambda frame: abs(int(frame.get("timestamp_ms") or 0) - int(event_ts)),
+            )
+            severity = str(alert_event.get("severity") or "normal").strip().lower()
+            if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+                severity = "normal"
+            event_payload = {
+                "title": str(alert_event.get("title") or "Event"),
+                "description": str(alert_event.get("description") or ""),
                 "severity": severity,
-                "bookmark_enabled": False,
-                "bookmark_sent": bookmarks_sent > 0,
-                "pos_score": 0.0,
-                "neg_score": 0.0,
-                "margin": 0.0,
-                "thumbnail_b64": anchor["thumbnail_b64"],
-                "clip_vec": anchor["clip_vec"],
-                "source": "vlm_alert",
-                "payload": alert_payload,
+                "state": str(alert_event.get("state") or "new"),
+                "timestamp_ms": event_ts,
+                "delivery_status": str(alert_event.get("delivery_status") or ""),
             }
-        )
-        alert_count = 1
+            if alert_event.get("error"):
+                event_payload["error"] = str(alert_event.get("error") or "")[:240]
+            event_hash = hashlib.sha1(
+                json.dumps(event_payload, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
+            ).hexdigest()[:12]
+            alert_payload = {
+                **base_payload,
+                "source": "vlm_alert",
+                "severity": severity,
+                "alert_event": event_payload,
+                "alert_event_index": event_index,
+                "anchor_role": "alert_anchor",
+                "anchor_frame_index": anchor["frame_index"],
+                "anchor_frame_timestamp_ms": anchor["timestamp_ms"],
+                "anchor_source_role": anchor["anchor_role"],
+            }
+            records.append(
+                {
+                    "dedupe_key": (
+                        f"vlm_alert:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
+                        f"{anchor['timestamp_ms']}:{severity}:{event_index}:{event_hash}"
+                    ),
+                    "timestamp_ms": int(anchor["timestamp_ms"]),
+                    "probe_id": f"vlm_alert:{channel_id}",
+                    "probe_name": f"VLM alert ch {channel_id}: {event_payload['title'][:64]}",
+                    "channel_id": channel_id,
+                    "severity": severity,
+                    "bookmark_enabled": False,
+                    "bookmark_sent": bookmarks_sent > 0,
+                    "pos_score": 0.0,
+                    "neg_score": 0.0,
+                    "margin": 0.0,
+                    "thumbnail_b64": anchor["thumbnail_b64"],
+                    "clip_vec": anchor["clip_vec"],
+                    "source": "vlm_alert",
+                    "payload": alert_payload,
+                }
+            )
+        alert_count = len(events_for_archive[:32])
     return records, summary_count, alert_count
 
 
@@ -8761,6 +8843,14 @@ def luxriot_prompt_settings():
         raw_stream_prompt = data.get('system_prompt')
         stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
 
+    alert_policy_prompt: Optional[str] = None
+    if 'alert_policy_prompt' in data:
+        raw_alert_policy_prompt = data.get('alert_policy_prompt')
+        alert_policy_prompt = '' if raw_alert_policy_prompt is None else str(raw_alert_policy_prompt)
+    elif 'alert_prompt' in data:
+        raw_alert_policy_prompt = data.get('alert_prompt')
+        alert_policy_prompt = '' if raw_alert_policy_prompt is None else str(raw_alert_policy_prompt)
+
     json_alert_prompt: Optional[str] = None
     if 'json_alert_prompt' in data:
         raw_json_prompt = data.get('json_alert_prompt')
@@ -8807,6 +8897,7 @@ def luxriot_prompt_settings():
         settings = luxriot_manager.update_prompt_settings(
             channel_id=channel_id,
             stream_system_prompt=stream_system_prompt,
+            alert_policy_prompt=alert_policy_prompt,
             rollup_prompts=rollup_prompt_updates,
             json_alert_prompt=json_alert_prompt,
             bookmark_enabled=bookmark_enabled,
@@ -8820,6 +8911,7 @@ def luxriot_prompt_settings():
             channel_id=channel_id,
             details={
                 "stream_system_prompt_updated": stream_system_prompt is not None,
+                "alert_policy_prompt_updated": alert_policy_prompt is not None,
                 "rollup_prompts_updated": bool(rollup_prompt_updates),
                 "json_alert_prompt_updated": json_alert_prompt is not None,
                 "bookmark_enabled_updated": bookmark_enabled is not None,
@@ -10467,7 +10559,25 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
         "EVOSSEARCH_LM_VIDEO_MAX_TOKENS": str(config.LM_VIDEO_MAX_TOKENS),
+        "EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS": str(
+            getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000)
+        ),
+        "EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS": str(
+            getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)
+        ),
         "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
+        "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000"
+        ),
         "EVOSSEARCH_OFFLINE_VIDEO_ENABLED": _bool_to_env(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
         "EVOSSEARCH_PROBE_SNAP_ENABLED": _bool_to_env(getattr(config, "PROBE_SNAP_ENABLED", False)),
         "EVOSSEARCH_INDEXED_FOLDER_ENABLED": _bool_to_env(getattr(config, "INDEXED_FOLDER_ENABLED", False)),
@@ -10486,6 +10596,16 @@ def _runtime_env_map() -> Dict[str, str]:
         ),
         "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
         "EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH": str(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)),
+        "EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT": str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "")),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED": _bool_to_env(
+            getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)
+        ),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES": str(
+            getattr(config, "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES", 2)
+        ),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS": _bool_to_env(
+            getattr(config, "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS", True)
+        ),
         "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
         "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
         "EVOSSEARCH_LUXRIOT_SEV_NORMAL": str(sev.get("normal", "normal")),
@@ -11310,7 +11430,13 @@ EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES={config.LM_VIDEO_DEFAULT_FRAMES}
 EVOSSEARCH_LM_VIDEO_MAX_FRAMES={config.LM_VIDEO_MAX_FRAMES}
 EVOSSEARCH_LM_VIDEO_MAX_EDGE={config.LM_VIDEO_MAX_EDGE}
 EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
+EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS={getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000)}
+EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS={getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)}
 EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
+EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN={os.getenv("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4")}
+EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000")}
+EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000")}
+EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000")}
 EVOSSEARCH_OFFLINE_VIDEO_ENABLED={str(getattr(config, "OFFLINE_VIDEO_ENABLED", False)).lower()}
 EVOSSEARCH_PROBE_SNAP_ENABLED={str(getattr(config, "PROBE_SNAP_ENABLED", False)).lower()}
 EVOSSEARCH_INDEXED_FOLDER_ENABLED={str(getattr(config, "INDEXED_FOLDER_ENABLED", False)).lower()}
@@ -11328,6 +11454,10 @@ EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT={luxriot_summary_history_limit}
 EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH={luxriot_summary_archive_frames_per_batch}
 EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
 EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH={getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)}
+EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT={getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "")}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED={str(getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)).lower()}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES={getattr(config, "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES", 2)}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS={str(getattr(config, "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS", True)).lower()}
 EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
 EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
@@ -11619,6 +11749,8 @@ def agent_action_plan_execute(plan_id: str):
     guard = _mutation_guard_error()
     if guard is not None:
         return guard
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('session_id') or '').strip() or None
     auth_context = _current_auth_context()
     if _auth_enabled() and auth_context is None:
         return jsonify({'error': 'Authentication required'}), 401
@@ -11633,6 +11765,7 @@ def agent_action_plan_execute(plan_id: str):
             str(channel_id)
             for channel_id in auth_context.allowed_channel_ids
         },
+        agent_session_id=session_id,
         request_id=auth_context.request_id,
         client_ip=_source_ip(),
     )

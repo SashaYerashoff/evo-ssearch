@@ -370,6 +370,16 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_MAX_TOKENS = 1536
     try:
+        LM_VIDEO_INPUT_WARNING_CHARS = int(os.getenv('EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS', '24000'))
+    except (TypeError, ValueError):
+        LM_VIDEO_INPUT_WARNING_CHARS = 24000
+    LM_VIDEO_INPUT_WARNING_CHARS = max(4000, LM_VIDEO_INPUT_WARNING_CHARS)
+    try:
+        LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = int(os.getenv('EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS', '2500000'))
+    except (TypeError, ValueError):
+        LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = 2500000
+    LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = max(100000, LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS)
+    try:
         LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
     except (TypeError, ValueError):
         LM_VIDEO_TEMPERATURE = 0.2
@@ -546,7 +556,20 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_ALERTS_MAX_PER_BATCH = 8
     LUXRIOT_ALERTS_MAX_PER_BATCH = max(1, min(32, LUXRIOT_ALERTS_MAX_PER_BATCH))
+    LUXRIOT_STATE_TRANSITIONS_ENABLED = _get_bool_env('EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED', 'True')
+    try:
+        LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES', '2')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES = 2
+    LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES = max(1, min(6, LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES))
+    LUXRIOT_STATE_TRANSITION_ALERT_EVENTS = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS',
+        'True',
+    )
     LUXRIOT_SYSTEM_PROMPT_DEFAULT = os.getenv('EVOSSEARCH_LUXRIOT_SYSTEM_PROMPT_DEFAULT', '').strip()
+    LUXRIOT_ALERT_POLICY_PROMPT = os.getenv('EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT', '').strip()
     LUXRIOT_ALERTS_JSON_PROMPT = os.getenv('EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT', '').strip()
     LUXRIOT_SEVERITY_MAP = {
         'info': os.getenv('EVOSSEARCH_LUXRIOT_SEV_INFO', 'info').lower(),
@@ -824,7 +847,9 @@ class Config:
         )
         print(
             f"Video LM: {cls.LM_MODEL} @ {cls.LM_BASE_URL or 'unset'} "
-            f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, max_edge={cls.LM_VIDEO_MAX_EDGE})"
+            f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, "
+            f"max_edge={cls.LM_VIDEO_MAX_EDGE}, max_tokens={cls.LM_VIDEO_MAX_TOKENS}, "
+            f"input_warn_chars={cls.LM_VIDEO_INPUT_WARNING_CHARS})"
         )
         print(
             "Inference queue: {} (capacity={}, local_workers={}, spool={})".format(

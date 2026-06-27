@@ -83,6 +83,10 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |
+| `EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT` (`empty`) | Optional default operator alert criteria appended separately from role/summary prompt |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED` (`true`) | Backend diff of L0 current-observed-state rows across batches |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES` (`2`) | Confirmation hysteresis before appearance/disappearance is emitted |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS` (`true`) | Store confirmed transitions as internal VLM alert events/evidence; does not send Luxriot bookmarks by itself |
 
 ## LM profiles (API keys are secrets)
 
@@ -91,7 +95,20 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
 | `EVOSSEARCH_LM_*_PROFILE_*` | Per-profile base_url / model / timeout / kind `[FIELD]` |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
-| `EVOSSEARCH_LM_VIDEO_*` | Frame count / max edge / tokens / temperature |
+| `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
+| `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |
+| `EVOSSEARCH_LM_VIDEO_MAX_TOKENS` / `_TEMPERATURE` | VLM output sampling limits |
+| `EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS` (`24000`) | Warning threshold for text-side VLM/rollup input payloads |
+| `EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS` (`2500000`) | Warning threshold for base64 image payload size |
+
+## Agent context budget
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`4`) | Conservative token estimator divisor |
+| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`12000`) | Old chat history budget before trimming |
+| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`45000`) | Adds an internal compact-answer warning before the next model call |
+| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and asks the agent to answer with gathered evidence |
 
 ## Inference queue (disabled by default)
 

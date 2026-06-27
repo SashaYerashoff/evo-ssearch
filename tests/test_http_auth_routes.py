@@ -807,10 +807,18 @@ class HttpAuthRouteTests(unittest.TestCase):
             allowed_prompt_only = self.client.post(
                 "/luxriot/prompt_settings",
                 headers={"X-CSRF-Token": csrf_token},
-                json={"channel_id": 7, "stream_system_prompt": "plain prompt"},
+                json={
+                    "channel_id": 7,
+                    "stream_system_prompt": "plain prompt",
+                    "alert_policy_prompt": "watch for visible falls near stairs",
+                },
             )
 
         self.assertEqual(allowed_prompt_only.status_code, 200, allowed_prompt_only.get_json())
+        self.assertEqual(
+            update_settings.call_args.kwargs["alert_policy_prompt"],
+            "watch for visible falls near stairs",
+        )
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_enabled"])
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_cooldown_sec"])
 
@@ -1150,6 +1158,7 @@ class HttpAuthRouteTests(unittest.TestCase):
             "/agent/action-plans/plan-123/execute",
             headers={"X-CSRF-Token": csrf_token},
             json={
+                "session_id": "session-1",
                 "preview": False,
                 "actor_id": "forged-admin",
                 "arguments": {"channel_id": 8},
@@ -1163,6 +1172,7 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(plan_id, "plan-123")
         self.assertEqual(context.actor_id, USER_ID)
         self.assertEqual(context.tenant_id, TENANT_ID)
+        self.assertEqual(context.session_id, "session-1")
         self.assertEqual(context.allowed_channel_ids, frozenset({"7"}))
 
     def test_non_admin_cannot_manage_users(self) -> None:

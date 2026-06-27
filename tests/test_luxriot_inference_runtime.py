@@ -199,6 +199,71 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "summary",
             )
 
+    def test_summary_batch_records_llm_input_stats_and_warnings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LM_VIDEO_INPUT_WARNING_CHARS": 120,
+                    "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS": 80,
+                },
+            )
+            manager.message_builder = lambda _channel, frames, prompt, system_prompt: [
+                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        *[
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{frame['thumbnail']}",
+                                    "detail": "high",
+                                },
+                            }
+                            for frame in frames
+                        ],
+                    ],
+                },
+            ]
+            frames = [
+                {
+                    "thumbnail": "a" * 90,
+                    "captured_at": 100.0,
+                    "time_sec": 100.0,
+                    "width": 1280,
+                    "height": 720,
+                },
+                {
+                    "thumbnail": "b" * 70,
+                    "captured_at": 105.0,
+                    "time_sec": 105.0,
+                    "width": 1280,
+                    "height": 720,
+                },
+            ]
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity with enough text to trip the warning.",
+                model_hint="model-a",
+                interval_sec=5.0,
+                frames=frames,
+            )
+
+            entry = manager.run_summary_batch(batch)
+            accepted = manager.accept_summary_entry(entry)
+
+            stats = accepted["llm_input_stats"]
+            self.assertEqual(stats["frame_count"], 2)
+            self.assertEqual(stats["image_parts"], 2)
+            self.assertEqual(stats["high_detail_images"], 2)
+            self.assertGreaterEqual(stats["total_image_base64_chars"], 160)
+            self.assertIn("warnings", stats)
+            self.assertIn("llm_input_stats", manager.summary_history[7][0])
+
     def test_sync_fallback_archives_batch_frame_anchors(self):
         archived = []
 
@@ -456,7 +521,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager = build_manager(
                 Path(temp),
                 alert_parser=lambda *_args, **_kwargs: [
-                    {"title": "test", "severity": "normal"}
+                    {"title": "test", "description": "visible event", "severity": "normal"}
                 ],
             )
             manager.default_bookmark_enabled = False
@@ -474,21 +539,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 frames=[{"captured_at": 100.0, "image_b64": "ZmFrZQ=="}],
             )
             self.assertIn("ALERTS_JSON", batch["system_prompt"])
-            self.assertEqual(
-                manager.process_summary_alerts(
-                    7,
-                    'ALERTS_JSON:\n{"alerts":[{"title":"test","severity":"normal"}]}',
-                    default_ts_ms=100_000,
-                ),
-                0,
+            result = manager.process_summary_alerts(
+                7,
+                'ALERTS_JSON:\n{"alerts":[{"title":"test","severity":"normal"}]}',
+                default_ts_ms=100_000,
             )
+            self.assertEqual(result, 0)
+            self.assertEqual(result.parsed, 1)
+            self.assertEqual(result.alert_events[0]["delivery_status"], "bookmark_disabled")
 
     def test_process_summary_alerts_sends_more_than_three_distinct_alerts(self):
         with tempfile.TemporaryDirectory() as temp:
             def parse_alerts(_text, _channel_id, _default_ts_ms=None):
                 return [
-                    {"title": "Thumb up", "description": "Person shows thumb", "severity": "info"},
-                    {"title": "Cup drink", "description": "Person drinks from cup", "severity": "low"},
+                    {"title": "Gate wave", "description": "Person waves near the gate", "severity": "info"},
+                    {"title": "Restricted lane entry", "description": "Vehicle enters a restricted lane", "severity": "low"},
                     {"title": "Fight", "description": "Two people fighting", "severity": "high"},
                     {"title": "Drifting", "description": "Vehicle drifting", "severity": "normal"},
                     {"title": "Fire", "description": "Trash bin fire", "severity": "critical"},
@@ -631,8 +696,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 if "Info Level:" in text:
                     alerts.append(
                         {
-                            "title": "Sasha gives a clear thumbs-up gesture",
-                            "description": "Sasha gives a clear thumbs-up gesture (visible in Snapshots 6-8).",
+                            "title": "Person waves at the gate",
+                            "description": "Person waves at the gate (visible in Snapshots 6-8).",
                             "severity": "info",
                             "channel_id": channel_id,
                             "timestamp_ms": default_ts_ms,
@@ -641,8 +706,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 if "Warning Level:" in text:
                     alerts.append(
                         {
-                            "title": "Sasha drinks from the mug",
-                            "description": "Sasha drinks from the mug with the British flag design.",
+                            "title": "Vehicle enters restricted lane",
+                            "description": "Vehicle enters the restricted lane near the gate.",
                             "severity": "low",
                             "channel_id": channel_id,
                             "timestamp_ms": default_ts_ms,
@@ -653,10 +718,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager = build_manager(Path(temp), alert_parser=parse_alerts)
             summary = (
                 "Summary of Activity:\n"
-                "Sasha performs two distinct actions.\n\n"
+                "Two distinct review events are visible near the gate.\n\n"
                 "Alerts:\n\n"
-                "Info Level: Sasha gives a clear thumbs-up gesture (visible in Snapshots 6-8).\n"
-                "Warning Level: Sasha drinks from the mug with the British flag design (visible in Snapshots 10-12).\n"
+                "Info Level: Person waves at the gate (visible in Snapshots 6-8).\n"
+                "Warning Level: Vehicle enters the restricted lane near the gate (visible in Snapshots 10-12).\n"
             )
 
             manager.record_summary_log(
@@ -672,7 +737,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             logs = manager.session_status(7, run_selector="all")["logs"]
             self.assertEqual(logs[0]["alert_counts"], {"low": 1, "info": 1})
             self.assertEqual(logs[0]["signal_digest"]["alerts"], {"low": 1, "info": 1})
-            self.assertIn("Sasha gives", " ".join(logs[0]["signal_digest"]["alert_events"]))
+            self.assertIn("Person waves", " ".join(logs[0]["signal_digest"]["alert_events"]))
 
             manager.default_bookmark_enabled = True
             manager.default_bookmark_cooldown_sec = 0.0
@@ -690,16 +755,16 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         parser = load_lm_alert_parser()
         summary = (
             "Activity Summary:\n"
-            "Sasha drinks from a mug and gives a thumbs-up gesture.\n\n"
+            "A person waves while a vehicle enters a restricted lane.\n\n"
             "Alerts:\n\n"
-            "Warning Level: Sasha drinks from the mug with the British flag art.\n"
-            "Info: Sasha gives a thumbs-up gesture.\n"
+            "Warning Level: Vehicle enters the restricted lane near the gate.\n"
+            "Info: Person waves at the gate.\n"
             "ALERTS_JSON:\n"
             "{\n"
             "  \"alerts\": [\n"
             "    {\n"
-            "      \"title\": \"Mug Consumption Detected\",\n"
-            "      \"description\": \"Sasha drinks from a mug.\",\n"
+            "      \"title\": \"Restricted Lane Entry\",\n"
+            "      \"description\": \"Vehicle enters a restricted lane near the gate.\",\n"
             "      \"severity\": \"warning\",\n"
             "      \"state\": \"new\",\n"
             "      \"channel_id\": 112,\n"
@@ -808,6 +873,202 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("keep drifting visible", routine_text)
             self.assertIn("parked maintenance vehicles", routine_text)
 
+    def test_current_observed_state_parser_extracts_present_absent_unknown(self):
+        summary = (
+            "### Current observed state\n"
+            "- Person near entrance: present in snapshots 1-12.\n"
+            "- Vehicle in restricted lane: not visible on the roadway.\n"
+            "- Smoke near waste bin: uncertain; haze may be lighting glare.\n\n"
+            "ALERTS_JSON:\n{\"alerts\":[]}"
+        )
+
+        observations = LuxriotManager._extract_current_observed_states(summary)
+
+        self.assertEqual(
+            [(item["key"], item["state"]) for item in observations],
+            [
+                ("person near entrance", "present"),
+                ("vehicle in restricted lane", "absent"),
+                ("smoke near waste bin", "unknown"),
+            ],
+        )
+
+        self.assertEqual(
+            LuxriotManager._extract_current_observed_states("Person near entrance: present."),
+            [],
+        )
+
+    def test_golden_state_transition_disappears_across_batches_after_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_STATE_TRANSITIONS_ENABLED": True,
+                    "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES": 2,
+                    "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS": True,
+                },
+            )
+
+            first = manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "### Current observed state\n"
+                        "- Person near entrance: present in snapshots 1-12.\n\n"
+                        "ALERTS_JSON:\n{\"alerts\":[]}"
+                    ),
+                    "frame_count": 12,
+                    "created_at": 100.0,
+                    "batch_start_ms": 100000,
+                    "batch_end_ms": 112000,
+                }
+            )
+            second = manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "### Current observed state\n"
+                        "- Person near entrance: absent; entrance area is clear.\n\n"
+                        "ALERTS_JSON:\n{\"alerts\":[]}"
+                    ),
+                    "frame_count": 12,
+                    "created_at": 113.0,
+                    "batch_start_ms": 113000,
+                    "batch_end_ms": 125000,
+                }
+            )
+            third = manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "### Current observed state\n"
+                        "- Person near entrance: absent; entrance area remains clear.\n\n"
+                        "ALERTS_JSON:\n{\"alerts\":[]}"
+                    ),
+                    "frame_count": 12,
+                    "created_at": 126.0,
+                    "batch_start_ms": 126000,
+                    "batch_end_ms": 138000,
+                }
+            )
+
+            self.assertEqual(first["state_transition_total"], 0)
+            self.assertEqual(second["state_transition_total"], 0)
+            self.assertEqual(third["state_transition_total"], 1)
+            transition = third["state_transition_events"][0]
+            self.assertEqual(transition["key"], "person near entrance")
+            self.assertEqual(transition["event_type"], "disappearance")
+            self.assertEqual(transition["from_state"], "present")
+            self.assertEqual(transition["to_state"], "absent")
+            self.assertEqual(third["alert_counts"], {"info": 1})
+            self.assertEqual(third["alert_events"][0]["delivery_status"], "state_tracker")
+
+    def test_summary_rollups_expose_l0_provenance_and_rollup_aggregates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Person fell near entrance. Warning Level: person down.",
+                    "frame_count": 12,
+                    "created_at": 100.0,
+                    "batch_start_ms": 100000,
+                    "batch_end_ms": 112000,
+                    "alert_counts": {"high": 1},
+                    "alert_total": 1,
+                    "parser_alert_count": 2,
+                    "json_alert_count": 1,
+                    "prose_alert_count": 2,
+                    "alert_events": [
+                        {
+                            "title": "Person down",
+                            "description": "Person fell near entrance.",
+                            "severity": "high",
+                            "state": "new",
+                            "channel_id": 7,
+                            "timestamp_ms": 108000,
+                            "delivery_status": "cooldown_skipped",
+                        }
+                    ],
+                    "state_observations": [
+                        {
+                            "key": "person near entrance",
+                            "label": "Person near entrance",
+                            "state": "present",
+                            "evidence": "visible on the floor near entrance",
+                        }
+                    ],
+                    "state_transition_events": [
+                        {
+                            "key": "person near entrance",
+                            "label": "Person near entrance",
+                            "event_type": "appearance",
+                            "from_state": "absent",
+                            "to_state": "present",
+                            "timestamp_ms": 108000,
+                            "evidence": "confirmed by current observed state",
+                        }
+                    ],
+                    "state_transition_total": 1,
+                },
+            )
+
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10, synthesize=False)
+            l0 = rollups["levels"]["L0"][0]
+            self.assertEqual(l0["alert_parser_breakdown"]["prose_only_signal_count"], 1)
+            self.assertEqual(l0["alert_delivery_breakdown"]["cooldown_skipped"], 1)
+            self.assertEqual(l0["alert_events"][0]["delivery_status"], "cooldown_skipped")
+            self.assertEqual(l0["state_observations"][0]["state"], "present")
+            self.assertEqual(l0["state_transition_events"][0]["event_type"], "appearance")
+
+            l1 = rollups["levels"]["L1"][0]
+            self.assertEqual(l1["alert_parser_breakdown"]["prose_only_signal_count"], 1)
+            self.assertEqual(l1["alert_delivery_breakdown"]["cooldown_skipped"], 1)
+            self.assertEqual(l1["state_transition_total"], 1)
+            self.assertNotIn("alert_events", l1)
+            self.assertNotIn("state_observations", l1)
+            self.assertNotIn("state_transition_events", l1)
+
+    def test_state_transition_unknown_observation_does_not_confirm_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_STATE_TRANSITIONS_ENABLED": True,
+                    "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES": 1,
+                    "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS": True,
+                },
+            )
+            manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "### Current observed state\n- Person near entrance: present.\n",
+                    "frame_count": 12,
+                    "created_at": 100.0,
+                    "batch_start_ms": 100000,
+                    "batch_end_ms": 112000,
+                }
+            )
+            unknown = manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "### Current observed state\n- Person near entrance: uncertain; partly out of frame.\n",
+                    "frame_count": 12,
+                    "created_at": 113.0,
+                    "batch_start_ms": 113000,
+                    "batch_end_ms": 125000,
+                }
+            )
+
+            self.assertEqual(unknown["state_transition_total"], 0)
+
     def test_rollup_prompt_layers_and_source_alerts_are_visible(self):
         with tempfile.TemporaryDirectory() as temp:
             captured_user_texts = []
@@ -854,7 +1115,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("prompt_layers", settings)
             self.assertIn("Alert Ledger must mention every source alert", settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"])
 
-            manager.summary_rollups(7, run_selector="all", level_limit=10)
+            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
             self.assertTrue(captured_user_texts)
             user_text = captured_user_texts[0]
             self.assertIn("Source alert totals: normal=1, low=1", user_text)
@@ -862,6 +1123,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("Alerts: normal=1, low=1", user_text)
             self.assertIn("[SOURCE_ALERTS normal=1]", user_text)
             self.assertIn("[SOURCE_ALERTS low=1]", user_text)
+            stats = rollups["levels"]["L1"][0]["llm_input_stats"]
+            self.assertEqual(stats["phase"], "rollup_request_built")
+            self.assertEqual(stats["level"], "L1")
+            self.assertEqual(stats["source_level"], "L0")
+            self.assertGreaterEqual(stats["source_lines_selected"], 2)
+            self.assertGreater(stats["text_chars"], 0)
 
     def test_summary_rollups_readonly_mode_does_not_synthesize_with_llm(self):
         with tempfile.TemporaryDirectory() as temp:
