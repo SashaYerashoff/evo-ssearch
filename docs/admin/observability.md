@@ -23,6 +23,14 @@ Per channel, watch (Video tab stream-health + agent `list_video_summary_channels
 Rule: a channel reporting **0 alerts with no gaps** is genuinely quiet; **0 alerts
 with gaps** means you lost coverage — don't trust the silence.
 
+EVA also maintains an in-memory **channel status digest** per channel. It is a
+bounded materialized view, not a new source of truth: it is rebuilt from
+summary history on startup and overlaid with live runtime status. It contains
+recent alert titles, alert delivery breakdown, parser health, current observed
+state, recent state transitions, running/pending/drop/error fields, and is used
+by the agent status/report surfaces to avoid re-deriving the same picture in
+every tool call.
+
 ## Alert & bookmark delivery
 
 - `alerts_parsed` — alerts extracted from descriptions.

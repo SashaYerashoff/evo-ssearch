@@ -2162,6 +2162,24 @@ class AgentTools:
                 "negative_score": _score_distribution([sample.get("negative_score") for sample in samples]),
                 "margin": _score_distribution([sample.get("margin") for sample in samples]),
             }
+            suggested_thresholds = _suggest_probe_thresholds_from_samples(
+                samples,
+                min_frames=min_frames,
+                has_contrast=contrast_vec is not None,
+            )
+            if contrast_warnings:
+                threshold_warnings = list(suggested_thresholds.get("warnings") or [])
+                threshold_warnings.extend(contrast_warnings)
+                suggested_thresholds = {
+                    **suggested_thresholds,
+                    "confidence": "low",
+                    "calibration_status": "bad_contrast",
+                    "separation_quality": "unknown",
+                    "recommended_action": "rephrase_contrast",
+                    "safe_to_apply": False,
+                    "needs_manual_frame_review": True,
+                    "warnings": list(dict.fromkeys(str(item) for item in threshold_warnings)),
+                }
             channel_results.append({
                 "channel_id": channel_id,
                 "sources": sources,
@@ -2170,11 +2188,7 @@ class AgentTools:
                 "source_returned": source_returned,
                 "coverage": coverage,
                 "distributions": distributions,
-                "suggested_thresholds": _suggest_probe_thresholds_from_samples(
-                    samples,
-                    min_frames=min_frames,
-                    has_contrast=contrast_vec is not None,
-                ),
+                "suggested_thresholds": suggested_thresholds,
                 "representative_frames": _calibration_representative_frames(samples, evidence_limit=evidence_limit),
                 "warnings": warnings[:12],
             })
@@ -2290,8 +2304,10 @@ class AgentTools:
         item: Mapping[str, Any],
         channel_result: Mapping[str, Any],
         contrast_effective: Optional[str],
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         thresholds = channel_result.get("suggested_thresholds") if isinstance(channel_result.get("suggested_thresholds"), Mapping) else {}
+        if thresholds.get("safe_to_apply") is not True:
+            return None
         positive = str(item.get("event_query") or item.get("probe_name") or "").strip()
         negative = str(contrast_effective or item.get("contrast_query") or "").strip()
         changes: Dict[str, Any] = {
@@ -2357,9 +2373,13 @@ class AgentTools:
             channel_result,
             calibration.get("contrast_query_effective"),
         )
+        thresholds = channel_result.get("suggested_thresholds") if isinstance(channel_result.get("suggested_thresholds"), Mapping) else {}
         warnings = []
         if isinstance(channel_result.get("warnings"), list):
             warnings.extend(str(item) for item in channel_result.get("warnings")[:8])
+        if isinstance(thresholds.get("warnings"), list):
+            warnings.extend(str(item) for item in thresholds.get("warnings")[:8])
+        warnings = list(dict.fromkeys(warnings))
         return {
             "item_id": item.get("item_id"),
             "source": item.get("source"),
@@ -2377,7 +2397,11 @@ class AgentTools:
             "warnings": warnings,
             "representative_frames": compact_frames,
             "recommended_probe_args": recommended,
-            "next_action": "preview_probe_update" if item.get("probe_id") else "preview_probe_create",
+            "next_action": (
+                "preview_probe_update" if recommended and item.get("probe_id")
+                else "preview_probe_create" if recommended
+                else thresholds.get("recommended_action") or "inspect_representative_frames"
+            ),
             "score_semantics": calibration.get("score_semantics"),
         }
 
@@ -2806,6 +2830,7 @@ class AgentTools:
         except Exception as exc:
             raise ToolError(f"Could not fetch channels: {exc}") from exc
         runtime_by_channel: Dict[int, Dict[str, Any]] = {}
+        status_digest_by_channel: Dict[int, Dict[str, Any]] = {}
         desired_video_channels: set[int] = set()
         desired_missing_by_channel: Dict[int, Dict[str, Any]] = {}
         try:
@@ -2819,6 +2844,12 @@ class AgentTools:
                 runtime_channel_id = _opt_int(item.get("channel_id"))
                 if runtime_channel_id is not None and runtime_channel_id > 0:
                     runtime_by_channel[int(runtime_channel_id)] = dict(item)
+            for item in streams_status.get("channel_status_digest") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                digest_channel_id = _opt_int(item.get("channel_id"))
+                if digest_channel_id is not None and digest_channel_id > 0:
+                    status_digest_by_channel[int(digest_channel_id)] = dict(item)
             desired_video_channels = {
                 int(item)
                 for item in streams_status.get("desired_video_channels") or []
@@ -2962,6 +2993,7 @@ class AgentTools:
             running = bool(status.get("running")) if isinstance(status, dict) else runtime_running
             silent_since_sec = trailing_gap_sec if latest_ts is not None else None
             quiet = bool(latest_ts is not None and trailing_gap_sec > gap_threshold_sec and not running)
+            status_digest = status_digest_by_channel.get(channel_id, {})
             runs_raw = status.get("runs") if isinstance(status, dict) and isinstance(status.get("runs"), list) else []
             overlapping_runs = 0
             for run in runs_raw:
@@ -2996,6 +3028,16 @@ class AgentTools:
                     "alert_counts": alert_counts,
                     "alert_parser_breakdown": parser_breakdown,
                     "alert_delivery_breakdown": delivery_breakdown,
+                    "recent_alerts": list(status_digest.get("recent_alerts") or [])[:10],
+                    "status_digest": {
+                        "last_summary_ts": status_digest.get("last_summary_ts"),
+                        "alert_total": status_digest.get("alert_total"),
+                        "alert_counts_by_severity": status_digest.get("alert_counts_by_severity"),
+                        "alert_delivery_breakdown": status_digest.get("alert_delivery_breakdown"),
+                        "alert_parser_breakdown": status_digest.get("alert_parser_breakdown"),
+                        "state_transition_total": status_digest.get("state_transition_total"),
+                        "current_observed_state": list(status_digest.get("current_observed_state") or [])[:8],
+                    } if status_digest else {},
                     "state_transition_total": state_transition_total,
                     "running": running,
                     "desired": desired,
@@ -3397,6 +3439,9 @@ class AgentTools:
 
         positives = [str(item).strip() for item in (args.get("positives") or []) if str(item).strip()]
         negatives = [str(item).strip() for item in (args.get("negatives") or []) if str(item).strip()]
+        negative_issues = _probe_negative_prompt_issues(negatives)
+        if negative_issues:
+            raise ToolError("Validation failed: " + "; ".join(negative_issues))
         probe = {
             "name": name,
             "channel_id": channel_id,
@@ -3530,6 +3575,13 @@ class AgentTools:
 
         if not changes:
             raise ToolError("'changes' must contain at least one field to modify.")
+        if "negatives" in changes:
+            raw_negatives = changes.get("negatives") or []
+            if not isinstance(raw_negatives, list):
+                raise ToolError("'negatives' must be a list of strings.")
+            negative_issues = _probe_negative_prompt_issues(raw_negatives)
+            if negative_issues:
+                raise ToolError("Validation failed: " + "; ".join(negative_issues))
 
         # Resolve probe
         if not probe_id and probe_name_raw:
@@ -5526,6 +5578,13 @@ def _format_agent_video_streams(
         for stream in status.get("video_streams") or []
         if isinstance(stream, Mapping) and allowed(stream.get("channel_id"))
     ]
+    digest_by_channel = {
+        int(row.get("channel_id")): row
+        for row in status.get("channel_status_digest") or []
+        if isinstance(row, Mapping)
+        and _opt_int(row.get("channel_id")) is not None
+        and allowed(row.get("channel_id"))
+    }
     desired_missing = [
         row
         for row in status.get("desired_video_missing") or []
@@ -5559,17 +5618,32 @@ def _format_agent_video_streams(
         alert_total = stream.get("last_alert_total")
         alert_counts = stream.get("last_alert_counts")
         alert_text = ""
+        digest = digest_by_channel.get(int(channel_id)) if _opt_int(channel_id) is not None else {}
+        recent_alerts = digest.get("recent_alerts") if isinstance(digest, Mapping) else None
         if isinstance(alert_counts, Mapping) and alert_counts:
             alert_text = ", alerts=" + ", ".join(
                 f"{key}:{value}" for key, value in alert_counts.items()
             )
+        elif isinstance(digest, Mapping) and isinstance(digest.get("alert_counts_by_severity"), Mapping) and digest.get("alert_counts_by_severity"):
+            alert_text = ", alerts=" + ", ".join(
+                f"{key}:{value}" for key, value in digest.get("alert_counts_by_severity", {}).items()
+            )
         elif alert_total not in (None, "", 0, "0"):
             alert_text = f", alerts={alert_total}"
+        recent_text = ""
+        if isinstance(recent_alerts, list) and recent_alerts:
+            titles = [
+                str(item.get("title") or "").strip()
+                for item in recent_alerts[:3]
+                if isinstance(item, Mapping) and str(item.get("title") or "").strip()
+            ]
+            if titles:
+                recent_text = ", recent_alerts=" + "; ".join(titles)[:160]
         error_text = f", last_error={last_error[:120]!r}" if last_error else ""
         lines.append(
-            f"  - CH {channel_id}: {state}, model={model}, "
+            f"  - CH {channel_id}: {state}, video_lm={model}, "
             f"pending={pending}, dropped_frames={dropped}, dropped_batches={queue_dropped}, "
-            f"summaries={logs}{alert_text}{error_text}"
+            f"summaries={logs}{alert_text}{recent_text}{error_text}"
         )
     if len(streams) > len(lines):
         lines.append(f"  - ... {len(streams) - len(lines)} more video stream(s) not expanded here")
@@ -5704,6 +5778,7 @@ def build_system_prompt(
         f"- For more than one probe/event/channel calibration item, use prepare_probe_calibration_batch instead of manual fan-out. It returns a server-side job_id, compact decision ledger, remaining_items, and recommended_probe_args. On 'continue', continue the same job_id; do not reconstruct the checklist from chat.\n"
         f"- For broad calibration across many channels, process at most {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels/items per turn. If a batch tool returns requires_continue, report job_id and remaining_count and ask the operator to continue before claiming the whole set is covered.\n"
         f"- Treat recommended_probe_args from prepare_probe_calibration_batch as pass-through preview arguments. Do not rewrite them into calibration-shaped arguments such as event_query/negative_prompt for create_probe/update_probe.\n"
+        f"- For CLIP P/N/M calibration, trust the tool's calibration_status, separation_quality, safe_to_apply, recommended_action, and warnings. Do not infer quality from positive_like_count alone: a very high positive_like_ratio can mean over-firing or weak contrast, not excellent separation. If safe_to_apply=false or recommended_probe_args is null, do not propose probe changes; ask for frame review or query rephrasing.\n"
         f"- Reuse existing probes by name/channel where possible (`update_existing=true`) and avoid creating duplicate probes for repeated VLM alerts from the same visual event class. Preserve the VLM alert severity only as an initial probe severity; tune thresholds from observed hits later.\n"
         f"- For probe modifications: call create_probe/update_probe/delete_probes with preview=true only. "
         f"Show the preview/diff and tell the operator to use the UI Apply button if they want to commit it. "
@@ -8176,6 +8251,15 @@ def _suggest_probe_thresholds_from_samples(
             "pos_floor": 0.20,
             "margin_thr": 0.03,
             "confidence": "low",
+            "calibration_status": "insufficient_data",
+            "separation_quality": "unknown",
+            "recommended_action": "collect_more_frames",
+            "safe_to_apply": False,
+            "needs_manual_frame_review": True,
+            "prevalence": {
+                "positive_like_ratio": 0.0,
+                "interpretation": "no scored frames",
+            },
             "warnings": ["no_scored_frames", *warnings],
             "rationale": "No scored archive frames were available; using conservative defaults.",
         }
@@ -8190,17 +8274,28 @@ def _suggest_probe_thresholds_from_samples(
         margin_thr = 0.03
         warnings.append("no_positive_separation")
 
-    pos_floor = max(0.05, min(0.95, pos_floor * 0.98))
+    positive_ratio = len(positive_like) / max(1, len(samples))
+    if positive_ratio >= 0.80:
+        # If nearly everything beats the contrast query, the contrast is not
+        # proving discrimination. Tighten candidate thresholds, but do not
+        # make them directly applyable without frame review.
+        pos_floor = float(np.quantile(np.asarray(pos_values, dtype=np.float32), 0.75))
+    pos_floor = max(0.05, min(0.95, pos_floor * (1.02 if positive_ratio >= 0.80 else 0.98)))
     if not has_contrast:
         margin_thr = 0.0
     else:
-        margin_thr = max(0.0, min(0.50, margin_thr * 0.85))
+        if positive_ratio >= 0.80 and positive_like:
+            margin_thr = float(np.quantile(
+                np.asarray([float(sample.get("margin") or 0.0) for sample in positive_like], dtype=np.float32),
+                0.75,
+            ))
+        margin_thr = max(0.0, min(0.50, margin_thr * (1.05 if positive_ratio >= 0.80 else 0.85)))
         if margin_thr < 0.01 and positive_like:
             warnings.append("weak_margin_separation")
 
     median_margin = float(np.median(np.asarray(margins, dtype=np.float32))) if margins else None
     top_margin = max(margins) if margins else None
-    positive_ratio = len(positive_like) / max(1, len(samples))
+    margin_q90 = float(np.quantile(np.asarray(margins, dtype=np.float32), 0.90)) if margins else None
     confidence = "low"
     if len(samples) >= min_frames and has_contrast and top_margin is not None:
         if top_margin >= 0.08 and positive_ratio >= 0.10:
@@ -8220,17 +8315,96 @@ def _suggest_probe_thresholds_from_samples(
             warnings.append("overlapping_positive_background_margins")
             confidence = "low" if confidence == "medium" else confidence
 
+    calibration_status = "usable"
+    recommended_action = "preview_threshold_update"
+    separation_quality = "weak"
+    safe_to_apply = True
+    needs_manual_frame_review = False
+    prevalence_interpretation = "candidate frames are present in a bounded share of the archive"
+
+    if not has_contrast:
+        calibration_status = "bad_contrast"
+        recommended_action = "rephrase_contrast"
+        separation_quality = "unknown"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        prevalence_interpretation = "no usable contrast query was scored"
+    elif len(samples) < min_frames:
+        calibration_status = "insufficient_data"
+        recommended_action = "collect_more_frames"
+        separation_quality = "unknown"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        prevalence_interpretation = "too few archive frames for reliable P/N/M calibration"
+    elif positive_ratio >= 0.80:
+        calibration_status = "over_firing"
+        recommended_action = "tighten_or_rephrase_contrast"
+        separation_quality = "poor"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        warnings.append("over_firing_positive_like_ratio")
+        prevalence_interpretation = (
+            "almost every scanned frame scored positive-like; this suggests an over-broad "
+            "positive query, weak contrast query, or target dominating the archive, not clean separation"
+        )
+        confidence = "low"
+    elif len(positive_like) == 0:
+        calibration_status = "target_absent"
+        recommended_action = "do_not_apply_rephrase_or_collect_examples"
+        separation_quality = "none"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        prevalence_interpretation = "no frames beat the contrast query"
+        confidence = "low"
+    elif positive_ratio <= 0.01:
+        if top_margin is not None and top_margin >= 0.08:
+            calibration_status = "rare_target_possible"
+            recommended_action = "inspect_representative_frames_before_preview"
+            separation_quality = "localized"
+            prevalence_interpretation = "very rare candidate frames with some margin signal"
+        else:
+            calibration_status = "target_absent"
+            recommended_action = "do_not_apply_rephrase_or_collect_examples"
+            separation_quality = "none"
+            prevalence_interpretation = "target is absent or not visually represented by the query in this archive"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        warnings.append("target_absent_or_rare_in_archive")
+        confidence = "low"
+    elif margin_q90 is None or margin_q90 < 0.03 or (top_margin is not None and top_margin < 0.05):
+        calibration_status = "weak_separation"
+        recommended_action = "rephrase_positive_or_contrast"
+        separation_quality = "weak"
+        safe_to_apply = False
+        needs_manual_frame_review = True
+        warnings.append("weak_margin_separation")
+        confidence = "low"
+    elif margin_q90 >= 0.12 and median_margin is not None and median_margin >= 0.03:
+        separation_quality = "strong"
+    elif margin_q90 >= 0.06:
+        separation_quality = "moderate"
+
+    warnings = list(dict.fromkeys(warnings))
     return {
         "pos_floor": round(float(pos_floor), 4),
         "margin_thr": round(float(margin_thr), 4),
         "confidence": confidence,
+        "calibration_status": calibration_status,
+        "separation_quality": separation_quality,
+        "recommended_action": recommended_action,
+        "safe_to_apply": safe_to_apply,
+        "needs_manual_frame_review": needs_manual_frame_review,
         "positive_like_count": len(positive_like),
         "background_like_count": len(background_like),
         "ambiguous_count": sum(1 for value in margins if abs(float(value)) < 0.03),
+        "prevalence": {
+            "positive_like_ratio": round(float(positive_ratio), 4),
+            "interpretation": prevalence_interpretation,
+        },
         "warnings": warnings,
         "rationale": (
-            "Suggested from archive CLIP P/N/M quantiles. Use as initial preview "
-            "thresholds only; inspect representative frames and observe post-change hits."
+            "Suggested from archive CLIP P/N/M margins, not positive prevalence alone. "
+            "Use only when safe_to_apply=true; otherwise inspect representative frames or rephrase queries."
         ),
     }
 
@@ -8329,6 +8503,20 @@ def _clip_effective_negative_state_query(
             f"{effective!r} instead of the literal negative phrase."
         )
     ]
+
+
+def _probe_negative_prompt_issues(values: Sequence[Any]) -> List[str]:
+    issues: List[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if re.search(r"\b(?:no|not|without|absent|missing)\b", lowered, flags=re.IGNORECASE):
+            issues.append(
+                f"negative prompt {text!r} uses literal negation; describe the visible alternative/background state instead"
+            )
+    return issues
 
 
 def _transition_label(previous_state: str, current_state: str, positive_label: str, negative_label: str) -> str:
@@ -9210,6 +9398,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "alert_counts": row.get("alert_counts"),
                     "alert_parser_breakdown": row.get("alert_parser_breakdown"),
                     "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                    "recent_alerts": row.get("recent_alerts"),
+                    "status_digest": row.get("status_digest"),
                     "state_transition_total": row.get("state_transition_total"),
                     "running": row.get("running"),
                     "desired": row.get("desired"),

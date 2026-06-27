@@ -449,6 +449,38 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertEqual(len(self.legacy.calls), 1)
 
+    def test_probe_write_rejects_negated_negative_prompts_through_adapter(self):
+        tools = AgentTools(
+            detections_store=_DetectionStore(),
+            probes_store=_ProbeStore(),
+            luxriot_manager=object(),
+            embed_text_fn=lambda _text: None,
+            embed_image_fn=lambda _image: None,
+            call_lm_fn=lambda *_args, **_kwargs: "",
+            encode_jpeg_fn=lambda *_args, **_kwargs: "",
+            search_indexed_folder_fn=lambda **_kwargs: [],
+            search_detections_fn=lambda **_kwargs: [],
+        )
+        adapter = EvaAgentToolAdapter(
+            tools,
+            _TOOL_SCHEMAS,
+            audit_callback=self.audit_events.append,
+        )
+        self.addCleanup(adapter.close)
+
+        with self.assertRaisesRegex(Exception, "literal negation"):
+            adapter.execute(
+                "create_probe",
+                {
+                    "name": "unsafe vehicle probe",
+                    "channel_id": 7,
+                    "positives": ["vehicle doing burnout"],
+                    "negatives": ["no vehicle"],
+                    "preview": True,
+                },
+                self.context,
+            )
+
     def test_write_apply_requires_plan_then_executes_stored_arguments(self):
         plan = self.adapter.create_plan(
             "update_probe",

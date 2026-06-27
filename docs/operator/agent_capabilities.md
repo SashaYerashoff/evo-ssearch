@@ -13,7 +13,8 @@ uses to dig through volume.
 
 **Read aggregated history (read-only — does not trigger LLM rollup synthesis)**
 - `list_video_summary_channels` — which channels are producing descriptions,
-  alert counts by severity, active/inactive, over a period.
+  alert counts by severity, active/inactive, recent alert titles from the
+  channel status digest, and pipeline health over a period.
 - `get_video_summaries` — L0–L3 timeline for a channel/period, with evidence
   frames, structured alert/state fields, and a coverage contract.
 - `count_video_summary_events` — count mentions/events in summaries for a channel.
@@ -50,13 +51,17 @@ uses to dig through volume.
   instead of negation. These probes are corroborating candidates, not proof.
 - `calibrate_probe_from_archive` — read-only archive calibration for proposed
   probe text. It scores archived frames with CLIP P/N/M, suggests initial
-  `pos_floor`/`margin_thr` values, and returns representative frames. For 50
-  channels it works in chunks of at most 8 channels and reports deferred channels.
+  `pos_floor`/`margin_thr` values, returns a `calibration_status` verdict, and
+  returns representative frames. Threshold suggestions are applyable only when
+  `safe_to_apply=true`; otherwise they are diagnostic and the operator should
+  inspect frames or rephrase the probe text. For 50 channels it works in chunks
+  of at most 8 channels and reports deferred channels.
 - `prepare_probe_calibration_batch` — stateful multi-probe/multi-channel
   calibration. It returns a `job_id`, compact decision ledger, remaining items,
-  and pass-through preview args so the agent does not reconstruct a long
-  checklist from chat. For multiple alert classes or many channels, the agent
-  should continue by `job_id` instead of dumping raw P/N/M traces.
+  and pass-through preview args only for safe verdicts, so the agent does not
+  reconstruct a long checklist from chat. For multiple alert classes or many
+  channels, the agent should continue by `job_id` instead of dumping raw P/N/M
+  traces.
 
 **Time & scope helpers**
 - `normalize_time_window` — turns "last 2 hours", "yesterday evening" into exact

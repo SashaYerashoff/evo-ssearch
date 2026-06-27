@@ -1034,6 +1034,136 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("state_observations", l1)
             self.assertNotIn("state_transition_events", l1)
 
+    def test_channel_status_digest_tracks_alert_titles_health_and_runtime_overlay(self):
+        def parser(_summary, channel_id, timestamp_ms):
+            return [
+                {
+                    "title": "Person down",
+                    "description": "Person appears to need help near entrance.",
+                    "severity": "high",
+                    "state": "new",
+                    "channel_id": channel_id,
+                    "timestamp_ms": timestamp_ms,
+                }
+            ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), alert_parser=parser)
+            manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "Person appears to need help near entrance.\n"
+                        "### Current observed state\n"
+                        "- Person near entrance: present; visible near doorway.\n"
+                        "ALERTS_JSON:\n"
+                        "{\"alerts\":[{\"title\":\"Person down\",\"severity\":\"high\",\"state\":\"new\"}]}"
+                    ),
+                    "frame_count": 12,
+                    "created_at": 100.0,
+                    "batch_start_ms": 100000,
+                    "batch_end_ms": 112000,
+                }
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+                run_id="run-7",
+                model_hint="vlm-a1",
+            )
+            session.frames = [{"thumbnail": "a"}, {"thumbnail": "b"}]
+            session.dropped_frames = 3
+            session.queue_dropped_batches = 2
+            session.last_error = "snapshot timeout"
+            manager.sessions[7] = session
+
+            digest = manager.system_status_digest(channel_ids=[7])["channels"][0]
+            self.assertEqual(digest["channel_id"], 7)
+            self.assertFalse(digest["running"])
+            self.assertEqual(digest["video_lm"], "vlm-a1")
+            self.assertEqual(digest["pending_frames"], 2)
+            self.assertEqual(digest["dropped_frames"], 3)
+            self.assertEqual(digest["dropped_batches"], 2)
+            self.assertEqual(digest["last_error"], "snapshot timeout")
+            self.assertEqual(digest["recent_alerts"][0]["title"], "Person down")
+            self.assertEqual(digest["recent_alerts"][0]["delivery_status"], "bookmark_disabled")
+            self.assertEqual(digest["alert_counts_by_severity"]["high"], 1)
+            self.assertEqual(digest["alert_delivery_breakdown"]["bookmark_disabled"], 1)
+            self.assertEqual(digest["alert_parser_breakdown"]["json_alert_count"], 1)
+            self.assertEqual(digest["current_observed_state"][0]["state"], "present")
+
+    def test_channel_status_digest_rebuilds_from_persisted_summary_history(self):
+        def parser(_summary, channel_id, timestamp_ms):
+            return [
+                {
+                    "title": "Smoke visible",
+                    "description": "Smoke is visible near roadway.",
+                    "severity": "normal",
+                    "state": "new",
+                    "channel_id": channel_id,
+                    "timestamp_ms": timestamp_ms,
+                }
+            ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            manager = build_manager(path, alert_parser=parser)
+            manager.accept_summary_entry(
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": (
+                        "Smoke visible near roadway.\n"
+                        "ALERTS_JSON:\n"
+                        "{\"alerts\":[{\"title\":\"Smoke visible\",\"severity\":\"normal\",\"state\":\"new\"}]}"
+                    ),
+                    "frame_count": 6,
+                    "created_at": 200.0,
+                    "batch_start_ms": 200000,
+                    "batch_end_ms": 206000,
+                }
+            )
+            manager.persist_summary_state()
+
+            restored = build_manager(path, alert_parser=parser)
+            digest = restored.system_status_digest(channel_ids=[7])["channels"][0]
+            self.assertEqual(digest["summary_count"], 1)
+            self.assertEqual(digest["recent_alerts"][0]["title"], "Smoke visible")
+            self.assertEqual(digest["alert_counts_by_severity"]["normal"], 1)
+            self.assertTrue(digest["rebuilt_from_history"])
+
+    def test_stream_status_ignores_stale_digest_alert_titles_for_newer_session_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            with manager.cache_lock:
+                manager.channel_status_digest[7] = {
+                    "channel_id": 7,
+                    "last_summary_ts": 100.0,
+                    "recent_alerts": [{"title": "Old alert", "severity": "high"}],
+                    "alert_counts_by_severity": {"high": 1},
+                    "alert_delivery_breakdown": {"sent": 1},
+                    "alert_parser_breakdown": {"json_alert_count": 1},
+                }
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+                run_id="run-7",
+                model_hint="vlm-a1",
+            )
+            with session.lock:
+                session.logs.append({"created_at": 120.0, "summary": "newer log", "frame_count": 1})
+            manager.sessions[7] = session
+
+            digest = manager.streams_status()["channel_status_digest"][0]
+            self.assertTrue(digest["stale_digest"])
+            self.assertNotIn("recent_alerts", digest)
+            self.assertNotIn("alert_counts_by_severity", digest)
+
     def test_state_transition_unknown_observation_does_not_confirm_change(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(

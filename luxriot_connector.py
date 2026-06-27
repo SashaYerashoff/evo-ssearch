@@ -731,6 +731,7 @@ class LuxriotManager:
             summary_retention_days = 7.0
         self.summary_retention_days = max(0.0, summary_retention_days)
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
+        self.channel_status_digest: Dict[int, Dict[str, Any]] = {}
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
         self.active_summary_runs: Dict[int, str] = {}
         self.channel_routine_context: Dict[int, Dict[str, Any]] = {}
@@ -1788,6 +1789,164 @@ class LuxriotManager:
             meta["state_transition_total"] = int(state_transition_total)
         return meta
 
+    @staticmethod
+    def _merge_int_breakdown(target: Dict[str, int], source: Mapping[str, Any]) -> None:
+        for raw_key, raw_value in source.items():
+            key = str(raw_key or "").strip().lower()
+            parsed = _parse_optional_int(raw_value)
+            if not key or parsed is None or parsed <= 0:
+                continue
+            target[key[:80]] = target.get(key[:80], 0) + int(parsed)
+
+    @classmethod
+    def _channel_status_digest_from_logs(
+        cls,
+        channel_id: int,
+        logs: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        ordered = sorted(
+            [dict(log) for log in logs if isinstance(log, Mapping)],
+            key=lambda row: float(cls._coerce_float(row.get("created_at")) or 0.0),
+        )
+        alert_counts: Dict[str, int] = {}
+        parser_breakdown: Dict[str, int] = {}
+        delivery_breakdown: Dict[str, int] = {}
+        recent_alerts: List[Dict[str, Any]] = []
+        recent_transitions: List[Dict[str, Any]] = []
+        current_state: List[Dict[str, Any]] = []
+        first_ts: Optional[float] = None
+        last_ts: Optional[float] = None
+        last_batch_end_ms: Optional[int] = None
+        frame_count = 0
+        state_transition_total = 0
+
+        for log in ordered:
+            start_ts, end_ts = cls._summary_log_bounds_seconds(log)
+            if start_ts is not None:
+                first_ts = start_ts if first_ts is None else min(first_ts, start_ts)
+            created = cls._coerce_float(log.get("created_at"))
+            latest_candidate = end_ts if end_ts is not None else created
+            if latest_candidate is not None:
+                last_ts = latest_candidate if last_ts is None else max(last_ts, latest_candidate)
+            parsed_batch_end = _parse_optional_int(log.get("batch_end_ms"))
+            if parsed_batch_end is not None:
+                last_batch_end_ms = parsed_batch_end if last_batch_end_ms is None else max(last_batch_end_ms, parsed_batch_end)
+            frame_count += int(_parse_optional_int(log.get("frame_count")) or 0)
+
+            raw_counts = log.get("alert_counts")
+            if isinstance(raw_counts, Mapping):
+                cls._merge_int_breakdown(alert_counts, raw_counts)
+            else:
+                total = _parse_optional_int(log.get("alert_total")) or 0
+                if total > 0:
+                    severity = str(log.get("severity") or "normal").strip().lower() or "normal"
+                    alert_counts[severity] = alert_counts.get(severity, 0) + int(total)
+
+            cls._merge_int_breakdown(parser_breakdown, cls._alert_parser_breakdown_from_entry(log))
+            cls._merge_int_breakdown(delivery_breakdown, cls._alert_delivery_breakdown_from_entry(log))
+            state_transition_total += int(_parse_optional_int(log.get("state_transition_total")) or 0)
+
+            event_ts_fallback = parsed_batch_end
+            for event in cls._compact_alert_events(log.get("alert_events")):
+                timestamp_ms = _parse_optional_int(event.get("timestamp_ms"))
+                if timestamp_ms is None:
+                    timestamp_ms = event_ts_fallback
+                item = {
+                    "title": str(event.get("title") or "Event").strip()[:120] or "Event",
+                    "severity": str(event.get("severity") or "normal").strip().lower()[:20] or "normal",
+                    "delivery_status": str(event.get("delivery_status") or "unknown").strip().lower()[:40] or "unknown",
+                }
+                if timestamp_ms is not None:
+                    item["timestamp_ms"] = int(timestamp_ms)
+                recent_alerts.append(item)
+
+            for transition in cls._compact_state_transition_events(log.get("state_transition_events")):
+                recent_transitions.append(transition)
+            state_observations = cls._compact_state_observations(log.get("state_observations"))
+            if state_observations:
+                current_state = state_observations[:16]
+
+        recent_alerts.sort(
+            key=lambda row: int(_parse_optional_int(row.get("timestamp_ms")) or 0),
+            reverse=True,
+        )
+        recent_transitions.sort(
+            key=lambda row: int(_parse_optional_int(row.get("timestamp_ms")) or 0),
+            reverse=True,
+        )
+        alert_total = int(sum(value for value in alert_counts.values() if isinstance(value, int) and value > 0))
+        updated_at = time.time()
+        return {
+            "channel_id": int(channel_id),
+            "summary_count": len(ordered),
+            "frame_count": int(frame_count),
+            "first_summary_ts": first_ts,
+            "last_summary_ts": last_ts,
+            "last_summary_batch_end_ms": last_batch_end_ms,
+            "alert_total": alert_total,
+            "alert_counts_by_severity": dict(alert_counts),
+            "recent_alerts": recent_alerts[:10],
+            "alert_delivery_breakdown": dict(delivery_breakdown),
+            "alert_parser_breakdown": dict(parser_breakdown),
+            "state_transition_total": int(state_transition_total),
+            "recent_state_transitions": recent_transitions[:10],
+            "current_observed_state": current_state[:16],
+            "updated_at": updated_at,
+            "rebuilt_from_history": True,
+            "source": "summary_history",
+        }
+
+    def _rebuild_channel_status_digest_locked(self) -> None:
+        self.channel_status_digest = {
+            int(channel_id): self._channel_status_digest_from_logs(int(channel_id), logs)
+            for channel_id, logs in self.summary_history.items()
+            if isinstance(logs, Sequence) and not isinstance(logs, (str, bytes, bytearray)) and logs
+        }
+
+    def _update_channel_status_digest_locked(
+        self,
+        channel_id: int,
+        logs: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not logs:
+            self.channel_status_digest.pop(int(channel_id), None)
+            return
+        self.channel_status_digest[int(channel_id)] = self._channel_status_digest_from_logs(int(channel_id), logs)
+
+    @staticmethod
+    def _overlay_stream_runtime_on_digest(
+        digest: Dict[str, Any],
+        runtime: Mapping[str, Any],
+    ) -> None:
+        latest_log_ts: Optional[float] = None
+        logs = runtime.get("logs")
+        if isinstance(logs, Sequence) and not isinstance(logs, (str, bytes, bytearray)) and logs:
+            latest_log = logs[-1] if isinstance(logs[-1], Mapping) else None
+            if isinstance(latest_log, Mapping):
+                latest_log_ts = LuxriotManager._coerce_float(latest_log.get("created_at"))
+        if latest_log_ts is None:
+            latest_log_ts = LuxriotManager._coerce_float(runtime.get("last_summary_at"))
+        digest_ts = LuxriotManager._coerce_float(digest.get("last_summary_ts"))
+        if latest_log_ts is not None and digest_ts is not None and latest_log_ts > digest_ts:
+            for field in (
+                "recent_alerts",
+                "alert_counts_by_severity",
+                "alert_delivery_breakdown",
+                "alert_parser_breakdown",
+                "recent_state_transitions",
+                "current_observed_state",
+            ):
+                digest.pop(field, None)
+            digest["stale_digest"] = True
+        digest["running"] = bool(runtime.get("running"))
+        digest["video_lm"] = str(runtime.get("model") or "").strip() or None
+        digest["pending_frames"] = _parse_optional_int(runtime.get("pending_frames")) or 0
+        digest["dropped_frames"] = _parse_optional_int(runtime.get("dropped_frames")) or 0
+        digest["dropped_batches"] = _parse_optional_int(runtime.get("queue_dropped_batches")) or 0
+        last_error = str(runtime.get("last_error") or runtime.get("last_restore_error") or "").strip()
+        digest["last_error"] = last_error[:240] or None
+        digest["runtime_updated_at"] = time.time()
+
     def _normalize_summary_log_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         channel_id = _parse_optional_int(entry.get("channel_id"))
         if channel_id is None:
@@ -2187,6 +2346,7 @@ class LuxriotManager:
             self.channel_routine_context = loaded_routines
             self.active_summary_runs = {}
             self.channel_prompt_overrides = loaded_channel_prompt_overrides
+            self._rebuild_channel_status_digest_locked()
             if loaded_stream_system_prompt is not None:
                 self.system_prompt = loaded_stream_system_prompt
             if loaded_alert_policy_prompt is not None:
@@ -4360,6 +4520,7 @@ class LuxriotManager:
         if len(merged) > self.summary_history_limit:
             merged = merged[-self.summary_history_limit :]
         self.summary_history[channel_id] = merged
+        self._update_channel_status_digest_locked(channel_id, merged)
         self._persist_summary_state_if_due_locked()
 
     def record_summary_log(self, channel_id: int, entry: Mapping[str, Any]) -> None:
@@ -5661,6 +5822,11 @@ class LuxriotManager:
             paused = set(self.paused_probe_channels)
             history_channels = sorted(channel_id for channel_id, logs in self.summary_history.items() if logs)
             restore_errors = dict(self.live_session_restore_errors)
+            status_digest = {
+                int(channel_id): dict(digest)
+                for channel_id, digest in self.channel_status_digest.items()
+                if isinstance(digest, Mapping)
+            }
         video_streams = [
             self._compact_stream_status("video", session.status(), paused)
             for _, session in video_items
@@ -5690,6 +5856,47 @@ class LuxriotManager:
             channel_id = int(item.get("channel_id") or 0)
             item["desired"] = channel_id in desired_video_channels
             item["last_restore_error"] = restore_errors.get(channel_id)
+            digest = status_digest.setdefault(
+                channel_id,
+                {
+                    "channel_id": channel_id,
+                    "summary_count": int(item.get("log_count") or 0),
+                    "alert_total": int(item.get("last_alert_total") or 0),
+                    "alert_counts_by_severity": dict(item.get("last_alert_counts") or {}),
+                    "recent_alerts": [],
+                    "alert_delivery_breakdown": {},
+                    "alert_parser_breakdown": {},
+                    "state_transition_total": 0,
+                    "current_observed_state": [],
+                    "recent_state_transitions": [],
+                    "rebuilt_from_history": False,
+                    "source": "runtime",
+                },
+            )
+            digest["desired"] = channel_id in desired_video_channels
+            digest["last_restore_error"] = restore_errors.get(channel_id)
+            self._overlay_stream_runtime_on_digest(digest, item)
+        for channel_id in desired_video_channels:
+            digest = status_digest.setdefault(
+                int(channel_id),
+                {
+                    "channel_id": int(channel_id),
+                    "summary_count": 0,
+                    "alert_total": 0,
+                    "alert_counts_by_severity": {},
+                    "recent_alerts": [],
+                    "alert_delivery_breakdown": {},
+                    "alert_parser_breakdown": {},
+                    "state_transition_total": 0,
+                    "current_observed_state": [],
+                    "recent_state_transitions": [],
+                    "rebuilt_from_history": False,
+                    "source": "desired",
+                },
+            )
+            digest["desired"] = True
+            digest.setdefault("running", False)
+            digest.setdefault("last_restore_error", restore_errors.get(int(channel_id)))
         analytics_streams = [
             self._compact_stream_status("analytics", session.status(), paused)
             for _, session in analytics_items
@@ -5697,11 +5904,47 @@ class LuxriotManager:
         return {
             "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
             "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
+            "channel_status_digest": sorted(status_digest.values(), key=lambda item: int(item.get("channel_id", 0))),
             "desired_video_channels": desired_video_channels,
             "desired_video_missing": desired_missing,
             "paused_analytics_channels": sorted(paused),
             "video_history_channels": history_channels,
             "running_total": len(video_streams) + len(analytics_streams),
+        }
+
+    def system_status_digest(
+        self,
+        channel_ids: Optional[Sequence[int]] = None,
+        *,
+        compact: bool = True,
+    ) -> Dict[str, Any]:
+        status = self.streams_status()
+        rows = status.get("channel_status_digest") if isinstance(status, Mapping) else []
+        wanted = {
+            int(item)
+            for item in (channel_ids or [])
+            if _parse_optional_int(item) is not None and int(item) > 0
+        }
+        output: List[Dict[str, Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, Mapping):
+                continue
+            channel_id = _parse_optional_int(row.get("channel_id"))
+            if channel_id is None:
+                continue
+            if wanted and int(channel_id) not in wanted:
+                continue
+            item = dict(row)
+            if compact:
+                item["recent_alerts"] = list(item.get("recent_alerts") or [])[:5]
+                item["recent_state_transitions"] = list(item.get("recent_state_transitions") or [])[:5]
+                item["current_observed_state"] = list(item.get("current_observed_state") or [])[:8]
+            output.append(item)
+        return {
+            "channels": output,
+            "count": len(output),
+            "compact": bool(compact),
+            "source": "luxriot_channel_status_digest",
         }
 
     def stop_stream(

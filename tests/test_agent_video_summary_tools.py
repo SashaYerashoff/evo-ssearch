@@ -57,6 +57,27 @@ class _SummaryManager:
                 {"channel_id": 8, "last_restore_error": "snapshot timeout"},
             ],
             "video_history_channels": [7, 8],
+            "channel_status_digest": [
+                {
+                    "channel_id": 7,
+                    "summary_count": 12,
+                    "last_summary_ts": 150.0,
+                    "alert_total": 1,
+                    "alert_counts_by_severity": {"low": 1},
+                    "recent_alerts": [
+                        {
+                            "title": "Doorway activity",
+                            "severity": "low",
+                            "delivery_status": "sent",
+                            "timestamp_ms": 150000,
+                        }
+                    ],
+                    "alert_delivery_breakdown": {"sent": 1},
+                    "alert_parser_breakdown": {"json_alert_count": 1},
+                    "state_transition_total": 0,
+                    "current_observed_state": [],
+                },
+            ],
         }
 
     @staticmethod
@@ -374,7 +395,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         )
 
         self.assertIn("Video-description runtime:", prompt)
-        self.assertIn("CH 7: running, model=vlm-a1", prompt)
+        self.assertIn("CH 7: running, video_lm=vlm-a1", prompt)
+        self.assertIn("recent_alerts=Doorway activity", prompt)
         self.assertIn("CH 8: desired but not running", prompt)
         self.assertIn("Configured semantic probes (1 total; secondary/internal", prompt)
         self.assertLess(prompt.index("Video-description runtime:"), prompt.index("Configured semantic probes"))
@@ -1424,6 +1446,112 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["channels"][0]["suggested_thresholds"]["confidence"], channel7["suggested_thresholds"]["confidence"])
         self.assertTrue(compact["channels"][0]["representative_frames"]["top_margin"][0]["image_url"].startswith("/detections/thumbnail/"))
 
+    def test_calibrate_probe_flags_over_firing_as_unsafe(self):
+        rows = [
+            {
+                "id": idx,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000 + idx * 1_000,
+                "clip_vec": [1.0, 0.0],
+            }
+            for idx in range(1, 11)
+        ]
+
+        def embed_text(text):
+            return [0.0, 1.0] if "normal traffic" in str(text).lower() else [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "vehicle doing burnout",
+                "contrast_query": "normal traffic",
+                "channel_id": 7,
+                "sources": ["vlm_summary"],
+                "from_ts": 100.0,
+                "to_ts": 120.0,
+            },
+        )
+
+        thresholds = result["channels"][0]["suggested_thresholds"]
+        self.assertEqual(thresholds["calibration_status"], "over_firing")
+        self.assertFalse(thresholds["safe_to_apply"])
+        self.assertIn("over_firing_positive_like_ratio", thresholds["warnings"])
+        self.assertIn("not clean separation", thresholds["prevalence"]["interpretation"])
+
+    def test_calibrate_probe_flags_target_absent_as_unsafe(self):
+        rows = [
+            {
+                "id": idx,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000 + idx * 1_000,
+                "clip_vec": [0.0, 1.0],
+            }
+            for idx in range(1, 11)
+        ]
+
+        def embed_text(text):
+            return [0.0, 1.0] if "people walking normally" in str(text).lower() else [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "person lying on ground",
+                "contrast_query": "people walking normally",
+                "channel_id": 7,
+                "sources": ["vlm_summary"],
+                "from_ts": 100.0,
+                "to_ts": 120.0,
+            },
+        )
+
+        thresholds = result["channels"][0]["suggested_thresholds"]
+        self.assertEqual(thresholds["calibration_status"], "target_absent")
+        self.assertEqual(thresholds["recommended_action"], "do_not_apply_rephrase_or_collect_examples")
+        self.assertTrue(thresholds["needs_manual_frame_review"])
+        self.assertFalse(thresholds["safe_to_apply"])
+
+    def test_calibrate_probe_flags_weak_margin_as_unsafe(self):
+        rows = []
+        for idx, vec in enumerate((
+            [0.51, 0.49],
+            [0.51, 0.49],
+            [0.51, 0.49],
+            [0.51, 0.49],
+            [0.49, 0.51],
+            [0.49, 0.51],
+            [0.49, 0.51],
+            [0.49, 0.51],
+        ), start=1):
+            rows.append({
+                "id": idx,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000 + idx * 1_000,
+                "clip_vec": vec,
+            })
+
+        def embed_text(text):
+            return [0.0, 1.0] if "clear roadway" in str(text).lower() else [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "smoke visible",
+                "contrast_query": "clear roadway",
+                "channel_id": 7,
+                "sources": ["vlm_summary"],
+                "from_ts": 100.0,
+                "to_ts": 120.0,
+            },
+        )
+
+        thresholds = result["channels"][0]["suggested_thresholds"]
+        self.assertEqual(thresholds["calibration_status"], "weak_separation")
+        self.assertEqual(thresholds["recommended_action"], "rephrase_positive_or_contrast")
+        self.assertFalse(thresholds["safe_to_apply"])
+
     def test_prepare_probe_calibration_batch_keeps_server_side_job_state(self):
         rows = [
             {
@@ -1434,11 +1562,25 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                 "clip_vec": [1.0, 0.0],
             },
             {
+                "id": 11,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 101_000,
+                "clip_vec": [0.0, 1.0],
+            },
+            {
                 "id": 2,
                 "channel_id": 8,
                 "source": "vlm_summary",
                 "event_timestamp_ms": 100_000,
                 "clip_vec": [1.0, 0.0],
+            },
+            {
+                "id": 12,
+                "channel_id": 8,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 101_000,
+                "clip_vec": [0.0, 1.0],
             },
         ]
 
@@ -1474,6 +1616,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                 "sources": ["vlm_summary"],
                 "from_ts": 99.0,
                 "to_ts": 101.0,
+                "min_frames": 1,
             },
         )
 
@@ -1510,6 +1653,125 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["job_id"], first["job_id"])
         self.assertTrue(compact["output_contract"]["recommended_probe_args_are_pass_through"])
         self.assertEqual(compact["processed_items"][0]["recommended_probe_args"]["tool"], "create_probe")
+
+    def test_prepare_probe_calibration_batch_suppresses_unsafe_recommendations(self):
+        rows = [
+            {
+                "id": idx,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000 + idx * 1_000,
+                "clip_vec": [1.0, 0.0],
+            }
+            for idx in range(1, 10)
+        ]
+
+        def embed_text(text):
+            return [0.0, 1.0] if "normal traffic" in str(text).lower() else [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "prepare_probe_calibration_batch",
+            {
+                "items": [
+                    {
+                        "name": "vehicle burnout",
+                        "event_query": "vehicle doing burnout",
+                        "contrast_query": "normal traffic",
+                        "channel_id": 7,
+                    },
+                ],
+                "items_per_call": 1,
+                "sources": ["vlm_summary"],
+                "from_ts": 99.0,
+                "to_ts": 120.0,
+            },
+        )
+
+        item = result["processed_items"][0]
+        self.assertEqual(item["suggested_thresholds"]["calibration_status"], "over_firing")
+        self.assertIsNone(item["recommended_probe_args"])
+        self.assertEqual(item["next_action"], "tighten_or_rephrase_contrast")
+
+    def test_prepare_probe_calibration_batch_suppresses_negated_contrast_recommendations(self):
+        rows = [
+            {
+                "id": idx,
+                "channel_id": 7,
+                "source": "vlm_summary",
+                "event_timestamp_ms": 100_000 + idx * 1_000,
+                "clip_vec": [1.0, 0.0] if idx <= 4 else [0.0, 1.0],
+            }
+            for idx in range(1, 9)
+        ]
+
+        def embed_text(text):
+            value = str(text).lower()
+            if "no person" in value:
+                return [0.0, 1.0]
+            return [1.0, 0.0]
+
+        result = _tools(detections_store=_DetectionStore(rows), embed_text_fn=embed_text).execute(
+            "prepare_probe_calibration_batch",
+            {
+                "items": [
+                    {
+                        "name": "person down",
+                        "event_query": "person lying on ground",
+                        "contrast_query": "no person",
+                        "channel_id": 7,
+                    },
+                ],
+                "items_per_call": 1,
+                "sources": ["vlm_summary"],
+                "from_ts": 99.0,
+                "to_ts": 120.0,
+            },
+        )
+
+        item = result["processed_items"][0]
+        self.assertEqual(item["suggested_thresholds"]["calibration_status"], "bad_contrast")
+        self.assertFalse(item["suggested_thresholds"]["safe_to_apply"])
+        self.assertTrue(any("negation" in warning for warning in item["warnings"]))
+        self.assertIsNone(item["recommended_probe_args"])
+        compact = _compact_tool_result_for_model("prepare_probe_calibration_batch", result)
+        self.assertIsNone(compact["processed_items"][0]["recommended_probe_args"])
+
+    def test_probe_negative_prompts_reject_literal_negation(self):
+        tools = _tools(
+            probes_store=_ProbeStore([
+                {
+                    "id": "probe-1",
+                    "name": "thumbs",
+                    "channel_id": 7,
+                    "positives": ["thumbs up gesture"],
+                    "negatives": ["person with hand lowered"],
+                    "pos_floor": 0.2,
+                    "margin": 0.05,
+                }
+            ])
+        )
+
+        with self.assertRaisesRegex(Exception, "literal negation"):
+            tools.execute(
+                "create_probe",
+                {
+                    "name": "unsafe negative",
+                    "channel_id": 7,
+                    "positives": ["thumbs up gesture"],
+                    "negatives": ["person with hand raised but not thumbs up"],
+                    "preview": True,
+                },
+            )
+
+        with self.assertRaisesRegex(Exception, "literal negation"):
+            tools.execute(
+                "update_probe",
+                {
+                    "probe_id": "probe-1",
+                    "changes": {"negatives": ["no smoke visible"]},
+                    "preview": True,
+                },
+            )
 
     def test_track_visual_state_transition_negative_embedding_warning_is_specific(self):
         store = _DetectionStore(
@@ -1615,6 +1877,11 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             [row["channel_id"] for row in result["candidate_channels"]],
             [7, 8],
         )
+        row7 = result["candidate_channels"][0]
+        self.assertEqual(row7["recent_alerts"][0]["title"], "Doorway activity")
+        self.assertEqual(row7["status_digest"]["alert_delivery_breakdown"]["sent"], 1)
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+        self.assertEqual(compact["candidate_channels"][0]["recent_alerts"][0]["title"], "Doorway activity")
 
     def test_list_video_summary_channels_uses_batch_bounds_for_activity_window(self):
         manager = _SummaryManager()
