@@ -1,0 +1,207 @@
+"""Thin client for live integration testing of the EVA agent over its real HTTP/SSE contract.
+
+Grounded on the actual endpoints (oldapp.py):
+  - POST /auth/login            {username, password} -> sets session + CSRF cookies
+  - POST /agent/chat            {message, session_id?, image_b64?} -> SSE text/event-stream
+  - POST /agent/action-plans/<plan_id>/execute  {session_id?} -> JSON {success, result}  (the UI "Apply")
+
+SSE event types yielded by the agent: tool_call, tool_result, tool_progress,
+tool_budget, text, session, done, error.
+
+This is an *acceptance smoke* client: assert structure (tool calls/results,
+safe_to_apply, restricted_matches, delivery_status, action receipts), not LLM prose.
+No new dependency: uses `requests` (already required) + stdlib.
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+
+def parse_sse_events(lines: Any) -> List[Dict[str, Any]]:
+    """Parse an SSE byte/line stream into a list of decoded `data:` JSON events.
+
+    Tolerant: ignores comment/heartbeat lines and non-JSON data payloads.
+    Supports both our normal one-line JSON events and standards-compliant
+    multi-line `data:` frames.
+    """
+    events: List[Dict[str, Any]] = []
+    data_parts: List[str] = []
+
+    def flush() -> None:
+        if not data_parts:
+            return
+        parts = [part for part in data_parts]
+        data_parts.clear()
+        payloads = ["\n".join(parts).strip()]
+        if len(parts) > 1:
+            payloads.extend(part.strip() for part in parts)
+        for payload in payloads:
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+                if payload == payloads[0]:
+                    return
+
+    for raw in lines:
+        if raw is None:
+            continue
+        line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        line = line.rstrip("\r\n")
+        if not line:
+            flush()
+            continue
+        if line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        data_parts.append(line[len("data:"):].lstrip())
+    flush()
+    return events
+
+
+@dataclass
+class Transcript:
+    """Structured view over one agent turn's SSE events (assert on this, not prose)."""
+
+    events: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def tool_calls(self) -> List[Tuple[str, Dict[str, Any]]]:
+        return [
+            (str(e.get("name") or ""), dict(e.get("args") or {}))
+            for e in self.events
+            if e.get("type") == "tool_call"
+        ]
+
+    @property
+    def tool_results(self) -> List[Tuple[str, Any, Optional[str]]]:
+        out: List[Tuple[str, Any, Optional[str]]] = []
+        for e in self.events:
+            if e.get("type") == "tool_result":
+                out.append((str(e.get("name") or ""), e.get("result"), e.get("error")))
+        return out
+
+    @property
+    def text(self) -> str:
+        return "".join(str(e.get("content") or "") for e in self.events if e.get("type") == "text")
+
+    @property
+    def session_id(self) -> Optional[str]:
+        for e in self.events:
+            if e.get("type") == "session" and e.get("session_id"):
+                return str(e.get("session_id"))
+            if e.get("type") == "done" and e.get("session_id"):
+                return str(e.get("session_id"))
+        return None
+
+    @property
+    def errored(self) -> bool:
+        return any(e.get("type") == "error" for e in self.events)
+
+    def called(self, name: str) -> bool:
+        return any(n == name for n, _ in self.tool_calls)
+
+    def calls_of(self, name: str) -> List[Dict[str, Any]]:
+        return [args for n, args in self.tool_calls if n == name]
+
+    def result_of(self, name: str) -> Optional[Any]:
+        for n, result, _err in self.tool_results:
+            if n == name:
+                return result
+        return None
+
+    def approval_plan_ids(self) -> List[str]:
+        ids: List[str] = []
+        for _n, result, _err in self.tool_results:
+            if isinstance(result, dict):
+                approval = result.get("approval")
+                if isinstance(approval, dict) and approval.get("plan_id"):
+                    ids.append(str(approval["plan_id"]))
+        return ids
+
+    def prose_has(self, pattern: str) -> bool:
+        return re.search(pattern, self.text, flags=re.IGNORECASE) is not None
+
+
+class EvaSession:
+    """Authenticated live session against a running EVA AI instance."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        csrf_cookie: str = "eva_csrf",
+        verify_tls: bool = False,
+        timeout: float = 180.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.csrf_cookie = csrf_cookie
+        self.verify_tls = verify_tls
+        self.timeout = timeout
+        self.http = requests.Session()
+        self.http.verify = verify_tls
+        if not verify_tls:
+            try:  # silence expected self-signed dev cert warnings only for this mode
+                import urllib3
+
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:  # pragma: no cover
+                pass
+
+    def _csrf_headers(self) -> Dict[str, str]:
+        token = self.http.cookies.get(self.csrf_cookie) or ""
+        return {"X-CSRF-Token": token} if token else {}
+
+    def login(self, username: str, password: str) -> Dict[str, Any]:
+        resp = self.http.post(
+            f"{self.base_url}/auth/login",
+            json={"username": username, "password": password},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def whoami(self) -> Dict[str, Any]:
+        resp = self.http.get(f"{self.base_url}/auth/me", timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def ask(self, message: str, session_id: Optional[str] = None, image_b64: Optional[str] = None) -> Transcript:
+        body: Dict[str, Any] = {"message": message}
+        if session_id:
+            body["session_id"] = session_id
+        if image_b64:
+            body["image_b64"] = image_b64
+        resp = self.http.post(
+            f"{self.base_url}/agent/chat",
+            json=body,
+            headers={**self._csrf_headers(), "Accept": "text/event-stream"},
+            stream=True,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return Transcript(events=parse_sse_events(resp.iter_lines()))
+
+    def apply_plan(self, plan_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Simulate the UI 'Apply' button: commit a previewed action plan."""
+        resp = self.http.post(
+            f"{self.base_url}/agent/action-plans/{plan_id}/execute",
+            json={"session_id": session_id} if session_id else {},
+            headers=self._csrf_headers(),
+            timeout=self.timeout,
+        )
+        # may legitimately return 4xx (e.g. approval not enabled); return the body either way
+        try:
+            return {"status": resp.status_code, **resp.json()}
+        except ValueError:
+            return {"status": resp.status_code, "raw": resp.text[:500]}
