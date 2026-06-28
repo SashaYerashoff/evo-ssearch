@@ -20,7 +20,7 @@ export SERVICE=eva-ai
 export ENV_FILE=/etc/eva-ai/eva-ai.env
 export DB_NAME=eva
 export BRANCH=feature/secure-50-channel-foundation
-export BASE_URL=https://127.0.0.1:5443
+export BASE_URL=http://127.0.0.1:5000
 
 printf 'APP_DIR=<%s>\nSERVICE=<%s>\nENV_FILE=<%s>\nDB_NAME=<%s>\nBRANCH=<%s>\nBASE_URL=<%s>\n' \
   "$APP_DIR" "$SERVICE" "$ENV_FILE" "$DB_NAME" "$BRANCH" "$BASE_URL"
@@ -32,6 +32,10 @@ printf 'APP_DIR=<%s>\nSERVICE=<%s>\nENV_FILE=<%s>\nDB_NAME=<%s>\nBRANCH=<%s>\nBA
 : "${BRANCH:?BRANCH is empty}"
 : "${BASE_URL:?BASE_URL is empty}"
 ```
+
+Office demo usually listens on plain HTTP port `5000`. The local dev box may
+use HTTPS port `5443`; set `BASE_URL=https://127.0.0.1:5443` only when the
+service status explicitly shows HTTPS/5443.
 
 If even simple commands like `ls -la` show no output while the prompt still
 appears, stdout/stderr were probably redirected in the current root shell. Fix
@@ -170,23 +174,18 @@ cd "$APP_DIR"
 
 This does not call the slow live agent smoke unless explicit env flags are set.
 
+If `pytest` is installed in the production venv, run the full deterministic
+predeploy gate:
+
 ```bash
 cd "$APP_DIR"
-scripts/predeploy_acceptance.sh
-```
-
-Expected:
-
-- docs drift OK;
-- pytest OK.
-
-If `pytest` is not installed in the production venv, do not install dev tooling
-on the office machine just for the update. Run the docs drift check and compile
-the changed runtime files with the same Python used by the service:
-
-```bash
-bash scripts/check_docs_drift.sh
-.venv/bin/python -m py_compile agent.py luxriot_connector.py oldapp.py agent_security/eva_adapter.py config.py wsgi.py
+if .venv/bin/python -m pytest --version >/dev/null 2>&1; then
+  scripts/predeploy_acceptance.sh
+else
+  echo "pytest is not installed in this production venv; using runtime fallback checks."
+  bash scripts/check_docs_drift.sh
+  .venv/bin/python -m py_compile agent.py luxriot_connector.py oldapp.py agent_security/eva_adapter.py config.py wsgi.py
+fi
 ```
 
 Then rely on service start, `/health`, `/ready`, and optional live smoke. If the
@@ -198,18 +197,45 @@ service fails to start due to a missing Python package, inspect
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl start "$SERVICE"
-sleep 10
+sleep 30
 sudo systemctl status "$SERVICE" --no-pager -l
 ```
 
+Read the `Listening at:` line in the status output. If it says
+`http://0.0.0.0:5000`, keep `BASE_URL=http://127.0.0.1:5000`. If it says
+`https://0.0.0.0:5443`, set `BASE_URL=https://127.0.0.1:5443`.
+
 ## 9. Health / Ready
 
-Use `-k` for the local self-signed certificate.
+The block below tries the configured `BASE_URL` first, then the two common local
+bindings. `-k` is harmless for HTTP and useful for self-signed HTTPS.
 
 ```bash
+rm -f /tmp/eva-ai-health.json
+HEALTH_OK=
+for candidate in "$BASE_URL" http://127.0.0.1:5000 https://127.0.0.1:5443; do
+  echo "Trying $candidate/health"
+  if curl -k -sS "$candidate/health" >/tmp/eva-ai-health.json; then
+    export BASE_URL="$candidate"
+    HEALTH_OK=1
+    break
+  fi
+done
+
+if [ -z "$HEALTH_OK" ]; then
+  echo "No local health endpoint responded. Re-check systemctl status Listening at: line."
+  exit 1
+fi
+
+echo "Using BASE_URL=$BASE_URL"
+cat /tmp/eva-ai-health.json | jq
 curl -k -sS "$BASE_URL/health" | jq
 curl -k -sS "$BASE_URL/ready" | jq
 ```
+
+If health fails while `systemctl status` says `active (running)`, check the
+`Listening at:` line and correct `BASE_URL`; do not restart the service just
+because curl was pointed at the wrong port.
 
 Expected:
 
