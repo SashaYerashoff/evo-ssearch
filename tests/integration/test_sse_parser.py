@@ -8,7 +8,15 @@ import json
 import unittest
 
 from tests.integration.eva_client import Transcript, parse_sse_events
-from tests.integration.scenarios import AnyResultCheck, AnyToolCheck, Scenario, ToolCheck, ResultCheck, run_scenario
+from tests.integration.scenarios import (
+    SCENARIOS,
+    AnyResultCheck,
+    AnyToolCheck,
+    Scenario,
+    ToolCheck,
+    ResultCheck,
+    run_scenario,
+)
 
 
 def _sse(*objs) -> list:
@@ -108,6 +116,16 @@ class SseParserTest(unittest.TestCase):
         )
         hard, _soft = run_scenario(self.t, scenario)
         self.assertEqual(hard, [])
+
+    def test_catalog_regex_fields_are_tuples(self) -> None:
+        for scenario in SCENARIOS:
+            for field_name in ("prose_must", "prose_must_not", "requires"):
+                value = getattr(scenario, field_name)
+                self.assertIsInstance(value, tuple, f"{scenario.name}.{field_name}")
+                self.assertTrue(
+                    all(isinstance(item, str) for item in value),
+                    f"{scenario.name}.{field_name}",
+                )
 
 
 if __name__ == "__main__":

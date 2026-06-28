@@ -19,7 +19,11 @@ the default suite so model variability can't flake CI.
 ## Setup (dev box)
 1. Service running (e.g. `https://127.0.0.1:5443`), secure mode on.
 2. Admin user: `python scripts/bootstrap_admin.py` (see admin_guide).
-3. For the redirect scenario, also create an **operator** (non-admin) account.
+3. For the redirect scenario, also create an **operator** (non-admin) account:
+   ```bash
+   EVA_LIVE_OPERATOR_PASSWORD='...' \
+   .venv/bin/python scripts/bootstrap_live_smoke_operator.py --channel-id 112 --set-password
+   ```
 4. For deterministic needle/contamination scenarios, **seed** known
    summary/archive/probe fixtures first (a known prose-only event; a probe with
    known archive frames; a planted searchable incident).

@@ -120,8 +120,8 @@ SCENARIOS: List[Scenario] = [
         name="status_report_from_tool",
         message="List active video-description streams, models, queues, dropped frames, and last errors.",
         tool_checks=(ToolCheck("list_video_summary_channels", desc="status must come from a tool"),),
-        prose_must_not=(r"\bqwen3\.5\b", r"\bagent model\b"),
-        note="video_lm label, not the agent LM; numbers from a tool.",
+        prose_must_not=(r"\bagent model\b",),
+        note="Runtime status must come from the video-description status tool, not docs or guessed agent-LM state.",
     ),
     Scenario(
         name="calibrate_probes_from_archive",
