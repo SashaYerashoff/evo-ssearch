@@ -99,6 +99,8 @@ under-tuned probe creation.
 - Added deterministic integration harness over the real HTTP/SSE contract.
 - Added seeded archive fixtures for live-smoke archive search and probe
   calibration plumbing.
+- Added `scripts/predeploy_acceptance.sh` as a single deterministic predeploy
+  gate with optional admin/non-admin live-smoke stages.
 - Added admin live-smoke path for:
   - live status
   - archive search
@@ -109,6 +111,8 @@ under-tuned probe creation.
 - Added non-admin live-smoke path for documentation/RBAC restricted-help checks.
 - Added `scripts/bootstrap_live_smoke_operator.py` for repeatable non-admin
   smoke setup.
+- Added office-demo git update runbook and manual test scenario for PM/intern
+  validation.
 
 ## How To Test Before Office Demo
 
@@ -121,8 +125,7 @@ sudo sed -i 's/^EVOSSEARCH_APP_VERSION=.*/EVOSSEARCH_APP_VERSION="β 0.8.2"/' /e
 Run deterministic tests:
 
 ```bash
-.venv/bin/pytest -q
-bash scripts/check_docs_drift.sh
+scripts/predeploy_acceptance.sh
 ```
 
 Seed deterministic archive fixtures on the target demo channel:
