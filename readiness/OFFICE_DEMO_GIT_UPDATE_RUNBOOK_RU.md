@@ -102,15 +102,16 @@ processes remain running.
 
 ## 3. Backup Database And Env
 
-This fixes the old permission trap by making the backup directory writable by
-the `postgres` OS user.
+Use a directory under `/var/lib/postgresql`. This avoids the permission trap
+where the `postgres` OS user can own the final backup directory but still cannot
+traverse a parent directory such as `/var/lib/eva-ai`.
 
 ```bash
 TS="$(date +%Y%m%d-%H%M%S)"
 
-sudo install -d -o postgres -g postgres -m 700 /var/lib/eva-ai/backups
+sudo install -d -o postgres -g postgres -m 700 /var/lib/postgresql/eva-ai-backups
 
-BACKUP="/var/lib/eva-ai/backups/eva-before-0.8.2-${TS}.dump"
+BACKUP="/var/lib/postgresql/eva-ai-backups/eva-before-0.8.2-${TS}.dump"
 sudo -u postgres pg_dump -Fc -d "$DB_NAME" -f "$BACKUP"
 sudo ls -lh "$BACKUP"
 
@@ -179,13 +180,18 @@ Expected:
 - docs drift OK;
 - pytest OK.
 
-If this is too slow on the office machine and you already tested locally, at
-minimum run:
+If `pytest` is not installed in the production venv, do not install dev tooling
+on the office machine just for the update. Run the docs drift check and compile
+the changed runtime files with the same Python used by the service:
 
 ```bash
 bash scripts/check_docs_drift.sh
-.venv/bin/pytest -q tests/integration tests/test_agent_tool_loop.py tests/test_eva_agent_adapter.py
+.venv/bin/python -m py_compile agent.py luxriot_connector.py oldapp.py agent_security/eva_adapter.py config.py wsgi.py
 ```
+
+Then rely on service start, `/health`, `/ready`, and optional live smoke. If the
+service fails to start due to a missing Python package, inspect
+`journalctl -u eva-ai -n 100 --no-pager -l` and fix that package explicitly.
 
 ## 8. Start EVA AI
 
