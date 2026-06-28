@@ -92,7 +92,7 @@ Single worker is **required** (in-process schedulers). See
 
 ## 7. Upgrades
 
-- **Code-only patch** (e.g. β 0.8.0 → 0.8.1): apply files, restart. No migration.
+- **Code-only patch** (e.g. β 0.8.1 → 0.8.2): apply files, restart. No migration.
 - **DB-touching patch:** run `alembic upgrade head` explicitly; the installer must
   refuse unsafe startup if DB revision < code-expected revision.
 - Always reversible via `scripts/rollback.sh`.

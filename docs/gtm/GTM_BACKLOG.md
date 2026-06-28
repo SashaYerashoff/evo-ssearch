@@ -1,6 +1,6 @@
 # Luxriot EVA AI — Go-to-Market Readiness Backlog
 
-**Status:** Current build is `β 0.8.1` — a production-pilot build for controlled client deployment.
+**Status:** Current build is `β 0.8.2` — a production-pilot build for controlled client deployment.
 **Premise:** The gap to a sellable product is hardening, operability, and legal/data
 clarity — **not features**. Items are ordered by recommended sequence, not just severity.
 

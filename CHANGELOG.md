@@ -4,6 +4,24 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## β 0.8.2 — 2026-06-28 (office-demo hardening)
+
+- **VLM alerts:** split live-feed role text from channel alert criteria; structured
+  alert parsing/delivery is now observable; backend state-transition events are
+  exposed to the agent with provenance so prose-only findings are treated as
+  unconfirmed until frame evidence is checked.
+- **Agent reports:** status/report flow is video-description-first, with pipeline
+  health separated from incident findings and live runtime status routed to
+  runtime tools instead of documentation lookup.
+- **Probe control:** archive-based CLIP P/N/M calibration returns deterministic
+  `safe_to_apply`, `recommended_action`, warnings, and pass-through preview args;
+  unsafe/over-firing calibrations do not produce apply-ready probe changes.
+- **Acceptance:** added seeded live-smoke fixtures plus admin and non-admin
+  live-smoke paths for preview/apply, documentation RBAC, archive search,
+  calibration, and broad-channel chunking.
+- **Upgrade:** code-only from β 0.8.1 — **no database migration**.
+- Schema head: `20260614_0006`. See `readiness/RELEASE_NOTES_0.8.2.md`.
+
 ## β 0.8.1 — 2026-06 (production-pilot stabilization)
 
 - **Agent:** video-description-first status/reports; probes secondary;
