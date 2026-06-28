@@ -29,6 +29,8 @@ the default suite so model variability can't flake CI.
 EVA_LIVE_BASE_URL=https://127.0.0.1:5443 \
 EVA_LIVE_USER=admin EVA_LIVE_PASSWORD='...' \
 EVA_LIVE_CHANNEL_REF='Zenbook webcam' \
+EVA_LIVE_NEEDLE_QUERY='person lying on the ground at night' \
+EVA_LIVE_PROBE_NAME='smoke: thumbs up gesture' \
 EVA_LIVE_INCLUDE=seed \
 .venv/bin/pytest -q tests/integration/test_live_agent.py -s
 ```
@@ -45,6 +47,8 @@ EVA_LIVE_INCLUDE=seed \
   ```
 - `EVA_LIVE_CHANNEL_REF` is the channel name or ID used in channel-scoped prompts
   (default: `the active video-description channel`, which relies on the agent to resolve it).
+- `EVA_LIVE_NEEDLE_QUERY` is the seeded archive-search query.
+- `EVA_LIVE_PROBE_NAME` is the seeded/configured probe used by the calibration scenario.
 - `EVA_LIVE_CSRF_COOKIE` overrides the CSRF cookie name (default `eva_csrf`).
 - `EVA_LIVE_VERIFY_TLS=1` enables TLS verification. By default the smoke accepts
   the local self-signed dev certificate.

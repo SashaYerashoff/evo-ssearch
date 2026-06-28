@@ -27,6 +27,8 @@ _USER = os.getenv("EVA_LIVE_USER", "").strip()
 _PASSWORD = os.getenv("EVA_LIVE_PASSWORD", "")
 _CSRF = os.getenv("EVA_LIVE_CSRF_COOKIE", "eva_csrf").strip() or "eva_csrf"
 _CHANNEL_REF = os.getenv("EVA_LIVE_CHANNEL_REF", "the active video-description channel").strip()
+_NEEDLE_QUERY = os.getenv("EVA_LIVE_NEEDLE_QUERY", "seeded test incident").strip()
+_PROBE_NAME = os.getenv("EVA_LIVE_PROBE_NAME", "the seeded probe").strip()
 _VERIFY_TLS = os.getenv("EVA_LIVE_VERIFY_TLS", "").strip().lower() in {"1", "true", "yes", "on"}
 # tags whose prerequisites are set up in this environment (seed data, operator acct, ...)
 _INCLUDE = {t.strip() for t in os.getenv("EVA_LIVE_INCLUDE", "").split(",") if t.strip()}
@@ -66,7 +68,11 @@ class LiveAgentSmoke(unittest.TestCase):
                     ["scenario requires non-admin/operator credentials; current user is admin-capable"],
                 ))
                 continue
-            message = scenario.message.format(channel_ref=_CHANNEL_REF)
+            message = scenario.message.format(
+                channel_ref=_CHANNEL_REF,
+                needle_query=_NEEDLE_QUERY,
+                probe_name=_PROBE_NAME,
+            )
             transcript = self.session.ask(message, session_id=chat_session_id)
             chat_session_id = transcript.session_id or chat_session_id
             hard, soft = run_scenario(transcript, scenario)

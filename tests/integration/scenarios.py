@@ -126,7 +126,7 @@ SCENARIOS: List[Scenario] = [
     Scenario(
         name="calibrate_probes_from_archive",
         message=(
-            "Review the probes' P/N/M against channel {channel_ref}'s archive "
+            "Review probe {probe_name}'s P/N/M against channel {channel_ref}'s archive "
             "and tell me which are safe to apply."
         ),
         tool_checks=(
@@ -196,7 +196,7 @@ SCENARIOS: List[Scenario] = [
     ),
     Scenario(
         name="needle_search_scoped_with_coverage",
-        message="Search channel {channel_ref}'s archive for the seeded test incident in the last 24 hours.",
+        message="Search channel {channel_ref}'s archive for {needle_query} in the last 24 hours.",
         tool_checks=(ToolCheck("search_archive", desc="scoped semantic search"),),
         prose_must=(r"coverage|inspected|window",),
         requires=("seed",),
