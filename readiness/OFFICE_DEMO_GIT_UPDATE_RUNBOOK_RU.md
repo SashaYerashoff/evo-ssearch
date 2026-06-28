@@ -9,20 +9,41 @@ Migration: **none**.
 This runbook updates code from git while preserving the current PostgreSQL
 database, archive, users, prompts, and existing `.env`.
 
-## 0. Assumptions
+## 0. Paste This First In The Same Terminal
 
-Adjust these if the office machine differs:
+Run this block first. Keep using the same terminal after it. The later command
+blocks rely on these exported variables.
 
 ```bash
-APP_DIR=/opt/eva-ai/evo-ssearch
-SERVICE=eva-ai
-ENV_FILE=/etc/eva-ai/eva-ai.env
-DB_NAME=eva
-BRANCH=feature/secure-50-channel-foundation
-BASE_URL=https://127.0.0.1:5443
+export APP_DIR=/opt/eva-ai/evo-ssearch
+export SERVICE=eva-ai
+export ENV_FILE=/etc/eva-ai/eva-ai.env
+export DB_NAME=eva
+export BRANCH=feature/secure-50-channel-foundation
+export BASE_URL=https://127.0.0.1:5443
+
+printf 'APP_DIR=<%s>\nSERVICE=<%s>\nENV_FILE=<%s>\nDB_NAME=<%s>\nBRANCH=<%s>\nBASE_URL=<%s>\n' \
+  "$APP_DIR" "$SERVICE" "$ENV_FILE" "$DB_NAME" "$BRANCH" "$BASE_URL"
+
+: "${APP_DIR:?APP_DIR is empty}"
+: "${SERVICE:?SERVICE is empty}"
+: "${ENV_FILE:?ENV_FILE is empty}"
+: "${DB_NAME:?DB_NAME is empty}"
+: "${BRANCH:?BRANCH is empty}"
+: "${BASE_URL:?BASE_URL is empty}"
 ```
 
-If the service is a user service instead of system service, replace:
+If even simple commands like `ls -la` show no output while the prompt still
+appears, stdout/stderr were probably redirected in the current root shell. Fix
+the shell before continuing:
+
+```bash
+exec >/dev/tty 2>&1
+printf 'stdout ok\n'
+printf 'stderr ok\n' >&2
+```
+
+If the service is a user service instead of a system service, replace:
 
 ```bash
 sudo systemctl ...
@@ -37,9 +58,12 @@ systemctl --user ...
 ## 1. Preflight
 
 ```bash
+: "${APP_DIR:?APP_DIR is empty; rerun section 0}"
+: "${SERVICE:?SERVICE is empty; rerun section 0}"
+
 cd "$APP_DIR"
 
-git config --global --add safe.directory "$APP_DIR"
+git config --global --add safe.directory /opt/eva-ai/evo-ssearch
 git branch --show-current
 git rev-parse --short HEAD
 git status --short
@@ -52,12 +76,29 @@ Expected:
 
 If `git status --short` shows modified tracked files, stop and ask before pulling.
 
+If git says `detected dubious ownership`, make sure section 0 was run and then
+run this exact command:
+
+```bash
+git config --global --add safe.directory /opt/eva-ai/evo-ssearch
+```
+
 ## 2. Stop EVA AI
 
 ```bash
+: "${SERVICE:?SERVICE is empty; rerun section 0}"
+
 sudo systemctl stop "$SERVICE"
 sudo systemctl status "$SERVICE" --no-pager -l || true
 ```
+
+If systemd says `Failed to mangle name: Invalid argument`, `$SERVICE` is empty.
+Rerun section 0 in the same terminal. Do not run `sudo --user systemctl`;
+`--user` belongs to `systemctl`, not to `sudo`.
+
+If `systemctl stop` ends with `Result: timeout` and then `SIGKILL`, the service
+is still stopped enough for the update. Continue with the backup step unless
+processes remain running.
 
 ## 3. Backup Database And Env
 
