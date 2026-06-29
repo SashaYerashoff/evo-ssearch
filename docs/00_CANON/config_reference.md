@@ -8,7 +8,7 @@ for behavior is `config.py`**; this table is the human reference. Secrets
 Defaults shown are the code defaults, not the pilot values. Pilot/field values
 live in the internal field-rollout doc with `[FIELD]` markers.
 
-Last reviewed: 2026-06-28 (β 0.8.2)
+Last reviewed: 2026-06-30 (β 0.8.2.1)
 
 ## Secure-pilot required set
 

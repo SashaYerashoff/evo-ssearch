@@ -12,6 +12,7 @@ from PIL import Image
 from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
     _SENSITIVE_ENDPOINT_PERMISSIONS,
+    _build_detection_search_result,
     _store_vlm_summary_archive_frames,
     app,
     config,
@@ -314,6 +315,43 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
+
+    def test_detection_search_result_preserves_vlm_payload_for_review(self) -> None:
+        result = _build_detection_search_result(
+            item={
+                "id": 42,
+                "timestamp_ms": 1780000012345,
+                "probe_id": "vlm_summary:112",
+                "probe_name": "VLM summary ch 112",
+                "channel_id": 112,
+                "severity": "info",
+                "source": "vlm_summary",
+                "payload": {
+                    "source": "vlm_summary",
+                    "run_id": "run-demo",
+                    "batch_start_ms": 1780000010000,
+                    "batch_end_ms": 1780000020000,
+                    "frame_timestamp_ms": 1780000012345,
+                    "frame_index": 4,
+                    "anchor_role": "sample",
+                    "summary": "A public lobby scene is calm.",
+                    "summary_truncated": False,
+                },
+            },
+            score=0.91,
+            clip_score=0.91,
+            dino_score=None,
+            mode="clip",
+            alpha=0.0,
+            dino_fallback=False,
+        )
+
+        self.assertEqual(result["source"], "vlm_summary")
+        self.assertEqual(result["payload"]["summary"], "A public lobby scene is calm.")
+        self.assertEqual(result["summary"], "A public lobby scene is calm.")
+        self.assertEqual(result["run_id"], "run-demo")
+        self.assertEqual(result["batch_start_ms"], 1780000010000)
+        self.assertEqual(result["frame_timestamp_ms"], 1780000012345)
 
     def test_detections_diagnostics_reports_sources_without_thumbnail_payloads(self) -> None:
         class Store:

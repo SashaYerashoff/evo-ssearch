@@ -11,6 +11,8 @@ from agent import (
     _record_turn_signal_ledger,
     _remember_turn_tool_result,
     _seed_turn_tool_context,
+    _safe_detection,
+    _strip_thumbnails,
     _tool_result_for_ui,
     build_system_prompt,
 )
@@ -341,6 +343,24 @@ class TurnSignalLedgerTests(unittest.TestCase):
 
 
 class AgentVideoSummaryToolTests(unittest.TestCase):
+    def test_ui_detection_rows_do_not_invent_image_url_without_thumbnail(self):
+        missing = {
+            "id": 117031,
+            "detection_id": 117031,
+            "source": "probe",
+        }
+        safe = _safe_detection(missing)
+        self.assertFalse(safe["has_thumbnail"])
+        self.assertNotIn("image_url", safe)
+
+        stripped = _strip_thumbnails([{**missing, "is_detection": True}])
+        self.assertFalse(stripped[0]["has_thumbnail"])
+        self.assertNotIn("image_url", stripped[0])
+
+        present = _safe_detection({**missing, "thumbnail": "abcd"})
+        self.assertTrue(present["has_thumbnail"])
+        self.assertEqual(present["image_url"], "/detections/thumbnail/117031")
+
     def test_compact_prompt_settings_preserves_layer_semantics_and_migration(self):
         compact = _compact_prompt_settings_for_model(
             {

@@ -8907,12 +8907,16 @@ def _detection_image_url(r: Dict[str, Any]) -> Optional[str]:
     if ip:
         from urllib.parse import quote
         return f"/detections/image?image_path={quote(ip, safe='')}"
+    has_thumbnail = bool(r.get("thumbnail") or r.get("thumbnail_b64") or r.get("has_thumbnail"))
+    thumbnail_known_missing = "has_thumbnail" in r and not has_thumbnail
     detection_id = _opt_int(r.get("detection_id") or r.get("id"))
-    if detection_id is not None:
+    if detection_id is not None and not thumbnail_known_missing:
         return f"/detections/thumbnail/{detection_id}"
     if r.get("thumbnail"):
         # Last-resort inline data URI for legacy rows without an ID.
         return _image_data_url(r.get("thumbnail"))
+    if r.get("thumbnail_b64"):
+        return _image_data_url(r.get("thumbnail_b64"))
     return None
 
 
@@ -8943,8 +8947,8 @@ def _safe_detection(r: Dict[str, Any]) -> Dict[str, Any]:
     if out.get("detection_id") is None and out.get("id") is not None:
         out["detection_id"] = out.get("id")
     out["score_semantics"] = _archive_score_semantics(source)
-    out["has_thumbnail"] = bool(r.get("thumbnail"))
-    url = _detection_image_url(r)
+    out["has_thumbnail"] = bool(r.get("thumbnail") or r.get("thumbnail_b64") or r.get("has_thumbnail"))
+    url = _detection_image_url({**r, "has_thumbnail": out["has_thumbnail"]})
     if url:
         out["image_url"] = url
     return out
@@ -8958,7 +8962,9 @@ def _strip_thumbnails(results: List[Dict[str, Any]], folder: Optional[str] = Non
         if row.get("source") is not None:
             row = _annotate_archive_row(row)
         is_detection = bool(r.get("is_detection")) or bool(r.get("detection_id")) or bool(r.get("image_path"))
-        url = _detection_image_url(r) if is_detection else _archive_result_image_url(r, folder=folder)
+        if is_detection:
+            row["has_thumbnail"] = bool(r.get("thumbnail") or r.get("thumbnail_b64") or r.get("has_thumbnail"))
+        url = _detection_image_url({**r, "has_thumbnail": row.get("has_thumbnail")}) if is_detection else _archive_result_image_url(r, folder=folder)
         if url:
             row["image_url"] = url
         out.append(row)

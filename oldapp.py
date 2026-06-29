@@ -7028,6 +7028,25 @@ def _build_detection_search_result(
         "search_mode": mode,
         "dino_fallback": bool(dino_fallback),
     }
+    if payload_obj:
+        result["payload"] = payload_obj
+        summary_excerpt = str(payload_obj.get("summary") or "").strip()
+        if summary_excerpt:
+            result["summary"] = summary_excerpt
+        for key in (
+            "run_id",
+            "batch_start_ms",
+            "batch_end_ms",
+            "frame_timestamp_ms",
+            "anchor_frame_timestamp_ms",
+            "frame_index",
+            "anchor_frame_index",
+            "anchor_role",
+            "anchor_source_role",
+            "summary_truncated",
+        ):
+            if key in payload_obj:
+                result[key] = payload_obj.get(key)
     if mode in {"fusion", "dino"}:
         result["fusion"] = {
             "clip_similarity": float(clip_score),

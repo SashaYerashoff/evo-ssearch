@@ -1,3 +1,18 @@
+    const uiRuntimeParams = new URLSearchParams(window.location.search || '');
+    const uiLiteMode = uiRuntimeParams.has('lite')
+        || uiRuntimeParams.get('ui') === 'lite'
+        || uiRuntimeParams.get('ui_lite') === '1';
+    if (uiLiteMode) {
+        document.documentElement.classList.add('ui-lite');
+        const applyUiLiteClass = () => {
+            if (document.body) document.body.classList.add('ui-lite');
+        };
+        applyUiLiteClass();
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', applyUiLiteClass, { once: true });
+        }
+    }
+
     const folderInput = document.getElementById('folderPath');
     const AUTH_ENABLED = {auth_enabled_json};
     const AUTH_CSRF_COOKIE = {auth_csrf_cookie_json};
@@ -251,6 +266,8 @@
     let archiveRenderedResults = [];
     let archiveRenderedCommented = false;
     let activeArchiveInspectorIndex = -1;
+    let archiveInspectorRenderKey = '';
+    let probeCardsRenderKey = '';
     let luxriotSummaryLogCache = [];
     const luxriotSummaryChannelCache = {};
     const luxriotSummarySeenKeys = {};
@@ -872,14 +889,14 @@
     function splitSummaryAndJson(text) {
         const full = String(text || '').trim();
         if (!full) {
-            return { main: '', json: '' };
+            return { main: '', json: '', marker: '' };
         }
 
         const fenced = full.match(/```json\s*([\s\S]*?)```/i);
         if (fenced && fenced[1]) {
             const jsonBlock = String(fenced[1] || '').trim();
             const mainText = full.replace(fenced[0], '').trim();
-            return { main: mainText, json: jsonBlock };
+            return { main: mainText, json: jsonBlock, marker: 'fenced_json' };
         }
 
         for (const marker of ['ALERTS_JSON:', 'MEMORY_UPDATE_JSON:']) {
@@ -888,7 +905,7 @@
                 const mainText = full.slice(0, markerIndex).trim();
                 const jsonBlock = full.slice(markerIndex + marker.length).trim();
                 if (jsonBlock) {
-                    return { main: mainText, json: jsonBlock };
+                    return { main: mainText, json: jsonBlock, marker };
                 }
             }
         }
@@ -900,11 +917,11 @@
             const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
             if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
                 const mainText = full.slice(0, startIndex).trim();
-                return { main: mainText, json: jsonCandidate };
+                return { main: mainText, json: jsonCandidate, marker: 'trailing_json' };
             }
         }
 
-        return { main: full, json: '' };
+        return { main: full, json: '', marker: '' };
     }
 
     function formatDuration(seconds) {
@@ -989,17 +1006,70 @@
             || userHasAnyPermission(['probes:manage', 'diagnostics:view']);
     }
 
-    function renderSummaryMachineJson(jsonText, label = 'Machine JSON') {
+    function parseSummaryMachineJson(raw) {
+        try {
+            return JSON.parse(String(raw || '').trim());
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function shortMachineJsonTitle(value, fallback = 'System message') {
+        const text = String(value || '').trim().replace(/\s+/g, ' ');
+        if (!text) return fallback;
+        return text.length > 72 ? `${text.slice(0, 69)}...` : text;
+    }
+
+    function summarizeMachineJson(raw, label = 'Machine JSON', marker = '') {
+        const text = String(raw || '').trim();
+        const lineCount = text.split(/\r?\n/).filter((line) => line.trim()).length || 1;
+        const sizeLabel = `${lineCount} line${lineCount === 1 ? '' : 's'}`;
+        const parsed = parseSummaryMachineJson(text);
+        const markerText = String(marker || '').toUpperCase();
+        const haystack = `${markerText}\n${text}`.toLowerCase();
+
+        if (
+            markerText.includes('MEMORY_UPDATE_JSON')
+            || /\b(homeostasis|memory_update|memory update|routine_baseline|baseline|prior)\b/i.test(haystack)
+        ) {
+            return { label: 'Memory/homeostasis', meta: sizeLabel, kind: 'memory' };
+        }
+
+        const alerts = parsed && Array.isArray(parsed.alerts) ? parsed.alerts : null;
+        if (alerts) {
+            if (!alerts.length) {
+                return { label: 'System message', meta: `no alerts · ${sizeLabel}`, kind: 'system' };
+            }
+            const first = alerts[0] || {};
+            const title = shortMachineJsonTitle(
+                first.title || first.alert_title || first.name || first.type || first.summary || first.description,
+                'Alert event'
+            );
+            const severity = String(first.severity || first.level || '').trim();
+            const countLabel = alerts.length > 1 ? ` +${alerts.length - 1}` : '';
+            const meta = [
+                severity || `${alerts.length} alert${alerts.length === 1 ? '' : 's'}`,
+                sizeLabel,
+            ].filter(Boolean).join(' · ');
+            return { label: `${title}${countLabel}`, meta, kind: 'alert' };
+        }
+
+        if (lineCount <= 3) {
+            return { label: 'System message', meta: sizeLabel, kind: 'system' };
+        }
+        return { label: label || 'Machine JSON', meta: sizeLabel, kind: 'machine' };
+    }
+
+    function renderSummaryMachineJson(jsonText, label = 'Machine JSON', marker = '') {
         const raw = String(jsonText || '').trim();
         if (!raw) return '';
         if (!canViewVlmMachineJson()) {
             return '<div class="summary-json-hidden" title="Visible to admin and engineer roles">Machine data hidden</div>';
         }
-        const lineCount = raw.split(/\r?\n/).filter((line) => line.trim()).length;
-        const sizeLabel = `${lineCount || 1} line${lineCount === 1 ? '' : 's'}`;
+        const summary = summarizeMachineJson(raw, label, marker);
         return `
-            <details class="summary-json-disclosure">
-                <summary><span>${escapeHtml(label)}</span><span class="summary-json-meta">${escapeHtml(sizeLabel)}</span></summary>
+            <details class="summary-json-disclosure summary-json-${escapeHtml(summary.kind)}">
+                <summary><span>${escapeHtml(summary.label)}</span><span class="summary-json-meta">${escapeHtml(summary.meta)}</span></summary>
                 <div class="summary-json-muted">${renderMarkdown(raw)}</div>
             </details>
         `;
@@ -2406,6 +2476,46 @@
         luxriotSummaries.scrollTop = luxriotSummaries.scrollHeight;
     }
 
+    function scrollLuxriotSummaryToTimestamp(targetMs) {
+        if (!luxriotSummaries) return false;
+        const target = Number(targetMs);
+        if (!Number.isFinite(target) || target <= 0) return false;
+        const cards = Array.from(luxriotSummaries.querySelectorAll('.luxriot-summary[data-summary-created-ms]'));
+        let bestCard = null;
+        let bestDistance = Number.POSITIVE_INFINITY;
+        cards.forEach((card) => {
+            const createdMs = Number(card.dataset.summaryCreatedMs);
+            const batchStartMs = Number(card.dataset.summaryBatchStartMs);
+            const batchEndMs = Number(card.dataset.summaryBatchEndMs);
+            const candidates = [];
+            if (Number.isFinite(createdMs) && createdMs > 0) candidates.push(createdMs);
+            if (Number.isFinite(batchStartMs) && batchStartMs > 0) candidates.push(batchStartMs);
+            if (Number.isFinite(batchEndMs) && batchEndMs > 0) candidates.push(batchEndMs);
+            let distance = candidates.length
+                ? Math.min(...candidates.map((value) => Math.abs(value - target)))
+                : Number.POSITIVE_INFINITY;
+            if (
+                Number.isFinite(batchStartMs)
+                && Number.isFinite(batchEndMs)
+                && target >= Math.min(batchStartMs, batchEndMs)
+                && target <= Math.max(batchStartMs, batchEndMs)
+            ) {
+                distance = 0;
+            }
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestCard = card;
+            }
+        });
+        if (!bestCard) return false;
+        luxriotSummaries.querySelectorAll('.luxriot-summary.is-jump-target').forEach((card) => {
+            card.classList.remove('is-jump-target');
+        });
+        bestCard.classList.add('is-jump-target');
+        bestCard.scrollIntoView({ block: 'center', behavior: uiLiteMode ? 'auto' : 'smooth' });
+        return true;
+    }
+
     function setLuxriotSummaryMeta(text, isError = false) {
         if (!luxriotSummaryMeta) return;
         luxriotSummaryMeta.textContent = text;
@@ -2515,7 +2625,11 @@
         const html = luxriotSummaryLogCache
             .map((log, idx) => {
                 const logKey = luxriotSummaryLogKey(log, idx);
-                const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
+                const createdAtSec = Number(log.created_at);
+                const createdMs = Number.isFinite(createdAtSec) && createdAtSec > 0 ? Math.round(createdAtSec * 1000) : 0;
+                const batchStartMs = Number(log.batch_start_ms || log.window_start_ms || 0);
+                const batchEndMs = Number(log.batch_end_ms || log.window_end_ms || 0);
+                const ts = createdMs ? new Date(createdMs) : null;
                 const tsLabel = ts ? ts.toLocaleString() : 'n/a';
                 const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
                 const modelLabel = String(log.model || '').trim();
@@ -2536,7 +2650,7 @@
                     ? `<button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${hasSummaryText ? '' : 'disabled'}>Bookmark</button>`
                     : '';
                 return `
-                    <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}">
+                    <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
                         <div class="luxriot-summary-head">
                             <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}</div>
                             <div class="luxriot-summary-actions">
@@ -2552,7 +2666,7 @@
                                 ${bookmarkButton}
                             </div>
                         </div>
-                        <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson)}</div>
+                        <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson, 'Machine JSON', summaryParts.marker)}</div>
                     </div>
                 `;
             })
@@ -5159,6 +5273,30 @@
         return null;
     }
 
+    function archiveResultCanOpenVlmFeed(result) {
+        const channelId = Number(result && result.channel_id);
+        const timestampMs = Number(archiveFrameTimestampMs(result));
+        return Number.isFinite(channelId) && channelId > 0
+            && Number.isFinite(timestampMs) && timestampMs > 0;
+    }
+
+    function archiveResultSummaryWindow(result) {
+        const payload = archiveResultPayload(result);
+        const targetMs = Number(archiveFrameTimestampMs(result));
+        const batchStartMs = Number(payload.batch_start_ms ?? result?.batch_start_ms);
+        const batchEndMs = Number(payload.batch_end_ms ?? result?.batch_end_ms);
+        const fallbackStartMs = Number.isFinite(targetMs) && targetMs > 0 ? targetMs : Date.now();
+        const baseStartMs = Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : fallbackStartMs;
+        const baseEndMs = Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : baseStartMs;
+        const startMs = Math.max(0, Math.min(baseStartMs, baseEndMs) - 60000);
+        const endMs = Math.max(startMs + 1000, Math.max(baseStartMs, baseEndMs) + 60000);
+        return {
+            targetMs: Number.isFinite(targetMs) && targetMs > 0 ? targetMs : baseStartMs,
+            startMs,
+            endMs,
+        };
+    }
+
     function formatArchiveTimestamp(ms) {
         const numeric = Number(ms);
         if (!Number.isFinite(numeric) || numeric <= 0) return 'n/a';
@@ -5558,7 +5696,7 @@
         archiveReviewJumpBtn.addEventListener('click', () => {
             const context = archiveReviewContext;
             if (!context) return;
-            jumpToVideoSummaryFromArchive(context.result);
+            void jumpToVideoSummaryFromArchive(context.result);
         });
     }
     if (archiveReviewCopyBtn) {
@@ -5582,6 +5720,26 @@
         }
         if (archiveReviewModal && archiveReviewModal.style.display === 'block') {
             closeArchiveReviewModal();
+            return;
+        }
+        if (probeSnapModal && probeSnapModal.style.display === 'block') {
+            setProbeSnapModalVisibility(false);
+            return;
+        }
+        if (probeCastModal && probeCastModal.style.display === 'block') {
+            setProbeCastModalVisibility(false);
+            return;
+        }
+        if (probeEditorModal && probeEditorModal.style.display === 'block') {
+            setProbeEditorModalVisibility(false);
+            return;
+        }
+        if (luxriotPromptModal && luxriotPromptModal.style.display === 'block') {
+            closeLuxriotPromptModal();
+            return;
+        }
+        if (agentSkillModal && agentSkillModal.style.display === 'block') {
+            agentSkillModal.style.display = 'none';
             return;
         }
         if (settingsModal && settingsModal.style.display === 'block') {
@@ -7780,8 +7938,8 @@
         const icons = {
             expand: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/></svg>',
             run: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m380-300 280-180-280-180v360Z"/></svg>',
-            enable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m424-296 282-282-56-56-226 226-114-114-56 56 170 170Z"/></svg>',
-            disable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M520-200v-560h160v560H520Zm-240 0v-560h160v560H280Z"/></svg>',
+            enable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m380-300 280-180-280-180v360Z"/></svg>',
+            disable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M320-320v-320h320v320H320Z"/></svg>',
             delete: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360Z"/></svg>',
             new: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>',
         };
@@ -7897,13 +8055,17 @@
     function renderProbeCards() {
         if (!probeCards) return;
         if (!probeList.length) {
-            probeCards.innerHTML = `
+            const emptyCardsHtml = `
                 <div class="probe-mini-card new-probe-card">
                     <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
                         ${probeActionIcon('new')}
                         <span>New Probe</span>
                     </button>
                 </div>`;
+            if (probeCardsRenderKey !== emptyCardsHtml) {
+                probeCards.innerHTML = emptyCardsHtml;
+                probeCardsRenderKey = emptyCardsHtml;
+            }
             renderMonitorProbeInspector();
             return;
         }
@@ -7924,28 +8086,29 @@
                         : 'pill-idle';
             const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
             const toggleAction = status === 'disabled' ? 'enable' : 'disable';
-            const toggleTitle = status === 'disabled' ? 'Enable probe' : 'Disable probe';
+            const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
             const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
             const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
             return `
                 <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}" data-probe-id="${p.id}">
+                    <div class="probe-mini-card-head">
+                        <div class="probe-status-pill ${pillClass}">${status}</div>
+                        <div class="probe-mini-actions probe-mini-primary-actions">
+                            <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                            <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
+                        </div>
+                    </div>
                     <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
                         ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
-                        <div class="probe-mini-overlay">
-                            <div class="probe-mini-top">
-                                <div class="probe-status-pill ${pillClass}">${status}</div>
-                                <div class="probe-mini-actions">
-                                    <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Open probe" aria-label="Open probe">${probeActionIcon('expand')}</button>
-                                    <button class="probe-action-btn" data-action="run" data-id="${p.id}" title="Run probe" aria-label="Run probe">${probeActionIcon('run')}</button>
-                                    <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
-                                    <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
-                                </div>
-                            </div>
-                            <div class="probe-mini-bottom">
-                                <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
-                                <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
-                                <div class="probe-mini-score">${scores}</div>
-                                <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
+                    </div>
+                    <div class="probe-mini-content">
+                        <div class="probe-mini-name" title="${escapeHtml(p.name || 'unnamed')}">${escapeHtml(p.name || 'unnamed')}</div>
+                        <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
+                        <div class="probe-mini-score">${scores}</div>
+                        <div class="probe-mini-card-foot">
+                            <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
+                            <div class="probe-mini-actions probe-mini-danger-actions">
+                                <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
                             </div>
                         </div>
                     </div>
@@ -7960,7 +8123,11 @@
                 </button>
             </div>
         `);
-        probeCards.innerHTML = cards.join('');
+        const cardsHtml = cards.join('');
+        if (probeCardsRenderKey !== cardsHtml) {
+            probeCards.innerHTML = cardsHtml;
+            probeCardsRenderKey = cardsHtml;
+        }
         renderMonitorProbeInspector();
     }
 
@@ -9227,6 +9394,7 @@
             resultsContainer.classList.remove('results-grid--detections');
         }
         activeArchiveInspectorIndex = -1;
+        archiveInspectorRenderKey = '';
         if (archiveInspectorEmpty) {
             archiveInspectorEmpty.textContent = message;
             archiveInspectorEmpty.classList.remove('is-hidden');
@@ -9238,6 +9406,25 @@
         document.querySelectorAll('#results .result-item').forEach((item) => {
             item.classList.remove('selected');
         });
+    }
+
+    function archiveResultIdentityKey(result, index) {
+        if (!result) return `empty:${index}`;
+        const payload = archiveResultPayload(result);
+        return [
+            archiveRenderedCommented ? 'commented' : 'result',
+            index,
+            result.id,
+            result.detection_id,
+            result.path,
+            result.filename,
+            result.timestamp_ms,
+            result.score,
+            result.is_detection ? 'detection' : 'image',
+            payload && payload.frame_id,
+            payload && payload.batch_start_ms,
+            payload && payload.batch_end_ms,
+        ].map((value) => String(value ?? '')).join('|');
     }
 
     function syncArchiveResultsLayout(results) {
@@ -9312,7 +9499,7 @@
             archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
         }
         if (archiveReviewJumpBtn) {
-            archiveReviewJumpBtn.disabled = !isVideoArchiveResult(result) || !Number.isFinite(Number(result.channel_id));
+            archiveReviewJumpBtn.disabled = !archiveResultCanOpenVlmFeed(result);
         }
         if (archiveReviewDescribeBtn) {
             archiveReviewDescribeBtn.disabled = !archiveResultHasImage(result);
@@ -9347,11 +9534,12 @@
         }
     }
 
-    function jumpToVideoSummaryFromArchive(result) {
-        if (!result || !isVideoArchiveResult(result)) return;
+    async function jumpToVideoSummaryFromArchive(result) {
+        if (!result || !archiveResultCanOpenVlmFeed(result)) return;
         const channelId = Number(result.channel_id);
         if (!Number.isFinite(channelId)) return;
         const payload = archiveResultPayload(result);
+        const summaryWindow = archiveResultSummaryWindow(result);
         closeArchiveReviewModal();
         setMode('video');
         if (luxriotChannelSelect) {
@@ -9371,28 +9559,30 @@
                 .some((opt) => String(opt.value) === luxriotSummaryRunFilter);
             luxriotSummaryRunSelect.value = hasRunValue ? luxriotSummaryRunFilter : 'all';
         }
-        const startMs = Number(payload.batch_start_ms || result.timestamp_ms || 0);
-        const endMs = Number(payload.batch_end_ms || result.timestamp_ms || startMs || 0);
-        if (Number.isFinite(startMs) && startMs > 0) {
-            luxriotSummaryRangePreset = 'custom';
-            luxriotSummaryFromTs = Math.max(0, (startMs / 1000) - 60);
-            luxriotSummaryToTs = Math.max(
-                luxriotSummaryFromTs + 1,
-                ((Number.isFinite(endMs) && endMs > 0 ? endMs : startMs) / 1000) + 60,
-            );
-            if (luxriotSummaryRangeSelect) {
-                luxriotSummaryRangeSelect.value = 'custom';
-            }
-            if (luxriotSummaryFromInput) {
-                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
-            }
-            if (luxriotSummaryToInput) {
-                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
-            }
-            syncSummaryRangeUI();
+        luxriotSummaryRangePreset = 'custom';
+        luxriotSummaryFromTs = summaryWindow.startMs / 1000;
+        luxriotSummaryToTs = summaryWindow.endMs / 1000;
+        if (luxriotSummaryRangeSelect) {
+            luxriotSummaryRangeSelect.value = 'custom';
         }
+        if (luxriotSummaryFromInput) {
+            luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
+        }
+        if (luxriotSummaryToInput) {
+            luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
+        }
+        syncSummaryRangeUI();
         setSummaryUnread(0);
-        refreshLuxriotSummaryView(channelId, true, false);
+        setLuxriotStatus(`Opening VLM feed around ${formatArchiveTimestamp(summaryWindow.targetMs)}...`);
+        const refreshed = await refreshLuxriotSummaryView(channelId, true, false);
+        const scrolled = scrollLuxriotSummaryToTimestamp(summaryWindow.targetMs);
+        if (!scrolled && refreshed === false) {
+            window.setTimeout(() => {
+                scrollLuxriotSummaryToTimestamp(summaryWindow.targetMs);
+            }, 700);
+        } else if (!scrolled) {
+            setLuxriotStatus(`VLM feed opened near ${formatArchiveTimestamp(summaryWindow.targetMs)}; no matching summary card was returned.`, true);
+        }
     }
 
     function showArchiveInspector(index) {
@@ -9406,7 +9596,19 @@
             return;
         }
 
+        const nextRenderKey = archiveResultIdentityKey(result, index);
+        if (
+            activeArchiveInspectorIndex === index
+            && archiveInspectorRenderKey === nextRenderKey
+            && !archiveInspectorBody.classList.contains('is-hidden')
+            && archiveInspectorBody.querySelector('.result-item')
+        ) {
+            highlightActiveArchiveResultCard(index);
+            return;
+        }
+
         activeArchiveInspectorIndex = index;
+        archiveInspectorRenderKey = nextRenderKey;
         if (archiveInspectorEmpty) {
             archiveInspectorEmpty.classList.add('is-hidden');
         }
@@ -9717,15 +9919,26 @@
         }
     }
 
+    function replaceChildrenStable(container, fragment) {
+        if (!container) return;
+        if (typeof container.replaceChildren === 'function') {
+            container.replaceChildren(fragment);
+            return;
+        }
+        container.innerHTML = '';
+        container.appendChild(fragment);
+    }
+
     // Display results
     function displayResults(results) {
-        resultsContainer.innerHTML = '';
         segmentContextByIndex = {};
         archiveRenderedResults = Array.isArray(results) ? results : [];
         archiveRenderedCommented = false;
+        archiveInspectorRenderKey = '';
         refreshArchiveScoreScale(archiveRenderedResults);
         syncArchiveResultsLayout(archiveRenderedResults);
-        
+
+        const fragment = document.createDocumentFragment();
         archiveRenderedResults.forEach((result, index) => {
             const item = document.createElement('div');
             item.className = 'result-item';
@@ -9736,8 +9949,9 @@
             item.innerHTML = generateResultItemHTML(result, index, false, 'card');
             
             setupResultItemEventHandlers(item, result, index, { variant: 'card' });
-            resultsContainer.appendChild(item);
+            fragment.appendChild(item);
         });
+        replaceChildrenStable(resultsContainer, fragment);
 
         if (archiveRenderedResults.length) {
             showArchiveInspector(0);
@@ -9749,13 +9963,14 @@
     
     // Display commented results (similar to displayResults but with comment info)
     function displayCommentedResults(results) {
-        resultsContainer.innerHTML = '';
         segmentContextByIndex = {};
         archiveRenderedResults = Array.isArray(results) ? results : [];
         archiveRenderedCommented = true;
+        archiveInspectorRenderKey = '';
         refreshArchiveScoreScale(archiveRenderedResults);
         syncArchiveResultsLayout(archiveRenderedResults);
-        
+
+        const fragment = document.createDocumentFragment();
         archiveRenderedResults.forEach((result, index) => {
             const item = document.createElement('div');
             item.className = 'result-item';
@@ -9766,8 +9981,9 @@
             item.innerHTML = generateResultItemHTML(result, index, true, 'card');
             
             setupResultItemEventHandlers(item, result, index, { variant: 'card' });
-            resultsContainer.appendChild(item);
+            fragment.appendChild(item);
         });
+        replaceChildrenStable(resultsContainer, fragment);
 
         if (archiveRenderedResults.length) {
             showArchiveInspector(0);
@@ -10866,6 +11082,7 @@
             const traceEl = document.createElement('details');
             traceEl.className = 'agent-tool-trace';
             traceEl.open = true;
+            traceEl.hidden = true;
             const traceSummary = document.createElement('summary');
             traceSummary.className = 'agent-tool-trace-summary';
             traceSummary.textContent = 'Research trace';
@@ -10899,21 +11116,30 @@
 
         function appendActionCard(bubble, name, result) {
             const stickToBottom = isAgentNearBottom();
-            const card = buildActionCard(name, result);
+            const card = isStandaloneProbeApprovalResult(name, result)
+                ? buildAgentProbeApprovalCard(name, result)
+                : buildActionCard(name, result);
             if (!card) return;
-            if (bubble.actionsEl) {
+            const standaloneApproval = card.dataset && card.dataset.agentStandaloneApproval === 'true';
+            if (standaloneApproval && bubble.bodyEl) {
+                const before = bubble.traceEl && bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
+                bubble.bodyEl.insertBefore(card, before);
+            } else if (bubble.actionsEl) {
+                if (bubble.traceEl) bubble.traceEl.hidden = false;
                 bubble.actionsEl.appendChild(card);
                 bubble.actionCount = (bubble.actionCount || 0) + 1;
                 updateAgentTraceSummary(bubble);
             } else {
                 bubble.bodyEl.appendChild(card);
             }
+            promoteStandaloneAgentApprovalCards(bubble);
             scrollToBottom(stickToBottom);
         }
 
         function appendProgressNote(bubble, evt) {
             if (!bubble || !bubble.actionsEl) return;
             const stickToBottom = isAgentNearBottom();
+            if (bubble.traceEl) bubble.traceEl.hidden = false;
             const note = document.createElement('div');
             note.className = 'agent-progress-note';
             const message = evt && evt.message ? String(evt.message) : 'Working...';
@@ -10932,6 +11158,36 @@
             if (!summaryEl) return;
             const count = Number(bubble.actionCount || 0);
             summaryEl.textContent = count > 0 ? `Research trace · ${count} step${count === 1 ? '' : 's'}` : 'Research trace';
+        }
+
+        function isLegacyProbeApprovalCard(card) {
+            if (!card || !card.classList || !card.classList.contains('agent-action-card')) return false;
+            const head = card.querySelector('.agent-action-card-head');
+            const text = String(head && head.textContent || '').toUpperCase();
+            return /\bPROBE(S)?\s+(CREATE|UPDATE|UPSERT|DELETE|DELETED|UPDATED|CREATED)\b/.test(text)
+                && (/\bPREVIEW\b/.test(text) || card.querySelector('.agent-approval-footer'));
+        }
+
+        function promoteStandaloneAgentApprovalCards(bubble) {
+            if (!bubble || !bubble.bodyEl || !bubble.actionsEl || !bubble.traceEl) return;
+            const candidates = Array.from(bubble.actionsEl.children).filter((node) => {
+                if (!(node instanceof HTMLElement)) return false;
+                return node.dataset.agentStandaloneApproval === 'true'
+                    || node.classList.contains('agent-approval-card')
+                    || isLegacyProbeApprovalCard(node);
+            });
+            if (!candidates.length) return;
+            const before = bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
+            candidates.forEach((node) => {
+                node.dataset.agentStandaloneApproval = 'true';
+                if (isLegacyProbeApprovalCard(node)) {
+                    node.classList.add('agent-approval-card', 'agent-approval-card-legacy');
+                }
+                bubble.bodyEl.insertBefore(node, before);
+                bubble.actionCount = Math.max(0, Number(bubble.actionCount || 0) - 1);
+            });
+            updateAgentTraceSummary(bubble);
+            bubble.traceEl.hidden = Number(bubble.actionCount || 0) <= 0;
         }
 
         function scrollToBottom(force = false) {
@@ -10977,21 +11233,44 @@
             const url = agentImageUrlForItem(item);
             const score = scoreVal != null ? String(scoreVal) : '';
             const previewTitle = item.filename || item.name || agentThumbTitle(item);
+            const addScore = () => {
+                if (!score) return;
+                const badge = document.createElement('div');
+                badge.className = cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score';
+                badge.textContent = score;
+                div.appendChild(badge);
+            };
+            const showMissingImage = () => {
+                delete div.dataset.previewImage;
+                delete div.dataset.previewTitle;
+                div.classList.add('agent-thumb-missing-image');
+                div.textContent = item && (item.id || item.detection_id)
+                    ? `No image #${item.id || item.detection_id}`
+                    : 'No image';
+                addScore();
+            };
             if (url) {
                 div.dataset.previewImage = String(url);
                 div.dataset.previewTitle = String(previewTitle);
                 div.title = String(previewTitle);
-            }
-            if (url) {
-                div.innerHTML = `<img src="${escapeHtml(url)}" alt="${escapeHtml(previewTitle)}" loading="lazy" />${score ? `<div class="${cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score'}">${escapeHtml(score)}</div>` : ''}<a class="agent-thumb-open-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="Open image" data-open-image-link>open</a>`;
+                const img = document.createElement('img');
+                img.src = String(url);
+                img.alt = String(previewTitle);
+                img.loading = 'lazy';
+                img.addEventListener('error', showMissingImage, { once: true });
+                div.appendChild(img);
+                addScore();
+                const link = document.createElement('a');
+                link.className = 'agent-thumb-open-link';
+                link.href = String(url);
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.title = 'Open image';
+                link.dataset.openImageLink = '';
+                link.textContent = 'open';
+                div.appendChild(link);
             } else {
-                div.textContent = item.id ? `#${item.id}` : '—';
-                if (score) {
-                    const badge = document.createElement('div');
-                    badge.className = cls === 'agent-det-thumb' ? 'agent-det-score' : 'agent-search-score';
-                    badge.textContent = score;
-                    div.appendChild(badge);
-                }
+                showMissingImage();
             }
             return div;
         }
@@ -11156,6 +11435,123 @@
             });
             footer.appendChild(button);
             card.appendChild(footer);
+        }
+
+        function isProbeMutationTool(toolName) {
+            return ['create_probe', 'update_probe', 'delete_probes'].includes(String(toolName || ''));
+        }
+
+        function isStandaloneProbeApprovalResult(toolName, result) {
+            if (!isProbeMutationTool(toolName) || !result || typeof result !== 'object') return false;
+            const status = String(result.status || '').toLowerCase();
+            return status === 'preview' || status === 'applied' || Boolean(result.approval);
+        }
+
+        function agentProbeMutationTitle(toolName, result) {
+            const status = String(result && result.status || '').toLowerCase();
+            const preview = status === 'preview' || Boolean(result && result.approval);
+            const applied = status === 'applied';
+            const action = String(result && result.action || '');
+            if (toolName === 'delete_probes') {
+                return preview ? 'Probe delete preview' : (applied ? 'Probes deleted' : 'Probe delete result');
+            }
+            if (toolName === 'update_probe') {
+                return preview ? 'Probe update preview' : (applied ? 'Probe updated' : 'Probe update result');
+            }
+            if (action === 'update_existing') {
+                return preview ? 'Probe upsert preview' : (applied ? 'Probe updated via create' : 'Probe upsert result');
+            }
+            return preview ? 'Probe create preview' : (applied ? 'Probe created' : 'Probe create result');
+        }
+
+        function appendAgentApprovalField(parent, key, value) {
+            if (value === undefined || value === null || String(value).trim() === '') return;
+            const row = document.createElement('div');
+            row.className = 'agent-approval-field';
+            const keyEl = document.createElement('span');
+            keyEl.className = 'agent-approval-key';
+            keyEl.textContent = key;
+            const valEl = document.createElement('span');
+            valEl.className = 'agent-approval-val';
+            valEl.textContent = agentCompactValue(value);
+            row.appendChild(keyEl);
+            row.appendChild(valEl);
+            parent.appendChild(row);
+        }
+
+        function buildAgentProbeApprovalCard(toolName, result) {
+            const status = String(result && result.status || '').toLowerCase();
+            const isPreview = status === 'preview' || Boolean(result && result.approval);
+            const isApplied = status === 'applied';
+            const card = document.createElement('div');
+            card.className = `agent-approval-card${isPreview ? ' is-preview' : ''}${isApplied ? ' is-applied-card' : ''}`;
+            card.dataset.agentStandaloneApproval = 'true';
+
+            const head = document.createElement('div');
+            head.className = 'agent-approval-card-head';
+            const titleWrap = document.createElement('div');
+            titleWrap.className = 'agent-approval-title-wrap';
+            const kicker = document.createElement('div');
+            kicker.className = 'agent-approval-kicker';
+            kicker.textContent = isPreview ? 'Operator approval required' : 'Probe action receipt';
+            const title = document.createElement('div');
+            title.className = 'agent-approval-title';
+            title.textContent = agentProbeMutationTitle(toolName, result);
+            titleWrap.appendChild(kicker);
+            titleWrap.appendChild(title);
+            const statusBadge = document.createElement('span');
+            statusBadge.className = `agent-approval-status${isApplied ? ' is-applied' : ''}`;
+            statusBadge.textContent = isPreview ? 'Preview' : (isApplied ? 'Applied' : 'Result');
+            head.appendChild(titleWrap);
+            head.appendChild(statusBadge);
+            card.appendChild(head);
+
+            const body = document.createElement('div');
+            body.className = 'agent-approval-card-body';
+            const fields = document.createElement('div');
+            fields.className = 'agent-approval-fields';
+            const probe = (result && (result.proposed || result.probe)) || {};
+            const probeName = probe.name || (result && result.probe_name);
+            appendAgentApprovalField(fields, 'Probe', probeName || 'unknown');
+            appendAgentApprovalField(fields, 'Channel', probe.channel_id ?? (result && result.channel_id));
+            appendAgentApprovalField(fields, 'Action', (result && result.action) || toolName);
+            appendAgentApprovalField(fields, 'Status', (result && result.status) || (isPreview ? 'preview' : 'result'));
+
+            const targets = Array.isArray(result && result.targets) ? result.targets : [];
+            if (targets.length) {
+                appendAgentApprovalField(fields, 'Targets', targets.map((item) => item && (item.name || item.id || item.probe_id || '?')).join(', '));
+            }
+
+            const diff = (result && result.diff) || {};
+            Object.entries(diff).forEach(([key, value]) => appendAgentApprovalField(fields, key, value));
+
+            const proposedKeys = [
+                'positive_prompt', 'negative_prompt', 'pos_floor', 'margin',
+                'threshold', 'threshold_margin', 'cooldown_sec', 'bookmark_enabled',
+            ];
+            proposedKeys.forEach((key) => {
+                if (probe && probe[key] !== undefined && diff[key] === undefined) {
+                    appendAgentApprovalField(fields, key, probe[key]);
+                }
+            });
+            body.appendChild(fields);
+
+            const conflicts = Array.isArray(result && result.conflicts) ? result.conflicts : [];
+            if (conflicts.length) {
+                const warning = document.createElement('div');
+                warning.className = 'agent-approval-warning';
+                warning.textContent = `Potential conflicts: ${conflicts.map((item) => item && (item.name || item.id || '?')).join(', ')}`;
+                body.appendChild(warning);
+            }
+            if (isPreview) {
+                const note = document.createElement('div');
+                note.className = 'agent-approval-note';
+                note.textContent = 'Preview only. Apply commits this probe change through the server-side approval plan.';
+                body.appendChild(note);
+            }
+            card.appendChild(body);
+            appendApprovalControl(card, toolName, result);
+            return card;
         }
 
         function agentResultList(value) {
@@ -11323,6 +11719,9 @@
                 body.innerHTML = `<div class="agent-inline-msg error">${escapeHtml(String(result.error))}</div>`;
                 card.appendChild(body);
                 return card;
+            }
+            if (isStandaloneProbeApprovalResult(toolName, result)) {
+                return buildAgentProbeApprovalCard(toolName, result);
             }
 
             if (toolName === 'search_archive') {
@@ -11978,8 +12377,10 @@
             if (bubble.traceEl) {
                 const hasText = String(bubble.text || '').trim().length > 0;
                 const hasActions = Number(bubble.actionCount || 0) > 0;
+                bubble.traceEl.hidden = !hasActions;
                 bubble.traceEl.open = hasActions && !hasText;
             }
+            promoteStandaloneAgentApprovalCards(bubble);
             syncAgentEvidenceIdCard(bubble);
         }
 
@@ -12300,6 +12701,13 @@
             }
             if (closeAgentSkillModalBtn) closeAgentSkillModalBtn.addEventListener('click', closeAgentSkillModal);
             if (agentSkillCancelBtn) agentSkillCancelBtn.addEventListener('click', closeAgentSkillModal);
+            if (agentSkillModal) {
+                agentSkillModal.addEventListener('click', (event) => {
+                    if (event.target === agentSkillModal) {
+                        closeAgentSkillModal();
+                    }
+                });
+            }
             if (agentSkillSaveBtn) {
                 agentSkillSaveBtn.addEventListener('click', () => {
                     void agentSaveSkill();

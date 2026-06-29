@@ -4,6 +4,21 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## β 0.8.2.1 — 2026-06-30 (UI evidence and approval polish)
+
+- **Agent chat UI:** probe create/update/delete previews and receipts render as
+  standalone approval cards outside the collapsible research trace; legacy probe
+  preview cards are promoted out of the trace if encountered.
+- **Video-summary UI:** machine JSON blocks are labeled by provenance
+  (`System message`, alert title, or `Memory/homeostasis`) instead of a generic
+  machine label.
+- **Monitor UI:** removed the unstable selected-probe filmstrip from the monitor
+  inspector; probe cards and repeated grids keep the CEF-safe layout contracts.
+- **Evidence UI:** metadata-only detections no longer masquerade as visual
+  evidence; missing thumbnails render as non-clickable `No image` tiles.
+- **Upgrade:** code-only from β 0.8.2 — **no database migration**.
+- Schema head: `20260614_0006`. See `readiness/RELEASE_NOTES_0.8.2.1.md`.
+
 ## β 0.8.2 — 2026-06-28 (office-demo hardening)
 
 - **VLM alerts:** split live-feed role text from channel alert criteria; structured
