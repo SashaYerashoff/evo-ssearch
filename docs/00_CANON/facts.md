@@ -46,10 +46,17 @@ Last reviewed: 2026-06-28 (β 0.8.2)
 |---|---|
 | WSGI server | Gunicorn, `gthread` worker class |
 | Worker count | **1** (required; in-process capture/probe/summary schedulers are not multi-worker safe) |
-| App port | `5443` (TLS) `[FIELD]` confirm per site |
+| App bind | Gunicorn serves plain HTTP on `EVOSSEARCH_HOST:EVOSSEARCH_PORT` (`5000` default) |
+| Browser entrypoint | HTTPS/TLS reverse proxy or site TLS boundary `[FIELD]`; office/demo may use HTTP-only internally |
 | Liveness / readiness | `GET /health`, `GET /ready` |
 | Inference queue | Present but **disabled by default**; summary dispatch is synchronous in-process |
 | Graceful-restart durability | Gunicorn worker hooks flush summary state + rollup cache (`gunicorn_conf.py`) |
+
+HTTP/TLS invariant: port number alone does not make the app HTTPS. If operators
+open EVA AI through HTTPS (reverse proxy or TLS-terminating service), set
+`EVOSSEARCH_AUTH_COOKIE_SECURE=true`. If a lab/demo opens the app directly over
+plain HTTP, `EVOSSEARCH_AUTH_COOKIE_SECURE` must be `false` for browser login,
+and that mode is not client-facing.
 
 ## Models & embedders
 

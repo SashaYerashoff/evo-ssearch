@@ -25,12 +25,18 @@ human-in-the-loop). `[NEEDS LEGAL]` marks items for PM/legal sign-off.
 
 | Boundary | Control |
 |---|---|
-| Browser ↔ app | TLS; secure cookies; CSRF token; session TTL |
+| Browser ↔ app | TLS at browser-facing boundary; secure cookies; CSRF token; session TTL |
 | User ↔ data | Named auth; RBAC; **per-channel grants**; RLS forced in DB |
 | App ↔ PostgreSQL | Separate runtime roles (API/audit/worker); RLS tenant isolation |
 | App ↔ Luxriot / LM hosts | Closed network; credentials in `.env` (`0600`), never in code/docs |
 | Sensitive ops | Audited; mutating/sensitive routes centrally guarded |
 | Disabled features | Offline-video / probe-snap / indexed-folder return 404 server-side, not just hidden |
+
+Gunicorn's default production service is internal HTTP (`EVOSSEARCH_PORT=5000`).
+TLS is normally supplied by Nginx or the site's TLS boundary. If a temporary
+office/lab deployment is HTTP-only, `EVOSSEARCH_AUTH_COOKIE_SECURE=false` may be
+needed for browser login, and the deployment must be treated as non-client-facing
+until HTTPS is restored.
 
 ## The AI agent as a threat surface (important)
 

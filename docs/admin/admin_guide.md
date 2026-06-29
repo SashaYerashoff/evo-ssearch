@@ -105,7 +105,8 @@ prompt settings, desired live sessions, and summary state (see
   and restarting the service. Never commit secrets or place them in shareable docs.
 - For deployments behind HTTPS/TLS, set `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
   Office demo systems may run plain HTTP internally, but client-facing systems
-  should not keep insecure-cookie settings.
+  should not keep insecure-cookie settings. See
+  [production_settings](../install/production_settings.md).
 
 ## Routine checks
 

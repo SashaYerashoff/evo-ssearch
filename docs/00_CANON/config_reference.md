@@ -40,7 +40,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | Var (default) | Notes |
 |---|---|
 | `EVOSSEARCH_HOST` (`0.0.0.0`) | Bind host |
-| `EVOSSEARCH_PORT` (`5000`) | Pilot uses `5443` (TLS) `[FIELD]` |
+| `EVOSSEARCH_PORT` (`5000`) | Internal Gunicorn HTTP port. TLS is provided by reverse proxy/TLS boundary, not by this variable |
 | `EVOSSEARCH_DEBUG` (`false`) | Keep false in prod |
 | `EVOSSEARCH_APP_VERSION` | Overrides `VERSION` only if set; keep in sync with release |
 | `EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED` | Gate for secure-mode checks + single-worker enforcement |
@@ -53,7 +53,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 |---|---|
 | `EVOSSEARCH_AUTH_ENABLED` (`false`) | Must be `true` in pilot |
 | `EVOSSEARCH_AUTH_TENANT_ID` | Tenant UUID |
-| `EVOSSEARCH_AUTH_COOKIE_SECURE` (`true`) | Requires HTTPS |
+| `EVOSSEARCH_AUTH_COOKIE_SECURE` (`true`) | Requires the browser-facing URL to be HTTPS. Use `false` only for HTTP-only lab/demo |
 | `EVOSSEARCH_AUTH_SESSION_TTL_HOURS` (`12`) | Session lifetime |
 | `EVOSSEARCH_AUTH_SESSION_COOKIE` / `_CSRF_COOKIE` | Cookie names |
 | `EVOSSEARCH_ADMIN_TOKEN` | **Legacy**; not the current auth model |

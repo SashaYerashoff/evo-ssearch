@@ -5,7 +5,8 @@ no client data** — all site specifics are placeholders. The filled, internal
 version lives in `install/field_rollout_demo.md` (not shared).
 
 Invariants: [facts](../00_CANON/facts.md). All variables:
-[config_reference](../00_CANON/config_reference.md). Placeholders: `<...>`.
+[config_reference](../00_CANON/config_reference.md). Production browser/internal
+URL rules: [production_settings](production_settings.md). Placeholders: `<...>`.
 
 ## Prerequisites
 
@@ -50,7 +51,8 @@ EVOSSEARCH_ARCHIVE_STORE=postgres
 EVOSSEARCH_GUNICORN_WORKERS=1
 EVOSSEARCH_AUTH_COOKIE_SECURE=true
 
-EVOSSEARCH_PORT=<port>            # e.g. 5443 (TLS)
+EVOSSEARCH_HOST=127.0.0.1         # recommended when Nginx/reverse proxy fronts the app
+EVOSSEARCH_PORT=5000              # internal Gunicorn HTTP port
 EVA_DATABASE_DSN=<...>
 EVA_AUDIT_DATABASE_DSN=<...>
 EVA_WORKER_DATABASE_DSN=<...>
@@ -59,6 +61,18 @@ EVOSSEARCH_LUXRIOT_USERNAME=<...>
 EVOSSEARCH_LUXRIOT_PASSWORD=<...>
 # LM profiles (agent + vlm) — see inference_topology
 ```
+
+Production browser access should be HTTPS/TLS at the reverse proxy or site
+boundary, for example:
+
+```
+browser https://<eva-host>/  ->  Nginx/TLS  ->  http://127.0.0.1:5000
+```
+
+`run_prod.sh` does not create TLS by itself; it starts Gunicorn over HTTP. If a
+temporary lab/demo opens `http://<eva-host>:5000` directly, set
+`EVOSSEARCH_AUTH_COOKIE_SECURE=false` or browser login cookies will not work.
+Do not keep HTTP-only mode for a client-facing deployment.
 
 ## 4. First admin & verification
 

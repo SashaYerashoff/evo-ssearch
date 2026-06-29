@@ -6,8 +6,9 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
 
 ## Components
 
-- **EVA AI app** (`oldapp.py`, Flask under Gunicorn) — HTTP API + UI, capture
-  scheduler, probe daemon, summary pipeline, archive access, agent gateway.
+- **EVA AI app** (`oldapp.py`, Flask under Gunicorn) — internal HTTP API + UI,
+  capture scheduler, probe daemon, summary pipeline, archive access, agent
+  gateway. TLS is normally terminated before Gunicorn (Nginx/site proxy).
 - **PostgreSQL** — control plane: IAM, agent sessions, audit, archive
   (`archive.detections`, `archive.probes`, `archive.runtime_state`). RLS forced.
 - **CLIP embedder** — runs on the app host; embeds every captured frame and
@@ -20,17 +21,24 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
 ## Deployment topology (pilot)
 
 ```
-[Operator browser] --TLS--> [EVA AI host: Flask/Gunicorn(1 worker, gthread)
-                              + CLIP + PostgreSQL + Agent LM client]
-        |                         |                       |
-        | snapshots/bookmarks     | SQL (RLS, 3 roles)    | HTTP
-        v                         v                       v
-   [Luxriot Evo NVR]        [PostgreSQL]           [vLLM host(s): qwen3-vl-4b]
-                                                   [Agent LM host: qwen3.5-9b]
+[Operator browser] --TLS--> [Nginx/site TLS boundary]
+                              |
+                              v HTTP localhost
+                         [EVA AI host: Flask/Gunicorn(1 worker, gthread)
+                          + CLIP + PostgreSQL + Agent LM client]
+                              |                       |
+        snapshots/bookmarks   | SQL (RLS, 3 roles)    | HTTP
+                              v                       v
+                         [Luxriot Evo NVR]     [vLLM host(s): qwen3-vl-4b]
+                                               [Agent LM host: qwen3.5-9b]
 ```
 
 Client specifics (hosts/IPs/ports) live in `install/field_rollout_demo.md`
 (`[FIELD]`); the sanitized `install/deployment_guide.md` uses placeholders.
+
+Office/demo systems may temporarily expose Gunicorn directly over HTTP
+(`http://<host>:5000`). Client-facing systems should use TLS at the browser
+boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 
 ## Data flows
 
