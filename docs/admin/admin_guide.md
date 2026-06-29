@@ -20,7 +20,8 @@ security; a user never exceeds their channel grants regardless of UI or agent.
 
 ## User lifecycle
 
-Via the Admin UI and/or `scripts/manage_users.py` `[VERIFY exact subcommands]`:
+Use **Settings → Users** in the UI for normal administration, or
+`scripts/manage_users.py` for CLI maintenance flows `[VERIFY exact subcommands]`:
 
 - **Create** a user (role + initial password).
 - **Reset password**, **enable/disable**, **revoke sessions**.
@@ -31,6 +32,11 @@ Via the Admin UI and/or `scripts/manage_users.py` `[VERIFY exact subcommands]`:
 Login throttling and a session inventory are built in; disable shared-token
 workflows (legacy admin token is not the current auth model).
 
+If an operator asks the agent how to reset another user's password or assign
+channel grants, the agent should redirect them to an admin/engineer rather than
+reciting procedure steps. Admin/engineer users may receive sanitized procedure
+help through the documentation lookup.
+
 ## Channel grants
 
 - Grant the minimum channels a user needs (data minimization + privacy).
@@ -40,8 +46,8 @@ workflows (legacy admin token is not the current auth model).
 ## Audit
 
 - Sensitive endpoints and **agent tool calls** are audited.
-- Read the audit log via the protected admin/diagnostics reader `[VERIFY UI path]`
-  — who did what, when, including agent actions.
+- Read the audit log via **Settings → Audit** / protected diagnostics reader
+  `[VERIFY exact UI path]` — who did what, when, including agent actions.
 
 ## Retention administration
 
@@ -76,6 +82,10 @@ prompt settings, desired live sessions, and summary state (see
   counts) is always on regardless.
 - Watch the bookmark delivery metrics (observability) to confirm alerts reach
   Luxriot.
+- **Start summaries** persists the desired live video-description session for a
+  channel; restored sessions should come back after service restart. If a channel
+  is quiet after restart, check stream health and desired-session restore status
+  before assuming "no activity".
 
 ## Probes (engineer/agent-managed)
 
@@ -85,11 +95,17 @@ prompt settings, desired live sessions, and summary state (see
 - Probe calibration from archive is read-only and audited. It proposes thresholds
   from archived CLIP P/N/M evidence, then requires the normal preview/apply flow
   before any probe setting changes.
+- Probe negatives must be visible contrast/background states, never literal
+  absence phrases such as "no weapon". Refusal to create an unsafe preview is a
+  correct outcome.
 
 ## Secrets rotation
 
 - All secrets live in the on-host `.env` (mode `0600`). Rotate by updating `.env`
   and restarting the service. Never commit secrets or place them in shareable docs.
+- For deployments behind HTTPS/TLS, set `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
+  Office demo systems may run plain HTTP internally, but client-facing systems
+  should not keep insecure-cookie settings.
 
 ## Routine checks
 

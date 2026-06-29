@@ -12,6 +12,8 @@ Terms: [glossary](../00_CANON/glossary.md). Ready-made scenarios:
 
 ## 1. Sign in & what you can touch
 
+- Open the deployment URL you were given. Office demo installs may use plain
+  HTTP on port `5000`; client deployments should normally be behind HTTPS/TLS.
 - Log in with your named account. Your **role** (admin / engineer / operator /
   viewer) and **channel grants** decide what you see. If a tab or channel is
   missing, you don't have the grant — ask an admin.
@@ -24,7 +26,14 @@ Terms: [glossary](../00_CANON/glossary.md). Ready-made scenarios:
 This is where the system's always-on description of each channel lives.
 
 - **Live Stream Control** — pick a channel; see its live preview.
-- **Stream context** — channel, cadence, batch size, model, queue, probe state.
+- **Start summaries / Stop summaries** — starts or stops the live
+  video-description loop for the selected channel. Starting a channel persists
+  the desired live session, so the service can restore it after restart.
+- **Stream context** — channel, cadence, batch size, model, queue, and runtime
+  state.
+- **Summary Lens** — filters what level/source you are reading in the VLM feed.
+  It does not change what happened in the video; it changes which summaries are
+  shown.
 - **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = live per-batch)
   and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries). Collapsed summary
   rows show **alert badges** when something was flagged.
@@ -33,8 +42,14 @@ This is where the system's always-on description of each channel lives.
   batches**. A channel that is *quiet* is fine; a channel that is *blind* (gaps)
   is not — trust the health panel, not silence.
 
+Prompt/settings note: **Alert Criteria** is the plain-language "watch for /
+alert on" policy. The L0 stream prompt is for description style/role. The
+`ALERTS_JSON` template is a machine-readable contract and should not be edited
+unless an engineer is intentionally changing parser/schema behavior.
+
 What to do here: confirm your demo channels are running, skim recent L1/L2 for
-context, and note any alert badges before you ask the agent.
+context, check coverage/health, and note any alert badges before you ask the
+agent.
 
 ## 3. Agent tab — ask in plain language
 
@@ -42,6 +57,10 @@ This is the main investigation surface.
 
 - **Ask with a period and a channel.** "What happened on channel 12 in the last 2
   hours?" Natural time works ("yesterday evening", "last 90 minutes").
+- **Sessions** — persistent investigation threads. Start a new session for a new
+  incident or demo track; reopen an old session when you want the agent to keep
+  the same task context. If the thread starts drifting, restate the channel and
+  period or start a fresh session.
 - **Quick-question chips** are video-description-first — use them as starting
   points and edit the channel/period.
 - **Read the coverage line** in answers: it tells you the period requested vs.
@@ -85,6 +104,12 @@ can view the Probe Board; creating/tuning probes is an engineer/agent task. (A
 curated watch-list probe set may be cast on demo channels as a safety-net
 detector — see the demo runbook.)
 
+Important: a probe **negative** is not "no X". CLIP negatives must be visible
+contrast/background states, such as "people standing normally with empty hands"
+or "clear lobby with ordinary pedestrian movement". If the agent refuses
+`negative: no weapon` and asks for a visible alternative, that is correct safety
+behavior.
+
 If you want a second layer for video-description alerts, ask the agent to create
 **probe previews** from the alert classes. The agent should translate the alert
 into generic visual wording (not private names) and use visible background states
@@ -97,6 +122,8 @@ fighting alerts on active channels using the last 24 hours of archive evidence."
 The agent will process up to 8 channels at a time, show which channels were
 deferred, and propose thresholds from archive P/N/M signals. Calibration is still
 a candidate signal — inspect representative frames before applying changes.
+`NOT SAFE TO APPLY`, `weak_separation`, or `manual frame review required` can be
+the correct result when the archive evidence is weak.
 
 ## 6. Settings / Admin
 
