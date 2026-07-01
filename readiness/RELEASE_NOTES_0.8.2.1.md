@@ -1,7 +1,7 @@
 # Luxriot EVA AI β 0.8.2.1 Internal Release Notes
 
 Release date: 2026-06-30  
-Amended: 2026-07-01
+Amended: 2026-07-01  
 Release type: office-demo UI/evidence and agent-workflow patch
 Previous baseline: `β 0.8.2`  
 Schema head: `20260614_0006`  
@@ -42,6 +42,23 @@ or latest-slice answers on ad-hoc onboarding installs.
 - If only the latest slice is actually available because history retention or
   coverage is short, the agent must report that as a coverage limitation rather
   than implying the full requested period was reviewed.
+
+### Last-Week Reports And Archive Fallback
+
+- `normalize_time_window` now treats `last week`, `last 7 days`, and equivalent
+  relative wording as a rolling 7-day period. The agent prompt and tool schema
+  explicitly instruct the model to use `relative_range` for these phrases rather
+  than inventing a calendar date.
+- `generate_report` now accepts `since_ms` / `until_ms` aliases and normalizes
+  them to `from_ts` / `to_ts` before secure tool dispatch. This removes the
+  `unknown tool arguments: since_ms` failure seen in manual chat traces.
+- `list_video_summary_channels` no longer aborts the whole report when the live
+  Luxriot channel inventory is temporarily unreachable. If local video-summary
+  history/runtime digest exists, the tool returns `channel_inventory_status:
+  archive_fallback` and builds candidate channels from local history.
+- Video-description reports surface that fallback explicitly. The agent should
+  say "live inventory unavailable, report uses local video-summary/runtime
+  history" instead of claiming that no channels or no incidents exist.
 
 ### Period-Wide Evidence Sampling
 
@@ -91,6 +108,14 @@ or latest-slice answers on ad-hoc onboarding installs.
 - Agent thumbnail grids fall back to a non-clickable `No image #id` tile if an
   image request fails.
 
+### Database Schema Audit
+
+- Added `readiness/db_schema_audit_0_8_2_1_ru.md` as a current Russian audit of
+  the PostgreSQL schema, tenant/RLS layout, agent/audit/archive tables, and
+  screenshot/image storage surfaces.
+- The audit is descriptive only: it documents the current implementation and
+  intentionally does not propose integration changes.
+
 ## Upgrade Notes
 
 - Code-only patch from `β 0.8.2`.
@@ -126,6 +151,12 @@ Expected:
 - JavaScript syntax check passes;
 - `/health.version` reports `β 0.8.2.1` after restart/env override update.
 
+Full local validation after the July 1 agent-report patch:
+
+- `360 passed, 19 skipped, 127 subtests passed`
+- docs drift check passed
+- `py_compile` passed for touched agent/security/test modules
+
 ## Manual Regression Focus
 
 - Ask the agent to introduce or list available channels on a real
@@ -137,3 +168,16 @@ Expected:
 - Ask for a probe report over a long period. The answer should use
   representative probe events across the period when discussing evidence, with
   `latest_ts` treated as metadata only.
+- Ask for a video-summary report for active channels for the last week. The
+  period should be rolling 7 days, `generate_report` must not reject
+  `since_ms/until_ms`, and live inventory failures should be reported as
+  `archive_fallback` when local summaries exist.
+
+## Manual Test Documents
+
+- `readiness/MANUAL_TEST_SCENARIO_0.8.2.1_AGENT_REPORTS_RU.md` - agent/report
+  acceptance scenario for VLM alerts, last-week reports, coverage gaps,
+  archive fallback, probe calibration, and prompt tuning discipline.
+- `readiness/MANUAL_TEST_PROTOCOL_0.8.2.1_UI_PATCH_RU.md` - UI regression
+  protocol for probe approval cards, machine JSON labels, monitor probe cards,
+  missing-image handling, and archive review modal behavior.

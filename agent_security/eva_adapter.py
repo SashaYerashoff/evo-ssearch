@@ -471,6 +471,19 @@ class EvaAgentToolAdapter:
             now = prepared.pop("now")
             prepared.setdefault("force", _coerce_bool_argument(now, default=False))
 
+        if name == "generate_report":
+            since_ms = prepared.pop("since_ms", None)
+            until_ms = prepared.pop("until_ms", None)
+            try:
+                if since_ms is not None and prepared.get("from_ts") is None:
+                    prepared["from_ts"] = float(since_ms) / 1000.0
+                if until_ms is not None and prepared.get("to_ts") is None:
+                    prepared["to_ts"] = float(until_ms) / 1000.0
+            except (TypeError, ValueError) as exc:
+                raise InvalidToolArgumentsError(
+                    "generate_report since_ms/until_ms must be Unix milliseconds"
+                ) from exc
+
         if name == "search_archive":
             scope = str(prepared.get("scope") or "detections").strip()
             if scope != "detections":

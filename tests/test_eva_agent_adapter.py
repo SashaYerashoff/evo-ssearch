@@ -381,6 +381,23 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["arguments"]["channel_ids"], ["7"])
 
+    def test_generate_report_accepts_millisecond_window_aliases(self):
+        result = self.adapter.execute(
+            "generate_report",
+            {
+                "report_type": "video_descriptions",
+                "since_ms": 100_000,
+                "until_ms": 200_000,
+            },
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["from_ts"], 100.0)
+        self.assertEqual(result["arguments"]["to_ts"], 200.0)
+        self.assertNotIn("since_ms", result["arguments"])
+        self.assertNotIn("until_ms", result["arguments"])
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+
     def test_visual_state_transitions_defaults_to_scoped_channel(self):
         result = self.adapter.execute(
             "track_visual_state_transitions",

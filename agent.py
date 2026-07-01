@@ -600,7 +600,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "relative_range": {
                         "type": "string",
-                        "description": "Optional relative range such as 'last day' (rolling 24h), 'last two hours', 'past 90 minutes', or 'last hour'. Prefer this for phrases like 'during the last two hours'.",
+                        "description": "Optional relative range such as 'last week' (rolling 7 days), 'last day' (rolling 24h), 'last two hours', 'past 90 minutes', or 'last hour'. Prefer this for phrases like 'during the last two hours' or 'for the last week'.",
                     },
                     "timezone": {
                         "type": "string",
@@ -644,6 +644,14 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "to_ts": {
                         "type": "number",
                         "description": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound in Unix milliseconds. Normalized to from_ts.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound in Unix milliseconds. Normalized to to_ts.",
                     },
                     "run": {
                         "type": "string",
@@ -1485,6 +1493,14 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "to_ts": {
                         "type": "number",
                         "description": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
+                    },
+                    "since_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute lower timestamp bound in Unix milliseconds. Normalized to from_ts.",
+                    },
+                    "until_ms": {
+                        "type": "integer",
+                        "description": "Optional absolute upper timestamp bound in Unix milliseconds. Normalized to to_ts.",
                     },
                     "channel_id": {
                         "type": "integer",
@@ -2814,7 +2830,7 @@ class AgentTools:
     # ── list_video_summary_channels ─────────────────────────────────────────
 
     def _list_video_summary_channels(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        if not hasattr(self._lxm, "get_channels") or not hasattr(self._lxm, "session_status"):
+        if not hasattr(self._lxm, "session_status"):
             raise ToolError("Luxriot manager is not available or not configured.")
         depth = _normalize_summary_depth(args.get("depth"))
         limit = max(1, min(100, int(args.get("limit") or 16)))
@@ -2825,10 +2841,12 @@ class AgentTools:
             int(item) for item in (requested_ids or [])
             if _opt_int(item) is not None and int(item) > 0
         }
+        channel_inventory_error: Optional[str] = None
         try:
-            channels = self._lxm.get_channels(force=False)
+            channels = self._lxm.get_channels(force=False) if hasattr(self._lxm, "get_channels") else []
         except Exception as exc:
-            raise ToolError(f"Could not fetch channels: {exc}") from exc
+            channel_inventory_error = str(exc)[:300]
+            channels = []
         runtime_by_channel: Dict[int, Dict[str, Any]] = {}
         status_digest_by_channel: Dict[int, Dict[str, Any]] = {}
         desired_video_channels: set[int] = set()
@@ -2862,6 +2880,36 @@ class AgentTools:
                 and _opt_int(row.get("channel_id")) is not None
                 and int(row.get("channel_id")) > 0
             }
+        if not isinstance(channels, list) or not channels:
+            fallback_ids: set[int] = set(requested_ids_set)
+            fallback_ids.update(runtime_by_channel)
+            fallback_ids.update(status_digest_by_channel)
+            fallback_ids.update(desired_video_channels)
+            fallback_ids.update(desired_missing_by_channel)
+            for attr_name in ("summary_history", "logs_by_channel"):
+                raw_map = getattr(self._lxm, attr_name, None)
+                if isinstance(raw_map, Mapping):
+                    for raw_channel_id in raw_map:
+                        parsed_channel_id = _opt_int(raw_channel_id)
+                        if parsed_channel_id is not None and parsed_channel_id > 0:
+                            fallback_ids.add(int(parsed_channel_id))
+
+            def _fallback_channel_title(channel_id: int) -> str:
+                digest = status_digest_by_channel.get(channel_id, {})
+                runtime = runtime_by_channel.get(channel_id, {})
+                desired_missing = desired_missing_by_channel.get(channel_id, {})
+                for source in (digest, runtime, desired_missing):
+                    if not isinstance(source, Mapping):
+                        continue
+                    title = source.get("title") or source.get("name") or source.get("channel_title")
+                    if title:
+                        return str(title)
+                return f"channel-{channel_id}"
+
+            channels = [
+                {"id": channel_id, "title": _fallback_channel_title(channel_id)}
+                for channel_id in sorted(fallback_ids)
+            ]
 
         valid_channel_ids: set[int] = set()
         for channel in channels if isinstance(channels, list) else []:
@@ -2875,6 +2923,11 @@ class AgentTools:
         channel_rows: List[Dict[str, Any]] = []
         inactive_count = 0
         errors: List[Dict[str, Any]] = []
+        if channel_inventory_error:
+            errors.append({
+                "scope": "channel_inventory",
+                "error": f"Live channel inventory unavailable; using local video-summary history when present: {channel_inventory_error}",
+            })
         for channel in channels if isinstance(channels, list) else []:
             if not isinstance(channel, dict):
                 continue
@@ -3095,15 +3148,18 @@ class AgentTools:
             if int(_opt_int(row.get("coverage_gap_count")) or 0) > 0
             and _opt_int(row.get("channel_id")) is not None
         ]
+        channel_error_count = sum(1 for row in errors if _opt_int(row.get("channel_id")) is not None)
         return {
             "depth": depth,
             "from_ts": from_ts,
             "to_ts": to_ts,
             "time_window": time_meta,
+            "channel_inventory_status": "archive_fallback" if channel_inventory_error else "live",
+            "channel_inventory_error": channel_inventory_error,
             "requested_count": requested_count,
             "unchecked_count": unchecked_count,
             "unchecked_channel_ids": unchecked_channel_ids,
-            "total_channels_checked": active_count + inactive_count + len(errors),
+            "total_channels_checked": active_count + inactive_count + channel_error_count,
             "active_count": active_count,
             "inactive_count": inactive_count,
             "error_count": len(errors),
@@ -4392,6 +4448,14 @@ class AgentTools:
         report_args = dict(args)
         if report_args.get("from_ts") is not None or report_args.get("to_ts") is not None:
             return report_args
+        since_ms = _opt_float(args.get("since_ms"))
+        until_ms = _opt_float(args.get("until_ms"))
+        if since_ms is not None or until_ms is not None:
+            if since_ms is not None:
+                report_args["from_ts"] = float(since_ms) / 1000.0
+            if until_ms is not None:
+                report_args["to_ts"] = float(until_ms) / 1000.0
+            return report_args
         since_hours = float(args.get("since_hours") or 24)
         until_hours = _opt_float(args.get("until_hours"))
         if until_hours is not None:
@@ -4518,6 +4582,8 @@ class AgentTools:
             f"Active with summaries: {active_count}; inactive/no summaries: {inactive_count}; "
             f"errors: {error_count}; deferred: {deferred_count}."
         )
+        if inventory.get("channel_inventory_status") == "archive_fallback":
+            coverage_note += " Live channel inventory was unavailable; channel candidates came from local video-summary/runtime history."
         if desired_missing:
             coverage_note += f" Desired-but-not-running channels: {len(desired_missing)}."
         if gapped_channels:
@@ -4535,6 +4601,8 @@ class AgentTools:
                 f"{len(desired_missing)} desired but not running."
             ),
         ]
+        if inventory.get("channel_inventory_status") == "archive_fallback":
+            lines.append("Live channel inventory unavailable: report uses local video-summary/runtime history only.")
         if alert_counts:
             alert_text = ", ".join(f"{sev}:{count}" for sev, count in sorted(alert_counts.items()))
             lines.append(f"VLM alerts: {sum(alert_counts.values())} total ({alert_text}).")
@@ -4584,6 +4652,8 @@ class AgentTools:
             "coverage": {
                 "status": coverage_status,
                 "note": coverage_note,
+                "channel_inventory_status": inventory.get("channel_inventory_status"),
+                "channel_inventory_error": inventory.get("channel_inventory_error"),
                 "checked_channels": checked,
                 "active_count": active_count,
                 "inactive_count": inactive_count,
@@ -4744,6 +4814,16 @@ class AgentTools:
         raw_to = args.get("to_ts")
         from_ts = _coerce_epoch_seconds(raw_from)
         to_ts = _coerce_epoch_seconds(raw_to)
+        raw_since_ms = args.get("since_ms")
+        raw_until_ms = args.get("until_ms")
+        if from_ts is None and raw_since_ms is not None:
+            parsed_since_ms = _opt_float(raw_since_ms)
+            from_ts = float(parsed_since_ms) / 1000.0 if parsed_since_ms is not None else None
+            raw_from = raw_since_ms
+        if to_ts is None and raw_until_ms is not None:
+            parsed_until_ms = _opt_float(raw_until_ms)
+            to_ts = float(parsed_until_ms) / 1000.0 if parsed_until_ms is not None else None
+            raw_to = raw_until_ms
         normalized_units = {
             "from_ts": _epoch_input_unit(raw_from),
             "to_ts": _epoch_input_unit(raw_to),
@@ -5908,7 +5988,7 @@ def build_system_prompt(
         f"- If an operator asks for an unsupported export, say so plainly and offer the closest available format, such as a structured chat report.\n"
         f"- Prefer absolute time windows (since_ms/until_ms or from_ts/to_ts) when the operator asks about a specific date or period.\n"
         f"- For video-description or video-summary review over a period, first call normalize_time_window unless the user already provided exact Unix timestamps. Use from_ts/to_ts for video summaries and since_ms/until_ms for detection archive tools.\n"
-        f"- For relative period phrases such as 'last day', 'last 24 hours', 'last two hours', or 'past 90 minutes', call normalize_time_window with relative_range set to the phrase; do not invent local start_time/end_time strings. Interpret 'last day' as rolling 24 hours; use 'yesterday' only for the previous calendar day.\n"
+        f"- For relative period phrases such as 'last week', 'last 7 days', 'last day', 'last 24 hours', 'last two hours', or 'past 90 minutes', call normalize_time_window with relative_range set to the phrase; do not invent local start_time/end_time strings. Interpret 'last week' as rolling 7 days and 'last day' as rolling 24 hours; use 'yesterday' only for the previous calendar day.\n"
         f"- If the operator asks for video-summary review without naming channel(s), call list_video_summary_channels for the normalized period before reading full summaries. If active_count exceeds the per_turn_channel_limit, present candidate channels and ask the operator to choose channels or confirm full multi-turn research.\n"
         f"- Do not review more than {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels of video summaries in one turn unless the operator explicitly confirmed broad research. For broad research, work in chunks and report unchecked channels.\n"
         f"- For video event investigations over a non-trivial period, use rollups as a map before detail: L2 for broad context, L1 for candidate windows, and live/L0 only to verify exact events and evidence. Do not treat L2/L1 as visual proof.\n"
@@ -5994,7 +6074,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
                 prepared["until_ms"] = time_window.get("until_ms")
         if tool_name == "generate_report" and not _has_any_arg(
             prepared,
-            ("from_ts", "to_ts", "since_hours", "until_hours"),
+            ("from_ts", "to_ts", "since_ms", "until_ms", "since_hours", "until_hours"),
         ):
             if time_window.get("from_ts") is not None:
                 prepared["from_ts"] = time_window.get("from_ts")
@@ -7383,6 +7463,7 @@ def _parse_relative_window_seconds(value: Any) -> Optional[Tuple[int, str]]:
         r"шесть|семь|восемь|девять|десять|пара"
     )
     unit_pattern = (
+        r"weeks?|w|недел(?:ю|и|ь)?|нед(?:еля|ели|елю)?|"
         r"hours?|hrs?|h|час(?:а|ов)?|час|"
         r"minutes?|mins?|min|m|минут(?:ы|у)?|м(?:ин)?|"
         r"days?|d|д(?:ень|ня|ней)?|сут(?:ки|ок|ка)?"
@@ -7401,7 +7482,7 @@ def _parse_relative_window_seconds(value: Any) -> Optional[Tuple[int, str]]:
     if not match:
         implicit = re.search(
             r"(?:last|past|previous|prior|recent|последн\w+)\s+"
-            r"(?P<unit>hour|час|minute|минута|day|день|сутки)\b",
+            r"(?P<unit>week|неделя|неделю|hour|час|minute|минута|day|день|сутки)\b",
             normalized,
         )
         if implicit:
@@ -7423,7 +7504,9 @@ def _parse_relative_window_seconds(value: Any) -> Optional[Tuple[int, str]]:
     if not amount or amount <= 0:
         return None
     unit = str(unit or "").lower()
-    if unit.startswith(("d", "day", "д", "сут")):
+    if unit.startswith(("w", "week", "нед")):
+        seconds = int(amount * 604800)
+    elif unit.startswith(("d", "day", "д", "сут")):
         seconds = int(amount * 86400)
     elif unit.startswith(("h", "hr", "hour", "час")):
         seconds = int(amount * 3600)
@@ -9483,6 +9566,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         return {
             "depth": result.get("depth"),
             "time_window": result.get("time_window"),
+            "channel_inventory_status": result.get("channel_inventory_status"),
+            "channel_inventory_error": result.get("channel_inventory_error"),
             "requested_count": result.get("requested_count"),
             "unchecked_count": result.get("unchecked_count"),
             "unchecked_channel_ids": result.get("unchecked_channel_ids"),
@@ -9498,6 +9583,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "full_research_note": result.get("full_research_note"),
             "errors": [
                 {
+                    "scope": row.get("scope"),
                     "channel_id": row.get("channel_id"),
                     "title": row.get("title"),
                     "error": row.get("error"),

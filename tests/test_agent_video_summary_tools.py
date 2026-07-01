@@ -807,6 +807,22 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["to_ts"] - result["from_ts"], 86_400)
         self.assertEqual(result["until_ms"] - result["since_ms"], 86_400_000)
 
+    def test_normalize_time_window_accepts_relative_last_week_as_rolling_7_days(self):
+        tools = _tools()
+        result = tools.execute(
+            "normalize_time_window",
+            {
+                "relative_range": "last week",
+                "timezone": "Europe/Riga",
+            },
+        )
+
+        self.assertEqual(result["duration_sec"], 604_800)
+        self.assertEqual(result["day_hint"], "relative")
+        self.assertEqual(result["relative_range"], "last week")
+        self.assertEqual(result["to_ts"] - result["from_ts"], 604_800)
+        self.assertEqual(result["until_ms"] - result["since_ms"], 604_800_000)
+
     def test_normalize_time_window_accepts_date_without_clock_as_calendar_day(self):
         tools = _tools()
         result = tools.execute(
@@ -2024,6 +2040,60 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(row["first_ts"], 100.0)
         self.assertEqual(row["latest_ts"], 130.0)
 
+    def test_list_video_summary_channels_accepts_millisecond_time_window(self):
+        result = _tools().execute(
+            "list_video_summary_channels",
+            {
+                "since_ms": 100_000,
+                "until_ms": 300_000,
+                "limit": 10,
+            },
+        )
+
+        self.assertEqual(result["from_ts"], 100.0)
+        self.assertEqual(result["to_ts"], 300.0)
+        self.assertEqual(result["time_window"]["since_ms"], 100_000)
+        self.assertEqual(result["time_window"]["until_ms"], 300_000)
+
+    def test_list_video_summary_channels_falls_back_to_local_history_when_channel_inventory_fails(self):
+        manager = _SummaryManager()
+
+        def get_channels(force=False):
+            raise RuntimeError("No route to host")
+
+        manager.get_channels = get_channels
+        manager.logs_by_channel = {
+            7: [
+                {
+                    "created_at": 150.0,
+                    "summary": "local archive event",
+                    "frame_count": 3,
+                    "alert_counts": {"normal": 1},
+                    "alert_total": 1,
+                }
+            ],
+        }
+
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "limit": 10,
+            },
+        )
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+
+        self.assertEqual(result["channel_inventory_status"], "archive_fallback")
+        self.assertIn("No route to host", result["channel_inventory_error"])
+        self.assertEqual(result["active_count"], 1)
+        self.assertEqual(result["candidate_channels"][0]["channel_id"], 7)
+        self.assertEqual(result["candidate_channels"][0]["alert_total"], 1)
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(result["inactive_count"], 1)
+        self.assertEqual(result["total_channels_checked"], 2)
+        self.assertEqual(compact["channel_inventory_status"], "archive_fallback")
+
     def test_list_video_summary_channels_caps_candidates_when_confirmation_required(self):
         manager = _SummaryManager()
         manager.channels = [
@@ -2212,6 +2282,27 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             [row["detection_id"] for row in result["vlm_alert_frames"]],
             [0, 4, 8],
         )
+
+    def test_generate_report_accepts_millisecond_time_window_and_inventory_fallback(self):
+        class OfflineInventoryManager(_SummaryManager):
+            def get_channels(self, force=False):
+                raise RuntimeError("No route to host")
+
+        result = _tools(manager=OfflineInventoryManager()).execute(
+            "generate_report",
+            {
+                "report_type": "video_descriptions",
+                "since_ms": 100_000,
+                "until_ms": 300_000,
+                "top_events": 2,
+            },
+        )
+
+        self.assertEqual(result["period"]["from_ts"], 100.0)
+        self.assertEqual(result["period"]["to_ts"], 300.0)
+        self.assertEqual(result["coverage"]["channel_inventory_status"], "archive_fallback")
+        self.assertIn("Live channel inventory unavailable", result["report"])
+        self.assertGreaterEqual(result["summary"]["returned_channels"], 1)
 
     def test_generate_report_probe_type_keeps_legacy_probe_shape(self):
         class ProbeReportStore(_DetectionStore):
