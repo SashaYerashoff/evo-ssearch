@@ -4,11 +4,21 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
-## β 0.8.2.1 — 2026-06-30 (UI evidence and approval polish)
+## β 0.8.2.1 — 2026-06-30, amended 2026-07-01 (UI evidence, approval, and agent workflow polish)
 
 - **Agent chat UI:** probe create/update/delete previews and receipts render as
   standalone approval cards outside the collapsible research trace; legacy probe
   preview cards are promoted out of the trace if encountered.
+- **Agent channel inventory:** startup context and channel-reference resolution
+  now use the production `get_channels()` contract instead of the legacy/test
+  `.channels` attribute, avoiding false "Luxriot not connected" answers.
+- **Agent period investigations:** broad video-summary/report workflows are
+  explicitly guarded against latest-slice answers; reports now use period-wide
+  representative evidence instead of newest-only archive hits.
+- **Probe reports:** compact agent results include representative probe events
+  across the requested period, not only aggregate counts and `latest_ts`.
+- **Tool-call resilience:** `list_channels {"now": true}` is accepted as a safe
+  alias for `force=true` and normalized before gateway dispatch.
 - **Video-summary UI:** machine JSON blocks are labeled by provenance
   (`System message`, alert title, or `Memory/homeostasis`) instead of a generic
   machine label.

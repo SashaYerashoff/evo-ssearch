@@ -25,11 +25,12 @@ Default order:
 5. For selected channels and periods longer than about one hour, call `get_video_summaries` with `depth="L2"` first to get the background map. For shorter periods, use `depth="L1"` first.
 6. Use L2 as context, not proof. Drill from L2 into `depth="L1"` around candidate windows.
 7. Drill into `depth="live"`/`L0` only for suspicious, ambiguous, or high-value windows that need exact evidence.
-8. For event-oriented review, optionally call `get_visual_window_signals` with visible positive/negative phrases to prioritize candidate frames/windows.
-9. When visual proof is requested, call `get_video_summaries` with `include_evidence_frames=true` or `get_detections` with `source="vlm_summary"`/`source="vlm_alert"` for the same channel and exact time window.
-10. Before saying visual confirmation, call `describe_frame` on the relevant returned `detection_id` or frame image and use that description as the visual basis.
-11. Use `search_archive` only for semantic discovery. Keep archive detections separate from VLM summary evidence.
-12. Return a report with: scope, coverage, timeline, direct observations, indirect indicators, archive corroboration, gaps, and confidence.
+8. Do not answer from the newest returned summary alone. Pick 2-3 candidate windows across the requested period, prioritizing alert/deviation windows and keeping first/last coverage anchors when the result is truncated.
+9. For event-oriented review, optionally call `get_visual_window_signals` with visible positive/negative phrases to prioritize candidate frames/windows.
+10. When visual proof is requested, call `get_video_summaries` with `include_evidence_frames=true` or `get_detections` with `source="vlm_summary"`/`source="vlm_alert"` for the same channel and exact time window.
+11. Before saying visual confirmation, call `describe_frame` on the relevant returned `detection_id` or frame image and use that description as the visual basis.
+12. Use `search_archive` only for semantic discovery. Keep archive detections separate from VLM summary evidence.
+13. Return a report with: scope, coverage, timeline, direct observations, indirect indicators, archive corroboration, gaps, and confidence.
 
 Trust hierarchy:
 - Routine memory or repeated background is a prior, not proof of a new event.

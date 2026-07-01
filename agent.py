@@ -4474,28 +4474,26 @@ class AgentTools:
             if frame_channel_ids:
                 per_channel_limit = max(1, top_events)
                 for frame_channel_id in frame_channel_ids:
-                    rows, _total = self._ds.list_detections(
+                    rows, _total = self._sample_detection_window(
                         probe_id=None,
                         channel_id=frame_channel_id,
                         source="vlm_alert",
                         since_ms=since_ms,
                         until_ms=until_ms,
                         limit=per_channel_limit,
-                        offset=0,
                     )
                     frame_rows.extend(r for r in rows if isinstance(r, dict))
             else:
-                rows, _total = self._ds.list_detections(
+                rows, _total = self._sample_detection_window(
                     probe_id=None,
                     channel_id=None,
                     source="vlm_alert",
                     since_ms=since_ms,
                     until_ms=until_ms,
                     limit=top_events,
-                    offset=0,
                 )
                 frame_rows.extend(r for r in rows if isinstance(r, dict))
-            frame_rows.sort(key=_detection_timestamp_ms, reverse=True)
+            frame_rows.sort(key=_detection_timestamp_ms)
             alert_frames = [
                 _safe_detection(_annotate_archive_row(r))
                 for r in frame_rows[:top_events]
@@ -4657,6 +4655,14 @@ class AgentTools:
                 limit=top_events,
                 offset=0,
             )
+            representative_rows, _ = self._sample_detection_window(
+                probe_id=pid,
+                channel_id=channel_id,
+                source="probe",
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=top_events,
+            )
 
             # Accumulate hourly buckets
             all_rows, _ = self._ds.list_detections(
@@ -4680,6 +4686,10 @@ class AgentTools:
                 "hit_count": row.get("hit_count", 0),
                 "latest_ts": row.get("latest_timestamp_ms"),
                 "top_events": [_safe_detection(_annotate_archive_row(r)) for r in top_rows],
+                "representative_events": [
+                    _safe_detection(_annotate_archive_row(r))
+                    for r in representative_rows
+                ],
             })
 
         return {
@@ -4914,6 +4924,34 @@ class AgentTools:
     ) -> Tuple[List[Dict[str, Any]], int]:
         max_scan = max(limit + offset, max_scan or (limit + offset))
         max_scan = max(limit + offset, min(5_000, int(max_scan)))
+        if sort_by == "oldest":
+            probe_rows, total = self._ds.list_detections(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                source=source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=1,
+                offset=0,
+            )
+            if total <= 0:
+                return [], int(total or 0)
+            effective_limit = max(0, min(int(limit), int(total) - int(offset)))
+            if effective_limit <= 0:
+                return [], int(total)
+            desc_offset = max(0, int(total) - int(offset) - effective_limit)
+            rows, total = self._ds.list_detections(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                source=source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=effective_limit,
+                offset=desc_offset,
+            )
+            ordered = _sort_detection_rows([dict(row) for row in rows], "oldest")
+            return ordered[:effective_limit], int(total or len(probe_rows) or len(rows))
+
         batch_size = min(500, max_scan)
         scanned: List[Dict[str, Any]] = []
         total = 0
@@ -4936,6 +4974,66 @@ class AgentTools:
                 break
         ordered = _sort_detection_rows(scanned, sort_by)
         return ordered[offset: offset + limit], total
+
+    def _sample_detection_window(
+        self,
+        *,
+        probe_id: Optional[str],
+        channel_id: Optional[int],
+        source: Optional[str],
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        limit = max(1, min(100, int(limit or 1)))
+        rows, total = self._ds.list_detections(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=1,
+            offset=0,
+        )
+        total = int(total or len(rows) or 0)
+        if total <= 0:
+            return [], 0
+        if total <= limit:
+            all_rows, total = self._list_detection_window(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                source=source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                offset=0,
+                sort_by="oldest",
+                max_scan=limit,
+            )
+            return all_rows, int(total or len(all_rows))
+
+        selected: List[Dict[str, Any]] = []
+        seen: set[Tuple[Any, ...]] = set()
+        for ascending_index in _evenly_spaced_indices(total, limit):
+            desc_offset = max(0, total - 1 - int(ascending_index))
+            sample_rows, _sample_total = self._ds.list_detections(
+                probe_id=probe_id,
+                channel_id=channel_id,
+                source=source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=1,
+                offset=desc_offset,
+            )
+            for row in sample_rows or []:
+                row_dict = dict(row)
+                key = _evidence_row_key(row_dict)
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(row_dict)
+        selected.sort(key=lambda row: (_detection_timestamp_ms(row), _opt_int(row.get("id") or row.get("detection_id")) or 0))
+        return selected[:limit], total
 
     def _filter_detection_band(
         self,
@@ -5022,7 +5120,10 @@ class AgentTools:
         if numeric_ref is not None:
             return numeric_ref
 
-        raw_channels = getattr(self._lxm, "channels", None) or []
+        if hasattr(self._lxm, "get_channels"):
+            raw_channels = self._lxm.get_channels(force=False)
+        else:
+            raw_channels = getattr(self._lxm, "channels", None) or []
         channels = [
             ch for ch in raw_channels
             if isinstance(ch, dict) and _opt_int(ch.get("id")) is not None
@@ -5699,7 +5800,10 @@ def build_system_prompt(
 
     # Available channels
     try:
-        raw_channels = getattr(luxriot_manager, "channels", None) or []
+        if hasattr(luxriot_manager, "get_channels"):
+            raw_channels = luxriot_manager.get_channels(force=False)
+        else:
+            raw_channels = getattr(luxriot_manager, "channels", None) or []
         raw_channel_list = (
             raw_channels if isinstance(raw_channels, list) else []
         )
@@ -5715,7 +5819,7 @@ def build_system_prompt(
         channels_str = ", ".join(
             f"{c.get('id')} ({c.get('title', 'unknown')})"
             for c in visible_channels
-        ) or "unknown (Luxriot not connected)"
+        ) or "unknown (call list_channels to verify)"
     except Exception:
         channels_str = "unknown"
 
@@ -5808,6 +5912,8 @@ def build_system_prompt(
         f"- If the operator asks for video-summary review without naming channel(s), call list_video_summary_channels for the normalized period before reading full summaries. If active_count exceeds the per_turn_channel_limit, present candidate channels and ask the operator to choose channels or confirm full multi-turn research.\n"
         f"- Do not review more than {AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN} channels of video summaries in one turn unless the operator explicitly confirmed broad research. For broad research, work in chunks and report unchecked channels.\n"
         f"- For video event investigations over a non-trivial period, use rollups as a map before detail: L2 for broad context, L1 for candidate windows, and live/L0 only to verify exact events and evidence. Do not treat L2/L1 as visual proof.\n"
+        f"- Do not answer a broad period investigation from only the newest summary entry or newest archive hits. First establish period coverage/alert/probe health, then inspect L2/L1 summaries across the requested window, choose 2-3 candidate windows spanning the period or carrying alerts/deviations, and only then drill into frames/L0 for evidence. If only the latest slice is available, report that as a coverage limitation.\n"
+        f"- When probes are relevant to a period investigation, use list_probes or generate_report with report_type='probes' as a secondary signal. Prefer representative_events across the period over latest_ts/top newest hits when explaining probe evidence.\n"
         f"- Rank video-summary signals by provenance. Routine memory/baseline is prior context, not current evidence. L0 prose is a current VLM description but can be contaminated by prior memory. Structured L0 alert_events/state_observations are stronger than prose. Backend state_transition_events are confirmed cross-batch state changes from structured L0 observations, but still require frame evidence for final visual confirmation. Archive frame plus describe_frame is the strongest visual proof available in chat.\n"
         f"- If L0 prose mentions an event or entity but structured alert_events/state_observations do not confirm it, do not drop it and do not call it false. Mark it as unconfirmed prose-only evidence: possible memory contamination, structured-output miss, or real event needing frame review. For important safety/security findings, drill into VLM summary/alert frames and describe_frame before concluding.\n"
         f"- Treat parser/delivery diagnostics as pipeline health, not incident counts: json/prose/parser counts explain extraction quality; delivery_status sent/cooldown_skipped/bookmark_disabled/failed explains Luxriot bookmark side effects.\n"
@@ -9290,6 +9396,11 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                         "channel_id": row.get("channel_id"),
                         "hit_count": row.get("hit_count"),
                         "latest_ts": row.get("latest_ts"),
+                        "representative_events": [
+                            _compact_detection_for_model(event)
+                            for event in (row.get("representative_events") or [])[:3]
+                            if isinstance(event, dict)
+                        ],
                     }
                     for row in probes[:8]
                     if isinstance(row, dict)

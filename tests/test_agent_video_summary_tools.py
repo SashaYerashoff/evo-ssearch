@@ -263,6 +263,17 @@ class _ProbeStore:
         return [dict(probe) for probe in self.probes]
 
 
+class _ChannelsMethodOnlyManager:
+    def get_channels(self, force=False):
+        return [
+            {"id": 1353, "title": "Office lobby"},
+            {"id": 1463, "title": "Street loop"},
+        ]
+
+    def streams_status(self):
+        return {"video_streams": [], "channel_status_digest": []}
+
+
 def _tools(manager=None, search_detections_fn=None, detections_store=None, call_lm_fn=None, embed_text_fn=None, probes_store=None):
     return AgentTools(
         detections_store=detections_store or _DetectionStore(),
@@ -451,6 +462,26 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertIn("do not refuse when the request can be reframed", prompt)
         self.assertIn("smoking weed/pipe/joint", prompt)
         self.assertIn("person holding a small cylindrical object", prompt)
+
+    def test_system_prompt_reads_channels_through_get_channels(self):
+        prompt = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _ChannelsMethodOnlyManager(),
+        )
+
+        self.assertIn("Available channels: 1353 (Office lobby), 1463 (Street loop)", prompt)
+        self.assertNotIn("Luxriot not connected", prompt)
+
+    def test_channel_ref_resolution_reads_channels_through_get_channels(self):
+        tools = _tools(manager=_ChannelsMethodOnlyManager())
+
+        channel_id = tools._resolve_channel_id(
+            {"channel_ref": "office lobby"},
+            required=True,
+        )
+
+        self.assertEqual(channel_id, 1353)
 
     def test_describe_frame_prefers_detection_thumbnail_over_live_channel(self):
         class SnapshotFailManager(_SummaryManager):
@@ -1880,6 +1911,50 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             all(row["score_semantics"] == "not_applicable" for row in compact["detections"])
         )
 
+    def test_detection_window_oldest_reaches_start_of_large_period(self):
+        store = _DetectionStore(
+            [
+                {
+                    "id": index,
+                    "source": "vlm_alert",
+                    "channel_id": 7,
+                    "timestamp_ms": 100_000 + index * 1_000,
+                }
+                for index in range(20)
+            ]
+        )
+        tools = _tools(detections_store=store)
+
+        rows, total = tools._list_detection_window(
+            probe_id=None,
+            channel_id=7,
+            source="vlm_alert",
+            since_ms=100_000,
+            until_ms=119_000,
+            limit=3,
+            offset=0,
+            sort_by="oldest",
+            max_scan=3,
+        )
+
+        self.assertEqual(total, 20)
+        self.assertEqual([row["id"] for row in rows], [0, 1, 2])
+
+        tail_rows, tail_total = tools._list_detection_window(
+            probe_id=None,
+            channel_id=7,
+            source="vlm_alert",
+            since_ms=100_000,
+            until_ms=119_000,
+            limit=3,
+            offset=19,
+            sort_by="oldest",
+            max_scan=3,
+        )
+
+        self.assertEqual(tail_total, 20)
+        self.assertEqual([row["id"] for row in tail_rows], [19])
+
     def test_list_video_summary_channels_returns_active_candidates_and_confirmation_flag(self):
         result = _tools().execute(
             "list_video_summary_channels",
@@ -2089,6 +2164,55 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["pipeline_health"]["alert_delivery_breakdown"]["sent"], 1)
         self.assertEqual(compact["vlm_alert_frames"][0]["image_url"], "/detections/thumbnail/501")
 
+    def test_generate_report_samples_vlm_alert_frames_across_period(self):
+        class SingleChannelManager(_SummaryManager):
+            channels = [{"id": 7, "title": "Lobby"}]
+
+            def session_status(self, channel_id, run_selector=None, start_ts=None, end_ts=None, limit=None):
+                return {
+                    "running": False,
+                    "logs": [
+                        {
+                            "created_at": 100.0 + index * 100.0,
+                            "batch_start_ms": 100_000 + index * 100_000,
+                            "batch_end_ms": 110_000 + index * 100_000,
+                            "summary": f"summary {index}",
+                            "frame_count": 12,
+                            "alert_counts": {"normal": 1},
+                            "alert_total": 1,
+                        }
+                        for index in range(9)
+                    ],
+                }
+
+        store = _DetectionStore(
+            [
+                {
+                    "id": index,
+                    "detection_id": index,
+                    "source": "vlm_alert",
+                    "channel_id": 7,
+                    "timestamp_ms": 100_000 + index * 100_000,
+                }
+                for index in range(9)
+            ]
+        )
+
+        result = _tools(manager=SingleChannelManager(), detections_store=store).execute(
+            "generate_report",
+            {
+                "from_ts": 100.0,
+                "to_ts": 1_000.0,
+                "channel_id": 7,
+                "top_events": 3,
+            },
+        )
+
+        self.assertEqual(
+            [row["detection_id"] for row in result["vlm_alert_frames"]],
+            [0, 4, 8],
+        )
+
     def test_generate_report_probe_type_keeps_legacy_probe_shape(self):
         class ProbeReportStore(_DetectionStore):
             def summarize_by_probe(self, *args, **kwargs):
@@ -2130,6 +2254,54 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["probe_count"], 1)
         self.assertEqual(result["probes"][0]["probe_name"], "door")
         self.assertEqual(store.summary_kwargs["source"], "probe")
+
+    def test_generate_probe_report_exposes_representative_events_to_model(self):
+        class ProbeReportStore(_DetectionStore):
+            def summarize_by_probe(self, *args, **kwargs):
+                return [
+                    {
+                        "probe_id": "probe-1",
+                        "probe_name": "door",
+                        "channel_id": 7,
+                        "hit_count": 9,
+                        "latest_timestamp_ms": 900_000,
+                    }
+                ]
+
+        store = ProbeReportStore(
+            [
+                {
+                    "id": index,
+                    "probe_id": "probe-1",
+                    "probe_name": "door",
+                    "source": "probe",
+                    "channel_id": 7,
+                    "timestamp_ms": 100_000 + index * 100_000,
+                    "margin": 0.2,
+                }
+                for index in range(9)
+            ]
+        )
+
+        result = _tools(detections_store=store).execute(
+            "generate_report",
+            {
+                "report_type": "probes",
+                "since_hours": 1_000_000,
+                "channel_id": 7,
+                "top_events": 3,
+            },
+        )
+        compact = _compact_tool_result_for_model("generate_report", result)
+
+        self.assertEqual(
+            [row["detection_id"] for row in result["probes"][0]["representative_events"]],
+            [0, 4, 8],
+        )
+        self.assertEqual(
+            [row["detection_id"] for row in compact["probes"][0]["representative_events"]],
+            [0, 4, 8],
+        )
 
     def test_turn_context_applies_normalized_time_window_to_generate_report(self):
         context = _seed_turn_tool_context("Generate a video report for the selected channel.")

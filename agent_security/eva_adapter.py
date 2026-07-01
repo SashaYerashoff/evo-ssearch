@@ -22,6 +22,25 @@ from .policy import RateLimit, ToolPolicy, ToolRisk
 from .registry import ToolRegistry
 
 
+_TRUE_ARG_STRINGS = frozenset({"1", "true", "yes", "y", "on"})
+_FALSE_ARG_STRINGS = frozenset({"0", "false", "no", "n", "off"})
+
+
+def _coerce_bool_argument(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_ARG_STRINGS:
+            return True
+        if normalized in _FALSE_ARG_STRINGS:
+            return False
+        return default
+    return bool(value)
+
+
 _PREVIEW_ONLY_TOOLS = frozenset(
     {
         "create_probe",
@@ -447,6 +466,10 @@ class EvaAgentToolAdapter:
             # Permissions never travel through model/tool args; strip any attempt.
             # Trusted permissions are passed to the tool via execution context.
             prepared.pop("_granted_permissions", None)
+
+        if name == "list_channels" and "now" in prepared:
+            now = prepared.pop("now")
+            prepared.setdefault("force", _coerce_bool_argument(now, default=False))
 
         if name == "search_archive":
             scope = str(prepared.get("scope") or "detections").strip()

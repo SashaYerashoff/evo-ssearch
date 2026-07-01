@@ -228,6 +228,14 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             ["probe-7"],
         )
 
+    def test_list_channels_accepts_now_alias_without_leaking_unknown_arg(self):
+        self.adapter.execute("list_channels", {"now": True}, self.context)
+
+        self.assertEqual(
+            self.legacy.calls[-1],
+            ("list_channels", {"force": True}),
+        )
+
     def test_probe_calibration_batch_items_are_filtered_to_channel_grants(self):
         result = self.adapter.execute(
             "prepare_probe_calibration_batch",
