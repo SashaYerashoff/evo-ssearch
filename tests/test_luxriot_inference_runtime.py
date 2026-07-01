@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import stat
 import tempfile
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 from uuid import uuid4
+
+import numpy as np
 
 from inference_queue import (
     InMemoryInferenceQueueRepository,
@@ -44,6 +47,10 @@ def build_manager(
         LUXRIOT_ROLLUP_TIME_ONLY=True,
         LUXRIOT_SNAPSHOT_INTERVAL=5,
         LUXRIOT_SNAPSHOT_MAX_EDGE=800,
+        LUXRIOT_CAPTURE_SOURCE="auto",
+        LUXRIOT_LIVE_SEGMENT_SECONDS=2.0,
+        LUXRIOT_LIVE_SEGMENT_MB=1.0,
+        LUXRIOT_LIVE_SEGMENT_EVERY_N=1,
         LUXRIOT_MAX_BUFFER_FRAMES=180,
         LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH=4,
         LUXRIOT_BASE_URL="http://luxriot.invalid",
@@ -104,6 +111,56 @@ def sample_frames(start: float = 100.0):
     ]
 
 
+class FakeVectorProbeManager:
+    def add_frame(self, channel_id, pil_image, timestamp_ms):
+        return None
+
+    def query(
+        self,
+        channel_id,
+        positives,
+        negatives,
+        pos_floor,
+        margin_thr,
+        top_k,
+        window_sec=None,
+        image_probe=None,
+        roi_norm=None,
+        roi_padding=0.05,
+    ):
+        return {
+            "results": [
+                {
+                    "timestamp_ms": 105000,
+                    "channel_id": int(channel_id),
+                    "pos_score": 0.42,
+                    "neg_score": 0.18,
+                    "margin": 0.24,
+                    "thumbnail": "should-not-enter-vector-signal",
+                }
+            ],
+            "frames_indexed": 12,
+            "status": {"frames": 12},
+        }
+
+
+class FakeVectorProbeStore:
+    def list_probes(self):
+        return [
+            {
+                "id": "probe-drift",
+                "name": "vehicle drift candidate",
+                "channel_id": 7,
+                "enabled": True,
+                "positives": ["vehicle drifting or burnout"],
+                "negatives": ["normal traffic flow"],
+                "pos_floor": 0.25,
+                "margin": 0.05,
+                "severity": "high",
+            }
+        ]
+
+
 def load_lm_alert_parser():
     source = Path(__file__).resolve().parent.parent.joinpath("oldapp.py").read_text(encoding="utf-8")
     module = ast.parse(source)
@@ -125,6 +182,68 @@ def load_lm_alert_parser():
 
 
 class LuxriotCaptureDispatchTests(unittest.TestCase):
+    def test_summary_flush_preserves_recent_preview_frames(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.set_summary_dispatcher(lambda _batch, _workload: {"queued": False})
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=2,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            image = SimpleNamespace(width=1280, height=720)
+
+            session._accept_captured_frame(image, 1_000, summarize=True)
+            session._accept_captured_frame(image, 2_000, summarize=True)
+
+            self.assertEqual(len(session.frames), 0)
+            self.assertEqual(len(session.recent_frame_items()), 2)
+            self.assertEqual(session.nearest_frame_thumbnail(), "jpeg")
+            status = session.status()
+            self.assertEqual(status["pending_frames"], 0)
+            self.assertEqual(status["recent_frame_count"], 2)
+
+    def test_repeated_exact_frames_mark_source_frozen_and_stop_buffering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_FROZEN_FRAME_MAX_SEC": 10.0,
+                    "LUXRIOT_FROZEN_FRAME_MIN_COUNT": 3,
+                },
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            image = SimpleNamespace(width=1280, height=720)
+
+            with patch("luxriot_connector.time.time", return_value=100.0):
+                session._accept_captured_frame(image, 100_000, summarize=True)
+            with patch("luxriot_connector.time.time", return_value=105.0):
+                session._accept_captured_frame(image, 105_000, summarize=True)
+            with patch("luxriot_connector.time.time", return_value=112.0):
+                session._accept_captured_frame(image, 112_000, summarize=True)
+
+            with patch("luxriot_connector.time.time", return_value=113.0):
+                status = session.status()
+            self.assertTrue(status["frozen_signal"])
+            self.assertEqual(status["frozen_frame_count"], 3)
+            self.assertEqual(status["frozen_frame_dropped_count"], 1)
+            self.assertEqual(len(session.recent_frame_items()), 2)
+
+            manager.jpeg_encoder = lambda _image, **_kwargs: "jpeg-new"
+            with patch("luxriot_connector.time.time", return_value=114.0):
+                session._accept_captured_frame(image, 114_000, summarize=True)
+                status = session.status()
+            self.assertFalse(status["frozen_signal"])
+            self.assertEqual(len(session.recent_frame_items()), 3)
+
     def test_dispatch_failure_restores_detached_frames(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -177,6 +296,51 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(session.frames), 1)
             self.assertIn("vlm unavailable", session.last_error)
             self.assertEqual(session.queue_dropped_batches, 1)
+
+    def test_capture_loop_uses_live_segment_after_slow_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_CAPTURE_SOURCE": "auto",
+                    "LUXRIOT_LIVE_SEGMENT_SECONDS": 2.0,
+                    "LUXRIOT_LIVE_SEGMENT_MB": 1.0,
+                    "LUXRIOT_LIVE_SEGMENT_EVERY_N": 1,
+                },
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=4,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            session.slow_snapshot_count = 1
+            decoded_frames = [
+                SimpleNamespace(
+                    timestamp_ms=1_000,
+                    image=np.zeros((4, 6, 3), dtype=np.uint8),
+                ),
+                SimpleNamespace(
+                    timestamp_ms=2_000,
+                    image=np.full((4, 6, 3), 128, dtype=np.uint8),
+                ),
+            ]
+
+            with (
+                patch.object(session, "_run_ffmpeg_live_segment_once", return_value=None),
+                patch("luxriot_connector.iter_luxriot_live_segment_frames", return_value=iter(decoded_frames)) as live_iter,
+            ):
+                handled = session._run_live_segment_once()
+
+            self.assertTrue(handled)
+            live_iter.assert_called_once()
+            self.assertEqual(len(session.frames), 2)
+            self.assertEqual(session.active_capture_source, "live_segment")
+            self.assertEqual(session.live_segment_count, 1)
+            self.assertEqual(session.live_segment_frame_count, 2)
+            self.assertEqual(session.last_live_segment_frames, 2)
+            self.assertIsNone(session.last_live_segment_error)
 
     def test_sync_fallback_records_summary_without_dispatcher(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -263,6 +427,55 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertGreaterEqual(stats["total_image_base64_chars"], 160)
             self.assertIn("warnings", stats)
             self.assertIn("llm_input_stats", manager.summary_history[7][0])
+
+    def test_summary_batch_injects_vector_signal_bundle_into_l0_prompt_and_status(self):
+        captured_messages = []
+
+        def lm_callback(messages, _model):
+            captured_messages.extend(messages)
+            return (
+                "Current observed state:\n"
+                "Vehicle drift candidate: uncertain; vector cue should be visually checked.\n"
+                "ALERTS_JSON:{\"alerts\":[]}"
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.probe_manager = FakeVectorProbeManager()
+            manager.probes_store = FakeVectorProbeStore()
+
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint="model-a",
+                interval_sec=5.0,
+                frames=sample_frames(),
+            )
+
+            vector_signal = batch["vector_signal"]
+            json.dumps(vector_signal, allow_nan=False)
+            self.assertEqual(vector_signal["clip_probe_signals"][0]["name"], "vehicle drift candidate")
+            self.assertEqual(vector_signal["clip_probe_signals"][0]["apex_frame"], 2)
+            self.assertEqual(vector_signal["clip_probe_signals"][0]["p"], 0.42)
+            self.assertNotIn("thumbnail", json.dumps(vector_signal))
+
+            entry = manager.run_summary_batch(batch)
+            accepted = manager.accept_summary_entry(entry)
+
+            prompt_text = json.dumps(captured_messages)
+            self.assertIn("VECTOR_SIGNALS_JSON", prompt_text)
+            self.assertIn("vector_homeostasis_attention_signal_not_visual_proof", prompt_text)
+            self.assertIn("not visual proof", prompt_text)
+            self.assertNotIn("should-not-enter-vector-signal", prompt_text)
+            self.assertIn("vector_signal", accepted)
+            self.assertEqual(manager.summary_history[7][0]["vector_signal"]["clip_probe_signals"][0]["m"], 0.24)
+            l0 = manager.summary_rollups(channel_id=7, synthesize=False)["levels"]["L0"][0]
+            self.assertEqual(l0["vector_signal"]["clip_probe_signals"][0]["probe_id"], "probe-drift")
+            digest = manager.system_status_digest(channel_ids=[7])["channels"][0]
+            self.assertEqual(digest["vector_signal_total"], 1)
+            self.assertEqual(digest["recent_vector_signals"][0]["top_clip_probe"]["name"], "vehicle drift candidate")
 
     def test_sync_fallback_archives_batch_frame_anchors(self):
         archived = []
@@ -457,6 +670,14 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             {
                 "channel_id": 7,
                 "running": True,
+                "snapshot_count": 8,
+                "snapshot_failed_count": 1,
+                "slow_snapshot_count": 3,
+                "snapshot_slow_threshold_sec": 2.0,
+                "last_snapshot_latency_sec": 7.25,
+                "avg_snapshot_latency_sec": 3.5,
+                "max_snapshot_latency_sec": 10.0,
+                "last_snapshot_at": 101.5,
                 "logs": [
                     {"created_at": 100.0, "summary": "routine"},
                     {
@@ -481,6 +702,102 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(compact["last_alert_counts"], {"low": 1, "normal": 1})
         self.assertEqual(compact["last_bookmark_failed_count"], 1)
         self.assertEqual(compact["last_bookmark_last_error"], "bookmark rejected")
+        self.assertEqual(compact["snapshot_count"], 8)
+        self.assertEqual(compact["snapshot_failed_count"], 1)
+        self.assertEqual(compact["slow_snapshot_count"], 3)
+        self.assertEqual(compact["snapshot_slow_threshold_sec"], 2.0)
+        self.assertEqual(compact["last_snapshot_latency_sec"], 7.25)
+        self.assertEqual(compact["avg_snapshot_latency_sec"], 3.5)
+        self.assertEqual(compact["max_snapshot_latency_sec"], 10.0)
+        self.assertEqual(compact["last_snapshot_at"], 101.5)
+
+    def test_probe_capture_shares_active_video_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            calls = {"thumbnail": 0}
+
+            def video_status():
+                return {
+                    "channel_id": 7,
+                    "running": True,
+                    "capture_kind": "video",
+                    "summarization_enabled": True,
+                    "pending_frames": 4,
+                    "interval_sec": 1.0,
+                    "max_buffer_frames": 120,
+                    "snapshot_count": 9,
+                    "last_snapshot_latency_sec": 6.25,
+                    "avg_snapshot_latency_sec": 4.0,
+                    "slow_snapshot_count": 5,
+                    "logs": [{"summary": "hidden from compact status"}],
+                }
+
+            video_session = SimpleNamespace(
+                status=video_status,
+                nearest_frame_thumbnail=lambda _ts=None: calls.__setitem__("thumbnail", calls["thumbnail"] + 1) or "thumb-b64",
+            )
+            manager.sessions[7] = video_session
+
+            state = manager.start_probe_capture(7, fps=3.0)
+
+            self.assertTrue(state["running"])
+            self.assertTrue(state["shared_capture"])
+            self.assertEqual(state["stream_type"], "analytics")
+            self.assertEqual(state["capture_kind"], "analytics")
+            self.assertFalse(state["summarization_enabled"])
+            self.assertEqual(state["pending_frames"], 4)
+            self.assertEqual(state["last_snapshot_latency_sec"], 6.25)
+            self.assertEqual(state["requested_fps"], 3.0)
+            self.assertNotIn("logs", state)
+            self.assertNotIn(7, manager.probe_sessions)
+            self.assertIn(7, manager.shared_probe_channels)
+
+            streams = manager.streams_status()
+            analytics = [item for item in streams["analytics_streams"] if item["channel_id"] == 7]
+            self.assertEqual(len(analytics), 1)
+            self.assertTrue(analytics[0]["shared_capture"])
+            self.assertEqual(analytics[0]["last_snapshot_latency_sec"], 6.25)
+            self.assertEqual(streams["running_total"], 2)
+            self.assertEqual(streams["capture_thread_total"], 1)
+            self.assertEqual(streams["shared_analytics_count"], 1)
+            self.assertEqual(manager.probe_frame_thumbnail(7), "thumb-b64")
+            self.assertEqual(calls["thumbnail"], 1)
+
+            stopped = manager.stop_probe_capture(7, pause=True)
+            self.assertTrue(stopped["shared_capture"])
+            self.assertTrue(stopped["paused"])
+            self.assertNotIn(7, manager.shared_probe_channels)
+            self.assertIn(7, manager.paused_probe_channels)
+
+    def test_probe_capture_prefers_shared_video_over_existing_analytics_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            stopped = {"analytics": 0}
+            analytics_session = SimpleNamespace(
+                status=lambda: {"channel_id": 7, "running": True, "capture_kind": "analytics"},
+                stop=lambda: stopped.__setitem__("analytics", stopped["analytics"] + 1),
+            )
+            video_session = SimpleNamespace(
+                status=lambda: {
+                    "channel_id": 7,
+                    "running": True,
+                    "capture_kind": "video",
+                    "summarization_enabled": True,
+                    "pending_frames": 2,
+                    "interval_sec": 1.0,
+                    "logs": [],
+                },
+                nearest_frame_thumbnail=lambda _ts=None: None,
+            )
+            manager.probe_sessions[7] = analytics_session
+            manager.sessions[7] = video_session
+
+            state = manager.start_probe_capture(7)
+
+            self.assertTrue(state["shared_capture"])
+            self.assertEqual(stopped["analytics"], 1)
+            self.assertNotIn(7, manager.probe_sessions)
+            self.assertIn(7, manager.shared_probe_channels)
 
     def test_summary_filters_and_l0_rollups_use_batch_bounds(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1647,7 +1964,9 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
             self.manager.summary_history[7][0]["summary"],
             "queued summary",
         )
+        self.wait_for(lambda: not list((self.directory / "spool").glob("*.json")))
         self.assertEqual(list((self.directory / "spool").glob("*.json")), [])
+        self.wait_for(lambda: self.runtime.status()["completed_count"] == 1)
         self.assertEqual(self.runtime.status()["completed_count"], 1)
 
     def test_worker_archives_batch_frame_anchors(self):

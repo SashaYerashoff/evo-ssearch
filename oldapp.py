@@ -28,7 +28,7 @@ from threading import Lock
 import numpy as np
 import torch
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
 from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
@@ -50,6 +50,7 @@ from inference_queue import (
 )
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
+from road_events import AutoSceneCardConfig, DecodedVideoFrame, infer_scene_card_from_frames
 from security import (
     ALL_CHANNELS,
     AuditEvent,
@@ -269,8 +270,10 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "detections_diagnostics": Permission.DETECTIONS_VIEW,
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
+    "luxriot_recent_frame": Permission.STREAMS_VIEW,
     "luxriot_snapshot": Permission.STREAMS_VIEW,
     "luxriot_snapshot_capture": Permission.STREAMS_VIEW,
+    "road_scene_overlay": Permission.DIAGNOSTICS_VIEW,
     "luxriot_session_status": Permission.STREAMS_VIEW,
     "luxriot_summary_rollups": Permission.REPORTS_VIEW,
     "luxriot_streams_status": Permission.STREAMS_VIEW,
@@ -2052,6 +2055,294 @@ def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int 
     return base64.b64encode(buffer.getvalue()).decode()
 
 
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(int(minimum), min(int(maximum), parsed))
+
+
+def _clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    return max(float(minimum), min(float(maximum), parsed))
+
+
+def _render_road_scene_overlay_png(
+    base_image: Image.Image,
+    scene_result: Any,
+) -> str:
+    """Render an engineer-facing motion-zone preview over the current frame."""
+
+    image = base_image.convert("RGBA")
+    width, height = image.size
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    zones = tuple(getattr(getattr(scene_result, "scene_card", None), "zones", ()) or ())
+    for zone in zones:
+        if getattr(zone, "enabled", True) is False:
+            continue
+        polygon = tuple(getattr(zone, "polygon", ()) or ())
+        if not polygon:
+            points = [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)]
+        else:
+            points = [
+                (
+                    int(round(float(x) * max(1, width - 1))),
+                    int(round(float(y) * max(1, height - 1))),
+                )
+                for x, y in polygon
+            ]
+        if len(points) < 3:
+            continue
+        draw.polygon(points, fill=(0, 214, 143, 54), outline=(0, 255, 170, 230))
+        draw.line(points + [points[0]], fill=(0, 255, 170, 240), width=max(2, width // 360))
+
+        expected_flow = getattr(zone, "expected_flow", None)
+        if expected_flow is None:
+            continue
+        try:
+            dx, dy = float(expected_flow[0]), float(expected_flow[1])
+        except Exception:
+            continue
+        magnitude = math.hypot(dx, dy)
+        if magnitude <= 1e-9:
+            continue
+        dx, dy = dx / magnitude, dy / magnitude
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        cx = sum(xs) / max(1, len(xs))
+        cy = sum(ys) / max(1, len(ys))
+        length = max(36.0, min(width, height) * 0.18)
+        x0, y0 = cx - dx * length * 0.42, cy - dy * length * 0.42
+        x1, y1 = cx + dx * length * 0.58, cy + dy * length * 0.58
+        line_width = max(4, width // 180)
+        draw.line([(x0, y0), (x1, y1)], fill=(255, 209, 102, 245), width=line_width)
+        head_len = max(10.0, line_width * 3.2)
+        angle = math.atan2(dy, dx)
+        for side in (1, -1):
+            head_angle = angle + side * 2.55
+            hx = x1 + math.cos(head_angle) * head_len
+            hy = y1 + math.sin(head_angle) * head_len
+            draw.line([(x1, y1), (hx, hy)], fill=(255, 209, 102, 245), width=line_width)
+
+    combined = Image.alpha_composite(image, overlay).convert("RGB")
+    buffer = BytesIO()
+    combined.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _road_scene_buffered_frames(
+    channel_id: int,
+    limit: int,
+    *,
+    max_age_sec: Optional[float] = None,
+) -> List[DecodedVideoFrame]:
+    """Return frames EVA already captured for a channel without hitting Luxriot again."""
+
+    sessions: List[Any] = []
+    try:
+        with luxriot_manager.cache_lock:
+            video_session = luxriot_manager.sessions.get(int(channel_id))
+            analytics_session = luxriot_manager.probe_sessions.get(int(channel_id))
+        if video_session is not None:
+            sessions.append(video_session)
+        if analytics_session is not None and analytics_session is not video_session:
+            sessions.append(analytics_session)
+    except Exception:
+        sessions = []
+
+    decoded: List[DecodedVideoFrame] = []
+    frame_limit = max(1, int(limit))
+    for session in sessions:
+        try:
+            recent_fn = getattr(session, "recent_frame_items", None)
+            if callable(recent_fn):
+                raw_frames = list(recent_fn(frame_limit))
+            else:
+                with session.lock:
+                    raw_frames = list(session.frames)[-frame_limit:]
+        except Exception:
+            raw_frames = []
+        for raw in raw_frames:
+            if len(decoded) >= frame_limit:
+                break
+            if not isinstance(raw, Mapping):
+                continue
+            thumbnail = str(raw.get("thumbnail") or "").strip()
+            if not thumbnail:
+                continue
+            try:
+                with Image.open(BytesIO(base64.b64decode(thumbnail))) as opened:
+                    opened.load()
+                    image = opened.convert("RGB")
+                captured_at = float(raw.get("captured_at") or raw.get("time_sec") or time.time())
+                if max_age_sec is not None and (time.time() - captured_at) > float(max_age_sec):
+                    continue
+                decoded.append(
+                    DecodedVideoFrame(
+                        frame_index=len(decoded),
+                        timestamp_ms=int(captured_at * 1000.0),
+                        source_timestamp_ms=None,
+                        image=np.asarray(image),
+                    )
+                )
+            except Exception:
+                continue
+        if len(decoded) >= frame_limit:
+            break
+    return decoded
+
+
+def _luxriot_recent_frame_item(
+    channel_id: int,
+    mode: str = "latest",
+    *,
+    max_age_sec: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_mode = str(mode or "latest").strip().lower()
+    sessions: List[Any] = []
+    try:
+        with luxriot_manager.cache_lock:
+            video_session = luxriot_manager.sessions.get(int(channel_id))
+            analytics_session = luxriot_manager.probe_sessions.get(int(channel_id))
+        if video_session is not None:
+            sessions.append(video_session)
+        if analytics_session is not None and analytics_session is not video_session:
+            sessions.append(analytics_session)
+    except Exception:
+        sessions = []
+
+    for session in sessions:
+        try:
+            recent_fn = getattr(session, "recent_frame_items", None)
+            if callable(recent_fn):
+                raw_frames = list(recent_fn(60 if normalized_mode in {"cycle", "animated", "scan"} else 1))
+            else:
+                with session.lock:
+                    raw_frames = list(session.frames)[-60 if normalized_mode in {"cycle", "animated", "scan"} else -1:]
+        except Exception:
+            raw_frames = []
+        candidates = [
+            dict(raw)
+            for raw in raw_frames
+            if isinstance(raw, Mapping) and str(raw.get("thumbnail") or "").strip()
+        ]
+        if max_age_sec is not None:
+            fresh_candidates: List[Dict[str, Any]] = []
+            for candidate in candidates:
+                age_sec = _luxriot_recent_frame_age_sec(candidate)
+                if age_sec is not None and age_sec <= float(max_age_sec):
+                    fresh_candidates.append(candidate)
+            candidates = fresh_candidates
+        if not candidates:
+            continue
+        if normalized_mode in {"cycle", "animated", "scan"} and len(candidates) > 1:
+            try:
+                fps = max(1.0, min(6.0, float(request.args.get("fps") or 2.0)))
+            except Exception:
+                fps = 2.0
+            index = int(time.time() * fps) % len(candidates)
+            item = candidates[index]
+            item["_recent_frame_index"] = index
+            item["_recent_frame_count"] = len(candidates)
+            return item
+        for raw in reversed(candidates):
+            if not isinstance(raw, Mapping):
+                continue
+            thumbnail = str(raw.get("thumbnail") or "").strip()
+            if thumbnail:
+                raw["_recent_frame_index"] = len(candidates) - 1
+                raw["_recent_frame_count"] = len(candidates)
+                return raw
+    return None
+
+
+def _luxriot_recent_frame_timestamp_sec(frame_item: Mapping[str, Any]) -> Optional[float]:
+    for key in ("captured_at", "time_sec"):
+        value = frame_item.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    for key in ("timestamp_ms", "source_timestamp_ms"):
+        value = frame_item.get(key)
+        try:
+            parsed_ms = float(value)
+        except (TypeError, ValueError):
+            parsed_ms = 0.0
+        if parsed_ms > 0:
+            return parsed_ms / 1000.0
+    return None
+
+
+def _luxriot_recent_frame_age_sec(frame_item: Mapping[str, Any], *, now: Optional[float] = None) -> Optional[float]:
+    timestamp_sec = _luxriot_recent_frame_timestamp_sec(frame_item)
+    if timestamp_sec is None:
+        return None
+    return max(0.0, float(now if now is not None else time.time()) - timestamp_sec)
+
+
+def _luxriot_recent_frame_max_age_sec(raw_value: Any = None) -> float:
+    try:
+        max_age = float(raw_value) if raw_value not in (None, "") else float(config.LUXRIOT_RECENT_FRAME_MAX_AGE_SEC)
+    except (TypeError, ValueError):
+        max_age = float(config.LUXRIOT_RECENT_FRAME_MAX_AGE_SEC)
+    return max(3.0, min(300.0, max_age))
+
+
+def _luxriot_capture_status_for_channel(channel_id: int) -> Dict[str, Any]:
+    statuses: List[Dict[str, Any]] = []
+    try:
+        with luxriot_manager.cache_lock:
+            sessions = [
+                luxriot_manager.sessions.get(int(channel_id)),
+                luxriot_manager.probe_sessions.get(int(channel_id)),
+            ]
+        for session in sessions:
+            if session is None:
+                continue
+            status_fn = getattr(session, "status", None)
+            if callable(status_fn):
+                status = status_fn()
+                if isinstance(status, Mapping):
+                    statuses.append(dict(status))
+    except Exception:
+        statuses = []
+    if not statuses:
+        return {}
+    return {
+        "running": any(bool(status.get("running")) for status in statuses),
+        "recent_frame_count": max(int(status.get("recent_frame_count") or 0) for status in statuses),
+        "last_error": next((status.get("last_error") for status in statuses if status.get("last_error")), None),
+        "frozen_signal": any(bool(status.get("frozen_signal")) for status in statuses),
+        "frozen_signal_since": next(
+            (status.get("frozen_signal_since") for status in statuses if status.get("frozen_signal_since")),
+            None,
+        ),
+        "frozen_signal_age_sec": max(
+            (float(status.get("frozen_signal_age_sec") or 0.0) for status in statuses),
+            default=0.0,
+        )
+        or None,
+        "frozen_frame_count": max(int(status.get("frozen_frame_count") or 0) for status in statuses),
+        "active_capture_source": next(
+            (status.get("active_capture_source") for status in statuses if status.get("active_capture_source")),
+            None,
+        ),
+        "last_snapshot_at": max(
+            (float(status.get("last_snapshot_at") or 0.0) for status in statuses),
+            default=0.0,
+        )
+        or None,
+    }
+
+
 def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
     alpha = alpha_image.convert('L')
     scale = float(opacity_scale)
@@ -3213,6 +3504,7 @@ def _build_archive_stores() -> Tuple[Any, Any]:
 
 
 probes_store, detections_store = _build_archive_stores()
+luxriot_manager.probes_store = probes_store
 APP_STARTED_AT = time.time()
 
 
@@ -5943,6 +6235,85 @@ def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str
     return events
 
 
+def _vlm_archive_snapshot_hint(text: object) -> Optional[int]:
+    """Return the strongest 1-based snapshot/frame reference from alert prose.
+
+    VLM alerts often describe the decisive moment as "Snapshots 8-12" while
+    timestamp_ms is missing or parser-filled. Prefer the latest referenced
+    snapshot in a range; for motion events that is usually the most informative
+    anchor frame.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    hints: List[int] = []
+    pattern = re.compile(
+        r"\b(?:snapshot|snapshots|frame|frames)\s*#?\s*(\d{1,3})"
+        r"(?:\s*(?:-|–|—|to|through|and)\s*#?\s*(\d{1,3}))?",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(raw):
+        first = _to_optional_int(match.group(1))
+        second = _to_optional_int(match.group(2))
+        for value in (first, second):
+            if value is not None and 1 <= int(value) <= 512:
+                hints.append(int(value))
+    if not hints:
+        return None
+    return max(hints)
+
+
+def _vlm_archive_anchor_from_snapshot_hint(
+    valid_frames: Sequence[Mapping[str, Any]],
+    snapshot_hint: Optional[int],
+) -> Optional[Mapping[str, Any]]:
+    if snapshot_hint is None or not valid_frames:
+        return None
+    frame_indices = {
+        _to_int(frame.get("frame_index"), -1): frame
+        for frame in valid_frames
+        if isinstance(frame, Mapping)
+    }
+    hinted = int(snapshot_hint)
+    zero_based = hinted - 1
+    if zero_based in frame_indices:
+        return frame_indices[zero_based]
+    if hinted in frame_indices:
+        return frame_indices[hinted]
+    return min(
+        valid_frames,
+        key=lambda frame: abs(_to_int(frame.get("frame_index"), 0) - zero_based),
+    )
+
+
+def _select_vlm_alert_anchor(
+    valid_frames: Sequence[Mapping[str, Any]],
+    alert_event: Mapping[str, Any],
+    *,
+    fallback_timestamp_ms: int,
+    summary_text: str,
+    single_alert: bool,
+) -> Tuple[Mapping[str, Any], str, Optional[int]]:
+    event_text = " ".join(
+        str(alert_event.get(key) or "")
+        for key in ("title", "description")
+    )
+    snapshot_hint = _vlm_archive_snapshot_hint(event_text)
+    reason = "alert_snapshot_reference"
+    if snapshot_hint is None and single_alert:
+        snapshot_hint = _vlm_archive_snapshot_hint(summary_text)
+        reason = "summary_snapshot_reference"
+    anchor = _vlm_archive_anchor_from_snapshot_hint(valid_frames, snapshot_hint)
+    if anchor is not None:
+        return anchor, reason, snapshot_hint
+    event_ts = _to_int(alert_event.get("timestamp_ms"), fallback_timestamp_ms)
+    anchor = min(
+        valid_frames,
+        key=lambda frame: abs(int(frame.get("timestamp_ms") or 0) - int(event_ts)),
+    )
+    return anchor, "timestamp_nearest", None
+
+
 def _vlm_archive_excerpt(value: Any, limit: int) -> Tuple[str, bool]:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -5999,6 +6370,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         and not isinstance(entry.get("state_transition_events"), (str, bytes, bytearray))
         else [],
         "state_transition_total": _to_int(entry.get("state_transition_total"), 0),
+        "vector_signal": dict(entry.get("vector_signal") or {})
+        if isinstance(entry.get("vector_signal"), Mapping)
+        else {},
     }
 
     records: List[Dict[str, Any]] = []
@@ -6075,11 +6449,15 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                     "delivery_status": "aggregate",
                 }
             ]
-        for event_index, alert_event in enumerate(events_for_archive[:32]):
+        archived_events = events_for_archive[:32]
+        for event_index, alert_event in enumerate(archived_events):
             event_ts = _to_int(alert_event.get("timestamp_ms"), int(valid_frames[-1]["timestamp_ms"]))
-            anchor = min(
+            anchor, anchor_selection, snapshot_hint = _select_vlm_alert_anchor(
                 valid_frames,
-                key=lambda frame: abs(int(frame.get("timestamp_ms") or 0) - int(event_ts)),
+                alert_event,
+                fallback_timestamp_ms=event_ts,
+                summary_text=summary_excerpt,
+                single_alert=len(archived_events) == 1,
             )
             severity = str(alert_event.get("severity") or "normal").strip().lower()
             if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
@@ -6107,7 +6485,10 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "anchor_frame_index": anchor["frame_index"],
                 "anchor_frame_timestamp_ms": anchor["timestamp_ms"],
                 "anchor_source_role": anchor["anchor_role"],
+                "anchor_selection": anchor_selection,
             }
+            if snapshot_hint is not None:
+                alert_payload["anchor_snapshot_hint"] = int(snapshot_hint)
             records.append(
                 {
                     "dedupe_key": (
@@ -8728,6 +9109,211 @@ def luxriot_snapshot(channel_id: int):
         return response
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/recent_frame/<int:channel_id>', methods=['GET'])
+def luxriot_recent_frame(channel_id: int):
+    """Serve a fresh EVA-captured frame.
+
+    Stale buffered frames are treated as signal loss so the operator does not
+    watch replayed history while the model is no longer receiving current input.
+    """
+
+    stream_type = request.args.get('stream', 'mainStream')
+    fallback_raw = str(request.args.get('fallback') or 'snapshot').strip().lower()
+    fallback_snapshot = fallback_raw in {'1', 'true', 'yes', 'on', 'snapshot', 'luxriot'}
+    fallback_probe = fallback_raw in {'probe', 'diagnostic', 'analytics'}
+    mode = str(request.args.get('mode') or 'latest').strip().lower()
+    max_age_sec = _luxriot_recent_frame_max_age_sec(request.args.get('max_age_sec'))
+    allow_stale = str(request.args.get('allow_stale') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    try:
+        capture_status = _luxriot_capture_status_for_channel(channel_id)
+        frame_item = _luxriot_recent_frame_item(
+            channel_id,
+            mode=mode,
+            max_age_sec=None if allow_stale else max_age_sec,
+        )
+        stale_frame: Optional[Dict[str, Any]] = None
+        frame_age_sec = _luxriot_recent_frame_age_sec(frame_item) if frame_item else None
+        frozen_signal = bool(capture_status.get("frozen_signal")) and not allow_stale
+        if frozen_signal:
+            frame_item = None
+            frame_age_sec = None
+        if frame_item is None and not allow_stale:
+            latest_frame = _luxriot_recent_frame_item(channel_id, mode="latest")
+            latest_age_sec = _luxriot_recent_frame_age_sec(latest_frame) if latest_frame else None
+            if latest_frame and (latest_age_sec is None or latest_age_sec > max_age_sec):
+                stale_frame = latest_frame
+        encoded = str((frame_item or {}).get("thumbnail") or "").strip()
+        source = 'eva_recent'
+        meta: Dict[str, Any] = {}
+        if frame_item:
+            meta = {
+                "width": frame_item.get("width"),
+                "height": frame_item.get("height"),
+                "captured_at": frame_item.get("captured_at") or frame_item.get("time_sec"),
+            }
+        if not encoded and fallback_probe:
+            encoded = luxriot_manager.probe_frame_thumbnail(channel_id) or ""
+            if encoded:
+                source = 'probe_thumbnail_fallback'
+        if not encoded and fallback_snapshot and stale_frame is None and not frozen_signal:
+            encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
+            source = 'luxriot_snapshot_fallback'
+        if not encoded:
+            response_status = 503 if stale_frame is not None or frozen_signal else 409
+            stale_age = _luxriot_recent_frame_age_sec(stale_frame) if stale_frame else None
+            error_code = 'signal_frozen' if frozen_signal else ('signal_lost' if stale_frame is not None else 'no_eva_frame')
+            return jsonify(
+                {
+                    'success': False,
+                    'error_code': error_code,
+                    'error': (
+                        'EVA frame source is frozen; live signal is not currently changing for the model.'
+                        if frozen_signal
+                        else (
+                        'EVA frame buffer is stale; live signal is not currently reaching the model.'
+                        if stale_frame is not None
+                        else 'No fresh EVA frame is available for this channel yet.'
+                        )
+                    ),
+                    'channel_id': int(channel_id),
+                    'stream': stream_type,
+                    'source': 'eva_recent',
+                    'max_age_sec': max_age_sec,
+                    'last_frame_age_sec': stale_age,
+                    'recent_frame_count': capture_status.get("recent_frame_count"),
+                    'running': capture_status.get("running"),
+                    'active_capture_source': capture_status.get("active_capture_source"),
+                    'last_error': capture_status.get("last_error"),
+                    'frozen_signal': capture_status.get("frozen_signal"),
+                    'frozen_signal_since': capture_status.get("frozen_signal_since"),
+                    'frozen_signal_age_sec': capture_status.get("frozen_signal_age_sec"),
+                    'frozen_frame_count': capture_status.get("frozen_frame_count"),
+                }
+            ), response_status
+        encoded = _strip_image_data_url_prefix(encoded)
+        img_bytes = base64.b64decode(encoded)
+        response = make_response(img_bytes)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['X-EVA-Frame-Source'] = source
+        if frame_age_sec is not None:
+            response.headers['X-EVA-Frame-Age-Sec'] = f"{frame_age_sec:.3f}"
+        response.headers['X-EVA-Signal'] = 'fresh' if source == 'eva_recent' else 'fallback'
+        response.headers['X-EVA-Max-Frame-Age-Sec'] = f"{max_age_sec:.3f}"
+        if frame_item and frame_item.get('_recent_frame_index') is not None:
+            response.headers['X-EVA-Frame-Index'] = str(frame_item.get('_recent_frame_index'))
+        if frame_item and frame_item.get('_recent_frame_count') is not None:
+            response.headers['X-EVA-Frame-Count'] = str(frame_item.get('_recent_frame_count'))
+        if meta.get('width') is not None:
+            response.headers['X-Image-Width'] = str(meta.get('width'))
+        if meta.get('height') is not None:
+            response.headers['X-Image-Height'] = str(meta.get('height'))
+        if meta.get('captured_at') is not None:
+            try:
+                response.headers['X-EVA-Frame-Timestamp-Ms'] = str(int(float(meta.get('captured_at')) * 1000.0))
+            except Exception:
+                pass
+        return response
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/road/scene_overlay/<int:channel_id>', methods=['GET'])
+def road_scene_overlay(channel_id: int):
+    """Generate a bounded engineer preview of the auto-inferred road mask."""
+
+    context = _current_auth_context()
+    if _auth_enabled() and context is not None:
+        try:
+            require_permission(context, Permission.STREAMS_VIEW)
+        except PermissionError:
+            return _auth_failure_response("Permission denied", 403)
+
+    stream_type = str(request.args.get('stream') or 'mainStream').strip() or 'mainStream'
+    sample_frames = _clamp_int(request.args.get('frames'), 60, 12, 120)
+    max_edge = _clamp_int(request.args.get('max_edge'), 240, 96, 480)
+    max_age_sec = _luxriot_recent_frame_max_age_sec(request.args.get('max_age_sec'))
+    try:
+        capture_status = _luxriot_capture_status_for_channel(channel_id)
+        if bool(capture_status.get("frozen_signal")):
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": "signal_frozen",
+                    "error": "EVA frame source is frozen; road mask grounding is paused until the Luxriot signal changes again.",
+                    "channel_id": int(channel_id),
+                    "stream": stream_type,
+                    "source": "eva_capture_buffer",
+                    "max_age_sec": max_age_sec,
+                    "recent_frame_count": capture_status.get("recent_frame_count"),
+                    "running": capture_status.get("running"),
+                    "last_error": capture_status.get("last_error"),
+                    "frozen_signal_age_sec": capture_status.get("frozen_signal_age_sec"),
+                    "frozen_frame_count": capture_status.get("frozen_frame_count"),
+                    "budget": {
+                        "frames": sample_frames,
+                        "max_edge": max_edge,
+                    },
+                }
+            ), 409
+        frames = _road_scene_buffered_frames(channel_id, sample_frames, max_age_sec=max_age_sec)
+        if not frames:
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": "no_fresh_eva_frames",
+                    "error": "No fresh buffered EVA frames are available for this channel. Start video summaries or restore the Luxriot signal first.",
+                    "channel_id": int(channel_id),
+                    "stream": stream_type,
+                    "source": "eva_capture_buffer",
+                    "max_age_sec": max_age_sec,
+                    "recent_frame_count": capture_status.get("recent_frame_count"),
+                    "running": capture_status.get("running"),
+                    "last_error": capture_status.get("last_error"),
+                    "budget": {
+                        "frames": sample_frames,
+                        "max_edge": max_edge,
+                    },
+                }
+            ), 409
+        base_array = frames[-1].image
+        base_image = Image.fromarray(base_array.astype(np.uint8), mode="RGB")
+        scene_result = infer_scene_card_from_frames(
+            int(channel_id),
+            f"Channel {channel_id}",
+            frames,
+            config=AutoSceneCardConfig(max_edge=max_edge),
+        )
+        overlay_b64 = _render_road_scene_overlay_png(base_image, scene_result)
+        return jsonify(
+            {
+                "success": True,
+                "channel_id": int(channel_id),
+                "stream": stream_type,
+                "source": "eva_capture_buffer",
+                "overlay_b64": overlay_b64,
+                "snapshot_meta": {
+                    "width": base_image.width,
+                    "height": base_image.height,
+                    "frame_count": len(frames),
+                    "latest_timestamp_ms": frames[-1].timestamp_ms,
+                },
+                "scene": scene_result.as_dict(),
+                "budget": {
+                    "frames": sample_frames,
+                    "max_edge": max_edge,
+                },
+            }
+        )
+    except Exception as exc:
+        app.logger.exception(
+            "Road scene overlay failed request_id=%s channel_id=%s",
+            getattr(g, "request_id", ""),
+            channel_id,
+        )
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route('/luxriot/snapshot/<int:channel_id>/capture', methods=['POST'])

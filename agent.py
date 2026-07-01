@@ -618,7 +618,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Inventory which Luxriot channels have VLM video-summary coverage in a time window. "
                 "Use this before broad video-description review when the operator did not name channels. "
-                "Returns metadata and candidate channels, not full summaries."
+                "Returns metadata, candidate channels, and runtime_problem_channels for stale/frozen/error/stopped live signal issues; not full summaries."
             ),
             "parameters": {
                 "type": "object",
@@ -2848,6 +2848,7 @@ class AgentTools:
             channel_inventory_error = str(exc)[:300]
             channels = []
         runtime_by_channel: Dict[int, Dict[str, Any]] = {}
+        runtime_items: List[Dict[str, Any]] = []
         status_digest_by_channel: Dict[int, Dict[str, Any]] = {}
         desired_video_channels: set[int] = set()
         desired_missing_by_channel: Dict[int, Dict[str, Any]] = {}
@@ -2855,13 +2856,22 @@ class AgentTools:
             streams_status = self._lxm.streams_status() if hasattr(self._lxm, "streams_status") else {}
         except Exception:
             streams_status = {}
+        try:
+            live_frame_max_age_sec = float(os.getenv("EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC", "45") or 45.0)
+        except Exception:
+            live_frame_max_age_sec = 45.0
+        live_frame_max_age_sec = max(3.0, min(300.0, live_frame_max_age_sec))
         if isinstance(streams_status, Mapping):
             for item in streams_status.get("video_streams") or []:
                 if not isinstance(item, Mapping):
                     continue
+                runtime_items.append(dict(item))
                 runtime_channel_id = _opt_int(item.get("channel_id"))
                 if runtime_channel_id is not None and runtime_channel_id > 0:
                     runtime_by_channel[int(runtime_channel_id)] = dict(item)
+            for item in streams_status.get("analytics_streams") or []:
+                if isinstance(item, Mapping):
+                    runtime_items.append(dict(item))
             for item in streams_status.get("channel_status_digest") or []:
                 if not isinstance(item, Mapping):
                     continue
@@ -2962,6 +2972,8 @@ class AgentTools:
             parser_breakdown: Dict[str, int] = {}
             delivery_breakdown: Dict[str, int] = {}
             state_transition_total = 0
+            vector_signal_total = 0
+            recent_alerts_from_logs: List[Dict[str, Any]] = []
             log_run_ids: set[str] = set()
             for log in logs:
                 if not isinstance(log, dict):
@@ -3004,7 +3016,16 @@ class AgentTools:
                     parser_breakdown[key] = parser_breakdown.get(key, 0) + int(value)
                 for key, value in _summary_log_delivery_breakdown(log).items():
                     delivery_breakdown[key] = delivery_breakdown.get(key, 0) + int(value)
+                batch_event_ts = _opt_int(log.get("batch_end_ms") or log.get("timestamp_ms"))
+                for event in _compact_vlm_alert_events_for_model(log.get("alert_events"), limit=10):
+                    if "timestamp_ms" not in event and batch_event_ts is not None:
+                        event["timestamp_ms"] = int(batch_event_ts)
+                    recent_alerts_from_logs.append(event)
                 state_transition_total += int(_opt_int(log.get("state_transition_total")) or 0)
+                vector_signal_total += int(_opt_int(log.get("vector_signal_total")) or 0)
+                if not _opt_int(log.get("vector_signal_total")) and isinstance(log.get("vector_signal"), Mapping):
+                    vector_compact = _compact_vector_signal_for_model(log.get("vector_signal"))
+                    vector_signal_total += len(vector_compact.get("clip_probe_signals") or []) + len(vector_compact.get("road_cv_cues") or [])
             latest_ts = max(ends) if ends else None
             first_ts = min(starts) if starts else None
             alert_total = int(sum(alert_counts.values()))
@@ -3043,10 +3064,62 @@ class AgentTools:
             runtime = runtime_by_channel.get(channel_id, {})
             desired = channel_id in desired_video_channels
             runtime_running = bool(runtime.get("running"))
-            running = bool(status.get("running")) if isinstance(status, dict) else runtime_running
+            running = (bool(status.get("running")) if isinstance(status, dict) else False) or runtime_running
             silent_since_sec = trailing_gap_sec if latest_ts is not None else None
             quiet = bool(latest_ts is not None and trailing_gap_sec > gap_threshold_sec and not running)
             status_digest = status_digest_by_channel.get(channel_id, {})
+            recent_alerts = list(status_digest.get("recent_alerts") or [])
+            if not recent_alerts and recent_alerts_from_logs:
+                recent_alerts_from_logs.sort(
+                    key=lambda row: int(_opt_int(row.get("timestamp_ms")) or 0),
+                    reverse=True,
+                )
+                recent_alerts = recent_alerts_from_logs[:10]
+            frozen_signal = bool(runtime.get("frozen_signal") or status_digest.get("frozen_signal"))
+            frozen_signal_age_sec = (
+                runtime.get("frozen_signal_age_sec")
+                if runtime.get("frozen_signal_age_sec") is not None
+                else status_digest.get("frozen_signal_age_sec")
+            )
+            frozen_frame_count = (
+                runtime.get("frozen_frame_count")
+                if runtime.get("frozen_frame_count") is not None
+                else status_digest.get("frozen_frame_count")
+            )
+            recent_frame_count = (
+                runtime.get("recent_frame_count")
+                if runtime.get("recent_frame_count") is not None
+                else status_digest.get("recent_frame_count")
+            )
+            video_lm = str(runtime.get("model") or status_digest.get("video_lm") or "").strip() or None
+            active_capture_source = (
+                str(runtime.get("active_capture_source") or status_digest.get("active_capture_source") or "").strip()
+                or None
+            )
+            last_capture_ts = _coerce_epoch_seconds(
+                runtime.get("last_snapshot_at")
+                or runtime.get("last_summary_at")
+                or status_digest.get("runtime_updated_at")
+            )
+            last_capture_age_sec = (
+                max(0.0, time.time() - float(last_capture_ts))
+                if last_capture_ts is not None
+                else None
+            )
+            stale_signal = bool(
+                runtime_running
+                and last_capture_age_sec is not None
+                and last_capture_age_sec > live_frame_max_age_sec
+            )
+            live_signal_status = (
+                "frozen"
+                if frozen_signal
+                else (
+                    "error"
+                    if (runtime.get("last_error") or status_digest.get("last_error"))
+                    else ("stale" if stale_signal else ("running" if runtime_running else "inactive"))
+                )
+            )
             runs_raw = status.get("runs") if isinstance(status, dict) and isinstance(status.get("runs"), list) else []
             overlapping_runs = 0
             for run in runs_raw:
@@ -3081,20 +3154,44 @@ class AgentTools:
                     "alert_counts": alert_counts,
                     "alert_parser_breakdown": parser_breakdown,
                     "alert_delivery_breakdown": delivery_breakdown,
-                    "recent_alerts": list(status_digest.get("recent_alerts") or [])[:10],
+                    "recent_alerts": recent_alerts[:10],
+                    "vector_signal_total": vector_signal_total or int(_opt_int(status_digest.get("vector_signal_total")) or 0),
+                    "recent_vector_signals": list(status_digest.get("recent_vector_signals") or [])[:5],
                     "status_digest": {
                         "last_summary_ts": status_digest.get("last_summary_ts"),
+                        "running": status_digest.get("running"),
+                        "video_lm": status_digest.get("video_lm"),
+                        "live_signal_status": status_digest.get("live_signal_status"),
+                        "active_capture_source": status_digest.get("active_capture_source"),
+                        "recent_frame_count": status_digest.get("recent_frame_count"),
+                        "frozen_signal": status_digest.get("frozen_signal"),
+                        "frozen_signal_age_sec": status_digest.get("frozen_signal_age_sec"),
+                        "frozen_frame_count": status_digest.get("frozen_frame_count"),
+                        "frozen_frame_dropped_count": status_digest.get("frozen_frame_dropped_count"),
                         "alert_total": status_digest.get("alert_total"),
                         "alert_counts_by_severity": status_digest.get("alert_counts_by_severity"),
                         "alert_delivery_breakdown": status_digest.get("alert_delivery_breakdown"),
                         "alert_parser_breakdown": status_digest.get("alert_parser_breakdown"),
                         "state_transition_total": status_digest.get("state_transition_total"),
+                        "vector_signal_total": status_digest.get("vector_signal_total"),
+                        "recent_vector_signals": list(status_digest.get("recent_vector_signals") or [])[:5],
                         "current_observed_state": list(status_digest.get("current_observed_state") or [])[:8],
                     } if status_digest else {},
                     "state_transition_total": state_transition_total,
                     "running": running,
                     "desired": desired,
                     "runtime_running": runtime_running,
+                    "live_signal_status": live_signal_status,
+                    "video_lm": video_lm,
+                    "active_capture_source": active_capture_source,
+                    "recent_frame_count": recent_frame_count,
+                    "stale_signal": stale_signal,
+                    "last_capture_age_sec": round(last_capture_age_sec, 3) if last_capture_age_sec is not None else None,
+                    "max_frame_age_sec": live_frame_max_age_sec,
+                    "frozen_signal": frozen_signal,
+                    "frozen_signal_age_sec": frozen_signal_age_sec,
+                    "frozen_frame_count": frozen_frame_count,
+                    "frozen_frame_dropped_count": runtime.get("frozen_frame_dropped_count", status_digest.get("frozen_frame_dropped_count")),
                     "pending_frames": runtime.get("pending_frames"),
                     "dropped_frames": runtime.get("dropped_frames", status.get("dropped_frames") if isinstance(status, dict) else 0),
                     "queue_dropped_batches": runtime.get("queue_dropped_batches", status.get("queue_dropped_batches") if isinstance(status, dict) else 0),
@@ -3148,6 +3245,92 @@ class AgentTools:
             if int(_opt_int(row.get("coverage_gap_count")) or 0) > 0
             and _opt_int(row.get("channel_id")) is not None
         ]
+        title_by_channel_id = {
+            int(channel.get("id")): str(channel.get("title") or channel.get("name") or f"channel-{channel.get('id')}")
+            for channel in channels
+            if isinstance(channel, Mapping)
+            and _opt_int(channel.get("id")) is not None
+            and int(channel.get("id")) > 0
+        }
+        runtime_problem_channels: List[Dict[str, Any]] = []
+        seen_runtime_problem_channels: set[Tuple[int, str]] = set()
+        for item in runtime_items:
+            if not isinstance(item, Mapping):
+                continue
+            runtime_channel_id = _opt_int(item.get("channel_id"))
+            if runtime_channel_id is None or runtime_channel_id <= 0:
+                continue
+            if requested_ids_set and int(runtime_channel_id) not in requested_ids_set:
+                continue
+            last_error = str(item.get("last_error") or item.get("last_restore_error") or item.get("last_live_segment_error") or "").strip()
+            frozen_signal = bool(item.get("frozen_signal"))
+            running_now = bool(item.get("running"))
+            last_capture_ts = _coerce_epoch_seconds(item.get("last_snapshot_at") or item.get("last_summary_at"))
+            last_capture_age_sec = (
+                max(0.0, time.time() - float(last_capture_ts))
+                if last_capture_ts is not None
+                else None
+            )
+            stale_signal = bool(
+                running_now
+                and last_capture_age_sec is not None
+                and last_capture_age_sec > live_frame_max_age_sec
+            )
+            if running_now and not stale_signal and not frozen_signal and not last_error:
+                continue
+            stream_type = str(item.get("stream_type") or item.get("capture_kind") or "runtime").strip() or "runtime"
+            key = (int(runtime_channel_id), stream_type)
+            if key in seen_runtime_problem_channels:
+                continue
+            seen_runtime_problem_channels.add(key)
+            runtime_problem_channels.append(
+                {
+                    "channel_id": int(runtime_channel_id),
+                    "title": title_by_channel_id.get(int(runtime_channel_id), f"channel-{int(runtime_channel_id)}"),
+                    "stream_type": stream_type,
+                    "running": running_now,
+                    "live_signal_status": (
+                        "frozen"
+                        if frozen_signal
+                        else ("error" if last_error else ("stale" if stale_signal else ("stopped" if not running_now else "degraded")))
+                    ),
+                    "stale_signal": stale_signal,
+                    "last_capture_age_sec": round(last_capture_age_sec, 3) if last_capture_age_sec is not None else None,
+                    "max_frame_age_sec": live_frame_max_age_sec,
+                    "frozen_signal": frozen_signal,
+                    "frozen_signal_age_sec": item.get("frozen_signal_age_sec"),
+                    "frozen_frame_count": item.get("frozen_frame_count"),
+                    "recent_frame_count": item.get("recent_frame_count"),
+                    "model": item.get("model"),
+                    "active_capture_source": item.get("active_capture_source"),
+                    "last_error": last_error[:240] or None,
+                }
+            )
+        for channel_id, item in desired_missing_by_channel.items():
+            if requested_ids_set and int(channel_id) not in requested_ids_set:
+                continue
+            key = (int(channel_id), "desired")
+            if key in seen_runtime_problem_channels:
+                continue
+            seen_runtime_problem_channels.add(key)
+            runtime_problem_channels.append(
+                {
+                    "channel_id": int(channel_id),
+                    "title": title_by_channel_id.get(int(channel_id), f"channel-{int(channel_id)}"),
+                    "stream_type": "desired",
+                    "running": False,
+                    "live_signal_status": "stopped",
+                    "frozen_signal": False,
+                    "last_error": str(item.get("last_restore_error") or "").strip()[:240] or None,
+                }
+            )
+        runtime_problem_channels.sort(
+            key=lambda row: (
+                0 if row.get("live_signal_status") == "frozen" else 1,
+                int(row.get("channel_id") or 0),
+                str(row.get("stream_type") or ""),
+            )
+        )
         channel_error_count = sum(1 for row in errors if _opt_int(row.get("channel_id")) is not None)
         return {
             "depth": depth,
@@ -3182,6 +3365,8 @@ class AgentTools:
             "quiet_channel_ids": quiet_channel_ids,
             "gapped_count": len(gapped_channel_ids),
             "gapped_channel_ids": gapped_channel_ids,
+            "runtime_problem_count": len(runtime_problem_channels),
+            "runtime_problem_channels": runtime_problem_channels[:12],
             "candidate_channels": candidate_channels,
             "errors": errors[:8],
         }
@@ -3957,22 +4142,28 @@ class AgentTools:
             parser_breakdown = _compact_int_breakdown(node.get("alert_parser_breakdown"))
             delivery_breakdown = _compact_int_breakdown(node.get("alert_delivery_breakdown"))
             state_transition_total = int(_opt_int(node.get("state_transition_total")) or 0)
+            vector_signal_total = int(_opt_int(node.get("vector_signal_total")) or 0)
             if parser_breakdown:
                 entry["alert_parser_breakdown"] = parser_breakdown
             if delivery_breakdown:
                 entry["alert_delivery_breakdown"] = delivery_breakdown
             if state_transition_total > 0:
                 entry["state_transition_total"] = state_transition_total
+            if vector_signal_total > 0:
+                entry["vector_signal_total"] = vector_signal_total
             if str(node.get("level") or "").strip().upper() == "L0":
                 alert_events = _compact_vlm_alert_events_for_model(node.get("alert_events"), limit=6)
                 state_observations = _compact_state_observations_for_model(node.get("state_observations"), limit=8)
                 state_transitions = _compact_state_transitions_for_model(node.get("state_transition_events"), limit=8)
+                vector_signal = _compact_vector_signal_for_model(node.get("vector_signal"))
                 if alert_events:
                     entry["alert_events"] = alert_events
                 if state_observations:
                     entry["state_observations"] = state_observations
                 if state_transitions:
                     entry["state_transition_events"] = state_transitions
+                if vector_signal:
+                    entry["vector_signal"] = vector_signal
             if parser_breakdown.get("prose_only_signal_count"):
                 entry["unconfirmed_prose_signal_count"] = parser_breakdown.get("prose_only_signal_count")
                 entry["unconfirmed_prose_note"] = (
@@ -5801,6 +5992,7 @@ def _format_agent_video_streams(
         alert_text = ""
         digest = digest_by_channel.get(int(channel_id)) if _opt_int(channel_id) is not None else {}
         recent_alerts = digest.get("recent_alerts") if isinstance(digest, Mapping) else None
+        vector_total = _opt_int(digest.get("vector_signal_total")) if isinstance(digest, Mapping) else None
         if isinstance(alert_counts, Mapping) and alert_counts:
             alert_text = ", alerts=" + ", ".join(
                 f"{key}:{value}" for key, value in alert_counts.items()
@@ -5820,11 +6012,12 @@ def _format_agent_video_streams(
             ]
             if titles:
                 recent_text = ", recent_alerts=" + "; ".join(titles)[:160]
+        vector_text = f", vector_signals={vector_total}" if vector_total else ""
         error_text = f", last_error={last_error[:120]!r}" if last_error else ""
         lines.append(
             f"  - CH {channel_id}: {state}, video_lm={model}, "
             f"pending={pending}, dropped_frames={dropped}, dropped_batches={queue_dropped}, "
-            f"summaries={logs}{alert_text}{recent_text}{error_text}"
+            f"summaries={logs}{alert_text}{recent_text}{vector_text}{error_text}"
         )
     if len(streams) > len(lines):
         lines.append(f"  - ... {len(streams) - len(lines)} more video stream(s) not expanded here")
@@ -5954,6 +6147,7 @@ def build_system_prompt(
         f"Rules:\n"
         f"- Default reports and status answers must be video-description-first: active/running summary streams, VLM alerts, coverage gaps, channels that went quiet, dropped frames/batches, last errors, and archived VLM evidence frames.\n"
         f"- For current/live runtime status requests about active video-description streams, models, queues, pending work, dropped frames/batches, or last errors, call list_video_summary_channels first. Do not answer live runtime status from lookup_help or from the static startup snapshot alone.\n"
+        f"- When list_video_summary_channels returns runtime_problem_channels, report those channels explicitly as stale/frozen/error/stopped runtime issues even if they have no candidate summaries. Do not collapse them into a vague inactive bucket.\n"
         f"- For questions about whether streams were active, disconnected, reconnected, or quiet over a period, combine the current Video-description runtime snapshot with list_video_summary_channels/get_video_summaries coverage. Report observed coverage gaps as gaps, not proven network outages unless a tool returns an error.\n"
         f"- Use probe tools only when the operator explicitly asks about probes, when a configured probe is named, or as a secondary semantic signal for large archive searches. Do not make probe status the default report center.\n"
         f"- If the operator asks to double-check video-description alerts with probes, turn VLM alerts into a secondary CLIP attention layer: inspect the current L0/live prompt or relevant VLM alerts first, extract distinct visible event classes, create one preview probe per event/channel with create_probe(update_existing=true, preview=true), and clearly say these probes are corroborating candidates, not proof.\n"
@@ -5994,7 +6188,7 @@ def build_system_prompt(
         f"- For video event investigations over a non-trivial period, use rollups as a map before detail: L2 for broad context, L1 for candidate windows, and live/L0 only to verify exact events and evidence. Do not treat L2/L1 as visual proof.\n"
         f"- Do not answer a broad period investigation from only the newest summary entry or newest archive hits. First establish period coverage/alert/probe health, then inspect L2/L1 summaries across the requested window, choose 2-3 candidate windows spanning the period or carrying alerts/deviations, and only then drill into frames/L0 for evidence. If only the latest slice is available, report that as a coverage limitation.\n"
         f"- When probes are relevant to a period investigation, use list_probes or generate_report with report_type='probes' as a secondary signal. Prefer representative_events across the period over latest_ts/top newest hits when explaining probe evidence.\n"
-        f"- Rank video-summary signals by provenance. Routine memory/baseline is prior context, not current evidence. L0 prose is a current VLM description but can be contaminated by prior memory. Structured L0 alert_events/state_observations are stronger than prose. Backend state_transition_events are confirmed cross-batch state changes from structured L0 observations, but still require frame evidence for final visual confirmation. Archive frame plus describe_frame is the strongest visual proof available in chat.\n"
+        f"- Rank video-summary signals by provenance. Routine memory/baseline is prior context, not current evidence. Vector signals/CLIP P/N/M/road-CV cues are attention or homeostasis signals: stronger than routine memory for choosing where to inspect, but not visual proof. L0 prose is a current VLM description but can be contaminated by prior memory. Structured L0 alert_events/state_observations are stronger than prose. Backend state_transition_events are confirmed cross-batch state changes from structured L0 observations, but still require frame evidence for final visual confirmation. Archive frame plus describe_frame is the strongest visual proof available in chat.\n"
         f"- If L0 prose mentions an event or entity but structured alert_events/state_observations do not confirm it, do not drop it and do not call it false. Mark it as unconfirmed prose-only evidence: possible memory contamination, structured-output miss, or real event needing frame review. For important safety/security findings, drill into VLM summary/alert frames and describe_frame before concluding.\n"
         f"- Treat parser/delivery diagnostics as pipeline health, not incident counts: json/prose/parser counts explain extraction quality; delivery_status sent/cooldown_skipped/bookmark_disabled/failed explains Luxriot bookmark side effects.\n"
         f"- For count/state-change questions that can be checked visually, such as 'how many times did X appear/disappear', 'when did the door open/close', or 'did the object leave/return', prefer track_visual_state_transitions after normalize_time_window. Provide positive_state_query and a visible-background negative_state_query; avoid literal negation like 'no X'/'without X' because CLIP does not reliably understand negation. Use L2/L1 summaries as a map and use count_video_summary_events only as summary-text fallback when archived CLIP frames are unavailable. Report that CLIP P/N/M state transitions are candidates and cite boundary frame evidence before strong conclusions.\n"
@@ -6404,10 +6598,31 @@ def _record_turn_signal_ledger(
                     for row in (result.get("desired_video_missing") or [])[:8]
                     if isinstance(row, Mapping)
                 ],
+                "runtime_problem_channels": [
+                    {
+                        "channel_id": row.get("channel_id"),
+                        "stream_type": row.get("stream_type"),
+                        "live_signal_status": row.get("live_signal_status"),
+                        "stale_signal": row.get("stale_signal"),
+                        "last_capture_age_sec": row.get("last_capture_age_sec"),
+                        "frozen_signal": row.get("frozen_signal"),
+                        "frozen_signal_age_sec": row.get("frozen_signal_age_sec"),
+                        "recent_frame_count": row.get("recent_frame_count"),
+                        "last_error": _compact_signal_value(row.get("last_error"), 120),
+                    }
+                    for row in (result.get("runtime_problem_channels") or [])[:8]
+                    if isinstance(row, Mapping)
+                ],
                 "candidate_channels": [
                     {
                         "channel_id": row.get("channel_id"),
                         "running": row.get("running"),
+                        "live_signal_status": row.get("live_signal_status"),
+                        "stale_signal": row.get("stale_signal"),
+                        "last_capture_age_sec": row.get("last_capture_age_sec"),
+                        "frozen_signal": row.get("frozen_signal"),
+                        "frozen_signal_age_sec": row.get("frozen_signal_age_sec"),
+                        "recent_frame_count": row.get("recent_frame_count"),
                         "summary_count": row.get("summary_count"),
                         "alert_total": row.get("alert_total"),
                         "alert_parser_breakdown": row.get("alert_parser_breakdown"),
@@ -7633,6 +7848,73 @@ def _compact_state_transitions_for_model(value: Any, limit: int = 8) -> List[Dic
         if len(rows) >= max(1, int(limit)):
             break
     return rows
+
+
+def _compact_vector_signal_for_model(value: Any, *, clip_limit: int = 4, road_limit: int = 4) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: Dict[str, Any] = {
+        "semantics": "vector_homeostasis_attention_signal_not_visual_proof",
+    }
+    clip_rows: List[Dict[str, Any]] = []
+    raw_clip = value.get("clip_probe_signals")
+    if isinstance(raw_clip, Sequence) and not isinstance(raw_clip, (str, bytes, bytearray)):
+        for raw in raw_clip:
+            if not isinstance(raw, Mapping):
+                continue
+            name = _compact_signal_value(raw.get("name") or raw.get("probe_name"), 120)
+            if not name:
+                continue
+            item: Dict[str, Any] = {
+                "name": name,
+                "state": str(raw.get("state") or "positive_candidate").strip().lower()[:40],
+            }
+            for key in ("probe_id", "severity"):
+                text = _compact_signal_value(raw.get(key), 80)
+                if text:
+                    item[key] = text
+            for key in ("p", "n", "m", "pos_score", "negative_score", "margin"):
+                if key in raw and isinstance(raw.get(key), (int, float)):
+                    item[key] = round(float(raw.get(key)), 4)
+            for key in ("apex_frame", "timestamp_ms", "hit_count"):
+                parsed = _opt_int(raw.get(key))
+                if parsed is not None:
+                    item[key] = int(parsed)
+            clip_rows.append(item)
+            if len(clip_rows) >= max(1, int(clip_limit)):
+                break
+    if clip_rows:
+        out["clip_probe_signals"] = clip_rows
+
+    road_rows: List[Dict[str, Any]] = []
+    raw_road = value.get("road_cv_cues")
+    if isinstance(raw_road, Sequence) and not isinstance(raw_road, (str, bytes, bytearray)):
+        for raw in raw_road:
+            if not isinstance(raw, Mapping):
+                continue
+            cue_type = _compact_signal_value(raw.get("cue_type") or raw.get("type"), 80)
+            if not cue_type:
+                continue
+            item = {"cue_type": cue_type}
+            for key in ("zone_name", "evidence"):
+                text = _compact_signal_value(raw.get(key), 140 if key == "evidence" else 80)
+                if text:
+                    item[key] = text
+            if isinstance(raw.get("score"), (int, float)):
+                item["score"] = round(float(raw.get("score")), 4)
+            for key in ("apex_frame", "frame_index", "timestamp_ms"):
+                parsed = _opt_int(raw.get(key))
+                if parsed is not None:
+                    item[key] = int(parsed)
+            road_rows.append(item)
+            if len(road_rows) >= max(1, int(road_limit)):
+                break
+    if road_rows:
+        out["road_cv_cues"] = road_rows
+
+    if len(out) <= 1:
+        return {}
+    return out
 
 
 def _summary_log_parser_breakdown(row: Mapping[str, Any]) -> Dict[str, int]:
@@ -9581,6 +9863,28 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "per_turn_channel_limit": result.get("per_turn_channel_limit"),
             "requires_confirmation": result.get("requires_confirmation"),
             "full_research_note": result.get("full_research_note"),
+            "runtime_problem_count": result.get("runtime_problem_count"),
+            "runtime_problem_channels": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "stream_type": row.get("stream_type"),
+                    "running": row.get("running"),
+                    "live_signal_status": row.get("live_signal_status"),
+                    "stale_signal": row.get("stale_signal"),
+                    "last_capture_age_sec": row.get("last_capture_age_sec"),
+                    "max_frame_age_sec": row.get("max_frame_age_sec"),
+                    "frozen_signal": row.get("frozen_signal"),
+                    "frozen_signal_age_sec": row.get("frozen_signal_age_sec"),
+                    "frozen_frame_count": row.get("frozen_frame_count"),
+                    "recent_frame_count": row.get("recent_frame_count"),
+                    "model": row.get("model"),
+                    "active_capture_source": row.get("active_capture_source"),
+                    "last_error": row.get("last_error"),
+                }
+                for row in (result.get("runtime_problem_channels") or [])[:8]
+                if isinstance(row, dict)
+            ],
             "errors": [
                 {
                     "scope": row.get("scope"),
@@ -9607,6 +9911,17 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "state_transition_total": row.get("state_transition_total"),
                     "running": row.get("running"),
                     "desired": row.get("desired"),
+                    "runtime_running": row.get("runtime_running"),
+                    "live_signal_status": row.get("live_signal_status"),
+                    "video_lm": row.get("video_lm"),
+                    "active_capture_source": row.get("active_capture_source"),
+                    "recent_frame_count": row.get("recent_frame_count"),
+                    "stale_signal": row.get("stale_signal"),
+                    "last_capture_age_sec": row.get("last_capture_age_sec"),
+                    "max_frame_age_sec": row.get("max_frame_age_sec"),
+                    "frozen_signal": row.get("frozen_signal"),
+                    "frozen_signal_age_sec": row.get("frozen_signal_age_sec"),
+                    "frozen_frame_count": row.get("frozen_frame_count"),
                     "run_count": row.get("run_count"),
                     "coverage_status": row.get("coverage_status"),
                     "coverage_ratio": row.get("coverage_ratio"),

@@ -131,6 +131,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/image/<path:filepath>",
             "/js/app.js",
             "/lm/models",
+            "/luxriot/recent_frame/<int:channel_id>",
             "/ready",
         }
         unexpected_backend_only = backend_only - allowed_backend_only
@@ -254,6 +255,88 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual([record["severity"] for record in alert_records], ["info", "low"])
         self.assertEqual(alert_records[0]["payload"]["alert_event"]["title"], "Thumbs up")
         self.assertEqual(alert_records[1]["payload"]["alert_event"]["title"], "Union Jack mug drink")
+
+    def test_vlm_alert_archive_anchor_prefers_snapshot_reference(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.records: List[Dict[str, Any]] = []
+
+            def add_detections(self, records: List[Dict[str, Any]]) -> int:
+                self.records.extend(records)
+                return len(records)
+
+        store = Store()
+        entry = {
+            "channel_id": 120,
+            "run_id": "run-drift",
+            "summary": "Vehicle drifts through Snapshots 8-12 with tire smoke.",
+            "frame_count": 12,
+            "batch_size": 12,
+            "created_at": 100.0,
+            "batch_start_ms": 100000,
+            "batch_end_ms": 112000,
+            "alert_counts": {"high": 1},
+            "alert_total": 1,
+            "bookmarks_sent": 1,
+            "alert_events": [
+                {
+                    "title": "Vehicle drift with tire smoke",
+                    "description": "Silver sedan performs a drift and emits tire smoke in Snapshots 8-12.",
+                    "severity": "high",
+                    "timestamp_ms": 100000,
+                    "delivery_status": "sent",
+                },
+            ],
+            "vector_signal": {
+                "version": 1,
+                "semantics": "vector_homeostasis_attention_signal_not_visual_proof",
+                "clip_probe_signals": [
+                    {
+                        "name": "vehicle drift candidate",
+                        "probe_id": "probe-drift",
+                        "p": 0.41,
+                        "n": 0.12,
+                        "m": 0.29,
+                        "apex_frame": 11,
+                    }
+                ],
+                "road_cv_cues": [
+                    {
+                        "cue_type": "road_motion_burst",
+                        "score": 0.73,
+                        "apex_frame": 10,
+                        "zone_name": "auto_motion_zone",
+                    }
+                ],
+            },
+            "archive_frames": [
+                {
+                    "anchor_role": "first" if frame_index == 0 else "sample",
+                    "frame_index": frame_index,
+                    "timestamp_ms": 100000 + frame_index * 1000,
+                    "thumbnail": f"frame-{frame_index}",
+                }
+                for frame_index in range(12)
+            ],
+        }
+
+        with (
+            patch("oldapp.detections_store", store),
+            patch("oldapp._embed_thumbnail_b64", return_value=None),
+            patch("oldapp._apply_archive_retention", return_value={"ok": True}),
+        ):
+            result = _store_vlm_summary_archive_frames(entry)
+
+        alert_records = [record for record in store.records if record["source"] == "vlm_alert"]
+        self.assertEqual(result["alert_frames"], 1)
+        self.assertEqual(len(alert_records), 1)
+        payload = alert_records[0]["payload"]
+        self.assertEqual(alert_records[0]["thumbnail_b64"], "frame-11")
+        self.assertEqual(payload["anchor_frame_index"], 11)
+        self.assertEqual(payload["anchor_snapshot_hint"], 12)
+        self.assertEqual(payload["anchor_selection"], "alert_snapshot_reference")
+        self.assertEqual(payload["vector_signal"]["clip_probe_signals"][0]["name"], "vehicle drift candidate")
+        self.assertEqual(payload["vector_signal"]["road_cv_cues"][0]["cue_type"], "road_motion_burst")
 
     def test_detections_list_passes_archive_source_filter(self) -> None:
         captured: Dict[str, Any] = {}

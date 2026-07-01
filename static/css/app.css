@@ -5374,6 +5374,22 @@ textarea::placeholder {
         linear-gradient(180deg, rgba(8, 12, 15, 0.92), rgba(7, 10, 14, 0.98));
 }
 
+.luxriot-viewport.is-signal-lost {
+    border-color: rgba(255, 85, 117, 0.72);
+    background:
+        repeating-linear-gradient(
+            135deg,
+            rgba(255, 85, 117, 0.08),
+            rgba(255, 85, 117, 0.08) 12px,
+            rgba(7, 10, 14, 0.96) 12px,
+            rgba(7, 10, 14, 0.96) 24px
+        );
+}
+
+.luxriot-viewport.is-signal-lost img {
+    opacity: 0;
+}
+
 .luxriot-viewport::after {
     content: "";
     position: absolute;
@@ -5392,6 +5408,11 @@ textarea::placeholder {
     color: #7b8d9d;
     letter-spacing: 0.08em;
     text-transform: uppercase;
+}
+
+.luxriot-viewport.is-signal-lost .luxriot-overlay {
+    color: #ff6b81;
+    background: rgba(7, 10, 14, 0.66);
 }
 
 .luxriot-stream-list,
@@ -7792,7 +7813,7 @@ textarea::placeholder {
 
 .luxriot-stream-context-actions {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
     gap: 8px;
 }
 
@@ -7806,6 +7827,105 @@ textarea::placeholder {
     color: var(--muted);
     font-size: 0.78rem;
     line-height: 1.45;
+}
+
+.road-scene-grounding-panel {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid rgba(37, 51, 66, 0.78);
+    border-radius: 12px;
+    background: rgba(6, 11, 16, 0.82);
+}
+
+.road-scene-grounding-panel[hidden] {
+    display: none;
+}
+
+.road-scene-grounding-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.road-scene-grounding-kicker {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.64rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+}
+
+.road-scene-grounding-title {
+    margin-top: 4px;
+    color: var(--text);
+    font-size: 0.9rem;
+    font-weight: 650;
+    overflow-wrap: anywhere;
+}
+
+.road-scene-confidence {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 0 9px;
+    border: 1px solid rgba(95, 120, 145, 0.45);
+    border-radius: 999px;
+    color: var(--muted);
+    background: rgba(15, 23, 32, 0.78);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.road-scene-confidence.medium,
+.road-scene-confidence.high {
+    color: var(--accent-green);
+    border-color: rgba(0, 255, 170, 0.34);
+    background: rgba(0, 255, 170, 0.09);
+}
+
+.road-scene-confidence.low {
+    color: #ffd27a;
+    border-color: rgba(255, 210, 122, 0.35);
+    background: rgba(255, 210, 122, 0.09);
+}
+
+.road-scene-confidence.error {
+    color: #ff9b8f;
+    border-color: rgba(255, 110, 95, 0.42);
+    background: rgba(255, 80, 70, 0.1);
+}
+
+.road-scene-grounding-frame {
+    overflow: hidden;
+    border: 1px solid rgba(37, 51, 66, 0.76);
+    border-radius: 10px;
+    background:
+        repeating-linear-gradient(
+            135deg,
+            rgba(255, 255, 255, 0.025),
+            rgba(255, 255, 255, 0.025) 8px,
+            transparent 8px,
+            transparent 18px
+        ),
+        rgba(0, 0, 0, 0.3);
+}
+
+.road-scene-grounding-frame img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
+
+.road-scene-grounding-meta {
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.42;
 }
 
 .luxriot-summaries {

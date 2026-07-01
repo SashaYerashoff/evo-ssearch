@@ -1,8 +1,14 @@
 import unittest
+import base64
+import threading
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
+from io import BytesIO
+from types import SimpleNamespace
 
 import oldapp
+from PIL import Image
 from unittest.mock import patch
 from security import ALL_CHANNELS, Permission, Role, digest_session_token
 from security.http_auth import AuthenticationService
@@ -511,6 +517,272 @@ class HttpAuthRouteTests(unittest.TestCase):
                 for event in self.audit.events
             )
         )
+
+    def test_road_scene_overlay_requires_diagnostics_permission(self) -> None:
+        self._login()
+        denied = self.client.get("/road/scene_overlay/7")
+        self.assertEqual(denied.status_code, 403)
+
+    def test_luxriot_recent_frame_prefers_eva_buffer(self) -> None:
+        self._login()
+        image = Image.new("RGB", (32, 24), (80, 120, 160))
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        snapshot_b64 = base64.b64encode(jpeg.getvalue()).decode("ascii")
+
+        fake_session = SimpleNamespace(
+            recent_frame_items=lambda limit=1: [
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": time.time(),
+                    "width": 32,
+                    "height": 24,
+                }
+            ],
+            status=lambda: {
+                "running": True,
+                "recent_frame_count": 1,
+                "last_error": None,
+                "active_capture_source": "live_segment",
+            },
+        )
+        with oldapp.luxriot_manager.cache_lock:
+            had_video = 7 in oldapp.luxriot_manager.sessions
+            old_video = oldapp.luxriot_manager.sessions.get(7)
+            oldapp.luxriot_manager.sessions[7] = fake_session
+        try:
+            response = self.client.get("/luxriot/recent_frame/7?fallback=0")
+        finally:
+            with oldapp.luxriot_manager.cache_lock:
+                if had_video:
+                    oldapp.luxriot_manager.sessions[7] = old_video
+                else:
+                    oldapp.luxriot_manager.sessions.pop(7, None)
+
+        self.assertEqual(response.status_code, 200, response.get_json(silent=True))
+        self.assertEqual(response.headers.get("Content-Type"), "image/jpeg")
+        self.assertEqual(response.headers.get("X-EVA-Frame-Source"), "eva_recent")
+        self.assertEqual(response.headers.get("X-EVA-Signal"), "fresh")
+        self.assertGreater(len(response.data), 20)
+
+    def test_luxriot_recent_frame_rejects_stale_eva_buffer(self) -> None:
+        self._login()
+        image = Image.new("RGB", (32, 24), (80, 120, 160))
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        snapshot_b64 = base64.b64encode(jpeg.getvalue()).decode("ascii")
+        fake_session = SimpleNamespace(
+            recent_frame_items=lambda limit=1: [
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": time.time() - 600,
+                    "width": 32,
+                    "height": 24,
+                }
+            ],
+            status=lambda: {
+                "running": True,
+                "recent_frame_count": 1,
+                "last_error": "Luxriot snapshot failed",
+                "active_capture_source": "live_segment",
+            },
+        )
+        with oldapp.luxriot_manager.cache_lock:
+            had_video = 7 in oldapp.luxriot_manager.sessions
+            old_video = oldapp.luxriot_manager.sessions.get(7)
+            oldapp.luxriot_manager.sessions[7] = fake_session
+        try:
+            response = self.client.get("/luxriot/recent_frame/7?fallback=0&max_age_sec=45")
+        finally:
+            with oldapp.luxriot_manager.cache_lock:
+                if had_video:
+                    oldapp.luxriot_manager.sessions[7] = old_video
+                else:
+                    oldapp.luxriot_manager.sessions.pop(7, None)
+
+        self.assertEqual(response.status_code, 503)
+        body = response.get_json()
+        self.assertEqual(body["error_code"], "signal_lost")
+        self.assertEqual(body["last_error"], "Luxriot snapshot failed")
+        self.assertGreater(body["last_frame_age_sec"], 45)
+
+    def test_luxriot_recent_frame_cycle_skips_stale_candidates(self) -> None:
+        self._login()
+        image = Image.new("RGB", (32, 24), (80, 120, 160))
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        snapshot_b64 = base64.b64encode(jpeg.getvalue()).decode("ascii")
+        fake_session = SimpleNamespace(
+            recent_frame_items=lambda limit=1: [
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": 900.0,
+                    "width": 32,
+                    "height": 24,
+                },
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": 990.0,
+                    "width": 32,
+                    "height": 24,
+                },
+            ],
+            status=lambda: {
+                "running": True,
+                "recent_frame_count": 2,
+                "last_error": None,
+                "active_capture_source": "live_segment",
+            },
+        )
+        with oldapp.luxriot_manager.cache_lock:
+            had_video = 7 in oldapp.luxriot_manager.sessions
+            old_video = oldapp.luxriot_manager.sessions.get(7)
+            oldapp.luxriot_manager.sessions[7] = fake_session
+        try:
+            with patch("oldapp.time.time", return_value=1000.0):
+                response = self.client.get("/luxriot/recent_frame/7?mode=cycle&fps=1&fallback=0&max_age_sec=45")
+        finally:
+            with oldapp.luxriot_manager.cache_lock:
+                if had_video:
+                    oldapp.luxriot_manager.sessions[7] = old_video
+                else:
+                    oldapp.luxriot_manager.sessions.pop(7, None)
+
+        self.assertEqual(response.status_code, 200, response.get_json(silent=True))
+        self.assertEqual(response.headers.get("X-EVA-Signal"), "fresh")
+        self.assertLess(float(response.headers.get("X-EVA-Frame-Age-Sec")), 45)
+
+    def test_luxriot_recent_frame_rejects_frozen_signal(self) -> None:
+        self._login()
+        image = Image.new("RGB", (32, 24), (80, 120, 160))
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        snapshot_b64 = base64.b64encode(jpeg.getvalue()).decode("ascii")
+        fake_session = SimpleNamespace(
+            recent_frame_items=lambda limit=1: [
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": time.time(),
+                    "width": 32,
+                    "height": 24,
+                }
+            ],
+            status=lambda: {
+                "running": True,
+                "recent_frame_count": 1,
+                "last_error": None,
+                "active_capture_source": "live_segment",
+                "frozen_signal": True,
+                "frozen_signal_age_sec": 22.0,
+                "frozen_frame_count": 5,
+            },
+        )
+        with oldapp.luxriot_manager.cache_lock:
+            had_video = 7 in oldapp.luxriot_manager.sessions
+            old_video = oldapp.luxriot_manager.sessions.get(7)
+            oldapp.luxriot_manager.sessions[7] = fake_session
+        try:
+            response = self.client.get("/luxriot/recent_frame/7?fallback=0&max_age_sec=45")
+        finally:
+            with oldapp.luxriot_manager.cache_lock:
+                if had_video:
+                    oldapp.luxriot_manager.sessions[7] = old_video
+                else:
+                    oldapp.luxriot_manager.sessions.pop(7, None)
+
+        self.assertEqual(response.status_code, 503)
+        body = response.get_json()
+        self.assertEqual(body["error_code"], "signal_frozen")
+        self.assertTrue(body["frozen_signal"])
+        self.assertEqual(body["frozen_frame_count"], 5)
+
+    def test_road_scene_overlay_returns_bounded_preview_for_engineer(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.STREAMS_VIEW.value,
+                    Permission.DIAGNOSTICS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        image = Image.new("RGB", (64, 48), (24, 28, 32))
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        snapshot_b64 = base64.b64encode(jpeg.getvalue()).decode("ascii")
+
+        zone = SimpleNamespace(
+            enabled=True,
+            polygon=((0.1, 0.2), (0.9, 0.2), (0.9, 0.8), (0.1, 0.8)),
+            expected_flow=(1.0, 0.0),
+        )
+        result = SimpleNamespace(
+            scene_card=SimpleNamespace(zones=(zone,)),
+            as_dict=lambda: {
+                "confidence": "medium",
+                "reason": "motion-history zone inferred",
+                "frame_count": 12,
+                "motion_pair_count": 6,
+                "scene_cut_count": 0,
+                "zone_area_ratio": 0.42,
+                "flow_dominance": 0.7,
+                "scene_card": {
+                    "channel_id": 7,
+                    "zones": [
+                        {
+                            "name": "auto_motion_zone",
+                            "polygon": [[0.1, 0.2], [0.9, 0.2], [0.9, 0.8], [0.1, 0.8]],
+                            "expected_flow": [1.0, 0.0],
+                        }
+                    ],
+                },
+            },
+        )
+        fake_session = SimpleNamespace(
+            lock=threading.Lock(),
+            frames=[
+                {
+                    "thumbnail": snapshot_b64,
+                    "captured_at": time.time() - (12 - index),
+                }
+                for index in range(12)
+            ],
+        )
+        with oldapp.luxriot_manager.cache_lock:
+            had_video = 7 in oldapp.luxriot_manager.sessions
+            old_video = oldapp.luxriot_manager.sessions.get(7)
+            had_probe = 7 in oldapp.luxriot_manager.probe_sessions
+            old_probe = oldapp.luxriot_manager.probe_sessions.get(7)
+            oldapp.luxriot_manager.sessions[7] = fake_session
+            oldapp.luxriot_manager.probe_sessions.pop(7, None)
+        try:
+            with patch("oldapp.infer_scene_card_from_frames", return_value=result):
+                response = self.client.get("/road/scene_overlay/7?seconds=999&frames=999&mb=999")
+        finally:
+            with oldapp.luxriot_manager.cache_lock:
+                if had_video:
+                    oldapp.luxriot_manager.sessions[7] = old_video
+                else:
+                    oldapp.luxriot_manager.sessions.pop(7, None)
+                if had_probe:
+                    oldapp.luxriot_manager.probe_sessions[7] = old_probe
+                else:
+                    oldapp.luxriot_manager.probe_sessions.pop(7, None)
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        body = response.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["channel_id"], 7)
+        self.assertEqual(body["source"], "eva_capture_buffer")
+        self.assertTrue(body["overlay_b64"])
+        self.assertEqual(body["scene"]["confidence"], "medium")
+        self.assertEqual(body["budget"]["frames"], 120)
+        self.assertEqual(body["budget"]["max_edge"], 240)
+        self.assertEqual(body["snapshot_meta"]["width"], 64)
+        self.assertEqual(body["snapshot_meta"]["height"], 48)
+        self.assertEqual(body["snapshot_meta"]["frame_count"], 12)
 
     def test_channel_lists_and_stream_status_are_filtered(self) -> None:
         self._login()

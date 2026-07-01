@@ -253,6 +253,7 @@
                         <div class="luxriot-actions">
                             <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
                             <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
+                            <button class="feature-btn" data-road-scene-grounding>Ground road mask</button>
                             <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
                         </div>
                         <div class="video-summary-controls">
@@ -350,8 +351,22 @@
                                 <div class="luxriot-stream-context-actions">
                                     <button id="luxriotContextToggleCapture" class="feature-btn primary">Start summaries</button>
                                     <button id="luxriotContextFlushCapture" class="feature-btn">Flush</button>
+                                    <button id="roadSceneGroundingBtn" class="feature-btn" data-road-scene-grounding>Ground road mask</button>
                                 </div>
                                 <div id="luxriotStreamDetail" class="luxriot-stream-context-detail">Runtime state will update when the preview and stream status refresh.</div>
+                                <div id="roadSceneGroundingPanel" class="road-scene-grounding-panel" hidden>
+                                    <div class="road-scene-grounding-head">
+                                        <div>
+                                            <div class="road-scene-grounding-kicker">Road CV grounding</div>
+                                            <div id="roadSceneGroundingTitle" class="road-scene-grounding-title">No preview yet</div>
+                                        </div>
+                                        <span id="roadSceneGroundingConfidence" class="road-scene-confidence">idle</span>
+                                    </div>
+                                    <div class="road-scene-grounding-frame">
+                                        <img id="roadSceneGroundingImage" alt="Road motion mask overlay" />
+                                    </div>
+                                    <div id="roadSceneGroundingMeta" class="road-scene-grounding-meta">Generate a bounded preview to inspect the inferred motion zone.</div>
+                                </div>
                             </aside>
                         </div>
                     </div>

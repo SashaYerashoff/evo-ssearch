@@ -122,6 +122,38 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 "ALERTS_JSON must stay last after current-state instructions",
             )
 
+    def test_vector_signal_prompt_marks_cues_as_attention_not_visual_proof(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            install_channel_memory(manager)
+
+            final_prompt = manager.compose_live_system_prompt(
+                7,
+                manager.get_effective_stream_system_prompt(7),
+                vector_signal={
+                    "version": 1,
+                    "channel_id": 7,
+                    "semantics": "vector_homeostasis_attention_signal_not_visual_proof",
+                    "clip_probe_signals": [
+                        {
+                            "name": "vehicle drift candidate",
+                            "probe_id": "probe-drift",
+                            "p": 0.42,
+                            "n": 0.18,
+                            "m": 0.24,
+                            "apex_frame": 2,
+                        }
+                    ],
+                },
+            )
+
+            self.assertIn("VECTOR_SIGNALS_JSON", final_prompt)
+            self.assertIn("secondary attention/arousal signal", final_prompt)
+            self.assertIn("not visual proof", final_prompt)
+            self.assertLess(final_prompt.index("Active Channel Memory"), final_prompt.index("VECTOR_SIGNALS_JSON"))
+            self.assertLess(final_prompt.index("VECTOR_SIGNALS_JSON"), final_prompt.index("Current-batch observation contract"))
+            self.assertLess(final_prompt.index("VECTOR_SIGNALS_JSON"), final_prompt.index("ALERTS_JSON:"))
+
     def test_default_alert_contract_has_no_private_scene_entities(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

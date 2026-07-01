@@ -76,6 +76,7 @@
     const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
     const luxriotStatusLabel = document.getElementById('luxriotStatus');
     const luxriotPreviewImg = document.getElementById('luxriotPreview');
+    const luxriotViewport = document.getElementById('luxriotViewport');
     const luxriotOverlay = document.getElementById('luxriotOverlay');
     const luxriotStreamName = document.getElementById('luxriotStreamName');
     const luxriotStreamState = document.getElementById('luxriotStreamState');
@@ -91,6 +92,13 @@
     const luxriotStreamDetail = document.getElementById('luxriotStreamDetail');
     const luxriotContextToggleCaptureBtn = document.getElementById('luxriotContextToggleCapture');
     const luxriotContextFlushCaptureBtn = document.getElementById('luxriotContextFlushCapture');
+    const roadSceneGroundingBtns = Array.from(document.querySelectorAll('[data-road-scene-grounding]'));
+    const roadSceneGroundingBtn = document.getElementById('roadSceneGroundingBtn') || roadSceneGroundingBtns[0] || null;
+    const roadSceneGroundingPanel = document.getElementById('roadSceneGroundingPanel');
+    const roadSceneGroundingImage = document.getElementById('roadSceneGroundingImage');
+    const roadSceneGroundingTitle = document.getElementById('roadSceneGroundingTitle');
+    const roadSceneGroundingConfidence = document.getElementById('roadSceneGroundingConfidence');
+    const roadSceneGroundingMeta = document.getElementById('roadSceneGroundingMeta');
     const luxriotToggleCaptureBtn = document.getElementById('luxriotToggleCapture');
     const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
     const luxriotPromptSettingsBtn = document.getElementById('luxriotPromptSettingsBtn');
@@ -294,6 +302,9 @@
     };
     let luxriotActiveChannel = luxriotDefaults.channelId;
     let luxriotPreviewTimer = null;
+    let luxriotPreviewLoading = false;
+    let luxriotPreviewRequestSeq = 0;
+    let luxriotPreviewObjectUrl = '';
     let luxriotSummaryTimer = null;
     let luxriotSummaryRefreshInFlight = false;
     let luxriotSummaryRefreshQueued = null;
@@ -307,6 +318,8 @@
         height: 0,
         loadedAt: 0,
         failed: false,
+        errorCode: '',
+        errorText: '',
     };
     let luxriotPromptModalTab = 'stream';
     let luxriotPromptLayers = null;
@@ -654,6 +667,7 @@
         if (/\/detections\/image\?/i.test(value)) return true;
         if (/\/detections\/thumbnail\/\d+/i.test(value)) return true;
         if (/^\/image\//i.test(value)) return true;
+        if (/\/luxriot\/recent_frame/i.test(value)) return true;
         if (/\/luxriot\/snapshot/i.test(value)) return true;
         return /\.(?:png|jpe?g|webp|gif|bmp|svg)(?:[?#].*)?$/i.test(value);
     }
@@ -1310,6 +1324,16 @@
         const logsTotalRaw = stream.logs_total ?? (Array.isArray(stream.logs) ? stream.logs.length : null);
         const logsTotal = logsTotalRaw === null || logsTotalRaw === undefined ? null : luxriotHealthCount(logsTotalRaw);
         const lastError = String(stream.last_error || '').trim();
+        const lastSnapshotLatency = Number(stream.last_snapshot_latency_sec);
+        const avgSnapshotLatency = Number(stream.avg_snapshot_latency_sec);
+        const snapshotSlowThreshold = Number(stream.snapshot_slow_threshold_sec);
+        const slowSnapshots = luxriotHealthCount(stream.slow_snapshot_count);
+        const activeCaptureSource = String(stream.active_capture_source || '').trim();
+        const liveSegmentLatency = Number(stream.last_live_segment_latency_sec);
+        const liveSegmentFrames = luxriotHealthCount(stream.last_live_segment_frames);
+        const frozenSignal = Boolean(stream.frozen_signal);
+        const frozenAge = Number(stream.frozen_signal_age_sec);
+        const frozenCount = luxriotHealthCount(stream.frozen_frame_count);
         const lagThreshold = maxBuffer > 0 ? Math.max(1, Math.ceil(maxBuffer * 0.8)) : 0;
         const titleParts = [
             `state ${stream.running ? 'running' : 'stopped'}`,
@@ -1317,12 +1341,38 @@
                 ? `pending ${formatCompactCount(pending)}/${formatCompactCount(maxBuffer)}`
                 : `pending ${formatCompactCount(pending)}`,
         ];
+        if (activeCaptureSource) titleParts.push(`source ${activeCaptureSource}`);
+        if (Number.isFinite(lastSnapshotLatency) && lastSnapshotLatency > 0) {
+            titleParts.push(`snapshot ${lastSnapshotLatency.toFixed(1)}s`);
+        }
+        if (Number.isFinite(avgSnapshotLatency) && avgSnapshotLatency > 0) {
+            titleParts.push(`avg snapshot ${avgSnapshotLatency.toFixed(1)}s`);
+        }
+        if (slowSnapshots > 0) titleParts.push(`slow snapshots ${formatCompactCount(slowSnapshots)}`);
+        if (Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0) {
+            titleParts.push(`segment ${liveSegmentLatency.toFixed(1)}s/${formatCompactCount(liveSegmentFrames)} frames`);
+        }
+        if (frozenSignal) {
+            titleParts.unshift(`frozen ${Number.isFinite(frozenAge) && frozenAge > 0 ? formatLuxriotDuration(frozenAge) : ''}${frozenCount > 0 ? `/${formatCompactCount(frozenCount)} frames` : ''}`.trim());
+            return { label: 'frozen', tone: 'error', title: titleParts.join(' | ') };
+        }
         if (droppedFrames > 0) titleParts.push(`dropped frames ${formatCompactCount(droppedFrames)}`);
         if (droppedBatches > 0) titleParts.push(`queue drops ${formatCompactCount(droppedBatches)}`);
         if (logsTotal !== null) titleParts.push(`logs ${formatCompactCount(logsTotal)}`);
         if (lastError) {
             titleParts.unshift(`error ${truncateLuxriotHealthText(lastError)}`);
             return { label: 'error', tone: 'error', title: titleParts.join(' | ') };
+        }
+        if (
+            slowSnapshots > 0
+            || (
+                Number.isFinite(lastSnapshotLatency)
+                && Number.isFinite(snapshotSlowThreshold)
+                && snapshotSlowThreshold > 0
+                && lastSnapshotLatency >= snapshotSlowThreshold
+            )
+        ) {
+            return { label: 'slow', tone: 'warning', title: titleParts.join(' | ') };
         }
         if (droppedFrames > 0 || droppedBatches > 0) {
             return { label: 'drops', tone: 'warning', title: titleParts.join(' | ') };
@@ -1453,7 +1503,11 @@
                         ? 'paused'
                         : 'idle';
         const stateText = luxriotPreviewMeta.failed
-            ? 'preview error'
+            ? luxriotPreviewMeta.errorCode === 'signal_lost'
+                ? 'signal lost'
+                : luxriotPreviewMeta.errorCode === 'signal_frozen'
+                    ? 'signal frozen'
+                : 'preview error'
             : running
                 ? 'summaries on'
                 : showProbeDiagnostics && probeRunning
@@ -1466,7 +1520,11 @@
         const resolution = previewWidth > 0 && previewHeight > 0
             ? `${previewWidth}x${previewHeight}`
             : luxriotPreviewMeta.failed
-                ? 'failed'
+                ? luxriotPreviewMeta.errorCode === 'signal_lost'
+                    ? 'signal lost'
+                    : luxriotPreviewMeta.errorCode === 'signal_frozen'
+                        ? 'signal frozen'
+                    : 'failed'
                 : 'waiting';
         const intervalSec = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
             || getLuxriotLiveIntervalInputValue()
@@ -1480,11 +1538,20 @@
         const analyticsQueued = Number(analyticsStream?.pending_frames) || 0;
         const analyticsInterval = Number(analyticsStream?.interval_sec);
         const probeCadence = Number.isFinite(analyticsInterval) && analyticsInterval > 0 ? formatLuxriotCadence(analyticsInterval) : '';
+        const probeShared = Boolean(analyticsStream?.shared_capture);
+        const lastSnapshotLatency = Number(videoStream?.last_snapshot_latency_sec);
+        const avgSnapshotLatency = Number(videoStream?.avg_snapshot_latency_sec);
+        const slowSnapshotCount = Number(videoStream?.slow_snapshot_count) || 0;
+        const activeCaptureSource = String(videoStream?.active_capture_source || '').trim();
+        const liveSegmentLatency = Number(videoStream?.last_live_segment_latency_sec);
+        const liveSegmentFrames = Number(videoStream?.last_live_segment_frames) || 0;
         const queueLabel = running
             ? `${formatCompactCount(queued)}/${formatCompactCount(batchSize)} frames · ${formatCompactCount(flushes)} flushes${dropped > 0 ? ` · ${formatCompactCount(dropped)} dropped` : ''}`
             : 'idle';
         const probeLabel = probeRunning
-            ? `active · ${formatCompactCount(analyticsQueued)} buffered${probeCadence ? ` · ${probeCadence}` : ''}`
+            ? probeShared
+                ? `shared with summaries · ${formatCompactCount(analyticsQueued)} buffered`
+                : `active · ${formatCompactCount(analyticsQueued)} buffered${probeCadence ? ` · ${probeCadence}` : ''}`
             : probePaused
                 ? 'paused'
                 : probeStats.enabled > 0
@@ -1493,10 +1560,29 @@
                         ? 'configured, disabled'
                         : 'not configured';
         const detailParts = [];
+        if (luxriotPreviewMeta.failed && luxriotPreviewMeta.errorText) {
+            detailParts.push(luxriotPreviewMeta.errorText);
+        }
+        if (videoStream?.frozen_signal) {
+            const age = Number(videoStream.frozen_signal_age_sec);
+            detailParts.push(`Frozen source: repeated identical EVA frames${Number.isFinite(age) && age > 0 ? ` for ${formatLuxriotDuration(age)}` : ''}.`);
+        }
         if (videoStream?.last_error) detailParts.push(`Summary error: ${videoStream.last_error}`);
         if (showProbeDiagnostics && analyticsStream?.last_error) detailParts.push(`Diagnostic probe error: ${analyticsStream.last_error}`);
+        if (Number.isFinite(lastSnapshotLatency) && lastSnapshotLatency > 0) {
+            detailParts.push(
+                `Source snapshot ${lastSnapshotLatency.toFixed(1)}s${Number.isFinite(avgSnapshotLatency) && avgSnapshotLatency > 0 ? ` avg ${avgSnapshotLatency.toFixed(1)}s` : ''}${slowSnapshotCount > 0 ? ` · ${formatCompactCount(slowSnapshotCount)} slow` : ''}`
+            );
+        }
+        if (activeCaptureSource === 'live_segment' && Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0) {
+            detailParts.push(`Live segment source ${liveSegmentLatency.toFixed(1)}s · ${formatCompactCount(liveSegmentFrames)} frames`);
+        }
         if (!detailParts.length && running) detailParts.push('Live summaries are collecting frames for the selected channel.');
-        if (!detailParts.length && showProbeDiagnostics && probeRunning) detailParts.push('Diagnostic capture is buffering frames for semantic/image probes.');
+        if (!detailParts.length && showProbeDiagnostics && probeRunning) {
+            detailParts.push(probeShared
+                ? 'Diagnostic probes are reading frames from the video-summary capture loop.'
+                : 'Diagnostic capture is buffering frames for semantic/image probes.');
+        }
         if (!detailParts.length) detailParts.push('Runtime state will update when the preview and stream status refresh.');
 
         setTextContentSafe(luxriotStreamName, channelLabel);
@@ -1532,6 +1618,44 @@
             clearInterval(luxriotPreviewTimer);
             luxriotPreviewTimer = null;
         }
+        luxriotPreviewRequestSeq += 1;
+        luxriotPreviewLoading = false;
+    }
+
+    function releaseLuxriotPreviewObjectUrl() {
+        if (!luxriotPreviewObjectUrl) return;
+        try {
+            URL.revokeObjectURL(luxriotPreviewObjectUrl);
+        } catch (err) {
+            // Best-effort cleanup only.
+        }
+        luxriotPreviewObjectUrl = '';
+    }
+
+    function setLuxriotPreviewSignalLost(errorCode, errorText) {
+        releaseLuxriotPreviewObjectUrl();
+        if (luxriotPreviewImg) {
+            luxriotPreviewImg.removeAttribute('src');
+        }
+        if (luxriotViewport) {
+            luxriotViewport.classList.add('is-signal-lost');
+        }
+        luxriotPreviewMeta = {
+            width: 0,
+            height: 0,
+            loadedAt: 0,
+            failed: true,
+            errorCode: errorCode || 'preview_error',
+            errorText: errorText || 'Live preview is unavailable.',
+        };
+        if (luxriotOverlay) {
+            luxriotOverlay.textContent = errorCode === 'signal_lost'
+                ? 'Signal lost'
+                : errorCode === 'signal_frozen'
+                    ? 'Signal frozen'
+                    : 'Preview unavailable';
+        }
+        updateLuxriotStreamContext();
     }
 
     function stopLuxriotSummaryPoll() {
@@ -2422,40 +2546,184 @@
             setLuxriotStatus('Select a channel to preview', true);
             return;
         }
-        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, failed: false };
+        stopLuxriotPreview();
+        releaseLuxriotPreviewObjectUrl();
+        if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost');
+        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, failed: false, errorCode: '', errorText: '' };
         updateLuxriotStreamContext();
-        const refresh = () => {
+        const refresh = async () => {
+            if (luxriotPreviewLoading) return;
+            luxriotPreviewLoading = true;
+            const requestSeq = ++luxriotPreviewRequestSeq;
+            const requestedChannelId = channelId;
             if (luxriotOverlay) {
                 luxriotOverlay.textContent = 'Loading...';
             }
-            luxriotPreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
+            const previewUrl = `/luxriot/recent_frame/${requestedChannelId}?mode=cycle&fps=2&fallback=0&max_age_sec=45&t=${Date.now()}`;
+            try {
+                const response = await fetch(previewUrl, { cache: 'no-store' });
+                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                    return;
+                }
+                if (!response.ok) {
+                    let body = {};
+                    try {
+                        body = await response.json();
+                    } catch (err) {
+                        body = {};
+                    }
+                    luxriotPreviewLoading = false;
+                    const code = String(body.error_code || (response.status === 503 ? 'signal_lost' : 'preview_error'));
+                    const detail = String(body.error || body.message || (code === 'signal_lost'
+                        ? 'Live signal is not currently reaching the EVA model.'
+                        : `Preview request failed with HTTP ${response.status}.`));
+                    setLuxriotPreviewSignalLost(code, detail);
+                    setLuxriotStatus(detail, true);
+                    return;
+                }
+                const contentType = String(response.headers.get('Content-Type') || '');
+                if (!contentType.toLowerCase().startsWith('image/')) {
+                    throw new Error('Preview endpoint did not return an image.');
+                }
+                const blob = await response.blob();
+                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                    return;
+                }
+                const objectUrl = URL.createObjectURL(blob);
+                const loader = new Image();
+                loader.decoding = 'async';
+                loader.onload = () => {
+                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                        URL.revokeObjectURL(objectUrl);
+                        return;
+                    }
+                    releaseLuxriotPreviewObjectUrl();
+                    luxriotPreviewObjectUrl = objectUrl;
+                    luxriotPreviewLoading = false;
+                    luxriotPreviewImg.src = objectUrl;
+                    if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost');
+                    luxriotPreviewMeta = {
+                        width: Number(loader.naturalWidth) || 0,
+                        height: Number(loader.naturalHeight) || 0,
+                        loadedAt: Date.now(),
+                        failed: false,
+                        errorCode: '',
+                        errorText: '',
+                    };
+                    if (luxriotOverlay) luxriotOverlay.textContent = '';
+                    updateLuxriotStreamContext();
+                    setLuxriotStatus(`Previewing channel ${requestedChannelId}`);
+                };
+                loader.onerror = () => {
+                    URL.revokeObjectURL(objectUrl);
+                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                        return;
+                    }
+                    luxriotPreviewLoading = false;
+                    setLuxriotPreviewSignalLost('preview_error', 'Preview image could not be decoded.');
+                    setLuxriotStatus('Preview image could not be decoded.', true);
+                };
+                loader.src = objectUrl;
+            } catch (err) {
+                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                    return;
+                }
+                luxriotPreviewLoading = false;
+                const message = err && err.message ? err.message : 'Preview request failed.';
+                setLuxriotPreviewSignalLost('preview_error', message);
+                setLuxriotStatus(message, true);
+            }
         };
-        luxriotPreviewImg.onload = () => {
-            luxriotPreviewMeta = {
-                width: Number(luxriotPreviewImg.naturalWidth) || 0,
-                height: Number(luxriotPreviewImg.naturalHeight) || 0,
-                loadedAt: Date.now(),
-                failed: false,
-            };
-            if (luxriotOverlay) luxriotOverlay.textContent = '';
-            updateLuxriotStreamContext();
-            setLuxriotStatus(`Previewing channel ${channelId}`);
-        };
-        luxriotPreviewImg.onerror = () => {
-            luxriotPreviewMeta = {
-                width: 0,
-                height: 0,
-                loadedAt: 0,
-                failed: true,
-            };
-            if (luxriotOverlay) luxriotOverlay.textContent = 'Preview failed';
-            updateLuxriotStreamContext();
-            setLuxriotStatus('Preview failed', true);
-        };
-        stopLuxriotPreview();
         refresh();
-        const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
+        const intervalMs = Math.max(1000, Math.min(2000, (luxriotDefaults.snapshotInterval || 5) * 1000));
         luxriotPreviewTimer = setInterval(refresh, intervalMs);
+    }
+
+    function setRoadSceneGroundingConfidence(value) {
+        if (!roadSceneGroundingConfidence) return;
+        const normalized = String(value || 'idle').toLowerCase();
+        roadSceneGroundingConfidence.classList.remove('low', 'medium', 'high', 'error');
+        if (['low', 'medium', 'high', 'error'].includes(normalized)) {
+            roadSceneGroundingConfidence.classList.add(normalized);
+        }
+        roadSceneGroundingConfidence.textContent = normalized;
+    }
+
+    function renderRoadSceneGrounding(payload) {
+        if (!roadSceneGroundingPanel) return;
+        roadSceneGroundingPanel.hidden = false;
+        const scene = payload?.scene || {};
+        const sceneCard = scene.scene_card || {};
+        const zones = Array.isArray(sceneCard.zones) ? sceneCard.zones : [];
+        const zone = zones[0] || {};
+        const channelId = payload?.channel_id || getSelectedLuxriotChannel();
+        const label = getLuxriotChannelLabel(channelId);
+        if (roadSceneGroundingImage && payload?.overlay_b64) {
+            roadSceneGroundingImage.src = `data:image/png;base64,${payload.overlay_b64}`;
+        }
+        setTextContentSafe(roadSceneGroundingTitle, label);
+        setRoadSceneGroundingConfidence(scene.confidence || 'unknown');
+        const flow = Array.isArray(zone.expected_flow)
+            ? `flow ${zone.expected_flow.map((v) => Number(v).toFixed(2)).join(', ')}`
+            : 'flow not inferred';
+        const area = Number(scene.zone_area_ratio);
+        const areaText = Number.isFinite(area) ? `${Math.round(area * 100)}% zone` : 'zone n/a';
+        const budget = payload?.budget || {};
+        const meta = [
+            scene.reason || 'No scene reason returned.',
+            `${scene.frame_count || 0} frames · ${scene.motion_pair_count || 0} motion pairs · ${scene.scene_cut_count || 0} scene cuts`,
+            `${areaText} · ${flow}`,
+            `Budget: ${budget.seconds || '?'}s · max ${budget.frames || '?'} frames`,
+        ].join(' | ');
+        setTextContentSafe(roadSceneGroundingMeta, meta);
+    }
+
+    function resetRoadSceneGrounding() {
+        if (!roadSceneGroundingPanel) return;
+        roadSceneGroundingPanel.hidden = true;
+        if (roadSceneGroundingImage) roadSceneGroundingImage.removeAttribute('src');
+        setTextContentSafe(roadSceneGroundingTitle, 'No preview yet');
+        setRoadSceneGroundingConfidence('idle');
+        setTextContentSafe(roadSceneGroundingMeta, 'Generate a bounded preview to inspect the inferred motion zone.');
+    }
+
+    function setRoadSceneGroundingBusy(busy) {
+        roadSceneGroundingBtns.forEach((button) => setButtonBusy(button, busy));
+    }
+
+    async function refreshRoadSceneGrounding() {
+        const channelId = getSelectedLuxriotChannel();
+        if (!channelId) {
+            setLuxriotStatus('Select a channel before grounding road mask', true);
+            return;
+        }
+        if (roadSceneGroundingPanel) roadSceneGroundingPanel.hidden = false;
+        setTextContentSafe(roadSceneGroundingTitle, getLuxriotChannelLabel(channelId));
+        setRoadSceneGroundingConfidence('idle');
+        setTextContentSafe(roadSceneGroundingMeta, 'Capturing a short bounded live segment and inferring motion zone...');
+        setRoadSceneGroundingBusy(true);
+        try {
+            const params = new URLSearchParams({
+                stream: 'mainStream',
+                seconds: '8',
+                frames: '60',
+                every_n: '6',
+                mb: '8',
+            });
+            const response = await fetch(`/road/scene_overlay/${channelId}?${params.toString()}`, { cache: 'no-store' });
+            const payload = await parseApiJson(response, 'Road mask preview failed');
+            renderRoadSceneGrounding(payload);
+            setLuxriotStatus(`Road mask grounded for ${getLuxriotChannelLabel(channelId)}`);
+        } catch (error) {
+            if (roadSceneGroundingPanel) roadSceneGroundingPanel.hidden = false;
+            setRoadSceneGroundingConfidence('error');
+            setTextContentSafe(roadSceneGroundingTitle, getLuxriotChannelLabel(channelId));
+            setTextContentSafe(roadSceneGroundingMeta, error.message || 'Road mask preview failed');
+            if (roadSceneGroundingImage) roadSceneGroundingImage.removeAttribute('src');
+            setLuxriotStatus(error.message || 'Road mask preview failed', true);
+        } finally {
+            setRoadSceneGroundingBusy(false);
+        }
     }
 
     function luxriotSummaryLogKey(log, idx = 0) {
@@ -3105,8 +3373,17 @@
                     const batch = Number(video?.batch_size) || 0;
                     const queued = Number(video?.pending_frames) || 0;
                     const flushes = Number(video?.flush_count) || 0;
+                    const snapshotLatency = Number(video?.last_snapshot_latency_sec);
+                    const slowSnapshots = Number(video?.slow_snapshot_count) || 0;
+                    const source = String(video?.active_capture_source || '').trim();
+                    const segmentLatency = Number(video?.last_live_segment_latency_sec);
+                    const segmentFrames = Number(video?.last_live_segment_frames) || 0;
                     if (batch > 0) videoParts.push(`batch ${batch}`);
                     videoParts.push(`${queued} queued`);
+                    if (source) videoParts.push(source);
+                    if (Number.isFinite(snapshotLatency) && snapshotLatency > 0) videoParts.push(`snapshot ${snapshotLatency.toFixed(1)}s`);
+                    if (slowSnapshots > 0) videoParts.push('slow source');
+                    if (Number.isFinite(segmentLatency) && segmentLatency > 0) videoParts.push(`segment ${segmentLatency.toFixed(1)}s/${segmentFrames}f`);
                     if (flushes > 0) videoParts.push(`${flushes} flushes`);
                     if (video?.last_error) videoParts.push('error');
                 }
@@ -3121,7 +3398,11 @@
                     const queued = Number(analytics?.pending_frames) || 0;
                     const intervalSec = Number(analytics?.interval_sec);
                     const fpsLabel = Number.isFinite(intervalSec) && intervalSec > 0 ? `${(1 / intervalSec).toFixed(2)} fps` : 'n/a fps';
-                    probeParts.push(fpsLabel, `${queued} buffered`);
+                    if (analytics?.shared_capture) {
+                        probeParts.push('shared with video', `${queued} buffered`);
+                    } else {
+                        probeParts.push(fpsLabel, `${queued} buffered`);
+                    }
                     if (analytics?.last_error) probeParts.push('error');
                 }
                 const probeLine = isProbeRunning
@@ -4014,6 +4295,10 @@
         const canDiagnostics = userHasPermission('diagnostics:view');
         const canModelsManage = userHasPermission('models:manage');
         const canBookmarks = userHasPermission('bookmarks:create');
+        const canRoadGround = (
+            userHasAnyRole(['admin', 'engineer'])
+            || (canDiagnostics && userHasPermission('streams:view'))
+        );
 
         [
             luxriotToggleCaptureBtn,
@@ -4062,6 +4347,10 @@
         });
         setElementHidden(probeBenchBtn, !canDiagnostics);
         setControlDisabled(probeBenchBtn, !canDiagnostics);
+        roadSceneGroundingBtns.forEach((button) => {
+            setElementHidden(button, !canRoadGround);
+            setControlDisabled(button, !canRoadGround);
+        });
         [
             probeBookmarkToggle,
             probeBookmarkSeverityInput,
@@ -6624,6 +6913,9 @@
     if (luxriotContextFlushCaptureBtn) {
         luxriotContextFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
     }
+    roadSceneGroundingBtns.forEach((button) => {
+        button.addEventListener('click', refreshRoadSceneGrounding);
+    });
     if (luxriotBatchSizeSelect) {
         luxriotBatchSizeSelect.addEventListener('change', updateLuxriotBatchInfo);
     }
@@ -6996,6 +7288,7 @@
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
             void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
+            resetRoadSceneGrounding();
             startLuxriotPreview();
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
             refreshLuxriotStreams();
@@ -11311,20 +11604,39 @@
             const mdWrap = '[`*_~]*';
             const idAtom = `${mdWrap}\\d{2,9}${mdWrap}`;
             const idList = `(?:${idAtom}(?:\\s*(?:,|and|&|/)\\s*)?){1,12}`;
-            const addId = (raw) => {
+            const deniedIdContext = (absoluteIndex) => {
+                if (!Number.isFinite(absoluteIndex) || absoluteIndex < 0) return false;
+                const before = source.slice(Math.max(0, absoluteIndex - 56), absoluteIndex);
+                return /\b(?:channel|ch|probe|plan|approval|session|job|batch|task|run|tenant|user|account|model)\s*(?:id|#)?\s*$/i.test(before);
+            };
+            const addId = (raw, absoluteIndex = -1) => {
                 const value = String(raw || '').trim();
                 const match = value.match(/\b\d{2,9}\b/);
                 if (!match) return;
+                if (deniedIdContext(absoluteIndex)) return;
                 const id = Number(match[0]);
                 if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) return;
                 seen.add(id);
                 ids.push(id);
             };
-            const parseList = (raw) => {
-                const matches = String(raw || '').match(/\b\d{2,9}\b/g) || [];
-                matches.forEach(addId);
+            const parseList = (raw, baseIndex = -1) => {
+                const rawText = String(raw || '');
+                const matcher = /\b\d{2,9}\b/g;
+                let numberMatch;
+                while ((numberMatch = matcher.exec(rawText)) && ids.length < AGENT_EVIDENCE_ID_LIMIT) {
+                    const absoluteIndex = baseIndex >= 0 ? baseIndex + numberMatch.index : -1;
+                    addId(numberMatch[0], absoluteIndex);
+                }
+            };
+            const parseMatchList = (match) => {
+                const raw = match && match[1] ? String(match[1]) : '';
+                if (!raw) return;
+                const localIndex = String(match[0] || '').indexOf(raw);
+                const baseIndex = localIndex >= 0 ? match.index + localIndex : -1;
+                parseList(raw, baseIndex);
             };
             const directPatterns = [
+                new RegExp(`\\bevidence\\s+ids?\\s*[:#-]?\\s*(${idList})`, 'gi'),
                 new RegExp(`\\b(?:detections?|frames?|candidates?|images?|snapshots?)\\s+ids?\\s*[:#-]?\\s*(${idList})`, 'gi'),
                 new RegExp(`\\b(?:detection|frame|image|snapshot)\\s+(?:id|#)\\s*[:#-]?\\s*(${idAtom})(?=\\W|$)`, 'gi'),
                 new RegExp(`\\b(?:candidate)\\s+\\d+\\s*[:#-]\\s*(?:detection\\s+id\\s*)?(${idAtom})(?=\\W|$)`, 'gi'),
@@ -11334,7 +11646,7 @@
             directPatterns.forEach((pattern) => {
                 let match;
                 while ((match = pattern.exec(source)) && ids.length < AGENT_EVIDENCE_ID_LIMIT) {
-                    parseList(match[1] || '');
+                    parseMatchList(match);
                 }
             });
 
@@ -11344,8 +11656,8 @@
                 const start = Math.max(0, match.index - 90);
                 const end = Math.min(source.length, match.index + match[0].length + 60);
                 const context = source.slice(start, end);
-                if (/\b(?:detections?|frames?|candidates?|evidence|probes?|visual|snapshots?|thumbnails?|images?)\b/i.test(context)) {
-                    parseList(match[1] || '');
+                if (/\b(?:detections?|frames?|candidates?|evidence|visual|snapshots?|thumbnails?|images?)\b/i.test(context)) {
+                    parseMatchList(match);
                 }
             }
             return ids.slice(0, AGENT_EVIDENCE_ID_LIMIT);

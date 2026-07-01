@@ -464,6 +464,51 @@ class Config:
         LUXRIOT_SNAPSHOT_MAX_EDGE = 800
     if LUXRIOT_SNAPSHOT_MAX_EDGE < 640:
         LUXRIOT_SNAPSHOT_MAX_EDGE = 640
+    LUXRIOT_CAPTURE_SOURCE = os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE', 'auto').strip().lower() or 'auto'
+    if LUXRIOT_CAPTURE_SOURCE not in {'auto', 'snapshot', 'live_segment'}:
+        LUXRIOT_CAPTURE_SOURCE = 'auto'
+    try:
+        LUXRIOT_LIVE_SEGMENT_SECONDS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS', '15.0'))
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_SEGMENT_SECONDS = 15.0
+    LUXRIOT_LIVE_SEGMENT_SECONDS = max(2.0, min(60.0, LUXRIOT_LIVE_SEGMENT_SECONDS))
+    try:
+        LUXRIOT_LIVE_SEGMENT_MB = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_MB', '8.0'))
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_SEGMENT_MB = 8.0
+    LUXRIOT_LIVE_SEGMENT_MB = max(0.5, min(128.0, LUXRIOT_LIVE_SEGMENT_MB))
+    try:
+        LUXRIOT_LIVE_SEGMENT_EVERY_N = int(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_EVERY_N', '25'))
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_SEGMENT_EVERY_N = 25
+    LUXRIOT_LIVE_SEGMENT_EVERY_N = max(1, min(240, LUXRIOT_LIVE_SEGMENT_EVERY_N))
+    try:
+        LUXRIOT_LIVE_SEGMENT_FPS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS', '3.0'))
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_SEGMENT_FPS = 3.0
+    LUXRIOT_LIVE_SEGMENT_FPS = max(0.2, min(10.0, LUXRIOT_LIVE_SEGMENT_FPS))
+    LUXRIOT_VECTOR_SIGNALS_ENABLED = os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
+    try:
+        LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT', '6'))
+    except (TypeError, ValueError):
+        LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = 6
+    LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = max(0, min(16, LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT))
+    try:
+        LUXRIOT_VECTOR_SIGNAL_TOP_HITS = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS', '2'))
+    except (TypeError, ValueError):
+        LUXRIOT_VECTOR_SIGNAL_TOP_HITS = 2
+    LUXRIOT_VECTOR_SIGNAL_TOP_HITS = max(1, min(5, LUXRIOT_VECTOR_SIGNAL_TOP_HITS))
+    LUXRIOT_ROAD_CV_BATCH_SIGNALS = os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
+    try:
+        LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES = int(os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES', '24'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES = 24
+    LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES = max(4, min(48, LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES))
+    try:
+        LUXRIOT_ROAD_CV_BATCH_MAX_EDGE = int(os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE', '240'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROAD_CV_BATCH_MAX_EDGE = 240
+    LUXRIOT_ROAD_CV_BATCH_MAX_EDGE = max(96, min(480, LUXRIOT_ROAD_CV_BATCH_MAX_EDGE))
     LUXRIOT_BATCH_SIZES = (12, 24, 36)
     try:
         LUXRIOT_SUMMARY_RETENTION_DAYS = float(
@@ -542,10 +587,47 @@ class Config:
         LUXRIOT_MAX_BUFFER_FRAMES = 180
     if LUXRIOT_MAX_BUFFER_FRAMES < 12:
         LUXRIOT_MAX_BUFFER_FRAMES = 12
+    try:
+        LUXRIOT_RECENT_FRAME_MAX_AGE_SEC = float(os.getenv('EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC', '45'))
+    except (TypeError, ValueError):
+        LUXRIOT_RECENT_FRAME_MAX_AGE_SEC = 45.0
+    LUXRIOT_RECENT_FRAME_MAX_AGE_SEC = max(3.0, min(300.0, LUXRIOT_RECENT_FRAME_MAX_AGE_SEC))
+    try:
+        LUXRIOT_FROZEN_FRAME_MAX_SEC = float(os.getenv('EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC', '20'))
+    except (TypeError, ValueError):
+        LUXRIOT_FROZEN_FRAME_MAX_SEC = 20.0
+    LUXRIOT_FROZEN_FRAME_MAX_SEC = max(5.0, min(300.0, LUXRIOT_FROZEN_FRAME_MAX_SEC))
+    try:
+        LUXRIOT_FROZEN_FRAME_MIN_COUNT = int(os.getenv('EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT', '3'))
+    except (TypeError, ValueError):
+        LUXRIOT_FROZEN_FRAME_MIN_COUNT = 3
+    LUXRIOT_FROZEN_FRAME_MIN_COUNT = max(2, min(120, LUXRIOT_FROZEN_FRAME_MIN_COUNT))
     LUXRIOT_AUTO_BOOKMARKS = _get_bool_env('EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS', 'False')
     OFFLINE_VIDEO_ENABLED = _get_bool_env('EVOSSEARCH_OFFLINE_VIDEO_ENABLED', 'False')
     PROBE_SNAP_ENABLED = _get_bool_env('EVOSSEARCH_PROBE_SNAP_ENABLED', 'False')
     INDEXED_FOLDER_ENABLED = _get_bool_env('EVOSSEARCH_INDEXED_FOLDER_ENABLED', 'False')
+    ROAD_CV_ENABLED = _get_bool_env('EVOSSEARCH_ROAD_CV_ENABLED', 'False')
+    ROAD_CV_SCENE_CARDS = os.getenv('EVOSSEARCH_ROAD_CV_SCENE_CARDS', '').strip()
+    try:
+        ROAD_CV_MAX_EDGE = int(os.getenv('EVOSSEARCH_ROAD_CV_MAX_EDGE', '360'))
+    except (TypeError, ValueError):
+        ROAD_CV_MAX_EDGE = 360
+    ROAD_CV_MAX_EDGE = max(96, min(1280, ROAD_CV_MAX_EDGE))
+    try:
+        ROAD_CV_MIN_MOTION_PX = float(os.getenv('EVOSSEARCH_ROAD_CV_MIN_MOTION_PX', '0.7'))
+    except (TypeError, ValueError):
+        ROAD_CV_MIN_MOTION_PX = 0.7
+    ROAD_CV_MIN_MOTION_PX = max(0.05, min(20.0, ROAD_CV_MIN_MOTION_PX))
+    try:
+        ROAD_CV_ACTIVE_RATIO_FLOOR = float(os.getenv('EVOSSEARCH_ROAD_CV_ACTIVE_RATIO_FLOOR', '0.012'))
+    except (TypeError, ValueError):
+        ROAD_CV_ACTIVE_RATIO_FLOOR = 0.012
+    ROAD_CV_ACTIVE_RATIO_FLOOR = max(0.001, min(0.5, ROAD_CV_ACTIVE_RATIO_FLOOR))
+    try:
+        ROAD_CV_WRONG_WAY_ALIGNMENT = float(os.getenv('EVOSSEARCH_ROAD_CV_WRONG_WAY_ALIGNMENT', '-0.45'))
+    except (TypeError, ValueError):
+        ROAD_CV_WRONG_WAY_ALIGNMENT = -0.45
+    ROAD_CV_WRONG_WAY_ALIGNMENT = max(-1.0, min(0.0, ROAD_CV_WRONG_WAY_ALIGNMENT))
     try:
         LUXRIOT_BOOKMARK_COOLDOWN_SEC = float(os.getenv('EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC', '60.0'))
     except (TypeError, ValueError):
@@ -870,7 +952,9 @@ class Config:
             f"Luxriot Evo: {cls.LUXRIOT_BASE_URL or 'unset'} "
             f"(default channel: {cls.LUXRIOT_DEFAULT_CHANNEL_ID}, "
             f"snapshot every {cls.LUXRIOT_SNAPSHOT_INTERVAL}s @ <= {cls.LUXRIOT_SNAPSHOT_MAX_EDGE}px, "
+            f"capture_source={cls.LUXRIOT_CAPTURE_SOURCE}, "
             f"buffer cap {cls.LUXRIOT_MAX_BUFFER_FRAMES} frames, "
+            f"vector_signals {'on' if cls.LUXRIOT_VECTOR_SIGNALS_ENABLED else 'off'}, "
             f"auto-bookmarks {'on' if cls.LUXRIOT_AUTO_BOOKMARKS else 'off'})"
         )
         print(

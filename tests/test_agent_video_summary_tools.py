@@ -50,8 +50,21 @@ class _SummaryManager:
                     "pending_frames": 3,
                     "dropped_frames": 1,
                     "queue_dropped_batches": 0,
+                    "recent_frame_count": 2,
+                    "frozen_signal": True,
+                    "frozen_signal_age_sec": 22.5,
+                    "frozen_frame_count": 4,
                     "log_count": 12,
                     "last_alert_counts": {"low": 1},
+                },
+            ],
+            "analytics_streams": [
+                {
+                    "channel_id": 9,
+                    "stream_type": "analytics",
+                    "running": True,
+                    "last_snapshot_at": 1.0,
+                    "recent_frame_count": 1,
                 },
             ],
             "desired_video_channels": [7, 8],
@@ -1991,8 +2004,21 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         row7 = result["candidate_channels"][0]
         self.assertEqual(row7["recent_alerts"][0]["title"], "Doorway activity")
         self.assertEqual(row7["status_digest"]["alert_delivery_breakdown"]["sent"], 1)
+        self.assertEqual(row7["live_signal_status"], "frozen")
+        self.assertTrue(row7["frozen_signal"])
+        self.assertEqual(row7["frozen_frame_count"], 4)
+        self.assertGreaterEqual(result["runtime_problem_count"], 1)
+        self.assertEqual(result["runtime_problem_channels"][0]["channel_id"], 7)
+        self.assertEqual(result["runtime_problem_channels"][0]["live_signal_status"], "frozen")
+        stale_row = next(row for row in result["runtime_problem_channels"] if row["channel_id"] == 9)
+        self.assertEqual(stale_row["live_signal_status"], "stale")
+        self.assertTrue(stale_row["stale_signal"])
         compact = _compact_tool_result_for_model("list_video_summary_channels", result)
         self.assertEqual(compact["candidate_channels"][0]["recent_alerts"][0]["title"], "Doorway activity")
+        self.assertEqual(compact["candidate_channels"][0]["live_signal_status"], "frozen")
+        self.assertTrue(compact["candidate_channels"][0]["frozen_signal"])
+        self.assertEqual(compact["runtime_problem_channels"][0]["live_signal_status"], "frozen")
+        self.assertTrue(any(row["live_signal_status"] == "stale" for row in compact["runtime_problem_channels"]))
 
     def test_list_video_summary_channels_uses_batch_bounds_for_activity_window(self):
         manager = _SummaryManager()

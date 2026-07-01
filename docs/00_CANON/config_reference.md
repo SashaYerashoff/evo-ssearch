@@ -8,7 +8,7 @@ for behavior is `config.py`**; this table is the human reference. Secrets
 Defaults shown are the code defaults, not the pilot values. Pilot/field values
 live in the internal field-rollout doc with `[FIELD]` markers.
 
-Last reviewed: 2026-06-30 (β 0.8.2.1)
+Last reviewed: 2026-07-02 (β 0.8.3)
 
 ## Secure-pilot required set
 
@@ -68,6 +68,9 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
 | `EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES` (`180`) | Per-channel frame buffer cap |
+| `EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC` (`45`) | Max age for UI live-preview EVA frames; stale buffers render as signal loss instead of replay |
+| `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC` (`20`) | Exact repeated-frame duration before a live source is marked frozen |
+| `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT` (`3`) | Minimum identical captured frames before frozen-source detection can trigger |
 | `EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS` (`false`) | Push alerts as Luxriot bookmarks |
 | `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`60`) | Dedup cooldown |
 | `EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH` (`8`) | Max alerts per batch |
@@ -138,8 +141,25 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
 | `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
 | `EVOSSEARCH_PROBE_BOOKMARK_*` | Probe bookmark cooldown/dedup/thresholds |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED` (`true`) | Feed compact CLIP/road-CV attention cues into L0 video-description prompts |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT` (`6`) | Max active channel probes scanned per L0 batch for vector/homeostasis cues |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS` (`2`) | Max live CLIP hits considered per probe signal |
 | `EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED` (`true`) | Persist detection frames |
 | `EVOSSEARCH_DETECTIONS_RETENTION_*` | Dedup/keep windows + similarity thresholds |
+
+## Road CV primitives (experimental)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS` (`true`) | Adds bounded road-motion cues to L0 vector signals from the current batch |
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES` (`24`) | Max frames sampled per L0 batch for road-CV cue extraction |
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE` (`240`) | Max edge used for L0 batch road-CV cue extraction |
+| `EVOSSEARCH_ROAD_CV_ENABLED` (`false`) | Reserved for dedicated road-event CV runners |
+| `EVOSSEARCH_ROAD_CV_SCENE_CARDS` (`empty`) | JSON scene-card path with channel road zones and expected flow vectors |
+| `EVOSSEARCH_ROAD_CV_MAX_EDGE` (`360`) | Max edge for motion analysis frames |
+| `EVOSSEARCH_ROAD_CV_MIN_MOTION_PX` (`0.7`) | Optical-flow magnitude threshold for active pixels |
+| `EVOSSEARCH_ROAD_CV_ACTIVE_RATIO_FLOOR` (`0.012`) | Minimum moving-pixel ratio inside a road zone |
+| `EVOSSEARCH_ROAD_CV_WRONG_WAY_ALIGNMENT` (`-0.45`) | Cosine alignment threshold for opposing-flow candidates |
 
 ## Embedder / vision
 

@@ -4,6 +4,29 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## β 0.8.3 — 2026-07-02 (road-event and live-signal stabilization)
+
+- **Road-event foundation:** added lightweight road-motion CV primitives,
+  scene-card bootstrap, motion-zone/flow cues, and Luxriot snapshot/live-video
+  smoke tooling for drift, burnout, wrong-way, and aggressive-traffic candidate
+  workflows.
+- **Vector signals:** compact CLIP/probe and road-CV cues can now condition L0
+  video descriptions as secondary attention signals; they remain candidate
+  signals and must be verified against current frames.
+- **Live preview honesty:** stale and exact-frozen Luxriot buffers now surface as
+  `Signal lost` / `Signal frozen` instead of replaying old frames in the UI or
+  feeding VLM/probe loops.
+- **Agent runtime status:** video-summary inventory now carries explicit
+  `runtime_problem_channels` so stale/frozen/error capture issues are visible to
+  the agent even when no summaries exist for that channel.
+- **Road grounding UI:** engineer/admin monitoring can render a fresh-frame road
+  mask overlay for scene grounding and diagnostics.
+- **Acceptance:** added a cumulative β0.8.0→β0.8.3 manual acceptance scenario
+  focused on alerts, reports, probe control, signal loss, and road-event
+  candidate handling.
+- **Upgrade:** code-only from β 0.8.2.1 — **no database migration**.
+- Schema head: `20260614_0006`. See `readiness/RELEASE_NOTES_0.8.3.md`.
+
 ## β 0.8.2.1 — 2026-06-30, amended 2026-07-01 (UI evidence, approval, and agent workflow polish)
 
 - **Agent chat UI:** probe create/update/delete previews and receipts render as
