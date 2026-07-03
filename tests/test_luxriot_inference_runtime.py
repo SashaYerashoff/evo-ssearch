@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -283,7 +284,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 run_id="run-7",
             )
             session.client = SimpleNamespace(
-                get_snapshot=lambda _channel_id: SimpleNamespace(width=1280, height=720)
+                get_snapshot=lambda _channel_id, **_kwargs: SimpleNamespace(width=1280, height=720)
             )
 
             def stop_after_one_wait(_interval):
@@ -296,6 +297,107 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(session.frames), 1)
             self.assertIn("vlm unavailable", session.last_error)
             self.assertEqual(session.queue_dropped_batches, 1)
+
+    def test_async_summary_worker_does_not_block_recent_frame_updates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.jpeg_encoder = lambda image, **_kwargs: f"jpeg-{getattr(image, 'marker', 'x')}"
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_dispatcher(_batch, _workload):
+                started.set()
+                release.wait(timeout=2.0)
+                return {"queued": False, "accepted": True}
+
+            manager.set_summary_dispatcher(slow_dispatcher)
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=2,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            session.summary_worker_thread.start()
+            try:
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
+                self.assertTrue(started.wait(timeout=1.0))
+
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=3), 3_000, summarize=True)
+
+                self.assertEqual(len(session.recent_frame_items()), 3)
+                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-3")
+                status = session.status()
+                self.assertTrue(status["summary_inflight"])
+                self.assertEqual(status["pending_frames"], 1)
+            finally:
+                release.set()
+                session.stop()
+
+    def test_async_summary_queue_is_bounded_and_latest_wins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES": 1},
+            )
+            manager.jpeg_encoder = lambda image, **_kwargs: f"jpeg-{getattr(image, 'marker', 'x')}"
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_dispatcher(_batch, _workload):
+                started.set()
+                release.wait(timeout=2.0)
+                return {"queued": False, "accepted": True}
+
+            manager.set_summary_dispatcher(slow_dispatcher)
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=1,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            session.summary_worker_thread.start()
+            try:
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
+                self.assertTrue(started.wait(timeout=1.0))
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=3), 3_000, summarize=True)
+
+                status = session.status()
+                self.assertEqual(status["summary_queue_depth"], 1)
+                self.assertEqual(status["summary_queue_frame_count"], 1)
+                self.assertEqual(session.queue_dropped_batches, 1)
+                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-3")
+            finally:
+                release.set()
+                session.stop()
+
+    def test_async_summary_worker_completion_records_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lambda _messages, _model: "async summary")
+            manager.jpeg_encoder = lambda image, **_kwargs: f"jpeg-{getattr(image, 'marker', 'x')}"
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=2,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            manager.sessions[7] = session
+            session.summary_worker_thread.start()
+            try:
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
+                for _ in range(40):
+                    if session.status()["logs"]:
+                        break
+                    time.sleep(0.025)
+                self.assertEqual(session.status()["logs"][0]["summary"], "async summary")
+                self.assertEqual(manager.summary_history[7][0]["summary"], "async summary")
+            finally:
+                session.stop()
 
     def test_capture_loop_uses_live_segment_after_slow_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -341,6 +443,101 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(session.live_segment_frame_count, 2)
             self.assertEqual(session.last_live_segment_frames, 2)
             self.assertIsNone(session.last_live_segment_error)
+
+    def test_auto_capture_falls_back_to_live_segment_after_snapshot_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_CAPTURE_SOURCE": "auto",
+                    "LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC": 1.0,
+                },
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=120,
+                batch_size=4,
+                prompt="Describe activity.",
+                run_id="run-120",
+            )
+            session.client = SimpleNamespace(
+                get_snapshot=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("snapshot 404"))
+            )
+
+            def stop_after_cycle(_timeout: float) -> bool:
+                session.stop_event.set()
+                return True
+
+            with (
+                patch.object(session, "_run_live_segment_once", return_value=True) as live_segment,
+                patch.object(session.stop_event, "wait", side_effect=stop_after_cycle),
+            ):
+                session._run()
+
+            live_segment.assert_called_once()
+            self.assertEqual(session.snapshot_failed_count, 1)
+            self.assertIsNone(session.last_error)
+            self.assertTrue(session._should_use_live_segment())
+
+    def test_auto_capture_does_not_retry_unavailable_snapshot_after_live_segment_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_CAPTURE_SOURCE": "auto",
+                    "LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC": 1.0,
+                },
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=120,
+                batch_size=4,
+                prompt="Describe activity.",
+                run_id="run-120",
+            )
+            snapshot_calls = 0
+
+            def fail_snapshot(*_args, **_kwargs):
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                raise RuntimeError("snapshot 404")
+
+            session.client = SimpleNamespace(get_snapshot=fail_snapshot)
+            session.snapshot_failed_count = 1
+
+            def stop_after_cycle(_timeout: float) -> bool:
+                session.stop_event.set()
+                return True
+
+            with (
+                patch.object(session, "_run_live_segment_once", return_value=False) as live_segment,
+                patch.object(session.stop_event, "wait", side_effect=stop_after_cycle),
+            ):
+                session._run()
+
+            live_segment.assert_called_once()
+            self.assertEqual(snapshot_calls, 0)
+            self.assertEqual(session.snapshot_failed_count, 1)
+
+    def test_live_segment_failure_backoff_skips_immediate_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), config_overrides={"LUXRIOT_CAPTURE_SOURCE": "auto"})
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=120,
+                batch_size=4,
+                prompt="Describe activity.",
+                run_id="run-120",
+            )
+            session._set_live_segment_backoff(failed=True)
+            with patch.object(session, "_run_ffmpeg_live_segment_once", return_value=True) as ffmpeg_live:
+                self.assertFalse(session._run_live_segment_once())
+            ffmpeg_live.assert_not_called()
+
+            session._set_live_segment_backoff(failed=False)
+            with patch.object(session, "_run_ffmpeg_live_segment_once", return_value=True) as ffmpeg_live:
+                self.assertTrue(session._run_live_segment_once())
+            ffmpeg_live.assert_called_once()
 
     def test_sync_fallback_records_summary_without_dispatcher(self):
         with tempfile.TemporaryDirectory() as temp:

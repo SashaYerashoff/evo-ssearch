@@ -335,14 +335,21 @@ class LuxriotClient:
             )
         return cleaned
 
-    def get_snapshot(self, channel_id: int, stream: str = "mainStream") -> Image.Image:
+    def get_snapshot(
+        self,
+        channel_id: int,
+        stream: str = "mainStream",
+        *,
+        timeout: Optional[float] = None,
+    ) -> Image.Image:
+        request_timeout = float(timeout) if timeout is not None else max(10, self.timeout)
         resp = self._request(
             "GET",
             f"/live/{channel_id}/snapshot",
             params={"stream": stream},
             headers={"Accept": "image/jpeg"},
             stream=False,
-            timeout=max(10, self.timeout),
+            timeout=max(1.0, request_timeout),
         )
         try:
             with Image.open(BytesIO(resp.content)) as opened:
@@ -604,6 +611,14 @@ class LuxriotCaptureSession:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
+        self.summary_queue_max_batches = max(
+            1,
+            min(12, int(getattr(manager.config, "LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES", 2) or 2)),
+        )
+        self.summary_condition = threading.Condition(self.lock)
+        self.summary_queue: List[Tuple[List[Dict[str, Any]], str, Dict[str, Any]]] = []
+        self.summary_inflight = False
+        self.summary_worker_thread = threading.Thread(target=self._summary_worker, daemon=True)
         self.last_error: Optional[str] = None
         self.snapshot_count = 0
         self.snapshot_failed_count = 0
@@ -623,6 +638,7 @@ class LuxriotCaptureSession:
         self.last_live_segment_latency_sec: Optional[float] = None
         self.last_live_segment_frames = 0
         self.last_live_segment_error: Optional[str] = None
+        self.live_segment_backoff_until = 0.0
         self._last_frame_hash: Optional[str] = None
         self._same_frame_started_at: Optional[float] = None
         self._same_frame_count = 0
@@ -633,13 +649,19 @@ class LuxriotCaptureSession:
         self.frozen_frame_dropped_count = 0
 
     def start(self) -> None:
+        if self.summarization_enabled and not self.summary_worker_thread.is_alive():
+            self.summary_worker_thread.start()
         if not self.thread.is_alive():
             self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        with self.summary_condition:
+            self.summary_condition.notify_all()
         if self.thread.is_alive():
             self.thread.join(timeout=0.75)
+        if self.summary_worker_thread.is_alive():
+            self.summary_worker_thread.join(timeout=0.75)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -647,10 +669,26 @@ class LuxriotCaptureSession:
             try:
                 if self._should_use_live_segment():
                     handled = self._run_live_segment_once()
-                    if not handled and self.capture_source_mode == "auto":
+                    if (
+                        not handled
+                        and self.capture_source_mode == "auto"
+                        and not self._snapshot_unavailable_in_auto()
+                    ):
                         self._run_snapshot_once()
                 else:
-                    self._run_snapshot_once()
+                    try:
+                        self._run_snapshot_once()
+                    except Exception as exc:
+                        if self.capture_source_mode != "auto":
+                            raise
+                        self.last_error = str(exc)
+                        self._record_snapshot_result(
+                            max(0.0, time.monotonic() - loop_started),
+                            success=False,
+                        )
+                        handled = self._run_live_segment_once()
+                        if handled:
+                            self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
                 self._record_snapshot_result(
@@ -667,28 +705,40 @@ class LuxriotCaptureSession:
             return True
         with self.lock:
             slow_count = int(self.slow_snapshot_count)
+            snapshot_count = int(self.snapshot_count)
+            snapshot_failed_count = int(self.snapshot_failed_count)
             last_latency = self.last_snapshot_latency_sec
             threshold = float(self.snapshot_slow_threshold_sec)
-        return slow_count > 0 or (
+        return (snapshot_count <= 0 and snapshot_failed_count > 0) or slow_count > 0 or (
             last_latency is not None
             and threshold > 0
             and float(last_latency) >= threshold
         )
 
+    def _snapshot_unavailable_in_auto(self) -> bool:
+        if self.capture_source_mode != "auto":
+            return False
+        with self.lock:
+            return int(self.snapshot_count) <= 0 and int(self.snapshot_failed_count) > 0
+
     def _run_snapshot_once(self) -> None:
         snapshot_started = time.monotonic()
-        snapshot = self.client.get_snapshot(self.channel_id)
+        capture_timeout = float(getattr(self.manager.config, "LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC", 5.0))
+        snapshot = self.client.get_snapshot(self.channel_id, timeout=capture_timeout)
         snapshot_latency = max(0.0, time.monotonic() - snapshot_started)
         self._record_snapshot_result(snapshot_latency, success=True)
         self.active_capture_source = "snapshot"
         self._accept_captured_frame(snapshot, int(time.time() * 1000))
 
     def _run_live_segment_once(self) -> bool:
+        if self._live_segment_backoff_active():
+            return False
         ffmpeg_result = self._run_ffmpeg_live_segment_once()
         if ffmpeg_result is not None:
             return ffmpeg_result
         if iter_luxriot_live_segment_frames is None:
             self.last_live_segment_error = "road_events live segment decoder is unavailable"
+            self._set_live_segment_backoff(failed=True)
             if self.capture_source_mode == "live_segment":
                 raise RuntimeError(self.last_live_segment_error)
             return False
@@ -728,6 +778,7 @@ class LuxriotCaptureSession:
                 self.last_live_segment_latency_sec = latency
                 self.last_live_segment_frames = accepted
                 self.last_live_segment_error = None if accepted > 0 else "live segment produced no decoded frames"
+            self._set_live_segment_backoff(failed=accepted <= 0)
             self._summarize_if_ready()
             return accepted > 0
         except Exception as exc:
@@ -738,6 +789,7 @@ class LuxriotCaptureSession:
                 self.last_live_segment_latency_sec = latency
                 self.last_live_segment_frames = accepted
                 self.last_live_segment_error = str(exc)[:240] or exc.__class__.__name__
+            self._set_live_segment_backoff(failed=True)
             if self.capture_source_mode == "live_segment":
                 raise
             return False
@@ -753,12 +805,28 @@ class LuxriotCaptureSession:
         live_path = f"{base_path}/live/{int(self.channel_id)}/mainStream"
         return urlunsplit((parsed.scheme or "http", netloc, live_path, "", ""))
 
+    def _live_segment_backoff_active(self) -> bool:
+        with self.lock:
+            return float(self.live_segment_backoff_until or 0.0) > time.monotonic()
+
+    def _set_live_segment_backoff(self, *, failed: bool) -> None:
+        with self.lock:
+            if failed:
+                delay_sec = max(2.0, min(10.0, float(self.interval) * 5.0))
+                self.live_segment_backoff_until = time.monotonic() + delay_sec
+            else:
+                self.live_segment_backoff_until = 0.0
+
     def _run_ffmpeg_live_segment_once(self) -> Optional[bool]:
         frame_limit = max(1, int(self.batch_size))
         fps = float(getattr(self.manager.config, "LUXRIOT_LIVE_SEGMENT_FPS", 2.0))
         fps = max(0.2, min(10.0, fps))
         segment_seconds = float(getattr(self.manager.config, "LUXRIOT_LIVE_SEGMENT_SECONDS", 15.0))
-        timeout_sec = max(12.0, segment_seconds + 15.0, (float(frame_limit) / fps) + 12.0)
+        read_timeout_sec = float(getattr(self.manager.config, "LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC", 5.0))
+        read_timeout_sec = max(1.0, min(30.0, read_timeout_sec))
+        timeout_sec = max(6.0, segment_seconds + read_timeout_sec + 2.0, (float(frame_limit) / fps) + read_timeout_sec + 2.0)
+        timeout_sec = min(30.0, timeout_sec)
+        rw_timeout_us = str(int(read_timeout_sec * 1_000_000))
         started = time.monotonic()
         accepted = 0
         try:
@@ -770,6 +838,8 @@ class LuxriotCaptureSession:
                     "-loglevel",
                     "error",
                     "-nostdin",
+                    "-rw_timeout",
+                    rw_timeout_us,
                     "-i",
                     self._live_stream_url_with_credentials(),
                     "-vf",
@@ -815,6 +885,7 @@ class LuxriotCaptureSession:
                     else:
                         self.live_segment_failed_count += 1
                         self.last_live_segment_error = stderr[:240] or f"ffmpeg exited {completed.returncode} without frames"
+                self._set_live_segment_backoff(failed=accepted <= 0)
                 self._summarize_if_ready()
                 if accepted > 0:
                     return True
@@ -831,6 +902,7 @@ class LuxriotCaptureSession:
                 self.last_live_segment_latency_sec = latency
                 self.last_live_segment_frames = accepted
                 self.last_live_segment_error = f"ffmpeg live segment timed out after {timeout_sec:.1f}s"
+            self._set_live_segment_backoff(failed=True)
             if self.capture_source_mode == "live_segment":
                 raise RuntimeError(self.last_live_segment_error) from exc
             return False
@@ -842,6 +914,7 @@ class LuxriotCaptureSession:
                 self.last_live_segment_latency_sec = latency
                 self.last_live_segment_frames = accepted
                 self.last_live_segment_error = str(exc)[:240] or exc.__class__.__name__
+            self._set_live_segment_backoff(failed=True)
             if self.capture_source_mode == "live_segment":
                 raise
             return False
@@ -906,7 +979,7 @@ class LuxriotCaptureSession:
             ready_to_summarize = len(self.frames) >= self.batch_size
         summarized_ok = True
         if self.summarization_enabled and ready_to_summarize:
-            summarized_ok = self._summarize_batch()
+            summarized_ok = self._enqueue_summary_batch()
         if summarized_ok:
             self.last_error = None
 
@@ -929,21 +1002,27 @@ class LuxriotCaptureSession:
             if latency >= float(self.snapshot_slow_threshold_sec):
                 self.slow_snapshot_count += 1
 
-    def _summarize_batch(self, workload_class: str = "heartbeat") -> bool:
-        with self.lock:
-            frames_copy = list(self.frames)
-            self.frames.clear()
-        if not frames_copy:
+    def _dispatch_summary_frames(
+        self,
+        frames_copy: Sequence[Mapping[str, Any]],
+        *,
+        workload_class: str = "heartbeat",
+        restore_on_failure: bool = False,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        frame_items = [dict(frame) for frame in frames_copy if isinstance(frame, Mapping)]
+        if not frame_items:
             return True
+        job_meta = dict(metadata or {})
         try:
             batch = self.manager.create_summary_batch(
                 channel_id=self.channel_id,
-                run_id=self.run_id,
-                batch_size=self.batch_size,
-                prompt=self.prompt,
-                model_hint=self.model_hint,
-                interval_sec=self.interval,
-                frames=frames_copy,
+                run_id=str(job_meta.get("run_id") or self.run_id),
+                batch_size=int(job_meta.get("batch_size") or self.batch_size),
+                prompt=str(job_meta.get("prompt") if "prompt" in job_meta else self.prompt),
+                model_hint=cast(Optional[str], job_meta.get("model_hint")) if job_meta.get("model_hint") else self.model_hint,
+                interval_sec=float(job_meta.get("interval_sec") or self.interval),
+                frames=frame_items,
             )
             outcome = self.manager.dispatch_summary_batch(
                 batch,
@@ -961,10 +1040,79 @@ class LuxriotCaptureSession:
         except Exception as exc:
             self.last_error = str(exc)
             with self.lock:
-                self.frames = frames_copy + self.frames
-                self._enforce_buffer_locked()
+                if restore_on_failure:
+                    self.frames = frame_items + self.frames
+                    self._enforce_buffer_locked()
                 self.queue_dropped_batches += 1
             return False
+
+    def _summarize_batch(self, workload_class: str = "heartbeat") -> bool:
+        with self.lock:
+            frames_copy = list(self.frames)
+            self.frames.clear()
+        return self._dispatch_summary_frames(
+            frames_copy,
+            workload_class=workload_class,
+            restore_on_failure=True,
+        )
+
+    def _summary_job_metadata(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "batch_size": int(self.batch_size),
+            "prompt": self.prompt,
+            "model_hint": self.model_hint,
+            "interval_sec": float(self.interval),
+        }
+
+    def _enqueue_summary_batch(self, workload_class: str = "heartbeat") -> bool:
+        with self.summary_condition:
+            frames_copy = list(self.frames)
+            self.frames.clear()
+            if not frames_copy:
+                return True
+            metadata = self._summary_job_metadata()
+            if not self.summary_worker_thread.is_alive():
+                # Unit tests and manual direct calls often exercise the loop without
+                # start(); preserve the previous synchronous semantics there.
+                pass
+            else:
+                while len(self.summary_queue) >= self.summary_queue_max_batches:
+                    dropped_frames, _, _ = self.summary_queue.pop(0)
+                    self.queue_dropped_batches += 1
+                    self.dropped_frames += len(dropped_frames)
+                self.summary_queue.append((frames_copy, str(workload_class or "heartbeat"), metadata))
+                self.summary_condition.notify_all()
+                return True
+        return self._dispatch_summary_frames(
+            frames_copy,
+            workload_class=workload_class,
+            restore_on_failure=True,
+            metadata=metadata,
+        )
+
+    def _summary_worker(self) -> None:
+        while True:
+            with self.summary_condition:
+                while not self.summary_queue and not self.stop_event.is_set():
+                    self.summary_condition.wait(timeout=0.5)
+                if not self.summary_queue and self.stop_event.is_set():
+                    return
+                frames_copy, workload_class, metadata = self.summary_queue.pop(0)
+                self.summary_inflight = True
+            try:
+                ok = self._dispatch_summary_frames(
+                    frames_copy,
+                    workload_class=workload_class,
+                    restore_on_failure=False,
+                    metadata=metadata,
+                )
+                if ok:
+                    self.last_error = None
+            finally:
+                with self.summary_condition:
+                    self.summary_inflight = False
+                    self.summary_condition.notify_all()
 
     def _enforce_buffer_locked(self) -> None:
         """Ensure frame buffer does not grow unbounded."""
@@ -985,6 +1133,10 @@ class LuxriotCaptureSession:
         with self.lock:
             logs_copy = list(self.logs)
             pending_frames = len(self.frames)
+            summary_queue_depth = len(self.summary_queue)
+            summary_queue_frame_count = sum(len(item[0]) for item in self.summary_queue)
+            summary_inflight = bool(self.summary_inflight)
+            summary_worker_alive = self.summary_worker_thread.is_alive()
             recent_frame_count = len(self.recent_frames)
             last_snapshot_latency_sec = self.last_snapshot_latency_sec
             avg_snapshot_latency_sec = self.avg_snapshot_latency_sec
@@ -1000,6 +1152,7 @@ class LuxriotCaptureSession:
             last_live_segment_latency_sec = self.last_live_segment_latency_sec
             last_live_segment_frames = self.last_live_segment_frames
             last_live_segment_error = self.last_live_segment_error
+            live_segment_backoff_sec = max(0.0, float(self.live_segment_backoff_until or 0.0) - time.monotonic())
             frozen_signal = self.frozen_signal
             frozen_signal_since = self.frozen_signal_since
             frozen_frame_count = self.frozen_frame_count
@@ -1012,6 +1165,11 @@ class LuxriotCaptureSession:
             "run_started_at": self.run_started_at,
             "batch_size": self.batch_size,
             "pending_frames": pending_frames,
+            "summary_queue_depth": summary_queue_depth,
+            "summary_queue_frame_count": summary_queue_frame_count,
+            "summary_queue_max_batches": self.summary_queue_max_batches,
+            "summary_inflight": summary_inflight,
+            "summary_worker_alive": summary_worker_alive,
             "recent_frame_count": recent_frame_count,
             "interval_sec": self.interval,
             "max_edge": self.max_edge,
@@ -1048,6 +1206,7 @@ class LuxriotCaptureSession:
             else None,
             "last_live_segment_frames": last_live_segment_frames,
             "last_live_segment_error": last_live_segment_error,
+            "live_segment_backoff_sec": round(float(live_segment_backoff_sec), 3),
             "frozen_signal": frozen_signal,
             "frozen_signal_since": frozen_signal_since,
             "frozen_signal_age_sec": (
@@ -2955,6 +3114,7 @@ class LuxriotManager:
             "last_live_segment_latency_sec",
             "last_live_segment_frames",
             "last_live_segment_error",
+            "live_segment_backoff_sec",
             "frozen_signal",
             "frozen_signal_since",
             "frozen_signal_age_sec",

@@ -67,6 +67,8 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID` (`1`) | Default channel |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
+| `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC` (`5`) | Short timeout for per-frame snapshot capture; prevents stale UI when Luxriot stalls |
+| `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC` (`5`) | HTTP read timeout passed to ffmpeg live-segment capture |
 | `EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES` (`180`) | Per-channel frame buffer cap |
 | `EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC` (`45`) | Max age for UI live-preview EVA frames; stale buffers render as signal loss instead of replay |
 | `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC` (`20`) | Exact repeated-frame duration before a live source is marked frozen |
@@ -83,6 +85,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | History retention |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT` | Per-channel history cap |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH` (`4`) | Frames archived per batch for search |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES` (`2`) | Per-channel VLM summary backlog cap; live capture keeps refreshing while older queued batches may be dropped under load |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |

@@ -5,6 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/dist}"
 BUNDLE_NAME="${BUNDLE_NAME:-eva-ai-patch-$(date +%Y%m%d-%H%M%S)}"
+INCLUDE_WHEELHOUSE=false
+WHEELHOUSE_DIR=""
+PYTHON_BIN="${PYTHON:-python3}"
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -23,13 +26,17 @@ usage() {
 Usage: scripts/build_patch_bundle.sh [options]
 
 Options:
-  --output-dir DIR   Directory for the generated tarball.
-  --name NAME        Bundle directory/archive name.
-  -h, --help         Show this help.
+  --output-dir DIR      Directory for the generated tarball.
+  --name NAME           Bundle directory/archive name.
+  --with-wheelhouse     Download Python wheels into bundle/wheelhouse.
+  --wheelhouse-dir DIR  Copy an existing wheelhouse directory into the bundle.
+  --python-bin PATH     Python used for pip download. Default: $PYTHON or python3.
+  -h, --help            Show this help.
 
 Environment:
-  OUTPUT_DIR         Same as --output-dir.
-  BUNDLE_NAME        Same as --name.
+  OUTPUT_DIR            Same as --output-dir.
+  BUNDLE_NAME           Same as --name.
+  PYTHON                Same as --python-bin.
 USAGE
 }
 
@@ -41,6 +48,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --name)
       BUNDLE_NAME="$2"
+      shift 2
+      ;;
+    --with-wheelhouse)
+      INCLUDE_WHEELHOUSE=true
+      shift
+      ;;
+    --wheelhouse-dir)
+      WHEELHOUSE_DIR="$2"
+      INCLUDE_WHEELHOUSE=true
+      shift 2
+      ;;
+    --python-bin)
+      PYTHON_BIN="$2"
       shift 2
       ;;
     -h|--help)
@@ -96,6 +116,7 @@ log "Creating working-tree snapshot from ${REPO_ROOT}"
 COMMON_EXCLUDES=(
   "--exclude=.git"
   "--exclude=.venv"
+  "--exclude=.venv*"
   "--exclude=__pycache__"
   "--exclude=*.pyc"
   "--exclude=.pytest_cache"
@@ -108,6 +129,7 @@ COMMON_EXCLUDES=(
   "--exclude=detections_archive"
   "--exclude=video"
   "--exclude=models"
+  "--exclude=qwen-cookbooks"
   "--exclude=*.mp4"
   "--exclude=*.avi"
   "--exclude=*.mov"
@@ -128,12 +150,57 @@ else
   tar "${COMMON_EXCLUDES[@]}" -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${SNAPSHOT_DIR}"
 fi
 
-for script_name in install_patch.sh verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh; do
+for script_name in install_patch.sh verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh; do
   if [[ -f "${REPO_ROOT}/scripts/${script_name}" ]]; then
     cp "${REPO_ROOT}/scripts/${script_name}" "${BUNDLE_DIR}/scripts/${script_name}"
     chmod 0755 "${BUNDLE_DIR}/scripts/${script_name}"
   fi
 done
+
+if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
+  mkdir -p "${BUNDLE_DIR}/wheelhouse"
+  if [[ -n "${WHEELHOUSE_DIR}" ]]; then
+    [[ -d "${WHEELHOUSE_DIR}" ]] || {
+      fail "Wheelhouse directory not found: ${WHEELHOUSE_DIR}"
+      exit 1
+    }
+    log "Copying existing wheelhouse from ${WHEELHOUSE_DIR}"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a "${WHEELHOUSE_DIR}/" "${BUNDLE_DIR}/wheelhouse/"
+    else
+      tar -cf - -C "${WHEELHOUSE_DIR}" . | tar -xf - -C "${BUNDLE_DIR}/wheelhouse"
+    fi
+  else
+    log "Downloading offline wheels with ${PYTHON_BIN}"
+    if [[ -x "${PYTHON_BIN}" ]]; then
+      PIP_PYTHON="${PYTHON_BIN}"
+    elif command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+      PIP_PYTHON="$(command -v "${PYTHON_BIN}")"
+    else
+      fail "Python not found for wheel download: ${PYTHON_BIN}"
+      exit 1
+    fi
+    "${PIP_PYTHON}" -m pip download --dest "${BUNDLE_DIR}/wheelhouse" -r "${REPO_ROOT}/requirements.txt"
+    if [[ -f "${REPO_ROOT}/requirements-db.txt" ]]; then
+      "${PIP_PYTHON}" -m pip download --dest "${BUNDLE_DIR}/wheelhouse" -r "${REPO_ROOT}/requirements-db.txt"
+    fi
+  fi
+  {
+    printf 'created_at=%s\n' "$(date -Is)"
+    printf 'python_bin=%s\n' "${PYTHON_BIN}"
+    if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+      "${PYTHON_BIN}" --version 2>&1 | sed 's/^/python_version=/'
+    elif [[ -x "${PYTHON_BIN}" ]]; then
+      "${PYTHON_BIN}" --version 2>&1 | sed 's/^/python_version=/'
+    fi
+    printf 'requirements=requirements.txt requirements-db.txt\n'
+    if [[ -n "${WHEELHOUSE_DIR}" ]]; then
+      printf 'wheelhouse_source_dir=%s\n' "${WHEELHOUSE_DIR}"
+    fi
+    printf 'wheel_count=%s\n' "$(find "${BUNDLE_DIR}/wheelhouse" -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | wc -l | tr -d ' ')"
+  } > "${BUNDLE_DIR}/wheelhouse_manifest.txt"
+  ok "wheelhouse included"
+fi
 
 {
   printf 'bundle_name=%s\n' "${BUNDLE_NAME}"
@@ -142,6 +209,11 @@ done
   printf 'git_branch=%s\n' "${GIT_BRANCH}"
   printf 'git_commit=%s\n' "${GIT_COMMIT}"
   printf 'version=%s\n' "${VERSION_VALUE}"
+  if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
+    printf 'wheelhouse=included\n'
+  else
+    printf 'wheelhouse=not_included\n'
+  fi
   if [[ -n "${GIT_STATUS}" ]]; then
     printf 'working_tree_status=dirty\n'
     printf '\nChanged files at build time:\n'

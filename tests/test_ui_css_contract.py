@@ -119,7 +119,7 @@ def test_modal_consistency_contract_has_bounded_scroll_bodies():
     assert ".archive-review-shell" in section
     assert "max-block-size: calc(100dvh - 32px);" in section
     assert ".prompt-modal-scrollarea" in section
-    assert "grid-template-rows: auto minmax(0, 1fr) auto auto minmax(0, 0.55fr);" in section
+    assert "grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 0.55fr);" in section
     assert "position: relative;" in section
     assert "inset: auto;" in section
     assert "width: min(96vw, 1120px);" in section

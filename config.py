@@ -487,6 +487,20 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_LIVE_SEGMENT_FPS = 3.0
     LUXRIOT_LIVE_SEGMENT_FPS = max(0.2, min(10.0, LUXRIOT_LIVE_SEGMENT_FPS))
+    try:
+        LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC', '5.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC = 5.0
+    LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC))
+    try:
+        LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC', '5.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = 5.0
+    LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC))
     LUXRIOT_VECTOR_SIGNALS_ENABLED = os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
     try:
         LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT', '6'))
@@ -545,6 +559,13 @@ class Config:
         1,
         min(16, LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH),
     )
+    try:
+        LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES', '2')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES = 2
+    LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES = max(1, min(12, LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES))
     try:
         ARCHIVE_ESTIMATE_CHANNELS = int(os.getenv('EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS', '50'))
     except (TypeError, ValueError):
