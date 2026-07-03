@@ -92,10 +92,14 @@ candidate/evidence/navigation signals for human review.
 ### Offline Deployment Package
 
 - Added split offline patch runbooks:
+  - `readiness/OFFLINE_USB_01_PREPARE_MEDIA_EN.md`
+  - `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_EN.md`
+  - `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_EN.md`
   - `readiness/OFFLINE_USB_01_PREPARE_MEDIA_RU.md`
   - `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_RU.md`
   - `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_RU.md`
 - Added physical client topology docs:
+  - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_EN.md`
   - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_RU.md`
   - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3.svg`
 - `scripts/build_patch_bundle.sh` includes `preflight_patch.sh` in generated

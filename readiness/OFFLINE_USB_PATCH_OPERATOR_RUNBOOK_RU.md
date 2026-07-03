@@ -6,7 +6,19 @@ Schema head: `20260614_0006`
 Миграция БД: **нет** для обновления `β 0.8.2.1 -> β 0.8.3`
 
 Статус: этот файл оставлен как полный legacy-runbook. Для полевой установки
-предпочтительно использовать раздельные документы:
+предпочтительно использовать раздельные документы. Для космонавта используйте
+английскую версию:
+
+1. `readiness/OFFLINE_USB_01_PREPARE_MEDIA_EN.md` - USB preparation,
+   Linux mount steps, and terminal cheat sheet.
+2. `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_EN.md` - preflight and
+   deployment scenario decision.
+3. `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_EN.md` - install variants,
+   rollback, and manual post-install test.
+4. `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_EN.md` and
+   `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3.svg` - client physical topology.
+
+Русские версии оставлены рядом:
 
 1. `readiness/OFFLINE_USB_01_PREPARE_MEDIA_RU.md` - подготовка флешки,
    поиск/монтирование USB под Linux и терминальная шпаргалка.
