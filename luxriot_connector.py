@@ -20,14 +20,28 @@ try:
     from road_events import (
         AutoSceneCardConfig,
         DecodedVideoFrame,
+        RoadEventCue,
+        RoadEpisodeAggregator,
+        RoadEpisodeAggregatorConfig,
         RoadMotionAnalyzer,
+        RoadSceneCard,
+        RoadZone,
+        SceneCalibrationConfig,
+        calibrate_scene_card_from_results,
         infer_scene_card_from_frames,
         iter_luxriot_live_segment_frames,
     )
 except Exception:  # pragma: no cover - road CV is optional in minimal installs
     AutoSceneCardConfig = None  # type: ignore[assignment]
     DecodedVideoFrame = None  # type: ignore[assignment]
+    RoadEventCue = None  # type: ignore[assignment]
+    RoadEpisodeAggregator = None  # type: ignore[assignment]
+    RoadEpisodeAggregatorConfig = None  # type: ignore[assignment]
     RoadMotionAnalyzer = None  # type: ignore[assignment]
+    RoadSceneCard = None  # type: ignore[assignment]
+    RoadZone = None  # type: ignore[assignment]
+    SceneCalibrationConfig = None  # type: ignore[assignment]
+    calibrate_scene_card_from_results = None  # type: ignore[assignment]
     infer_scene_card_from_frames = None  # type: ignore[assignment]
     iter_luxriot_live_segment_frames = None  # type: ignore[assignment]
 
@@ -1526,6 +1540,14 @@ class LuxriotManager:
             road_cv_max_edge = 240
         self.road_cv_batch_max_edge = max(96, min(480, road_cv_max_edge))
         try:
+            road_scene_samples = int(getattr(config, "LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES", 8))
+        except Exception:
+            road_scene_samples = 8
+        self.road_scene_calibration_samples = max(4, min(64, road_scene_samples))
+        self.road_scene_auto_samples: Dict[int, List[Any]] = {}
+        self.road_scene_calibrations: Dict[int, Dict[str, Any]] = {}
+        self.road_episode_aggregators: Dict[int, Any] = {}
+        try:
             self.lm_input_warning_chars = int(getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000))
         except (TypeError, ValueError):
             self.lm_input_warning_chars = 24000
@@ -2544,7 +2566,10 @@ class LuxriotManager:
                 score = cls._finite_float(raw.get("score"))
                 if score is not None:
                     item["score"] = round(float(score), 4)
-                for int_key in ("timestamp_ms", "frame_index", "apex_frame"):
+                active_ratio = cls._finite_float(raw.get("active_ratio"))
+                if active_ratio is not None:
+                    item["active_ratio"] = round(float(active_ratio), 4)
+                for int_key in ("timestamp_ms", "frame_index", "apex_frame", "frame_interval_ms"):
                     parsed = _parse_optional_int(raw.get(int_key))
                     if parsed is not None:
                         item[int_key] = int(parsed)
@@ -2552,18 +2577,55 @@ class LuxriotManager:
         if road_items:
             out["road_cv_cues"] = road_items[:8]
 
+        episode_items: List[Dict[str, Any]] = []
+        raw_episodes = value.get("road_episodes")
+        if isinstance(raw_episodes, Sequence) and not isinstance(raw_episodes, (str, bytes, bytearray)):
+            for raw in raw_episodes[:12]:
+                if not isinstance(raw, Mapping):
+                    continue
+                event_type = str(raw.get("event_type") or "").strip()[:80]
+                episode_id = str(raw.get("episode_id") or "").strip()[:80]
+                if not event_type or not episode_id:
+                    continue
+                item = {
+                    "episode_id": episode_id,
+                    "event_type": event_type,
+                    "confidence": str(raw.get("confidence") or "low").strip().lower()[:20],
+                    "status": str(raw.get("status") or "candidate").strip().lower()[:20],
+                    "score_semantics": "road_episode_fusion_candidate_not_visual_proof",
+                }
+                for text_key in ("zone_name",):
+                    text = str(raw.get(text_key) or "").strip()
+                    if text:
+                        item[text_key] = text[:80]
+                score = cls._finite_float(raw.get("score"))
+                if score is not None:
+                    item["score"] = round(float(score), 4)
+                sources = raw.get("sources")
+                if isinstance(sources, Sequence) and not isinstance(sources, (str, bytes, bytearray)):
+                    item["sources"] = [str(source).strip()[:40] for source in sources if str(source).strip()][:8]
+                for int_key in ("channel_id", "start_ms", "end_ms", "apex_timestamp_ms", "apex_frame", "cue_count"):
+                    parsed = _parse_optional_int(raw.get(int_key))
+                    if parsed is not None:
+                        item[int_key] = int(parsed)
+                episode_items.append(item)
+        if episode_items:
+            out["road_episodes"] = episode_items[:8]
+
         scene = value.get("road_cv_scene")
         if isinstance(scene, Mapping):
             scene_out: Dict[str, Any] = {}
-            for text_key in ("confidence", "reason"):
+            for text_key in ("confidence", "reason", "status", "live_sample_confidence", "live_sample_reason"):
                 text = str(scene.get(text_key) or "").strip()
                 if text:
                     scene_out[text_key] = text[:180]
-            for int_key in ("frame_count", "motion_pair_count", "scene_cut_count"):
+            if "directional_enabled" in scene:
+                scene_out["directional_enabled"] = bool(scene.get("directional_enabled"))
+            for int_key in ("frame_count", "motion_pair_count", "scene_cut_count", "sample_count", "usable_zone_samples", "usable_flow_samples"):
                 parsed = _parse_optional_int(scene.get(int_key))
                 if parsed is not None:
                     scene_out[int_key] = int(parsed)
-            for score_key in ("zone_area_ratio", "flow_dominance"):
+            for score_key in ("zone_area_ratio", "flow_dominance", "zone_agreement", "flow_agreement"):
                 number = cls._finite_float(scene.get(score_key))
                 if number is not None:
                     scene_out[score_key] = round(float(number), 4)
@@ -2594,7 +2656,7 @@ class LuxriotManager:
             if health_out:
                 out["health"] = health_out
 
-        has_signal_payload = any(key in out for key in ("clip_probe_signals", "road_cv_cues"))
+        has_signal_payload = any(key in out for key in ("clip_probe_signals", "road_cv_cues", "road_episodes", "road_cv_scene"))
         if not has_signal_payload:
             return {}
         return out
@@ -2746,6 +2808,232 @@ class LuxriotManager:
         )
         return signals[:8], health
 
+    @staticmethod
+    def _road_scene_card_to_dict(card: Any) -> Dict[str, Any]:
+        if card is None:
+            return {}
+        return {
+            "channel_id": int(getattr(card, "channel_id", 0) or 0),
+            "title": str(getattr(card, "title", "") or ""),
+            "version": int(getattr(card, "version", 1) or 1),
+            "notes": str(getattr(card, "notes", "") or ""),
+            "zones": [
+                {
+                    "name": str(getattr(zone, "name", "") or ""),
+                    "polygon": [list(point) for point in (getattr(zone, "polygon", ()) or ())],
+                    "zone_type": str(getattr(zone, "zone_type", "") or "road"),
+                    "expected_flow": list(getattr(zone, "expected_flow", None))
+                    if getattr(zone, "expected_flow", None)
+                    else None,
+                    "enabled": bool(getattr(zone, "enabled", True)),
+                }
+                for zone in (getattr(card, "zones", ()) or ())
+            ],
+        }
+
+    @staticmethod
+    def _road_scene_card_without_expected_flow(card: Any) -> Any:
+        if RoadSceneCard is None or RoadZone is None or card is None:
+            return card
+        try:
+            zones = tuple(
+                RoadZone(
+                    name=str(getattr(zone, "name", "") or "road_zone"),
+                    polygon=tuple(getattr(zone, "polygon", ()) or ()),
+                    zone_type=str(getattr(zone, "zone_type", "") or "road"),
+                    expected_flow=None,
+                    enabled=bool(getattr(zone, "enabled", True)),
+                )
+                for zone in (getattr(card, "zones", ()) or ())
+            )
+            return RoadSceneCard(
+                channel_id=int(getattr(card, "channel_id", 0) or 0),
+                title=str(getattr(card, "title", "") or ""),
+                zones=zones,
+                notes=str(getattr(card, "notes", "") or ""),
+                version=int(getattr(card, "version", 1) or 1),
+            )
+        except Exception:
+            return card
+
+    @classmethod
+    def _road_calibration_state_from_result(cls, result: Any) -> Dict[str, Any]:
+        payload = result.as_dict() if hasattr(result, "as_dict") else {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        return {
+            "channel_id": int(getattr(getattr(result, "scene_card", None), "channel_id", 0) or 0),
+            "confidence": str(getattr(result, "confidence", payload.get("confidence", "low")) or "low").strip().lower(),
+            "reason": str(getattr(result, "reason", payload.get("reason", "")) or "").strip()[:240],
+            "sample_count": int(_parse_optional_int(payload.get("sample_count")) or _parse_optional_int(getattr(result, "sample_count", None)) or 0),
+            "usable_zone_samples": int(_parse_optional_int(payload.get("usable_zone_samples")) or _parse_optional_int(getattr(result, "usable_zone_samples", None)) or 0),
+            "usable_flow_samples": int(_parse_optional_int(payload.get("usable_flow_samples")) or _parse_optional_int(getattr(result, "usable_flow_samples", None)) or 0),
+            "zone_agreement": round(float(cls._finite_float(payload.get("zone_agreement")) or cls._finite_float(getattr(result, "zone_agreement", None)) or 0.0), 4),
+            "flow_agreement": round(float(cls._finite_float(payload.get("flow_agreement")) or cls._finite_float(getattr(result, "flow_agreement", None)) or 0.0), 4),
+            "updated_at": time.time(),
+            "scene_card": cls._road_scene_card_to_dict(getattr(result, "scene_card", None)),
+        }
+
+    @staticmethod
+    def _road_scene_card_from_state(state: Mapping[str, Any]) -> Any:
+        if RoadSceneCard is None:
+            return None
+        card_raw = state.get("scene_card")
+        if not isinstance(card_raw, Mapping):
+            return None
+        try:
+            return RoadSceneCard.from_mapping(card_raw)
+        except Exception:
+            return None
+
+    def _update_road_scene_calibration(self, channel_id: int, sample_result: Any) -> Dict[str, Any]:
+        if calibrate_scene_card_from_results is None or SceneCalibrationConfig is None:
+            return {}
+        with self.cache_lock:
+            samples = self.road_scene_auto_samples.setdefault(int(channel_id), [])
+            samples.append(sample_result)
+            if len(samples) > self.road_scene_calibration_samples:
+                del samples[: len(samples) - self.road_scene_calibration_samples]
+            if len(samples) < self.road_scene_calibration_samples:
+                existing = self.road_scene_calibrations.get(int(channel_id))
+                return dict(existing) if isinstance(existing, Mapping) else {}
+            sample_list = list(samples)
+        try:
+            result = calibrate_scene_card_from_results(
+                int(channel_id),
+                f"Channel {channel_id}",
+                sample_list,
+                config=SceneCalibrationConfig(),
+            )
+        except Exception:
+            existing = self.road_scene_calibrations.get(int(channel_id))
+            return dict(existing) if isinstance(existing, Mapping) else {}
+        state = self._road_calibration_state_from_result(result)
+        with self.cache_lock:
+            self.road_scene_calibrations[int(channel_id)] = state
+            self._summary_state_dirty = True
+        return dict(state)
+
+    def _road_episode_aggregator(self, channel_id: int) -> Any:
+        if RoadEpisodeAggregator is None or RoadEpisodeAggregatorConfig is None:
+            return None
+        with self.cache_lock:
+            existing = self.road_episode_aggregators.get(int(channel_id))
+            if existing is not None:
+                return existing
+            aggregator = RoadEpisodeAggregator(
+                RoadEpisodeAggregatorConfig(
+                    window_ms=90_000,
+                    close_after_ms=45_000,
+                    max_inter_cue_gap_ms=20_000,
+                )
+            )
+            self.road_episode_aggregators[int(channel_id)] = aggregator
+            return aggregator
+
+    @staticmethod
+    def _road_cue_type_from_clip_signal(signal: Mapping[str, Any]) -> Optional[str]:
+        text = " ".join(
+            str(signal.get(key) or "")
+            for key in ("name", "probe_id", "state")
+        ).lower()
+        if "burnout" in text:
+            return "clip_burnout"
+        if "tire smoke" in text or ("smoke" in text and ("car" in text or "vehicle" in text or "road" in text)):
+            return "clip_tire_smoke"
+        if "drift" in text or "sideways" in text or "sliding vehicle" in text:
+            return "clip_vehicle_drift"
+        return None
+
+    @classmethod
+    def _compact_road_episodes(cls, episodes: Sequence[Any]) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for episode in episodes[:12]:
+            if episode is None:
+                continue
+            item: Dict[str, Any] = {
+                "episode_id": str(getattr(episode, "episode_id", "") or "")[:80],
+                "event_type": str(getattr(episode, "event_type", "") or "")[:80],
+                "zone_name": str(getattr(episode, "zone_name", "") or "")[:80],
+                "confidence": str(getattr(episode, "confidence", "") or "low")[:20],
+                "status": str(getattr(episode, "status", "") or "candidate")[:20],
+                "score_semantics": "road_episode_fusion_candidate_not_visual_proof",
+                "cue_count": len(getattr(episode, "cues", ()) or ()),
+                "sources": sorted({str(getattr(cue, "source", "") or "") for cue in (getattr(episode, "cues", ()) or ()) if str(getattr(cue, "source", "") or "")})[:8],
+            }
+            for attr in ("channel_id", "start_ms", "end_ms", "apex_timestamp_ms", "apex_frame"):
+                parsed = _parse_optional_int(getattr(episode, attr, None))
+                if parsed is not None:
+                    item[attr] = int(parsed)
+            score = cls._finite_float(getattr(episode, "score", None))
+            if score is not None:
+                item["score"] = round(float(score), 4)
+            if item["episode_id"] and item["event_type"]:
+                items.append(item)
+        items.sort(key=lambda row: (int(_parse_optional_int(row.get("end_ms")) or 0), float(row.get("score") or 0.0)), reverse=True)
+        return items[:8]
+
+    def _road_episode_vector_signals(
+        self,
+        channel_id: int,
+        road_cues: Sequence[Mapping[str, Any]],
+        clip_signals: Sequence[Mapping[str, Any]],
+        *,
+        now_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if RoadEventCue is None:
+            return []
+        aggregator = self._road_episode_aggregator(int(channel_id))
+        if aggregator is None:
+            return []
+        event_cues: List[Any] = []
+        for cue in road_cues:
+            if not isinstance(cue, Mapping):
+                continue
+            cue_type = str(cue.get("cue_type") or "").strip()
+            timestamp_ms = _parse_optional_int(cue.get("timestamp_ms"))
+            if not cue_type or timestamp_ms is None:
+                continue
+            event_cues.append(
+                RoadEventCue(
+                    source="cv_motion",
+                    cue_type=cue_type,
+                    timestamp_ms=int(timestamp_ms),
+                    channel_id=int(channel_id),
+                    zone_name=str(cue.get("zone_name") or "").strip(),
+                    score=float(self._finite_float(cue.get("score")) or 0.0),
+                    label=str(cue.get("evidence") or "").strip(),
+                    evidence={
+                        "frame_index": _parse_optional_int(cue.get("frame_index")),
+                        "apex_frame": _parse_optional_int(cue.get("apex_frame")),
+                    },
+                )
+            )
+        for signal in clip_signals:
+            if not isinstance(signal, Mapping):
+                continue
+            cue_type = self._road_cue_type_from_clip_signal(signal)
+            timestamp_ms = _parse_optional_int(signal.get("timestamp_ms"))
+            if not cue_type or timestamp_ms is None:
+                continue
+            event_cues.append(
+                RoadEventCue(
+                    source="clip_probe",
+                    cue_type=cue_type,
+                    timestamp_ms=int(timestamp_ms),
+                    channel_id=int(channel_id),
+                    zone_name="",
+                    score=float(self._finite_float(signal.get("margin")) or self._finite_float(signal.get("m")) or 0.0),
+                    label=str(signal.get("name") or "").strip(),
+                    evidence={"apex_frame": _parse_optional_int(signal.get("apex_frame"))},
+                )
+            )
+        if event_cues:
+            episodes = aggregator.add_cues(event_cues)
+        else:
+            episodes = aggregator.current_episodes(now_ms=now_ms)
+        return self._compact_road_episodes(list(episodes))
+
     def _road_cv_vector_signals(
         self,
         channel_id: int,
@@ -2778,6 +3066,17 @@ class LuxriotManager:
         health["road_cv_decoded_frames"] = len(decoded)
         if len(decoded) < 3:
             return [], {}, health
+        intervals = [
+            int(decoded[idx].timestamp_ms) - int(decoded[idx - 1].timestamp_ms)
+            for idx in range(1, len(decoded))
+            if int(decoded[idx].timestamp_ms) >= int(decoded[idx - 1].timestamp_ms)
+        ]
+        if intervals:
+            sorted_intervals = sorted(intervals)
+            median_interval = sorted_intervals[len(sorted_intervals) // 2]
+            p90_interval = sorted_intervals[min(len(sorted_intervals) - 1, int(round((len(sorted_intervals) - 1) * 0.9)))]
+            health["road_cv_frame_interval_ms_median"] = int(median_interval)
+            health["road_cv_frame_interval_ms_p90"] = int(p90_interval)
         try:
             scene_result = infer_scene_card_from_frames(
                 int(channel_id),
@@ -2785,37 +3084,83 @@ class LuxriotManager:
                 decoded,
                 config=AutoSceneCardConfig(max_edge=int(self.road_cv_batch_max_edge), min_frames=min(12, max(3, len(decoded)))),
             )
-            analyzer = RoadMotionAnalyzer(scene_result.scene_card)
+            calibration_state = self._update_road_scene_calibration(int(channel_id), scene_result)
+            calibrated_card = self._road_scene_card_from_state(calibration_state)
+            calibration_confidence = str(calibration_state.get("confidence") or "").strip().lower()
+            if calibrated_card is not None and calibration_confidence == "high":
+                analysis_card = calibrated_card
+                scene_status = "calibrated"
+                directional_enabled = True
+            else:
+                analysis_card = self._road_scene_card_without_expected_flow(scene_result.scene_card)
+                scene_status = "calibrating" if calibration_state else "uncalibrated"
+                if calibration_confidence and calibration_confidence != "high":
+                    scene_status = "low_confidence" if calibration_confidence == "low" else "calibrating"
+                directional_enabled = False
+            health["road_cv_scene_status"] = scene_status
+            health["road_cv_directional_enabled"] = bool(directional_enabled)
+            analyzer = RoadMotionAnalyzer(analysis_card)
             cues: List[Dict[str, Any]] = []
+            active_ratios: List[float] = []
+            global_motion_values: List[float] = []
+            low_fps_suppressed = 0
             for decoded_frame in decoded:
                 sample = analyzer.analyze_frame(
                     decoded_frame.image,
                     timestamp_ms=int(decoded_frame.timestamp_ms),
                     frame_index=int(decoded_frame.frame_index),
                 )
+                if sample.global_motion:
+                    global_motion = self._finite_float(sample.global_motion.get("magnitude"))
+                    if global_motion is not None:
+                        global_motion_values.append(float(global_motion))
+                if sample.quality and int(_parse_optional_int(sample.quality.get("low_fps_suppressed")) or 0) > 0:
+                    low_fps_suppressed += 1
+                for metrics in sample.zone_metrics.values():
+                    if not isinstance(metrics, Mapping):
+                        continue
+                    active_ratio = self._finite_float(metrics.get("active_ratio"))
+                    if active_ratio is not None:
+                        active_ratios.append(float(active_ratio))
                 for cue in sample.cues:
+                    metrics = dict(cue.metrics)
                     cues.append(
                         {
                             "cue_type": cue.cue_type,
                             "zone_name": cue.zone_name,
                             "score": round(float(cue.score), 4),
                             "evidence": cue.evidence,
+                            "active_ratio": round(float(metrics.get("active_ratio") or 0.0), 4),
+                            "frame_interval_ms": int(_parse_optional_int(metrics.get("frame_interval_ms")) or 0),
                             "timestamp_ms": int(cue.timestamp_ms),
                             "frame_index": int(cue.frame_index or decoded_frame.frame_index),
                             "apex_frame": int(cue.frame_index or decoded_frame.frame_index),
                         }
                     )
+            if active_ratios:
+                health["road_cv_active_ratio_max"] = round(max(active_ratios), 4)
+            if global_motion_values:
+                health["road_cv_global_motion_max"] = round(max(global_motion_values), 4)
+            if low_fps_suppressed:
+                health["road_cv_low_fps_suppressed_frames"] = int(low_fps_suppressed)
             cues.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
             scene = scene_result.as_dict()
             scene_compact = {
-                "confidence": scene.get("confidence"),
-                "reason": scene.get("reason"),
+                "confidence": calibration_confidence or scene.get("confidence"),
+                "reason": calibration_state.get("reason") if calibration_state else scene.get("reason"),
+                "status": scene_status,
+                "directional_enabled": bool(directional_enabled),
+                "live_sample_confidence": scene.get("confidence"),
+                "live_sample_reason": scene.get("reason"),
                 "frame_count": scene.get("frame_count"),
                 "motion_pair_count": scene.get("motion_pair_count"),
                 "scene_cut_count": scene.get("scene_cut_count"),
                 "zone_area_ratio": scene.get("zone_area_ratio"),
                 "flow_dominance": scene.get("flow_dominance"),
             }
+            for key in ("sample_count", "usable_zone_samples", "usable_flow_samples", "zone_agreement", "flow_agreement"):
+                if key in calibration_state:
+                    scene_compact[key] = calibration_state.get(key)
             return cues[:8], scene_compact, health
         except Exception as exc:
             health["road_cv_error"] = str(exc)[:160] or exc.__class__.__name__
@@ -2905,7 +3250,8 @@ class LuxriotManager:
             if vector_signal:
                 clip_count = len(vector_signal.get("clip_probe_signals") or []) if isinstance(vector_signal.get("clip_probe_signals"), list) else 0
                 road_count = len(vector_signal.get("road_cv_cues") or []) if isinstance(vector_signal.get("road_cv_cues"), list) else 0
-                vector_signal_total += int(clip_count + road_count)
+                episode_count = len(vector_signal.get("road_episodes") or []) if isinstance(vector_signal.get("road_episodes"), list) else 0
+                vector_signal_total += int(clip_count + road_count + episode_count)
         meta: Dict[str, Any] = {}
         if delivery:
             meta["alert_delivery_breakdown"] = delivery
@@ -2999,11 +3345,13 @@ class LuxriotManager:
             if vector_signal:
                 clip_count = len(vector_signal.get("clip_probe_signals") or []) if isinstance(vector_signal.get("clip_probe_signals"), list) else 0
                 road_count = len(vector_signal.get("road_cv_cues") or []) if isinstance(vector_signal.get("road_cv_cues"), list) else 0
-                vector_signal_total += int(clip_count + road_count)
+                episode_count = len(vector_signal.get("road_episodes") or []) if isinstance(vector_signal.get("road_episodes"), list) else 0
+                vector_signal_total += int(clip_count + road_count + episode_count)
                 vector_item = {
                     "timestamp_ms": parsed_batch_end or (int(latest_candidate * 1000.0) if latest_candidate is not None else None),
                     "clip_probe_signal_count": clip_count,
                     "road_cv_cue_count": road_count,
+                    "road_episode_count": episode_count,
                     "health": vector_signal.get("health") if isinstance(vector_signal.get("health"), Mapping) else {},
                 }
                 clip_signals = vector_signal.get("clip_probe_signals")
@@ -3012,6 +3360,12 @@ class LuxriotManager:
                 road_cues = vector_signal.get("road_cv_cues")
                 if isinstance(road_cues, list) and road_cues:
                     vector_item["top_road_cv_cue"] = road_cues[0]
+                road_episodes = vector_signal.get("road_episodes")
+                if isinstance(road_episodes, list) and road_episodes:
+                    vector_item["top_road_episode"] = road_episodes[0]
+                road_scene = vector_signal.get("road_cv_scene")
+                if isinstance(road_scene, Mapping):
+                    vector_item["road_cv_scene"] = dict(road_scene)
                 recent_vector_signals.append(vector_item)
 
         recent_alerts.sort(
@@ -3320,6 +3674,11 @@ class LuxriotManager:
             "summary_history": history_payload,
             "summary_runs": runs_payload,
             "channel_routines": routine_payload,
+            "road_scene_calibrations": {
+                str(channel_id): dict(state)
+                for channel_id, state in self.road_scene_calibrations.items()
+                if isinstance(state, Mapping)
+            },
             "prompt_settings": prompt_payload,
         }
         state_store = getattr(self, "runtime_state_store", None)
@@ -3373,6 +3732,7 @@ class LuxriotManager:
         history_raw = payload.get("summary_history") if isinstance(payload, Mapping) else None
         runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
         routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
+        road_scene_raw = payload.get("road_scene_calibrations") if isinstance(payload, Mapping) else None
         prompt_settings_raw = payload.get("prompt_settings") if isinstance(payload, Mapping) else None
         loaded_history: Dict[int, List[Dict[str, Any]]] = {}
         if isinstance(history_raw, Mapping):
@@ -3440,6 +3800,47 @@ class LuxriotManager:
                 if isinstance(memory_raw, Mapping):
                     loaded_entry["memory"] = dict(memory_raw)
                 loaded_routines[int(channel_id)] = loaded_entry
+        loaded_road_scene_calibrations: Dict[int, Dict[str, Any]] = {}
+        if isinstance(road_scene_raw, Mapping):
+            for channel_key, state_value in road_scene_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or not isinstance(state_value, Mapping):
+                    continue
+                card_raw = state_value.get("scene_card")
+                if RoadSceneCard is None or not isinstance(card_raw, Mapping):
+                    continue
+                try:
+                    card = RoadSceneCard.from_mapping(card_raw)
+                except Exception:
+                    continue
+                normalized_state = {
+                    "channel_id": int(channel_id),
+                    "confidence": str(state_value.get("confidence") or "low").strip().lower() or "low",
+                    "reason": str(state_value.get("reason") or "").strip()[:240],
+                    "sample_count": int(_parse_optional_int(state_value.get("sample_count")) or 0),
+                    "usable_zone_samples": int(_parse_optional_int(state_value.get("usable_zone_samples")) or 0),
+                    "usable_flow_samples": int(_parse_optional_int(state_value.get("usable_flow_samples")) or 0),
+                    "zone_agreement": float(self._coerce_float(state_value.get("zone_agreement")) or 0.0),
+                    "flow_agreement": float(self._coerce_float(state_value.get("flow_agreement")) or 0.0),
+                    "updated_at": float(self._coerce_float(state_value.get("updated_at")) or time.time()),
+                    "scene_card": {
+                        "channel_id": card.channel_id,
+                        "title": card.title,
+                        "version": card.version,
+                        "notes": card.notes,
+                        "zones": [
+                            {
+                                "name": zone.name,
+                                "polygon": [list(point) for point in zone.polygon],
+                                "zone_type": zone.zone_type,
+                                "expected_flow": list(zone.expected_flow) if zone.expected_flow else None,
+                                "enabled": zone.enabled,
+                            }
+                            for zone in card.zones
+                        ],
+                    },
+                }
+                loaded_road_scene_calibrations[int(channel_id)] = normalized_state
         loaded_stream_system_prompt: Optional[str] = None
         loaded_alert_policy_prompt: Optional[str] = None
         loaded_rollup_prompts: Dict[str, str] = {}
@@ -3526,6 +3927,7 @@ class LuxriotManager:
             self.summary_history = loaded_history
             self.summary_runs = loaded_runs
             self.channel_routine_context = loaded_routines
+            self.road_scene_calibrations = loaded_road_scene_calibrations
             self.active_summary_runs = {}
             self.channel_prompt_overrides = loaded_channel_prompt_overrides
             self._rebuild_channel_status_digest_locked()
@@ -4343,6 +4745,12 @@ class LuxriotManager:
         health.update(clip_health)
         road_cues, road_scene, road_health = self._road_cv_vector_signals(int(channel_id), frames)
         health.update(road_health)
+        road_episodes = self._road_episode_vector_signals(
+            int(channel_id),
+            road_cues,
+            clip_signals,
+            now_ms=batch_end_ms,
+        )
         bundle: Dict[str, Any] = {
             "version": 1,
             "channel_id": int(channel_id),
@@ -4357,6 +4765,8 @@ class LuxriotManager:
             bundle["clip_probe_signals"] = clip_signals
         if road_cues:
             bundle["road_cv_cues"] = road_cues
+        if road_episodes:
+            bundle["road_episodes"] = road_episodes
         if road_scene:
             bundle["road_cv_scene"] = road_scene
         return self._compact_vector_signal(bundle)
@@ -5601,7 +6011,8 @@ class LuxriotManager:
                 node["vector_signal"] = vector_signal
                 clip_count = len(vector_signal.get("clip_probe_signals") or []) if isinstance(vector_signal.get("clip_probe_signals"), list) else 0
                 road_count = len(vector_signal.get("road_cv_cues") or []) if isinstance(vector_signal.get("road_cv_cues"), list) else 0
-                node["vector_signal_total"] = int(clip_count + road_count)
+                episode_count = len(vector_signal.get("road_episodes") or []) if isinstance(vector_signal.get("road_episodes"), list) else 0
+                node["vector_signal_total"] = int(clip_count + road_count + episode_count)
             nodes.append(node)
         nodes.sort(key=lambda item: float(item.get("window_start") or 0.0))
         return nodes

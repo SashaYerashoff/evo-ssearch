@@ -88,6 +88,39 @@ def test_motion_analyzer_flags_opposing_flow_against_scene_card():
     assert sample.zone_metrics["main_lane"]["alignment"] < -0.35
 
 
+def test_motion_analyzer_does_not_emit_directional_cues_without_expected_flow():
+    analyzer = RoadMotionAnalyzer(
+        _scene(expected_flow=None),
+        MotionAnalyzerConfig(
+            max_edge=160,
+            min_motion_px=0.25,
+            active_ratio_floor=0.003,
+            mean_motion_floor=0.05,
+            p90_motion_floor=0.1,
+            wrong_way_alignment=-0.35,
+            compensate_global_motion=True,
+        ),
+    )
+    analyzer.analyze_frame(_frame_with_vehicle(52), timestamp_ms=1000, frame_index=1)
+
+    sample = analyzer.analyze_frame(_frame_with_vehicle(36), timestamp_ms=2000, frame_index=2)
+
+    assert any(cue.cue_type == "road_motion_burst" for cue in sample.cues)
+    assert not any(cue.cue_type == "opposing_flow_candidate" for cue in sample.cues)
+    assert not any(cue.cue_type == "cross_flow_candidate" for cue in sample.cues)
+
+
+def test_motion_analyzer_suppresses_motion_claims_at_low_fps_intervals():
+    analyzer = _analyzer()
+    analyzer.analyze_frame(_frame_with_vehicle(20), timestamp_ms=1000, frame_index=1)
+
+    sample = analyzer.analyze_frame(_frame_with_vehicle(52), timestamp_ms=7000, frame_index=2)
+
+    assert sample.quality["low_fps_suppressed"] == 1.0
+    assert sample.zone_metrics["main_lane"]["frame_interval_ms"] == 6000
+    assert sample.cues == ()
+
+
 def test_motion_analyzer_does_not_flag_expected_direction_as_wrong_way():
     analyzer = _analyzer()
     analyzer.analyze_frame(_frame_with_vehicle(20), timestamp_ms=1000, frame_index=1)
@@ -338,6 +371,114 @@ def test_episode_aggregator_promotes_repeated_motion_to_medium_candidate():
     assert episodes[0].event_type == "aggressive_vehicle_motion_candidate"
     assert episodes[0].confidence == "medium"
     assert episodes[0].evidence_timestamps == (10_000, 20_000)
+
+
+def test_episode_aggregator_keeps_episode_id_as_window_slides():
+    aggregator = RoadEpisodeAggregator(
+        RoadEpisodeAggregatorConfig(
+            window_ms=15_000,
+            close_after_ms=30_000,
+            max_inter_cue_gap_ms=20_000,
+            min_cues_for_medium=2,
+        )
+    )
+    cue1 = RoadEventCue(
+        source="cv_motion",
+        cue_type="road_motion_burst",
+        timestamp_ms=10_000,
+        channel_id=7,
+        zone_name="main_lane",
+        score=0.4,
+    )
+    cue2 = RoadEventCue(
+        source="cv_motion",
+        cue_type="road_motion_burst",
+        timestamp_ms=20_000,
+        channel_id=7,
+        zone_name="main_lane",
+        score=0.5,
+    )
+    cue3 = RoadEventCue(
+        source="cv_motion",
+        cue_type="road_motion_burst",
+        timestamp_ms=30_000,
+        channel_id=7,
+        zone_name="main_lane",
+        score=0.6,
+    )
+
+    first = aggregator.add_cues([cue1, cue2])[0]
+    second = aggregator.add_cue(cue3)[0]
+
+    assert second.episode_id == first.episode_id
+    assert second.start_ms == 10_000
+    assert second.end_ms == 30_000
+    assert second.confidence == "medium"
+
+
+def test_episode_aggregator_starts_new_episode_after_quiet_gap():
+    aggregator = RoadEpisodeAggregator(
+        RoadEpisodeAggregatorConfig(
+            window_ms=90_000,
+            close_after_ms=30_000,
+            max_inter_cue_gap_ms=5_000,
+        )
+    )
+    cue1 = RoadEventCue(
+        source="cv_motion",
+        cue_type="road_motion_burst",
+        timestamp_ms=10_000,
+        channel_id=7,
+        zone_name="main_lane",
+        score=0.4,
+    )
+    cue2 = RoadEventCue(
+        source="cv_motion",
+        cue_type="road_motion_burst",
+        timestamp_ms=20_000,
+        channel_id=7,
+        zone_name="main_lane",
+        score=0.5,
+    )
+
+    first_id = aggregator.add_cue(cue1)[0].episode_id
+    episodes = aggregator.add_cue(cue2)
+
+    assert len(episodes) == 2
+    assert {episode.status for episode in episodes} == {"active", "closed"}
+    assert any(episode.episode_id == first_id and episode.status == "closed" for episode in episodes)
+    assert any(episode.episode_id != first_id and episode.status == "active" for episode in episodes)
+
+
+def test_episode_aggregator_promotes_appearance_drift_without_motion_cue():
+    aggregator = RoadEpisodeAggregator(
+        RoadEpisodeAggregatorConfig(window_ms=90_000, min_sources_for_high=2)
+    )
+
+    episodes = aggregator.add_cues(
+        [
+            RoadEventCue(
+                source="clip_probe",
+                cue_type="clip_tire_smoke",
+                timestamp_ms=10_000,
+                channel_id=7,
+                zone_name="intersection",
+                score=0.7,
+            ),
+            RoadEventCue(
+                source="vlm_alert",
+                cue_type="vlm_vehicle_drift",
+                timestamp_ms=12_000,
+                channel_id=7,
+                zone_name="intersection",
+                score=0.8,
+            ),
+        ]
+    )
+
+    drift = [episode for episode in episodes if episode.event_type == "drift_burnout_candidate"][0]
+    assert drift.confidence == "high"
+    assert {cue.source for cue in drift.cues} == {"clip_probe", "vlm_alert"}
 
 
 def test_episode_aggregator_promotes_multi_source_drift_to_high_candidate():

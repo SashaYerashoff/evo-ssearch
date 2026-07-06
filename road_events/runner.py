@@ -63,6 +63,8 @@ def _episode_to_dict(episode: RoadEpisode) -> dict:
         "score": round(float(episode.score), 4),
         "status": episode.status,
         "evidence_timestamps": list(episode.evidence_timestamps),
+        "apex_timestamp_ms": episode.apex_timestamp_ms,
+        "apex_frame": episode.apex_frame,
         "cue_count": len(episode.cues),
         "sources": sorted({cue.source for cue in episode.cues}),
     }

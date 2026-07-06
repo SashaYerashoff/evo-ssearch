@@ -1,4 +1,5 @@
 import ast
+import base64
 import json
 import os
 import stat
@@ -6,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -13,6 +15,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import numpy as np
+from PIL import Image
 
 from inference_queue import (
     InMemoryInferenceQueueRepository,
@@ -109,6 +112,32 @@ def sample_frames(start: float = 100.0):
             "width": 1280,
             "height": 720,
         },
+    ]
+
+
+def _jpeg_b64(frame: np.ndarray) -> str:
+    image = Image.fromarray(frame.astype(np.uint8), "RGB")
+    out = BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+def _road_frame(x: int, *, width: int = 120, height: int = 80) -> np.ndarray:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[46:58, x : x + 20, :] = 255
+    return frame
+
+
+def road_sample_frames(xs: Sequence[int], start: float = 100.0, step: float = 1.0):
+    return [
+        {
+            "thumbnail": _jpeg_b64(_road_frame(x)),
+            "captured_at": start + idx * step,
+            "time_sec": start + idx * step,
+            "width": 120,
+            "height": 80,
+        }
+        for idx, x in enumerate(xs)
     ]
 
 
@@ -656,6 +685,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(vector_signal["clip_probe_signals"][0]["name"], "vehicle drift candidate")
             self.assertEqual(vector_signal["clip_probe_signals"][0]["apex_frame"], 2)
             self.assertEqual(vector_signal["clip_probe_signals"][0]["p"], 0.42)
+            self.assertEqual(vector_signal["road_episodes"][0]["event_type"], "drift_burnout_candidate")
+            self.assertIn("clip_probe", vector_signal["road_episodes"][0]["sources"])
             self.assertNotIn("thumbnail", json.dumps(vector_signal))
 
             entry = manager.run_summary_batch(batch)
@@ -671,8 +702,76 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             l0 = manager.summary_rollups(channel_id=7, synthesize=False)["levels"]["L0"][0]
             self.assertEqual(l0["vector_signal"]["clip_probe_signals"][0]["probe_id"], "probe-drift")
             digest = manager.system_status_digest(channel_ids=[7])["channels"][0]
-            self.assertEqual(digest["vector_signal_total"], 1)
+            self.assertEqual(digest["vector_signal_total"], 2)
             self.assertEqual(digest["recent_vector_signals"][0]["top_clip_probe"]["name"], "vehicle drift candidate")
+            self.assertEqual(digest["recent_vector_signals"][0]["top_road_episode"]["event_type"], "drift_burnout_candidate")
+
+    def test_road_cv_directional_cues_wait_for_frozen_high_confidence_scene(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES": 4,
+                    "LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT": 0,
+                },
+            )
+
+            forward = [12, 20, 28, 36, 44, 52, 60, 68]
+            first = manager._build_vector_signal_bundle(
+                7,
+                road_sample_frames(forward, start=100.0),
+                batch_start_ms=100000,
+                batch_end_ms=107000,
+            )
+
+            self.assertEqual(first["road_cv_scene"]["status"], "uncalibrated")
+            self.assertFalse(first["road_cv_scene"]["directional_enabled"])
+            self.assertNotIn(
+                "opposing_flow_candidate",
+                {cue["cue_type"] for cue in first.get("road_cv_cues", [])},
+            )
+
+            for offset in (120.0, 140.0, 160.0):
+                manager._build_vector_signal_bundle(
+                    7,
+                    road_sample_frames(forward, start=offset),
+                    batch_start_ms=int(offset * 1000),
+                    batch_end_ms=int((offset + 7) * 1000),
+                )
+
+            reverse = [68, 60, 52, 44, 36, 28, 20, 12]
+            checked = manager._build_vector_signal_bundle(
+                7,
+                road_sample_frames(reverse, start=180.0),
+                batch_start_ms=180000,
+                batch_end_ms=187000,
+            )
+
+            self.assertEqual(checked["road_cv_scene"]["status"], "calibrated")
+            self.assertTrue(checked["road_cv_scene"]["directional_enabled"])
+            self.assertIn(
+                "opposing_flow_candidate",
+                {cue["cue_type"] for cue in checked.get("road_cv_cues", [])},
+            )
+            self.assertEqual(checked["health"]["road_cv_scene_status"], "calibrated")
+
+    def test_low_fps_suppresses_road_cv_motion_but_keeps_clip_vector_signal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.probe_manager = FakeVectorProbeManager()
+            manager.probes_store = FakeVectorProbeStore()
+
+            vector_signal = manager._build_vector_signal_bundle(
+                7,
+                road_sample_frames([12, 44, 76, 44], start=100.0, step=6.0),
+                batch_start_ms=100000,
+                batch_end_ms=118000,
+            )
+
+            self.assertEqual(vector_signal["clip_probe_signals"][0]["name"], "vehicle drift candidate")
+            self.assertEqual(vector_signal["health"]["road_cv_low_fps_suppressed_frames"], 3)
+            self.assertNotIn("road_cv_cues", vector_signal)
+            self.assertEqual(vector_signal["road_episodes"][0]["event_type"], "drift_burnout_candidate")
 
     def test_sync_fallback_archives_batch_frame_anchors(self):
         archived = []

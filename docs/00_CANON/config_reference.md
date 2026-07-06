@@ -157,6 +157,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS` (`true`) | Adds bounded road-motion cues to L0 vector signals from the current batch |
 | `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES` (`24`) | Max frames sampled per L0 batch for road-CV cue extraction |
 | `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE` (`240`) | Max edge used for L0 batch road-CV cue extraction |
+| `EVOSSEARCH_LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES` (`8`) | Per-channel auto-scene samples required before high-confidence frozen road direction can enable wrong-way/cross-flow cues |
 | `EVOSSEARCH_ROAD_CV_ENABLED` (`false`) | Reserved for dedicated road-event CV runners |
 | `EVOSSEARCH_ROAD_CV_SCENE_CARDS` (`empty`) | JSON scene-card path with channel road zones and expected flow vectors |
 | `EVOSSEARCH_ROAD_CV_MAX_EDGE` (`360`) | Max edge for motion analysis frames |
