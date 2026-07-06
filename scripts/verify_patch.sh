@@ -5,6 +5,7 @@ SERVICE_NAME="${EVA_SERVICE_NAME:-eva-ai}"
 BASE_URL="${EVA_BASE_URL:-http://127.0.0.1:5000}"
 TIMEOUT_SECONDS="${EVA_VERIFY_TIMEOUT_SECONDS:-45}"
 CHECK_SERVICE=true
+USER_SERVICE=false
 CURL_INSECURE="${EVA_PATCH_CURL_INSECURE:-false}"
 
 ok() {
@@ -27,7 +28,9 @@ Options:
   --service NAME      systemd service name. Default: eva-ai.
   --base-url URL      App base URL. Default: http://127.0.0.1:5000.
   --timeout SECONDS   Wait timeout for endpoints. Default: 45.
+  --user-service      Check a per-user systemd service with systemctl --user.
   --skip-service      Do not check systemd service state.
+  --curl-insecure     Allow self-signed HTTPS checks.
   -h, --help          Show this help.
 
 Environment:
@@ -49,8 +52,16 @@ while [[ $# -gt 0 ]]; do
       TIMEOUT_SECONDS="$2"
       shift 2
       ;;
+    --user-service)
+      USER_SERVICE=true
+      shift
+      ;;
     --skip-service)
       CHECK_SERVICE=false
+      shift
+      ;;
+    --curl-insecure)
+      CURL_INSECURE=true
       shift
       ;;
     -h|--help)
@@ -79,7 +90,11 @@ RESULT=0
 
 if [[ "${CHECK_SERVICE}" == true ]]; then
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    SYSTEMCTL=(systemctl)
+    if [[ "${USER_SERVICE}" == true ]]; then
+      SYSTEMCTL=(systemctl --user)
+    fi
+    if "${SYSTEMCTL[@]}" is-active --quiet "${SERVICE_NAME}.service"; then
       ok "service ${SERVICE_NAME} is active"
     else
       fail "service ${SERVICE_NAME} is not active"

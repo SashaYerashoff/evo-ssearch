@@ -11,6 +11,9 @@ EXPECTED_VERSION="${EVA_EXPECTED_VERSION:-}"
 EXPECTED_SCHEMA="${EVA_EXPECTED_SCHEMA:-20260614_0006}"
 BUNDLE_DIR=""
 STRICT=false
+CHECK_SERVICE=true
+USER_SERVICE=false
+CURL_INSECURE=true
 MIN_BACKUP_FREE_MB="${EVA_PREFLIGHT_MIN_BACKUP_FREE_MB:-20480}"
 
 OK_COUNT=0
@@ -50,6 +53,10 @@ Options:
   --expected-version STR  Expected patch/app version, for example "β 0.8.3".
   --expected-schema REV   Expected Alembic revision. Default: 20260614_0006.
   --min-backup-free-mb N  Warn if backup filesystem has less free space.
+  --user-service          Check a per-user systemd service with systemctl --user.
+  --skip-service          Do not check systemd service state.
+  --curl-insecure         Allow self-signed HTTPS checks. Enabled by default.
+  --no-curl-insecure      Disable curl -k for HTTPS endpoint checks.
   --strict                Treat warnings as failures.
   -h, --help              Show this help.
 USAGE
@@ -96,6 +103,22 @@ while [[ $# -gt 0 ]]; do
     --min-backup-free-mb)
       MIN_BACKUP_FREE_MB="$2"
       shift 2
+      ;;
+    --user-service)
+      USER_SERVICE=true
+      shift
+      ;;
+    --skip-service)
+      CHECK_SERVICE=false
+      shift
+      ;;
+    --curl-insecure)
+      CURL_INSECURE=true
+      shift
+      ;;
+    --no-curl-insecure)
+      CURL_INSECURE=false
+      shift
       ;;
     --strict)
       STRICT=true
@@ -235,21 +258,31 @@ if [[ -d "${APP_DIR}" ]]; then
 fi
 
 print_header "Systemd"
-if command -v systemctl >/dev/null 2>&1; then
-  if systemctl list-unit-files "${SERVICE_NAME}.service" --no-legend >/dev/null 2>&1 \
-    || systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1
+SYSTEMCTL=(systemctl)
+if [[ "${USER_SERVICE}" == true ]]; then
+  SYSTEMCTL=(systemctl --user)
+fi
+if [[ "${CHECK_SERVICE}" != true ]]; then
+  warn "systemd service check skipped"
+elif command -v systemctl >/dev/null 2>&1; then
+  if "${SYSTEMCTL[@]}" list-unit-files "${SERVICE_NAME}.service" --no-legend >/dev/null 2>&1 \
+    || "${SYSTEMCTL[@]}" cat "${SERVICE_NAME}.service" >/dev/null 2>&1
   then
-    ok "systemd service exists: ${SERVICE_NAME}.service"
-    unit_path="$(systemctl show -p FragmentPath --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
-    work_dir="$(systemctl show -p WorkingDirectory --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
-    user_name="$(systemctl show -p User --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
-    group_name="$(systemctl show -p Group --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    if [[ "${USER_SERVICE}" == true ]]; then
+      ok "user systemd service exists: ${SERVICE_NAME}.service"
+    else
+      ok "systemd service exists: ${SERVICE_NAME}.service"
+    fi
+    unit_path="$("${SYSTEMCTL[@]}" show -p FragmentPath --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    work_dir="$("${SYSTEMCTL[@]}" show -p WorkingDirectory --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    user_name="$("${SYSTEMCTL[@]}" show -p User --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    group_name="$("${SYSTEMCTL[@]}" show -p Group --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
     printf 'unit_path=%s\nworking_directory=%s\nuser=%s\ngroup=%s\n' \
       "${unit_path:-unknown}" "${work_dir:-unknown}" "${user_name:-unknown}" "${group_name:-unknown}"
     if [[ -n "${work_dir}" && "${work_dir}" != "${APP_DIR}" ]]; then
       warn "systemd WorkingDirectory differs from app dir"
     fi
-    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    if "${SYSTEMCTL[@]}" is-active --quiet "${SERVICE_NAME}.service"; then
       ok "service is active"
     else
       warn "service is not active before patch"
@@ -358,7 +391,11 @@ print_header "HTTP Health"
 if command -v curl >/dev/null 2>&1; then
   health_body="$(mktemp)"
   ready_body="$(mktemp)"
-  if curl -k -sS --max-time 8 "${BASE_URL}/health" > "${health_body}" 2>/tmp/eva-preflight-curl.err; then
+  CURL_OPTS=(-sS --max-time 8)
+  if [[ "${CURL_INSECURE}" == true ]]; then
+    CURL_OPTS+=(-k)
+  fi
+  if curl "${CURL_OPTS[@]}" "${BASE_URL}/health" > "${health_body}" 2>/tmp/eva-preflight-curl.err; then
     ok "health reachable at ${BASE_URL}/health"
     health_version="$(json_value "${health_body}" '.version')"
     health_status="$(json_value "${health_body}" '.status')"
@@ -368,7 +405,7 @@ if command -v curl >/dev/null 2>&1; then
     warn "health not reachable at ${BASE_URL}/health"
     [[ -s /tmp/eva-preflight-curl.err ]] && sed -n '1,3p' /tmp/eva-preflight-curl.err >&2
   fi
-  if curl -k -sS --max-time 8 "${BASE_URL}/ready" > "${ready_body}" 2>/tmp/eva-preflight-curl.err; then
+  if curl "${CURL_OPTS[@]}" "${BASE_URL}/ready" > "${ready_body}" 2>/tmp/eva-preflight-curl.err; then
     ok "ready reachable at ${BASE_URL}/ready"
     ready_status="$(json_value "${ready_body}" '.status')"
     [[ -n "${ready_status}" ]] && printf 'ready_status=%s\n' "${ready_status}"
