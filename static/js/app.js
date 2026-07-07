@@ -257,7 +257,10 @@
     const archiveReviewFrameEmpty = document.getElementById('archiveReviewFrameEmpty');
     const archiveReviewChannel = document.getElementById('archiveReviewChannel');
     const archiveReviewFrameRole = document.getElementById('archiveReviewFrameRole');
+    const archiveReviewPrevFrameBtn = document.getElementById('archiveReviewPrevFrameBtn');
+    const archiveReviewNextFrameBtn = document.getElementById('archiveReviewNextFrameBtn');
     const archiveReviewTimestamp = document.getElementById('archiveReviewTimestamp');
+    const archiveReviewFilmstrip = document.getElementById('archiveReviewFilmstrip');
     const archiveReviewSummary = document.getElementById('archiveReviewSummary');
     const archiveReviewDescribeBtn = document.getElementById('archiveReviewDescribeBtn');
     const archiveReviewSimilarBtn = document.getElementById('archiveReviewSimilarBtn');
@@ -305,6 +308,7 @@
     let luxriotPreviewLoading = false;
     let luxriotPreviewRequestSeq = 0;
     let luxriotPreviewObjectUrl = '';
+    let luxriotPreviewAbortController = null;
     let luxriotSummaryTimer = null;
     let luxriotSummaryRefreshInFlight = false;
     let luxriotSummaryRefreshQueued = null;
@@ -317,6 +321,10 @@
         width: 0,
         height: 0,
         loadedAt: 0,
+        frameAgeSec: null,
+        stale: false,
+        staleAfterSec: 0,
+        lostAfterSec: 0,
         failed: false,
         errorCode: '',
         errorText: '',
@@ -324,6 +332,7 @@
     let luxriotPromptModalTab = 'stream';
     let luxriotPromptLayers = null;
     let luxriotInitialized = false;
+    let luxriotInitPromise = null;
     const probeHitsCacheByKey = {};
     const probeHitsOffsetByKey = {};
     const probeFramesByKey = {};
@@ -1135,21 +1144,42 @@
         monitorBox.style.display = mode === 'monitor' ? 'grid' : 'none';
         if (agentBox) agentBox.style.display = mode === 'agent' ? 'grid' : 'none';
         if (mode === 'video') {
-            ensureLuxriotInit();
-            startLuxriotPreview();
-            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            refreshLuxriotStreams();
-            startLuxriotSummaryPoll();
+            stopProbePreview();
+            stopProbeRunLoop();
+            stopProbeStatusPoll();
+            if (probeEditorModal) {
+                setProbeEditorModalVisibility(false);
+            }
+            setProbeCastModalVisibility(false);
             syncProbeChannelSelect();
+            void ensureLuxriotInit()
+                .then(() => {
+                    if (currentMode !== 'video') return;
+                    startLuxriotPreview();
+                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                    refreshLuxriotStreams();
+                    startLuxriotSummaryPoll();
+                })
+                .catch((err) => {
+                    setLuxriotStatus(`Luxriot init failed: ${err.message || err}`, true);
+                });
         } else if (mode === 'monitor') {
-            ensureLuxriotInit();
-            syncProbeChannelSelect();
-            syncProbePreview(getSelectedProbeChannelId());
-            refreshProbeStatus();
-            loadProbeList();
-            startProbeStatusPoll();
+            stopLuxriotPreview(true);
+            stopLuxriotSummaryPoll();
+            void ensureLuxriotInit()
+                .then(() => {
+                    if (currentMode !== 'monitor') return;
+                    syncProbeChannelSelect();
+                    syncProbePreview(getSelectedProbeChannelId());
+                    refreshProbeStatus();
+                    loadProbeList();
+                    startProbeStatusPoll();
+                })
+                .catch((err) => {
+                    setProbeStatus(`Luxriot init failed: ${err.message || err}`, true);
+                });
         } else {
-            stopLuxriotPreview();
+            stopLuxriotPreview(true);
             stopLuxriotSummaryPoll();
             stopProbePreview();
             stopProbeRunLoop();
@@ -1450,6 +1480,21 @@
         }) || null;
     }
 
+    function luxriotPreviewFreshnessLimits(channelId) {
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        const intervalSec = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
+            || getLuxriotLiveIntervalInputValue()
+            || Number(luxriotDefaults.snapshotInterval)
+            || 1;
+        const batchSize = Number(videoStream?.batch_size) || Number(luxriotBatchSizeSelect?.value) || Number(luxriotDefaults.batchSize) || 1;
+        const liveSegmentLatency = Number(videoStream?.last_live_segment_latency_sec);
+        const sourceLatency = Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0 ? liveSegmentLatency : 0;
+        const expectedCycleSec = Math.max(1, (Math.max(1, batchSize) * Math.max(0.25, intervalSec)) + sourceLatency);
+        const staleAfterSec = Math.max(20, Math.min(75, expectedCycleSec + 10));
+        const lostAfterSec = Math.max(staleAfterSec + 15, Math.min(180, (expectedCycleSec * 3) + 15));
+        return { expectedCycleSec, staleAfterSec, lostAfterSec };
+    }
+
     function probeStatsForChannel(channelId) {
         const target = parseInt(String(channelId || ''), 10);
         const stats = { total: 0, enabled: 0, disabled: 0 };
@@ -1495,6 +1540,8 @@
         const probePaused = probeState === 'paused' || Boolean(analyticsStream?.paused);
         const stateClass = luxriotPreviewMeta.failed
             ? 'error'
+            : luxriotPreviewMeta.stale
+                ? 'slow'
             : running
                 ? 'running'
                 : showProbeDiagnostics && probeRunning
@@ -1508,6 +1555,8 @@
                 : luxriotPreviewMeta.errorCode === 'signal_frozen'
                     ? 'signal frozen'
                 : 'preview error'
+            : luxriotPreviewMeta.stale
+                ? 'slow'
             : running
                 ? 'summaries on'
                 : showProbeDiagnostics && probeRunning
@@ -1545,6 +1594,9 @@
         const activeCaptureSource = String(videoStream?.active_capture_source || '').trim();
         const liveSegmentLatency = Number(videoStream?.last_live_segment_latency_sec);
         const liveSegmentFrames = Number(videoStream?.last_live_segment_frames) || 0;
+        const summaryQueueDepth = Number(videoStream?.summary_queue_depth) || 0;
+        const summaryQueueFrames = Number(videoStream?.summary_queue_frame_count) || 0;
+        const summaryInflight = Boolean(videoStream?.summary_inflight);
         const queueLabel = running
             ? `${formatCompactCount(queued)}/${formatCompactCount(batchSize)} frames · ${formatCompactCount(flushes)} flushes${dropped > 0 ? ` · ${formatCompactCount(dropped)} dropped` : ''}`
             : 'idle';
@@ -1563,6 +1615,13 @@
         if (luxriotPreviewMeta.failed && luxriotPreviewMeta.errorText) {
             detailParts.push(luxriotPreviewMeta.errorText);
         }
+        if (!luxriotPreviewMeta.failed && luxriotPreviewMeta.stale) {
+            const age = Number(luxriotPreviewMeta.frameAgeSec);
+            const lostAfter = Number(luxriotPreviewMeta.lostAfterSec);
+            detailParts.push(
+                `Preview frame is delayed${Number.isFinite(age) ? ` (${age.toFixed(1)}s old)` : ''}; EVA is holding the last model-visible frame while the capture/VLM cycle catches up${Number.isFinite(lostAfter) && lostAfter > 0 ? `, signal loss after ${Math.round(lostAfter)}s` : ''}.`
+            );
+        }
         if (videoStream?.frozen_signal) {
             const age = Number(videoStream.frozen_signal_age_sec);
             detailParts.push(`Frozen source: repeated identical EVA frames${Number.isFinite(age) && age > 0 ? ` for ${formatLuxriotDuration(age)}` : ''}.`);
@@ -1576,6 +1635,9 @@
         }
         if (activeCaptureSource === 'live_segment' && Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0) {
             detailParts.push(`Live segment source ${liveSegmentLatency.toFixed(1)}s · ${formatCompactCount(liveSegmentFrames)} frames`);
+        }
+        if (summaryInflight || summaryQueueDepth > 0) {
+            detailParts.push(`VLM processing${summaryInflight ? ' active' : ''}${summaryQueueDepth > 0 ? ` · ${formatCompactCount(summaryQueueDepth)} queued batch${summaryQueueDepth === 1 ? '' : 'es'} / ${formatCompactCount(summaryQueueFrames)} frames` : ''}.`);
         }
         if (!detailParts.length && running) detailParts.push('Live summaries are collecting frames for the selected channel.');
         if (!detailParts.length && showProbeDiagnostics && probeRunning) {
@@ -1613,13 +1675,38 @@
         }
     }
 
-    function stopLuxriotPreview() {
+    function abortLuxriotPreviewRequest() {
+        if (!luxriotPreviewAbortController) return;
+        try {
+            luxriotPreviewAbortController.abort();
+        } catch (err) {
+            // Best-effort cleanup only.
+        }
+        luxriotPreviewAbortController = null;
+    }
+
+    function stopLuxriotPreview(clearImage = false) {
         if (luxriotPreviewTimer) {
             clearInterval(luxriotPreviewTimer);
             luxriotPreviewTimer = null;
         }
         luxriotPreviewRequestSeq += 1;
+        abortLuxriotPreviewRequest();
         luxriotPreviewLoading = false;
+        if (clearImage) {
+            releaseLuxriotPreviewObjectUrl();
+            if (luxriotPreviewImg) {
+                luxriotPreviewImg.removeAttribute('src');
+            }
+            if (luxriotOverlay) {
+                luxriotOverlay.textContent = '';
+            }
+            if (luxriotViewport) {
+                luxriotViewport.classList.remove('is-signal-lost', 'is-signal-stale');
+            }
+            luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, frameAgeSec: null, stale: false, staleAfterSec: 0, lostAfterSec: 0, failed: false, errorCode: '', errorText: '' };
+            updateLuxriotStreamContext();
+        }
     }
 
     function releaseLuxriotPreviewObjectUrl() {
@@ -1639,11 +1726,16 @@
         }
         if (luxriotViewport) {
             luxriotViewport.classList.add('is-signal-lost');
+            luxriotViewport.classList.remove('is-signal-stale');
         }
         luxriotPreviewMeta = {
             width: 0,
             height: 0,
             loadedAt: 0,
+            frameAgeSec: null,
+            stale: false,
+            staleAfterSec: 0,
+            lostAfterSec: 0,
             failed: true,
             errorCode: errorCode || 'preview_error',
             errorText: errorText || 'Live preview is unavailable.',
@@ -1663,6 +1755,7 @@
             clearInterval(luxriotSummaryTimer);
             luxriotSummaryTimer = null;
         }
+        luxriotSummaryRefreshQueued = null;
     }
 
     function getSelectedLuxriotChannel() {
@@ -2548,10 +2641,11 @@
         }
         stopLuxriotPreview();
         releaseLuxriotPreviewObjectUrl();
-        if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost');
-        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, failed: false, errorCode: '', errorText: '' };
+        if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost', 'is-signal-stale');
+        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, frameAgeSec: null, stale: false, staleAfterSec: 0, lostAfterSec: 0, failed: false, errorCode: '', errorText: '' };
         updateLuxriotStreamContext();
         const refresh = async () => {
+            if (currentMode !== 'video') return;
             if (luxriotPreviewLoading) return;
             luxriotPreviewLoading = true;
             const requestSeq = ++luxriotPreviewRequestSeq;
@@ -2559,10 +2653,23 @@
             if (luxriotOverlay) {
                 luxriotOverlay.textContent = 'Loading...';
             }
-            const previewUrl = `/luxriot/recent_frame/${requestedChannelId}?mode=cycle&fps=2&fallback=0&max_age_sec=45&t=${Date.now()}`;
+            abortLuxriotPreviewRequest();
+            const controller = new AbortController();
+            luxriotPreviewAbortController = controller;
+            const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+            const clearActiveRequest = () => {
+                window.clearTimeout(timeoutId);
+                if (luxriotPreviewAbortController === controller) {
+                    luxriotPreviewAbortController = null;
+                }
+            };
+            const freshness = luxriotPreviewFreshnessLimits(requestedChannelId);
+            const maxAgeSec = freshness.lostAfterSec;
+            const previewUrl = `/luxriot/recent_frame/${requestedChannelId}?mode=latest&fallback=0&max_age_sec=${encodeURIComponent(String(maxAgeSec))}&t=${Date.now()}`;
             try {
-                const response = await fetch(previewUrl, { cache: 'no-store' });
+                const response = await fetch(previewUrl, { cache: 'no-store', signal: controller.signal });
                 if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                    clearActiveRequest();
                     return;
                 }
                 if (!response.ok) {
@@ -2572,6 +2679,7 @@
                     } catch (err) {
                         body = {};
                     }
+                    clearActiveRequest();
                     luxriotPreviewLoading = false;
                     const code = String(body.error_code || (response.status === 503 ? 'signal_lost' : 'preview_error'));
                     const detail = String(body.error || body.message || (code === 'signal_lost'
@@ -2585,14 +2693,37 @@
                 if (!contentType.toLowerCase().startsWith('image/')) {
                     throw new Error('Preview endpoint did not return an image.');
                 }
+                const frameTimestampMs = Number(response.headers.get('X-EVA-Frame-Timestamp-Ms'));
+                const frameAgeSec = Number(response.headers.get('X-EVA-Frame-Age-Sec'));
+                const previewLoadedAt = Number.isFinite(frameTimestampMs) && frameTimestampMs > 0
+                    ? frameTimestampMs
+                    : Number.isFinite(frameAgeSec) && frameAgeSec >= 0
+                        ? Date.now() - (frameAgeSec * 1000)
+                        : Date.now();
                 const blob = await response.blob();
+                clearActiveRequest();
                 if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
                     return;
                 }
                 const objectUrl = URL.createObjectURL(blob);
                 const loader = new Image();
                 loader.decoding = 'async';
+                let imageSettled = false;
+                const imageTimeoutId = window.setTimeout(() => {
+                    if (imageSettled) return;
+                    imageSettled = true;
+                    URL.revokeObjectURL(objectUrl);
+                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                        return;
+                    }
+                    luxriotPreviewLoading = false;
+                    setLuxriotPreviewSignalLost('preview_error', 'Preview image decode timed out.');
+                    setLuxriotStatus('Preview image decode timed out.', true);
+                }, 5000);
                 loader.onload = () => {
+                    if (imageSettled) return;
+                    imageSettled = true;
+                    window.clearTimeout(imageTimeoutId);
                     if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
                         URL.revokeObjectURL(objectUrl);
                         return;
@@ -2601,20 +2732,33 @@
                     luxriotPreviewObjectUrl = objectUrl;
                     luxriotPreviewLoading = false;
                     luxriotPreviewImg.src = objectUrl;
-                    if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost');
+                    const stale = Number.isFinite(frameAgeSec) && frameAgeSec > freshness.staleAfterSec;
+                    if (luxriotViewport) {
+                        luxriotViewport.classList.remove('is-signal-lost');
+                        luxriotViewport.classList.toggle('is-signal-stale', stale);
+                    }
                     luxriotPreviewMeta = {
                         width: Number(loader.naturalWidth) || 0,
                         height: Number(loader.naturalHeight) || 0,
-                        loadedAt: Date.now(),
+                        loadedAt: previewLoadedAt,
+                        frameAgeSec: Number.isFinite(frameAgeSec) ? frameAgeSec : null,
+                        stale,
+                        staleAfterSec: freshness.staleAfterSec,
+                        lostAfterSec: freshness.lostAfterSec,
                         failed: false,
                         errorCode: '',
                         errorText: '',
                     };
-                    if (luxriotOverlay) luxriotOverlay.textContent = '';
+                    if (luxriotOverlay) luxriotOverlay.textContent = stale ? 'Processing delay' : '';
                     updateLuxriotStreamContext();
-                    setLuxriotStatus(`Previewing channel ${requestedChannelId}`);
+                    setLuxriotStatus(stale
+                        ? `Previewing delayed EVA frame for channel ${requestedChannelId}`
+                        : `Previewing channel ${requestedChannelId}`);
                 };
                 loader.onerror = () => {
+                    if (imageSettled) return;
+                    imageSettled = true;
+                    window.clearTimeout(imageTimeoutId);
                     URL.revokeObjectURL(objectUrl);
                     if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
                         return;
@@ -2625,11 +2769,13 @@
                 };
                 loader.src = objectUrl;
             } catch (err) {
+                clearActiveRequest();
                 if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
                     return;
                 }
                 luxriotPreviewLoading = false;
-                const message = err && err.message ? err.message : 'Preview request failed.';
+                const aborted = err && err.name === 'AbortError';
+                const message = aborted ? 'Preview request timed out.' : (err && err.message ? err.message : 'Preview request failed.');
                 setLuxriotPreviewSignalLost('preview_error', message);
                 setLuxriotStatus(message, true);
             }
@@ -3150,6 +3296,7 @@
             if (data.error) {
                 throw new Error(data.error);
             }
+            if (currentMode !== 'video') return;
             syncSummaryRunSelectOptions(data.runs, data.selected_run);
             syncSummaryFiltersFromResponse(data);
             const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
@@ -3162,7 +3309,9 @@
                 if (luxriotSummaryRunSelect) {
                     luxriotSummaryRunSelect.value = 'all';
                 }
-                refreshLuxriotSummaryView(channelId, true, false);
+                if (currentMode === 'video') {
+                    refreshLuxriotSummaryView(channelId, true, false);
+                }
                 return;
             }
             luxriotSummaryRollupCache[channelId] = data;
@@ -3184,12 +3333,14 @@
             setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
             setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
         } catch (err) {
+            if (currentMode !== 'video') return;
             setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch rollups: ' + err.message, true);
         }
     }
 
     async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+        if (currentMode !== 'video') return false;
         if (!channelId) return;
         if (luxriotSummaryRefreshInFlight) {
             const next = luxriotSummaryRefreshQueued || {};
@@ -3213,7 +3364,7 @@
             return true;
         } finally {
             luxriotSummaryRefreshInFlight = false;
-            if (luxriotSummaryRefreshQueued) {
+            if (currentMode === 'video' && luxriotSummaryRefreshQueued) {
                 const next = luxriotSummaryRefreshQueued;
                 luxriotSummaryRefreshQueued = null;
                 void refreshLuxriotSummaryView(
@@ -3221,6 +3372,8 @@
                     Boolean(next.force),
                     next.allowRunFallback !== false,
                 );
+            } else if (currentMode !== 'video') {
+                luxriotSummaryRefreshQueued = null;
             }
         }
     }
@@ -3790,6 +3943,7 @@
             if (data.error) {
                 throw new Error(data.error);
             }
+            if (currentMode !== 'video') return;
             syncSummaryRunSelectOptions(data.runs, data.selected_run);
             syncSummaryFiltersFromResponse(data);
             const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
@@ -3802,7 +3956,9 @@
                 if (luxriotSummaryRunSelect) {
                     luxriotSummaryRunSelect.value = 'all';
                 }
-                refreshLuxriotSummaryView(channelId, true, false);
+                if (currentMode === 'video') {
+                    refreshLuxriotSummaryView(channelId, true, false);
+                }
                 return;
             }
             renderLuxriotSummaries(data.logs || [], channelId);
@@ -3829,6 +3985,7 @@
             }
             appendLuxriotStatusHealthBadge(data);
         } catch (err) {
+            if (currentMode !== 'video') return;
             setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
         }
@@ -3837,6 +3994,7 @@
     function startLuxriotSummaryPoll() {
         stopLuxriotSummaryPoll();
         luxriotSummaryTimer = setInterval(() => {
+            if (currentMode !== 'video') return;
             const channelId = getSelectedSummaryChannel();
             refreshLuxriotSummaryView(channelId);
             refreshLuxriotStreams();
@@ -3892,7 +4050,9 @@
             setSummaryUnread(0);
             refreshLuxriotSummaryView(channelId, true);
             refreshLuxriotStreams();
-            startLuxriotSummaryPoll();
+            if (currentMode === 'video') {
+                startLuxriotSummaryPoll();
+            }
         } catch (err) {
             setLuxriotStatus(err.message, true);
         } finally {
@@ -3970,17 +4130,24 @@
 
     async function ensureLuxriotInit() {
         if (luxriotInitialized) return;
-        luxriotInitialized = true;
-        await fetchLuxriotChannels();
-        await refreshLuxriotPromptSettings();
-        updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
-        updateSummaryControlsUI();
-        setSummaryUnread(0);
-        syncLuxriotSummaryChannelSelect();
-        startLuxriotPreview();
-        refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-        refreshLuxriotStreams();
-        startLuxriotSummaryPoll();
+        if (luxriotInitPromise) return luxriotInitPromise;
+        luxriotInitPromise = (async () => {
+            await fetchLuxriotChannels();
+            await refreshLuxriotPromptSettings();
+            updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
+            updateSummaryControlsUI();
+            setSummaryUnread(0);
+            syncLuxriotSummaryChannelSelect();
+            refreshLuxriotStreams();
+            luxriotInitialized = true;
+        })();
+        try {
+            await luxriotInitPromise;
+        } catch (err) {
+            luxriotInitialized = false;
+            luxriotInitPromise = null;
+            throw err;
+        }
     }
 
     const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
@@ -5965,6 +6132,26 @@
             }
         });
     }
+    if (archiveReviewPrevFrameBtn) {
+        archiveReviewPrevFrameBtn.addEventListener('click', () => {
+            archiveReviewStepFrame(-1);
+        });
+    }
+    if (archiveReviewNextFrameBtn) {
+        archiveReviewNextFrameBtn.addEventListener('click', () => {
+            archiveReviewStepFrame(1);
+        });
+    }
+    if (archiveReviewFilmstrip) {
+        archiveReviewFilmstrip.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-archive-review-frame-index]');
+            if (!btn) return;
+            const frameIndex = Number.parseInt(btn.dataset.archiveReviewFrameIndex || '-1', 10);
+            if (Number.isFinite(frameIndex)) {
+                archiveReviewSetFrame(frameIndex);
+            }
+        });
+    }
     if (archiveReviewDescribeBtn) {
         archiveReviewDescribeBtn.addEventListener('click', () => {
             const context = archiveReviewContext;
@@ -6002,6 +6189,18 @@
     });
 
     document.addEventListener('keydown', (e) => {
+        if (archiveReviewModal && archiveReviewModal.style.display === 'block') {
+            if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                archiveReviewStepFrame(-1);
+                return;
+            }
+            if (e.key === 'ArrowRight') {
+                e.preventDefault();
+                archiveReviewStepFrame(1);
+                return;
+            }
+        }
         if (e.key !== 'Escape') return;
         if (imageLightboxModal && imageLightboxModal.style.display === 'block') {
             closeImageLightbox();
@@ -6034,6 +6233,14 @@
         if (settingsModal && settingsModal.style.display === 'block') {
             settingsModal.style.display = 'none';
         }
+    });
+
+    window.addEventListener('pagehide', () => {
+        stopLuxriotPreview(true);
+        stopLuxriotSummaryPoll();
+        stopProbePreview();
+        stopProbeRunLoop();
+        stopProbeStatusPoll();
     });
 
     if (adminUsersRefreshBtn) {
@@ -7289,8 +7496,10 @@
             updateLuxriotStreamContext();
             void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
             resetRoadSceneGrounding();
-            startLuxriotPreview();
-            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            if (currentMode === 'video') {
+                startLuxriotPreview();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            }
             refreshLuxriotStreams();
         });
     }
@@ -7729,6 +7938,7 @@
 
     function startProbePreview(channelId) {
         if (!probePreviewImg) return;
+        if (currentMode !== 'monitor') return;
         if (probePreviewTimer && probePreviewChannelId === channelId) return;
         stopProbePreview();
         if (!channelId && channelId !== 0) {
@@ -7751,6 +7961,10 @@
     }
 
     function syncProbePreview(channelIdOverride = null) {
+        if (currentMode !== 'monitor') {
+            stopProbePreview();
+            return;
+        }
         const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
         if (!probeEditorModal || probeEditorModal.style.display !== 'block') {
             stopProbePreview();
@@ -9750,16 +9964,291 @@
         if (imageLightboxMeta) imageLightboxMeta.textContent = '';
     }
 
+    function archiveReviewFrameNumber(result) {
+        const payload = archiveResultPayload(result);
+        const value = Number(payload.frame_index ?? payload.anchor_frame_index);
+        return Number.isFinite(value) ? value : null;
+    }
+
+    function archiveReviewBatchKey(result) {
+        if (!result || !isVideoArchiveResult(result)) return '';
+        const payload = archiveResultPayload(result);
+        const channelId = Number(result.channel_id);
+        const startMs = Number(payload.batch_start_ms ?? result.batch_start_ms);
+        const endMs = Number(payload.batch_end_ms ?? result.batch_end_ms);
+        const runId = String(payload.run_id || '').trim();
+        if (!Number.isFinite(channelId) || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return '';
+        return `${channelId}:${runId}:${Math.trunc(startMs)}:${Math.trunc(endMs)}`;
+    }
+
+    function archiveReviewFrameIdentity(result) {
+        if (!result) return '';
+        const payload = archiveResultPayload(result);
+        const batchKey = archiveReviewBatchKey(result);
+        const frameNo = archiveReviewFrameNumber(result);
+        const ts = Number(archiveFrameTimestampMs(result));
+        if (batchKey && (frameNo !== null || Number.isFinite(ts))) {
+            return [
+                batchKey,
+                frameNo !== null ? `f:${frameNo}` : '',
+                Number.isFinite(ts) ? `t:${Math.trunc(ts)}` : '',
+            ].filter(Boolean).join('|');
+        }
+        const id = result.detection_id ?? result.id;
+        if (id !== undefined && id !== null && String(id).trim()) {
+            return `id:${String(id)}`;
+        }
+        const role = String(payload.anchor_role || payload.anchor_source_role || result.source || '').trim();
+        return [
+            batchKey,
+            Number.isFinite(frameNo) ? `f:${frameNo}` : '',
+            Number.isFinite(ts) ? `t:${Math.trunc(ts)}` : '',
+            role,
+        ].filter(Boolean).join('|');
+    }
+
+    function archiveReviewSortFrames(frames) {
+        return [...frames].sort((a, b) => {
+            const aFrame = archiveReviewFrameNumber(a);
+            const bFrame = archiveReviewFrameNumber(b);
+            if (aFrame !== null && bFrame !== null && aFrame !== bFrame) return aFrame - bFrame;
+            const aTs = Number(archiveFrameTimestampMs(a));
+            const bTs = Number(archiveFrameTimestampMs(b));
+            if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return aTs - bTs;
+            return String(archiveReviewFrameIdentity(a)).localeCompare(String(archiveReviewFrameIdentity(b)));
+        });
+    }
+
+    function archiveReviewMergeFrames(frames) {
+        const unique = new Map();
+        (frames || []).forEach((frame) => {
+            if (!frame || !archiveResultHasImage(frame)) return;
+            const key = archiveReviewFrameIdentity(frame);
+            if (!key || unique.has(key)) return;
+            unique.set(key, frame);
+        });
+        return archiveReviewSortFrames(Array.from(unique.values()));
+    }
+
+    function archiveReviewLocalBatchFrames(result) {
+        const frames = [];
+        if (result && archiveResultHasImage(result)) frames.push(result);
+        const sourceKey = archiveReviewBatchKey(result);
+        if (sourceKey && Array.isArray(archiveRenderedResults)) {
+            archiveRenderedResults.forEach((candidate) => {
+                if (!candidate || !archiveResultHasImage(candidate)) return;
+                if (!isVideoArchiveResult(candidate)) return;
+                if (archiveReviewBatchKey(candidate) === sourceKey) {
+                    frames.push(candidate);
+                }
+            });
+        }
+        return archiveReviewMergeFrames(frames);
+    }
+
+    function archiveReviewActiveFrameIndex(frames, result) {
+        const targetIdentity = archiveReviewFrameIdentity(result);
+        const exact = frames.findIndex((frame) => archiveReviewFrameIdentity(frame) === targetIdentity);
+        if (exact >= 0) return exact;
+        const targetFrame = archiveReviewFrameNumber(result);
+        if (targetFrame !== null) {
+            const byFrame = frames.findIndex((frame) => archiveReviewFrameNumber(frame) === targetFrame);
+            if (byFrame >= 0) return byFrame;
+        }
+        const targetTs = Number(archiveFrameTimestampMs(result));
+        if (Number.isFinite(targetTs) && frames.length) {
+            let bestIndex = 0;
+            let bestDistance = Infinity;
+            frames.forEach((frame, idx) => {
+                const ts = Number(archiveFrameTimestampMs(frame));
+                if (!Number.isFinite(ts)) return;
+                const distance = Math.abs(ts - targetTs);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = idx;
+                }
+            });
+            return bestIndex;
+        }
+        return 0;
+    }
+
+    function archiveReviewRenderFrameNav() {
+        const context = archiveReviewContext;
+        const frames = Array.isArray(context?.frames) ? context.frames : [];
+        const activeIndex = Number.isFinite(context?.activeFrameIndex) ? context.activeFrameIndex : 0;
+        const activeResult = frames[activeIndex] || context?.result || null;
+        if (archiveReviewFrameRole) {
+            archiveReviewFrameRole.textContent = archiveFrameRoleText(activeResult);
+        }
+        if (archiveReviewTimestamp) {
+            archiveReviewTimestamp.textContent = `Timestamp: ${formatArchiveTimestamp(archiveFrameTimestampMs(activeResult))}`;
+        }
+        const previousFrame = activeIndex > 0 ? frames[activeIndex - 1] : null;
+        const nextFrame = activeIndex < frames.length - 1 ? frames[activeIndex + 1] : null;
+        if (archiveReviewPrevFrameBtn) {
+            const previousNumber = previousFrame ? archiveReviewFrameNumber(previousFrame) : null;
+            archiveReviewPrevFrameBtn.disabled = !previousFrame;
+            archiveReviewPrevFrameBtn.innerHTML = previousNumber !== null
+                ? `<span>${escapeHtml(String(previousNumber))}</span><span>&lsaquo;</span>`
+                : '&lsaquo;';
+        }
+        if (archiveReviewNextFrameBtn) {
+            const nextNumber = nextFrame ? archiveReviewFrameNumber(nextFrame) : null;
+            archiveReviewNextFrameBtn.disabled = !nextFrame;
+            archiveReviewNextFrameBtn.innerHTML = nextNumber !== null
+                ? `<span>&rsaquo;</span><span>${escapeHtml(String(nextNumber))}</span>`
+                : '&rsaquo;';
+        }
+    }
+
+    function archiveReviewRenderFilmstrip() {
+        if (!archiveReviewFilmstrip) return;
+        const context = archiveReviewContext;
+        const frames = Array.isArray(context?.frames) ? context.frames : [];
+        const activeIndex = Number.isFinite(context?.activeFrameIndex) ? context.activeFrameIndex : 0;
+        if (context?.framesLoading) {
+            archiveReviewFilmstrip.innerHTML = '<div class="archive-review-filmstrip-status">Loading batch frames...</div>';
+            return;
+        }
+        if (context?.framesError && frames.length <= 1) {
+            archiveReviewFilmstrip.innerHTML = `<div class="archive-review-filmstrip-status is-error">${escapeHtml(context.framesError)}</div>`;
+            return;
+        }
+        if (frames.length <= 1) {
+            archiveReviewFilmstrip.innerHTML = '<div class="archive-review-filmstrip-status">No neighboring batch frames returned.</div>';
+            return;
+        }
+        archiveReviewFilmstrip.innerHTML = frames.map((frame, idx) => {
+            const imageSrc = archiveResultImageSrc(frame);
+            const frameNo = archiveReviewFrameNumber(frame);
+            const label = frameNo !== null ? `Frame ${frameNo}` : `Frame ${idx + 1}`;
+            const roleText = archiveFrameRoleText(frame).replace(/\s+/g, ' ');
+            const activeClass = idx === activeIndex ? ' is-active' : '';
+            return `
+                <button class="archive-review-strip-frame${activeClass}" type="button" data-archive-review-frame-index="${idx}" title="${escapeHtml(roleText)}">
+                    <img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(label)}" loading="lazy">
+                    <span>${escapeHtml(label)}</span>
+                </button>
+            `;
+        }).join('');
+        const activeButton = archiveReviewFilmstrip.querySelector('.archive-review-strip-frame.is-active');
+        if (activeButton) {
+            activeButton.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
+        }
+    }
+
+    function archiveReviewRenderActiveFrame() {
+        const context = archiveReviewContext;
+        if (!context) return;
+        const frames = Array.isArray(context.frames) && context.frames.length ? context.frames : [context.baseResult || context.result];
+        const activeIndex = Math.max(0, Math.min(frames.length - 1, Number(context.activeFrameIndex) || 0));
+        const activeResult = frames[activeIndex] || context.baseResult || context.result;
+        context.frames = frames;
+        context.activeFrameIndex = activeIndex;
+        context.result = activeResult;
+        const imageSrc = archiveResultImageSrc(activeResult);
+        if (archiveReviewImg) {
+            archiveReviewImg.src = imageSrc || '';
+            archiveReviewImg.classList.toggle('is-hidden', !imageSrc);
+        }
+        if (archiveReviewFrameEmpty) {
+            archiveReviewFrameEmpty.classList.toggle('is-hidden', Boolean(imageSrc));
+        }
+        archiveReviewRenderFrameNav();
+        archiveReviewRenderFilmstrip();
+        if (archiveReviewJumpBtn) {
+            archiveReviewJumpBtn.disabled = !archiveResultCanOpenVlmFeed(activeResult);
+        }
+        if (archiveReviewDescribeBtn) {
+            archiveReviewDescribeBtn.disabled = !archiveResultHasImage(activeResult);
+        }
+        if (archiveReviewSimilarBtn) {
+            archiveReviewSimilarBtn.disabled = !archiveResultHasImage(activeResult);
+        }
+    }
+
+    function archiveReviewSetFrame(frameIndex) {
+        const context = archiveReviewContext;
+        if (!context || !Array.isArray(context.frames) || !context.frames.length) return;
+        const nextIndex = Math.max(0, Math.min(context.frames.length - 1, Number(frameIndex) || 0));
+        if (nextIndex === context.activeFrameIndex) return;
+        context.activeFrameIndex = nextIndex;
+        archiveReviewRenderActiveFrame();
+    }
+
+    function archiveReviewStepFrame(delta) {
+        const context = archiveReviewContext;
+        if (!context || !Array.isArray(context.frames) || !context.frames.length) return;
+        archiveReviewSetFrame((Number(context.activeFrameIndex) || 0) + delta);
+    }
+
+    async function archiveReviewLoadBatchFrames(context) {
+        if (!context || !context.baseResult || !isVideoArchiveResult(context.baseResult)) return;
+        const payload = archiveResultPayload(context.baseResult);
+        const channelId = Number(context.baseResult.channel_id);
+        const batchStart = Number(payload.batch_start_ms ?? context.baseResult.batch_start_ms);
+        const batchEnd = Number(payload.batch_end_ms ?? context.baseResult.batch_end_ms);
+        if (!Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(batchStart) || !Number.isFinite(batchEnd)) return;
+        context.framesLoading = true;
+        archiveReviewRenderFilmstrip();
+        const params = new URLSearchParams();
+        params.set('channel_id', String(Math.trunc(channelId)));
+        params.set('source', 'vlm_summary');
+        params.set('since_ms', String(Math.trunc(Math.min(batchStart, batchEnd))));
+        params.set('until_ms', String(Math.trunc(Math.max(batchStart, batchEnd))));
+        params.set('limit', '120');
+        params.set('offset', '0');
+        try {
+            const response = await fetch(`/detections/list?${params.toString()}`);
+            const data = await parseApiJson(response, 'Failed to load batch frames');
+            if (archiveReviewContext !== context) return;
+            const loaded = normalizeDetectionResults(Array.isArray(data.detections) ? data.detections : [])
+                .filter((item) => isVideoArchiveResult(item) && archiveResultHasImage(item))
+                .filter((item) => {
+                    const itemPayload = archiveResultPayload(item);
+                    const itemRun = String(itemPayload.run_id || '').trim();
+                    const targetRun = String(payload.run_id || '').trim();
+                    if (targetRun && itemRun && itemRun !== targetRun) return false;
+                    return true;
+                });
+            const merged = archiveReviewMergeFrames([context.baseResult, ...loaded]);
+            context.frames = merged.length ? merged : archiveReviewLocalBatchFrames(context.baseResult);
+            context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
+            context.framesError = '';
+        } catch (error) {
+            if (archiveReviewContext !== context) return;
+            context.frames = archiveReviewLocalBatchFrames(context.baseResult);
+            context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
+            context.framesError = error.message || 'Batch frames unavailable.';
+        } finally {
+            if (archiveReviewContext === context) {
+                context.framesLoading = false;
+                archiveReviewRenderActiveFrame();
+            }
+        }
+    }
+
     function closeArchiveReviewModal() {
         if (!archiveReviewModal) return;
         archiveReviewModal.style.display = 'none';
         archiveReviewContext = null;
         if (archiveReviewImg) archiveReviewImg.src = '';
+        if (archiveReviewFilmstrip) archiveReviewFilmstrip.innerHTML = '';
     }
 
     function openArchiveReviewModal(index, result) {
         if (!archiveReviewModal || !result) return;
-        archiveReviewContext = { index, result };
+        const frames = archiveReviewLocalBatchFrames(result);
+        archiveReviewContext = {
+            index,
+            baseResult: result,
+            result,
+            frames,
+            activeFrameIndex: archiveReviewActiveFrameIndex(frames, result),
+            framesLoading: false,
+            framesError: '',
+        };
         if (archiveReviewTitle) {
             archiveReviewTitle.textContent = 'Archive research review for video description streams';
         }
@@ -9769,38 +10258,17 @@
         if (archiveReviewMatch) {
             archiveReviewMatch.textContent = archiveReviewMatchText(result);
         }
-        const imageSrc = archiveResultImageSrc(result);
-        if (archiveReviewImg) {
-            archiveReviewImg.src = imageSrc || '';
-            archiveReviewImg.classList.toggle('is-hidden', !imageSrc);
-        }
-        if (archiveReviewFrameEmpty) {
-            archiveReviewFrameEmpty.classList.toggle('is-hidden', Boolean(imageSrc));
-        }
         if (archiveReviewChannel) {
             archiveReviewChannel.textContent = `Channel: ID: ${archiveChannelLabel(result)}`;
-        }
-        if (archiveReviewFrameRole) {
-            archiveReviewFrameRole.textContent = archiveFrameRoleText(result);
-        }
-        if (archiveReviewTimestamp) {
-            archiveReviewTimestamp.textContent = `Timestamp: ${formatArchiveTimestamp(archiveFrameTimestampMs(result))}`;
         }
         if (archiveReviewSummary) {
             const summary = archiveSummaryText(result);
             const truncated = archiveResultPayload(result).summary_truncated;
             archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
         }
-        if (archiveReviewJumpBtn) {
-            archiveReviewJumpBtn.disabled = !archiveResultCanOpenVlmFeed(result);
-        }
-        if (archiveReviewDescribeBtn) {
-            archiveReviewDescribeBtn.disabled = !archiveResultHasImage(result);
-        }
-        if (archiveReviewSimilarBtn) {
-            archiveReviewSimilarBtn.disabled = !archiveResultHasImage(result);
-        }
+        archiveReviewRenderActiveFrame();
         archiveReviewModal.style.display = 'block';
+        void archiveReviewLoadBatchFrames(archiveReviewContext);
     }
 
     async function copyArchiveReviewSummary() {
@@ -9838,6 +10306,11 @@
         if (luxriotChannelSelect) {
             luxriotChannelSelect.value = String(channelId);
         }
+        luxriotActiveChannel = channelId;
+        syncLuxriotLiveIntervalInput(channelId);
+        updateLuxriotCaptureToggleButton(channelId);
+        updateLuxriotStreamContext();
+        resetRoadSceneGrounding();
         luxriotSummaryChannel = channelId;
         if (luxriotSummaryChannelSelect) {
             syncLuxriotSummaryChannelSelect();

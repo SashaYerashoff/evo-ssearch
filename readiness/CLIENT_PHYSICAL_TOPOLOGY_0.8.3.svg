@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">EVA AI client physical topology beta 0.8.3</title>
+  <desc id="desc">Physical client topology with Luxriot Evo server, EVA AI server, LM Studio agent model, two vLLM VLM servers, and operator workstation.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64d2ff"/>
+    </marker>
+    <style>
+      .bg { fill: #071016; }
+      .panel { fill: #0d1a23; stroke: #244154; stroke-width: 2; rx: 18; }
+      .box { fill: #101f2b; stroke: #3a6780; stroke-width: 2; rx: 14; }
+      .boxAccent { fill: #0d2a25; stroke: #00d08a; stroke-width: 2; rx: 14; }
+      .boxWarn { fill: #2a2110; stroke: #ffb44a; stroke-width: 2; rx: 14; }
+      .line { fill: none; stroke: #64d2ff; stroke-width: 3; marker-end: url(#arrow); }
+      .lineGreen { fill: none; stroke: #00d08a; stroke-width: 3; marker-end: url(#arrow); }
+      .lineAmber { fill: none; stroke: #ffb44a; stroke-width: 3; marker-end: url(#arrow); }
+      .title { fill: #e8f4ff; font: 700 24px Arial, sans-serif; letter-spacing: 1px; }
+      .h { fill: #e8f4ff; font: 700 20px Arial, sans-serif; }
+      .t { fill: #b8ccd9; font: 16px Arial, sans-serif; }
+      .s { fill: #8ea6b5; font: 14px Arial, sans-serif; }
+      .tag { fill: #00d08a; font: 700 13px Arial, sans-serif; letter-spacing: 1px; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1280" height="720"/>
+  <text class="title" x="40" y="44">EVA AI client topology - beta 0.8.3</text>
+  <text class="s" x="40" y="70">Physical view: one Luxriot Evo server, one EVA AI server with LM Studio, two vLLM VLM servers.</text>
+
+  <rect class="box" x="45" y="130" width="230" height="125" rx="14"/>
+  <text class="h" x="68" y="166">Operator</text>
+  <text class="t" x="68" y="194">Browser / EVO Monitor</text>
+  <text class="s" x="68" y="220">UI, chat, manual review</text>
+
+  <rect class="boxWarn" x="45" y="425" width="250" height="150" rx="14"/>
+  <text class="h" x="68" y="462">Luxriot Evo server</text>
+  <text class="t" x="68" y="490">video channels + archive</text>
+  <text class="t" x="68" y="516">bookmarks</text>
+  <text class="s" x="68" y="545">observed: 192.168.3.27:8080</text>
+
+  <rect class="panel" x="390" y="105" width="440" height="500" rx="18"/>
+  <text class="h" x="418" y="140">EVA AI server</text>
+  <text class="s" x="418" y="164">/opt/eva-ai/evo-ssearch - service eva-ai - http://127.0.0.1:5000</text>
+
+  <rect class="boxAccent" x="425" y="200" width="365" height="92" rx="14"/>
+  <text class="h" x="448" y="234">EVA AI control-plane</text>
+  <text class="t" x="448" y="260">UI/API, agent tools, video runtime</text>
+
+  <rect class="box" x="425" y="325" width="165" height="95" rx="14"/>
+  <text class="h" x="448" y="360">PostgreSQL</text>
+  <text class="s" x="448" y="388">summaries, detections, state</text>
+
+  <rect class="box" x="625" y="325" width="165" height="95" rx="14"/>
+  <text class="h" x="648" y="360">Local files</text>
+  <text class="s" x="648" y="388">cache, evidence, logs</text>
+
+  <rect class="boxAccent" x="425" y="465" width="365" height="92" rx="14"/>
+  <text class="h" x="448" y="499">LM Studio</text>
+  <text class="t" x="448" y="525">agent model: qwen3.5-9b-mtp</text>
+
+  <rect class="boxAccent" x="945" y="160" width="260" height="130" rx="14"/>
+  <text class="h" x="970" y="198">vLLM server A</text>
+  <text class="t" x="970" y="228">192.168.3.104</text>
+  <text class="t" x="970" y="254">qwen3-vl-4b-fp8</text>
+
+  <rect class="boxAccent" x="945" y="400" width="260" height="130" rx="14"/>
+  <text class="h" x="970" y="438">vLLM server B</text>
+  <text class="t" x="970" y="468">192.168.3.11</text>
+  <text class="t" x="970" y="494">qwen3-vl-4b-fp8</text>
+
+  <path class="line" d="M 275 190 C 330 190 340 245 425 245"/>
+  <text class="s" x="300" y="180">UI/API</text>
+  <path class="lineAmber" d="M 295 492 C 345 492 350 246 425 246"/>
+  <text class="s" x="310" y="465">frames/archive</text>
+  <path class="lineGreen" d="M 425 270 C 335 310 335 445 295 492"/>
+  <text class="s" x="315" y="330">bookmarks</text>
+  <path class="line" d="M 610 292 L 512 325"/>
+  <path class="line" d="M 610 292 L 708 325"/>
+  <path class="lineGreen" d="M 610 292 L 610 465"/>
+  <path class="lineGreen" d="M 790 245 C 850 245 870 225 945 225"/>
+  <text class="s" x="835" y="210">VLM L0 batches</text>
+  <path class="lineGreen" d="M 790 260 C 875 325 875 465 945 465"/>
+  <text class="s" x="835" y="350">fallback / second lane</text>
+
+  <rect x="840" y="600" width="390" height="70" fill="#08141c" stroke="#244154" stroke-width="1.5" rx="10"/>
+  <text class="tag" x="862" y="628">IMPORTANT</text>
+  <text class="s" x="862" y="652">Road/drift outputs are candidate evidence for human review, not legal conclusions.</text>
+</svg>

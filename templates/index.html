@@ -891,9 +891,14 @@
             </div>
             <div class="archive-review-meta-row">
                 <div id="archiveReviewChannel">Channel: -</div>
-                <div id="archiveReviewFrameRole">Frame</div>
+                <div class="archive-review-frame-nav">
+                    <button id="archiveReviewPrevFrameBtn" class="archive-review-nav-btn" type="button" title="Previous batch frame" aria-label="Previous batch frame">&lsaquo;</button>
+                    <div id="archiveReviewFrameRole">Frame</div>
+                    <button id="archiveReviewNextFrameBtn" class="archive-review-nav-btn" type="button" title="Next batch frame" aria-label="Next batch frame">&rsaquo;</button>
+                </div>
                 <div id="archiveReviewTimestamp">Timestamp: -</div>
             </div>
+            <div id="archiveReviewFilmstrip" class="archive-review-filmstrip" aria-label="Batch frames"></div>
             <div class="archive-review-actions">
                 <button id="archiveReviewDescribeBtn" class="feature-btn">Describe frame</button>
                 <button id="archiveReviewSimilarBtn" class="feature-btn">Find similar</button>

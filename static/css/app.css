@@ -5390,6 +5390,14 @@ textarea::placeholder {
     opacity: 0;
 }
 
+.luxriot-viewport.is-signal-stale {
+    border-color: rgba(255, 210, 122, 0.64);
+}
+
+.luxriot-viewport.is-signal-stale img {
+    opacity: 0.72;
+}
+
 .luxriot-viewport::after {
     content: "";
     position: absolute;
@@ -5413,6 +5421,11 @@ textarea::placeholder {
 .luxriot-viewport.is-signal-lost .luxriot-overlay {
     color: #ff6b81;
     background: rgba(7, 10, 14, 0.66);
+}
+
+.luxriot-viewport.is-signal-stale .luxriot-overlay {
+    color: #ffd27a;
+    background: rgba(7, 10, 14, 0.54);
 }
 
 .luxriot-stream-list,
@@ -7404,7 +7417,7 @@ textarea::placeholder {
     position: absolute;
     inset: clamp(14px, 3vh, 28px) clamp(14px, 4vw, 44px);
     display: grid;
-    grid-template-rows: auto minmax(260px, 1fr) auto auto minmax(180px, 0.55fr);
+    grid-template-rows: auto minmax(260px, 1fr) auto auto auto minmax(180px, 0.55fr);
     gap: 12px;
     max-width: 1120px;
     margin: 0 auto;
@@ -7510,6 +7523,111 @@ textarea::placeholder {
     color: rgba(140, 172, 203, 0.62);
 }
 
+.archive-review-frame-nav {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.archive-review-nav-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-width: 42px;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid rgba(37, 51, 66, 0.92);
+    border-radius: 8px;
+    color: var(--text);
+    background: rgba(9, 15, 20, 0.92);
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    cursor: pointer;
+}
+
+.archive-review-nav-btn:disabled {
+    opacity: 0.38;
+    cursor: default;
+}
+
+.archive-review-filmstrip {
+    display: flex;
+    gap: 8px;
+    min-height: 72px;
+    margin: -2px 18px 0;
+    padding: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border: 1px solid rgba(37, 51, 66, 0.92);
+    border-radius: 12px;
+    background: rgba(5, 9, 13, 0.82);
+    scrollbar-gutter: stable;
+}
+
+.archive-review-strip-frame {
+    position: relative;
+    flex: 0 0 92px;
+    height: 60px;
+    min-width: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid rgba(37, 51, 66, 0.92);
+    border-radius: 8px;
+    background: #05080b;
+    cursor: pointer;
+}
+
+.archive-review-strip-frame.is-active {
+    border-color: var(--accent-green);
+    box-shadow: 0 0 0 1px rgba(0, 216, 166, 0.36);
+}
+
+.archive-review-strip-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0.82;
+}
+
+.archive-review-strip-frame.is-active img {
+    opacity: 1;
+}
+
+.archive-review-strip-frame span {
+    position: absolute;
+    left: 4px;
+    bottom: 4px;
+    max-width: calc(100% - 8px);
+    padding: 2px 5px;
+    overflow: hidden;
+    border-radius: 999px;
+    color: var(--text);
+    background: rgba(0, 0, 0, 0.66);
+    font-family: var(--mono);
+    font-size: 0.58rem;
+    line-height: 1.1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.archive-review-filmstrip-status {
+    display: grid;
+    place-items: center;
+    min-width: 100%;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.archive-review-filmstrip-status.is-error {
+    color: var(--accent-red);
+}
+
 .archive-review-meta-row > :last-child {
     text-align: right;
 }
@@ -7560,7 +7678,7 @@ textarea::placeholder {
 @media (max-width: 760px) {
     .archive-review-shell {
         inset: 10px;
-        grid-template-rows: auto minmax(220px, 0.9fr) auto auto minmax(180px, 0.6fr);
+        grid-template-rows: auto minmax(220px, 0.9fr) auto auto auto minmax(180px, 0.6fr);
     }
 
     .archive-review-head,
@@ -7749,6 +7867,12 @@ textarea::placeholder {
     color: #ffd27a;
     border-color: rgba(255, 210, 122, 0.35);
     background: rgba(255, 210, 122, 0.09);
+}
+
+.luxriot-stream-state.slow {
+    color: #ffd27a;
+    border-color: rgba(255, 210, 122, 0.42);
+    background: rgba(255, 210, 122, 0.12);
 }
 
 .luxriot-stream-state.error {
@@ -9644,7 +9768,7 @@ body.ui-lite [style*="backdrop-filter"] {
     margin: 0 auto;
     padding: 0;
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr) auto auto minmax(0, 0.55fr);
+    grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 0.55fr);
     gap: 12px;
     border: 1px solid rgba(37, 51, 66, 0.92);
     border-radius: 22px;
@@ -9697,7 +9821,7 @@ body.ui-lite [style*="backdrop-filter"] {
     .archive-review-shell {
         width: min(100%, 1120px);
         height: calc(100dvh - 20px);
-        grid-template-rows: auto minmax(0, 0.9fr) auto auto minmax(0, 0.7fr);
+        grid-template-rows: auto minmax(0, 0.9fr) auto auto auto minmax(0, 0.7fr);
     }
 
     .archive-review-head,

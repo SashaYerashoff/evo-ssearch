@@ -1,23 +1,76 @@
-# EVA AI: установка offline-патча с USB-накопителя
+# EVA AI: offline-патч с USB-накопителя
 
-Дата: 2026-06-22
+Дата: 2026-07-02
+Целевой релиз: `β 0.8.3`
+Schema head: `20260614_0006`
+Миграция БД: **нет** для обновления `β 0.8.2.1 -> β 0.8.3`
 
-Этот runbook рассчитан на оператора на клиентской машине EVA AI без доступа в
-интернет. Цель: привезти patch bundle на флешке, сделать резервные копии,
-установить код, проверить `/health` и `/ready`, а при проблеме откатиться на
-предыдущее состояние.
+Статус: этот файл оставлен как полный legacy-runbook. Для полевой установки
+предпочтительно использовать раздельные документы. Для космонавта используйте
+английскую версию:
 
-Не вставляйте в терминал пояснительный текст. Вставляйте только команды из
-блоков. Не копируйте и не отправляйте содержимое `/etc/eva-ai/eva-ai.env`: там
-могут быть пароли и DSN.
+1. `readiness/OFFLINE_USB_01_PREPARE_MEDIA_EN.md` - USB preparation,
+   Linux mount steps, and terminal cheat sheet.
+2. `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_EN.md` - preflight and
+   deployment scenario decision.
+3. `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_EN.md` - install variants,
+   rollback, and manual post-install test.
+4. `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_EN.md` and
+   `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3.svg` - client physical topology.
 
-## 0. Что должно быть на флешке
+Русские версии оставлены рядом:
 
-На инженерной машине заранее собирается архив вида:
+1. `readiness/OFFLINE_USB_01_PREPARE_MEDIA_RU.md` - подготовка флешки,
+   поиск/монтирование USB под Linux и терминальная шпаргалка.
+2. `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_RU.md` - preflight и выбор
+   сценария установки.
+3. `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_RU.md` - варианты раскатки,
+   rollback и ручной тест после установки.
+4. `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_RU.md` и
+   `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3.svg` - физическая схема клиента.
+
+Этот runbook рассчитан на инженера/оператора на клиентской EVA AI машине без
+доступа в интернет. Цель: привезти patch bundle на флешке, выполнить preflight,
+сделать backup, установить код, проверить `/health` и `/ready`, а при проблеме
+откатиться.
+
+Не копируйте и не отправляйте содержимое `/etc/eva-ai/eva-ai.env`: там могут
+быть пароли и DSN. В терминал вставляйте только команды из блоков.
+
+## 0. Что мы уже знаем о клиентской системе
+
+Эти значения взяты из предыдущего клиентского installation record и текущих
+полевых runbook-ов. Если на объекте факт отличается, сначала зафиксируйте
+расхождение, потом продолжайте по реальному значению.
+
+| Вопрос preflight | Ответ по текущему client/site record |
+| --- | --- |
+| EVA AI app dir | `/opt/eva-ai/evo-ssearch` |
+| systemd service | `eva-ai` |
+| service user/group | `eva:eva` |
+| env file | `/etc/eva-ai/eva-ai.env` |
+| internal app URL | `http://127.0.0.1:5000` |
+| browser/client URL | site HTTPS/TLS boundary `[FIELD]`; internal Gunicorn remains HTTP |
+| PostgreSQL DB fallback name | `eva` |
+| expected schema | `20260614_0006` |
+| worker count | `EVOSSEARCH_GUNICORN_WORKERS=1` |
+| Luxriot Evo observed pilot URL | `http://192.168.3.27:8080` |
+| inference A | `192.168.3.104`, ports `8001`/`8002` |
+| inference B | `192.168.3.11`, ports `8001`/`8002` |
+| VLM model | `qwen3-vl-4b-fp8` |
+| VLM batch shape | 12 images per L0 batch, endpoint limit 16 images |
+
+Важно: `https://127.0.0.1:5443` относится к local/dev или отдельному
+TLS-enabled service. На клиентском control-plane и office/demo по умолчанию
+проверяйте `http://127.0.0.1:5000`.
+
+## 1. Что должно быть на флешке
+
+На инженерной машине заранее собирается архив:
 
 ```text
-eva-ai-patch-YYYYMMDD-HHMMSS.tar.gz
-eva-ai-patch-YYYYMMDD-HHMMSS.tar.gz.sha256
+eva-ai-patch-0.8.3-YYYYMMDD-HHMMSS.tar.gz
+eva-ai-patch-0.8.3-YYYYMMDD-HHMMSS.tar.gz.sha256
 ```
 
 Внутри архива:
@@ -25,6 +78,7 @@ eva-ai-patch-YYYYMMDD-HHMMSS.tar.gz.sha256
 ```text
 manifest.txt
 repo/
+scripts/preflight_patch.sh
 scripts/install_patch.sh
 scripts/verify_patch.sh
 scripts/rollback.sh
@@ -34,16 +88,39 @@ repo/readiness/OFFLINE_USB_PATCH_OPERATOR_RUNBOOK_RU.md
 repo/readiness/CLIENT_DIAGNOSTICS_RUNBOOK.md
 ```
 
-Если архива нет, собрать его из рабочей копии репозитория можно так:
+Если на клиенте может не хватить Python packages, в bundle также должен быть:
+
+```text
+wheelhouse/
+wheelhouse_manifest.txt
+```
+
+Сборка на инженерной машине:
 
 ```bash
 cd /home/sasha/Projects/evo-ssearch
-scripts/build_patch_bundle.sh --output-dir /tmp/eva-ai-usb
+
+scripts/build_patch_bundle.sh \
+  --output-dir /tmp/eva-ai-usb \
+  --name "eva-ai-patch-0.8.3-$(date +%Y%m%d-%H%M%S)" \
+  --with-wheelhouse
 ```
 
-Скопируйте созданные `.tar.gz` и `.sha256` на USB-накопитель.
+`--with-wheelhouse` может сделать большой архив: `torch`, `opencv`,
+`transformers` и связанные wheels тяжелые. Для закрытой сети это ожидаемо.
+Собирать wheelhouse нужно на совместимой Linux/Python платформе. Если wheelhouse
+уже подготовлен отдельно:
 
-## 1. Подготовка на клиентской EVA AI машине
+```bash
+scripts/build_patch_bundle.sh \
+  --output-dir /tmp/eva-ai-usb \
+  --name "eva-ai-patch-0.8.3-$(date +%Y%m%d-%H%M%S)" \
+  --wheelhouse-dir /path/to/wheelhouse
+```
+
+Скопируйте `.tar.gz` и `.sha256` на USB-накопитель.
+
+## 2. Подготовка на клиентской машине
 
 Вставьте флешку. Найдите путь к ней:
 
@@ -62,7 +139,7 @@ cp /media/$USER/EVA_USB/eva-ai-patch-*.tar.gz* ~/eva-ai-patch/
 cd ~/eva-ai-patch
 ```
 
-Проверьте контрольную сумму, если рядом есть `.sha256`:
+Проверьте контрольную сумму:
 
 ```bash
 sha256sum -c eva-ai-patch-*.tar.gz.sha256
@@ -78,64 +155,84 @@ cd eva-ai-patch-*
 cat manifest.txt
 ```
 
-## 2. Предпроверка перед установкой
+Проверьте, что manifest показывает целевой релиз:
 
-Проверьте текущее состояние сервиса:
+```text
+version=β 0.8.3
+```
+
+## 3. Preflight до остановки сервиса
+
+Запустите безопасную предпроверку. Она ничего не останавливает, не копирует и
+не меняет.
 
 ```bash
-scripts/verify_patch.sh \
+sudo scripts/preflight_patch.sh \
+  --bundle-dir "$PWD" \
+  --app-dir /opt/eva-ai/evo-ssearch \
+  --env-file /etc/eva-ai/eva-ai.env \
   --service eva-ai \
-  --base-url http://127.0.0.1:5000
+  --base-url http://127.0.0.1:5000 \
+  --pg-database eva \
+  --expected-version "β 0.8.3" \
+  --expected-schema 20260614_0006
 ```
 
-Если `/ready` уже красный до установки, зафиксируйте это в акте работ. Патч всё
-равно можно ставить, но после установки важно отличать старую проблему от новой.
+Нормальный результат:
 
-Посмотрите свободное место для backup:
-
-```bash
-df -h /var/backups /opt/eva-ai /etc/eva-ai
+```text
+Preflight result: OK_WITH_WARNINGS_OR_OK
 ```
 
-Если на `/var/backups` мало места, остановитесь и согласуйте с инженером другой
-путь через `--backup-root`.
+Предупреждения допустимы, если они объяснены текущим состоянием объекта,
+например Luxriot Evo или inference host временно выключен до работ. `FAIL`
+нужно разобрать до установки.
 
-## 3. Установка патча
+Особенно проверьте:
+
+- `wheelhouse found`, если на объекте нет интернета и могут понадобиться wheels;
+- `EVOSSEARCH_GUNICORN_WORKERS` равен `1`;
+- schema revision `20260614_0006`;
+- backup filesystem имеет достаточно места;
+- `/health` отвечает на том URL, который вы будете использовать после установки.
+
+Если `/ready` уже не `ready` до установки, зафиксируйте это в акте работ. Патч
+можно ставить, но после установки нельзя считать старую внешнюю проблему новой.
+
+## 4. Установка патча
 
 Запустите установку от root:
 
 ```bash
 sudo scripts/install_patch.sh \
+  --bundle-dir "$PWD" \
   --app-dir /opt/eva-ai/evo-ssearch \
   --env-file /etc/eva-ai/eva-ai.env \
   --service eva-ai \
-  --base-url http://127.0.0.1:5000
+  --base-url http://127.0.0.1:5000 \
+  --pg-database eva
 ```
 
-Что делает скрипт:
+Что делает installer:
 
 - создаёт backup в `/var/backups/eva-ai/patch-YYYYMMDD-HHMMSS`;
 - сохраняет env-файл, systemd unit/drop-ins и текущий код;
 - делает `pg_dump`, если доступен `pg_dump` и найден DSN или локальная база;
 - останавливает `eva-ai`;
 - копирует код из bundle в `/opt/eva-ai/evo-ssearch`;
+- сохраняет существующие `.venv`, `.env`, archive/state/db файлы;
+- ставит wheels из `wheelhouse/`, если он есть в bundle;
 - запускает `eva-ai`;
 - проверяет `/health` и `/ready`.
 
-Нормальный результат:
+Для `β 0.8.3` не добавляйте `--run-migrations`: миграции нет.
 
-```text
-OK: ...
-OK: health endpoint returned HTTP 200
-OK: ready endpoint returned HTTP 200
-```
+Если installer напечатал `FAIL`, не продолжайте ручные правки. Сохраните вывод
+команды и переходите к rollback.
 
-Если скрипт напечатал `FAIL`, не продолжайте ручные правки. Сохраните весь
-вывод команды и переходите к разделу rollback.
+## 5. Проверка после установки
 
-## 4. Проверка после установки
-
-Повторите проверку:
+Повторите verification:
 
 ```bash
 scripts/verify_patch.sh \
@@ -144,29 +241,99 @@ scripts/verify_patch.sh \
   --timeout 60
 ```
 
-Проверьте systemd-журнал без вывода секретов:
+Проверьте фактический bind:
 
 ```bash
-sudo journalctl -u eva-ai -n 120 --no-pager
+systemctl status eva-ai --no-pager -l
 ```
 
-Откройте UI с операторского рабочего места и проверьте:
+Если `Listening at:` показывает `http://0.0.0.0:5000`, используйте
+`http://127.0.0.1:5000`. Если показывает `https://0.0.0.0:5443`, только тогда
+используйте `https://127.0.0.1:5443` и `curl -k`.
 
-- страница загружается;
-- вход выполняется штатным пользователем;
-- `/health` зелёный;
-- `/ready` зелёный или показывает только заранее известные внешние зависимости;
-- Luxriot live preview работает на тестовом канале;
-- VLM/agent endpoints доступны, если они должны быть включены на этом стенде.
-- В `Agent` нажмите `Stream status`: ответ должен быть про active video-description streams, модели, pending/dropped/last_error. Если агент отвечает в основном про probes, зафиксируйте это как regression.
-- В `Agent` нажмите `Video report` после накопления summaries: отчет должен начинаться с video summaries/VLM alerts/coverage gaps, а probes упоминать только как вторичный semantic signal.
+Проверьте health/readiness:
 
-Для текущей архитектуры live video descriptions должны работать в одном
-`gunicorn` worker на EVA AI host. Не увеличивайте
-`EVOSSEARCH_GUNICORN_WORKERS` выше `1` без отдельного инженерного согласования:
-capture loops пока живут в памяти процесса.
+```bash
+curl -sS http://127.0.0.1:5000/health | jq
+curl -sS http://127.0.0.1:5000/ready | jq '.status, .checks.deployment_security, .checks.luxriot, .checks.lm_profiles, .checks.postgresql'
+```
 
-## 5. Если на объекте изменились IP-адреса
+Ожидаемое:
+
+- `/health.version` = `β 0.8.3`;
+- PostgreSQL/auth checks готовы;
+- `deployment_security` не содержит неожиданных placeholder/HTTP/cookie проблем;
+- Luxriot и LM/VLM profiles reachable, если соответствующие машины включены;
+- `inference_queue.status=disabled` допустим в текущем пилоте;
+- browser UI открывается, login работает, live preview честно показывает signal
+  lost/frozen вместо старого буфера.
+
+### Проверка маршрутизации моделей
+
+После установки отдельно проверьте, что VLM-balancer смотрит на vLLM endpoints с
+`qwen3-vl-4b-fp8`, а агент смотрит на локальный agent endpoint EVA AI host с
+`qwen3.5-9b-mtp`.
+
+Проверка через runtime `/ready`:
+
+```bash
+curl -sS http://127.0.0.1:5000/ready \
+  | jq '.checks.lm_profiles.profiles[]
+    | {id, kind, model, base_url, required, ok, status}'
+```
+
+Ожидаемая картина для клиентского пилота:
+
+```text
+agent:
+  kind=agent
+  base_url=http://127.0.0.1:1234/v1
+  model=qwen3.5-9b-mtp
+
+vlm-a1:
+  kind=vlm
+  base_url=http://192.168.3.104:8001/v1
+  model=qwen3-vl-4b-fp8
+
+vlm-a0:
+  kind=vlm
+  base_url=http://192.168.3.104:8002/v1
+  model=qwen3-vl-4b-fp8
+
+vlm-b1:
+  kind=vlm
+  base_url=http://192.168.3.11:8001/v1
+  model=qwen3-vl-4b-fp8
+
+vlm-b0:
+  kind=vlm
+  base_url=http://192.168.3.11:8002/v1
+  model=qwen3-vl-4b-fp8
+```
+
+Также проверьте, что balancer включен и перечисляет VLM profiles:
+
+```bash
+sudo grep -E \
+  '^(EVOSSEARCH_LM_PROFILES|EVOSSEARCH_LM_AGENT_PROFILE_ID|EVOSSEARCH_LM_VLM_PROFILE_ID|EVOSSEARCH_LM_VLM_BALANCER_ENABLED|EVOSSEARCH_LM_VLM_BALANCER_PROFILES)=' \
+  /etc/eva-ai/eva-ai.env
+```
+
+Ожидаемо:
+
+```text
+EVOSSEARCH_LM_PROFILES=agent,vlm-a1,vlm-a0,vlm-b1,vlm-b0
+EVOSSEARCH_LM_AGENT_PROFILE_ID=agent
+EVOSSEARCH_LM_VLM_BALANCER_ENABLED=true
+EVOSSEARCH_LM_VLM_BALANCER_PROFILES=vlm-a1,vlm-a0,vlm-b1,vlm-b0
+```
+
+Если `agent` указывает на `qwen3-vl-4b-fp8` или один из `vlm-*` указывает на
+`qwen3.5-9b-mtp`, остановитесь и исправьте `/etc/eva-ai/eva-ai.env` до запуска
+массовых video descriptions. Если balancer выключен, каналы могут пойти в один
+default VLM endpoint вместо распределения по четырем GPU.
+
+## 6. Если на объекте изменились IP-адреса
 
 Узнайте актуальные IP:
 
@@ -181,10 +348,10 @@ ip -br addr
 sudo scripts/set_site_ips.sh \
   --env-file /etc/eva-ai/eva-ai.env \
   --service eva-ai \
-  --luxriot-ip 192.168.1.10 \
+  --luxriot-ip 192.168.3.27 \
   --luxriot-port 8080 \
-  --inference-a-ip 192.168.1.20 \
-  --inference-b-ip 192.168.1.21 \
+  --inference-a-ip 192.168.3.104 \
+  --inference-b-ip 192.168.3.11 \
   --agent-base-url http://127.0.0.1:1234/v1 \
   --restart
 ```
@@ -196,15 +363,39 @@ sudo scripts/set_site_ips.sh \
 sudo nano /etc/eva-ai/eva-ai.env
 ```
 
-После смены IP повторите:
+После смены IP повторите preflight/verify:
 
 ```bash
+sudo scripts/preflight_patch.sh \
+  --app-dir /opt/eva-ai/evo-ssearch \
+  --env-file /etc/eva-ai/eva-ai.env \
+  --service eva-ai \
+  --base-url http://127.0.0.1:5000 \
+  --pg-database eva \
+  --expected-schema 20260614_0006
+
 scripts/verify_patch.sh \
   --service eva-ai \
   --base-url http://127.0.0.1:5000
 ```
 
-## 6. Rollback без восстановления базы
+## 7. Минимальная UI/agent проверка
+
+После restart live video descriptions могут требовать повторного запуска на
+нужных каналах. В UI проверьте:
+
+- версия в `/health` или UI: `β 0.8.3`;
+- `Video Monitoring` показывает реальный live/signal lost/frozen, а не старый
+  кадр из буфера;
+- agent `Stream status` говорит о video-description streams, live signal state,
+  dropped/pending/last_error и runtime problem channels;
+- agent report остаётся video-description-first и отдельно показывает pipeline
+  health;
+- probe preview/apply остаётся gated: агент не применяет изменения без UI Apply;
+- road/drift outputs формулируются как candidates/evidence, не как юридическое
+  заключение о нарушении.
+
+## 8. Rollback без восстановления базы
 
 Обычный rollback возвращает код, env и systemd unit из последнего backup. Базу
 данных он не трогает.
@@ -228,9 +419,9 @@ sudo scripts/rollback.sh \
   --base-url http://127.0.0.1:5000
 ```
 
-После rollback выполните проверку из раздела 4.
+После rollback выполните проверку из раздела 5.
 
-## 7. Rollback базы данных только по согласованию
+## 9. Rollback базы данных только по согласованию
 
 Восстановление PostgreSQL dump является разрушительной операцией: текущие
 данные в базе могут быть заменены состоянием на момент backup. Делайте это
@@ -248,7 +439,7 @@ sudo EVA_PATCH_CONFIRM_DB_RESTORE=yes scripts/rollback.sh \
   --base-url http://127.0.0.1:5000
 ```
 
-## 8. Что отправить инженеру после работ
+## 10. Что отправить инженеру после работ
 
 Отправьте только безопасные артефакты:
 
@@ -258,5 +449,11 @@ sudo ls -la /var/backups/eva-ai
 scripts/verify_patch.sh --service eva-ai --base-url http://127.0.0.1:5000
 ```
 
-Не отправляйте `/etc/eva-ai/eva-ai.env`, PostgreSQL dump и полные логи, если в
-них могут быть секреты.
+Если что-то пошло не так:
+
+```bash
+sudo journalctl -u eva-ai -n 160 --no-pager -l
+```
+
+Не отправляйте `/etc/eva-ai/eva-ai.env`, DB dumps, cookies, passwords, tokens или
+полные DSN.

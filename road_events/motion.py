@@ -15,12 +15,16 @@ class MotionAnalyzerConfig:
     max_edge: int = 360
     min_motion_px: float = 0.7
     active_ratio_floor: float = 0.012
+    active_ratio_ceiling: float = 0.55
     mean_motion_floor: float = 0.18
     p90_motion_floor: float = 0.9
+    max_motion_claim_interval_ms: int = 3500
     wrong_way_alignment: float = -0.45
     cross_flow_alignment_abs_ceiling: float = 0.25
     cross_flow_ratio_floor: float = 0.04
+    directional_active_ratio_ceiling: float = 0.45
     compensate_global_motion: bool = True
+    compensation_active_ratio_ceiling: float = 0.35
     scene_cut_mean_diff_floor: float = 0.075
     scene_cut_changed_ratio_floor: float = 0.18
     scene_cut_p95_diff_floor: float = 0.22
@@ -47,6 +51,7 @@ class RoadMotionSample:
     cues: tuple[RoadMotionCue, ...] = field(default_factory=tuple)
     zone_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     global_motion: dict[str, float] = field(default_factory=dict)
+    quality: dict[str, float] = field(default_factory=dict)
     warmup: bool = False
     scene_cut: bool = False
 
@@ -104,18 +109,28 @@ class RoadMotionAnalyzer:
         self.scene_card = scene_card
         self.config = config or MotionAnalyzerConfig()
         self._previous_gray: np.ndarray | None = None
+        self._previous_timestamp_ms: int | None = None
 
     def reset(self) -> None:
         self._previous_gray = None
+        self._previous_timestamp_ms = None
 
     def analyze_frame(self, frame: Any, timestamp_ms: int, frame_index: int = 0) -> RoadMotionSample:
+        timestamp_ms = int(timestamp_ms)
         gray = _resize_gray(frame, max(64, int(self.config.max_edge)))
+        frame_interval_ms = (
+            max(0, timestamp_ms - self._previous_timestamp_ms)
+            if self._previous_timestamp_ms is not None
+            else None
+        )
         if self._previous_gray is None:
             self._previous_gray = gray
+            self._previous_timestamp_ms = timestamp_ms
             return RoadMotionSample(
                 channel_id=self.scene_card.channel_id,
-                timestamp_ms=int(timestamp_ms),
+                timestamp_ms=timestamp_ms,
                 frame_index=int(frame_index),
+                quality={"frame_interval_ms": 0.0},
                 warmup=True,
             )
         if self._previous_gray.shape != gray.shape:
@@ -123,11 +138,18 @@ class RoadMotionAnalyzer:
         cut_metrics = self._scene_cut_metrics(self._previous_gray, gray)
         if bool(cut_metrics["scene_cut"]):
             self._previous_gray = gray
+            self._previous_timestamp_ms = timestamp_ms
             return RoadMotionSample(
                 channel_id=self.scene_card.channel_id,
-                timestamp_ms=int(timestamp_ms),
+                timestamp_ms=timestamp_ms,
                 frame_index=int(frame_index),
                 global_motion=cut_metrics,
+                quality={
+                    "frame_interval_ms": float(frame_interval_ms or 0),
+                    "low_fps_suppressed": 1.0
+                    if (frame_interval_ms or 0) > self.config.max_motion_claim_interval_ms
+                    else 0.0,
+                },
                 warmup=True,
                 scene_cut=True,
             )
@@ -145,11 +167,29 @@ class RoadMotionAnalyzer:
             0,
         )
         self._previous_gray = gray
+        self._previous_timestamp_ms = timestamp_ms
+        raw_active_ratio = self._active_ratio(flow)
         global_metrics = self._global_motion(flow)
-        if self.config.compensate_global_motion:
+        global_metrics["active_ratio"] = raw_active_ratio
+        compensated = False
+        if (
+            self.config.compensate_global_motion
+            and raw_active_ratio <= self.config.compensation_active_ratio_ceiling
+        ):
             flow = flow.copy()
             flow[:, :, 0] -= global_metrics["dx"]
             flow[:, :, 1] -= global_metrics["dy"]
+            compensated = True
+        global_metrics["compensated"] = 1.0 if compensated else 0.0
+        low_fps_suppressed = (
+            frame_interval_ms is not None
+            and frame_interval_ms > self.config.max_motion_claim_interval_ms
+        )
+        quality = {
+            "frame_interval_ms": float(frame_interval_ms or 0),
+            "low_fps_suppressed": 1.0 if low_fps_suppressed else 0.0,
+            "raw_active_ratio": raw_active_ratio,
+        }
 
         cues: list[RoadMotionCue] = []
         zone_metrics: dict[str, dict[str, float]] = {}
@@ -158,17 +198,24 @@ class RoadMotionAnalyzer:
             zones = (RoadZone(name="full_frame"),)
         for zone in zones:
             metrics = self._zone_metrics(flow, zone)
+            metrics.update(quality)
             zone_metrics[zone.name] = metrics
             cues.extend(self._cues_for_zone(zone, metrics, int(timestamp_ms), int(frame_index)))
         return RoadMotionSample(
             channel_id=self.scene_card.channel_id,
-            timestamp_ms=int(timestamp_ms),
+            timestamp_ms=timestamp_ms,
             frame_index=int(frame_index),
             cues=tuple(cues),
             zone_metrics=zone_metrics,
             global_motion=global_metrics,
+            quality=quality,
             warmup=False,
         )
+
+    def _active_ratio(self, flow: np.ndarray) -> float:
+        mag = np.linalg.norm(flow, axis=2)
+        active = mag >= self.config.min_motion_px
+        return float(np.count_nonzero(active) / max(1, active.size))
 
     def _global_motion(self, flow: np.ndarray) -> dict[str, float]:
         values = flow.reshape(-1, 2)
@@ -247,8 +294,12 @@ class RoadMotionAnalyzer:
         mean_motion = metrics["mean_motion"]
         p90_motion = metrics["p90_motion"]
         alignment = metrics["alignment"]
+        low_fps = bool(metrics.get("low_fps_suppressed", 0.0) >= 1.0)
+        too_wide = active_ratio > self.config.active_ratio_ceiling
         burst = (
-            active_ratio >= self.config.active_ratio_floor
+            not low_fps
+            and not too_wide
+            and active_ratio >= self.config.active_ratio_floor
             and (
                 p90_motion >= self.config.p90_motion_floor
                 or mean_motion >= self.config.mean_motion_floor
@@ -278,7 +329,12 @@ class RoadMotionAnalyzer:
                     frame_index=frame_index,
                 )
             )
-        if zone.expected_flow is not None and burst and alignment <= self.config.wrong_way_alignment:
+        directional_allowed = (
+            zone.expected_flow is not None
+            and burst
+            and active_ratio <= self.config.directional_active_ratio_ceiling
+        )
+        if directional_allowed and alignment <= self.config.wrong_way_alignment:
             cues.append(
                 RoadMotionCue(
                     channel_id=self.scene_card.channel_id,
@@ -292,8 +348,7 @@ class RoadMotionAnalyzer:
                 )
             )
         if (
-            zone.expected_flow is not None
-            and burst
+            directional_allowed
             and abs(alignment) <= self.config.cross_flow_alignment_abs_ceiling
             and active_ratio >= self.config.cross_flow_ratio_floor
         ):

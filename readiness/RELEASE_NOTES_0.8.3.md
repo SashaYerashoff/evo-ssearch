@@ -75,6 +75,36 @@ candidate/evidence/navigation signals for human review.
 - Agent live-status rows include live signal state, recent-frame counts,
   capture source, frozen/stale flags, and current model labels where available.
 
+### Live Capture Stability Addendum
+
+- Live capture no longer blocks on slow VLM batch processing. Per-channel
+  summary dispatch now uses a bounded latest-wins queue, so fresh frames keep
+  reaching the UI/model even while older batches are still being summarized.
+- Added short Luxriot snapshot and live-segment read timeouts to prevent one
+  stalled capture call from freezing the live preview loop.
+- `auto` capture now fails over from snapshot to live-segment when snapshot
+  capture is unavailable for a channel.
+- Live-segment failures use a short backoff, reducing repeated ffmpeg/API churn
+  on disabled or unauthorized channels.
+- Stream status now exposes summary queue depth, inflight state, live-segment
+  backoff, and dropped latest-wins batches for diagnostics.
+
+### Offline Deployment Package
+
+- Added split offline patch runbooks:
+  - `readiness/OFFLINE_USB_01_PREPARE_MEDIA_EN.md`
+  - `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_EN.md`
+  - `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_EN.md`
+  - `readiness/OFFLINE_USB_01_PREPARE_MEDIA_RU.md`
+  - `readiness/OFFLINE_USB_02_PREFLIGHT_DECISION_RU.md`
+  - `readiness/OFFLINE_USB_03_INSTALL_AND_TEST_RU.md`
+- Added physical client topology docs:
+  - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_EN.md`
+  - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3_RU.md`
+  - `readiness/CLIENT_PHYSICAL_TOPOLOGY_0.8.3.svg`
+- `scripts/build_patch_bundle.sh` includes `preflight_patch.sh` in generated
+  bundles when present.
+
 ### Live Validation
 
 Live validation on the dev machine before packaging:
@@ -95,6 +125,9 @@ Live validation on the dev machine before packaging:
   - runtime status question called `list_video_summary_channels`;
   - runtime-problem smoke reported `emu-1` snapshot 404 as a live signal error;
   - documentation/how-to question called `lookup_help`.
+- Additional live-capture soak with active preview polling showed bounded
+  buffers (`recent_frame_count=36`, `summary_queue_depth<=2`) and no linear
+  memory growth over the smoke window.
 
 ## Upgrade Notes
 
@@ -119,12 +152,16 @@ Important new knobs:
 - `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_MB`
 - `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_EVERY_N`
 - `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS`
+- `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC`
+- `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC`
+- `EVOSSEARCH_LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES`
 - `EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED`
 - `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT`
 - `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS`
 - `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS`
 - `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES`
 - `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE`
+- `EVOSSEARCH_LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES`
 - `EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC`
 - `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC`
 - `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT`
