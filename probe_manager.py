@@ -1,14 +1,42 @@
 import base64
+import os
 import threading
 import time
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
-import faiss  # type: ignore
 import numpy as np
 from PIL import Image
 
 from config import config
+
+
+class _FaissTypingStub:
+    IndexFlatIP = Any
+
+
+faiss: Any = _FaissTypingStub()
+_faiss_module: Optional[Any] = None
+
+
+def _get_faiss() -> Any:
+    global faiss, _faiss_module
+    if str(os.getenv("EVOSSEARCH_LOCAL_VISION_ENABLED", "true") or "true").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _faiss_module is None:
+        import importlib
+
+        _faiss_module = importlib.import_module("faiss")
+        faiss = _faiss_module
+    return _faiss_module
 
 
 def _faiss_add(index: faiss.IndexFlatIP, vectors: np.ndarray) -> None:
@@ -56,8 +84,15 @@ class ProbeBuffer:
             self.index = None
             return
         mat = np.stack(self.embeddings, axis=0).astype(np.float32)
-        self.index = faiss.IndexFlatIP(mat.shape[1])
+        self.index = _get_faiss().IndexFlatIP(mat.shape[1])
         _faiss_add(self.index, mat)
+
+    def clear(self) -> None:
+        self.embeddings = []
+        self.meta = []
+        self.index = None
+        self.roi_cache = {}
+        self.roi_cache_order = []
 
     @staticmethod
     def _normalize_vec(vec: np.ndarray) -> np.ndarray:
@@ -96,6 +131,8 @@ class ProbeBuffer:
 
     def add(self, embedding: np.ndarray, timestamp_ms: int, channel_id: int, thumb: str) -> None:
         emb = self._normalize_vec(embedding)
+        if self.embeddings and emb.shape != self.embeddings[0].shape:
+            self.clear()
         frame_uid = int(self.next_uid)
         self.next_uid += 1
         self.embeddings.append(emb)
@@ -222,6 +259,16 @@ class ProbeBuffer:
         )
         if mat.size == 0 or not meta:
             return []
+        if pos_embs.ndim != 2 or pos_embs.shape[0] == 0:
+            return []
+        if int(mat.shape[1]) != int(pos_embs.shape[1]):
+            raise ValueError(
+                "Probe vector dimension mismatch. Clear the live probe buffer after changing the CLIP model."
+            )
+        if neg_embs.size > 0 and (neg_embs.ndim != 2 or int(neg_embs.shape[1]) != int(pos_embs.shape[1])):
+            raise ValueError(
+                "Positive and negative probe vectors use different embedding dimensions."
+            )
         pos_scores = mat @ pos_embs.T
         pos_max = pos_scores.max(axis=1)
         if neg_embs.size > 0:
@@ -298,7 +345,7 @@ class ProbeManager:
                 continue
             embs.append(self.embed_text_fn(str(t)))
         if not embs:
-            return np.zeros((0, 512), dtype=np.float32)
+            return np.zeros((0, 0), dtype=np.float32)
         mat = np.stack(embs, axis=0).astype(np.float32)
         mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
         return mat
@@ -344,8 +391,22 @@ class ProbeManager:
         if image_emb is not None:
             if image_emb.ndim != 1:
                 image_emb = image_emb.flatten()
+            if pos_embs.size and int(pos_embs.shape[1]) != int(image_emb.shape[0]):
+                return {
+                    "error": (
+                        "Text and image probe embeddings use different dimensions. "
+                        "Use one CLIP model and clear old probe buffers."
+                    )
+                }
             pos_embs = np.vstack([pos_embs, image_emb[np.newaxis, :]]) if pos_embs.size else image_emb[np.newaxis, :]
         neg_embs = self._embed_texts(neg_texts)
+        if neg_embs.size and pos_embs.size and int(neg_embs.shape[1]) != int(pos_embs.shape[1]):
+            return {
+                "error": (
+                    "Positive and negative probe embeddings use different dimensions. "
+                    "Use one CLIP model and clear old probe buffers."
+                )
+            }
         if image_pos_floor is not None:
             pos_floor = max(pos_floor, image_pos_floor)
         min_ts_ms: Optional[int] = None
@@ -355,17 +416,21 @@ class ProbeManager:
             buf = self.buffers.get(channel_id)
             if not buf:
                 return {"results": [], "frames_indexed": 0}
-            results = buf.query(
-                pos_embs,
-                neg_embs,
-                pos_floor,
-                margin_thr,
-                top_k,
-                min_ts_ms=min_ts_ms,
-                roi_norm=roi_norm,
-                embed_image_fn=self.embed_image_fn,
-                roi_padding=roi_padding,
-            )
+            try:
+                results = buf.query(
+                    pos_embs,
+                    neg_embs,
+                    pos_floor,
+                    margin_thr,
+                    top_k,
+                    min_ts_ms=min_ts_ms,
+                    roi_norm=roi_norm,
+                    embed_image_fn=self.embed_image_fn,
+                    roi_padding=roi_padding,
+                )
+            except ValueError as exc:
+                buf.clear()
+                return {"error": str(exc), "frames_indexed": 0}
             status = buf.status()
         return {"results": results, "status": status, "frames_indexed": status.get("frames", 0)}
 
@@ -379,3 +444,7 @@ class ProbeManager:
     def clear(self, channel_id: int) -> None:
         with self.lock:
             self.buffers.pop(channel_id, None)
+
+    def clear_all(self) -> None:
+        with self.lock:
+            self.buffers.clear()

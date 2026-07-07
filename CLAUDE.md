@@ -33,7 +33,7 @@ python oldapp.py
 
 **Network Access**: The server binds to all network interfaces and displays available URLs on startup:
 - Local: `http://localhost:5000`
-- Network: `http://192.168.1.104:5000` (or your machine's IP)
+- Network: `http://<your-host-ip>:5000`
 - IPv6: Available if configured
 
 ## Configuration

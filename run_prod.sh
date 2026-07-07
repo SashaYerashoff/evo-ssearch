@@ -7,22 +7,42 @@ WORKERS="${EVOSSEARCH_GUNICORN_WORKERS:-1}"
 THREADS="${EVOSSEARCH_GUNICORN_THREADS:-4}"
 TIMEOUT="${EVOSSEARCH_GUNICORN_TIMEOUT:-180}"
 GUNICORN_BIN="${EVOSSEARCH_GUNICORN_BIN:-}"
+GUNICORN_CONFIG="${EVOSSEARCH_GUNICORN_CONFIG:-gunicorn_conf.py}"
+SECURE_REQUIRED="${EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED:-false}"
+
+case "${SECURE_REQUIRED,,}" in
+  1|true|yes|on)
+    if [[ "${WORKERS}" != "1" ]]; then
+      echo "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED requires EVOSSEARCH_GUNICORN_WORKERS=1; shared in-process schedulers are not multi-worker safe." >&2
+      exit 1
+    fi
+    ;;
+esac
 
 if [[ -z "${GUNICORN_BIN}" ]]; then
-  if command -v gunicorn >/dev/null 2>&1; then
-    GUNICORN_BIN="gunicorn"
-  elif [[ -x ".venv/bin/gunicorn" ]]; then
+  if [[ -x ".venv/bin/gunicorn" ]]; then
     GUNICORN_BIN=".venv/bin/gunicorn"
+  elif command -v gunicorn >/dev/null 2>&1; then
+    GUNICORN_BIN="gunicorn"
   else
     echo "gunicorn not found. Install requirements or set EVOSSEARCH_GUNICORN_BIN." >&2
     exit 1
   fi
 fi
 
-exec "${GUNICORN_BIN}" \
+GUNICORN_ARGS=()
+
+if [[ -n "${GUNICORN_CONFIG}" ]]; then
+  GUNICORN_ARGS+=(--config "${GUNICORN_CONFIG}")
+fi
+
+GUNICORN_ARGS+=(
   "wsgi:app" \
   --bind "${HOST}:${PORT}" \
   --workers "${WORKERS}" \
   --threads "${THREADS}" \
   --timeout "${TIMEOUT}" \
   --worker-class gthread
+)
+
+exec "${GUNICORN_BIN}" "${GUNICORN_ARGS[@]}"

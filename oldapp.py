@@ -4,16 +4,21 @@ import atexit
 import base64
 import copy
 import gc
+import hashlib
 import html as html_lib
 import json
 import math
 import pickle
+import re
 import secrets
 import socket
+import tempfile
 import threading
 import time
 import uuid
 import requests
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
@@ -23,18 +28,45 @@ from threading import Lock
 import numpy as np
 import torch
 import cv2
-import clip
-import faiss
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 
 from config import config
-from detection_store import DetectionsStore
+from agent_postgres_store import PostgresAgentStore
+from archive_store import (
+    ARCHIVE_RUNTIME_REVISION,
+    ArchiveStoreNotReady,
+    PostgresDetectionsStore,
+    PostgresProbesStore,
+    PostgresRuntimeStateStore,
+)
 from embedders.dino_encoder import DINOEncoder
+from eva_db import DatabaseSettings, PsycopgPool
+from inference_queue import (
+    LuxriotInferenceQueueRuntime,
+    PostgresInferenceQueueRepository,
+)
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
+from road_events import AutoSceneCardConfig, DecodedVideoFrame, infer_scene_card_from_frames
+from security import (
+    ALL_CHANNELS,
+    AuditEvent,
+    AuditEventBuilder,
+    AuthContext,
+    AuthenticationService,
+    InvalidCredentials,
+    LoginThrottled,
+    Permission,
+    ROLE_PERMISSIONS,
+    Role,
+    require_channel_access,
+    require_permission,
+)
+from agent_security import ToolExecutionContext, ToolGatewayError
+from agent_security.audit import ToolAuditEvent
 if TYPE_CHECKING:
     from heads.mask2former_head import Mask2FormerHead
 try:
@@ -42,7 +74,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _Mask2FormerHeadRuntime = None  # type: ignore[misc]
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
 if config.CORS_ALLOWED_ORIGINS:
     CORS(app, resources={r"/*": {"origins": list(config.CORS_ALLOWED_ORIGINS)}})
@@ -55,13 +87,64 @@ clip_processor: Optional[Any] = None
 clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
 clip_runtime_device = device
+_clip_module: Optional[Any] = None
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
 _mask2former_failed = False
 SUPPORTED_EMBEDDERS = {"clip", "dino", "fusion"}
 EMBEDDER_SUBDIRS: Dict[str, str] = {"clip": "clip", "dino": "dino"}
+
+
+class _FaissTypingStub:
+    Index = Any
+
+
+faiss: Any = _FaissTypingStub()
+_faiss_module: Optional[Any] = None
 FaissIndexBundle = Tuple[Optional[faiss.Index], Optional[List[str]], Optional[List[Dict[str, Any]]], Dict[str, Any]]
+
+
+def _get_faiss() -> Any:
+    """Load FAISS only for index/search paths.
+
+    Some older CPU-only hosts can import the rest of the control plane but crash
+    with SIGILL when importing faiss-cpu wheels. Keeping this lazy lets auth,
+    audit, settings, Luxriot, and remote LLM smoke tests run on those hosts.
+    """
+    global faiss, _faiss_module
+    if not _local_vision_stack_enabled():
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _faiss_module is None:
+        import importlib
+
+        _faiss_module = importlib.import_module("faiss")
+        faiss = _faiss_module
+    return _faiss_module
+
+
+def _get_clip_module() -> Any:
+    """Load clip-anytorch only when CLIP embeddings are actually needed."""
+    global _clip_module
+    if not _local_vision_stack_enabled():
+        raise RuntimeError(
+            "Local vision stack is disabled. Set EVOSSEARCH_LOCAL_VISION_ENABLED=true "
+            "on a host that supports the installed CLIP/FAISS wheels."
+        )
+    if _clip_module is None:
+        import importlib
+
+        _clip_module = importlib.import_module("clip")
+    return _clip_module
+
+
+def _local_vision_stack_enabled() -> bool:
+    return str(
+        os.getenv("EVOSSEARCH_LOCAL_VISION_ENABLED", "true") or "true"
+    ).strip().lower() in TRUE_BOOL_STRINGS
 
 if hasattr(Image, "Resampling"):
     RESAMPLE_NEAREST = Image.Resampling.NEAREST
@@ -80,6 +163,186 @@ TRUE_BOOL_STRINGS = {"1", "true", "yes", "on"}
 FALSE_BOOL_STRINGS = {"0", "false", "no", "off"}
 PROBE_ROI_MIN_SIDE = 0.02
 PROBE_ROI_PADDING = 0.05
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+_auth_service: Optional[AuthenticationService] = None
+_auth_service_lock = Lock()
+_identity_repository: Optional[Any] = None
+_identity_repository_lock = Lock()
+_audit_writer: Optional[Any] = None
+_audit_writer_lock = Lock()
+_audit_reader: Optional[Any] = None
+_audit_reader_lock = Lock()
+_audit_db_pool: Optional[PsycopgPool] = None
+_audit_db_pool_lock = Lock()
+_control_plane_db_pool: Optional[PsycopgPool] = None
+_control_plane_db_lock = Lock()
+_inference_worker_db_pool: Optional[PsycopgPool] = None
+_inference_worker_db_lock = Lock()
+_inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
+_inference_queue_lock = Lock()
+
+
+def _experimental_embedding_models_enabled() -> bool:
+    return bool(getattr(config, "EXPERIMENTAL_EMBEDDERS_ENABLED", False))
+
+
+def _production_clip_model() -> str:
+    model = str(getattr(config, "PRODUCTION_CLIP_MODEL", "ViT-B/32") or "").strip()
+    return model or "ViT-B/32"
+
+
+def _normalize_clip_model_for_policy(model_name: Any) -> str:
+    requested = str(model_name or "").strip()
+    if not requested:
+        requested = _production_clip_model()
+    if _experimental_embedding_models_enabled():
+        return requested
+    return _production_clip_model()
+
+
+def _normalize_embedder_for_policy(embedder: Any, fusion_enabled: bool = False) -> str:
+    requested = str(embedder or "clip").strip().lower()
+    if requested not in SUPPORTED_EMBEDDERS:
+        requested = "clip"
+    if not _experimental_embedding_models_enabled():
+        return "clip"
+    if requested == "fusion" and not fusion_enabled:
+        return "clip"
+    return requested
+
+
+def _normalize_index_mode_for_policy(index_mode: Any) -> str:
+    requested = str(index_mode or "clip").strip().lower()
+    if requested not in {"clip", "dino", "dual"}:
+        requested = "clip"
+    if not _experimental_embedding_models_enabled():
+        return "clip"
+    return requested
+
+_MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
+    "auth_logout": None,
+    "save_comment": Permission.BOOKMARKS_CREATE,
+    "index_folder": Permission.MODELS_MANAGE,
+    "index_segments": Permission.MODELS_MANAGE,
+    "luxriot_start_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_prompt_settings": Permission.PROMPTS_MANAGE,
+    "luxriot_stop_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_flush_capture": Permission.CAPTURE_MANAGE,
+    "luxriot_stop_stream": Permission.CAPTURE_MANAGE,
+    "luxriot_stop_all_streams": Permission.CAPTURE_MANAGE,
+    "luxriot_bookmark": Permission.BOOKMARKS_CREATE,
+    "probes_query": Permission.PROBES_RUN,
+    "probes_start_capture": Permission.CAPTURE_MANAGE,
+    "probes_stop_capture": Permission.CAPTURE_MANAGE,
+    "probes_save": Permission.PROBES_MANAGE,
+    "probes_cast": Permission.PROBES_MANAGE,
+    "probes_delete": Permission.PROBES_MANAGE,
+    "probes_run": Permission.PROBES_RUN,
+    "agent_chat": Permission.AGENT_USE,
+    "agent_action_plan_execute": Permission.AGENT_USE,
+    "agent_config": Permission.MODELS_MANAGE,
+    "agent_skills_create": Permission.PROMPTS_MANAGE,
+    "agent_skill_detail": Permission.PROMPTS_MANAGE,
+    "agent_session": Permission.AGENT_USE,
+    "save_settings": Permission.SETTINGS_MANAGE,
+    "save_settings_env": Permission.SETTINGS_MANAGE,
+}
+_SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
+    "serve_image": Permission.DETECTIONS_VIEW,
+    "serve_detection_image": Permission.DETECTIONS_VIEW,
+    "serve_detection_thumbnail": Permission.DETECTIONS_VIEW,
+    "get_comments": Permission.REPORTS_VIEW,
+    "get_commented_images": Permission.REPORTS_VIEW,
+    "check_index": Permission.DIAGNOSTICS_VIEW,
+    "video_understanding": Permission.STREAMS_VIEW,
+    "describe_image": Permission.DETECTIONS_VIEW,
+    "get_settings_env": Permission.SETTINGS_MANAGE,
+    "lm_models": Permission.DIAGNOSTICS_VIEW,
+    "settings_archive_capacity": Permission.DIAGNOSTICS_VIEW,
+    "search": Permission.DETECTIONS_VIEW,
+    "search_by_image": Permission.DETECTIONS_VIEW,
+    "search_by_mask": Permission.DETECTIONS_VIEW,
+    "segment_from_point": Permission.DETECTIONS_VIEW,
+    "detections_search_text": Permission.DETECTIONS_VIEW,
+    "detections_search_image": Permission.DETECTIONS_VIEW,
+    "detections_list": Permission.DETECTIONS_VIEW,
+    "detections_summary": Permission.DETECTIONS_VIEW,
+    "detections_diagnostics": Permission.DETECTIONS_VIEW,
+    "luxriot_channels": Permission.STREAMS_VIEW,
+    "luxriot_prompt_settings": Permission.STREAMS_VIEW,
+    "luxriot_recent_frame": Permission.STREAMS_VIEW,
+    "luxriot_snapshot": Permission.STREAMS_VIEW,
+    "luxriot_snapshot_capture": Permission.STREAMS_VIEW,
+    "road_scene_overlay": Permission.DIAGNOSTICS_VIEW,
+    "luxriot_session_status": Permission.STREAMS_VIEW,
+    "luxriot_summary_rollups": Permission.REPORTS_VIEW,
+    "luxriot_streams_status": Permission.STREAMS_VIEW,
+    "probes_status": Permission.STREAMS_VIEW,
+    "probes_list": Permission.REPORTS_VIEW,
+    "probes_bench": Permission.DIAGNOSTICS_VIEW,
+    "agent_sessions": Permission.AGENT_USE,
+    "agent_config": Permission.AGENT_USE,
+    "agent_skills": Permission.AGENT_USE,
+    "agent_skill_detail": Permission.AGENT_USE,
+    "agent_session": Permission.AGENT_USE,
+    "audit_events": Permission.AUDIT_VIEW,
+}
+_CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
+    {
+        "detections_list",
+        "detections_search_image",
+        "detections_search_text",
+        "detections_summary",
+        "describe_image",
+        "search",
+        "serve_image",
+        "luxriot_prompt_settings",
+        "probes_delete",
+        "probes_run",
+        "probes_save",
+        "probes_cast",
+    }
+)
+_ALL_CHANNELS_REQUIRED_ENDPOINTS = frozenset(
+    {
+        "audit_events",
+        "luxriot_stop_all_streams",
+    }
+)
+_DEFAULT_CHANNEL_ENDPOINTS = frozenset(
+    {
+        "luxriot_bookmark",
+        "luxriot_flush_capture",
+        "luxriot_session_status",
+        "luxriot_start_capture",
+        "luxriot_stop_capture",
+        "luxriot_stop_stream",
+        "luxriot_summary_rollups",
+        "probes_query",
+        "probes_save",
+        "probes_start_capture",
+        "probes_status",
+        "probes_stop_capture",
+    }
+)
+
+
+def _archive_store_not_ready_response(exc: ArchiveStoreNotReady):
+    app.logger.warning(
+        "Archive store not ready request_id=%s error=%s",
+        getattr(g, "request_id", ""),
+        exc,
+    )
+    return jsonify(
+        {
+            "error": (
+                "Archive storage is not ready. Apply the required database "
+                "migration before using archive search."
+            ),
+            "not_ready": "archive_store",
+            "required_revision": ARCHIVE_RUNTIME_REVISION,
+        }
+    ), 503
 
 
 def _json_body() -> Dict[str, Any]:
@@ -188,7 +451,763 @@ def _has_admin_access() -> bool:
     return secrets.compare_digest(provided, configured)
 
 
+def _auth_enabled() -> bool:
+    return bool(getattr(config, "AUTH_ENABLED", False))
+
+
+def _request_id() -> str:
+    value = str(request.headers.get("X-Request-ID") or "").strip()
+    if value and len(value) <= 128 and all(
+        character.isalnum() or character in "._:-" for character in value
+    ):
+        return value
+    return str(uuid.uuid4())
+
+
+def _source_ip() -> str:
+    return str(request.remote_addr or "0.0.0.0")
+
+
+def _postgres_database_configured() -> bool:
+    return any(
+        str(os.getenv(name) or "").strip()
+        for name in (
+            "EVA_DATABASE_DSN",
+            "EVA_DATABASE_URL",
+            "EVOSSEARCH_DATABASE_DSN",
+            "EVOSSEARCH_DATABASE_URL",
+            "DATABASE_URL",
+        )
+    )
+
+
+def _get_control_plane_db_pool() -> PsycopgPool:
+    global _control_plane_db_pool
+    with _control_plane_db_lock:
+        if _control_plane_db_pool is None:
+            _control_plane_db_pool = PsycopgPool(DatabaseSettings.from_env())
+        return _control_plane_db_pool
+
+
+def _archive_store_mode() -> str:
+    return "postgres"
+
+
+def _archive_tenant_id() -> str:
+    return str(
+        getattr(config, "ARCHIVE_TENANT_ID", "")
+        or getattr(config, "AUTH_TENANT_ID", "")
+        or ""
+    ).strip()
+
+
+def _archive_store_required() -> bool:
+    return True
+
+
+class _UnavailablePostgresStore:
+    """Fail-closed stand-in used when PostgreSQL runtime storage is unavailable."""
+
+    backend = "postgres"
+
+    def __init__(self, component: str, exc: Optional[Exception] = None) -> None:
+        self.component = str(component or "archive")
+        self.error = type(exc).__name__ if exc is not None else None
+        self.detail = str(exc)[:240] if exc is not None else None
+
+    def health(self) -> Dict[str, Any]:
+        status = "error" if self.error else "not_configured"
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "status": status,
+            "backend": self.backend,
+            "component": self.component,
+            "required_backend": "postgres",
+        }
+        if self.error:
+            payload["error"] = self.error
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
+
+    def load_state(self, key: str) -> Optional[Dict[str, Any]]:
+        raise ArchiveStoreNotReady(self._message())
+
+    def save_state(self, key: str, payload: Mapping[str, Any]) -> None:
+        raise ArchiveStoreNotReady(self._message())
+
+    def _message(self) -> str:
+        reason = f" ({self.error})" if self.error else ""
+        return f"PostgreSQL {self.component} store is unavailable{reason}."
+
+    def __getattr__(self, name: str) -> Any:
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            raise ArchiveStoreNotReady(self._message())
+
+        return _raise
+
+
+def _postgres_archive_enabled() -> bool:
+    if not _postgres_database_configured():
+        return False
+    if not _archive_tenant_id():
+        return False
+    return True
+
+
+def _build_luxriot_runtime_state_store() -> Optional[PostgresRuntimeStateStore]:
+    if not _postgres_archive_enabled():
+        return cast(Any, _UnavailablePostgresStore("runtime_state"))
+    try:
+        return PostgresRuntimeStateStore(
+            _get_control_plane_db_pool(),
+            _archive_tenant_id(),
+        )
+    except Exception as exc:
+        return cast(Any, _UnavailablePostgresStore("runtime_state", exc))
+
+
+def _get_identity_repository() -> Any:
+    global _identity_repository
+    with _identity_repository_lock:
+        if _identity_repository is None:
+            from security.postgres_identity import PostgresIdentityRepository
+
+            _identity_repository = PostgresIdentityRepository(
+                _get_control_plane_db_pool()
+            )
+        return _identity_repository
+
+
+def _get_auth_service() -> AuthenticationService:
+    global _auth_service
+    with _auth_service_lock:
+        if _auth_service is None:
+            if not str(getattr(config, "AUTH_TENANT_ID", "") or "").strip():
+                raise RuntimeError("EVOSSEARCH_AUTH_TENANT_ID is required")
+            from security.postgres_throttling import PostgresLoginThrottleRepository
+            from security.throttling import LoginThrottleService
+
+            throttle = LoginThrottleService(
+                PostgresLoginThrottleRepository(
+                    _get_control_plane_db_pool(),
+                    config.AUTH_TENANT_ID,
+                )
+            )
+            _auth_service = AuthenticationService(
+                _get_identity_repository(),
+                tenant_id=config.AUTH_TENANT_ID,
+                session_ttl=timedelta(
+                    hours=int(config.AUTH_SESSION_TTL_HOURS)
+                ),
+                throttle=throttle,
+            )
+        return _auth_service
+
+
+def _get_audit_writer() -> Any:
+    global _audit_writer
+    with _audit_writer_lock:
+        if _audit_writer is None:
+            from security.postgres_audit import PostgresAuditWriter
+
+            _audit_writer = PostgresAuditWriter(_get_audit_db_pool())
+        return _audit_writer
+
+
+def _get_audit_reader() -> Any:
+    global _audit_reader
+    with _audit_reader_lock:
+        if _audit_reader is None:
+            from security.postgres_audit_reader import PostgresAuditReader
+
+            _audit_reader = PostgresAuditReader(_get_control_plane_db_pool())
+        return _audit_reader
+
+
+def _audit_database_dsn() -> str:
+    return str(
+        os.getenv("EVA_AUDIT_DATABASE_DSN")
+        or os.getenv("EVOSSEARCH_AUDIT_DATABASE_DSN")
+        or ""
+    ).strip()
+
+
+def _get_audit_db_pool() -> PsycopgPool:
+    global _audit_db_pool
+    with _audit_db_pool_lock:
+        if _audit_db_pool is None:
+            dsn = _audit_database_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "EVA_AUDIT_DATABASE_DSN is required for durable audit"
+                )
+            base_settings = DatabaseSettings.from_env()
+            _audit_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    dsn=dsn,
+                    pool_min_size=0,
+                    pool_max_size=min(4, base_settings.pool_max_size),
+                    application_name="eva-ai-audit",
+                )
+            )
+        return _audit_db_pool
+
+
+def _current_auth_context() -> Optional[AuthContext]:
+    context = getattr(g, "auth_context", None)
+    return context if isinstance(context, AuthContext) else None
+
+
+def _probe_channel_ids(probe_ids: Iterable[Any]) -> Set[int]:
+    wanted = {
+        str(probe_id).strip()
+        for probe_id in probe_ids
+        if str(probe_id or "").strip()
+    }
+    if not wanted:
+        return set()
+    try:
+        probes = probes_store.list_probes()
+    except Exception:
+        g.channel_resolution_error = "probe_lookup_failed"
+        return set()
+    matched: Set[str] = set()
+    channel_ids: Set[int] = set()
+    for probe in probes:
+        probe_id = str(probe.get("id") or "")
+        if probe_id not in wanted:
+            continue
+        matched.add(probe_id)
+        channel_id = _to_optional_int(probe.get("channel_id"))
+        if channel_id is not None:
+            channel_ids.add(channel_id)
+    if matched != wanted:
+        g.channel_resolution_error = "probe_owner_missing"
+    return channel_ids
+
+
+def _image_channel_ids_for_request_value(value: Any) -> Set[int]:
+    image_path = str(value or "").strip()
+    if not image_path:
+        return set()
+    try:
+        return {
+            int(channel_id)
+            for channel_id in detections_store.channel_ids_for_image_path(image_path)
+            if _to_optional_int(channel_id) is not None
+        }
+    except Exception:
+        g.channel_resolution_error = "image_owner_lookup_failed"
+        return set()
+
+
+def _detection_channel_ids_for_request_value(value: Any) -> Set[int]:
+    detection_id = _to_optional_int(value)
+    if detection_id is None:
+        return set()
+    try:
+        rows = detections_store.fetch_detections_by_ids([detection_id], include_vectors=False)
+    except Exception:
+        g.channel_resolution_error = "detection_owner_lookup_failed"
+        return set()
+    channel_ids: Set[int] = set()
+    for row in rows:
+        channel_id = _to_optional_int(row.get("channel_id"))
+        if channel_id is not None:
+            channel_ids.add(channel_id)
+    if not channel_ids:
+        g.channel_resolution_error = "detection_owner_missing"
+    return channel_ids
+
+
+def _request_image_channel_ids(
+    endpoint: str,
+    view_args: Mapping[str, Any],
+    payload: Any,
+    form: Mapping[str, Any],
+) -> Set[int]:
+    values: List[Any] = []
+    detection_ids: List[Any] = []
+    if endpoint == "serve_detection_image":
+        values.append(request.args.get("image_path"))
+    if endpoint == "serve_detection_thumbnail":
+        detection_ids.append(view_args.get("detection_id"))
+    if endpoint == "serve_image":
+        values.append(request.args.get("image_path"))
+        values.append(view_args.get("filepath"))
+    if endpoint == "describe_image":
+        if isinstance(payload, Mapping):
+            values.append(payload.get("image_path"))
+        values.append(form.get("image_path"))
+    channel_ids: Set[int] = set()
+    for value in values:
+        channel_ids.update(_image_channel_ids_for_request_value(value))
+    for value in detection_ids:
+        channel_ids.update(_detection_channel_ids_for_request_value(value))
+    return channel_ids
+
+
+def _request_channel_ids() -> Set[int]:
+    candidates: List[Any] = []
+    view_args = request.view_args or {}
+    candidates.extend(
+        view_args.get(key) for key in ("channel_id", "channel") if key in view_args
+    )
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        candidates.extend(
+            payload.get(key) for key in ("channel_id", "channel") if key in payload
+        )
+        for key in ("channel_ids", "channels"):
+            raw_values = payload.get(key)
+            if isinstance(raw_values, (list, tuple, set)):
+                candidates.extend(raw_values)
+            elif raw_values is not None:
+                candidates.append(raw_values)
+    form = request.form
+    candidates.extend(
+        form.get(key) for key in ("channel_id", "channel") if key in form
+    )
+    candidates.extend(
+        request.args.get(key) for key in ("channel_id", "channel") if key in request.args
+    )
+    channel_ids: Set[int] = set()
+    for candidate in candidates:
+        try:
+            channel_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if channel_id > 0:
+            channel_ids.add(channel_id)
+
+    endpoint = str(request.endpoint or "")
+    probe_ids: List[Any] = []
+    for source in (view_args, payload, form, request.args):
+        if not isinstance(source, Mapping):
+            continue
+        if "probe_id" in source:
+            probe_ids.append(source.get("probe_id"))
+        if endpoint in {"probes_delete", "probes_run"}:
+            if "id" in source:
+                probe_ids.append(source.get("id"))
+    channel_ids.update(_probe_channel_ids(probe_ids))
+    channel_ids.update(
+        _request_image_channel_ids(endpoint, view_args, payload, form)
+    )
+
+    if not channel_ids and endpoint in _DEFAULT_CHANNEL_ENDPOINTS:
+        default_channel = _to_optional_int(config.LUXRIOT_DEFAULT_CHANNEL_ID)
+        if default_channel is not None and default_channel > 0:
+            channel_ids.add(default_channel)
+    return channel_ids
+
+
+def _audit_scope_details(
+    details: Mapping[str, Any],
+    channel_ids: Set[int],
+) -> Dict[str, Any]:
+    scoped = dict(details)
+    if len(channel_ids) > 1:
+        scoped["channel_ids"] = sorted(channel_ids)
+    return scoped
+
+
+def _channel_for_audit(channel_ids: Set[int]) -> Optional[int]:
+    return next(iter(channel_ids)) if len(channel_ids) == 1 else None
+
+
+def _is_channel_scoped(context: AuthContext) -> bool:
+    return ALL_CHANNELS not in context.allowed_channel_ids
+
+
+def _can_access_context_channel(
+    context: Optional[AuthContext],
+    channel_id: Any,
+) -> bool:
+    if context is None:
+        return True
+    normalized = _to_optional_int(channel_id)
+    if normalized is None:
+        return False
+    try:
+        require_channel_access(context, normalized)
+    except PermissionError:
+        return False
+    return True
+
+
+def _filter_stream_status_for_context(
+    status: Mapping[str, Any],
+    context: Optional[AuthContext],
+) -> Dict[str, Any]:
+    filtered = dict(status)
+    if not _auth_enabled() or context is None:
+        return filtered
+    for key in ("video_streams", "analytics_streams"):
+        filtered[key] = [
+            item
+            for item in filtered.get(key) or []
+            if _can_access_context_channel(
+                context,
+                item.get("channel_id") if isinstance(item, Mapping) else None,
+            )
+        ]
+    for key in (
+        "paused_analytics_channels",
+        "video_history_channels",
+    ):
+        filtered[key] = [
+            channel_id
+            for channel_id in filtered.get(key) or []
+            if _can_access_context_channel(context, channel_id)
+        ]
+    filtered["running_total"] = sum(
+        len(filtered.get(key) or [])
+        for key in ("video_streams", "analytics_streams")
+    )
+    return filtered
+
+
+def _write_security_audit(
+    *,
+    context: Optional[AuthContext],
+    action: str,
+    result: str,
+    target_type: str,
+    target_id: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    details: Optional[Mapping[str, Any]] = None,
+) -> None:
+    event = AuditEventBuilder().build(
+        context=context,
+        tenant_id=(
+            None
+            if context is not None
+            else str(getattr(config, "AUTH_TENANT_ID", "") or "").strip() or None
+        ),
+        source_ip=_source_ip(),
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        channel_id=channel_id,
+        result=result,
+        details=details,
+    )
+    _get_audit_writer().write(event)
+
+
+def _audit_fingerprint(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _audit_key_details(name: str, values: Iterable[Any], *, limit: int = 100) -> Dict[str, Any]:
+    keys = sorted({str(value).strip() for value in values if str(value).strip()})
+    details: Dict[str, Any] = {
+        f"{name}_count": len(keys),
+        name: keys[:limit],
+    }
+    if len(keys) > limit:
+        details[f"{name}_truncated"] = True
+    return details
+
+
+def _write_completion_audit_or_error(
+    *,
+    action: str,
+    result: str = "success",
+    target_type: str = "route",
+    target_id: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    details: Optional[Mapping[str, Any]] = None,
+):
+    if not _auth_enabled():
+        return None
+    try:
+        _write_security_audit(
+            context=_current_auth_context(),
+            action=action,
+            result=result,
+            target_type=target_type,
+            target_id=target_id,
+            channel_id=channel_id,
+            details=details,
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return None
+
+
+def _write_agent_tool_audit(event: ToolAuditEvent) -> None:
+    details = {
+        "phase": event.phase,
+        "operation": event.operation,
+        "risk": event.risk,
+        "required_permission": event.required_permission,
+        "arguments_hash": event.arguments_hash,
+        "code": event.code,
+        "duration_ms": event.duration_ms,
+        **dict(event.details),
+    }
+    audit_event = AuditEvent(
+        timestamp=event.timestamp,
+        request_id=event.request_id,
+        actor_user_id=event.actor_id,
+        actor_roles=tuple(sorted(event.actor_roles)),
+        tenant_id=event.tenant_id,
+        source_ip=event.source_ip or "0.0.0.0",
+        action=f"agent.tool.{event.operation}.{event.tool_name}",
+        target_type="agent_tool",
+        target_id=event.tool_name,
+        channel_id=None,
+        result=event.phase,
+        details=details,
+    )
+    _get_audit_writer().write(audit_event)
+
+
+def _auth_failure_response(message: str, status: int):
+    return jsonify({"success": False, "error": message}), status
+
+
+def _session_guard(
+    *,
+    permission: Optional[Permission],
+    require_csrf: bool,
+    action: str,
+):
+    context = _current_auth_context()
+    channel_ids = _request_channel_ids()
+    channel_id = _channel_for_audit(channel_ids)
+    if getattr(g, "auth_resolution_error", None):
+        return _auth_failure_response("Authentication service unavailable", 503)
+    if context is None:
+        try:
+            _write_security_audit(
+                context=None,
+                action=action,
+                result="denied",
+                target_type="route",
+                target_id=request.path,
+                channel_id=channel_id,
+                details=_audit_scope_details(
+                    {
+                        "method": request.method,
+                        "reason": "authentication_required",
+                    },
+                    channel_ids,
+                ),
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Authentication required", 401)
+
+    if require_csrf:
+        session_record = getattr(g, "auth_session", None)
+        cookie_token = str(
+            request.cookies.get(config.AUTH_CSRF_COOKIE) or ""
+        )
+        header_token = str(request.headers.get("X-CSRF-Token") or "")
+        try:
+            valid_csrf = bool(
+                session_record
+                and _get_auth_service().validate_csrf(
+                    session_record,
+                    cookie_token=cookie_token,
+                    header_token=header_token,
+                )
+            )
+        except Exception:
+            return _auth_failure_response("Authentication service unavailable", 503)
+        if not valid_csrf:
+            try:
+                _write_security_audit(
+                    context=context,
+                    action=action,
+                    result="denied",
+                    target_type="route",
+                    target_id=request.path,
+                    channel_id=channel_id,
+                    details=_audit_scope_details(
+                        {"method": request.method, "reason": "csrf_rejected"},
+                        channel_ids,
+                    ),
+                )
+            except Exception:
+                return _auth_failure_response("Audit service unavailable", 503)
+            return _auth_failure_response("CSRF token required", 403)
+
+    try:
+        if permission is not None:
+            require_permission(context, permission)
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "") in _ALL_CHANNELS_REQUIRED_ENDPOINTS
+        ):
+            raise PermissionError("all-channel access is required")
+        if _is_channel_scoped(context) and getattr(
+            g,
+            "channel_resolution_error",
+            None,
+        ):
+            raise PermissionError(str(g.channel_resolution_error))
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "")
+            in _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS
+            and not channel_ids
+        ):
+            raise PermissionError("an explicit authorized channel is required")
+        if (
+            _is_channel_scoped(context)
+            and str(request.endpoint or "") in {"serve_detection_image", "serve_detection_thumbnail"}
+            and not channel_ids
+        ):
+            raise PermissionError(
+                "detection image ownership metadata is required"
+            )
+        for requested_channel_id in channel_ids:
+            require_channel_access(context, requested_channel_id)
+    except PermissionError as exc:
+        try:
+            _write_security_audit(
+                context=context,
+                action=action,
+                result="denied",
+                target_type="route",
+                target_id=request.path,
+                channel_id=channel_id,
+                details=_audit_scope_details(
+                    {"method": request.method, "reason": type(exc).__name__},
+                    channel_ids,
+                ),
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Access denied", 403)
+
+    try:
+        _write_security_audit(
+            context=context,
+            action=action,
+            result="success",
+            target_type="route",
+            target_id=request.path,
+            channel_id=channel_id,
+            details=_audit_scope_details(
+                {"method": request.method, "phase": "authorized"},
+                channel_ids,
+            ),
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return None
+
+
+_INDEXED_FOLDER_ENDPOINTS = {
+    "get_comments",
+    "save_comment",
+    "get_commented_images",
+    "check_index",
+    "index_folder",
+    "index_segments",
+    "search",
+    "search_by_image",
+    "search_by_mask",
+    "segment_from_point",
+}
+
+
+def _request_has_field(field: str) -> bool:
+    if field in request.args or field in request.form:
+        return True
+    data = request.get_json(silent=True) if request.is_json else None
+    return isinstance(data, Mapping) and field in data
+
+
+def _disabled_feature_response():
+    endpoint = str(request.endpoint or "")
+    if endpoint == "video_understanding" and not bool(getattr(config, "OFFLINE_VIDEO_ENABLED", False)):
+        return jsonify({"error": "offline_video_disabled"}), 404
+    if endpoint == "luxriot_snapshot_capture" and not bool(getattr(config, "PROBE_SNAP_ENABLED", False)):
+        return jsonify({"error": "probe_snap_disabled"}), 404
+
+    indexed_folder_enabled = bool(getattr(config, "INDEXED_FOLDER_ENABLED", False))
+    if indexed_folder_enabled:
+        return None
+    if endpoint in _INDEXED_FOLDER_ENDPOINTS:
+        return jsonify({"error": "indexed_folder_disabled"}), 404
+    if endpoint == "describe_image" and _request_has_field("folder"):
+        return jsonify({"error": "indexed_folder_disabled"}), 404
+    if endpoint == "serve_image" and "folder" in request.args:
+        return "Not found", 404
+    return None
+
+
+@app.before_request
+def _bind_request_security_context() -> None:
+    g.request_id = _request_id()
+    g.auth_context = None
+    g.auth_session = None
+    g.auth_resolution_error = None
+    g.channel_resolution_error = None
+    disabled_feature = _disabled_feature_response()
+    if disabled_feature is not None:
+        return disabled_feature
+    if not _auth_enabled():
+        return
+    session_token = str(
+        request.cookies.get(config.AUTH_SESSION_COOKIE) or ""
+    )
+    if not session_token:
+        resolved = None
+    else:
+        try:
+            resolved = _get_auth_service().resolve(
+                session_token,
+                request_id=g.request_id,
+            )
+            if resolved is not None:
+                g.auth_session, g.auth_context = resolved
+        except Exception as exc:
+            g.auth_resolution_error = type(exc).__name__
+
+    permission = _SENSITIVE_ENDPOINT_PERMISSIONS.get(str(request.endpoint or ""))
+    if permission is not None:
+        return _session_guard(
+            permission=permission,
+            require_csrf=request.method not in {"GET", "HEAD", "OPTIONS"},
+            action=f"http.{request.endpoint}.access",
+        )
+
+
+@app.after_request
+def _attach_request_security_headers(response):
+    response.headers["X-Request-ID"] = str(
+        getattr(g, "request_id", "") or uuid.uuid4()
+    )
+    return response
+
+
 def _settings_guard(write: bool = False):
+    if _auth_enabled():
+        return _session_guard(
+            permission=(
+                Permission.SETTINGS_MANAGE
+                if write
+                else Permission.SETTINGS_VIEW
+            ),
+            require_csrf=write,
+            action=(
+                "settings.write.authorize"
+                if write
+                else "settings.read"
+            ),
+        )
     if write:
         return _mutation_guard()
     if config.ADMIN_TOKEN:
@@ -201,6 +1220,18 @@ def _settings_guard(write: bool = False):
 
 
 def _mutation_guard():
+    if _auth_enabled():
+        endpoint = str(request.endpoint or "")
+        permission = (
+            _MUTATION_ENDPOINT_PERMISSIONS[endpoint]
+            if endpoint in _MUTATION_ENDPOINT_PERMISSIONS
+            else Permission.SETTINGS_MANAGE
+        )
+        return _session_guard(
+            permission=permission,
+            require_csrf=True,
+            action=f"http.{endpoint or 'unknown'}.mutate",
+        )
     configured = (config.ADMIN_TOKEN or "").strip()
     if not configured:
         return jsonify(
@@ -222,6 +1253,33 @@ def _mutation_guard_error():
     payload = body.get_json(silent=True) if hasattr(body, "get_json") else {}
     message = (payload or {}).get("error") or "Admin token required"
     return jsonify({"error": message}), status
+
+
+def _permission_guard_error(permission: Permission, *, action: str):
+    if not _auth_enabled():
+        return None
+    guard = _session_guard(
+        permission=permission,
+        require_csrf=False,
+        action=action,
+    )
+    if guard is None:
+        return None
+    body, status = guard
+    payload = body.get_json(silent=True) if hasattr(body, "get_json") else {}
+    message = (payload or {}).get("error") or "Access denied"
+    return jsonify({"error": message}), status
+
+
+def _current_request_has_permission(permission: Permission) -> bool:
+    if not _auth_enabled():
+        return True
+    context = _current_auth_context()
+    return bool(context and permission.value in context.permissions)
+
+
+def _bookmark_permission_guard_error(*, action: str):
+    return _permission_guard_error(Permission.BOOKMARKS_CREATE, action=action)
 
 
 def _path_within(path: Path, root: Path) -> bool:
@@ -268,7 +1326,8 @@ def init_clip() -> None:
             return
 
     preferred_device = device
-    requested_model = str(config.CLIP_MODEL or "").strip() or "ViT-B/32"
+    requested_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+    config.CLIP_MODEL = requested_model
     if _is_siglip2_clip_model(requested_model):
         try:
             model_obj, processor_obj = _load_siglip2_clip_model(requested_model, preferred_device)
@@ -351,7 +1410,8 @@ def _release_cuda_memory() -> None:
 
 
 def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
-    model, preprocess = clip.load(model_name, device=target_device)
+    clip_module = _get_clip_module()
+    model, preprocess = clip_module.load(model_name, device=target_device)
     cast(torch.nn.Module, model).eval()
     return cast(torch.nn.Module, model), preprocess
 
@@ -424,7 +1484,7 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
         else:
             if clip_model is None:
                 raise RuntimeError("CLIP backend is not initialized")
-            text_tokens = clip.tokenize(prepared).to(clip_runtime_device)
+            text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
             text_features = cast(Any, clip_model).encode_text(text_tokens)
         text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
     return text_features.cpu().numpy().astype(np.float32, copy=False)
@@ -607,14 +1667,29 @@ def get_image_embedding_from_pil(pil_image: Image.Image, embedder: Optional[str]
         return features[0]
 
 
-def get_text_embedding(text: str) -> np.ndarray:
-    """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
-    if active_embedder not in {"clip", "fusion"}:
-        raise RuntimeError("Text search is only supported when the CLIP backend is active.")
+def get_clip_text_embedding(text: str) -> np.ndarray:
+    """Extract a text embedding from the CLIP-like backend, including SigLIP2."""
     embeddings = _clip_text_embeddings([text])
     if embeddings.size == 0:
         raise RuntimeError("Text query is empty")
     return embeddings[0]
+
+
+def get_text_embedding(text: str) -> np.ndarray:
+    """Extract a CLIP text embedding. Only available when CLIP or fusion backend is active."""
+    if active_embedder not in {"clip", "fusion"}:
+        raise RuntimeError("Text search is only supported when the CLIP backend is active.")
+    return get_clip_text_embedding(text)
+
+
+def get_probe_image_embedding_from_pil(pil_image: Image.Image) -> np.ndarray:
+    """Probe image embeddings always use the CLIP-like backend so SigLIP2 can drive probe matching."""
+    return get_image_embedding_from_pil(pil_image, embedder="clip")
+
+
+def get_probe_text_embedding(text: str) -> np.ndarray:
+    """Probe text embeddings always use the CLIP-like backend so they remain available outside clip search mode."""
+    return get_clip_text_embedding(text)
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -652,6 +1727,27 @@ def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = 
         base.update(additional)
     base.setdefault("created_at", time.time())
     return base
+
+
+def _index_metadata_compatible(embedder: str, meta: Mapping[str, Any]) -> bool:
+    if not meta:
+        return True
+    if embedder == "clip":
+        expected_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+        meta_model = str(meta.get("model") or meta.get("requested_model") or "").strip()
+        if meta_model and meta_model != expected_model:
+            return False
+        if not _experimental_embedding_models_enabled():
+            backend = str(meta.get("backend") or "").strip().lower()
+            if backend and backend != "openai_clip":
+                return False
+        return True
+    if embedder == "dino":
+        if not _experimental_embedding_models_enabled():
+            return False
+        meta_model = str(meta.get("config_model") or meta.get("model") or "").strip()
+        return not meta_model or meta_model == str(config.DINO_MODEL)
+    return True
 
 
 def _index_targets() -> List[str]:
@@ -696,7 +1792,7 @@ def _create_index_for_embedder(entries: List[Tuple[Path, Dict[str, Any]]], embed
         return None
 
     embeddings_array = np.array(embeddings, dtype='float32')
-    index = faiss.IndexFlatIP(embeddings_array.shape[1])
+    index = _get_faiss().IndexFlatIP(embeddings_array.shape[1])
     _faiss_add_vectors(index, embeddings_array)
     index_meta = _build_index_metadata(embedder, {'image_count': len(image_paths)})
     return index, image_paths, image_metadata, index_meta
@@ -721,10900 +1817,75 @@ def create_index(folder_path):
 
 @app.route('/')
 def home():
-    """Serve the frontend"""
-    # Generate result limit options dynamically based on config
-    result_options = []
-    
-    # Create a reasonable set of options between min and max
-    min_val = config.MIN_RESULTS
-    max_val = config.MAX_RESULTS
-    default_val = config.DEFAULT_RESULTS
-    
-    # Generate options with reasonable intervals
-    options = set()
-    
-    # Always include min, default, and max
-    options.add(min_val)
-    options.add(default_val)
-    options.add(max_val)
-    
-    # Add some intermediate values
+    """Serve the frontend."""
+    min_val, max_val, default_val = config.MIN_RESULTS, config.MAX_RESULTS, config.DEFAULT_RESULTS
+    options: Set[int] = {min_val, default_val, max_val}
     if max_val <= 20:
-        # Small range: add every 2-3 values
-        for i in range(min_val, max_val + 1):
-            if i % 2 == 0 or i % 3 == 0:
-                options.add(i)
+        options.update(i for i in range(min_val, max_val + 1) if i % 2 == 0 or i % 3 == 0)
     else:
-        # Larger range: add multiples of 6, 12, etc.
-        for i in [6, 12, 18, 24, 30]:
-            if min_val <= i <= max_val:
-                options.add(i)
-    
-    # Sort and create HTML options
-    for i in sorted(options):
-        selected = "selected" if i == default_val else ""
-        result_options.append(f'<option value="{i}" {selected}>{i}</option>')
-    
-    result_options_html = '\n                            '.join(result_options)
-    luxriot_batch_options = []
-    for size in config.LUXRIOT_BATCH_SIZES:
-        selected = "selected" if size == config.LUXRIOT_BATCH_SIZES[0] else ""
-        luxriot_batch_options.append(f'<option value="{size}" {selected}>{size}</option>')
-    luxriot_batch_options_html = '\n                            '.join(luxriot_batch_options)
-    luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+        options.update(i for i in [6, 12, 18, 24, 30] if min_val <= i <= max_val)
+    result_options_html = '\n                            '.join(
+        f'<option value="{i}" {"selected" if i == default_val else ""}>{i}</option>'
+        for i in sorted(options)
+    )
+
+    luxriot_batch_options = '\n                            '.join(
+        f'<option value="{size}" {"selected" if size == config.LUXRIOT_BATCH_SIZES[0] else ""}>{size}</option>'
+        for size in config.LUXRIOT_BATCH_SIZES
+    )
+
     default_video_frames = max(1, int(config.LM_VIDEO_DEFAULT_FRAMES))
     max_video_frames = max(default_video_frames, int(config.LM_VIDEO_MAX_FRAMES))
     video_frame_options_set: Set[int] = {default_video_frames}
-    for raw_option in getattr(config, "LM_VIDEO_FRAME_OPTIONS", ()):
+    for _raw in getattr(config, "LM_VIDEO_FRAME_OPTIONS", ()):
         try:
-            option = int(raw_option)
+            _opt = int(_raw)
         except (TypeError, ValueError):
             continue
-        if 1 <= option <= max_video_frames:
-            video_frame_options_set.add(option)
-    video_frame_options = sorted(video_frame_options_set)
+        if 1 <= _opt <= max_video_frames:
+            video_frame_options_set.add(_opt)
     video_frame_options_html = '\n                            '.join(
         f'<option value="{count}" {"selected" if count == default_video_frames else ""}>{count}</option>'
-        for count in video_frame_options
+        for count in sorted(video_frame_options_set)
     )
-    segments_enabled_checked = "checked" if bool(config.DINO_SEGMENTS_ENABLED) else ""
-    segment_min_patches_default = max(1, int(config.DINO_SEGMENT_MIN_PATCHES))
-    segment_threshold_percent = min(99, max(40, int(round(float(config.DINO_HEATMAP_THRESHOLD) * 100))))
-    
-    # Use string formatting for the result options
-    html_template = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Natural Language Image Search</title>
-    <!-- Cache buster: {timestamp} -->
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Titillium+Web:wght@600;700&display=swap');
 
-        :root {
-            --bg: #0a0a0a;
-            --panel: #161616;
-            --panel-border: #262626;
-            --surface: #0f0f0f;
-            --field: #0a0a0a;
-            --field-border: #333;
-            --text: #e0e0e0;
-            --muted: #8f8f8f;
-            --radius-md: 8px;
-            --radius-lg: 12px;
-            --control-h: 36px;
-            --panel-gap: 0.75rem;
-            --panel-header-gap: 0.65rem;
-            --btn-sm-h: 30px;
-            --btn-md-h: 36px;
-            --btn-lg-h: 42px;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .container {
-            width: 100%;
-            max-width: 1280px;
-            min-width: 0;
-            margin: 0 auto;
-            padding: 1.5rem;
-            flex: 1;
-        }
-        
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-        }
-
-        .header-actions {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .brand {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.9rem;
-        }
-
-        .brand-top {
-            display: flex;
-            align-items: flex-end;
-            gap: 0.9rem;
-        }
-
-        .brand-logo {
-            height: 36px;
-            width: auto;
-            object-fit: contain;
-            display: block;
-            flex: 0 0 auto;
-            filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
-        }
-
-        .brand-main {
-            font-size: 2rem;
-            font-weight: 700;
-            letter-spacing: 0.02em;
-            margin: 0;
-            line-height: 0.9;
-            transform: translateY(2px);
-            font-family: "Titillium Web", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }
-
-        .brand-sub {
-            color: #d8d8d8;
-            font-size: 1.05rem;
-            margin: 0;
-        }
-
-        .settings-icon {
-            cursor: pointer;
-            padding: 8px;
-            border-radius: 6px;
-            transition: all 0.2s ease;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .settings-icon:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.2);
-            transform: scale(1.05);
-        }
-        
-        /* Settings Modal */
-        .settings-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            z-index: 1000;
-            backdrop-filter: blur(4px);
-        }
-        
-        .settings-modal-content {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: #161616;
-            border-radius: 12px;
-            border: 1px solid #262626;
-            width: 90%;
-            max-width: 600px;
-            max-height: 80vh;
-            overflow-y: auto;
-            padding: 2rem;
-        }
-
-        .probe-editor-modal-content {
-            max-width: 1040px;
-            width: min(96vw, 1040px);
-            max-height: 88vh;
-        }
-
-        .probe-editor-modal-body {
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .probe-editor-layout {
-            display: grid;
-            grid-template-columns: minmax(280px, 0.9fr) minmax(500px, 1.1fr);
-            gap: 1rem;
-            align-items: start;
-        }
-
-        .probe-editor-settings {
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .probe-editor-modal-actions {
-            margin-top: 0.25rem;
-        }
-
-        .probe-snap-modal-content {
-            max-width: 980px;
-            width: min(96vw, 980px);
-            max-height: 88vh;
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .probe-snap-toolbar {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.6rem;
-            flex-wrap: wrap;
-        }
-
-        .probe-snap-preview {
-            border: 1px solid #2a2a2a;
-            border-radius: 8px;
-            background: #0a0a0a;
-            padding: 0.5rem;
-            overflow: auto;
-            max-height: min(62vh, 640px);
-        }
-
-        .probe-snap-preview img {
-            display: block;
-            max-width: 100%;
-            width: 100%;
-            height: auto;
-            margin: 0 auto;
-            border-radius: 4px;
-        }
-
-        .probe-snap-preview.actual-size img {
-            width: auto;
-            max-width: none;
-        }
-        
-        .settings-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-            padding-bottom: 1rem;
-            border-bottom: 1px solid #333;
-        }
-        
-        .settings-header h2 {
-            font-size: 1.5rem;
-            font-weight: 300;
-            color: #e0e0e0;
-            margin: 0;
-        }
-        
-        .close-btn {
-            background: none;
-            border: none;
-            color: #888;
-            font-size: 1.5rem;
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            transition: all 0.2s ease;
-        }
-        
-        .close-btn:hover {
-            color: #e0e0e0;
-            background: rgba(255, 255, 255, 0.1);
-        }
-        
-        .settings-section {
-            margin-bottom: 2rem;
-        }
-        
-        .settings-section h3 {
-            font-size: 1.1rem;
-            font-weight: 400;
-            color: #e0e0e0;
-            margin-bottom: 1rem;
-            padding-bottom: 0.5rem;
-            border-bottom: 1px solid #333;
-        }
-        
-        .settings-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1rem;
-            gap: 1rem;
-        }
-
-        .backend-dino {
-            display: none;
-        }
-
-        .mode-tab[disabled] {
-            opacity: 0.4;
-            cursor: not-allowed;
-        }
-
-        .settings-label {
-            flex: 1;
-            color: #ccc;
-            font-size: 0.9rem;
-            min-width: 120px;
-        }
-        
-        .settings-input {
-            flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #333;
-            min-height: var(--control-h);
-            padding: 0 0.75rem;
-            border-radius: 6px;
-            color: #e0e0e0;
-            font-size: 0.9rem;
-            transition: border-color 0.2s;
-            max-width: 200px;
-        }
-
-        .settings-row.align-start {
-            align-items: flex-start;
-        }
-
-        .env-editor {
-            flex: 1;
-            max-width: none;
-            min-height: 240px;
-            padding: 0.65rem 0.75rem;
-            resize: vertical;
-            font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace;
-            font-size: 0.82rem;
-            line-height: 1.35;
-            white-space: pre;
-        }
-
-        .settings-note {
-            flex: 1;
-            color: #9aa0ad;
-            font-size: 0.82rem;
-        }
-
-        .env-editor-actions {
-            flex: 1;
-            display: flex;
-            gap: 0.5rem;
-            justify-content: flex-end;
-        }
-        
-        .settings-input:focus {
-            outline: none;
-            border-color: #555;
-        }
-
-        .settings-input.disabled {
-            opacity: 0.5;
-        }
-        
-        .settings-checkbox {
-            width: 18px;
-            height: 18px;
-            accent-color: #4a4a4a;
-        }
-        
-        .settings-select {
-            background: #0a0a0a;
-            border: 1px solid #333;
-            min-height: var(--control-h);
-            padding: 0 0.75rem;
-            border-radius: 6px;
-            color: #e0e0e0;
-            font-size: 0.9rem;
-            cursor: pointer;
-            max-width: 200px;
-        }
-        
-        .settings-range {
-            flex: 1;
-            max-width: 150px;
-            accent-color: #555;
-        }
-        
-        .range-value {
-            min-width: 30px;
-            text-align: center;
-            color: #888;
-            font-size: 0.85rem;
-        }
-
-        .range-value.disabled {
-            opacity: 0.5;
-        }
-        
-        .settings-actions {
-            display: flex;
-            gap: 1rem;
-            justify-content: flex-end;
-            margin-top: 2rem;
-            padding-top: 1rem;
-            border-top: 1px solid #333;
-        }
-        
-        .settings-btn {
-            background: #2a2a2a;
-            border: 1px solid #444;
-            color: #e0e0e0;
-            min-height: var(--btn-md-h);
-            padding: 0 1.2rem;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            line-height: 1;
-        }
-        
-        .settings-btn:hover {
-            background: #333;
-            border-color: #555;
-        }
-        
-        .settings-btn.primary {
-            background: #4a4a4a;
-            border-color: #666;
-        }
-        
-        .settings-btn.primary:hover {
-            background: #555;
-            border-color: #777;
-        }
-        
-        .settings-status {
-            margin-top: 1rem;
-            padding: 0.75rem;
-            border-radius: 6px;
-            font-size: 0.9rem;
-            display: none;
-        }
-        
-        .settings-status.success {
-            background: rgba(74, 222, 128, 0.1);
-            border: 1px solid rgba(74, 222, 128, 0.3);
-            color: #4ade80;
-        }
-        
-        .settings-status.error {
-            background: rgba(248, 113, 113, 0.1);
-            border: 1px solid rgba(248, 113, 113, 0.3);
-            color: #f87171;
-        }
-        
-        .control-panel {
-            background: var(--panel);
-            border-radius: var(--radius-lg);
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            border: 1px solid var(--panel-border);
-            position: static;
-        }
-        
-        .folder-select {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 1rem;
-        }
-        
-        input[type="text"] {
-            flex: 1;
-            background: var(--field);
-            border: 1px solid var(--field-border);
-            min-height: var(--control-h);
-            padding: 0 1rem;
-            border-radius: var(--radius-md);
-            color: var(--text);
-            font-size: 0.95rem;
-            transition: border-color 0.2s;
-            min-width: 0;
-        }
-
-        input[type="number"],
-        input[type="password"],
-        select {
-            min-height: var(--control-h);
-            line-height: 1.2;
-        }
-        
-        input[type="text"]:focus {
-            outline: none;
-            border-color: #555;
-        }
-        
-        button {
-            background: #1a1a1a;
-            border: 1px solid var(--field-border);
-            color: var(--text);
-            padding: 0.75rem 1.5rem;
-            border-radius: var(--radius-md);
-            cursor: pointer;
-            font-size: 0.95rem;
-            transition: all 0.2s;
-        }
-        
-        button:hover {
-            background: #222;
-            border-color: #444;
-        }
-        
-        button:active {
-            transform: translateY(1px);
-        }
-        
-        .status {
-            font-size: 0.875rem;
-            color: #888;
-            margin-top: 0.5rem;
-        }
-        
-        .status.success {
-            color: #4ade80;
-        }
-        
-        .status.error {
-            color: #f87171;
-        }
-
-        .status.warning {
-            color: #f4c066;
-        }
-        
-        .search-panel {
-            background: var(--panel);
-            border-radius: var(--radius-lg);
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            border: 1px solid var(--panel-border);
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-        
-        .search-mode-tabs {
-            display: flex;
-            gap: 0;
-            border-radius: var(--radius-md);
-            overflow: hidden;
-        }
-        
-        .mode-tab {
-            flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #333;
-            color: #888;
-            min-height: var(--btn-md-h);
-            padding: 0 1rem;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-            border-radius: 0;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .mode-tab.active {
-            background: #1a1a1a;
-            color: #e0e0e0;
-            border-color: #555;
-        }
-        
-        .mode-tab:hover {
-            background: #222;
-            color: #e0e0e0;
-        }
-        
-        .search-controls {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .archive-box {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .archive-workspace {
-            display: grid;
-            grid-template-columns: 320px minmax(0, 1fr);
-            gap: 1rem;
-            align-items: start;
-        }
-
-        .archive-results-panel {
-            background: #101010;
-            border: 1px solid #232323;
-            border-radius: var(--radius-md);
-            padding: 0.9rem;
-            min-height: 280px;
-        }
-
-        .archive-results-head {
-            color: #bdbdbd;
-            font-size: 0.82rem;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            margin-bottom: 0.75rem;
-            line-height: 1.2;
-        }
-        
-        .control-group {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-        
-        .feature-btn {
-            background: #2a4a3a;
-            border: 1px solid #3a5a4a;
-            color: #e0e0e0;
-            min-height: var(--btn-md-h);
-            padding: 0 1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-            white-space: nowrap;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            line-height: 1;
-        }
-
-        .feature-btn.btn-sm {
-            min-height: var(--btn-sm-h);
-            padding: 0 0.7rem;
-            font-size: 0.82rem;
-        }
-
-        .feature-btn.btn-md {
-            min-height: var(--btn-md-h);
-            padding: 0 1rem;
-        }
-
-        .feature-btn.btn-lg {
-            min-height: var(--btn-lg-h);
-            padding: 0 1.25rem;
-            font-size: 0.95rem;
-        }
-        
-        .feature-btn:hover {
-            background: #345a44;
-            border-color: #4a6a54;
-        }
-
-        .feature-btn.primary {
-            background: #3a6346;
-            border-color: #4e7a5b;
-            color: #eef8f1;
-        }
-
-        .feature-btn.primary:hover {
-            background: #447454;
-            border-color: #5d8e6e;
-        }
-        
-        .feature-btn:active {
-            transform: translateY(1px);
-        }
-
-        .feature-btn:disabled {
-            opacity: 0.55;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .feature-btn.auto-hide-disabled:disabled {
-            display: none;
-        }
-
-        button.is-loading,
-        .feature-btn.is-loading,
-        .settings-btn.is-loading,
-        .save-comment-btn.is-loading,
-        .segment-action-btn.is-loading {
-            position: relative;
-            color: transparent !important;
-            pointer-events: none;
-        }
-
-        button.is-loading::after,
-        .feature-btn.is-loading::after,
-        .settings-btn.is-loading::after,
-        .save-comment-btn.is-loading::after,
-        .segment-action-btn.is-loading::after {
-            content: '';
-            position: absolute;
-            width: 14px;
-            height: 14px;
-            border: 2px solid rgba(255, 255, 255, 0.35);
-            border-top-color: rgba(255, 255, 255, 0.95);
-            border-radius: 50%;
-            animation: spin 0.7s linear infinite;
-        }
-
-        button[aria-busy="true"] {
-            cursor: progress;
-        }
-        
-        .sort-control {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .limit-control {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .scope-control {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .segment-controls {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .segment-controls label {
-            font-size: 0.85rem;
-            color: #bbb;
-        }
-        
-        .segment-threshold-control {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .segment-threshold-control input[type="range"] {
-            width: 160px;
-            accent-color: #ff9d1a;
-        }
-        
-        .segment-threshold-value {
-            font-variant-numeric: tabular-nums;
-            min-width: 3.5ch;
-            text-align: right;
-            color: #e0e0e0;
-        }
-        
-        .segment-threshold-control.disabled {
-            opacity: 0.4;
-            pointer-events: none;
-        }
-        
-        .sort-control label,
-        .limit-control label,
-        .scope-control label {
-            color: #888;
-            font-size: 0.9rem;
-        }
-        
-        select {
-            background: #0a0a0a;
-            border: 1px solid #333;
-            color: #e0e0e0;
-            padding: 0 0.75rem;
-            border-radius: 6px;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: border-color 0.2s;
-        }
-        
-        select:focus {
-            outline: none;
-            border-color: #555;
-        }
-        
-        select option {
-            background: #0a0a0a;
-            color: #e0e0e0;
-        }
-        
-        .search-box {
-            display: flex;
-            gap: 1rem;
-            align-items: flex-end;
-        }
-
-        .archive-search-shell {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-            position: sticky;
-            top: 1rem;
-            align-self: start;
-        }
-
-        .archive-section {
-            background: var(--surface);
-            border: 1px solid #222;
-            border-radius: var(--radius-md);
-            padding: 0.9rem;
-            display: flex;
-            flex-direction: column;
-            gap: var(--panel-gap);
-        }
-
-        .archive-filter-grid {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 0.7rem;
-        }
-
-        .archive-detections-actions {
-            display: flex;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .archive-detections-meta {
-            color: #9aa0ad;
-            font-size: 0.82rem;
-            min-height: 1.2rem;
-        }
-
-        .archive-section-title {
-            color: #bdbdbd;
-            font-size: 0.85rem;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            line-height: 1.2;
-        }
-
-        .section-help {
-            color: #8f96a7;
-            font-size: 0.8rem;
-            line-height: 1.35;
-        }
-        
-        .file-upload {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            min-width: 0;
-        }
-
-        .file-upload.inline {
-            width: 100%;
-        }
-
-        .file-upload-input {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            opacity: 0;
-            overflow: hidden;
-            clip-path: inset(50%);
-            white-space: nowrap;
-        }
-
-        .file-upload-btn {
-            flex: 0 0 auto;
-            margin: 0;
-        }
-
-        .file-upload-name {
-            color: #9aa0ad;
-            font-size: 0.86rem;
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .file-upload-name.is-hidden {
-            display: none;
-        }
-        
-        /* Image search layout */
-        .image-search-inputs {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-            flex: 1;
-            min-width: 0;
-        }
-        
-        .input-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-        
-        .input-label {
-            color: #888;
-            font-size: 0.9rem;
-            font-weight: 500;
-        }
-
-        .image-search-box {
-            align-items: stretch;
-        }
-
-        .image-query-panel {
-            width: 100%;
-            display: flex;
-            flex-direction: column;
-            gap: 0.65rem;
-        }
-
-        .image-query-actions {
-            display: flex;
-            align-items: center;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .image-query-actions .file-upload {
-            flex: 1;
-            min-width: 210px;
-        }
-
-        .image-query-actions .file-upload-name {
-            display: none;
-        }
-
-        .image-query-panel.has-image .image-query-actions .file-upload-name {
-            display: inline;
-        }
-
-        .image-search-btn {
-            display: none;
-        }
-
-        .image-query-panel.has-image .image-search-btn {
-            display: inline-flex;
-        }
-
-        .archive-query-preview {
-            position: relative;
-            border: 1px solid #262b36;
-            border-radius: 8px;
-            overflow: hidden;
-            min-height: 100px;
-            max-height: 180px;
-            background: #0f1218;
-        }
-
-        .archive-query-preview.is-hidden {
-            display: none;
-        }
-
-        .archive-query-preview img {
-            width: 100%;
-            height: 100%;
-            min-height: 100px;
-            max-height: 180px;
-            object-fit: contain;
-            display: block;
-            background: #0b0f16;
-        }
-
-        .archive-query-preview.is-empty img {
-            display: none;
-        }
-
-        .archive-query-preview-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #8e95a6;
-            font-size: 0.82rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            background: linear-gradient(140deg, rgba(9, 12, 18, 0.82), rgba(14, 19, 29, 0.58));
-        }
-
-        .archive-query-preview:not(.is-empty) .archive-query-preview-overlay {
-            display: none;
-        }
-        
-        .results-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 1.5rem;
-            align-content: start;
-        }
-        
-        .result-item {
-            background: #161616;
-            border-radius: 8px;
-            overflow: hidden;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: 1px solid #262626;
-        }
-        
-        .result-item:hover {
-            transform: translateY(-2px);
-            border-color: #444;
-        }
-        
-        .result-item.expanded {
-            grid-column: 1 / -1;
-        }
-        
-        .thumbnail {
-            width: 100%;
-            height: 150px;
-            object-fit: cover;
-            display: block;
-        }
-        
-        .thumbnail.segment-enabled {
-            cursor: crosshair;
-        }
-        
-        
-        .result-info {
-            padding: 0.75rem;
-            font-size: 0.875rem;
-        }
-        
-        .filename {
-            color: #e0e0e0;
-            margin-bottom: 0.25rem;
-            word-break: break-all;
-        }
-
-        .result-badges {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.35rem;
-            margin-bottom: 0.35rem;
-        }
-
-        .result-badge {
-            display: inline-flex;
-            align-items: center;
-            border-radius: 999px;
-            border: 1px solid #333;
-            padding: 0.1rem 0.45rem;
-            font-size: 0.68rem;
-            letter-spacing: 0.02em;
-            text-transform: uppercase;
-            color: #cfd3db;
-            background: rgba(180, 186, 201, 0.12);
-        }
-
-        .result-badge.mode-clip {
-            border-color: #2e6b45;
-            background: rgba(46, 107, 69, 0.2);
-            color: #b7f0ca;
-        }
-
-        .result-badge.mode-fusion {
-            border-color: #3d5da8;
-            background: rgba(61, 93, 168, 0.24);
-            color: #c4d6ff;
-        }
-
-        .result-badge.mode-dino {
-            border-color: #7b5a30;
-            background: rgba(123, 90, 48, 0.22);
-            color: #f7d8ad;
-        }
-
-        .result-badge.warning {
-            border-color: #8a6232;
-            background: rgba(138, 98, 50, 0.22);
-            color: #ffd39e;
-        }
-        
-        .similarity {
-            color: #bbb;
-            font-size: 0.85rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.2rem;
-        }
-
-        .similarity .metric-line {
-            display: flex;
-            gap: 0.3rem;
-            align-items: baseline;
-            color: #999;
-            min-width: 0;
-        }
-
-        .similarity .metric-line.metric-line-wrap {
-            align-items: center;
-        }
-
-        .metric-label {
-            color: #e0e0e0;
-            font-weight: 500;
-            flex: 0 0 auto;
-        }
-
-        .metric-value {
-            min-width: 0;
-        }
-
-        .metric-stream-name {
-            display: block;
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .metric-note {
-            color: #777;
-            font-size: 0.75rem;
-            margin-left: 0.35rem;
-        }
-
-        .settings-input.disabled,
-        .settings-input:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .loading {
-            text-align: center;
-            padding: 2rem;
-            color: #666;
-        }
-        
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 2px solid #333;
-            border-top-color: #888;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        /* Comment System Styles */
-        .comment-section {
-            display: none;
-            padding: 1rem;
-            border-top: 1px solid #333;
-            background: #0f0f0f;
-        }
-        
-        .segments-panel {
-            display: none;
-            padding: 1rem;
-            border-top: 1px solid #2a2a2a;
-            background: #111;
-        }
-        
-        .result-item.expanded .segments-panel {
-            display: block;
-        }
-        
-        .segments-status {
-            font-size: 0.85rem;
-            margin-bottom: 0.75rem;
-            color: #bcbcbc;
-        }
-        
-        .segments-status.success {
-            color: #7dd97b;
-        }
-        
-        .segments-status.error {
-            color: #ff6b6b;
-        }
-        
-        .segments-status.warning {
-            color: #f4c066;
-        }
-        
-        .segment-overlay-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 1rem;
-            align-items: flex-start;
-            margin-bottom: 0.75rem;
-        }
-        
-        .segment-overlay-figure,
-        .segment-segmap-figure {
-            margin: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
-            max-width: 280px;
-        }
-        
-        .segment-overlay-figure figcaption,
-        .segment-segmap-figure figcaption {
-            color: #aaa;
-            font-size: 0.78rem;
-            letter-spacing: 0.01em;
-        }
-        
-        .segment-overlay-stack {
-            position: relative;
-            border-radius: 10px;
-            overflow: hidden;
-            border: 1px solid #1f1f1f;
-        }
-        
-        .segment-overlay-stack img {
-            display: block;
-            width: 100%;
-            height: auto;
-        }
-        
-        .segment-overlay-stack .overlay-layer {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            pointer-events: none;
-        }
-        
-        .segment-overlay-stack .overlay-heatmap {
-            mix-blend-mode: screen;
-            opacity: 0.85;
-        }
-        
-        .segment-overlay-stack .overlay-mask {
-            mix-blend-mode: multiply;
-            opacity: 0.45;
-        }
-        
-        .segment-overlay-stack .overlay-crosshair {
-            position: absolute;
-            width: 14px;
-            height: 14px;
-            margin-left: -7px;
-            margin-top: -7px;
-            border-radius: 50%;
-            border: 2px solid #ffdf6b;
-            box-shadow: 0 0 6px rgba(255, 223, 107, 0.7);
-            pointer-events: none;
-        }
-
-        .segment-segmap {
-            width: 100%;
-            border-radius: 10px;
-            border: 1px solid #1f1f1f;
-            display: block;
-        }
-        
-        .segment-legend {
-            display: flex;
-            flex-direction: column;
-            gap: 0.3rem;
-            margin-bottom: 0.75rem;
-        }
-        
-        .segment-legend-item {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            font-size: 0.78rem;
-            color: #cfcfcf;
-        }
-        
-        .segment-legend-item.highlight {
-            color: #ffffff;
-            font-weight: 600;
-        }
-        
-        .segment-legend-swatch {
-            width: 16px;
-            height: 16px;
-            border-radius: 3px;
-            border: 1px solid rgba(0, 0, 0, 0.6);
-            box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
-        }
-        
-        .segment-legend-item.highlight .segment-legend-swatch {
-            box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
-        }
-        
-        .segment-overlay-images img {
-            max-width: 160px;
-            border: 1px solid #222;
-            border-radius: 4px;
-            background: #000;
-        }
-        
-        .segment-results-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-        
-        .segment-results-list li {
-            background: #181818;
-            border: 1px solid #242424;
-            border-radius: 6px;
-            padding: 0.6rem 0.75rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.35rem;
-            font-size: 0.82rem;
-        }
-        
-        .segment-title {
-            color: #e0e0e0;
-            font-weight: 600;
-            letter-spacing: 0.01em;
-        }
-        
-        .segment-meta {
-            color: #888;
-            font-size: 0.78rem;
-        }
-
-        .segment-actions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.5rem;
-            margin-bottom: 0.75rem;
-        }
-
-        .segment-action-btn {
-            border: 1px solid #2e2e2e;
-            background: #151515;
-            color: #ddd;
-            border-radius: 999px;
-            padding: 0.34rem 0.72rem;
-            font-size: 0.76rem;
-            cursor: pointer;
-            transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
-        }
-
-        .segment-action-btn:hover {
-            border-color: #4a4a4a;
-            background: #1c1c1c;
-            color: #fff;
-        }
-
-        .segment-action-btn.primary {
-            border-color: #3f4d6a;
-            background: #1a2235;
-            color: #d7e3ff;
-        }
-
-        .segment-action-btn.primary:hover {
-            border-color: #5e73a5;
-            background: #22304d;
-            color: #ffffff;
-        }
-
-        .segment-action-btn:disabled {
-            opacity: 0.65;
-            cursor: default;
-        }
-        
-        .segment-match-list {
-            display: flex;
-            flex-direction: column;
-            gap: 0.35rem;
-        }
-        
-        .segment-match-row {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            background: #111;
-            border: 1px solid #222;
-            border-radius: 5px;
-            padding: 0.35rem 0.5rem;
-        }
-        
-        .segment-match-thumb {
-            width: 44px;
-            height: 44px;
-            object-fit: cover;
-            border-radius: 4px;
-            border: 1px solid #1f1f1f;
-        }
-        
-        .segment-match-thumb.placeholder {
-            background: repeating-linear-gradient(45deg, #222, #222 6px, #1a1a1a 6px, #1a1a1a 12px);
-        }
-        
-        .segment-match-meta {
-            display: flex;
-            flex-direction: column;
-            font-size: 0.75rem;
-            color: #cfcfcf;
-            line-height: 1.35;
-        }
-        
-        .result-item.expanded .comment-section {
-            display: block;
-        }
-
-        .lm-description {
-            margin-bottom: 0.75rem;
-        }
-
-        .lm-description-actions {
-            display: flex;
-            justify-content: flex-end;
-            margin-bottom: 0.75rem;
-        }
-
-        .lm-comment {
-            border-left-color: #3f6d54;
-        }
-        
-        .comments-list {
-            max-height: 200px;
-            overflow-y: auto;
-            margin-bottom: 1rem;
-            padding: 0.5rem;
-            background: #1a1a1a;
-            border-radius: 6px;
-            border: 1px solid #333;
-        }
-        
-        .comment-item {
-            padding: 0.5rem;
-            margin-bottom: 0.5rem;
-            background: #222;
-            border-radius: 4px;
-            border-left: 3px solid #555;
-            font-size: 0.85rem;
-            line-height: 1.4;
-            color: #e0e0e0;
-        }
-        
-        .comment-item:last-child {
-            margin-bottom: 0;
-        }
-        
-        .comment-timestamp {
-            color: #888;
-            font-size: 0.75rem;
-            font-weight: bold;
-        }
-        
-        .comment-text {
-            margin-top: 0.25rem;
-            color: #ccc;
-        }
-        
-        .comment-form {
-            display: flex;
-            gap: 0.5rem;
-            align-items: flex-start;
-        }
-        
-        .comment-input {
-            flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #333;
-            padding: 0.5rem 0.75rem;
-            border-radius: 6px;
-            color: #e0e0e0;
-            font-size: 0.85rem;
-            resize: vertical;
-            min-height: 60px;
-            font-family: inherit;
-        }
-        
-        .comment-input:focus {
-            outline: none;
-            border-color: #555;
-        }
-        
-        .comment-input::placeholder {
-            color: #666;
-        }
-        
-        .save-comment-btn {
-            background: #2a2a2a;
-            border: 1px solid #444;
-            color: #e0e0e0;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: all 0.2s;
-            white-space: nowrap;
-        }
-        
-        .save-comment-btn:hover {
-            background: #333;
-            border-color: #555;
-        }
-        
-        .save-comment-btn:disabled {
-            background: #1a1a1a;
-            border-color: #333;
-            color: #666;
-            cursor: not-allowed;
-        }
-        
-        .no-comments {
-            text-align: center;
-            color: #666;
-            font-style: italic;
-            padding: 1rem;
-            font-size: 0.85rem;
-        }
-        
-        .comment-loading {
-            text-align: center;
-            color: #888;
-            font-size: 0.85rem;
-            padding: 0.5rem;
-        }
-
-        .is-hidden {
-            display: none;
-        }
-        
-        
-        /* Image Container and Overlay */
-        .image-container {
-            position: relative;
-            display: block;
-        }
-        
-        .image-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            pointer-events: none; /* Allow clicks to pass through to image */
-        }
-        
-        .expand-collapse-icon {
-            position: absolute;
-            bottom: 8px;
-            right: 8px;
-            background: rgba(0, 0, 0, 0.7);
-            border-radius: 4px;
-            padding: 4px;
-            cursor: pointer;
-            pointer-events: auto; /* Re-enable clicks for the icon */
-            transition: all 0.2s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .expand-collapse-icon:hover {
-            background: rgba(0, 0, 0, 0.9);
-            transform: scale(1.1);
-        }
-
-        .result-actions {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-            margin-top: 0.35rem;
-        }
-
-        .action-icon {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            background: #1a1a1a;
-            border: 1px solid #2d2d2d;
-            border-radius: 4px;
-            padding: 4px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        .action-icon:hover {
-            background: #202020;
-            border-color: #3a3a3a;
-        }
-        /* Video understanding */
-        .video-box {
-            display: none;
-            flex-direction: column;
-            gap: 1rem;
-            background: #111;
-            border: 1px solid #222;
-            border-radius: 10px;
-            padding: 1rem;
-        }
-
-        .monitor-box {
-            display: none;
-            background: #111;
-            border: 1px solid #222;
-            border-radius: 10px;
-            padding: 1rem;
-        }
-
-        .video-analysis-grid {
-            display: grid;
-            grid-template-columns: minmax(300px, 0.95fr) minmax(380px, 1.05fr);
-            gap: 1rem;
-            margin-top: 0.25rem;
-        }
-
-        .video-analysis-form {
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .video-analysis-output {
-            background: #0d0d0d;
-            border: 1px solid #1f1f1f;
-            border-radius: 8px;
-            padding: 0.75rem;
-            min-height: 240px;
-            display: flex;
-            flex-direction: column;
-            gap: 0.75rem;
-        }
-
-        .video-row {
-            display: flex;
-            gap: 0.75rem;
-            flex-wrap: wrap;
-        }
-
-        .video-row .input-group {
-            flex: 1;
-            min-width: 220px;
-        }
-
-        .video-prompt {
-            width: 100%;
-            min-height: 110px;
-            background: #0f0f0f;
-            border: 1px solid #2a2a2a;
-            border-radius: 6px;
-            color: #eaeaea;
-            padding: 0.75rem;
-            resize: vertical;
-        }
-
-        .video-controls {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            flex-wrap: wrap;
-        }
-
-        .video-prompt-note {
-            color: #aaa;
-            font-size: 0.85rem;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.35rem;
-        }
-
-        .video-status {
-            font-size: 0.9rem;
-            color: #ccc;
-            min-height: 20px;
-        }
-
-        .video-status.error {
-            color: #ff9080;
-        }
-
-        .video-output {
-            background: #0f0f0f;
-            border: 1px solid #222;
-            border-radius: 8px;
-            padding: 0.9rem;
-            color: #eaeaea;
-            line-height: 1.6;
-            white-space: pre-wrap;
-        }
-
-        .video-output-wrap,
-        .video-frame-block {
-            display: flex;
-            flex-direction: column;
-            gap: 0.45rem;
-        }
-
-        .video-block-title {
-            color: #bdbdbd;
-            font-size: 0.82rem;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-        }
-
-        .video-frame-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-            gap: 0.5rem;
-            max-height: 360px;
-            overflow-y: auto;
-            padding-right: 0.25rem;
-        }
-
-        .video-frame-grid img {
-            width: 100%;
-            height: 92px;
-            object-fit: cover;
-            border-radius: 5px;
-            border: 1px solid #222;
-            background: #111;
-        }
-
-        /* Luxriot live view */
-        .luxriot-grid {
-            display: grid;
-            grid-template-columns: 1.3fr 1fr;
-            gap: 0.75rem;
-            margin-bottom: 0.65rem;
-        }
-
-        @media (max-width: 1180px) {
-            .luxriot-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        .luxriot-card {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.85rem;
-            display: flex;
-            flex-direction: column;
-            gap: var(--panel-gap);
-        }
-
-        .luxriot-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: var(--panel-header-gap);
-        }
-
-        .luxriot-header h4 {
-            font-size: 1rem;
-            margin: 0;
-            line-height: 1.25;
-            letter-spacing: 0.01em;
-        }
-
-        .luxriot-status {
-            font-size: 0.9rem;
-            color: #a6ffb0;
-        }
-
-        .luxriot-status.error {
-            color: #ff9080;
-        }
-
-        .luxriot-row {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-row label {
-            color: #aaa;
-            font-size: 0.9rem;
-        }
-
-        .luxriot-viewport {
-            position: relative;
-            background: #050505;
-            border: 1px solid #222;
-            border-radius: 8px;
-            min-height: 260px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-        }
-
-        .luxriot-viewport img {
-            width: 100%;
-            max-height: 500px;
-            object-fit: contain;
-            display: block;
-        }
-
-        .luxriot-viewport .luxriot-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #777;
-            font-size: 0.9rem;
-            pointer-events: none;
-            background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-        }
-
-        .luxriot-actions {
-            display: flex;
-            align-items: center;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .luxriot-live-controls-row {
-            justify-content: space-between;
-        }
-
-        .luxriot-live-footer-actions {
-            justify-content: flex-start;
-        }
-
-        .luxriot-prompt {
-            width: 100%;
-            min-height: 80px;
-            background: #0f0f0f;
-            border: 1px solid #2a2a2a;
-            border-radius: 6px;
-            color: #eaeaea;
-            padding: 0.65rem;
-            resize: vertical;
-        }
-
-        .luxriot-hidden-prompts {
-            display: none;
-        }
-
-        .prompt-modal-content {
-            max-width: min(940px, 96vw);
-        }
-
-        .prompt-modal-body {
-            display: flex;
-            flex-direction: column;
-            gap: 0.65rem;
-        }
-
-        .prompt-modal-tabs {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 0.45rem;
-        }
-
-        .prompt-tab {
-            min-width: 120px;
-        }
-
-        .prompt-tab.active {
-            border-color: #4db58f;
-            box-shadow: 0 0 0 1px rgba(77, 181, 143, 0.25);
-        }
-
-        .prompt-modal-editor {
-            min-height: 300px;
-        }
-
-        .prompt-modal-meta {
-            color: #9ea4a3;
-            font-size: 0.88rem;
-            min-height: 1.05rem;
-        }
-
-        .prompt-bookmark-controls {
-            display: flex;
-            align-items: center;
-            gap: 0.7rem;
-            flex-wrap: wrap;
-            margin-top: -0.15rem;
-        }
-
-        .prompt-bookmark-controls .small-label-group {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.4rem;
-            color: #c3c7c6;
-            font-size: 0.9rem;
-        }
-
-        .summary-json-muted {
-            margin-top: 0.55rem;
-            border-left: 2px solid #2e3338;
-            padding-left: 0.65rem;
-            color: #8f98a3;
-            opacity: 0.9;
-        }
-
-        .luxriot-summaries {
-            max-height: min(64vh, 720px);
-            min-height: 280px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 0.55rem;
-            padding-right: 0.2rem;
-        }
-
-        .luxriot-summaries-card {
-            margin-bottom: 0.75rem;
-        }
-
-        .luxriot-stream-card .luxriot-stream-manager {
-            margin-top: 0;
-            padding-top: 0;
-            border-top: none;
-        }
-
-        .luxriot-summary-toolbar {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.45rem;
-            width: 100%;
-        }
-
-        .luxriot-summary-filters {
-            display: flex;
-            align-items: center;
-            gap: 0.45rem;
-            flex-wrap: wrap;
-            width: 100%;
-        }
-
-        .luxriot-summary-actions-row {
-            display: flex;
-            align-items: center;
-            gap: 0.45rem;
-            flex-wrap: wrap;
-            width: 100%;
-        }
-
-        .luxriot-summary-toolbar .luxriot-mini-input {
-            min-width: 170px;
-        }
-
-        .luxriot-summary-toolbar .luxriot-mini-input.luxriot-mini-time {
-            min-width: 170px;
-        }
-
-        .luxriot-summary-custom-time {
-            display: flex;
-            align-items: center;
-            gap: 0.35rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-summary-meta {
-            color: #b0b0b0;
-            font-size: 0.82rem;
-            min-height: 1.1rem;
-        }
-
-        .luxriot-summary-meta.error {
-            color: #ff9a8e;
-        }
-
-        .luxriot-stream-manager {
-            margin-top: 0.2rem;
-            padding-top: 0.55rem;
-            border-top: 1px solid #1f1f1f;
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .luxriot-stream-manager-head {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-stream-list {
-            max-height: 320px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-            padding-right: 0.2rem;
-        }
-
-        .luxriot-stream-item {
-            display: flex;
-            flex-direction: column;
-            gap: 0.45rem;
-            background: #0a0a0a;
-            border: 1px solid #232323;
-            border-radius: 8px;
-            padding: 0.55rem 0.6rem;
-        }
-
-        .luxriot-stream-head {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 0.55rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-stream-title-wrap {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.45rem;
-            min-width: 0;
-        }
-
-        .luxriot-stream-kind {
-            font-size: 0.72rem;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            color: #c8d6cc;
-            background: #162017;
-            border: 1px solid #2d4b32;
-            border-radius: 999px;
-            padding: 0.14rem 0.45rem;
-            white-space: nowrap;
-        }
-
-        .luxriot-stream-kind.analytics {
-            color: #d3cfbf;
-            background: #1d1a12;
-            border-color: #4f4325;
-        }
-
-        .luxriot-stream-title {
-            color: #ececec;
-            font-size: 0.94rem;
-            font-weight: 600;
-            line-height: 1.2;
-            overflow-wrap: anywhere;
-        }
-
-        .luxriot-stream-tags {
-            display: flex;
-            align-items: center;
-            gap: 0.35rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-stream-tag {
-            display: inline-flex;
-            align-items: center;
-            border-radius: 999px;
-            border: 1px solid #2f5a3a;
-            background: rgba(36, 70, 44, 0.28);
-            color: #aed7b9;
-            font-size: 0.72rem;
-            padding: 0.1rem 0.4rem;
-            width: fit-content;
-        }
-
-        .luxriot-stream-tag.paused {
-            border-color: #5f5533;
-            background: rgba(84, 71, 32, 0.3);
-            color: #e5d29b;
-        }
-
-        .luxriot-stream-tag.idle {
-            border-color: #474747;
-            background: rgba(82, 82, 82, 0.22);
-            color: #c9c9c9;
-        }
-
-        .luxriot-stream-stats {
-            display: flex;
-            align-items: center;
-            gap: 0.35rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-stream-stat {
-            display: inline-flex;
-            align-items: center;
-            background: #121212;
-            border: 1px solid #2a2a2a;
-            border-radius: 999px;
-            padding: 0.14rem 0.48rem;
-            color: #bdbdbd;
-            font-size: 0.76rem;
-            line-height: 1.2;
-        }
-
-        .luxriot-stream-controls {
-            display: flex;
-            align-items: center;
-            justify-content: flex-start;
-            gap: 0.35rem;
-            flex-wrap: wrap;
-        }
-
-        .luxriot-stream-controls .feature-btn {
-            padding: 0.2rem 0.55rem;
-            font-size: 0.75rem;
-            min-height: 30px;
-        }
-
-        .luxriot-summary {
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 6px;
-            padding: 0.65rem;
-        }
-
-        .luxriot-summary-head {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.5rem;
-            margin-bottom: 0.35rem;
-        }
-
-        .luxriot-summary-actions {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.3rem;
-            flex-wrap: wrap;
-            justify-content: flex-end;
-        }
-
-        .luxriot-summary-rollup-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.25rem;
-            padding: 0.14rem 0.45rem;
-            border: 1px solid #30514a;
-            border-radius: 999px;
-            background: rgba(41, 94, 80, 0.18);
-            color: #9acdbf;
-            font-size: 0.72rem;
-        }
-
-        .luxriot-summary-channel-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.25rem;
-            padding: 0.14rem 0.45rem;
-            border: 1px solid #3a4a61;
-            border-radius: 999px;
-            background: rgba(58, 88, 126, 0.16);
-            color: #b4cdee;
-            font-size: 0.72rem;
-        }
-
-        .luxriot-summary .timestamp {
-            color: #aaa;
-            font-size: 0.82rem;
-            margin-bottom: 0;
-        }
-
-        .luxriot-bookmark-btn,
-        .luxriot-summary-action-btn {
-            font-size: 0.72rem;
-            padding: 0.22rem 0.56rem;
-            border-radius: 999px;
-        }
-
-        .summary-body {
-            color: #d7d7d7;
-            line-height: 1.45;
-            font-size: 0.96rem;
-            white-space: normal;
-        }
-
-        .summary-body strong {
-            color: #f0f0f0;
-            font-weight: 600;
-        }
-
-        .summary-body code {
-            color: #d4f1da;
-            background: rgba(150, 240, 170, 0.1);
-            border: 1px solid rgba(150, 240, 170, 0.22);
-            padding: 0.05rem 0.24rem;
-            border-radius: 4px;
-        }
-
-        .summary-body p {
-            margin: 0.15rem 0;
-        }
-
-        .summary-body h1,
-        .summary-body h2,
-        .summary-body h3,
-        .summary-body h4,
-        .summary-body h5,
-        .summary-body h6 {
-            margin: 0.42rem 0 0.22rem;
-            line-height: 1.35;
-            color: #f0f0f0;
-            font-weight: 650;
-        }
-
-        .summary-body h1 { font-size: 1.12rem; }
-        .summary-body h2 { font-size: 1.06rem; }
-        .summary-body h3 { font-size: 1rem; }
-        .summary-body h4,
-        .summary-body h5,
-        .summary-body h6 { font-size: 0.95rem; }
-
-        .summary-body ul,
-        .summary-body ol {
-            margin: 0.24rem 0 0.22rem 1.15rem;
-            padding: 0;
-        }
-
-        .summary-body li {
-            margin: 0.12rem 0;
-        }
-
-        .summary-body pre {
-            margin: 0.3rem 0;
-            padding: 0.48rem 0.56rem;
-            border-radius: 6px;
-            border: 1px solid #2a2a2a;
-            background: #101214;
-            color: #dce7dc;
-            overflow-x: auto;
-            white-space: pre;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            font-size: 0.84rem;
-            line-height: 1.35;
-        }
-
-        .summary-body pre code {
-            border: none;
-            background: transparent;
-            padding: 0;
-            color: inherit;
-        }
-
-        .summary-body blockquote {
-            margin: 0.25rem 0;
-            padding: 0.08rem 0 0.08rem 0.65rem;
-            border-left: 2px solid #345243;
-            color: #c5d6c8;
-        }
-
-        .luxriot-summaries.compact .summary-body {
-            display: -webkit-box;
-            -webkit-line-clamp: 4;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
-            line-height: 1.35;
-            font-size: 0.9rem;
-        }
-
-        .luxriot-summary.is-collapsed .summary-body {
-            display: none;
-        }
-
-        .luxriot-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.25rem;
-            padding: 0.25rem 0.55rem;
-            background: #161616;
-            border: 1px solid #2b2b2b;
-            border-radius: 999px;
-            font-size: 0.8rem;
-            color: #cfcfcf;
-        }
-
-        .luxriot-mini-input {
-            min-width: 70px;
-        }
-
-        /* Probes */
-        .probe-card {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.85rem;
-            display: flex;
-            flex-direction: column;
-            gap: var(--panel-gap);
-            margin-top: 0.5rem;
-        }
-
-        .probe-row {
-            display: flex;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .probe-row.spread {
-            justify-content: space-between;
-        }
-
-        .probe-header {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-            margin-bottom: 0.2rem;
-        }
-
-        .probe-header.split {
-            align-items: center;
-        }
-
-        .probe-header h4 {
-            margin: 0;
-            line-height: 1.25;
-            letter-spacing: 0.01em;
-        }
-
-        .probe-header-actions {
-            display: flex;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .probe-panel {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.85rem;
-            display: flex;
-            flex-direction: column;
-            gap: var(--panel-gap);
-        }
-
-        .probe-select-grow {
-            flex: 1;
-        }
-
-        .probe-severity-wrap {
-            margin-left: auto;
-            display: flex;
-            align-items: center;
-            gap: 0.35rem;
-        }
-
-        .small-label-group {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.35rem;
-            color: #bdbdbd;
-            font-size: 0.88rem;
-        }
-
-        .probe-short-input {
-            max-width: 84px;
-        }
-
-        .inline-check {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.3rem;
-        }
-
-        .probe-pairs-spacer {
-            text-align: center;
-        }
-
-        .probe-remove-btn {
-            width: 54px;
-        }
-
-        .probe-mini-main {
-            display: flex;
-            flex-direction: column;
-            gap: 0.35rem;
-        }
-
-        .probe-row label {
-            color: #aaa;
-            font-size: 0.9rem;
-        }
-
-        .probe-textarea {
-            width: 100%;
-            min-height: 60px;
-            background: #0f0f0f;
-            border: 1px solid #2a2a2a;
-            border-radius: 6px;
-            color: #eaeaea;
-            padding: 0.65rem;
-            resize: vertical;
-        }
-
-        .probe-results {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 0.5rem;
-        }
-
-        .probe-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 0.75rem;
-        }
-
-        .bench-card {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.75rem;
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 0.5rem;
-            align-items: center;
-        }
-
-        .bench-meta {
-            color: #bcbcbc;
-            font-size: 0.95rem;
-            line-height: 1.35;
-        }
-
-        .probe-result {
-            background: #0a0a0a;
-            border: 1px solid #1d1d1d;
-            border-radius: 8px;
-            padding: 0.6rem;
-        }
-
-        .probe-result img {
-            width: 100%;
-            border-radius: 6px;
-            margin-bottom: 0.4rem;
-        }
-
-        /* Monitoring mock-inspired layout */
-        .monitor-grid {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 1rem;
-            margin-bottom: 1rem;
-            align-items: start;
-        }
-
-        .monitor-panel {
-            background: #111;
-            border: 1px solid #222;
-            border-radius: 10px;
-            padding: 0.75rem;
-            display: flex;
-            flex-direction: column;
-            gap: var(--panel-gap);
-        }
-
-        .monitor-panel h4 {
-            margin: 0 0 0.2rem 0;
-            line-height: 1.25;
-            letter-spacing: 0.01em;
-        }
-
-        .monitor-detections-panel .probe-nav {
-            display: grid;
-            grid-template-columns: auto 1fr auto;
-            gap: 0.5rem;
-            align-items: center;
-        }
-
-        .probe-nav-btn {
-            background: #1a1a1a;
-            border: 1px solid #2d2d2d;
-            color: #cfcfcf;
-            border-radius: 6px;
-            padding: 0.4rem 0.55rem;
-            min-width: 36px;
-        }
-
-        .probe-nav-btn:hover {
-            background: #232323;
-            border-color: #3a3a3a;
-        }
-
-        .probe-nav-btn:disabled {
-            opacity: 0.4;
-            cursor: default;
-        }
-
-        .monitor-detections-panel .probe-results {
-            grid-template-columns: repeat(5, minmax(118px, 1fr));
-            min-height: 190px;
-            max-height: none;
-            overflow: hidden;
-            padding-right: 0;
-        }
-
-        .monitor-detections-panel .probe-results .loading {
-            grid-column: 1 / -1;
-            padding: 1.4rem 0.3rem;
-        }
-
-        .monitor-detections-panel .probe-result {
-            padding: 0.42rem;
-            min-width: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 0.28rem;
-            border-color: #262626;
-        }
-
-        .monitor-detections-panel .probe-result img {
-            margin-bottom: 0;
-            width: 100%;
-            aspect-ratio: 16 / 9;
-            object-fit: cover;
-            border-radius: 5px;
-            border: 1px solid #202020;
-        }
-
-        .probe-result-time {
-            font-size: 0.74rem;
-            color: #d8d8d8;
-            line-height: 1.25;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .probe-result-score {
-            font-size: 0.7rem;
-            color: #aaaaaa;
-            line-height: 1.3;
-        }
-
-        .monitor-stream-preview {
-            width: 100%;
-            aspect-ratio: 16/9;
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 6px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .monitor-stream-preview img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-
-        .monitor-stream-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, rgba(0,0,0,0.35), rgba(0,0,0,0.2));
-            color: #c8c8c8;
-            font-weight: 600;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            pointer-events: none;
-            z-index: 4;
-        }
-
-        .probe-roi-layer {
-            position: absolute;
-            inset: 0;
-            z-index: 2;
-            cursor: crosshair;
-            pointer-events: none;
-            touch-action: none;
-        }
-
-        .probe-roi-layer.active {
-            pointer-events: auto;
-        }
-
-        .probe-roi-box {
-            position: absolute;
-            display: none;
-            border: 2px solid rgba(96, 220, 160, 0.95);
-            background: rgba(96, 220, 160, 0.18);
-            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55) inset;
-            border-radius: 3px;
-            pointer-events: none;
-            z-index: 3;
-        }
-
-        .probe-roi-box.active {
-            display: block;
-        }
-
-        .probe-meta-inline {
-            font-size: 0.82rem;
-            color: #9fd2b0;
-            letter-spacing: 0.01em;
-        }
-
-        .monitor-inline {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-
-        .monitor-btn-row {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 0.5rem;
-            margin-top: 0.5rem;
-        }
-
-        .monitor-actions-row {
-            display: flex;
-            justify-content: space-between;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .monitor-probe-header {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-
-        .monitor-probe-form {
-            display: flex;
-            flex-direction: column;
-            gap: 0.6rem;
-        }
-
-        .probe-name-row .input-text {
-            flex: 1 1 320px;
-            min-width: 220px;
-        }
-
-        .probe-bookmark-row {
-            align-items: center;
-        }
-
-        .probe-threshold-row {
-            align-items: center;
-        }
-
-        .probe-stream-actions {
-            gap: 0.55rem;
-            align-items: center;
-        }
-
-        .monitor-probe-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0.8rem;
-        }
-
-        .monitor-probe-box {
-            background: #0c0c0c;
-            border: 1px solid #1f1f1f;
-            border-radius: 8px;
-            padding: 0.6rem;
-        }
-
-        .probe-shell {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .probe-mini-card {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0;
-            display: block;
-            overflow: hidden;
-            min-height: 220px;
-        }
-
-        .probe-mini-card.active {
-            border-color: #4a7a58;
-            box-shadow: 0 0 0 1px rgba(74, 122, 88, 0.4), 0 12px 24px rgba(0, 0, 0, 0.35);
-        }
-
-        .probe-mini-head {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 0.4rem;
-        }
-
-        .probe-mini-name {
-            font-weight: 700;
-            color: #f5f5f5;
-            font-size: 0.98rem;
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .probe-status-pill {
-            padding: 0.15rem 0.45rem;
-            border-radius: 999px;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.02em;
-            border: 1px solid #2e2e2e;
-        }
-
-        .pill-running { background: rgba(58, 99, 70, 0.2); color: #9bd2a8; border-color: #3a6346; }
-        .pill-paused { background: rgba(140, 120, 60, 0.15); color: #e4c47c; border-color: #8c783c; }
-        .pill-idle { background: rgba(90, 90, 90, 0.2); color: #cfcfcf; border-color: #555; }
-        .pill-disabled { background: rgba(110, 30, 30, 0.18); color: #e8a4a4; border-color: #8b0000; }
-
-        .probe-mini-meta {
-            color: #d4d4d4;
-            font-size: 0.82rem;
-            line-height: 1.35;
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-        }
-
-        .probe-mini-actions {
-            display: flex;
-            gap: 0.35rem;
-            flex-wrap: nowrap;
-            justify-content: flex-end;
-            align-items: center;
-        }
-
-        .probe-action-btn {
-            width: 32px;
-            height: 32px;
-            border-radius: 999px;
-            border: 1px solid rgba(255, 255, 255, 0.35);
-            background: rgba(8, 8, 8, 0.58);
-            color: #f0f0f0;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            padding: 0;
-            cursor: pointer;
-            backdrop-filter: blur(3px);
-            transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
-        }
-
-        .probe-action-btn svg {
-            width: 17px;
-            height: 17px;
-            fill: currentColor;
-        }
-
-        .probe-action-btn:hover {
-            transform: translateY(-1px);
-            background: rgba(22, 22, 22, 0.8);
-            border-color: rgba(255, 255, 255, 0.55);
-        }
-
-        .probe-action-btn.delete {
-            border-color: rgba(255, 120, 120, 0.6);
-            color: #ffd1d1;
-            background: rgba(80, 18, 18, 0.45);
-        }
-
-        .probe-action-btn.delete:hover {
-            border-color: rgba(255, 150, 150, 0.85);
-            background: rgba(98, 26, 26, 0.65);
-        }
-
-        .probe-mini-thumb {
-            position: relative;
-            border: 1px solid #121212;
-            border-radius: 10px;
-            background: #040404;
-            overflow: hidden;
-            min-height: 220px;
-            aspect-ratio: 16/10;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .probe-mini-thumb img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            display: block;
-        }
-
-        .probe-mini-thumb.is-empty::before {
-            content: "No preview";
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #a4a4a4;
-            font-size: 0.86rem;
-            letter-spacing: 0.02em;
-            text-transform: uppercase;
-            background: repeating-linear-gradient(135deg, #0d0d0d 0 12px, #131313 12px 24px);
-        }
-
-        .probe-mini-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 0.55rem;
-            background: linear-gradient(180deg, rgba(0, 0, 0, 0.35) 0%, rgba(0, 0, 0, 0.04) 38%, rgba(0, 0, 0, 0.78) 100%);
-            pointer-events: none;
-        }
-
-        .probe-mini-top,
-        .probe-mini-bottom {
-            display: flex;
-            align-items: center;
-            gap: 0.45rem;
-        }
-
-        .probe-mini-top {
-            justify-content: space-between;
-            align-items: flex-start;
-        }
-
-        .probe-mini-bottom {
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0.18rem;
-        }
-
-        .probe-mini-overlay .probe-status-pill,
-        .probe-mini-overlay .probe-mini-actions {
-            pointer-events: auto;
-        }
-
-        .probe-mini-score {
-            color: #f0f0f0;
-            font-size: 0.79rem;
-            letter-spacing: 0.01em;
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-        }
-
-        .probe-mini-gate {
-            color: #b7c1b9;
-            font-size: 0.74rem;
-            letter-spacing: 0.01em;
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-            opacity: 0.92;
-        }
-
-        .probe-thumb-pill {
-            position: absolute;
-            top: 6px;
-            right: 6px;
-        }
-
-        .new-probe-card {
-            border: 1px dashed #2f5a3a;
-            background: radial-gradient(circle at 20% 20%, #121b14, #070707);
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            min-height: 220px;
-            display: flex;
-        }
-
-        .probe-new-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.45rem;
-            padding: 0.72rem 1.15rem;
-            border-radius: 999px;
-            border: 1px solid #3d6f4b;
-            background: rgba(23, 41, 28, 0.65);
-            color: #d7f0dc;
-            font-weight: 600;
-            cursor: pointer;
-        }
-
-        .probe-new-btn:hover {
-            background: rgba(34, 57, 40, 0.9);
-            border-color: #4f8a5f;
-        }
-
-        .probe-new-btn svg {
-            width: 16px;
-            height: 16px;
-            fill: currentColor;
-        }
-
-        .probe-pairs {
-            background: #0f0f0f;
-            border: 1px solid #1f1f1f;
-            border-radius: 10px;
-            padding: 0.6rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
-        }
-
-        .probe-pairs-header {
-            display: grid;
-            grid-template-columns: 40px 1fr 1fr 60px;
-            gap: 0.35rem;
-            align-items: center;
-            color: #919991;
-            font-size: 0.8rem;
-            font-weight: 500;
-            letter-spacing: 0.01em;
-        }
-
-        #probePairRows {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-
-        .probe-pair-row {
-            display: grid;
-            grid-template-columns: 40px 1fr 1fr 60px;
-            gap: 0.35rem;
-            align-items: center;
-        }
-
-        .probe-pair-idx {
-            color: #a5a5a5;
-            text-align: center;
-        }
-
-        .probe-pair-add-row .probe-add-pair-btn {
-            justify-self: start;
-            min-width: 112px;
-        }
-
-        .probe-pair-add-row .probe-add-empty {
-            color: #6f6f6f;
-            font-size: 0.83rem;
-            letter-spacing: 0.01em;
-        }
-
-        .probe-pairs-threshold-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.9rem;
-            flex-wrap: wrap;
-            padding-bottom: 0.35rem;
-        }
-
-        .probe-pairs-threshold-title {
-            color: #bdbdbd;
-            font-size: 0.9rem;
-            font-weight: 600;
-            letter-spacing: 0.01em;
-        }
-
-        .probe-panel-heading-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.75rem;
-            border-bottom: 1px solid rgba(63, 96, 74, 0.5);
-            padding-bottom: 6px;
-        }
-
-        .probe-panel-heading {
-            margin: 0;
-            color: #d7e6da;
-            font-size: 1rem;
-            font-weight: 700;
-            line-height: 1.2;
-            letter-spacing: 0.015em;
-        }
-
-        .probe-pairs-threshold-controls {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin-left: auto;
-        }
-
-        .probe-threshold-input {
-            min-width: 70px;
-            max-width: 70px;
-        }
-
-        .probe-meta {
-            color: #9a9a9a;
-            font-size: 0.9rem;
-        }
-
-        .image-probe-panel {
-            background: #101010;
-            border: 1px solid #203527;
-            border-radius: 10px;
-            padding: 0.75rem;
-            display: grid;
-            grid-template-columns: 65% 35%;
-            gap: 0.75rem;
-            align-items: stretch;
-        }
-
-        .image-probe-panel.no-image {
-            grid-template-columns: 1fr;
-        }
-
-        .image-probe-panel.no-image .probe-preview.compact {
-            display: none;
-        }
-
-        .image-probe-left {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .image-probe-title {
-            color: inherit;
-            font-weight: inherit;
-            letter-spacing: inherit;
-        }
-
-        .image-probe-row {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .image-probe-top-row {
-            justify-content: space-between;
-            gap: 0.75rem;
-            flex-wrap: wrap;
-        }
-
-        .image-probe-row .file-upload {
-            flex: 1;
-        }
-
-        .image-probe-clear-row {
-            justify-content: flex-start;
-        }
-
-        .image-probe-enable-check {
-            min-width: 96px;
-            justify-content: flex-end;
-        }
-
-        .image-probe-threshold-row {
-            justify-content: flex-end;
-        }
-
-        .image-probe-min-wrap {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
-
-        .image-probe-status {
-            color: #94b39b;
-            text-align: center;
-            font-size: 0.86rem;
-            letter-spacing: 0.01em;
-            border-top: 1px solid rgba(61, 94, 69, 0.35);
-            padding-top: 0.4rem;
-        }
-
-        .probe-preview {
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 8px;
-            min-height: 140px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .probe-preview img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            display: block;
-        }
-
-        .probe-preview-overlay {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, rgba(0,0,0,0.4), rgba(0,0,0,0.25));
-            color: #cfcfcf;
-            font-weight: 600;
-            letter-spacing: 0.03em;
-            text-transform: uppercase;
-            text-align: center;
-            padding: 0.5rem;
-        }
-
-        .probe-preview.compact {
-            max-width: 220px;
-            min-height: 140px;
-            justify-self: end;
-        }
-
-        .monitor-actions-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .monitor-actions-main {
-            display: flex;
-            gap: var(--panel-header-gap);
-            flex-wrap: wrap;
-        }
-
-        .severity-row {
-            display: flex;
-            gap: 0.4rem;
-            flex-wrap: wrap;
-        }
-
-        .settings-short-input {
-            width: 110px;
-        }
-
-        .input-text {
-            min-width: 200px;
-        }
-        
-        
-        /* Copy icon styling */
-        .copy-icon {
-            margin-left: 8px;
-            cursor: pointer;
-            transition: fill 0.2s ease;
-            vertical-align: middle;
-        }
-        
-        .copy-icon:hover {
-            fill: #e0e0e0;
-        }
-        
-        .filename {
-            display: flex;
-            align-items: center;
-        }
-        
-        /* Expanded image display */
-        .result-item.expanded .thumbnail {
-            width: 100%;
-            min-width: 0;
-            max-height: 70vh;
-            height: auto;
-            object-fit: contain;
-            background: #080808;
-        }
-
-        @media (max-width: 980px) {
-            .container {
-                padding: 1rem;
-            }
-
-            .header {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 0.75rem;
-            }
-
-            .folder-select {
-                flex-direction: column;
-            }
-
-            .control-panel {
-                position: static;
-            }
-
-            .search-controls {
-                flex-direction: column;
-                align-items: stretch;
-                gap: 0.75rem;
-            }
-
-            .archive-workspace {
-                grid-template-columns: 1fr;
-            }
-
-            .archive-search-shell {
-                position: static;
-            }
-
-            .archive-results-panel {
-                padding: 0.65rem;
-            }
-
-            .archive-filter-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .control-group {
-                width: 100%;
-                flex-wrap: wrap;
-                justify-content: flex-start;
-            }
-
-            .search-box {
-                flex-direction: column;
-                align-items: stretch;
-            }
-
-            .image-search-inputs {
-                margin-right: 0;
-            }
-
-            .file-upload {
-                align-items: stretch;
-                flex-direction: column;
-                gap: 0.45rem;
-            }
-
-            .file-upload-btn {
-                text-align: center;
-            }
-
-            .image-query-actions .file-upload {
-                flex-direction: row;
-                align-items: center;
-            }
-
-            .probe-editor-layout {
-                grid-template-columns: 1fr;
-            }
-
-            .video-analysis-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .video-analysis-output {
-                min-height: 0;
-            }
-
-            .monitor-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .monitor-detections-panel .probe-results {
-                grid-template-columns: repeat(5, minmax(0, 1fr));
-                min-height: 0;
-            }
-
-            .image-probe-panel {
-                grid-template-columns: 1fr;
-            }
-
-            .probe-preview.compact {
-                max-width: none;
-                justify-self: stretch;
-            }
-
-            .result-item.expanded .thumbnail {
-                max-height: 55vh;
-            }
-        }
-        
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="brand">
-                <div class="brand-top">
-                    <img class="brand-logo" src="/branding/logo" alt="Luxriot logo" />
-                    <div class="brand-main">EVA AI</div>
-                </div>
-                <div class="brand-sub">Smart Image Search and Understanding | version: {app_version}</div>
-            </div>
-            <div class="header-actions">
-                <div class="settings-icon" id="authTokenBtn" title="Set admin token">
-                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                        <path d="M240-160q-33 0-56.5-23.5T160-240v-480q0-33 23.5-56.5T240-800h360q33 0 56.5 23.5T680-720v160h40q33 0 56.5 23.5T800-480v240q0 33-23.5 56.5T720-160H240Zm0-80h480v-240H240v240Zm120-320h240v-160H360v160Zm120 200q17 0 28.5-11.5T520-400q0-17-11.5-28.5T480-440q-17 0-28.5 11.5T440-400q0 17 11.5 28.5T480-360Z"/>
-                    </svg>
-                </div>
-                <div class="settings-icon" id="settingsBtn">
-                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                        <path d="m370-80-16-128q-13-5-24.5-12T307-235l-119 50L78-375l103-78q-1-7-1-13.5v-27q0-6.5 1-13.5L78-585l110-190 119 50q11-8 23-15t24-12l16-128h220l16 128q13 5 24.5 12t22.5 15l119-50 110 190-103 78q1 7 1 13.5v27q0 6.5-1 13.5l103 78-110 190-119-50q-11 8-23 15t-24 12L590-80H370Zm70-80h79l14-106q31-8 57.5-23.5T639-327l99 41 39-68-86-65q5-14 7-29.5t2-31.5q0-16-2-31.5t-7-29.5l86-65-39-68-99 41q-22-23-48.5-38.5T533-694l-13-106h-79l-14 106q-31 8-57.5 23.5T321-633l-99-41-39 68 86 65q-5 14-7 29.5t-2 31.5q0 16 2 31.5t7 29.5l-86 65 39 68 99-41q22 23 48.5 38.5T427-266l13 106Zm42-180q58 0 99-41t41-99q0-58-41-99t-99-41q-59 0-99.5 41T342-480q0 58 40.5 99t99.5 41Zm-2-140Z"/>
-                    </svg>
-                </div>
-            </div>
-        </div>
-        
-        <div class="control-panel">
-            <div class="folder-select">
-                <input type="text" id="folderPath" placeholder="Enter folder path..." />
-                <button id="indexBtn" class="feature-btn primary btn-md">Index Folder</button>
-            </div>
-            <div class="status" id="indexStatus"></div>
-        </div>
-        
-            <div class="search-panel">
-                <div class="search-mode-tabs">
-                    <button id="archiveModeBtn" class="mode-tab active">Archive Research</button>
-                    <button id="videoModeBtn" class="mode-tab">Video Understanding</button>
-                    <button id="monitorModeBtn" class="mode-tab">Monitoring</button>
-                </div>
-            <div id="archiveBox" class="archive-box">
-                <div class="search-controls">
-                    <div class="control-group">
-                        <button id="showCommentedBtn" class="feature-btn">Show Commented Images</button>
-                    </div>
-                    <div class="control-group">
-                        <div class="sort-control">
-                            <label for="sortBy">Sort by:</label>
-                            <select id="sortBy">
-                                <option value="similarity" selected>Similarity</option>
-                                <option value="time">Time (Newest First)</option>
-                            </select>
-                        </div>
-                        <div class="limit-control">
-                            <label for="resultLimit">Results:</label>
-                            <select id="resultLimit">
-                                {result_options_html}
-                            </select>
-                        </div>
-                        <div class="scope-control">
-                            <label for="searchScope">Scope:</label>
-                            <select id="searchScope">
-                                <option value="folder" selected>Indexed Folder</option>
-                                <option value="detections">Detections Archive</option>
-                            </select>
-                        </div>
-                        <div class="segment-controls">
-                            <label for="segmentThresholdSlider">Region threshold:</label>
-                            <div class="segment-threshold-control" id="segmentThresholdControl">
-                                <input type="range" id="segmentThresholdSlider" min="40" max="99" value="{segment_threshold_percent}" step="1">
-                                <span class="segment-threshold-value" id="segmentThresholdValue">{segment_threshold_percent}%</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="archive-workspace">
-                    <div id="archiveSearchBox" class="archive-search-shell">
-                        <div class="archive-section">
-                            <div class="archive-section-title">Detections Archive</div>
-                            <div class="section-help">Choose stream/probe/time filters, then run text or image search in current scope.</div>
-                            <div class="archive-filter-grid">
-                                <div class="input-group">
-                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
-                                    <select id="archiveChannelFilter">
-                                        <option value="">All streams</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveProbeFilter" class="input-label">Probe:</label>
-                                    <select id="archiveProbeFilter">
-                                        <option value="">All probes</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveTimeFilter" class="input-label">Time range:</label>
-                                    <select id="archiveTimeFilter">
-                                        <option value="1">Last 1h</option>
-                                        <option value="6">Last 6h</option>
-                                        <option value="24" selected>Last 24h</option>
-                                        <option value="72">Last 3d</option>
-                                        <option value="168">Last 7d</option>
-                                        <option value="0">All time</option>
-                                    </select>
-                                </div>
-                                <div class="input-group">
-                                    <label for="archiveDetectionsLimit" class="input-label">Rows:</label>
-                                    <select id="archiveDetectionsLimit">
-                                        <option value="12">12</option>
-                                        <option value="24" selected>24</option>
-                                        <option value="36">36</option>
-                                        <option value="48">48</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="archive-detections-actions">
-                                <button id="archiveDetectionsPrev" class="feature-btn">&larr; Prev</button>
-                                <button id="archiveDetectionsNext" class="feature-btn">Next &rarr;</button>
-                                <button id="loadDetectionsBtn" class="feature-btn primary">Load Detections</button>
-                                <button id="refreshDetectionsFiltersBtn" class="feature-btn">Refresh Filters</button>
-                            </div>
-                            <div id="archiveDetectionsMeta" class="archive-detections-meta">Load probe detections by stream, probe, and time range.</div>
-                        </div>
-                        <div class="archive-section">
-                            <div class="archive-section-title">Text Query</div>
-                            <div class="section-help">Use natural language; scope and filters apply automatically.</div>
-                            <div id="textSearchBox" class="search-box">
-                                <input type="text" id="searchQuery" placeholder="Describe what you're looking for..." />
-                                <button id="searchBtn" class="feature-btn primary btn-md">Search</button>
-                            </div>
-                        </div>
-                        <div class="archive-section">
-                            <div class="archive-section-title">Image Query</div>
-                            <div class="section-help">Select an image and run visual similarity search.</div>
-                            <div id="imageSearchBox" class="search-box image-search-box">
-                                <div id="imageQueryPanel" class="image-query-panel">
-                                    <div id="queryImagePreview" class="archive-query-preview is-empty is-hidden">
-                                        <img id="queryImageThumb" src="" alt="Selected query preview" />
-                                        <div class="archive-query-preview-overlay">No image selected</div>
-                                    </div>
-                                    <div class="image-query-actions">
-                                        <div class="file-upload inline">
-                                            <input type="file" id="imageUpload" class="file-upload-input" accept="image/*" />
-                                            <label for="imageUpload" class="feature-btn file-upload-btn btn-md">Choose Image</label>
-                                            <span id="imageUploadName" class="file-upload-name is-hidden">No file selected</span>
-                                        </div>
-                                        <button id="imageSearchBtn" class="feature-btn primary image-search-btn btn-md">Search by Image</button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="archive-results-panel">
-                        <div class="archive-results-head">Search Results</div>
-                        <div id="results" class="results-grid"></div>
-                    </div>
-                </div>
-            </div>
-            <div id="videoBox" class="video-box">
-        <div class="luxriot-grid">
-            <div class="luxriot-card">
-                <div class="luxriot-header">
-                    <h4>Luxriot Live Streams</h4>
-                    <div id="luxriotStatus" class="luxriot-status">Not connected</div>
-                </div>
-                <div class="luxriot-row">
-                    <label for="luxriotChannelSelect">Channel:</label>
-                    <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
-                    <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
-                </div>
-                <div class="luxriot-row luxriot-live-controls-row">
-                    <span class="luxriot-pill">Batch:
-                        <select id="luxriotBatchSize" class="luxriot-mini-input">
-                            {luxriot_batch_options}
-                        </select>
-                    </span>
-                    <span id="luxriotBatchInfo" class="luxriot-pill">~{luxriot_snapshot_interval}s · {luxriot_snapshot_max_edge}px</span>
-                    <div class="luxriot-actions">
-                        <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
-                        <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
-                    </div>
-                </div>
-                <div class="luxriot-viewport" id="luxriotViewport">
-                    <img id="luxriotPreview" src="" alt="Luxriot live preview" />
-                    <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
-                </div>
-                <div class="luxriot-actions luxriot-live-footer-actions">
-                    <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
-                </div>
-                <div class="luxriot-hidden-prompts">
-                    <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
-                    <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{luxriot_system_prompt_default}</textarea>
-                    <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{luxriot_rollup_prompt_l1}</textarea>
-                    <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{luxriot_rollup_prompt_l2}</textarea>
-                    <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{luxriot_rollup_prompt_l3}</textarea>
-                    <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{luxriot_json_alert_prompt}</textarea>
-                </div>
-            </div>
-                    <div class="luxriot-card luxriot-stream-card">
-                <div class="luxriot-stream-manager">
-                    <div class="luxriot-stream-manager-head">
-                        <div class="video-block-title">Channel Runtime</div>
-                        <div class="luxriot-actions">
-                            <button id="luxriotRefreshStreams" class="feature-btn">Refresh</button>
-                            <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
-                            <button id="luxriotStopAllAnalytics" class="feature-btn">Pause probes</button>
-                        </div>
-                    </div>
-                    <div id="luxriotStreams" class="luxriot-stream-list">
-                        <div class="loading">No active channels.</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <div class="luxriot-card luxriot-summaries-card">
-            <div class="luxriot-header">
-                <h4>Live/Summaries</h4>
-                <div class="luxriot-summary-toolbar">
-                    <div class="luxriot-summary-filters">
-                        <label for="luxriotSummaryChannelSelect">Channel:</label>
-                        <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
-                        <label for="luxriotSummaryRangeSelect">History:</label>
-                        <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
-                            <option value="6h" selected>last 6 hours</option>
-                            <option value="24h">last day</option>
-                            <option value="3d">last 3 days</option>
-                            <option value="7d">last week</option>
-                            <option value="30d">last month</option>
-                            <option value="all">all history</option>
-                        </select>
-                        <label for="luxriotSummaryLevelSelect">Depth:</label>
-                        <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
-                            <option value="L0" selected>Live</option>
-                            <option value="L1">Minutes</option>
-                            <option value="L2">Hours</option>
-                            <option value="L3">Days</option>
-                        </select>
-                    </div>
-                    <div class="luxriot-summary-actions-row">
-                        <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
-                        <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
-                        <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
-                        <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
-                        <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
-                    </div>
-                </div>
-            </div>
-            <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
-            <div id="luxriotSummaries" class="luxriot-summaries">
-                <div class="loading">No summaries yet.</div>
-            </div>
-        </div>
-        <div class="video-analysis-grid">
-            <div class="video-analysis-form">
-                <div class="video-row">
-                    <div class="input-group">
-                        <label for="videoPath" class="input-label">Video Path:</label>
-                        <input type="text" id="videoPath" placeholder="/home/user/video.mp4" />
-                    </div>
-                    <div class="input-group">
-                        <label class="input-label" for="videoModel">Model ID:</label>
-                        <input type="text" id="videoModel" placeholder="qwen/qwen3-vl-4b" value="{lm_model}" />
-                    </div>
-                </div>
-                <div class="video-row">
-                    <div class="input-group">
-                        <label class="input-label" for="videoFrameCount">Frames to sample:</label>
-                        <select id="videoFrameCount">
-                            {video_frame_options_html}
-                        </select>
-                    </div>
-                    <div class="input-group">
-                        <label class="input-label" for="videoSampleFps">Target sample FPS (optional):</label>
-                        <input type="number" id="videoSampleFps" min="0" step="0.1" placeholder="auto" />
-                    </div>
-                </div>
-                <div class="input-group">
-                    <label class="input-label" for="videoPrompt">Prompt:</label>
-                    <textarea id="videoPrompt" class="video-prompt" placeholder="Describe the actions, key events, and any objects of interest."></textarea>
-                    <label class="video-prompt-note">
-                        <input type="checkbox" id="saveVideoPrompt"> Remember this prompt
-                    </label>
-                </div>
-                <div class="video-controls">
-                    <button id="videoRunBtn" class="feature-btn primary">Analyze Video</button>
-                    <button id="saveSummaryBtn" class="feature-btn is-hidden">Save summary as comment</button>
-                    <div id="videoStatus" class="video-status"></div>
-                </div>
-            </div>
-            <div class="video-analysis-output">
-                <div class="video-output-wrap">
-                    <div class="video-block-title">Summary</div>
-                    <div id="videoOutput" class="video-output is-hidden"></div>
-                </div>
-                <div class="video-frame-block">
-                    <div class="video-block-title">Sampled Frames</div>
-                    <div id="videoFrames" class="video-frame-grid"></div>
-                </div>
-            </div>
-        </div>
-            </div>
-                        <div id="monitorBox" class="monitor-box">
-                <div class="probe-shell">
-                    <div class="probe-panel">
-                        <div class="probe-header">
-                            <div>
-                                <h4>Saved probes</h4>
-                                <div class="probe-meta">Click to expand, run, or delete.</div>
-                            </div>
-                            <div class="probe-header-actions">
-                                <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
-                                <button id="probeNewBtn" class="feature-btn primary">+ New Probe</button>
-                            </div>
-                        </div>
-                        <div id="probeCards" class="probe-grid"></div>
-                    </div>
-                    <div class="bench-card">
-                        <div>
-                            <div class="bench-meta">GPU embed throughput (CLIP) estimate. Helps size total streams/probes.</div>
-                            <div id="probeBenchOutput" class="bench-meta">Not run yet.</div>
-                        </div>
-                        <button id="probeBenchBtn" class="feature-btn primary">Run benchmark</button>
-                    </div>
-                    <div class="monitor-grid">
-                        <div class="monitor-panel monitor-detections-panel">
-                            <div class="probe-header split">
-                                <h4>Latest Detections</h4>
-                                <div id="probeHitsMeta" class="probe-meta">Frames: 0 · Hits: 0</div>
-                            </div>
-                            <div class="probe-nav">
-                                <button class="probe-nav-btn" id="probeDetLeft">&#9664;</button>
-                                <div id="probeResults" class="probe-results"></div>
-                                <button class="probe-nav-btn" id="probeDetRight">&#9654;</button>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="monitor-actions-bar">
-                        <div class="monitor-actions-main">
-                            <button id="probeEditBtn" class="feature-btn">Probe settings</button>
-                            <button id="probeRunBtn" class="feature-btn primary">Run probe</button>
-                        </div>
-                        <button id="probeDeleteBtn" class="feature-btn">Delete Probe</button>
-                    </div>
-                </div>
-            </div>
-    </div>
-
-    <div id="probeEditorModal" class="settings-modal">
-        <div class="settings-modal-content probe-editor-modal-content">
-            <div class="settings-header">
-                <h2>Probe Settings</h2>
-                <button class="close-btn" id="closeProbeEditor">&times;</button>
-            </div>
-            <div class="probe-editor-modal-body">
-                <div class="probe-editor-layout">
-                    <div class="monitor-panel">
-                        <div class="probe-header split probe-panel-heading-row">
-                            <h4 class="probe-panel-heading">Live stream</h4>
-                            <span id="probeStatus" class="luxriot-status">Idle</span>
-                        </div>
-                        <div class="probe-row">
-                            <label>Channel:</label>
-                            <select id="probeChannelSelect" class="luxriot-mini-input probe-select-grow"></select>
-                        </div>
-                        <div class="monitor-stream-preview">
-                            <img id="probePreviewImg" src="" alt="" />
-                            <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
-                            <div id="probeRoiLayer" class="probe-roi-layer" aria-label="Draw probe ROI"></div>
-                            <div id="probeRoiBox" class="probe-roi-box"></div>
-                        </div>
-                        <div class="probe-meta" id="probeCaptureStatus">Stream: idle | Capture: idle</div>
-                        <div class="probe-meta" id="probeBufferInfo">Last snapshot: n/a</div>
-                        <input type="hidden" id="probeFps" value="0" />
-                        <input type="hidden" id="probeWindowSec" value="300" />
-                        <div class="probe-row probe-stream-actions">
-                            <button id="probeRoiToggle" type="button" class="feature-btn">ROI OFF</button>
-                            <button id="probeRoiClear" type="button" class="feature-btn">Clear ROI</button>
-                            <button id="probeStreamToggle" type="button" class="feature-btn primary">Start Stream</button>
-                            <button id="probeSnapBtn" type="button" class="feature-btn">Snap</button>
-                        </div>
-                        <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
-                    </div>
-                    <div class="probe-editor-settings">
-                        <div class="monitor-probe-form">
-                            <div class="probe-row probe-name-row">
-                                <label>Probe name:</label>
-                                <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
-                                <label class="inline-check">
-                                    <input type="checkbox" id="probeEnableToggle" checked>
-                                    Enabled
-                                </label>
-                            </div>
-                            <div class="probe-row probe-bookmark-row">
-                                <label class="inline-check"><input type="checkbox" id="probeBookmarkToggle" checked> Make bookmarks</label>
-                                <div class="probe-severity-wrap">
-                                    <label>Severity:</label>
-                                    <select id="probeBookmarkSeverity" class="luxriot-mini-input">
-                                        <option value="info" selected>info</option>
-                                        <option value="low">low</option>
-                                        <option value="normal">normal</option>
-                                        <option value="high">high</option>
-                                        <option value="critical">critical</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="probe-pairs" id="probePairs">
-                            <div class="probe-row probe-threshold-row probe-pairs-threshold-row probe-panel-heading-row">
-                                <div class="probe-pairs-threshold-title probe-panel-heading">Text Probe Settings:</div>
-                                <div class="probe-pairs-threshold-controls">
-                                    <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.2" /></div>
-                                    <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.05" /></div>
-                                </div>
-                            </div>
-                            <div class="probe-pairs-header">
-                                <div></div>
-                                <div>Positive Examples:</div>
-                                <div>Negative Examples:</div>
-                                <div class="probe-pairs-spacer">&nbsp;</div>
-                            </div>
-                            <div id="probePairRows"></div>
-                        </div>
-                        <div class="image-probe-panel no-image">
-                            <div class="image-probe-left">
-                                <div class="probe-panel-heading-row">
-                                    <div class="image-probe-title probe-panel-heading">Image Probe Settings:</div>
-                                </div>
-                                <div class="image-probe-row image-probe-top-row">
-                                    <div class="file-upload inline">
-                                        <input type="file" id="probeImageFile" class="file-upload-input" accept="image/*" />
-                                        <label for="probeImageFile" class="feature-btn file-upload-btn btn-md">Choose Image</label>
-                                        <span id="probeImageFileName" class="file-upload-name">No file selected</span>
-                                    </div>
-                                    <label class="inline-check image-probe-enable-check">
-                                        <input type="checkbox" id="probeImageEnableToggle">
-                                        Enabled
-                                    </label>
-                                </div>
-                                <div class="image-probe-row image-probe-clear-row is-hidden">
-                                    <button type="button" id="probeImageClear" class="feature-btn auto-hide-disabled">Clear image</button>
-                                </div>
-                                <div class="image-probe-row image-probe-threshold-row">
-                                    <div class="image-probe-min-wrap">
-                                        <label>Minimal match:</label>
-                                        <input type="number" id="probeImagePos" class="settings-input luxriot-mini-input probe-short-input" step="0.01" min="0" max="1" value="0.7" />
-                                    </div>
-                                </div>
-                                <div class="image-probe-status" id="probeImageStatus">Probe status: Disabled; Image: Missing.</div>
-                            </div>
-                            <div class="probe-preview compact">
-                                <img id="probeImageThumb" src="" alt="" />
-                                <div id="probeImageOverlay" class="probe-preview-overlay">No image selected</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="settings-actions probe-editor-modal-actions">
-                    <button id="probeEditorCloseBtn" class="settings-btn">Close</button>
-                    <button id="probeSaveBtn" class="settings-btn primary">Save Probe</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div id="probeSnapModal" class="settings-modal">
-        <div class="settings-modal-content probe-snap-modal-content">
-            <div class="settings-header">
-                <h2>Probe Snapshot</h2>
-                <button class="close-btn" id="closeProbeSnap">&times;</button>
-            </div>
-            <div class="probe-snap-toolbar">
-                <label class="inline-check">
-                    <input type="checkbox" id="probeSnapActualSize">
-                    Show actual resolution
-                </label>
-                <div id="probeSnapMeta" class="probe-meta">No snapshot captured.</div>
-            </div>
-            <div id="probeSnapPreview" class="probe-snap-preview">
-                <img id="probeSnapImg" src="" alt="Probe snapshot preview" />
-            </div>
-            <div class="settings-actions probe-editor-modal-actions">
-                <button id="probeSnapCloseBtn" class="settings-btn">Close</button>
-                <button id="probeSnapExportBtn" class="settings-btn">Export</button>
-                <button id="probeSnapUseBtn" class="settings-btn primary">Set as image probe</button>
-            </div>
-        </div>
-    </div>
-
-    <div id="luxriotPromptModal" class="settings-modal">
-        <div class="settings-modal-content prompt-modal-content">
-            <div class="settings-header">
-                <h2>System Prompt Settings</h2>
-                <button class="close-btn" id="closeLuxriotPromptModal">&times;</button>
-            </div>
-            <div class="prompt-modal-body">
-                <div class="prompt-modal-tabs">
-                    <button type="button" class="feature-btn prompt-tab active" data-luxriot-prompt-tab="stream">Stream System Prompt</button>
-                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L1">L1</button>
-                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L2">L2</button>
-                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="L3">L3</button>
-                    <button type="button" class="feature-btn prompt-tab" data-luxriot-prompt-tab="json">JSON</button>
-                </div>
-                <textarea id="luxriotPromptModalInput" class="luxriot-prompt prompt-modal-editor" placeholder="Set prompt for selected summary depth..."></textarea>
-                <div class="prompt-bookmark-controls">
-                    <label class="inline-check">
-                        <input type="checkbox" id="luxriotBookmarkEnabled">
-                        Enable bookmarks
-                    </label>
-                    <label class="small-label-group">
-                        Dedup cooldown (sec):
-                        <input type="number" id="luxriotBookmarkCooldown" class="settings-input luxriot-mini-input" min="0" step="1" />
-                    </label>
-                </div>
-                <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>
-                <div class="settings-actions">
-                    <button id="luxriotPromptApplyBtn" class="settings-btn primary">Apply</button>
-                    <button id="luxriotPromptCloseBtn" class="settings-btn">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Settings Modal -->
-    <div id="settingsModal" class="settings-modal">
-        <div class="settings-modal-content">
-            <div class="settings-header">
-                <h2>Settings</h2>
-                <button class="close-btn" id="closeSettings">&times;</button>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Server Configuration</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Host:</label>
-                    <input type="text" id="host" class="settings-input" placeholder="0.0.0.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Port:</label>
-                    <input type="number" id="port" class="settings-input" min="1000" max="65535" placeholder="5000">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Debug Mode:</label>
-                    <input type="checkbox" id="debug" class="settings-checkbox">
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Search Configuration</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Min Results:</label>
-                    <input type="number" id="minResults" class="settings-input" min="1" max="100" placeholder="3">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max Results:</label>
-                    <input type="number" id="maxResults" class="settings-input" min="1" max="200" placeholder="48">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Default Results:</label>
-                    <input type="number" id="defaultResults" class="settings-input" min="1" max="100" placeholder="12">
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Model & Processing</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Backend:</label>
-                    <select id="embedder" class="settings-select">
-                        <option value="clip">CLIP</option>
-                        <option value="dino">DINO</option>
-                        <option value="fusion">Fusion</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Fusion Enabled:</label>
-                    <input type="checkbox" id="fusionEnabled" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Fusion Alpha:</label>
-                    <input type="range" id="fusionAlpha" class="settings-range" min="0" max="1" step="0.05" value="0.7">
-                    <span class="range-value" id="fusionAlphaValue">0.70</span>
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Model:</label>
-                    <input type="text" id="dinoModel" class="settings-input" placeholder="dinov3_vitb16">
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Embedding Dim:</label>
-                    <input type="number" id="dinoEmbedDim" class="settings-input" min="128" max="4096" placeholder="1280">
-                </div>
-                <div class="settings-row backend-dino">
-                    <label class="settings-label">DINO Weights Path:</label>
-                    <input type="text" id="dinoWeightsPath" class="settings-input" placeholder="/path/to/dinov3">
-                </div>
-                <div class="settings-row backend-clip">
-                    <label class="settings-label">CLIP Model:</label>
-                    <select id="clipModel" class="settings-select">
-                        <option value="ViT-B/32">ViT-B/32</option>
-                        <option value="ViT-B/16">ViT-B/16</option>
-                        <option value="ViT-L/14">ViT-L/14</option>
-                        <option value="google/siglip2-base-patch16-224">SigLIP2 Base (patch16-224)</option>
-                        <option value="google/siglip2-so400m-patch14-384">SigLIP2 So400m (patch14-384)</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Batch Size:</label>
-                    <input type="number" id="batchSize" class="settings-input" min="1" max="128" placeholder="32">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Thumbnail Quality:</label>
-                    <input type="range" id="thumbnailQuality" class="settings-range" min="50" max="100" value="85">
-                    <span class="range-value" id="qualityValue">85</span>
-                </div>
-            </div>
-
-            <div class="settings-section">
-                <h3>Luxriot Evo</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Base URL:</label>
-                    <input type="text" id="luxriotBaseUrl" class="settings-input" placeholder="http://192.168.1.102:8080">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Username:</label>
-                    <input type="text" id="luxriotUsername" class="settings-input" placeholder="admin">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Password:</label>
-                    <input type="password" id="luxriotPassword" class="settings-input" placeholder="••••••">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Default Channel ID:</label>
-                    <input type="number" id="luxriotDefaultChannelId" class="settings-input" min="1" placeholder="103">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Snapshot Interval (s):</label>
-                    <input type="number" id="luxriotSnapshotInterval" class="settings-input" min="1" max="300" placeholder="5">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Snapshot Max Edge (px):</label>
-                    <input type="number" id="luxriotSnapshotMaxEdge" class="settings-input" min="640" max="1600" placeholder="800">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max Buffer Frames:</label>
-                    <input type="number" id="luxriotMaxBufferFrames" class="settings-input" min="12" max="2000" placeholder="180">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Auto Bookmark Alerts:</label>
-                    <input type="checkbox" id="luxriotAutoBookmarks" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Bookmark Cooldown (s):</label>
-                    <input type="number" id="probeBookmarkCooldownSec" class="settings-input" min="0" step="0.5" placeholder="8.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Dedupe Window (s):</label>
-                    <input type="number" id="probeBookmarkDedupeWindowSec" class="settings-input" min="0.5" step="0.5" placeholder="20.0">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Similarity High:</label>
-                    <input type="number" id="probeBookmarkSimHigh" class="settings-input" min="0.5" max="0.9999" step="0.0001" placeholder="0.985">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Margin Delta:</label>
-                    <input type="number" id="probeBookmarkMarginDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Score Delta:</label>
-                    <input type="number" id="probeBookmarkScoreDelta" class="settings-input" min="0" step="0.01" placeholder="0.08">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Probe Max Frame Gap:</label>
-                    <input type="number" id="probeBookmarkMaxFrameGap" class="settings-input" min="1" step="1" placeholder="8">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Severity Mapping:</label>
-                    <div class="severity-row">
-                        <input type="text" id="luxriotSevInfo" class="settings-input settings-short-input" placeholder="info">
-                        <input type="text" id="luxriotSevLow" class="settings-input settings-short-input" placeholder="low">
-                        <input type="text" id="luxriotSevNormal" class="settings-input settings-short-input" placeholder="normal">
-                        <input type="text" id="luxriotSevHigh" class="settings-input settings-short-input" placeholder="high">
-                        <input type="text" id="luxriotSevCritical" class="settings-input settings-short-input" placeholder="critical">
-                    </div>
-                </div>
-            </div>
-            
-            <div class="settings-section">
-                <h3>Advanced Settings</h3>
-                <div class="settings-row">
-                    <label class="settings-label">Max Comment Length:</label>
-                    <input type="number" id="maxCommentLength" class="settings-input" min="50" max="2000" placeholder="100">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Max File Size (MB):</label>
-                    <input type="number" id="maxFileSize" class="settings-input" min="1" max="500" placeholder="50">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Index Folder Name:</label>
-                    <input type="text" id="indexFolderName" class="settings-input" placeholder=".clip_index">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Index Mode:</label>
-                    <select id="indexMode" class="settings-select">
-                        <option value="clip">CLIP only</option>
-                        <option value="dino">DINO only</option>
-                        <option value="dual">Dual (CLIP & DINO)</option>
-                    </select>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Rerank Enabled:</label>
-                    <input type="checkbox" id="rerankEnabled" class="settings-checkbox">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Rerank Top-K:</label>
-                    <input type="number" id="rerankTopK" class="settings-input" min="1" max="500" placeholder="50">
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Segment Embeddings:</label>
-                    <input type="checkbox" id="segmentsEnabled" class="settings-checkbox" {segments_enabled_checked}>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Min Segment Patches:</label>
-                    <input type="number" id="segmentMinPatches" class="settings-input" min="1" max="256" placeholder="3" value="{segment_min_patches_default}">
-                </div>
-            </div>
-
-            <div class="settings-section">
-                <h3>Environment Variables</h3>
-                <div class="settings-row align-start">
-                    <label class="settings-label">`EVOSSEARCH_*` values:</label>
-                    <textarea id="envEditor" class="settings-input env-editor" spellcheck="false" placeholder="EVOSSEARCH_KEY=value"></textarea>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Env actions:</label>
-                    <div class="env-editor-actions">
-                        <button class="settings-btn" id="reloadEnvBtn">Reload Env</button>
-                        <button class="settings-btn primary" id="saveEnvBtn">Save Env</button>
-                    </div>
-                </div>
-                <div class="settings-row">
-                    <label class="settings-label">Runtime:</label>
-                    <div class="settings-note">Env changes are saved to `.env`. Restart server to apply all values.</div>
-                </div>
-            </div>
-            
-            <div class="settings-actions">
-                <button class="settings-btn" id="resetSettings">Reset to Defaults</button>
-                <button class="settings-btn primary" id="saveSettings">Save Settings</button>
-            </div>
-            
-            <div id="settingsStatus" class="settings-status"></div>
-        </div>
-    </div>
-    
-    <script>
-        const folderInput = document.getElementById('folderPath');
-        const indexBtn = document.getElementById('indexBtn');
-        const indexStatus = document.getElementById('indexStatus');
-        const searchInput = document.getElementById('searchQuery');
-        const searchBtn = document.getElementById('searchBtn');
-        const imageUpload = document.getElementById('imageUpload');
-        const imageUploadName = document.getElementById('imageUploadName');
-        const imageQueryPanel = document.getElementById('imageQueryPanel');
-        const queryImagePreview = document.getElementById('queryImagePreview');
-        const queryImageThumb = document.getElementById('queryImageThumb');
-        const imageSearchBtn = document.getElementById('imageSearchBtn');
-        const archiveModeBtn = document.getElementById('archiveModeBtn');
-        const videoModeBtn = document.getElementById('videoModeBtn');
-        const archiveBox = document.getElementById('archiveBox');
-        const videoBox = document.getElementById('videoBox');
-        const videoPathInput = document.getElementById('videoPath');
-        const videoModelInput = document.getElementById('videoModel');
-        const videoFrameCount = document.getElementById('videoFrameCount');
-        const videoSampleFpsInput = document.getElementById('videoSampleFps');
-        const videoPromptInput = document.getElementById('videoPrompt');
-        const saveVideoPromptInput = document.getElementById('saveVideoPrompt');
-        const videoRunBtn = document.getElementById('videoRunBtn');
-        const videoStatus = document.getElementById('videoStatus');
-        const videoOutput = document.getElementById('videoOutput');
-        const videoFrames = document.getElementById('videoFrames');
-        const saveSummaryBtn = document.getElementById('saveSummaryBtn');
-        const monitorModeBtn = document.getElementById('monitorModeBtn');
-        const monitorBox = document.getElementById('monitorBox');
-        const luxriotChannelSelect = document.getElementById('luxriotChannelSelect');
-        const luxriotRefreshChannelsBtn = document.getElementById('luxriotRefreshChannels');
-        const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
-        const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
-        const luxriotStatusLabel = document.getElementById('luxriotStatus');
-        const luxriotPreviewImg = document.getElementById('luxriotPreview');
-        const luxriotOverlay = document.getElementById('luxriotOverlay');
-        const luxriotToggleCaptureBtn = document.getElementById('luxriotToggleCapture');
-        const luxriotFlushCaptureBtn = document.getElementById('luxriotFlushCapture');
-        const luxriotPromptSettingsBtn = document.getElementById('luxriotPromptSettingsBtn');
-        const luxriotPromptModal = document.getElementById('luxriotPromptModal');
-        const closeLuxriotPromptModalBtn = document.getElementById('closeLuxriotPromptModal');
-        const luxriotPromptCloseBtn = document.getElementById('luxriotPromptCloseBtn');
-        const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
-        const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
-        const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
-        const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
-        const luxriotRefreshSummariesBtn = document.getElementById('luxriotRefreshSummaries');
-        const luxriotSummaryChannelSelect = document.getElementById('luxriotSummaryChannelSelect');
-        const luxriotSummaryRunSelect = document.getElementById('luxriotSummaryRunSelect');
-        const luxriotSummaryRangeSelect = document.getElementById('luxriotSummaryRangeSelect');
-        const luxriotSummaryLevelSelect = document.getElementById('luxriotSummaryLevelSelect');
-        const luxriotSummaryCustomTime = document.getElementById('luxriotSummaryCustomTime');
-        const luxriotSummaryFromInput = document.getElementById('luxriotSummaryFromInput');
-        const luxriotSummaryToInput = document.getElementById('luxriotSummaryToInput');
-        const luxriotSummaryApplyFiltersBtn = document.getElementById('luxriotSummaryApplyFiltersBtn');
-        const luxriotSummaryBackBtn = document.getElementById('luxriotSummaryBackBtn');
-        const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
-        const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
-        const luxriotSummaryPauseBtn = document.getElementById('luxriotSummaryPauseBtn');
-        const luxriotSummaryViewBtn = document.getElementById('luxriotSummaryViewBtn');
-        const luxriotSummaryCollapseAllBtn = document.getElementById('luxriotSummaryCollapseAllBtn');
-        const luxriotSummaryJumpBtn = document.getElementById('luxriotSummaryJumpBtn');
-        const luxriotSummaries = document.getElementById('luxriotSummaries');
-        const luxriotStreams = document.getElementById('luxriotStreams');
-        const luxriotRefreshStreamsBtn = document.getElementById('luxriotRefreshStreams');
-        const luxriotStopAllVideoBtn = document.getElementById('luxriotStopAllVideo');
-        const luxriotStopAllAnalyticsBtn = document.getElementById('luxriotStopAllAnalytics');
-        const luxriotPromptInput = document.getElementById('luxriotPrompt');
-        const luxriotSystemPromptInput = document.getElementById('luxriotSystemPrompt');
-        const luxriotRollupPromptL1Input = document.getElementById('luxriotRollupPromptL1');
-        const luxriotRollupPromptL2Input = document.getElementById('luxriotRollupPromptL2');
-        const luxriotRollupPromptL3Input = document.getElementById('luxriotRollupPromptL3');
-        const luxriotJsonAlertPromptInput = document.getElementById('luxriotJsonAlertPrompt');
-        const luxriotBookmarkEnabledInput = document.getElementById('luxriotBookmarkEnabled');
-        const luxriotBookmarkCooldownInput = document.getElementById('luxriotBookmarkCooldown');
-        const probeChannelSelect = document.getElementById('probeChannelSelect');
-        const probeTopKInput = document.getElementById('probeTopK');
-        const probePosFloorInput = document.getElementById('probePosFloor');
-        const probeMarginInput = document.getElementById('probeMargin');
-        const probeNameInput = document.getElementById('probeName');
-        const probeRunBtn = document.getElementById('probeRunBtn');
-        const probeSaveBtn = document.getElementById('probeSaveBtn');
-        const probeDeleteBtn = document.getElementById('probeDeleteBtn');
-        const probeEditBtn = document.getElementById('probeEditBtn');
-        const probeEditorModal = document.getElementById('probeEditorModal');
-        const closeProbeEditorBtn = document.getElementById('closeProbeEditor');
-        const probeEditorCloseBtn = document.getElementById('probeEditorCloseBtn');
-        const probeResults = document.getElementById('probeResults');
-        const probeStatus = document.getElementById('probeStatus');
-        const probeBookmarkSeverityInput = document.getElementById('probeBookmarkSeverity');
-        const probeBookmarkToggle = document.getElementById('probeBookmarkToggle');
-        const probeFpsInput = document.getElementById('probeFps');
-        const probeWindowSecInput = document.getElementById('probeWindowSec');
-        const probeStreamToggleBtn = document.getElementById('probeStreamToggle');
-        const probeCaptureStatus = document.getElementById('probeCaptureStatus');
-        const probeHitsMeta = document.getElementById('probeHitsMeta');
-        const probeCards = document.getElementById('probeCards');
-        const probeNewBtn = document.getElementById('probeNewBtn');
-        const probeReloadBtn = document.getElementById('probeReloadBtn');
-        const probePreviewImg = document.getElementById('probePreviewImg');
-        const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.monitor-stream-preview') : null;
-        const probePreviewOverlay = document.getElementById('probePreviewOverlay');
-        const probeRoiLayer = document.getElementById('probeRoiLayer');
-        const probeRoiBox = document.getElementById('probeRoiBox');
-        const probeRoiToggleBtn = document.getElementById('probeRoiToggle');
-        const probeRoiClearBtn = document.getElementById('probeRoiClear');
-        const probeSnapBtn = document.getElementById('probeSnapBtn');
-        const probeRoiInfo = document.getElementById('probeRoiInfo');
-        const probeSnapModal = document.getElementById('probeSnapModal');
-        const closeProbeSnapBtn = document.getElementById('closeProbeSnap');
-        const probeSnapCloseBtn = document.getElementById('probeSnapCloseBtn');
-        const probeSnapExportBtn = document.getElementById('probeSnapExportBtn');
-        const probeSnapUseBtn = document.getElementById('probeSnapUseBtn');
-        const probeSnapActualSizeInput = document.getElementById('probeSnapActualSize');
-        const probeSnapMeta = document.getElementById('probeSnapMeta');
-        const probeSnapPreview = document.getElementById('probeSnapPreview');
-        const probeSnapImg = document.getElementById('probeSnapImg');
-        const probePairsContainer = document.getElementById('probePairs');
-        const probePairRows = document.getElementById('probePairRows');
-        const probeImageFile = document.getElementById('probeImageFile');
-        const probeImageFileName = document.getElementById('probeImageFileName');
-        const probeImageClearBtn = document.getElementById('probeImageClear');
-        const probeImageClearRow = probeImageClearBtn ? probeImageClearBtn.closest('.image-probe-clear-row') : null;
-        const probeImageEnableToggle = document.getElementById('probeImageEnableToggle');
-        const probeImageStatus = document.getElementById('probeImageStatus');
-        const probeImageThumb = document.getElementById('probeImageThumb');
-        const probeImageOverlay = document.getElementById('probeImageOverlay');
-        const probeImagePanel = document.querySelector('.image-probe-panel');
-        const probeImagePosInput = document.getElementById('probeImagePos');
-        const probeDetLeftBtn = document.getElementById('probeDetLeft');
-        const probeDetRightBtn = document.getElementById('probeDetRight');
-        const resultLimitSelect = document.getElementById('resultLimit');
-        const sortBySelect = document.getElementById('sortBy');
-        const searchScopeSelect = document.getElementById('searchScope');
-        const showCommentedBtn = document.getElementById('showCommentedBtn');
-        const resultsContainer = document.getElementById('results');
-        const archiveChannelFilter = document.getElementById('archiveChannelFilter');
-        const archiveProbeFilter = document.getElementById('archiveProbeFilter');
-        const archiveTimeFilter = document.getElementById('archiveTimeFilter');
-        const archiveDetectionsLimit = document.getElementById('archiveDetectionsLimit');
-        const loadDetectionsBtn = document.getElementById('loadDetectionsBtn');
-        const refreshDetectionsFiltersBtn = document.getElementById('refreshDetectionsFiltersBtn');
-        const archiveDetectionsPrevBtn = document.getElementById('archiveDetectionsPrev');
-        const archiveDetectionsNextBtn = document.getElementById('archiveDetectionsNext');
-        const archiveDetectionsMeta = document.getElementById('archiveDetectionsMeta');
-        const probeBufferInfo = document.getElementById('probeBufferInfo');
-        const probeEnableToggle = document.getElementById('probeEnableToggle');
-        const probeBenchBtn = document.getElementById('probeBenchBtn');
-        const probeBenchOutput = document.getElementById('probeBenchOutput');
-        
-        let currentFolder = '';
-        let currentMode = 'archive';
-        let videoTimerHandle = null;
-        let videoRequestStarted = 0;
-        let lastSummaryText = '';
-        let lastSummaryTarget = null;
-        let segmentContextByIndex = {};
-        let luxriotSummaryLogCache = [];
-        const luxriotSummaryChannelCache = {};
-        const luxriotSummarySeenKeys = {};
-        let luxriotSummaryUnread = 0;
-        let luxriotSummaryChannel = null;
-        let luxriotSummaryRunFilter = 'latest';
-        let luxriotSummaryRangePreset = '6h';
-        let luxriotSummaryFromTs = null;
-        let luxriotSummaryToTs = null;
-        let luxriotSummaryLevel = 'L0';
-        let luxriotSummaryRollupStack = [];
-        let luxriotSummaryRollupRows = [];
-        const luxriotSummaryRollupCache = {};
-        let luxriotSummaryFollowLive = true;
-        let luxriotSummaryAutoRefresh = true;
-        let luxriotSummaryCompactMode = false;
-        const luxriotSummaryCollapsedByChannel = {};
-        const luxriotDefaults = {
-            channelId: {luxriot_default_channel},
-            snapshotInterval: {luxriot_snapshot_interval},
-            snapshotMaxEdge: {luxriot_snapshot_max_edge},
-            baseUrl: {luxriot_base_url_json},
-            batchSize: {luxriot_batch_default}
-        };
-        let luxriotActiveChannel = luxriotDefaults.channelId;
-        let luxriotPreviewTimer = null;
-        let luxriotSummaryTimer = null;
-        let luxriotSummaryRefreshInFlight = false;
-        let luxriotSummaryRefreshQueued = null;
-        let luxriotStreamsCache = [];
-        const luxriotChannelNameById = {};
-        const luxriotCaptureRunningByChannel = {};
-        let luxriotPromptModalTab = 'stream';
-        let luxriotInitialized = false;
-        const probeHitsCacheByKey = {};
-        const probeHitsOffsetByKey = {};
-        const probeFramesByKey = {};
-        const probeHitsUpdatedByKey = {};
-        const probeWindowSecByKey = {};
-        let probePairsState = [];
-        let probeImageState = null;
-        let probeRoiEnabled = false;
-        let probeRoiNorm = null;
-        let probeRoiDraftNorm = null;
-        let probeRoiDrawState = null;
-        let probeSnapState = null;
-        let imageProbeEnabled = false;
-        let probeList = [];
-        let probeCatalog = [];
-        let activeProbeId = null;
-        const probeCaptureState = {};
-        const probeChannelRuntime = {};
-        const probeCaptureManualStop = {};
-        let probeRunTimer = null;
-        let probeRunInFlight = false;
-        let probePreviewTimer = null;
-        let probePreviewChannelId = null;
-        let lastProbeRefresh = 0;
-        let probeStatusTimer = null;
-        let archiveDetectionsOffset = 0;
-        let archiveDetectionsTotal = 0;
-        let archiveDetectionsHasMore = false;
-        const channelCaptureConfig = {};
-        const channelFpsDesired = {};
-        const ADMIN_TOKEN_STORAGE_KEY = 'evs_admin_token';
-
-        function getAdminToken() {
-            return (localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '').trim();
-        }
-
-        function saveAdminToken(token) {
-            const clean = (token || '').trim();
-            if (clean) {
-                localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, clean);
-            } else {
-                localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
-            }
-        }
-
-        (function seedAdminTokenFromQuery() {
-            try {
-                const url = new URL(window.location.href);
-                const qp = (url.searchParams.get('admin_token') || '').trim();
-                if (!qp) return;
-                saveAdminToken(qp);
-                url.searchParams.delete('admin_token');
-                window.history.replaceState({}, '', url.toString());
-            } catch (_) {
-                // no-op
-            }
-        })();
-
-        const rawFetch = window.fetch.bind(window);
-        window.fetch = (input, init = {}) => {
-            const options = init ? { ...init } : {};
-            const token = getAdminToken();
-            if (token) {
-                const headers = new Headers(options.headers || {});
-                if (!headers.has('X-Admin-Token') && !headers.has('Authorization')) {
-                    headers.set('X-Admin-Token', token);
-                }
-                options.headers = headers;
-            }
-            return rawFetch(input, options);
-        };
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        function renderMarkdownInline(text) {
-            const source = String(text || '');
-            const inlineCode = [];
-            const placeholder = source.replace(/`([^`\\n]+)`/g, (_, codeText) => {
-                const idx = inlineCode.push(`<code>${escapeHtml(codeText)}</code>`) - 1;
-                return `@@INLINE_CODE_${idx}@@`;
-            });
-            let out = escapeHtml(placeholder);
-            out = out
-                .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/__(.+?)__/g, '<strong>$1</strong>')
-                .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
-                .replace(/_(.+?)_/g, '<em>$1</em>');
-            out = out.replace(/@@INLINE_CODE_(\\d+)@@/g, (_, idx) => inlineCode[Number(idx)] || '');
-            return out;
-        }
-
-        function renderMarkdown(text) {
-            const source = String(text || '').replace(/\\r\\n?/g, '\\n').trim();
-            if (!source) return '';
-
-            const lines = source.split('\\n');
-            const htmlParts = [];
-            let paragraphLines = [];
-            let ulItems = [];
-            let olItems = [];
-            let inCodeFence = false;
-            let codeFenceLang = '';
-            let codeFenceLines = [];
-
-            const flushParagraph = () => {
-                if (!paragraphLines.length) return;
-                const body = paragraphLines.map((line) => renderMarkdownInline(line)).join('<br>');
-                htmlParts.push(`<p>${body}</p>`);
-                paragraphLines = [];
-            };
-
-            const flushLists = () => {
-                if (ulItems.length) {
-                    htmlParts.push(`<ul>${ulItems.map((item) => `<li>${item}</li>`).join('')}</ul>`);
-                    ulItems = [];
-                }
-                if (olItems.length) {
-                    htmlParts.push(`<ol>${olItems.map((item) => `<li>${item}</li>`).join('')}</ol>`);
-                    olItems = [];
-                }
-            };
-
-            const flushCodeFence = () => {
-                if (!inCodeFence) return;
-                const classAttr = codeFenceLang ? ` class="language-${escapeHtml(codeFenceLang)}"` : '';
-                htmlParts.push(
-                    `<pre><code${classAttr}>${escapeHtml(codeFenceLines.join('\\n'))}</code></pre>`
-                );
-                inCodeFence = false;
-                codeFenceLang = '';
-                codeFenceLines = [];
-            };
-
-            for (const rawLine of lines) {
-                const line = String(rawLine || '');
-                const trimmed = line.trim();
-                const fenceMatch = trimmed.match(/^```\\s*([\\w-]+)?\\s*$/);
-                if (fenceMatch) {
-                    if (inCodeFence) {
-                        flushCodeFence();
-                    } else {
-                        flushParagraph();
-                        flushLists();
-                        inCodeFence = true;
-                        codeFenceLang = String(fenceMatch[1] || '').trim();
-                        codeFenceLines = [];
-                    }
-                    continue;
-                }
-
-                if (inCodeFence) {
-                    codeFenceLines.push(line);
-                    continue;
-                }
-
-                if (!trimmed) {
-                    flushParagraph();
-                    flushLists();
-                    continue;
-                }
-
-                const headingMatch = trimmed.match(/^(#{1,6})\\s+(.+)$/);
-                if (headingMatch) {
-                    flushParagraph();
-                    flushLists();
-                    const level = Math.min(6, Math.max(1, headingMatch[1].length));
-                    htmlParts.push(`<h${level}>${renderMarkdownInline(headingMatch[2])}</h${level}>`);
-                    continue;
-                }
-
-                const quoteMatch = trimmed.match(/^>\\s?(.*)$/);
-                if (quoteMatch) {
-                    flushParagraph();
-                    flushLists();
-                    htmlParts.push(`<blockquote>${renderMarkdownInline(quoteMatch[1] || '')}</blockquote>`);
-                    continue;
-                }
-
-                const ulMatch = trimmed.match(/^[-*]\\s+(.+)$/);
-                if (ulMatch) {
-                    flushParagraph();
-                    if (olItems.length) {
-                        flushLists();
-                    }
-                    ulItems.push(renderMarkdownInline(ulMatch[1]));
-                    continue;
-                }
-
-                const olMatch = trimmed.match(/^\\d+\\.\\s+(.+)$/);
-                if (olMatch) {
-                    flushParagraph();
-                    if (ulItems.length) {
-                        flushLists();
-                    }
-                    olItems.push(renderMarkdownInline(olMatch[1]));
-                    continue;
-                }
-
-                paragraphLines.push(line);
-            }
-
-            flushParagraph();
-            flushLists();
-            flushCodeFence();
-            return htmlParts.join('');
-        }
-
-        function splitSummaryAndJson(text) {
-            const full = String(text || '').trim();
-            if (!full) {
-                return { main: '', json: '' };
-            }
-
-            const fenced = full.match(/```json\\s*([\\s\\S]*?)```/i);
-            if (fenced && fenced[1]) {
-                const jsonBlock = String(fenced[1] || '').trim();
-                const mainText = full.replace(fenced[0], '').trim();
-                return { main: mainText, json: jsonBlock };
-            }
-
-            const marker = 'ALERTS_JSON:';
-            const markerIndex = full.toUpperCase().indexOf(marker);
-            if (markerIndex >= 0) {
-                const mainText = full.slice(0, markerIndex).trim();
-                const jsonBlock = full.slice(markerIndex + marker.length).trim();
-                if (jsonBlock) {
-                    return { main: mainText, json: jsonBlock };
-                }
-            }
-
-            const trailingStart = full.lastIndexOf('\\n{');
-            const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
-            if (startIndex >= 0) {
-                const jsonCandidate = full.slice(startIndex).trim();
-                const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
-                if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
-                    const mainText = full.slice(0, startIndex).trim();
-                    return { main: mainText, json: jsonCandidate };
-                }
-            }
-
-            return { main: full, json: '' };
-        }
-
-        function formatDuration(seconds) {
-            if (!Number.isFinite(seconds)) return 'n/a';
-            const mins = Math.floor(seconds / 60);
-            const secs = Math.floor(seconds % 60);
-            return `${mins}m ${secs}s`;
-        }
-
-        const buttonBusyState = new WeakMap();
-
-        function setButtonBusy(button, busy) {
-            if (!(button instanceof HTMLButtonElement)) return;
-            if (busy) {
-                if (!buttonBusyState.has(button)) {
-                    buttonBusyState.set(button, Boolean(button.disabled));
-                }
-                button.disabled = true;
-                button.classList.add('is-loading');
-                button.setAttribute('aria-busy', 'true');
-                return;
-            }
-            const wasDisabled = buttonBusyState.has(button) ? Boolean(buttonBusyState.get(button)) : false;
-            buttonBusyState.delete(button);
-            button.classList.remove('is-loading');
-            button.removeAttribute('aria-busy');
-            button.disabled = wasDisabled;
-        }
-
-        function startVideoTimer() {
-            videoRequestStarted = performance.now();
-            if (videoTimerHandle) clearInterval(videoTimerHandle);
-            videoTimerHandle = setInterval(() => {
-                const elapsed = (performance.now() - videoRequestStarted) / 1000;
-                const base = videoStatus.dataset.base || '';
-                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
-            }, 200);
-        }
-
-        function stopVideoTimer(finalize = false) {
-            const elapsed = videoRequestStarted ? (performance.now() - videoRequestStarted) / 1000 : 0;
-            if (videoTimerHandle) {
-                clearInterval(videoTimerHandle);
-                videoTimerHandle = null;
-            }
-            if (finalize) {
-                const base = videoStatus.dataset.base || '';
-                videoStatus.textContent = `${base} · ${elapsed.toFixed(1)}s`;
-            }
-            videoRequestStarted = 0;
-        }
-
-        function setMode(mode) {
-            currentMode = mode;
-            archiveModeBtn.classList.toggle('active', mode === 'archive');
-            videoModeBtn.classList.toggle('active', mode === 'video');
-            monitorModeBtn.classList.toggle('active', mode === 'monitor');
-            if (archiveBox) {
-                archiveBox.style.display = mode === 'archive' ? 'flex' : 'none';
-            }
-            videoBox.style.display = mode === 'video' ? 'flex' : 'none';
-            monitorBox.style.display = mode === 'monitor' ? 'block' : 'none';
-            if (mode === 'video') {
-                ensureLuxriotInit();
-                startLuxriotPreview();
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                refreshLuxriotStreams();
-                startLuxriotSummaryPoll();
-                syncProbeChannelSelect();
-            } else if (mode === 'monitor') {
-                ensureLuxriotInit();
-                syncProbeChannelSelect();
-                syncProbePreview(getSelectedProbeChannelId());
-                refreshProbeStatus();
-                loadProbeList();
-                startProbeStatusPoll();
-            } else {
-                stopLuxriotPreview();
-                stopLuxriotSummaryPoll();
-                stopProbePreview();
-                stopProbeRunLoop();
-                stopProbeStatusPoll();
-                refreshArchiveFilters().catch(() => {});
-                if (probeEditorModal) {
-                    setProbeEditorModalVisibility(false);
-                }
-            }
-        }
-
-        function setProbeEditorModalVisibility(visible) {
-            if (!probeEditorModal) return;
-            probeEditorModal.style.display = visible ? 'block' : 'none';
-            if (visible) {
-                syncProbePreview(getSelectedProbeChannelId());
-            } else {
-                stopProbePreview();
-                setProbeSnapModalVisibility(false);
-            }
-        }
-
-        function setProbeSnapModalVisibility(visible) {
-            if (!probeSnapModal) return;
-            probeSnapModal.style.display = visible ? 'block' : 'none';
-            if (!visible) {
-                probeSnapState = null;
-                if (probeSnapImg) probeSnapImg.src = '';
-                if (probeSnapMeta) probeSnapMeta.textContent = 'No snapshot captured.';
-                if (probeSnapPreview) {
-                    probeSnapPreview.classList.remove('actual-size');
-                }
-                if (probeSnapActualSizeInput) {
-                    probeSnapActualSizeInput.checked = false;
-                }
-            }
-        }
-
-        function setLuxriotStatus(text, isError = false) {
-            if (!luxriotStatusLabel) return;
-            luxriotStatusLabel.textContent = text;
-            luxriotStatusLabel.classList.toggle('error', Boolean(isError));
-            if (isError) {
-                luxriotStatusLabel.title = text;
-            } else {
-                luxriotStatusLabel.removeAttribute('title');
-            }
-        }
-
-        function updateLuxriotBatchInfo() {
-            if (!luxriotBatchInfo) return;
-            const intervalSec = Number(luxriotDefaults.snapshotInterval) || 1;
-            const fps = intervalSec > 0 ? (1 / intervalSec) : 0;
-            const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
-            luxriotBatchInfo.textContent = `~${fpsLabel} fps, ${luxriotDefaults.snapshotMaxEdge}px`;
-        }
-
-        function stopLuxriotPreview() {
-            if (luxriotPreviewTimer) {
-                clearInterval(luxriotPreviewTimer);
-                luxriotPreviewTimer = null;
-            }
-        }
-
-        function stopLuxriotSummaryPoll() {
-            if (luxriotSummaryTimer) {
-                clearInterval(luxriotSummaryTimer);
-                luxriotSummaryTimer = null;
-            }
-        }
-
-        function getSelectedLuxriotChannel() {
-            const raw = luxriotChannelSelect ? luxriotChannelSelect.value : '';
-            const parsed = parseInt(raw || luxriotActiveChannel, 10);
-            if (Number.isFinite(parsed)) {
-                luxriotActiveChannel = parsed;
-                return parsed;
-            }
-            return luxriotDefaults.channelId;
-        }
-
-        function getSelectedSummaryChannel() {
-            const raw = luxriotSummaryChannelSelect ? luxriotSummaryChannelSelect.value : '';
-            const fallback = luxriotSummaryChannel ?? getSelectedLuxriotChannel();
-            const parsed = parseInt(raw || String(fallback || ''), 10);
-            if (Number.isFinite(parsed)) {
-                luxriotSummaryChannel = parsed;
-                return parsed;
-            }
-            return getSelectedLuxriotChannel();
-        }
-
-        function normalizeSummaryRun(value) {
-            const text = String(value || '').trim();
-            if (!text) return 'latest';
-            const lowered = text.toLowerCase();
-            if (lowered === 'latest' || lowered === 'live' || lowered === 'all') {
-                return lowered;
-            }
-            return text;
-        }
-
-        function normalizeSummaryRangePreset(value) {
-            const text = String(value || '').trim().toLowerCase();
-            if (text === '6h' || text === '24h' || text === '3d' || text === '7d' || text === '30d' || text === 'all' || text === 'custom') {
-                return text;
-            }
-            return '24h';
-        }
-
-        function getSummaryRangeBounds(rangePreset, nowSec = null) {
-            const normalized = normalizeSummaryRangePreset(rangePreset);
-            const now = Number.isFinite(nowSec) ? Number(nowSec) : Math.floor(Date.now() / 1000);
-            const toTs = now;
-            if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
-            if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
-            if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
-            if (normalized === '7d') return { fromTs: toTs - 7 * 24 * 3600, toTs };
-            if (normalized === '30d') return { fromTs: toTs - 30 * 24 * 3600, toTs };
-            return { fromTs: null, toTs: null };
-        }
-
-        function getSummaryRangeLabel() {
-            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
-            if (preset === '6h') return '6h';
-            if (preset === '24h') return '1d';
-            if (preset === '3d') return '3d';
-            if (preset === '7d') return '7d';
-            if (preset === '30d') return '30d';
-            if (preset === 'all') return 'all';
-            if (Number.isFinite(luxriotSummaryFromTs) || Number.isFinite(luxriotSummaryToTs)) {
-                return `custom ${formatRollupRange(luxriotSummaryFromTs, luxriotSummaryToTs)}`;
-            }
-            return 'custom';
-        }
-
-        function syncSummaryRangeUI() {
-            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
-            if (luxriotSummaryRangeSelect) {
-                luxriotSummaryRangeSelect.value = preset;
-            }
-            if (luxriotSummaryCustomTime) {
-                luxriotSummaryCustomTime.classList.toggle('is-hidden', preset !== 'custom');
-            }
-        }
-
-        function parseSummaryDatetimeInput(value) {
-            const text = String(value || '').trim();
-            if (!text) return null;
-            const ms = Date.parse(text);
-            if (!Number.isFinite(ms)) return null;
-            return ms / 1000;
-        }
-
-        function formatSummaryDatetimeInput(ts) {
-            const sec = Number(ts);
-            if (!Number.isFinite(sec)) return '';
-            const d = new Date(sec * 1000);
-            const yyyy = d.getFullYear();
-            const mm = String(d.getMonth() + 1).padStart(2, '0');
-            const dd = String(d.getDate()).padStart(2, '0');
-            const hh = String(d.getHours()).padStart(2, '0');
-            const mi = String(d.getMinutes()).padStart(2, '0');
-            return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
-        }
-
-        function readSummaryFiltersFromInputs() {
-            const run = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
-            const rangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect ? luxriotSummaryRangeSelect.value : luxriotSummaryRangePreset);
-            let fromTs = null;
-            let toTs = null;
-            if (rangePreset === 'custom') {
-                fromTs = parseSummaryDatetimeInput(luxriotSummaryFromInput ? luxriotSummaryFromInput.value : '');
-                toTs = parseSummaryDatetimeInput(luxriotSummaryToInput ? luxriotSummaryToInput.value : '');
-            } else if (rangePreset !== 'all') {
-                const bounds = getSummaryRangeBounds(rangePreset);
-                fromTs = bounds.fromTs;
-                toTs = bounds.toTs;
-            }
-            if (fromTs !== null && toTs !== null && fromTs > toTs) {
-                const tmp = fromTs;
-                fromTs = toTs;
-                toTs = tmp;
-            }
-            return { run, fromTs, toTs, rangePreset };
-        }
-
-        function applySummaryFiltersFromInputs() {
-            const filters = readSummaryFiltersFromInputs();
-            luxriotSummaryRunFilter = filters.run;
-            luxriotSummaryRangePreset = normalizeSummaryRangePreset(filters.rangePreset);
-            luxriotSummaryFromTs = filters.fromTs;
-            luxriotSummaryToTs = filters.toTs;
-            if (luxriotSummaryRunSelect) {
-                luxriotSummaryRunSelect.value = luxriotSummaryRunFilter;
-            }
-            syncSummaryRangeUI();
-            if (luxriotSummaryFromInput) {
-                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
-            }
-            if (luxriotSummaryToInput) {
-                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
-            }
-        }
-
-        function clearSummaryFilters() {
-            luxriotSummaryRunFilter = 'latest';
-            luxriotSummaryRangePreset = '6h';
-            luxriotSummaryFromTs = null;
-            luxriotSummaryToTs = null;
-            if (luxriotSummaryRunSelect) {
-                luxriotSummaryRunSelect.value = 'latest';
-            }
-            if (luxriotSummaryRangeSelect) {
-                luxriotSummaryRangeSelect.value = '6h';
-            }
-            if (luxriotSummaryFromInput) {
-                luxriotSummaryFromInput.value = '';
-            }
-            if (luxriotSummaryToInput) {
-                luxriotSummaryToInput.value = '';
-            }
-            syncSummaryRangeUI();
-        }
-
-        function buildSummaryQueryParams(channelId) {
-            const params = new URLSearchParams();
-            params.set('channel_id', String(channelId));
-            const run = normalizeSummaryRun(luxriotSummaryRunFilter);
-            if (run) params.set('run', run);
-            const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
-            let fromTs = luxriotSummaryFromTs;
-            let toTs = luxriotSummaryToTs;
-            if (preset !== 'custom') {
-                if (preset === 'all') {
-                    fromTs = null;
-                    toTs = null;
-                } else {
-                    const bounds = getSummaryRangeBounds(preset);
-                    fromTs = bounds.fromTs;
-                    toTs = bounds.toTs;
-                }
-                luxriotSummaryFromTs = fromTs;
-                luxriotSummaryToTs = toTs;
-            }
-            if (Number.isFinite(fromTs)) {
-                params.set('from_ts', String(fromTs));
-            }
-            if (Number.isFinite(toTs)) {
-                params.set('to_ts', String(toTs));
-            }
-            return params;
-        }
-
-        function syncSummaryRunSelectOptions(runs, selectedRun = null) {
-            if (!luxriotSummaryRunSelect) return;
-            const runItems = Array.isArray(runs) ? runs : [];
-            const currentValue = normalizeSummaryRun(
-                selectedRun || luxriotSummaryRunSelect.value || luxriotSummaryRunFilter || 'latest'
-            );
-            const baseOptions = [
-                { value: 'latest', label: 'Latest run' },
-                { value: 'live', label: 'Live run' },
-                { value: 'all', label: 'All runs' },
-            ];
-            const seen = new Set(baseOptions.map((item) => item.value));
-            const dynamicOptions = [];
-            runItems.forEach((run) => {
-                const runId = String(run?.run_id || '').trim();
-                if (!runId || seen.has(runId)) return;
-                seen.add(runId);
-                const logCount = Number(run?.log_count || 0);
-                const running = Boolean(run?.running);
-                const stateLabel = running ? 'live' : 'saved';
-                dynamicOptions.push({
-                    value: runId,
-                    label: `${runId} (${stateLabel}, ${logCount})`,
-                });
-            });
-            const optionsHtml = baseOptions
-                .concat(dynamicOptions)
-                .map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`)
-                .join('');
-            luxriotSummaryRunSelect.innerHTML = optionsHtml;
-            const hasCurrent = Array.from(luxriotSummaryRunSelect.options || [])
-                .some((opt) => String(opt.value) === currentValue);
-            luxriotSummaryRunSelect.value = hasCurrent ? currentValue : 'latest';
-            luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
-        }
-
-        function syncSummaryFiltersFromResponse(payload) {
-            const data = payload && typeof payload === 'object' ? payload : {};
-            if (Object.prototype.hasOwnProperty.call(data, 'selected_run')) {
-                luxriotSummaryRunFilter = normalizeSummaryRun(data.selected_run);
-            }
-            if (Object.prototype.hasOwnProperty.call(data, 'from_ts')) {
-                const rawFrom = data.from_ts;
-                if (rawFrom === null || rawFrom === '' || typeof rawFrom === 'undefined') {
-                    luxriotSummaryFromTs = null;
-                } else {
-                    const fromTs = Number(rawFrom);
-                    luxriotSummaryFromTs = Number.isFinite(fromTs) && fromTs > 0 ? fromTs : null;
-                }
-            }
-            if (Object.prototype.hasOwnProperty.call(data, 'to_ts')) {
-                const rawTo = data.to_ts;
-                if (rawTo === null || rawTo === '' || typeof rawTo === 'undefined') {
-                    luxriotSummaryToTs = null;
-                } else {
-                    const toTs = Number(rawTo);
-                    luxriotSummaryToTs = Number.isFinite(toTs) && toTs > 0 ? toTs : null;
-                }
-            }
-            if (luxriotSummaryRunSelect) {
-                const hasRunValue = Array.from(luxriotSummaryRunSelect.options || [])
-                    .some((opt) => String(opt.value) === luxriotSummaryRunFilter);
-                luxriotSummaryRunSelect.value = hasRunValue ? luxriotSummaryRunFilter : 'latest';
-                luxriotSummaryRunFilter = normalizeSummaryRun(luxriotSummaryRunSelect.value);
-            }
-            if (luxriotSummaryFromInput) {
-                luxriotSummaryFromInput.value = formatSummaryDatetimeInput(luxriotSummaryFromTs);
-            }
-            if (luxriotSummaryToInput) {
-                luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
-            }
-            syncSummaryRangeUI();
-        }
-
-        function normalizeSummaryLevel(value) {
-            const text = String(value || '').trim().toUpperCase();
-            if (text === 'L1' || text === 'L2' || text === 'L3') return text;
-            return 'L0';
-        }
-
-        function setSummaryBaseLevel(level) {
-            const normalized = normalizeSummaryLevel(level);
-            luxriotSummaryLevel = normalized;
-            luxriotSummaryRollupStack = [{ level: normalized, sourceIds: null, label: normalized }];
-            if (luxriotSummaryLevelSelect) {
-                luxriotSummaryLevelSelect.value = normalized;
-            }
-        }
-
-        function getCurrentSummaryRollupContext() {
-            if (!Array.isArray(luxriotSummaryRollupStack) || !luxriotSummaryRollupStack.length) {
-                setSummaryBaseLevel(luxriotSummaryLevel);
-            }
-            const last = luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1];
-            if (!last || typeof last !== 'object') {
-                setSummaryBaseLevel('L0');
-                return luxriotSummaryRollupStack[luxriotSummaryRollupStack.length - 1] || null;
-            }
-            return last;
-        }
-
-        function isRollupViewActive() {
-            const ctx = getCurrentSummaryRollupContext();
-            if (!ctx) return false;
-            const hasFilter = Array.isArray(ctx.sourceIds) && ctx.sourceIds.length > 0;
-            return normalizeSummaryLevel(ctx.level) !== 'L0' || hasFilter;
-        }
-
-        function setSummaryUnread(count) {
-            luxriotSummaryUnread = Math.max(0, Number.isFinite(count) ? count : 0);
-            if (!luxriotSummaryJumpBtn) return;
-            if (luxriotSummaryUnread > 0) {
-                luxriotSummaryJumpBtn.classList.remove('is-hidden');
-                luxriotSummaryJumpBtn.textContent = `⬇ Jump to latest (${luxriotSummaryUnread})`;
-            } else {
-                luxriotSummaryJumpBtn.classList.add('is-hidden');
-                luxriotSummaryJumpBtn.textContent = '⬇ Jump to latest';
-            }
-        }
-
-        function getSummaryCollapsedMap(channelId = getSelectedSummaryChannel()) {
-            const key = String(channelId);
-            if (!luxriotSummaryCollapsedByChannel[key] || typeof luxriotSummaryCollapsedByChannel[key] !== 'object') {
-                luxriotSummaryCollapsedByChannel[key] = {};
-            }
-            return luxriotSummaryCollapsedByChannel[key];
-        }
-
-        function isSummaryCollapsed(channelId, logKey) {
-            if (!logKey) return false;
-            const map = getSummaryCollapsedMap(channelId);
-            return Boolean(map[logKey]);
-        }
-
-        function setSummaryCollapsed(channelId, logKey, collapsed) {
-            if (!logKey) return;
-            const map = getSummaryCollapsedMap(channelId);
-            if (collapsed) {
-                map[logKey] = true;
-            } else {
-                delete map[logKey];
-            }
-        }
-
-        function rollupSummaryKey(row, idx = 0) {
-            const level = normalizeSummaryLevel(row?.level || '');
-            const channelId = parseInt(String(row?.channel_id ?? ''), 10);
-            const windowStart = Number(row?.window_start);
-            const windowSecRaw = Number(row?.window_sec);
-            const windowEnd = Number(row?.window_end);
-            if (
-                level !== 'L0'
-                && Number.isFinite(channelId)
-                && Number.isFinite(windowStart)
-            ) {
-                const startBucket = Math.floor(windowStart);
-                let windowSec = Number.isFinite(windowSecRaw) ? Math.floor(windowSecRaw) : 0;
-                if (!(windowSec > 0) && Number.isFinite(windowEnd)) {
-                    windowSec = Math.max(1, Math.floor(windowEnd - windowStart));
-                }
-                return `rollup:${level}:ch${channelId}:w${windowSec}:t${startBucket}`;
-            }
-            const rid = String(row?.rollup_id || '').trim();
-            if (rid) return `rollup:${rid}`;
-            return `rollup:idx-${idx}`;
-        }
-
-        function areAllSummariesCollapsed(channelId = getSelectedSummaryChannel()) {
-            if (isRollupViewActive()) {
-                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
-                if (!rows.length) return false;
-                return rows.every((row, idx) => isSummaryCollapsed(channelId, rollupSummaryKey(row, idx)));
-            }
-            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
-            if (!logs.length) return false;
-            return logs.every((log, idx) => isSummaryCollapsed(channelId, luxriotSummaryLogKey(log, idx)));
-        }
-
-        function collapseAllSummariesForChannel(channelId = getSelectedSummaryChannel(), collapsed = true) {
-            const map = getSummaryCollapsedMap(channelId);
-            if (isRollupViewActive()) {
-                const rows = Array.isArray(luxriotSummaryRollupRows) ? luxriotSummaryRollupRows : [];
-                if (!rows.length) return;
-                if (collapsed) {
-                    rows.forEach((row, idx) => {
-                        map[rollupSummaryKey(row, idx)] = true;
-                    });
-                } else {
-                    rows.forEach((row, idx) => {
-                        delete map[rollupSummaryKey(row, idx)];
-                    });
-                }
-                return;
-            }
-            const logs = Array.isArray(luxriotSummaryChannelCache[channelId]) ? luxriotSummaryChannelCache[channelId] : [];
-            if (!logs.length) return;
-            if (collapsed) {
-                logs.forEach((log, idx) => {
-                    map[luxriotSummaryLogKey(log, idx)] = true;
-                });
-            } else {
-                Object.keys(map).forEach((key) => {
-                    delete map[key];
-                });
-            }
-        }
-
-        function setSummaryCompactMode(enabled) {
-            luxriotSummaryCompactMode = Boolean(enabled);
-            if (luxriotSummaries) {
-                luxriotSummaries.classList.toggle('compact', luxriotSummaryCompactMode);
-            }
-        }
-
-        function copyTextToClipboard(text) {
-            const value = String(text || '');
-            if (!value) return Promise.reject(new Error('Nothing to copy'));
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                return navigator.clipboard.writeText(value);
-            }
-            const textarea = document.createElement('textarea');
-            textarea.value = value;
-            textarea.style.position = 'fixed';
-            textarea.style.opacity = '0';
-            document.body.appendChild(textarea);
-            textarea.focus();
-            textarea.select();
-            try {
-                document.execCommand('copy');
-                return Promise.resolve();
-            } catch (err) {
-                return Promise.reject(err);
-            } finally {
-                document.body.removeChild(textarea);
-            }
-        }
-
-        function downloadTextFile(filename, content) {
-            const blob = new Blob([String(content || '')], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const anchor = document.createElement('a');
-            anchor.href = url;
-            anchor.download = filename;
-            document.body.appendChild(anchor);
-            anchor.click();
-            document.body.removeChild(anchor);
-            URL.revokeObjectURL(url);
-        }
-
-        function updateSummaryControlsUI() {
-            const rollupMode = isRollupViewActive();
-            if (luxriotSummaryFollowBtn) {
-                const liveOn = !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
-                luxriotSummaryFollowBtn.classList.toggle('primary', liveOn);
-                luxriotSummaryFollowBtn.textContent = rollupMode
-                    ? '▶ Live n/a'
-                    : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
-                luxriotSummaryFollowBtn.disabled = rollupMode;
-            }
-            if (luxriotSummaryPauseBtn) {
-                luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
-                luxriotSummaryPauseBtn.textContent = luxriotSummaryAutoRefresh ? 'Pause updates' : 'Resume updates';
-            }
-            if (luxriotSummaryViewBtn) {
-                luxriotSummaryViewBtn.classList.toggle('primary', luxriotSummaryCompactMode);
-                luxriotSummaryViewBtn.textContent = luxriotSummaryCompactMode ? 'View: Compact' : 'View: Expanded';
-            }
-            if (luxriotSummaryCollapseAllBtn) {
-                const collapsed = areAllSummariesCollapsed();
-                luxriotSummaryCollapseAllBtn.classList.toggle('primary', collapsed);
-                luxriotSummaryCollapseAllBtn.textContent = collapsed ? '⇵ Expand all' : '⇵ Collapse all';
-                luxriotSummaryCollapseAllBtn.disabled = false;
-            }
-            if (luxriotSummaryBackBtn) {
-                luxriotSummaryBackBtn.disabled = !Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1;
-            }
-            if (luxriotSummaryJumpBtn) {
-                if (rollupMode) {
-                    luxriotSummaryJumpBtn.classList.add('is-hidden');
-                } else if (luxriotSummaryUnread > 0) {
-                    luxriotSummaryJumpBtn.classList.remove('is-hidden');
-                } else {
-                    luxriotSummaryJumpBtn.classList.add('is-hidden');
-                }
-            }
-            if (luxriotSummaryApplyFiltersBtn) {
-                luxriotSummaryApplyFiltersBtn.disabled = normalizeSummaryRangePreset(luxriotSummaryRangePreset) !== 'custom';
-            }
-        }
-
-        function syncLuxriotSummaryChannelSelect() {
-            if (!luxriotSummaryChannelSelect || !luxriotChannelSelect) return;
-            const options = Array.from(luxriotChannelSelect.options || [])
-                .map((opt) => {
-                    const value = String(opt.value || '').trim();
-                    const label = String(opt.textContent || '').trim();
-                    if (!value) return null;
-                    return `<option value="${value}">${escapeHtml(label)}</option>`;
-                })
-                .filter((opt) => Boolean(opt));
-            if (!options.length) {
-                luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
-                return;
-            }
-            const selected = Number.isFinite(luxriotSummaryChannel) ? luxriotSummaryChannel : getSelectedLuxriotChannel();
-            luxriotSummaryChannelSelect.innerHTML = options.join('');
-            const exists = Array.from(luxriotSummaryChannelSelect.options || [])
-                .some((opt) => parseInt(String(opt.value || ''), 10) === selected);
-            if (exists) {
-                luxriotSummaryChannelSelect.value = String(selected);
-            } else {
-                luxriotSummaryChannelSelect.selectedIndex = 0;
-                const first = parseInt(luxriotSummaryChannelSelect.value || '', 10);
-                luxriotSummaryChannel = Number.isFinite(first) ? first : getSelectedLuxriotChannel();
-            }
-        }
-
-        function normalizeLuxriotChannelName(channel, channelId) {
-            const raw = String(
-                channel?.title
-                || channel?.name
-                || channel?.channel_name
-                || channel?.label
-                || ''
-            ).trim();
-            if (raw) return raw;
-            if (Number.isFinite(channelId)) return `Channel #${channelId}`;
-            return 'Unknown channel';
-        }
-
-        async function fetchLuxriotChannels(force = false) {
-            if (!luxriotChannelSelect) return;
-            luxriotChannelSelect.innerHTML = '<option>Loading...</option>';
-            try {
-                const response = await fetch(`/luxriot/channels${force ? '?force=1' : ''}`);
-                const data = await response.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                const channels = data.channels || [];
-                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
-                if (!channels.length) {
-                    luxriotChannelSelect.innerHTML = '<option value="">No channels</option>';
-                    if (luxriotSummaryChannelSelect) {
-                        luxriotSummaryChannelSelect.innerHTML = '<option value="">No channels</option>';
-                    }
-                    setLuxriotStatus('No channels available', true);
-                    return;
-                }
-                const options = channels
-                    .map((ch) => {
-                        const rawId = ch.id ?? ch.channel_id;
-                        const id = parseInt(String(rawId || ''), 10);
-                        if (!Number.isFinite(id)) return '';
-                        const label = normalizeLuxriotChannelName(ch, id);
-                        luxriotChannelNameById[String(id)] = label;
-                        const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
-                        return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
-                    })
-                    .filter((item) => Boolean(item));
-                luxriotChannelSelect.innerHTML = options.join('');
-                const channelIds = channels
-                    .map((ch) => parseInt(String(ch.id ?? ch.channel_id ?? ''), 10))
-                    .filter((id) => Number.isFinite(id));
-                if (!channelIds.some((id) => String(id) === String(luxriotActiveChannel))) {
-                    luxriotActiveChannel = channelIds[0] || luxriotDefaults.channelId;
-                    luxriotChannelSelect.value = luxriotActiveChannel;
-                }
-                if (!Number.isFinite(luxriotSummaryChannel)) {
-                    luxriotSummaryChannel = luxriotActiveChannel;
-                }
-                syncLuxriotSummaryChannelSelect();
-                if (!(String(luxriotActiveChannel) in luxriotCaptureRunningByChannel)) {
-                    luxriotCaptureRunningByChannel[String(luxriotActiveChannel)] = false;
-                }
-                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
-                setLuxriotStatus(`Loaded ${channels.length} channels`);
-            } catch (err) {
-                Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
-                luxriotChannelSelect.innerHTML = '<option value="">Load failed</option>';
-                if (luxriotSummaryChannelSelect) {
-                    luxriotSummaryChannelSelect.innerHTML = '<option value="">Load failed</option>';
-                }
-                updateLuxriotCaptureToggleButton();
-                setLuxriotStatus('Channel load failed: ' + err.message, true);
-            }
-        }
-
-        function getLuxriotChannelLabel(channelId) {
-            if (!Number.isFinite(channelId)) return 'Unknown channel';
-            const known = luxriotChannelNameById[String(channelId)];
-            if (known) return known;
-            if (!luxriotChannelSelect) return `Channel #${channelId}`;
-            const options = Array.from(luxriotChannelSelect.options || []);
-            const match = options.find((opt) => parseInt(opt.value || '', 10) === channelId);
-            if (!match) return `Channel #${channelId}`;
-            const label = String(match.textContent || '').trim();
-            return label || `Channel #${channelId}`;
-        }
-
-        function setLuxriotCaptureRunning(channelId, running) {
-            const parsed = parseInt(String(channelId || ''), 10);
-            if (!Number.isFinite(parsed)) return;
-            luxriotCaptureRunningByChannel[String(parsed)] = Boolean(running);
-        }
-
-        function isLuxriotCaptureRunning(channelId) {
-            const parsed = parseInt(String(channelId || ''), 10);
-            if (!Number.isFinite(parsed)) return false;
-            return Boolean(luxriotCaptureRunningByChannel[String(parsed)]);
-        }
-
-        function updateLuxriotCaptureToggleButton(channelIdOverride = null) {
-            if (!luxriotToggleCaptureBtn) return;
-            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
-            const running = isLuxriotCaptureRunning(channelId);
-            luxriotToggleCaptureBtn.textContent = running ? 'Stop summaries' : 'Start summaries';
-            luxriotToggleCaptureBtn.classList.toggle('primary', !running);
-        }
-
-        function getLuxriotPromptInputByTab(tab) {
-            const normalized = String(tab || '').trim().toLowerCase();
-            if (normalized === 'stream') return luxriotSystemPromptInput;
-            if (normalized === 'l1') return luxriotRollupPromptL1Input;
-            if (normalized === 'l2') return luxriotRollupPromptL2Input;
-            if (normalized === 'l3') return luxriotRollupPromptL3Input;
-            if (normalized === 'json') return luxriotJsonAlertPromptInput;
-            return luxriotSystemPromptInput;
-        }
-
-        function getLuxriotPromptTabLabel(tab) {
-            const normalized = String(tab || '').trim().toLowerCase();
-            if (normalized === 'stream') return 'Stream system prompt';
-            if (normalized === 'l1') return 'L1 rollup prompt';
-            if (normalized === 'l2') return 'L2 rollup prompt';
-            if (normalized === 'l3') return 'L3 rollup prompt';
-            if (normalized === 'json') return 'JSON alert prompt';
-            return 'System prompt';
-        }
-
-        function getLuxriotPromptTabMeta(tab) {
-            const normalized = String(tab || '').trim().toLowerCase();
-            if (normalized === 'stream') {
-                return 'Editing stream system prompt used for live summaries.';
-            }
-            if (normalized === 'l1') {
-                return 'Editing L1 rollup prompt (stored for rollup workflow tuning).';
-            }
-            if (normalized === 'l2') {
-                return 'Editing L2 rollup prompt (stored for rollup workflow tuning).';
-            }
-            if (normalized === 'l3') {
-                return 'Editing L3 rollup prompt (stored for rollup workflow tuning).';
-            }
-            if (normalized === 'json') {
-                return 'Editing optional bookmark JSON block. It should only be emitted when a Task-defined trigger is observed.';
-            }
-            return 'Editing system prompt.';
-        }
-
-        function collectLuxriotPromptSettings() {
-            return {
-                stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
-                rollup_prompts: {
-                    L1: luxriotRollupPromptL1Input ? String(luxriotRollupPromptL1Input.value || '') : '',
-                    L2: luxriotRollupPromptL2Input ? String(luxriotRollupPromptL2Input.value || '') : '',
-                    L3: luxriotRollupPromptL3Input ? String(luxriotRollupPromptL3Input.value || '') : '',
-                },
-                json_alert_prompt: luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '',
-                bookmark_enabled: luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false,
-                bookmark_cooldown_sec: luxriotBookmarkCooldownInput
-                    ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
-                    : 0,
-            };
-        }
-
-        function applyLuxriotPromptSettingsFromPayload(payload) {
-            const settings = payload && typeof payload === 'object' ? payload : {};
-            if (luxriotSystemPromptInput && Object.prototype.hasOwnProperty.call(settings, 'stream_system_prompt')) {
-                luxriotSystemPromptInput.value = String(settings.stream_system_prompt || '');
-            }
-            const rollupPrompts = settings.rollup_prompts && typeof settings.rollup_prompts === 'object'
-                ? settings.rollup_prompts
-                : {};
-            if (luxriotRollupPromptL1Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L1')) {
-                luxriotRollupPromptL1Input.value = String(rollupPrompts.L1 || '');
-            }
-            if (luxriotRollupPromptL2Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L2')) {
-                luxriotRollupPromptL2Input.value = String(rollupPrompts.L2 || '');
-            }
-            if (luxriotRollupPromptL3Input && Object.prototype.hasOwnProperty.call(rollupPrompts, 'L3')) {
-                luxriotRollupPromptL3Input.value = String(rollupPrompts.L3 || '');
-            }
-            if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
-                luxriotJsonAlertPromptInput.value = String(settings.json_alert_prompt || '');
-            }
-            if (luxriotBookmarkEnabledInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_enabled')) {
-                luxriotBookmarkEnabledInput.checked = Boolean(settings.bookmark_enabled);
-            }
-            if (luxriotBookmarkCooldownInput && Object.prototype.hasOwnProperty.call(settings, 'bookmark_cooldown_sec')) {
-                const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
-                luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
-            }
-            const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-            if (luxriotPromptModalInput && activeInput) {
-                luxriotPromptModalInput.value = String(activeInput.value || '');
-            }
-        }
-
-        async function refreshLuxriotPromptSettings(showError = false, channelIdOverride = null) {
-            const channelId = Number.isFinite(channelIdOverride)
-                ? channelIdOverride
-                : getSelectedLuxriotChannel();
-            if (!Number.isFinite(channelId)) {
-                return;
-            }
-            try {
-                const params = new URLSearchParams();
-                params.set('channel_id', String(channelId));
-                const response = await fetch(`/luxriot/prompt_settings?${params.toString()}`);
-                const data = await parseApiJson(response, 'Failed to load prompt settings');
-                applyLuxriotPromptSettingsFromPayload(data);
-            } catch (err) {
-                if (showError) {
-                    setLuxriotStatus(err.message || 'Failed to load prompt settings', true);
-                }
-            }
-        }
-
-        async function persistLuxriotPromptSettings(channelIdOverride = null) {
-            const channelId = Number.isFinite(channelIdOverride)
-                ? channelIdOverride
-                : getSelectedLuxriotChannel();
-            if (!Number.isFinite(channelId)) {
-                throw new Error('Select a channel first');
-            }
-            const payload = collectLuxriotPromptSettings();
-            payload.channel_id = channelId;
-            const response = await fetch('/luxriot/prompt_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const data = await parseApiJson(response, 'Failed to save prompt settings');
-            applyLuxriotPromptSettingsFromPayload(data);
-        }
-
-        function setLuxriotPromptModalTab(tab) {
-            const normalized = String(tab || '').trim().toLowerCase();
-            const previousInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-            if (luxriotPromptModalInput && previousInput) {
-                previousInput.value = luxriotPromptModalInput.value || '';
-            }
-            const tabValue = normalized === 'stream' ? 'stream' : normalized.toUpperCase();
-            luxriotPromptModalTab = tabValue;
-            luxriotPromptTabButtons.forEach((button) => {
-                const buttonTab = String(button.dataset.luxriotPromptTab || '').trim();
-                button.classList.toggle('active', buttonTab.toLowerCase() === String(tabValue).toLowerCase());
-            });
-            if (luxriotPromptModalInput) {
-                const sourceInput = getLuxriotPromptInputByTab(tabValue);
-                luxriotPromptModalInput.value = sourceInput ? String(sourceInput.value || '') : '';
-            }
-            if (luxriotPromptModalMeta) {
-                const channelLabel = getLuxriotChannelLabel(getSelectedLuxriotChannel());
-                luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`;
-            }
-        }
-
-        function openLuxriotPromptModal() {
-            if (!luxriotPromptModal) return;
-            luxriotPromptModal.style.display = 'block';
-            void refreshLuxriotPromptSettings(true);
-            setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
-        }
-
-        function closeLuxriotPromptModal() {
-            if (!luxriotPromptModal) return;
-            luxriotPromptModal.style.display = 'none';
-        }
-
-        async function applyLuxriotPromptModal() {
-            const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-            if (targetInput && luxriotPromptModalInput) {
-                targetInput.value = luxriotPromptModalInput.value || '';
-            }
-            const channelId = getSelectedLuxriotChannel();
-            await persistLuxriotPromptSettings(channelId);
-            setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(channelId)}`);
-        }
-
-        function startLuxriotPreview() {
-            if (!luxriotPreviewImg) return;
-            const channelId = getSelectedLuxriotChannel();
-            if (!channelId) {
-                setLuxriotStatus('Select a channel to preview', true);
-                return;
-            }
-            const refresh = () => {
-                if (luxriotOverlay) {
-                    luxriotOverlay.textContent = 'Loading...';
-                }
-                luxriotPreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
-            };
-            luxriotPreviewImg.onload = () => {
-                if (luxriotOverlay) luxriotOverlay.textContent = '';
-                setLuxriotStatus(`Previewing channel ${channelId}`);
-            };
-            luxriotPreviewImg.onerror = () => {
-                if (luxriotOverlay) luxriotOverlay.textContent = 'Preview failed';
-                setLuxriotStatus('Preview failed', true);
-            };
-            stopLuxriotPreview();
-            refresh();
-            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
-            luxriotPreviewTimer = setInterval(refresh, intervalMs);
-        }
-
-        function luxriotSummaryLogKey(log, idx = 0) {
-            const createdRaw = Number(log?.created_at);
-            const createdKey = Number.isFinite(createdRaw) ? createdRaw.toFixed(6) : `idx-${idx}`;
-            const frameKey = Number(log?.frame_count || 0);
-            const summaryKey = String(log?.summary || '').trim().slice(0, 160);
-            return `${createdKey}|${frameKey}|${summaryKey}`;
-        }
-
-        function isSummaryNearBottom(threshold = 48) {
-            if (!luxriotSummaries) return true;
-            return (luxriotSummaries.scrollTop + luxriotSummaries.clientHeight) >= (luxriotSummaries.scrollHeight - threshold);
-        }
-
-        function scrollSummaryToLatest() {
-            if (!luxriotSummaries) return;
-            luxriotSummaries.scrollTop = luxriotSummaries.scrollHeight;
-        }
-
-        function setLuxriotSummaryMeta(text, isError = false) {
-            if (!luxriotSummaryMeta) return;
-            luxriotSummaryMeta.textContent = text;
-            luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
-        }
-
-        function withSummaryUpdatedMeta(text) {
-            const base = String(text || '').trim();
-            const stamp = new Date().toLocaleTimeString();
-            return `${base} · updated ${stamp}`;
-        }
-
-        function formatSummaryWindowLabel(seconds) {
-            const value = Number(seconds);
-            if (!Number.isFinite(value) || value <= 0) return 'n/a';
-            if (value % 86400 === 0) return `${Math.floor(value / 86400)}d`;
-            if (value % 3600 === 0) return `${Math.floor(value / 3600)}h`;
-            if (value % 60 === 0) return `${Math.floor(value / 60)}m`;
-            return `${Math.floor(value)}s`;
-        }
-
-        function setSummaryRefreshButtonState(state = 'idle') {
-            if (!luxriotRefreshSummariesBtn) return;
-            if (state === 'busy') {
-                luxriotRefreshSummariesBtn.disabled = true;
-                luxriotRefreshSummariesBtn.textContent = '⟳ Refreshing...';
-                return;
-            }
-            if (state === 'queued') {
-                luxriotRefreshSummariesBtn.disabled = true;
-                luxriotRefreshSummariesBtn.textContent = '⟳ Queued...';
-                return;
-            }
-            luxriotRefreshSummariesBtn.disabled = false;
-            luxriotRefreshSummariesBtn.textContent = '⟳ Refresh';
-        }
-
-        function renderLuxriotSummaries(logs, channelId = getSelectedSummaryChannel()) {
-            if (!luxriotSummaries) return;
-            const normalizedLogs = Array.isArray(logs) ? logs.slice() : [];
-            normalizedLogs.sort((a, b) => Number(a?.created_at || 0) - Number(b?.created_at || 0));
-            luxriotSummaryChannelCache[channelId] = normalizedLogs;
-            setSummaryCompactMode(luxriotSummaryCompactMode);
-
-            const prevKeys = Array.isArray(luxriotSummarySeenKeys[channelId]) ? luxriotSummarySeenKeys[channelId] : [];
-            const prevKeySet = new Set(prevKeys);
-            const newKeys = normalizedLogs.map((log, idx) => luxriotSummaryLogKey(log, idx));
-            luxriotSummarySeenKeys[channelId] = newKeys;
-            const newCount = newKeys.reduce((count, key) => count + (prevKeySet.has(key) ? 0 : 1), 0);
-            const shouldStickBottom = luxriotSummaryFollowLive && isSummaryNearBottom();
-            const prevScrollTop = luxriotSummaries.scrollTop;
-            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
-
-            if (!normalizedLogs.length) {
-                luxriotSummaryLogCache = [];
-                luxriotSummaries.innerHTML = '<div class="loading">No summaries yet for this channel.</div>';
-                if (luxriotSummaryFollowLive) {
-                    setSummaryUnread(0);
-                }
-                luxriotSummaries.dataset.hasRender = '1';
-                updateSummaryControlsUI();
-                return;
-            }
-
-            luxriotSummaryLogCache = normalizedLogs;
-            const html = luxriotSummaryLogCache
-                .map((log, idx) => {
-                    const logKey = luxriotSummaryLogKey(log, idx);
-                    const ts = Number(log.created_at) ? new Date(log.created_at * 1000) : null;
-                    const tsLabel = ts ? ts.toLocaleString() : 'n/a';
-                    const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
-                    const modelLabel = String(log.model || '').trim();
-                    const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
-                    const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
-                    const channelLabel = Number.isFinite(rowChannelId)
-                        ? getLuxriotChannelLabel(rowChannelId)
-                        : 'Unknown channel';
-                    const summary = String(log.summary || '').trim();
-                    const summaryParts = splitSummaryAndJson(summary);
-                    const summaryMain = summaryParts.main || summary;
-                    const summaryJson = summaryParts.json;
-                    const canBookmark = summary.length > 0;
-                    const collapsed = isSummaryCollapsed(channelId, logKey);
-                    return `
-                        <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}">
-                            <div class="luxriot-summary-head">
-                                <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}</div>
-                                <div class="luxriot-summary-actions">
-                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
-                                        ${collapsed ? 'Expand' : 'Collapse'}
-                                    </button>
-                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-copy="${idx}" ${canBookmark ? '' : 'disabled'}>
-                                        Copy
-                                    </button>
-                                    <button class="feature-btn luxriot-summary-action-btn" data-luxriot-export="${idx}" ${canBookmark ? '' : 'disabled'}>
-                                        Export
-                                    </button>
-                                    <button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${canBookmark ? '' : 'disabled'}>
-                                        Bookmark
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
-                        </div>
-                    `;
-                })
-                .join('');
-            luxriotSummaries.innerHTML = html;
-
-            if (shouldStickBottom || !hasInitialRender) {
-                scrollSummaryToLatest();
-            } else {
-                luxriotSummaries.scrollTop = prevScrollTop;
-            }
-            luxriotSummaries.dataset.hasRender = '1';
-
-            if (luxriotSummaryFollowLive) {
-                setSummaryUnread(0);
-            } else if (newCount > 0) {
-                setSummaryUnread(luxriotSummaryUnread + newCount);
-            }
-            updateSummaryControlsUI();
-        }
-
-        function formatRollupRange(windowStart, windowEnd) {
-            const start = Number(windowStart);
-            const end = Number(windowEnd);
-            const startLabel = Number.isFinite(start) ? new Date(start * 1000).toLocaleString() : 'n/a';
-            const endLabel = Number.isFinite(end) ? new Date(end * 1000).toLocaleString() : 'n/a';
-            return `${startLabel} -> ${endLabel}`;
-        }
-
-        function formatLuxriotRollupExport(row) {
-            const nl = String.fromCharCode(10);
-            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
-            const level = normalizeSummaryLevel(row?.level || 'L0');
-            const sourceLevel = String(row?.source_level || '').trim() || 'n/a';
-            const rollupId = String(row?.rollup_id || '').trim() || 'n/a';
-            const itemCount = Number(row?.item_count || 0);
-            const frameCount = Number(row?.frame_count || 0);
-            const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
-            const range = formatRollupRange(row?.window_start, row?.window_end);
-            const summary = String(row?.summary || '').trim();
-            const header = [
-                `Channel: ${channelId}`,
-                `Level: ${level}`,
-                `Rollup ID: ${rollupId}`,
-                `Range: ${range}`,
-                `Items: ${itemCount}`,
-                `Frames: ${frameCount}`,
-                `Runs: ${runCount}`,
-                `Source level: ${sourceLevel}`,
-            ].join(nl);
-            return `${header}${nl}${nl}${summary}`;
-        }
-
-        async function copyLuxriotRollupFromRow(rowIndex, triggerBtn = null) {
-            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
-                setLuxriotStatus('Invalid rollup selection', true);
-                return;
-            }
-            const row = luxriotSummaryRollupRows[idx] || {};
-            try {
-                await copyTextToClipboard(formatLuxriotRollupExport(row));
-                setLuxriotStatus('Rollup copied');
-                if (triggerBtn) {
-                    const original = triggerBtn.textContent;
-                    triggerBtn.textContent = 'Copied';
-                    setTimeout(() => {
-                        if (triggerBtn) triggerBtn.textContent = original || 'Copy';
-                    }, 1200);
-                }
-            } catch (_) {
-                setLuxriotStatus('Failed to copy rollup', true);
-            }
-        }
-
-        function exportLuxriotRollupFromRow(rowIndex) {
-            const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) {
-                setLuxriotStatus('Invalid rollup selection', true);
-                return;
-            }
-            const row = luxriotSummaryRollupRows[idx] || {};
-            const level = normalizeSummaryLevel(row?.level || 'L0');
-            const stamp = Number.isFinite(Number(row?.window_start))
-                ? new Date(Number(row.window_start) * 1000).toISOString().replace(/[:]/g, '-')
-                : `entry-${idx + 1}`;
-            const channelId = Number(row?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
-            const filename = `luxriot_rollup_${level.toLowerCase()}_ch${channelId}_${stamp}.txt`;
-            downloadTextFile(filename, formatLuxriotRollupExport(row));
-            setLuxriotStatus(`Exported ${filename}`);
-        }
-
-        function pushSummaryRollupContext(level, sourceIds = null, label = '') {
-            const normalized = normalizeSummaryLevel(level);
-            const ids = Array.isArray(sourceIds)
-                ? sourceIds.map((id) => String(id || '').trim()).filter((id) => id.length > 0)
-                : null;
-            luxriotSummaryRollupStack.push({
-                level: normalized,
-                sourceIds: ids && ids.length ? ids : null,
-                label: String(label || normalized).trim() || normalized,
-            });
-            luxriotSummaryLevel = normalized;
-            if (luxriotSummaryLevelSelect) {
-                luxriotSummaryLevelSelect.value = normalized;
-            }
-        }
-
-        function popSummaryRollupContext() {
-            if (!Array.isArray(luxriotSummaryRollupStack) || luxriotSummaryRollupStack.length <= 1) {
-                return null;
-            }
-            luxriotSummaryRollupStack.pop();
-            const ctx = getCurrentSummaryRollupContext();
-            luxriotSummaryLevel = normalizeSummaryLevel(ctx?.level || 'L0');
-            if (luxriotSummaryLevelSelect) {
-                luxriotSummaryLevelSelect.value = luxriotSummaryLevel;
-            }
-            return ctx;
-        }
-
-        function renderLuxriotRollups(payload, channelId = getSelectedSummaryChannel()) {
-            if (!luxriotSummaries) return 0;
-            const data = payload && typeof payload === 'object' ? payload : {};
-            const levels = data.levels && typeof data.levels === 'object' ? data.levels : {};
-            const prevScrollTop = luxriotSummaries.scrollTop;
-            const hasInitialRender = luxriotSummaries.dataset.hasRender === '1';
-            const shouldStickBottom = isSummaryNearBottom();
-            const ctx = getCurrentSummaryRollupContext();
-            const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
-            const sourceSet = Array.isArray(ctx?.sourceIds) && ctx.sourceIds.length
-                ? new Set(ctx.sourceIds.map((id) => String(id || '').trim()).filter((id) => id))
-                : null;
-            const levelRows = Array.isArray(levels[level]) ? levels[level] : [];
-            const rows = levelRows
-                .filter((row) => {
-                    if (!sourceSet) return true;
-                    const rowId = String(row?.rollup_id || '').trim();
-                    return rowId && sourceSet.has(rowId);
-                })
-                .sort((a, b) => Number(a?.window_start || 0) - Number(b?.window_start || 0));
-
-            luxriotSummaryRollupRows = rows;
-            luxriotSummaryLogCache = [];
-            if (!rows.length) {
-                luxriotSummaries.innerHTML = `<div class="loading">No ${level} rollups available for this selection.</div>`;
-                luxriotSummaries.dataset.hasRender = '1';
-                setSummaryUnread(0);
-                updateSummaryControlsUI();
-                return 0;
-            }
-
-            const html = rows.map((row, idx) => {
-                const rowLevel = normalizeSummaryLevel(row?.level || level);
-                const rollupKey = rollupSummaryKey(row, idx);
-                const collapsed = isSummaryCollapsed(channelId, rollupKey);
-                const rangeLabel = formatRollupRange(row?.window_start, row?.window_end);
-                const rowChannelId = parseInt(String(row?.channel_id ?? channelId), 10);
-                const channelTag = Number.isFinite(rowChannelId) ? `#${rowChannelId}` : '#?';
-                const channelLabel = Number.isFinite(rowChannelId)
-                    ? getLuxriotChannelLabel(rowChannelId)
-                    : 'Unknown channel';
-                const itemCount = Number(row?.item_count || 0);
-                const frameCount = Number(row?.frame_count || 0);
-                const sourceTokens = Number(row?.source_tokens || 0);
-                const runCount = Array.isArray(row?.run_ids) ? row.run_ids.length : 0;
-                const sourceLevel = String(row?.source_level || '').trim();
-                const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
-                const summary = String(row?.summary || '').trim();
-                const summaryParts = splitSummaryAndJson(summary);
-                const summaryMain = summaryParts.main || summary;
-                const summaryJson = summaryParts.json;
-                const canDrill = Boolean(sourceLevel && sourceIds.length > 0);
-                const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
-                const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
-                return `
-                    <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
-                        <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}</div>
-                            <div class="luxriot-summary-actions">
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-export="${idx}">Export</button>
-                                <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
-                            </div>
-                        </div>
-                        <div class="summary-body">${renderMarkdown(summaryMain)}${summaryJson ? `<div class="summary-json-muted">${renderMarkdown(summaryJson)}</div>` : ''}</div>
-                    </div>
-                `;
-            }).join('');
-
-            luxriotSummaries.innerHTML = html;
-            if (shouldStickBottom || !hasInitialRender) {
-                scrollSummaryToLatest();
-            } else {
-                luxriotSummaries.scrollTop = prevScrollTop;
-            }
-            luxriotSummaries.dataset.hasRender = '1';
-            setSummaryUnread(0);
-            updateSummaryControlsUI();
-            return rows.length;
-        }
-
-        async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
-            if (!channelId) return;
-            if (!luxriotSummaryAutoRefresh && !force) return;
-            try {
-                const params = buildSummaryQueryParams(channelId);
-                params.set('level_limit', '240');
-                const resp = await fetch(`/luxriot/rollups?${params.toString()}`);
-                const data = await resp.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                syncSummaryRunSelectOptions(data.runs, data.selected_run);
-                syncSummaryFiltersFromResponse(data);
-                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
-                if (
-                    allowRunFallback
-                    && !Boolean(data.running)
-                    && (selectedRun === 'live' || selectedRun === 'latest')
-                ) {
-                    luxriotSummaryRunFilter = 'all';
-                    if (luxriotSummaryRunSelect) {
-                        luxriotSummaryRunSelect.value = 'all';
-                    }
-                    refreshLuxriotSummaryView(channelId, true, false);
-                    return;
-                }
-                luxriotSummaryRollupCache[channelId] = data;
-                const renderedCount = renderLuxriotRollups(data, channelId);
-                const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
-                const ctx = getCurrentSummaryRollupContext();
-                const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
-                const drillLabel = ctx?.sourceIds ? ` · drill ${ctx.sourceIds.length}` : '';
-                const runLabel = luxriotSummaryRunFilter || 'latest';
-                const countsLabel = `L1 ${Number(counts.L1 || 0)} · L2 ${Number(counts.L2 || 0)} · L3 ${Number(counts.L3 || 0)}`;
-                const pendingCount = luxriotSummaryRollupRows
-                    .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
-                    .length;
-                const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
-                const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
-                const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
-                const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
-                const channelLabel = getLuxriotChannelLabel(channelId);
-                setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
-                setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
-            } catch (err) {
-                setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
-                setLuxriotStatus('Failed to fetch rollups: ' + err.message, true);
-            }
-        }
-
-        async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
-            if (!channelId) return;
-            if (luxriotSummaryRefreshInFlight) {
-                const next = luxriotSummaryRefreshQueued || {};
-                luxriotSummaryRefreshQueued = {
-                    channelId,
-                    force: Boolean(force || next.force),
-                    allowRunFallback: Boolean((allowRunFallback !== false) || (next.allowRunFallback !== false)),
-                };
-                if (force) {
-                    setLuxriotStatus('Refresh queued...');
-                }
-                return false;
-            }
-            luxriotSummaryRefreshInFlight = true;
-            try {
-                if (isRollupViewActive()) {
-                    await refreshLuxriotRollups(channelId, force, allowRunFallback);
-                } else {
-                    await refreshLuxriotSummaries(channelId, force, allowRunFallback);
-                }
-                return true;
-            } finally {
-                luxriotSummaryRefreshInFlight = false;
-                if (luxriotSummaryRefreshQueued) {
-                    const next = luxriotSummaryRefreshQueued;
-                    luxriotSummaryRefreshQueued = null;
-                    void refreshLuxriotSummaryView(
-                        next.channelId || getSelectedSummaryChannel(),
-                        Boolean(next.force),
-                        next.allowRunFallback !== false,
-                    );
-                }
-            }
-        }
-
-        function updateProbeChannelRuntime(payload, rerender = false) {
-            const data = payload && typeof payload === 'object' ? payload : {};
-            const pausedChannels = new Set(
-                (Array.isArray(data.paused_analytics_channels) ? data.paused_analytics_channels : [])
-                    .map((val) => parseInt(String(val), 10))
-                    .filter((val) => Number.isFinite(val))
-            );
-            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
-            const nextState = {};
-            analyticsStreams.forEach((stream) => {
-                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                if (!Number.isFinite(channelId)) return;
-                if (stream?.running) {
-                    nextState[channelId] = 'running';
-                } else if (pausedChannels.has(channelId)) {
-                    nextState[channelId] = 'paused';
-                } else {
-                    nextState[channelId] = 'idle';
-                }
-            });
-            pausedChannels.forEach((channelId) => {
-                if (!(channelId in nextState)) {
-                    nextState[channelId] = 'paused';
-                }
-            });
-            Object.keys(probeChannelRuntime).forEach((channelId) => {
-                delete probeChannelRuntime[channelId];
-            });
-            Object.assign(probeChannelRuntime, nextState);
-            Object.keys(probeCaptureState).forEach((channelId) => {
-                delete probeCaptureState[channelId];
-            });
-            Object.entries(probeChannelRuntime).forEach(([channelId, state]) => {
-                if (state === 'running') {
-                    probeCaptureState[channelId] = true;
-                    delete probeCaptureManualStop[channelId];
-                }
-            });
-            updateProbeCaptureMeta(getSelectedProbeChannelId());
-            syncProbePreview(getSelectedProbeChannelId());
-            if (rerender) {
-                renderProbeCards();
-            }
-        }
-
-        async function refreshProbeRuntimeState(rerender = false) {
-            try {
-                const resp = await fetch('/luxriot/streams');
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || 'Failed to fetch runtime stream state');
-                }
-                updateProbeChannelRuntime(data, rerender);
-            } catch (_) {
-                // Keep previous runtime snapshot when stream endpoint is unavailable.
-            }
-        }
-
-        function renderLuxriotStreams(payload, probes = probeCatalog) {
-            if (!luxriotStreams) return;
-            const data = payload && typeof payload === 'object' ? payload : {};
-            const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
-            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
-            const pausedChannels = new Set(
-                (Array.isArray(data.paused_analytics_channels) ? data.paused_analytics_channels : [])
-                    .map((val) => parseInt(String(val), 10))
-                    .filter((val) => Number.isFinite(val))
-            );
-            const historyChannels = new Set(
-                (Array.isArray(data.video_history_channels) ? data.video_history_channels : [])
-                    .map((val) => parseInt(String(val), 10))
-                    .filter((val) => Number.isFinite(val))
-            );
-            updateProbeChannelRuntime(data, probeList.length > 0);
-            luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
-            const sortedVideo = videoStreams
-                .slice()
-                .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
-            const sortedAnalytics = analyticsStreams
-                .slice()
-                .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
-            const videoByChannel = new Map();
-            sortedVideo.forEach((stream) => {
-                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                if (!Number.isFinite(channelId)) return;
-                videoByChannel.set(channelId, stream);
-            });
-            const analyticsByChannel = new Map();
-            sortedAnalytics.forEach((stream) => {
-                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                if (!Number.isFinite(channelId)) return;
-                analyticsByChannel.set(channelId, stream);
-            });
-            const probeStatsByChannel = new Map();
-            (Array.isArray(probes) ? probes : []).forEach((probe) => {
-                const channelId = parseInt(String(probe?.channel_id ?? ''), 10);
-                if (!Number.isFinite(channelId)) return;
-                if (!probeStatsByChannel.has(channelId)) {
-                    probeStatsByChannel.set(channelId, { total: 0, enabled: 0, disabled: 0 });
-                }
-                const stats = probeStatsByChannel.get(channelId);
-                stats.total += 1;
-                if (probe?.enabled === false) stats.disabled += 1;
-                else stats.enabled += 1;
-            });
-            const channelIds = new Set();
-            sortedVideo.forEach((stream) => {
-                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                if (Number.isFinite(channelId)) channelIds.add(channelId);
-            });
-            sortedAnalytics.forEach((stream) => {
-                const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                if (Number.isFinite(channelId)) channelIds.add(channelId);
-            });
-            pausedChannels.forEach((channelId) => channelIds.add(channelId));
-            historyChannels.forEach((channelId) => channelIds.add(channelId));
-            probeStatsByChannel.forEach((_, channelId) => channelIds.add(channelId));
-            if (!channelIds.size) {
-                luxriotStreams.innerHTML = '<div class="loading">No active channels.</div>';
-                return;
-            }
-            const rows = Array.from(channelIds)
-                .sort((a, b) => a - b)
-                .map((channelId) => {
-                    const video = videoByChannel.get(channelId) || null;
-                    const analytics = analyticsByChannel.get(channelId) || null;
-                    const stats = probeStatsByChannel.get(channelId) || { total: 0, enabled: 0, disabled: 0 };
-                    const hasProbes = stats.total > 0;
-                    const enabledCount = stats.enabled || 0;
-                    const isVideoRunning = Boolean(video?.running);
-                    const isProbeRunning = Boolean(analytics?.running);
-                    const isProbePaused = pausedChannels.has(channelId);
-                    const hasVideoHistory = historyChannels.has(channelId);
-
-                    const videoParts = [];
-                    if (isVideoRunning) {
-                        const batch = Number(video?.batch_size) || 0;
-                        const queued = Number(video?.pending_frames) || 0;
-                        const flushes = Number(video?.flush_count) || 0;
-                        if (batch > 0) videoParts.push(`batch ${batch}`);
-                        videoParts.push(`${queued} queued`);
-                        if (flushes > 0) videoParts.push(`${flushes} flushes`);
-                        if (video?.last_error) videoParts.push('error');
-                    }
-                    const videoLine = isVideoRunning
-                        ? `Video summaries: active${videoParts.length ? ` · ${videoParts.join(' · ')}` : ''}`
-                        : hasVideoHistory
-                            ? 'Video summaries: stopped · history available'
-                            : 'Video summaries: idle';
-
-                    const probeParts = [];
-                    if (isProbeRunning) {
-                        const queued = Number(analytics?.pending_frames) || 0;
-                        const intervalSec = Number(analytics?.interval_sec);
-                        const fpsLabel = Number.isFinite(intervalSec) && intervalSec > 0 ? `${(1 / intervalSec).toFixed(2)} fps` : 'n/a fps';
-                        probeParts.push(fpsLabel, `${queued} buffered`);
-                        if (analytics?.last_error) probeParts.push('error');
-                    }
-                    const probeLine = isProbeRunning
-                        ? `Probe capture: active${probeParts.length ? ` · ${probeParts.join(' · ')}` : ''}`
-                        : isProbePaused
-                            ? 'Probe capture: paused'
-                            : enabledCount > 0
-                                ? 'Probe capture: idle'
-                                : hasProbes
-                                    ? 'Probe capture: all probes disabled'
-                                    : 'Probe capture: no probes configured';
-
-                    const probesLine = hasProbes
-                        ? `${stats.total} probes · ${enabledCount} enabled${stats.disabled ? ` · ${stats.disabled} disabled` : ''}`
-                        : 'No probes configured';
-                    const videoTag = isVideoRunning
-                        ? '<span class="luxriot-stream-tag">video active</span>'
-                        : '<span class="luxriot-stream-tag idle">video idle</span>';
-                    const probeTag = isProbeRunning
-                        ? '<span class="luxriot-stream-tag">probes active</span>'
-                        : isProbePaused
-                            ? '<span class="luxriot-stream-tag paused">probes paused</span>'
-                            : enabledCount > 0
-                                ? '<span class="luxriot-stream-tag idle">probes idle</span>'
-                                : hasProbes
-                                    ? '<span class="luxriot-stream-tag idle">probes disabled</span>'
-                                    : '<span class="luxriot-stream-tag idle">no probes</span>';
-                    const pauseLabel = isProbePaused ? 'Resume probes' : 'Pause probes';
-                    const pauseAction = isProbePaused ? 'resume' : 'pause';
-                    const canPauseProbes = !isProbePaused && (isProbeRunning || enabledCount > 0);
-                    const canResumeProbes = isProbePaused;
-                    const canProbeAction = canPauseProbes || canResumeProbes;
-                    const canStopAll = isVideoRunning || isProbeRunning;
-                    const channelLabel = getLuxriotChannelLabel(channelId);
-                    return `
-                        <div class="luxriot-stream-item">
-                            <div class="luxriot-stream-head">
-                                <div class="luxriot-stream-title-wrap">
-                                    <div class="luxriot-stream-kind">Channel</div>
-                                    <div class="luxriot-stream-title">${escapeHtml(channelLabel)}</div>
-                                </div>
-                                <div class="luxriot-stream-tags">${videoTag} ${probeTag}</div>
-                            </div>
-                            <div class="luxriot-stream-stats">
-                                <span class="luxriot-stream-stat">${escapeHtml(probesLine)}</span>
-                                <span class="luxriot-stream-stat">${escapeHtml(videoLine)}</span>
-                                <span class="luxriot-stream-stat">${escapeHtml(probeLine)}</span>
-                            </div>
-                            <div class="luxriot-stream-controls">
-                                <button class="feature-btn" data-summary-channel="${channelId}" title="Open this channel in summaries panel">View summaries</button>
-                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="analytics" data-stream-action="${pauseAction}" ${canProbeAction ? '' : 'disabled'}>${pauseLabel}</button>
-                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="video" ${isVideoRunning ? '' : 'disabled'}>Stop video</button>
-                                <button class="feature-btn" data-stream-stop="${channelId}" data-stream-type="both" ${canStopAll ? '' : 'disabled'}>Stop all</button>
-                            </div>
-                        </div>
-                    `;
-                });
-            luxriotStreams.innerHTML = rows.join('');
-        }
-
-        async function refreshLuxriotStreams() {
-            if (!luxriotStreams) return;
-            try {
-                const resp = await fetch('/luxriot/streams');
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || 'Failed to fetch stream state');
-                }
-                const nextCaptureState = {};
-                const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
-                videoStreams.forEach((stream) => {
-                    const channelId = parseInt(String(stream?.channel_id ?? ''), 10);
-                    if (!Number.isFinite(channelId)) return;
-                    nextCaptureState[String(channelId)] = Boolean(stream?.running);
-                });
-                Object.keys(luxriotCaptureRunningByChannel).forEach((key) => {
-                    delete luxriotCaptureRunningByChannel[key];
-                });
-                Object.assign(luxriotCaptureRunningByChannel, nextCaptureState);
-                const selectedChannelId = getSelectedLuxriotChannel();
-                if (!(String(selectedChannelId) in luxriotCaptureRunningByChannel)) {
-                    luxriotCaptureRunningByChannel[String(selectedChannelId)] = false;
-                }
-                updateLuxriotCaptureToggleButton(selectedChannelId);
-                try {
-                    const probesResp = await fetch('/probes/list');
-                    const probesData = await probesResp.json();
-                    if (probesResp.ok && !probesData.error && Array.isArray(probesData.probes)) {
-                        probeCatalog = probesData.probes;
-                    }
-                } catch (_) {
-                    // Keep previous probe catalog if probe listing fails.
-                }
-                renderLuxriotStreams(data, probeCatalog);
-            } catch (err) {
-                luxriotStreams.innerHTML = `<div class="loading">Stream state unavailable: ${escapeHtml(err.message || 'Unknown error')}</div>`;
-            }
-        }
-
-        function guessProbeCaptureFps(channelId) {
-            const targetChannel = parseInt(String(channelId || ''), 10);
-            if (!Number.isFinite(targetChannel)) return 0;
-            const fpsValues = (Array.isArray(probeCatalog) ? probeCatalog : [])
-                .filter((probe) => parseInt(String(probe?.channel_id ?? ''), 10) === targetChannel)
-                .map((probe) => Number.parseFloat(String(probe?.fps ?? '')))
-                .filter((fps) => Number.isFinite(fps) && fps > 0);
-            if (!fpsValues.length) return 0;
-            return Math.max(...fpsValues);
-        }
-
-        async function resumeLuxriotProbeCapture(channelId) {
-            const parsedChannelId = parseInt(String(channelId || ''), 10);
-            if (!Number.isFinite(parsedChannelId)) {
-                setLuxriotStatus('Invalid channel id for probe resume', true);
-                return;
-            }
-            const fps = guessProbeCaptureFps(parsedChannelId);
-            setLuxriotStatus(`Resuming probe capture on channel ${parsedChannelId}...`);
-            try {
-                const response = await fetch('/probes/start_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: parsedChannelId,
-                        fps,
-                        clear_pause: true,
-                    }),
-                });
-                await parseApiJson(response, 'Probe resume failed');
-                await refreshLuxriotStreams();
-                await refreshProbeStatus(parsedChannelId);
-                setLuxriotStatus(`Probe capture resumed on channel ${parsedChannelId}`);
-            } catch (err) {
-                setLuxriotStatus(err.message || 'Failed to resume probe capture', true);
-            }
-        }
-
-        async function stopLuxriotStream(channelId, streamType) {
-            const parsedChannelId = parseInt(String(channelId || ''), 10);
-            const normalizedType = String(streamType || '').trim().toLowerCase();
-            if (!Number.isFinite(parsedChannelId)) {
-                setLuxriotStatus('Invalid channel id for stream stop', true);
-                return;
-            }
-            if (!['video', 'analytics', 'both'].includes(normalizedType)) {
-                setLuxriotStatus('Invalid stream type', true);
-                return;
-            }
-            const actionLabel = normalizedType === 'analytics'
-                ? 'Pausing probe capture'
-                : normalizedType === 'video'
-                    ? 'Stopping video summaries'
-                    : 'Stopping video and pausing probes';
-            setLuxriotStatus(`${actionLabel} on channel ${parsedChannelId}...`);
-            try {
-                const response = await fetch('/luxriot/streams/stop', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: parsedChannelId,
-                        stream_type: normalizedType,
-                        pause_analytics: true,
-                    }),
-                });
-                await parseApiJson(response, 'Stream stop failed');
-                await refreshLuxriotStreams();
-                if (normalizedType === 'video' || normalizedType === 'both') {
-                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                }
-                if (normalizedType === 'analytics' || normalizedType === 'both') {
-                    await refreshProbeStatus(parsedChannelId);
-                }
-                const doneLabel = normalizedType === 'analytics'
-                    ? 'Probe capture paused'
-                    : normalizedType === 'video'
-                        ? 'Video summaries stopped'
-                        : 'Video summaries stopped, probes paused';
-                setLuxriotStatus(`${doneLabel} on channel ${parsedChannelId}`);
-            } catch (err) {
-                setLuxriotStatus(err.message || 'Failed to stop stream', true);
-            }
-        }
-
-        async function stopAllLuxriotStreams(streamType) {
-            const normalizedType = String(streamType || '').trim().toLowerCase();
-            const stopVideo = normalizedType === 'video' || normalizedType === 'both';
-            const stopAnalytics = normalizedType === 'analytics' || normalizedType === 'both';
-            if (!stopVideo && !stopAnalytics) return;
-            const actionLabel = stopVideo && stopAnalytics
-                ? 'Stopping video summaries and pausing probes'
-                : stopVideo
-                    ? 'Stopping all video summaries'
-                    : 'Pausing all probe capture streams';
-            setLuxriotStatus(`${actionLabel}...`);
-            try {
-                const response = await fetch('/luxriot/streams/stop_all', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        stop_video: stopVideo,
-                        stop_analytics: stopAnalytics,
-                        pause_analytics: true,
-                    }),
-                });
-                await parseApiJson(response, 'Stop-all failed');
-                await refreshLuxriotStreams();
-                if (stopVideo) {
-                    stopLuxriotSummaryPoll();
-                    await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                }
-                if (stopAnalytics) {
-                    await refreshProbeStatus();
-                }
-                const doneLabel = stopVideo && stopAnalytics
-                    ? 'Stopped video summaries and paused probes'
-                    : stopVideo
-                        ? 'Stopped all video summaries'
-                        : 'Paused all probe capture streams';
-                setLuxriotStatus(doneLabel);
-            } catch (err) {
-                setLuxriotStatus(err.message || 'Failed to stop streams', true);
-            }
-        }
-
-        async function sendLuxriotBookmarkFromLog(logIndex, triggerBtn = null) {
-            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
-                setLuxriotStatus('Invalid summary selection', true);
-                return;
-            }
-            const log = luxriotSummaryLogCache[idx] || {};
-            const summaryText = String(log.summary || '').trim();
-            if (!summaryText) {
-                setLuxriotStatus('No summary text to bookmark', true);
-                return;
-            }
-            const channelId = Number(log.channel_id) || getSelectedLuxriotChannel() || luxriotDefaults.channelId;
-            const firstLine = summaryText.split(/\\r?\\n/, 1)[0].trim();
-            const titleBase = firstLine || `Channel ${channelId} summary`;
-            const title = titleBase.length > 80 ? `${titleBase.slice(0, 77)}...` : titleBase;
-            const description = summaryText.length > 2400 ? `${summaryText.slice(0, 2397)}...` : summaryText;
-            const createdAtSec = Number(log.created_at);
-            const timestampMs = Number.isFinite(createdAtSec) ? Math.round(createdAtSec * 1000) : null;
-
-            const button = triggerBtn;
-            const originalLabel = button ? button.textContent : '';
-            if (button) {
-                button.disabled = true;
-                button.textContent = 'Saving...';
-            }
-
-            try {
-                const response = await fetch('/luxriot/bookmark', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: channelId,
-                        title: `Live summary: ${title}`,
-                        description,
-                        severity: 'normal',
-                        state: 'new',
-                        timestamp_ms: timestampMs
-                    }),
-                });
-                await parseApiJson(response, 'Bookmark failed');
-                setLuxriotStatus(`Bookmark sent for channel ${channelId}`);
-                if (button) {
-                    button.textContent = 'Bookmarked';
-                }
-            } catch (err) {
-                setLuxriotStatus(err.message || 'Bookmark failed', true);
-                if (button) {
-                    button.textContent = originalLabel || 'Bookmark';
-                }
-            } finally {
-                if (button) {
-                    button.disabled = false;
-                }
-            }
-        }
-
-        function formatLuxriotSummaryExport(log) {
-            const createdRaw = Number(log?.created_at);
-            const ts = Number.isFinite(createdRaw) ? new Date(createdRaw * 1000) : null;
-            const tsLabel = ts ? ts.toISOString() : 'n/a';
-            const channelId = Number(log?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
-            const frameCount = Number(log?.frame_count || 0);
-            const model = String(log?.model || '').trim();
-            const summary = String(log?.summary || '').trim();
-            const nl = String.fromCharCode(10);
-            const header = [
-                `Channel: ${channelId}`,
-                `Timestamp: ${tsLabel}`,
-                `Frames: ${frameCount || 'n/a'}`,
-                `Model: ${model || 'n/a'}`,
-            ].join(nl);
-            return `${header}${nl}${nl}${summary}`;
-        }
-
-        async function copyLuxriotSummaryFromLog(logIndex, triggerBtn = null) {
-            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
-                setLuxriotStatus('Invalid summary selection', true);
-                return;
-            }
-            const log = luxriotSummaryLogCache[idx] || {};
-            const summary = String(log.summary || '').trim();
-            if (!summary) {
-                setLuxriotStatus('Summary is empty', true);
-                return;
-            }
-            try {
-                await copyTextToClipboard(formatLuxriotSummaryExport(log));
-                setLuxriotStatus('Summary copied');
-                if (triggerBtn) {
-                    const original = triggerBtn.textContent;
-                    triggerBtn.textContent = 'Copied';
-                    setTimeout(() => {
-                        if (triggerBtn) triggerBtn.textContent = original || 'Copy';
-                    }, 1200);
-                }
-            } catch (err) {
-                setLuxriotStatus('Failed to copy summary', true);
-            }
-        }
-
-        function exportLuxriotSummaryFromLog(logIndex) {
-            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
-                setLuxriotStatus('Invalid summary selection', true);
-                return;
-            }
-            const log = luxriotSummaryLogCache[idx] || {};
-            const createdRaw = Number(log?.created_at);
-            const stamp = Number.isFinite(createdRaw)
-                ? new Date(createdRaw * 1000).toISOString().replace(/[:]/g, '-')
-                : `entry-${idx + 1}`;
-            const channelId = Number(log?.channel_id) || getSelectedSummaryChannel() || luxriotDefaults.channelId;
-            const filename = `luxriot_summary_ch${channelId}_${stamp}.txt`;
-            downloadTextFile(filename, formatLuxriotSummaryExport(log));
-            setLuxriotStatus(`Exported ${filename}`);
-        }
-
-        function toggleLuxriotSummaryCollapse(logIndex) {
-            const idx = Number.isFinite(logIndex) ? logIndex : parseInt(String(logIndex || ''), 10);
-            if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) {
-                return;
-            }
-            const channelId = getSelectedSummaryChannel();
-            const log = luxriotSummaryLogCache[idx] || {};
-            const key = luxriotSummaryLogKey(log, idx);
-            const nextState = !isSummaryCollapsed(channelId, key);
-            setSummaryCollapsed(channelId, key, nextState);
-            renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
-        }
-
-        async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
-            if (!channelId) return;
-            if (!luxriotSummaryAutoRefresh && !force) return;
-            try {
-                const params = buildSummaryQueryParams(channelId);
-                params.set('limit', '240');
-                const resp = await fetch(`/luxriot/session?${params.toString()}`);
-                const data = await resp.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                syncSummaryRunSelectOptions(data.runs, data.selected_run);
-                syncSummaryFiltersFromResponse(data);
-                const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
-                if (
-                    allowRunFallback
-                    && !Boolean(data.running)
-                    && (selectedRun === 'live' || selectedRun === 'latest')
-                ) {
-                    luxriotSummaryRunFilter = 'all';
-                    if (luxriotSummaryRunSelect) {
-                        luxriotSummaryRunSelect.value = 'all';
-                    }
-                    refreshLuxriotSummaryView(channelId, true, false);
-                    return;
-                }
-                renderLuxriotSummaries(data.logs || [], channelId);
-                setLuxriotCaptureRunning(channelId, Boolean(data.running));
-                if (channelId === getSelectedLuxriotChannel()) {
-                    updateLuxriotCaptureToggleButton(channelId);
-                }
-                const historyCount = Number(data.archived_log_count || 0);
-                const totalCount = Array.isArray(data.logs) ? data.logs.length : 0;
-                const stateLabel = data.running ? 'live' : 'stopped';
-                const channelLabel = getLuxriotChannelLabel(channelId);
-                const detailParts = [channelLabel, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
-                if (historyCount > 0) detailParts.push(`hist ${historyCount}`);
-                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) detailParts.push(`q ${data.pending_frames}`);
-                if (data.last_error) detailParts.push('err');
-                setLuxriotSummaryMeta(withSummaryUpdatedMeta(detailParts.join(' · ')), Boolean(data.last_error));
-                let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
-                if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
-                    baseStatus += ` · ${data.pending_frames} frames queued`;
-                }
-                setLuxriotStatus(baseStatus, Boolean(data.last_error));
-                if (data.last_error) {
-                    luxriotStatusLabel.title = data.last_error;
-                }
-            } catch (err) {
-                setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
-                setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
-            }
-        }
-
-        function startLuxriotSummaryPoll() {
-            stopLuxriotSummaryPoll();
-            luxriotSummaryTimer = setInterval(() => {
-                const channelId = getSelectedSummaryChannel();
-                refreshLuxriotSummaryView(channelId);
-                refreshLuxriotStreams();
-            }, 8000);
-        }
-
-        async function startLuxriotCapture(channelIdOverride = null) {
-            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
-            if (!channelId) {
-                setLuxriotStatus('Select a channel first', true);
-                return;
-            }
-            await refreshLuxriotPromptSettings(false, channelId);
-            const batchSize = luxriotBatchSizeSelect
-                ? parseInt(luxriotBatchSizeSelect.value, 10)
-                : luxriotDefaults.batchSize || 12;
-            const prompt = luxriotPromptInput ? luxriotPromptInput.value.trim() : '';
-            const systemPrompt = luxriotSystemPromptInput ? luxriotSystemPromptInput.value.trim() : '';
-            const fallbackPrompt = videoPromptInput ? videoPromptInput.value.trim() : '';
-            if (luxriotToggleCaptureBtn) {
-                luxriotToggleCaptureBtn.disabled = true;
-            }
-            setLuxriotStatus('Starting summaries...');
-            try {
-                const resp = await fetch('/luxriot/start_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: channelId,
-                        batch_size: batchSize,
-                        prompt: prompt || fallbackPrompt,
-                        model: videoModelInput ? videoModelInput.value.trim() : '',
-                        system_prompt: systemPrompt
-                    })
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || 'Luxriot start failed');
-                }
-                setLuxriotCaptureRunning(channelId, true);
-                updateLuxriotCaptureToggleButton(channelId);
-                setLuxriotStatus(`Summaries running on channel ${channelId} (batch ${batchSize})`);
-                luxriotSummaryChannel = channelId;
-                luxriotSummaryFollowLive = true;
-                syncLuxriotSummaryChannelSelect();
-                updateSummaryControlsUI();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(channelId, true);
-                refreshLuxriotStreams();
-                startLuxriotSummaryPoll();
-            } catch (err) {
-                setLuxriotStatus(err.message, true);
-            } finally {
-                if (luxriotToggleCaptureBtn) {
-                    luxriotToggleCaptureBtn.disabled = false;
-                }
-            }
-        }
-
-        async function stopLuxriotCapture(channelIdOverride = null) {
-            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedLuxriotChannel();
-            if (luxriotToggleCaptureBtn) {
-                luxriotToggleCaptureBtn.disabled = true;
-            }
-            setLuxriotStatus('Stopping...');
-            try {
-                const resp = await fetch('/luxriot/stop_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId })
-                });
-                const data = await resp.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                setLuxriotCaptureRunning(channelId, false);
-                updateLuxriotCaptureToggleButton(channelId);
-                setLuxriotStatus('Summaries stopped');
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                refreshLuxriotStreams();
-            } catch (err) {
-                setLuxriotStatus(err.message, true);
-            } finally {
-                if (luxriotToggleCaptureBtn) {
-                    luxriotToggleCaptureBtn.disabled = false;
-                }
-            }
-        }
-
-        async function toggleLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
-            if (!channelId) {
-                setLuxriotStatus('Select a channel first', true);
-                return;
-            }
-            if (isLuxriotCaptureRunning(channelId)) {
-                await stopLuxriotCapture(channelId);
-            } else {
-                await startLuxriotCapture(channelId);
-            }
-        }
-
-        async function flushLuxriotCapture() {
-            const channelId = getSelectedLuxriotChannel();
-            setLuxriotStatus('Flushing...');
-            try {
-                const resp = await fetch('/luxriot/flush_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ channel_id: channelId })
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || data.message || 'Flush failed');
-                }
-                setLuxriotStatus('Buffer flushed');
-                if (data.status) {
-                    if (getSelectedSummaryChannel() === channelId) {
-                        if (isRollupViewActive()) {
-                            await refreshLuxriotSummaryView(channelId, true);
-                        } else {
-                            renderLuxriotSummaries(data.status.logs || [], channelId);
-                        }
-                    }
-                }
-                refreshLuxriotStreams();
-            } catch (err) {
-                setLuxriotStatus(err.message, true);
-            }
-        }
-
-        async function ensureLuxriotInit() {
-            if (luxriotInitialized) return;
-            luxriotInitialized = true;
-            await fetchLuxriotChannels();
-            await refreshLuxriotPromptSettings();
-            updateLuxriotCaptureToggleButton(getSelectedLuxriotChannel());
-            updateSummaryControlsUI();
-            setSummaryUnread(0);
-            syncLuxriotSummaryChannelSelect();
-            startLuxriotPreview();
-            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            refreshLuxriotStreams();
-            startLuxriotSummaryPoll();
-        }
-
-        const savedVideoPrompt = localStorage.getItem('evs_video_prompt');
-        if (savedVideoPrompt && videoPromptInput) {
-            videoPromptInput.value = savedVideoPrompt;
-            if (saveVideoPromptInput) {
-                saveVideoPromptInput.checked = true;
-            }
-        }
-        if (luxriotPromptInput && videoPromptInput && videoPromptInput.value && !luxriotPromptInput.value) {
-            luxriotPromptInput.value = videoPromptInput.value;
-        }
-        updateLuxriotBatchInfo();
-        setLuxriotPromptModalTab('stream');
-        updateLuxriotCaptureToggleButton(luxriotActiveChannel);
-        function syncProbeChannelSelect() {
-            if (probeChannelSelect && luxriotChannelSelect && luxriotChannelSelect.innerHTML) {
-                probeChannelSelect.innerHTML = luxriotChannelSelect.innerHTML;
-                probeChannelSelect.value = luxriotChannelSelect.value || luxriotDefaults.channelId;
-            }
-        }
-        syncProbeChannelSelect();
-        syncSummaryRunSelectOptions([], luxriotSummaryRunFilter);
-        applySummaryFiltersFromInputs();
-        setSummaryBaseLevel(luxriotSummaryLevel);
-
-        setMode(currentMode);
-        
-        // Settings modal elements
-        const authTokenBtn = document.getElementById('authTokenBtn');
-        const settingsBtn = document.getElementById('settingsBtn');
-        const settingsModal = document.getElementById('settingsModal');
-        const closeSettingsBtn = document.getElementById('closeSettings');
-        const saveSettingsBtn = document.getElementById('saveSettings');
-        const resetSettingsBtn = document.getElementById('resetSettings');
-        const settingsStatus = document.getElementById('settingsStatus');
-        const envEditorInput = document.getElementById('envEditor');
-        const reloadEnvBtn = document.getElementById('reloadEnvBtn');
-        const saveEnvBtn = document.getElementById('saveEnvBtn');
-        const thumbnailQualitySlider = document.getElementById('thumbnailQuality');
-        const qualityValue = document.getElementById('qualityValue');
-        const embedderSelect = document.getElementById('embedder');
-        const fusionEnabledInput = document.getElementById('fusionEnabled');
-        const fusionAlphaInput = document.getElementById('fusionAlpha');
-        const fusionAlphaValue = document.getElementById('fusionAlphaValue');
-        const dinoModelInput = document.getElementById('dinoModel');
-        const dinoEmbedDimInput = document.getElementById('dinoEmbedDim');
-        const dinoWeightsInput = document.getElementById('dinoWeightsPath');
-        const indexModeSelect = document.getElementById('indexMode');
-        const rerankEnabledInput = document.getElementById('rerankEnabled');
-        const rerankTopKInput = document.getElementById('rerankTopK');
-        const segmentsEnabledInput = document.getElementById('segmentsEnabled');
-        const segmentMinPatchesInput = document.getElementById('segmentMinPatches');
-        const segmentThresholdSlider = document.getElementById('segmentThresholdSlider');
-        const segmentThresholdValueEl = document.getElementById('segmentThresholdValue');
-        const segmentThresholdControl = document.getElementById('segmentThresholdControl');
-        const luxriotBaseUrlInput = document.getElementById('luxriotBaseUrl');
-        const luxriotUsernameInput = document.getElementById('luxriotUsername');
-        const luxriotPasswordInput = document.getElementById('luxriotPassword');
-        const luxriotDefaultChannelIdInput = document.getElementById('luxriotDefaultChannelId');
-        const luxriotSnapshotIntervalInput = document.getElementById('luxriotSnapshotInterval');
-        const luxriotSnapshotMaxEdgeInput = document.getElementById('luxriotSnapshotMaxEdge');
-        const luxriotMaxBufferFramesInput = document.getElementById('luxriotMaxBufferFrames');
-        const luxriotAutoBookmarksInput = document.getElementById('luxriotAutoBookmarks');
-        const probeBookmarkCooldownSecInput = document.getElementById('probeBookmarkCooldownSec');
-        const probeBookmarkDedupeWindowSecInput = document.getElementById('probeBookmarkDedupeWindowSec');
-        const probeBookmarkSimHighInput = document.getElementById('probeBookmarkSimHigh');
-        const probeBookmarkMarginDeltaInput = document.getElementById('probeBookmarkMarginDelta');
-        const probeBookmarkScoreDeltaInput = document.getElementById('probeBookmarkScoreDelta');
-        const probeBookmarkMaxFrameGapInput = document.getElementById('probeBookmarkMaxFrameGap');
-        const luxriotSevInfoInput = document.getElementById('luxriotSevInfo');
-        const luxriotSevLowInput = document.getElementById('luxriotSevLow');
-        const luxriotSevNormalInput = document.getElementById('luxriotSevNormal');
-        const luxriotSevHighInput = document.getElementById('luxriotSevHigh');
-        const luxriotSevCriticalInput = document.getElementById('luxriotSevCritical');
-        
-        let segmentThreshold = 0.7;
-
-        function toBool(value, fallback = false) {
-            if (typeof value === 'boolean') return value;
-            if (value === null || value === undefined) return fallback;
-            if (typeof value === 'string') {
-                const normalized = value.trim().toLowerCase();
-                if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-                if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-                return fallback;
-            }
-            return Boolean(value);
-        }
-
-        function clampSegmentThreshold(value) {
-            const numeric = Number.parseFloat(value);
-            if (!Number.isFinite(numeric)) {
-                return segmentThreshold;
-            }
-            return Math.min(0.99, Math.max(0.0, numeric));
-        }
-
-        function setSegmentThresholdFromPercent(percentValue) {
-            const pct = Number.parseInt(percentValue, 10);
-            const clamped = Math.min(99, Math.max(0, Number.isFinite(pct) ? pct : Math.round(segmentThreshold * 100)));
-            segmentThreshold = clamped / 100;
-            if (segmentThresholdSlider) {
-                segmentThresholdSlider.value = String(clamped);
-            }
-            if (segmentThresholdValueEl) {
-                segmentThresholdValueEl.textContent = `${clamped}%`;
-            }
-        }
-
-        function formatPercent(value) {
-            if (!Number.isFinite(value)) {
-                return 'n/a';
-            }
-            return `${(value * 100).toFixed(1)}%`;
-        }
-
-        function buildSimilarityMetrics(result, isCommented = false) {
-            if (isCommented) {
-                const count = result.comment_count || 0;
-                const latest = (result.latest_comment || '').toString();
-                const trimmed = latest.length > 50 ? `${latest.substring(0, 50)}...` : latest;
-                return `<div class="metric-line"><span class="metric-label">Comments:</span> ${count}${trimmed ? ` <span class="metric-note">Latest: ${trimmed}</span>` : ''}</div>`;
-            }
-
-            if (result && result.is_detection) {
-                const probeName = String(result.probe_name || result.probe_id || result.filename || 'n/a').trim() || 'n/a';
-                const ts = result.timestamp_ms ? new Date(result.timestamp_ms).toLocaleString() : 'n/a';
-                const channelId = parseInt(String(result.channel_id ?? ''), 10);
-                const channelName = Number.isFinite(channelId) ? getLuxriotChannelLabel(channelId) : (
-                    String(result.channel_name || result.channel_title || '').trim() || 'n/a'
-                );
-                const sev = result.severity ? escapeHtml(String(result.severity)) : 'n/a';
-                const pos = Number.isFinite(result.pos_score) ? result.pos_score.toFixed(3) : 'n/a';
-                const neg = Number.isFinite(result.neg_score) ? result.neg_score.toFixed(3) : 'n/a';
-                const margin = Number.isFinite(result.margin) ? result.margin.toFixed(3) : 'n/a';
-                const similarity = Number.isFinite(result.similarity) ? formatPercent(result.similarity) : null;
-                const mode = String(result.search_mode || '').trim().toUpperCase();
-                const clipSearch = Number.isFinite(result?.fusion?.clip_similarity) ? formatPercent(result.fusion.clip_similarity) : null;
-                const dinoSearch = Number.isFinite(result?.fusion?.dino_similarity) ? formatPercent(result.fusion.dino_similarity) : null;
-                const safeChannelName = escapeHtml(channelName);
-                const safeProbeName = escapeHtml(probeName);
-                const lines = [
-                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Name:</span> <span class="metric-value metric-stream-name" title="${safeProbeName}">${safeProbeName}</span></div>`,
-                    `<div class="metric-line"><span class="metric-label">Time:</span> ${escapeHtml(ts)}</div>`,
-                    `<div class="metric-line metric-line-wrap"><span class="metric-label">Stream:</span> <span class="metric-value metric-stream-name" title="${safeChannelName}">${safeChannelName}</span></div>`,
-                    `<div class="metric-line"><span class="metric-label">Severity:</span> <span class="metric-value">${sev}</span></div>`,
-                    `<div class="metric-line"><span class="metric-label">Probe:</span> ${escapeHtml(pos)} / ${escapeHtml(neg)} / ${escapeHtml(margin)}</div>`,
-                ];
-                if (similarity) {
-                    const modeHint = mode ? ` <span class="metric-note">${escapeHtml(mode)}</span>` : '';
-                    lines.push(`<div class="metric-line"><span class="metric-label">Match:</span> ${escapeHtml(similarity)}${modeHint}</div>`);
-                }
-                if (clipSearch || dinoSearch) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">Match C/D:</span> ${escapeHtml(clipSearch || 'n/a')} / ${escapeHtml(dinoSearch || 'n/a')}</div>`);
-                }
-                return lines.join('');
-            }
-
-            const lines = [];
-            lines.push(`<div class="metric-line"><span class="metric-label">Final:</span> ${formatPercent(result.similarity)}</div>`);
-
-            if (result.rerank) {
-                const originalScore = formatPercent(result.rerank.original_score);
-                if (Number.isFinite(result.rerank.original_score)) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">Original:</span> ${originalScore}</div>`);
-                }
-
-                if (Number.isFinite(result.rerank.score)) {
-                    const rerankScore = formatPercent(result.rerank.score);
-                    const note = result.rerank.applied ? '' : '<span class="metric-note">fallback</span>';
-                    lines.push(`<div class="metric-line"><span class="metric-label">Rerank:</span> ${rerankScore}${note}</div>`);
-                }
-            }
-
-            if (result.fusion) {
-                if (Number.isFinite(result.fusion.clip_similarity)) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">CLIP:</span> ${formatPercent(result.fusion.clip_similarity)}</div>`);
-                }
-                if (Number.isFinite(result.fusion.dino_similarity)) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">DINO:</span> ${formatPercent(result.fusion.dino_similarity)}</div>`);
-                }
-                if (Number.isFinite(result.fusion.alpha)) {
-                    lines.push(`<div class="metric-line"><span class="metric-label">Fusion α:</span> ${result.fusion.alpha.toFixed(2)}</div>`);
-                }
-            }
-
-            if (!lines.length) {
-                lines.push(`<div class="metric-line"><span class="metric-label">Similarity:</span> ${formatPercent(result.similarity)}</div>`);
-            }
-
-            return lines.join('');
-        }
-
-        function buildResultBadges(result) {
-            if (!result || typeof result !== 'object') return '';
-            const badges = [];
-            if (result.is_detection) {
-                badges.push({ label: 'Detection', classes: '' });
-            }
-
-            const modeRaw = String(result.search_mode || '').trim().toLowerCase();
-            if (modeRaw) {
-                if (modeRaw === 'clip') {
-                    badges.push({ label: 'CLIP', classes: 'mode-clip' });
-                } else if (modeRaw === 'fusion') {
-                    badges.push({ label: 'Fusion', classes: 'mode-fusion' });
-                } else if (modeRaw === 'dino') {
-                    badges.push({ label: 'DINO', classes: 'mode-dino' });
-                } else {
-                    badges.push({ label: modeRaw, classes: '' });
-                }
-            }
-
-            const dinoFallback = Boolean(result.dino_fallback || result?.fusion?.dino_fallback);
-            if (dinoFallback) {
-                badges.push({ label: 'DINO fallback', classes: 'warning' });
-            }
-
-            if (!badges.length) return '';
-            return `<div class="result-badges">${badges.map((badge) => {
-                const cls = badge.classes ? ` result-badge ${badge.classes}` : 'result-badge';
-                return `<span class="${cls}">${escapeHtml(String(badge.label || ''))}</span>`;
-            }).join('')}</div>`;
-        }
-
-        function decorateDetectionSearchResults(results, modeUsed = '', modeRequested = '') {
-            return (results || []).map((raw) => {
-                if (!raw || typeof raw !== 'object') return raw;
-                const item = { ...raw };
-                if (modeUsed && !item.search_mode) {
-                    item.search_mode = String(modeUsed).trim().toLowerCase();
-                }
-                if (modeRequested && !item.mode_requested) {
-                    item.mode_requested = String(modeRequested).trim().toLowerCase();
-                }
-                if (item.dino_fallback === undefined && item.fusion && typeof item.fusion === 'object') {
-                    item.dino_fallback = Boolean(item.fusion.dino_fallback);
-                }
-                return item;
-            });
-        }
-
-        function setArchiveDetectionsMeta(text, isError = false) {
-            if (!archiveDetectionsMeta) return;
-            archiveDetectionsMeta.textContent = text;
-            archiveDetectionsMeta.style.color = isError ? '#ff8e8e' : '#9aa0ad';
-        }
-
-        function updateArchiveDetectionsNav() {
-            if (archiveDetectionsPrevBtn) {
-                archiveDetectionsPrevBtn.disabled = archiveDetectionsOffset <= 0;
-            }
-            if (archiveDetectionsNextBtn) {
-                archiveDetectionsNextBtn.disabled = !archiveDetectionsHasMore;
-            }
-        }
-
-        function applySelectOptions(selectEl, options, selected = '') {
-            if (!selectEl) return;
-            const previous = selected || selectEl.value || '';
-            selectEl.innerHTML = options.map((opt) => `<option value="${escapeHtml(String(opt.value))}">${escapeHtml(String(opt.label))}</option>`).join('');
-            const hasPrevious = options.some((opt) => String(opt.value) === String(previous));
-            selectEl.value = hasPrevious ? String(previous) : String(options[0]?.value || '');
-        }
-
-        async function refreshArchiveChannelFilter() {
-            if (!archiveChannelFilter) return;
-            try {
-                const response = await fetch('/luxriot/channels');
-                const data = await parseApiJson(response, 'Failed to load channels');
-                const channels = Array.isArray(data.channels) ? data.channels : [];
-                const options = [{ value: '', label: 'All streams' }];
-                channels.forEach((channel) => {
-                    const rawId = channel.channel_id ?? channel.id;
-                    const id = parseInt(String(rawId || ''), 10);
-                    if (!Number.isFinite(id)) return;
-                    const label = normalizeLuxriotChannelName(channel, id);
-                    luxriotChannelNameById[String(id)] = label;
-                    options.push({ value: String(id), label });
-                });
-                applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
-            } catch (_) {
-                applySelectOptions(archiveChannelFilter, [{ value: '', label: 'All streams' }], '');
-            }
-        }
-
-        async function refreshArchiveProbeFilter() {
-            if (!archiveProbeFilter) return;
-            try {
-                const params = new URLSearchParams({ hours: '168', limit: '300' });
-                const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
-                if (channelId) {
-                    params.set('channel_id', channelId);
-                }
-                const response = await fetch(`/detections/summary?${params.toString()}`);
-                const data = await parseApiJson(response, 'Failed to load detection probes');
-                const summary = Array.isArray(data.summary) ? data.summary : [];
-                const options = [{ value: '', label: 'All probes' }];
-                summary.forEach((item) => {
-                    const id = String(item.probe_id || '').trim();
-                    if (!id) return;
-                    const labelBase = item.probe_name ? String(item.probe_name) : id;
-                    const label = `${labelBase} (${item.hit_count || 0})`;
-                    options.push({ value: id, label });
-                });
-                applySelectOptions(archiveProbeFilter, options, archiveProbeFilter.value);
-            } catch (_) {
-                applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All probes' }], '');
-            }
-        }
-
-        async function refreshArchiveFilters() {
-            archiveDetectionsOffset = 0;
-            archiveDetectionsHasMore = false;
-            updateArchiveDetectionsNav();
-            await Promise.all([refreshArchiveChannelFilter(), refreshArchiveProbeFilter()]);
-        }
-
-        function normalizeDetectionResults(detections) {
-            return (detections || []).map((det, idx) => {
-                const ts = Number.isFinite(det?.timestamp_ms) ? det.timestamp_ms : null;
-                const probeLabel = det?.probe_name || det?.probe_id || 'probe';
-                return {
-                    filename: String(probeLabel),
-                    path: det?.image_path || det?.payload?.image_path || '',
-                    thumbnail: det?.thumbnail || '',
-                    is_detection: true,
-                    detection_id: det?.id,
-                    timestamp_ms: ts,
-                    channel_id: det?.channel_id,
-                    probe_id: det?.probe_id,
-                    probe_name: det?.probe_name,
-                    severity: det?.severity,
-                    pos_score: Number.isFinite(det?.pos_score) ? det.pos_score : _coerceNumeric(det?.pos_score),
-                    neg_score: Number.isFinite(det?.neg_score) ? det.neg_score : _coerceNumeric(det?.neg_score),
-                    margin: Number.isFinite(det?.margin) ? det.margin : _coerceNumeric(det?.margin),
-                    source: det?.source || '',
-                    _raw_index: idx,
-                };
-            });
-        }
-
-        function _coerceNumeric(value) {
-            const parsed = Number.parseFloat(value);
-            return Number.isFinite(parsed) ? parsed : 0;
-        }
-
-        async function loadDetectionsArchive(resetOffset = true) {
-            if (!resultsContainer) return;
-            if (resetOffset) {
-                archiveDetectionsOffset = 0;
-            }
-            archiveDetectionsHasMore = false;
-            updateArchiveDetectionsNav();
-            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
-            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
-            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
-            const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
-            const params = new URLSearchParams();
-            const parsedHours = Number.parseFloat(hoursRaw);
-            if (Number.isFinite(parsedHours) && parsedHours > 0) {
-                params.set('hours', String(parsedHours));
-            } else {
-                params.set('hours', '0');
-            }
-            if (channelId) params.set('channel_id', channelId);
-            if (probeId) params.set('probe_id', probeId);
-            const limit = Number.parseInt(limitRaw, 10);
-            params.set('limit', String(Number.isFinite(limit) ? limit : 24));
-            params.set('offset', String(Math.max(0, archiveDetectionsOffset)));
-
-            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading detections archive...</div>';
-            setArchiveDetectionsMeta('Loading detections...');
-            try {
-                const response = await fetch(`/detections/list?${params.toString()}`);
-                const data = await parseApiJson(response, 'Failed to load detections archive');
-                const detections = Array.isArray(data.detections) ? data.detections : [];
-                archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
-                archiveDetectionsHasMore = Boolean(data.has_more);
-                const mapped = normalizeDetectionResults(detections);
-                if (!mapped.length) {
-                    resultsContainer.innerHTML = '<div class="loading">No detections found for selected filters.</div>';
-                    setArchiveDetectionsMeta('No detections found for selected filters.');
-                    updateArchiveDetectionsNav();
-                    return;
-                }
-                displayResults(mapped);
-                const shownFrom = archiveDetectionsOffset + 1;
-                const shownTo = archiveDetectionsOffset + mapped.length;
-                setArchiveDetectionsMeta(`Showing detections ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}.`);
-                updateArchiveDetectionsNav();
-            } catch (err) {
-                resultsContainer.innerHTML = `<div class="loading">Error: ${escapeHtml(err.message || String(err))}</div>`;
-                setArchiveDetectionsMeta(`Error loading detections: ${err.message || String(err)}`, true);
-                archiveDetectionsHasMore = false;
-                updateArchiveDetectionsNav();
-            }
-        }
-
-        function buildDetectionSearchFilters() {
-            const payload = {};
-            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
-            const probeId = archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
-            const hoursRaw = archiveTimeFilter ? archiveTimeFilter.value : '24';
-            if (channelId) payload.channel_id = channelId;
-            if (probeId) payload.probe_id = probeId;
-            const parsedHours = Number.parseFloat(hoursRaw);
-            if (Number.isFinite(parsedHours)) {
-                payload.hours = parsedHours;
-            } else {
-                payload.hours = 24;
-            }
-            return payload;
-        }
-
-        function isDetectionsScope() {
-            return searchScopeSelect && searchScopeSelect.value === 'detections';
-        }
-
-        function updateSearchScopeUI() {
-            if (!searchScopeSelect) return;
-            if (isDetectionsScope()) {
-                if (searchInput) {
-                    searchInput.placeholder = 'Describe detection scene (filtered by stream/probe/time)...';
-                }
-                setArchiveDetectionsMeta('Detections scope active: text/image search runs over filtered detection shards.');
-            } else if (searchInput) {
-                searchInput.placeholder = "Describe what you're looking for...";
-            }
-        }
-
-        if (authTokenBtn) {
-            authTokenBtn.addEventListener('click', () => {
-                const existing = getAdminToken();
-                const entered = window.prompt(
-                    'Set admin token (stored in this browser for mutating API calls). Leave empty to clear.',
-                    existing
-                );
-                if (entered === null) {
-                    return;
-                }
-                saveAdminToken(entered);
-                const hasToken = !!getAdminToken();
-                authTokenBtn.style.opacity = hasToken ? '1' : '0.6';
-                indexStatus.textContent = hasToken ? 'Admin token saved in browser.' : 'Admin token cleared.';
-                indexStatus.className = hasToken ? 'status success' : 'status warning';
-            });
-            authTokenBtn.style.opacity = getAdminToken() ? '1' : '0.6';
-        }
-        
-        // Settings modal functionality
-        settingsBtn.addEventListener('click', () => {
-            settingsModal.style.display = 'block';
-            loadSettings();
-            loadEnvEditor();
-        });
-        
-        closeSettingsBtn.addEventListener('click', () => {
-            settingsModal.style.display = 'none';
-        });
-        
-        // Close modal when clicking outside
-        settingsModal.addEventListener('click', (e) => {
-            if (e.target === settingsModal) {
-                settingsModal.style.display = 'none';
-            }
-        });
-
-        if (probeEditBtn && probeEditorModal) {
-            probeEditBtn.addEventListener('click', () => {
-                setProbeEditorModalVisibility(true);
-            });
-        }
-        if (closeProbeEditorBtn && probeEditorModal) {
-            closeProbeEditorBtn.addEventListener('click', () => {
-                setProbeEditorModalVisibility(false);
-            });
-        }
-        if (probeEditorCloseBtn && probeEditorModal) {
-            probeEditorCloseBtn.addEventListener('click', () => {
-                setProbeEditorModalVisibility(false);
-            });
-        }
-        if (probeEditorModal) {
-            probeEditorModal.addEventListener('click', (e) => {
-                if (e.target === probeEditorModal) {
-                    setProbeEditorModalVisibility(false);
-                }
-            });
-        }
-        if (probeSnapBtn) {
-            probeSnapBtn.addEventListener('click', () => {
-                openProbeSnapModalFromPreview();
-            });
-        }
-        if (closeProbeSnapBtn) {
-            closeProbeSnapBtn.addEventListener('click', () => {
-                setProbeSnapModalVisibility(false);
-            });
-        }
-        if (probeSnapCloseBtn) {
-            probeSnapCloseBtn.addEventListener('click', () => {
-                setProbeSnapModalVisibility(false);
-            });
-        }
-        if (probeSnapExportBtn) {
-            probeSnapExportBtn.addEventListener('click', () => {
-                exportProbeSnapshot();
-            });
-        }
-        if (probeSnapUseBtn) {
-            probeSnapUseBtn.addEventListener('click', () => {
-                setProbeSnapshotAsImageProbe();
-            });
-        }
-        if (probeSnapActualSizeInput) {
-            probeSnapActualSizeInput.addEventListener('change', () => {
-                updateProbeSnapScaleMode();
-            });
-        }
-        if (probeSnapModal) {
-            probeSnapModal.addEventListener('click', (e) => {
-                if (e.target === probeSnapModal) {
-                    setProbeSnapModalVisibility(false);
-                }
-            });
-        }
-
-        // Thumbnail quality slider update
-        thumbnailQualitySlider.addEventListener('input', (e) => {
-            qualityValue.textContent = e.target.value;
-        });
-
-        fusionAlphaInput.addEventListener('input', () => {
-            fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
-        });
-
-        if (segmentThresholdSlider) {
-            segmentThresholdSlider.addEventListener('input', (e) => {
-                setSegmentThresholdFromPercent(e.target.value);
-            });
-            setSegmentThresholdFromPercent(segmentThresholdSlider.value);
-        }
-
-        fusionEnabledInput.addEventListener('change', () => {
-            updateFusionUI(fusionEnabledInput.checked);
-        });
-
-        rerankEnabledInput.addEventListener('change', () => {
-            updateRerankUI(rerankEnabledInput.checked);
-        });
-
-        segmentsEnabledInput.addEventListener('change', () => {
-            updateSegmentsUI(segmentsEnabledInput.checked);
-            refreshSegmentsPanels();
-        });
-
-        async function loadEnvEditor() {
-            if (!envEditorInput) return;
-            try {
-                const response = await fetch('/settings/env');
-                const data = await response.json();
-                if (data.success) {
-                    envEditorInput.value = String(data.envText || '');
-                } else {
-                    showSettingsStatus('Error loading environment variables: ' + (data.error || 'Unknown error'), 'error');
-                }
-            } catch (error) {
-                showSettingsStatus('Error loading environment variables: ' + error.message, 'error');
-            }
-        }
-
-        async function saveEnvEditor() {
-            if (!envEditorInput || !saveEnvBtn) return;
-            setButtonBusy(saveEnvBtn, true);
-            try {
-                const response = await fetch('/settings/env', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        envText: envEditorInput.value || ''
-                    })
-                });
-                const data = await response.json();
-                if (data.success) {
-                    showSettingsStatus(data.message || 'Environment variables saved.', 'success');
-                    await loadEnvEditor();
-                } else {
-                    showSettingsStatus('Error saving environment variables: ' + (data.error || 'Unknown error'), 'error');
-                }
-            } catch (error) {
-                showSettingsStatus('Error saving environment variables: ' + error.message, 'error');
-            } finally {
-                setButtonBusy(saveEnvBtn, false);
-            }
-        }
-
-        // Load current settings
-        async function loadSettings() {
-            try {
-                const response = await fetch('/settings');
-                const data = await response.json();
-
-                if (data.success) {
-                    const settings = data.settings;
-                    document.getElementById('host').value = settings.host;
-                    document.getElementById('port').value = settings.port;
-                    document.getElementById('debug').checked = toBool(settings.debug, false);
-                    embedderSelect.value = settings.embedder || 'clip';
-                    fusionEnabledInput.checked = toBool(settings.fusionEnabled, false);
-                    const parsedFusionAlpha = parseFloat(settings.fusionAlpha);
-                    const fusionAlpha = Number.isFinite(parsedFusionAlpha) ? parsedFusionAlpha : 0.7;
-                    fusionAlphaInput.value = fusionAlpha.toFixed(2);
-                    dinoModelInput.value = settings.dinoModel || 'dinov3_vitb16';
-                    dinoEmbedDimInput.value = settings.dinoEmbedDim || 1280;
-                    dinoWeightsInput.value = settings.dinoWeightsPath || '';
-                    indexModeSelect.value = settings.indexMode || 'clip';
-                    updateFusionUI(fusionEnabledInput.checked);
-                    rerankEnabledInput.checked = toBool(settings.rerankEnabled, false);
-                    const parsedRerankTopK = parseInt(settings.rerankTopK, 10);
-                    rerankTopKInput.value = Number.isFinite(parsedRerankTopK) ? parsedRerankTopK : 50;
-                    updateRerankUI(rerankEnabledInput.checked);
-                    document.getElementById('clipModel').value = settings.clipModel;
-                    document.getElementById('minResults').value = settings.minResults;
-                    document.getElementById('maxResults').value = settings.maxResults;
-                    document.getElementById('defaultResults').value = settings.defaultResults;
-                    document.getElementById('batchSize').value = settings.batchSize;
-                    document.getElementById('thumbnailQuality').value = settings.thumbnailQuality;
-                    document.getElementById('qualityValue').textContent = settings.thumbnailQuality;
-                    document.getElementById('maxCommentLength').value = settings.maxCommentLength;
-                    document.getElementById('maxFileSize').value = settings.maxFileSize;
-                    document.getElementById('indexFolderName').value = settings.indexFolderName;
-                    if (luxriotBaseUrlInput) luxriotBaseUrlInput.value = settings.luxriotBaseUrl || '';
-                    if (luxriotUsernameInput) luxriotUsernameInput.value = settings.luxriotUsername || '';
-                    if (luxriotPasswordInput) luxriotPasswordInput.value = settings.luxriotPassword || '';
-                    if (luxriotDefaultChannelIdInput) luxriotDefaultChannelIdInput.value = settings.luxriotDefaultChannelId || '';
-                    if (luxriotSnapshotIntervalInput) luxriotSnapshotIntervalInput.value = settings.luxriotSnapshotInterval || 5;
-                    if (luxriotSnapshotMaxEdgeInput) luxriotSnapshotMaxEdgeInput.value = settings.luxriotSnapshotMaxEdge || 800;
-                    if (luxriotMaxBufferFramesInput) luxriotMaxBufferFramesInput.value = settings.luxriotMaxBufferFrames || 180;
-                    if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = toBool(settings.luxriotAutoBookmarks, false);
-                    if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = settings.probeBookmarkCooldownSec ?? 8.0;
-                    if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = settings.probeBookmarkDedupeWindowSec ?? 20.0;
-                    if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = settings.probeBookmarkSimHigh ?? 0.985;
-                    if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = settings.probeBookmarkMarginDelta ?? 0.08;
-                    if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = settings.probeBookmarkScoreDelta ?? 0.08;
-                    if (probeBookmarkMaxFrameGapInput) probeBookmarkMaxFrameGapInput.value = settings.probeBookmarkMaxFrameGap ?? 8;
-                    if (settings.luxriotSeverityMap) {
-                        if (luxriotSevInfoInput) luxriotSevInfoInput.value = settings.luxriotSeverityMap.info || 'info';
-                        if (luxriotSevLowInput) luxriotSevLowInput.value = settings.luxriotSeverityMap.low || 'low';
-                        if (luxriotSevNormalInput) luxriotSevNormalInput.value = settings.luxriotSeverityMap.normal || 'normal';
-                        if (luxriotSevHighInput) luxriotSevHighInput.value = settings.luxriotSeverityMap.high || 'high';
-                        if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = settings.luxriotSeverityMap.critical || 'critical';
-                    }
-                    applyEmbedderUI(embedderSelect.value);
-                    segmentsEnabledInput.checked = toBool(settings.segmentsEnabled, segmentsEnabledInput.checked);
-                    segmentMinPatchesInput.value = settings.segmentMinPatches || 3;
-                    const thresholdRaw = clampSegmentThreshold(settings.segmentThreshold);
-                    const pctValue = Math.round(thresholdRaw * 100);
-                    setSegmentThresholdFromPercent(pctValue);
-                    updateSegmentsUI(segmentsEnabledInput.checked);
-                    refreshSegmentsPanels();
-                } else {
-                    showSettingsStatus('Error loading settings: ' + data.error, 'error');
-                }
-            } catch (error) {
-                showSettingsStatus('Error loading settings: ' + error.message, 'error');
-            }
-        }
-        
-        // Save settings
-        saveSettingsBtn.addEventListener('click', async () => {
-            try {
-                const settings = {
-                    host: document.getElementById('host').value.trim(),
-                    port: parseInt(document.getElementById('port').value),
-                    debug: document.getElementById('debug').checked,
-                    embedder: embedderSelect.value,
-                    fusionEnabled: fusionEnabledInput.checked,
-                    fusionAlpha: parseFloat(fusionAlphaInput.value),
-                    rerankEnabled: rerankEnabledInput.checked,
-                    rerankTopK: parseInt(rerankTopKInput.value),
-                    segmentsEnabled: segmentsEnabledInput.checked,
-                    segmentMinPatches: parseInt(segmentMinPatchesInput.value),
-                    segmentThreshold: segmentThreshold,
-                    clipModel: document.getElementById('clipModel').value,
-                    dinoModel: dinoModelInput.value.trim(),
-                    dinoEmbedDim: parseInt(dinoEmbedDimInput.value),
-                    dinoWeightsPath: dinoWeightsInput.value.trim(),
-                    indexMode: indexModeSelect.value,
-                    minResults: parseInt(document.getElementById('minResults').value),
-                    maxResults: parseInt(document.getElementById('maxResults').value),
-                    defaultResults: parseInt(document.getElementById('defaultResults').value),
-                    batchSize: parseInt(document.getElementById('batchSize').value),
-                    thumbnailQuality: parseInt(document.getElementById('thumbnailQuality').value),
-                    maxCommentLength: parseInt(document.getElementById('maxCommentLength').value),
-                    maxFileSize: parseInt(document.getElementById('maxFileSize').value),
-                    indexFolderName: document.getElementById('indexFolderName').value.trim(),
-                    luxriotBaseUrl: luxriotBaseUrlInput.value.trim(),
-                    luxriotUsername: luxriotUsernameInput.value.trim(),
-                    luxriotPassword: luxriotPasswordInput ? luxriotPasswordInput.value : '',
-                    luxriotDefaultChannelId: parseInt(luxriotDefaultChannelIdInput ? luxriotDefaultChannelIdInput.value : config.LUXRIOT_DEFAULT_CHANNEL_ID),
-                    luxriotSnapshotInterval: parseInt(luxriotSnapshotIntervalInput ? luxriotSnapshotIntervalInput.value : config.LUXRIOT_SNAPSHOT_INTERVAL),
-                    luxriotSnapshotMaxEdge: parseInt(luxriotSnapshotMaxEdgeInput ? luxriotSnapshotMaxEdgeInput.value : config.LUXRIOT_SNAPSHOT_MAX_EDGE),
-                    luxriotMaxBufferFrames: parseInt(luxriotMaxBufferFramesInput ? luxriotMaxBufferFramesInput.value : config.LUXRIOT_MAX_BUFFER_FRAMES),
-                    luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
-                    probeBookmarkCooldownSec: parseFloat(probeBookmarkCooldownSecInput ? probeBookmarkCooldownSecInput.value : '8'),
-                    probeBookmarkDedupeWindowSec: parseFloat(probeBookmarkDedupeWindowSecInput ? probeBookmarkDedupeWindowSecInput.value : '20'),
-                    probeBookmarkSimHigh: parseFloat(probeBookmarkSimHighInput ? probeBookmarkSimHighInput.value : '0.985'),
-                    probeBookmarkMarginDelta: parseFloat(probeBookmarkMarginDeltaInput ? probeBookmarkMarginDeltaInput.value : '0.08'),
-                    probeBookmarkScoreDelta: parseFloat(probeBookmarkScoreDeltaInput ? probeBookmarkScoreDeltaInput.value : '0.08'),
-                    probeBookmarkMaxFrameGap: parseInt(probeBookmarkMaxFrameGapInput ? probeBookmarkMaxFrameGapInput.value : '8'),
-                    luxriotSeverityMap: {
-                        info: luxriotSevInfoInput ? (luxriotSevInfoInput.value.trim() || 'info') : 'info',
-                        low: luxriotSevLowInput ? (luxriotSevLowInput.value.trim() || 'low') : 'low',
-                        normal: luxriotSevNormalInput ? (luxriotSevNormalInput.value.trim() || 'normal') : 'normal',
-                        high: luxriotSevHighInput ? (luxriotSevHighInput.value.trim() || 'high') : 'high',
-                        critical: luxriotSevCriticalInput ? (luxriotSevCriticalInput.value.trim() || 'critical') : 'critical'
-                    }
-                };
-                
-                // Basic validation
-                if (!settings.host) {
-                    showSettingsStatus('Host cannot be empty', 'error');
-                    return;
-                }
-                
-                if (settings.minResults >= settings.maxResults) {
-                    showSettingsStatus('Min results must be less than max results', 'error');
-                    return;
-                }
-                
-                if (settings.defaultResults < settings.minResults || settings.defaultResults > settings.maxResults) {
-                    showSettingsStatus('Default results must be between min and max results', 'error');
-                    return;
-                }
-
-                if (!Number.isFinite(settings.dinoEmbedDim) || settings.dinoEmbedDim <= 0) {
-                    settings.dinoEmbedDim = parseInt(dinoEmbedDimInput.placeholder) || 1280;
-                }
-
-                if (!Number.isFinite(settings.fusionAlpha) || settings.fusionAlpha < 0 || settings.fusionAlpha > 1) {
-                    const defaultAlpha = parseFloat(fusionAlphaInput.defaultValue || '0.7');
-                    settings.fusionAlpha = Number.isFinite(defaultAlpha) ? defaultAlpha : 0.7;
-                }
-
-                if (!settings.fusionEnabled && settings.embedder === 'fusion') {
-                    settings.embedder = 'clip';
-                }
-
-                if (!Number.isFinite(settings.rerankTopK) || settings.rerankTopK < 1) {
-                    const defaultTopK = parseInt(rerankTopKInput.placeholder) || 50;
-                    settings.rerankTopK = Number.isFinite(defaultTopK) && defaultTopK > 0 ? defaultTopK : 50;
-                }
-
-                if (!Number.isFinite(settings.segmentMinPatches) || settings.segmentMinPatches < 1) {
-                    const defaultSegments = parseInt(segmentMinPatchesInput.placeholder) || 3;
-                    settings.segmentMinPatches = Number.isFinite(defaultSegments) && defaultSegments > 0 ? defaultSegments : 3;
-                }
-
-                if (!Number.isFinite(settings.probeBookmarkCooldownSec) || settings.probeBookmarkCooldownSec < 0) {
-                    settings.probeBookmarkCooldownSec = 8.0;
-                }
-                if (!Number.isFinite(settings.probeBookmarkDedupeWindowSec) || settings.probeBookmarkDedupeWindowSec < 0.5) {
-                    settings.probeBookmarkDedupeWindowSec = 20.0;
-                }
-                if (!Number.isFinite(settings.probeBookmarkSimHigh)) {
-                    settings.probeBookmarkSimHigh = 0.985;
-                }
-                settings.probeBookmarkSimHigh = Math.min(0.9999, Math.max(0.5, settings.probeBookmarkSimHigh));
-                if (!Number.isFinite(settings.probeBookmarkMarginDelta) || settings.probeBookmarkMarginDelta < 0) {
-                    settings.probeBookmarkMarginDelta = 0.08;
-                }
-                if (!Number.isFinite(settings.probeBookmarkScoreDelta) || settings.probeBookmarkScoreDelta < 0) {
-                    settings.probeBookmarkScoreDelta = 0.08;
-                }
-                if (!Number.isFinite(settings.probeBookmarkMaxFrameGap) || settings.probeBookmarkMaxFrameGap < 1) {
-                    settings.probeBookmarkMaxFrameGap = 8;
-                }
-
-                settings.segmentThreshold = clampSegmentThreshold(settings.segmentThreshold);
-
-                if (settings.embedder === 'dino' && !settings.dinoModel) {
-                    showSettingsStatus('DINO model name is required when DINO backend is selected', 'error');
-                    return;
-                }
-                
-                setButtonBusy(saveSettingsBtn, true);
-                
-                const response = await fetch('/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(settings)
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    showSettingsStatus(data.message, 'success');
-                } else {
-                    showSettingsStatus('Error saving settings: ' + data.error, 'error');
-                }
-                
-            } catch (error) {
-                showSettingsStatus('Error saving settings: ' + error.message, 'error');
-            } finally {
-                setButtonBusy(saveSettingsBtn, false);
-            }
-        });
-        
-        // Reset settings to defaults
-        resetSettingsBtn.addEventListener('click', () => {
-            if (confirm('Reset all settings to default values?')) {
-                document.getElementById('host').value = '0.0.0.0';
-                document.getElementById('port').value = '5000';
-                document.getElementById('debug').checked = false;
-                embedderSelect.value = 'clip';
-                fusionEnabledInput.checked = false;
-                fusionAlphaInput.value = '0.70';
-                fusionAlphaValue.textContent = '0.70';
-                rerankEnabledInput.checked = false;
-                rerankTopKInput.value = '50';
-                segmentsEnabledInput.checked = false;
-                segmentMinPatchesInput.value = '3';
-                setSegmentThresholdFromPercent(70);
-                dinoModelInput.value = 'dinov3_vitb16';
-                dinoEmbedDimInput.value = '1280';
-                dinoWeightsInput.value = '';
-                indexModeSelect.value = 'clip';
-                document.getElementById('clipModel').value = 'ViT-B/32';
-                document.getElementById('minResults').value = '3';
-                document.getElementById('maxResults').value = '48';
-                document.getElementById('defaultResults').value = '12';
-                document.getElementById('batchSize').value = '32';
-                document.getElementById('thumbnailQuality').value = '85';
-                document.getElementById('qualityValue').textContent = '85';
-                document.getElementById('maxCommentLength').value = '100';
-                document.getElementById('maxFileSize').value = '50';
-                document.getElementById('indexFolderName').value = '.clip_index';
-                luxriotBaseUrlInput.value = 'http://192.168.1.102:8080';
-                luxriotUsernameInput.value = 'admin';
-                luxriotPasswordInput.value = '123';
-                luxriotDefaultChannelIdInput.value = '103';
-                luxriotSnapshotIntervalInput.value = '5';
-                luxriotSnapshotMaxEdgeInput.value = '800';
-                luxriotMaxBufferFramesInput.value = '180';
-                if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
-                if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = '8.0';
-                if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = '20.0';
-                if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = '0.985';
-                if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = '0.08';
-                if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = '0.08';
-                if (probeBookmarkMaxFrameGapInput) probeBookmarkMaxFrameGapInput.value = '8';
-                if (luxriotSevInfoInput) luxriotSevInfoInput.value = 'info';
-                if (luxriotSevLowInput) luxriotSevLowInput.value = 'low';
-                if (luxriotSevNormalInput) luxriotSevNormalInput.value = 'normal';
-                if (luxriotSevHighInput) luxriotSevHighInput.value = 'high';
-                if (luxriotSevCriticalInput) luxriotSevCriticalInput.value = 'critical';
-                updateFusionUI(false);
-                updateRerankUI(false);
-                updateSegmentsUI(false);
-                refreshSegmentsPanels();
-                applyEmbedderUI(embedderSelect.value);
-            }
-        });
-
-        if (reloadEnvBtn) {
-            reloadEnvBtn.addEventListener('click', () => {
-                loadEnvEditor();
-            });
-        }
-
-        if (saveEnvBtn) {
-            saveEnvBtn.addEventListener('click', () => {
-                saveEnvEditor();
-            });
-        }
-
-        // Show settings status message
-        function showSettingsStatus(message, type) {
-            settingsStatus.textContent = message;
-            settingsStatus.className = `settings-status ${type}`;
-            settingsStatus.style.display = 'block';
-            
-            setTimeout(() => {
-                settingsStatus.style.display = 'none';
-            }, 5000);
-        }
-
-        function updateFusionUI(enabled) {
-            fusionAlphaInput.disabled = !enabled;
-            fusionAlphaValue.textContent = Number(fusionAlphaInput.value).toFixed(2);
-            fusionAlphaValue.classList.toggle('disabled', !enabled);
-            const fusionOption = embedderSelect.querySelector('option[value="fusion"]');
-            if (fusionOption) {
-                fusionOption.disabled = !enabled;
-            }
-            if (!enabled && embedderSelect.value === 'fusion') {
-                embedderSelect.value = 'clip';
-                applyEmbedderUI('clip');
-            }
-        }
-
-        function updateRerankUI(enabled) {
-            rerankTopKInput.disabled = !enabled;
-            rerankTopKInput.classList.toggle('disabled', !enabled);
-        }
-
-        updateFusionUI(fusionEnabledInput.checked);
-        updateRerankUI(rerankEnabledInput.checked);
-        
-        function updateSegmentsUI(enabled) {
-            segmentMinPatchesInput.disabled = !enabled;
-            segmentMinPatchesInput.classList.toggle('disabled', !enabled);
-            updateSegmentControlsUI(enabled);
-        }
-
-        function updateSegmentControlsUI(enabled) {
-            if (!segmentThresholdSlider || !segmentThresholdControl) return;
-            segmentThresholdSlider.disabled = !enabled;
-            segmentThresholdControl.classList.toggle('disabled', !enabled);
-        }
-
-        updateSegmentsUI(segmentsEnabledInput.checked);
-        refreshSegmentsPanels();
-
-        function applyEmbedderUI(embedder) {
-            const showDino = embedder === 'dino' || embedder === 'fusion';
-            const dinoRows = document.querySelectorAll('.backend-dino');
-            dinoRows.forEach(row => {
-                row.style.display = showDino ? 'flex' : 'none';
-            });
-
-            const clipRows = document.querySelectorAll('.backend-clip');
-            clipRows.forEach(row => {
-                row.style.display = embedder === 'dino' ? 'none' : 'flex';
-            });
-
-            const textSearchAvailable = embedder !== 'dino';
-            searchInput.disabled = !textSearchAvailable;
-            searchBtn.disabled = !textSearchAvailable;
-            searchInput.placeholder = textSearchAvailable
-                ? "Describe what you're looking for..."
-                : 'Text search requires CLIP or Fusion backend.';
-            searchBtn.title = textSearchAvailable ? '' : 'Text search is disabled when backend is DINO.';
-        }
-
-        embedderSelect.addEventListener('change', (event) => {
-            applyEmbedderUI(event.target.value);
-        });
-        applyEmbedderUI(embedderSelect.value);
-        if (luxriotRefreshChannelsBtn) {
-            luxriotRefreshChannelsBtn.addEventListener('click', () => {
-                fetchLuxriotChannels(true).then(syncProbeChannelSelect);
-            });
-        }
-        if (luxriotToggleCaptureBtn) {
-            luxriotToggleCaptureBtn.addEventListener('click', toggleLuxriotCapture);
-        }
-        if (luxriotFlushCaptureBtn) {
-            luxriotFlushCaptureBtn.addEventListener('click', flushLuxriotCapture);
-        }
-        if (luxriotPromptSettingsBtn) {
-            luxriotPromptSettingsBtn.addEventListener('click', openLuxriotPromptModal);
-        }
-        if (closeLuxriotPromptModalBtn) {
-            closeLuxriotPromptModalBtn.addEventListener('click', closeLuxriotPromptModal);
-        }
-        if (luxriotPromptCloseBtn) {
-            luxriotPromptCloseBtn.addEventListener('click', closeLuxriotPromptModal);
-        }
-        if (luxriotPromptApplyBtn) {
-            luxriotPromptApplyBtn.addEventListener('click', async () => {
-                try {
-                    await applyLuxriotPromptModal();
-                    closeLuxriotPromptModal();
-                } catch (err) {
-                    setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
-                }
-            });
-        }
-        if (luxriotPromptModalInput) {
-            luxriotPromptModalInput.addEventListener('keydown', async (event) => {
-                if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'enter') {
-                    event.preventDefault();
-                    try {
-                        await applyLuxriotPromptModal();
-                        closeLuxriotPromptModal();
-                    } catch (err) {
-                        setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
-                    }
-                }
-            });
-        }
-        luxriotPromptTabButtons.forEach((button) => {
-            button.addEventListener('click', () => {
-                const tab = button.dataset.luxriotPromptTab || 'stream';
-                setLuxriotPromptModalTab(tab);
-            });
-        });
-        if (luxriotPromptModal) {
-            luxriotPromptModal.addEventListener('click', (event) => {
-                if (event.target === luxriotPromptModal) {
-                    closeLuxriotPromptModal();
-                }
-            });
-        }
-        if (luxriotRefreshSummariesBtn) {
-            luxriotRefreshSummariesBtn.addEventListener('click', async () => {
-                setSummaryRefreshButtonState('busy');
-                setLuxriotStatus('Refreshing summaries...');
-                let queued = false;
-                try {
-                    const started = await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                    queued = started === false;
-                    if (queued) {
-                        setSummaryRefreshButtonState('queued');
-                    }
-                } finally {
-                    if (queued) {
-                        setTimeout(() => setSummaryRefreshButtonState('idle'), 800);
-                    } else {
-                        setSummaryRefreshButtonState('idle');
-                    }
-                }
-            });
-        }
-        if (luxriotSummaryChannelSelect) {
-            luxriotSummaryChannelSelect.addEventListener('change', () => {
-                luxriotSummaryChannel = getSelectedSummaryChannel();
-                setSummaryBaseLevel(luxriotSummaryLevel);
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(luxriotSummaryChannel, true);
-            });
-        }
-        if (luxriotSummaryRunSelect) {
-            luxriotSummaryRunSelect.addEventListener('change', () => {
-                applySummaryFiltersFromInputs();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryRangeSelect) {
-            luxriotSummaryRangeSelect.addEventListener('change', () => {
-                luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
-                syncSummaryRangeUI();
-                if (luxriotSummaryRangePreset === 'custom') {
-                    updateSummaryControlsUI();
-                    return;
-                }
-                applySummaryFiltersFromInputs();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryLevelSelect) {
-            luxriotSummaryLevelSelect.addEventListener('change', () => {
-                setSummaryBaseLevel(luxriotSummaryLevelSelect.value);
-                setSummaryUnread(0);
-                updateSummaryControlsUI();
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryApplyFiltersBtn) {
-            luxriotSummaryApplyFiltersBtn.addEventListener('click', () => {
-                applySummaryFiltersFromInputs();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryFromInput) {
-            luxriotSummaryFromInput.addEventListener('keydown', (event) => {
-                if (event.key !== 'Enter') return;
-                event.preventDefault();
-                applySummaryFiltersFromInputs();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryToInput) {
-            luxriotSummaryToInput.addEventListener('keydown', (event) => {
-                if (event.key !== 'Enter') return;
-                event.preventDefault();
-                applySummaryFiltersFromInputs();
-                setSummaryUnread(0);
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-            });
-        }
-        if (luxriotSummaryBackBtn) {
-            luxriotSummaryBackBtn.addEventListener('click', () => {
-                const ctx = popSummaryRollupContext();
-                if (!ctx) {
-                    updateSummaryControlsUI();
-                    return;
-                }
-                setSummaryUnread(0);
-                const channelId = getSelectedSummaryChannel();
-                const cached = luxriotSummaryRollupCache[channelId];
-                if (isRollupViewActive() && cached) {
-                    renderLuxriotRollups(cached, channelId);
-                    return;
-                }
-                refreshLuxriotSummaryView(channelId, true);
-            });
-        }
-        if (luxriotSummaryFollowBtn) {
-            luxriotSummaryFollowBtn.addEventListener('click', () => {
-                const enableLive = !(luxriotSummaryAutoRefresh && luxriotSummaryFollowLive);
-                luxriotSummaryAutoRefresh = enableLive;
-                luxriotSummaryFollowLive = enableLive;
-                updateSummaryControlsUI();
-                if (enableLive) {
-                    setSummaryUnread(0);
-                    scrollSummaryToLatest();
-                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                }
-            });
-        }
-        if (luxriotSummaryPauseBtn) {
-            luxriotSummaryPauseBtn.addEventListener('click', () => {
-                luxriotSummaryAutoRefresh = !luxriotSummaryAutoRefresh;
-                updateSummaryControlsUI();
-                if (luxriotSummaryAutoRefresh) {
-                    refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                }
-            });
-        }
-        if (luxriotSummaryViewBtn) {
-            luxriotSummaryViewBtn.addEventListener('click', () => {
-                setSummaryCompactMode(!luxriotSummaryCompactMode);
-                updateSummaryControlsUI();
-                if (isRollupViewActive()) {
-                    const channelId = getSelectedSummaryChannel();
-                    const cached = luxriotSummaryRollupCache[channelId];
-                    if (cached) {
-                        renderLuxriotRollups(cached, channelId);
-                    }
-                } else {
-                    renderLuxriotSummaries(luxriotSummaryLogCache, getSelectedSummaryChannel());
-                }
-            });
-        }
-        if (luxriotSummaryCollapseAllBtn) {
-            luxriotSummaryCollapseAllBtn.addEventListener('click', () => {
-                const channelId = getSelectedSummaryChannel();
-                const allCollapsed = areAllSummariesCollapsed(channelId);
-                collapseAllSummariesForChannel(channelId, !allCollapsed);
-                if (isRollupViewActive()) {
-                    const cached = luxriotSummaryRollupCache[channelId];
-                    if (cached) {
-                        renderLuxriotRollups(cached, channelId);
-                    }
-                } else {
-                    renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
-                }
-            });
-        }
-        if (luxriotSummaryJumpBtn) {
-            luxriotSummaryJumpBtn.addEventListener('click', () => {
-                if (isRollupViewActive()) return;
-                luxriotSummaryFollowLive = true;
-                setSummaryUnread(0);
-                updateSummaryControlsUI();
-                scrollSummaryToLatest();
-            });
-        }
-        if (luxriotSummaries) {
-            luxriotSummaries.addEventListener('scroll', () => {
-                if (isRollupViewActive()) return;
-                if (!luxriotSummaryFollowLive) return;
-                if (!isSummaryNearBottom()) {
-                    luxriotSummaryFollowLive = false;
-                    updateSummaryControlsUI();
-                }
-            });
-        }
-        if (luxriotRefreshStreamsBtn) {
-            luxriotRefreshStreamsBtn.addEventListener('click', () => refreshLuxriotStreams());
-        }
-        if (luxriotStopAllVideoBtn) {
-            luxriotStopAllVideoBtn.addEventListener('click', () => stopAllLuxriotStreams('video'));
-        }
-        if (luxriotStopAllAnalyticsBtn) {
-            luxriotStopAllAnalyticsBtn.addEventListener('click', () => stopAllLuxriotStreams('analytics'));
-        }
-        if (luxriotSummaries) {
-            luxriotSummaries.addEventListener('click', (event) => {
-                const target = event.target;
-                if (!(target instanceof Element)) return;
-                const rollupCollapseBtn = target.closest('[data-luxriot-rollup-collapse]');
-                if (rollupCollapseBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(rollupCollapseBtn.dataset.luxriotRollupCollapse || '', 10);
-                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
-                    event.preventDefault();
-                    const row = luxriotSummaryRollupRows[idx] || {};
-                    const channelId = getSelectedSummaryChannel();
-                    const key = rollupSummaryKey(row, idx);
-                    const nextState = !isSummaryCollapsed(channelId, key);
-                    setSummaryCollapsed(channelId, key, nextState);
-                    const cached = luxriotSummaryRollupCache[channelId];
-                    if (cached) {
-                        renderLuxriotRollups(cached, channelId);
-                    }
-                    return;
-                }
-                const rollupCopyBtn = target.closest('[data-luxriot-rollup-copy]');
-                if (rollupCopyBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(rollupCopyBtn.dataset.luxriotRollupCopy || '', 10);
-                    if (!Number.isFinite(idx)) return;
-                    event.preventDefault();
-                    copyLuxriotRollupFromRow(idx, rollupCopyBtn);
-                    return;
-                }
-                const rollupExportBtn = target.closest('[data-luxriot-rollup-export]');
-                if (rollupExportBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(rollupExportBtn.dataset.luxriotRollupExport || '', 10);
-                    if (!Number.isFinite(idx)) return;
-                    event.preventDefault();
-                    exportLuxriotRollupFromRow(idx);
-                    return;
-                }
-                const rollupDrillBtn = target.closest('[data-luxriot-rollup-drill]');
-                if (rollupDrillBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(rollupDrillBtn.dataset.luxriotRollupDrill || '', 10);
-                    if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
-                    const row = luxriotSummaryRollupRows[idx] || {};
-                    const sourceLevel = String(row?.source_level || '').trim();
-                    const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
-                    if (!sourceLevel || !sourceIds.length) return;
-                    event.preventDefault();
-                    pushSummaryRollupContext(sourceLevel, sourceIds, formatRollupRange(row?.window_start, row?.window_end));
-                    setSummaryUnread(0);
-                    const channelId = getSelectedSummaryChannel();
-                    const cached = luxriotSummaryRollupCache[channelId];
-                    if (cached) {
-                        renderLuxriotRollups(cached, channelId);
-                    } else {
-                        refreshLuxriotSummaryView(channelId, true);
-                    }
-                    return;
-                }
-                const collapseBtn = target.closest('[data-luxriot-collapse]');
-                if (collapseBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(collapseBtn.dataset.luxriotCollapse || '', 10);
-                    if (!Number.isFinite(idx)) return;
-                    event.preventDefault();
-                    toggleLuxriotSummaryCollapse(idx);
-                    return;
-                }
-                const copyBtn = target.closest('[data-luxriot-copy]');
-                if (copyBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(copyBtn.dataset.luxriotCopy || '', 10);
-                    if (!Number.isFinite(idx)) return;
-                    event.preventDefault();
-                    copyLuxriotSummaryFromLog(idx, copyBtn);
-                    return;
-                }
-                const exportBtn = target.closest('[data-luxriot-export]');
-                if (exportBtn instanceof HTMLButtonElement) {
-                    const idx = parseInt(exportBtn.dataset.luxriotExport || '', 10);
-                    if (!Number.isFinite(idx)) return;
-                    event.preventDefault();
-                    exportLuxriotSummaryFromLog(idx);
-                    return;
-                }
-                const bookmarkBtn = target.closest('[data-luxriot-bookmark]');
-                if (!(bookmarkBtn instanceof HTMLButtonElement)) return;
-                const idx = parseInt(bookmarkBtn.dataset.luxriotBookmark || '', 10);
-                if (!Number.isFinite(idx)) return;
-                event.preventDefault();
-                sendLuxriotBookmarkFromLog(idx, bookmarkBtn);
-            });
-        }
-        if (luxriotStreams) {
-            luxriotStreams.addEventListener('click', (event) => {
-                const target = event.target;
-                if (!(target instanceof Element)) return;
-                const summaryBtn = target.closest('[data-summary-channel]');
-                if (summaryBtn instanceof HTMLButtonElement) {
-                    const summaryChannelId = parseInt(summaryBtn.dataset.summaryChannel || '', 10);
-                    if (Number.isFinite(summaryChannelId)) {
-                        luxriotSummaryChannel = summaryChannelId;
-                        syncLuxriotSummaryChannelSelect();
-                        setSummaryBaseLevel(luxriotSummaryLevel);
-                        setSummaryUnread(0);
-                        luxriotSummaryFollowLive = true;
-                        updateSummaryControlsUI();
-                        refreshLuxriotSummaryView(summaryChannelId, true);
-                        if (!isRollupViewActive()) {
-                            scrollSummaryToLatest();
-                        }
-                    }
-                    event.preventDefault();
-                    return;
-                }
-                const button = target.closest('[data-stream-stop]');
-                if (!(button instanceof HTMLButtonElement)) return;
-                const channelId = parseInt(button.dataset.streamStop || '', 10);
-                const streamType = (button.dataset.streamType || '').trim().toLowerCase();
-                const streamAction = (button.dataset.streamAction || '').trim().toLowerCase();
-                if (!Number.isFinite(channelId) || !streamType) return;
-                event.preventDefault();
-                if (streamType === 'analytics' && streamAction === 'resume') {
-                    resumeLuxriotProbeCapture(channelId);
-                } else {
-                    stopLuxriotStream(channelId, streamType);
-                }
-            });
-        }
-        if (luxriotChannelSelect) {
-            luxriotChannelSelect.addEventListener('change', () => {
-                luxriotActiveChannel = getSelectedLuxriotChannel();
-                syncProbeChannelSelect();
-                syncLuxriotSummaryChannelSelect();
-                setSummaryBaseLevel(luxriotSummaryLevel);
-                updateLuxriotCaptureToggleButton(luxriotActiveChannel);
-                void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
-                startLuxriotPreview();
-                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
-                refreshLuxriotStreams();
-            });
-        }
-        
-        // -------- Monitoring / Probes --------
-        function setProbeStatus(message, isError = false) {
-            if (!probeStatus) return;
-            probeStatus.textContent = message;
-            probeStatus.classList.toggle('error', Boolean(isError));
-        }
-
-        function getSelectedProbeChannelId() {
-            const parsed = parseInt(probeChannelSelect?.value || luxriotActiveChannel, 10);
-            return Number.isFinite(parsed) ? parsed : luxriotActiveChannel;
-        }
-
-        function getProbeRuntimeState(channelId) {
-            const state = probeChannelRuntime[channelId];
-            if (state === 'running' || state === 'paused' || state === 'idle') {
-                return state;
-            }
-            return 'idle';
-        }
-
-        function updateProbeStreamToggleButton(channelIdOverride = null) {
-            if (!probeStreamToggleBtn) return;
-            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
-            const runtimeState = getProbeRuntimeState(channelId);
-            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : (runtimeState === 'running');
-            probeStreamToggleBtn.textContent = enabled ? 'Stop Stream' : 'Start Stream';
-            probeStreamToggleBtn.classList.toggle('primary', !enabled);
-        }
-
-        function updateProbeCaptureMeta(channelId, statusData = null) {
-            const runtimeState = getProbeRuntimeState(channelId);
-            const streamLabel = runtimeState === 'running' ? 'ok' : (runtimeState === 'paused' ? 'paused' : 'idle');
-            let captureLabel = 'idle';
-            const frameCount = Number(statusData?.frames);
-            if (runtimeState === 'running') {
-                captureLabel = Number.isFinite(frameCount) && frameCount > 0 ? 'ok' : 'warming';
-            } else if (runtimeState === 'paused') {
-                captureLabel = 'paused';
-            }
-            if (probeCaptureStatus) {
-                probeCaptureStatus.textContent = `Stream: ${streamLabel} | Capture: ${captureLabel}`;
-            }
-            if (probeBufferInfo && statusData) {
-                const lastTs = statusData.last_timestamp_ms ? new Date(statusData.last_timestamp_ms).toLocaleString() : 'n/a';
-                probeBufferInfo.textContent = `Last snapshot: ${lastTs}`;
-            }
-            updateProbeStreamToggleButton(channelId);
-        }
-
-        function normalizeProbeRoiNorm(raw) {
-            if (!raw || typeof raw !== 'object') return null;
-            const x = Number.parseFloat(raw.x);
-            const y = Number.parseFloat(raw.y);
-            const w = Number.parseFloat(raw.w);
-            const h = Number.parseFloat(raw.h);
-            if (![x, y, w, h].every((value) => Number.isFinite(value))) return null;
-            const minSide = 0.02;
-            let nx = Math.min(1, Math.max(0, x));
-            let ny = Math.min(1, Math.max(0, y));
-            let nw = Math.min(1, Math.max(0, w));
-            let nh = Math.min(1, Math.max(0, h));
-            if (nw < minSide || nh < minSide) return null;
-            if (nx + nw > 1) nx = Math.max(0, 1 - nw);
-            if (ny + nh > 1) ny = Math.max(0, 1 - nh);
-            return {
-                x: Number(nx.toFixed(6)),
-                y: Number(ny.toFixed(6)),
-                w: Number(nw.toFixed(6)),
-                h: Number(nh.toFixed(6)),
-            };
-        }
-
-        function getProbePreviewGeometry() {
-            if (!probePreviewViewport || !probePreviewImg) return null;
-            const viewportRect = probePreviewViewport.getBoundingClientRect();
-            const viewportWidth = viewportRect.width;
-            const viewportHeight = viewportRect.height;
-            if (!(viewportWidth > 1) || !(viewportHeight > 1)) return null;
-            const naturalWidth = probePreviewImg.naturalWidth || 0;
-            const naturalHeight = probePreviewImg.naturalHeight || 0;
-            if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
-                return {
-                    viewportRect,
-                    viewportWidth,
-                    viewportHeight,
-                    imageWidth: viewportWidth,
-                    imageHeight: viewportHeight,
-                    imageOffsetX: 0,
-                    imageOffsetY: 0,
-                };
-            }
-            const scale = Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
-            const imageWidth = naturalWidth * scale;
-            const imageHeight = naturalHeight * scale;
-            return {
-                viewportRect,
-                viewportWidth,
-                viewportHeight,
-                imageWidth,
-                imageHeight,
-                imageOffsetX: (viewportWidth - imageWidth) / 2,
-                imageOffsetY: (viewportHeight - imageHeight) / 2,
-            };
-        }
-
-        function viewportPointToProbeNorm(clientX, clientY) {
-            const geom = getProbePreviewGeometry();
-            if (!geom) return null;
-            const px = clientX - geom.viewportRect.left;
-            const py = clientY - geom.viewportRect.top;
-            const nx = (px - geom.imageOffsetX) / geom.imageWidth;
-            const ny = (py - geom.imageOffsetY) / geom.imageHeight;
-            return {
-                x: Math.min(1, Math.max(0, nx)),
-                y: Math.min(1, Math.max(0, ny)),
-            };
-        }
-
-        function probeNormToViewportRect(roiNorm) {
-            const norm = normalizeProbeRoiNorm(roiNorm);
-            const geom = getProbePreviewGeometry();
-            if (!norm || !geom) return null;
-            const left = geom.imageOffsetX + (norm.x * geom.imageWidth);
-            const top = geom.imageOffsetY + (norm.y * geom.imageHeight);
-            const right = left + (norm.w * geom.imageWidth);
-            const bottom = top + (norm.h * geom.imageHeight);
-            const clampedLeft = Math.max(0, Math.min(geom.viewportWidth, left));
-            const clampedTop = Math.max(0, Math.min(geom.viewportHeight, top));
-            const clampedRight = Math.max(0, Math.min(geom.viewportWidth, right));
-            const clampedBottom = Math.max(0, Math.min(geom.viewportHeight, bottom));
-            if (clampedRight - clampedLeft < 2 || clampedBottom - clampedTop < 2) return null;
-            return {
-                left: clampedLeft,
-                top: clampedTop,
-                width: clampedRight - clampedLeft,
-                height: clampedBottom - clampedTop,
-            };
-        }
-
-        function renderProbeRoiBox() {
-            if (!probeRoiBox) return;
-            const candidate = probeRoiDraftNorm || probeRoiNorm;
-            if (!probeRoiEnabled || !candidate) {
-                probeRoiBox.classList.remove('active');
-                probeRoiBox.style.display = 'none';
-                return;
-            }
-            const rect = probeNormToViewportRect(candidate);
-            if (!rect) {
-                probeRoiBox.classList.remove('active');
-                probeRoiBox.style.display = 'none';
-                return;
-            }
-            probeRoiBox.style.display = 'block';
-            probeRoiBox.classList.add('active');
-            probeRoiBox.style.left = `${rect.left}px`;
-            probeRoiBox.style.top = `${rect.top}px`;
-            probeRoiBox.style.width = `${rect.width}px`;
-            probeRoiBox.style.height = `${rect.height}px`;
-        }
-
-        function updateProbeRoiUi() {
-            const normalized = normalizeProbeRoiNorm(probeRoiNorm);
-            if (probeRoiToggleBtn) {
-                probeRoiToggleBtn.textContent = probeRoiEnabled ? 'ROI ON' : 'ROI OFF';
-                probeRoiToggleBtn.classList.toggle('primary', probeRoiEnabled);
-            }
-            if (probeRoiClearBtn) {
-                probeRoiClearBtn.disabled = !normalized;
-            }
-            if (probeRoiLayer) {
-                probeRoiLayer.classList.toggle('active', probeRoiEnabled);
-            }
-            if (probeRoiInfo) {
-                if (!probeRoiEnabled) {
-                    probeRoiInfo.textContent = 'Full frame matching';
-                } else if (normalized) {
-                    const pct = (value) => `${Math.round(value * 100)}%`;
-                    probeRoiInfo.textContent = `ROI ${pct(normalized.w)} × ${pct(normalized.h)} @ ${pct(normalized.x)}, ${pct(normalized.y)}`;
-                } else {
-                    probeRoiInfo.textContent = 'ROI enabled, draw on preview';
-                }
-            }
-            renderProbeRoiBox();
-        }
-
-        function applyProbeRoiState(enabled, roiNorm) {
-            const normalized = normalizeProbeRoiNorm(roiNorm);
-            probeRoiEnabled = Boolean(enabled);
-            probeRoiNorm = normalized;
-            probeRoiDraftNorm = null;
-            probeRoiDrawState = null;
-            updateProbeRoiUi();
-        }
-
-        function clearProbeRoi(keepEnabled = true) {
-            probeRoiNorm = null;
-            probeRoiDraftNorm = null;
-            probeRoiDrawState = null;
-            probeRoiEnabled = Boolean(keepEnabled);
-            updateProbeRoiUi();
-        }
-
-        function stopProbeRoiDraw(commit) {
-            if (probeRoiLayer && probeRoiDrawState && Number.isFinite(probeRoiDrawState.pointerId)) {
-                try {
-                    probeRoiLayer.releasePointerCapture(probeRoiDrawState.pointerId);
-                } catch (_) {
-                    // ignore
-                }
-            }
-            if (commit) {
-                const normalized = normalizeProbeRoiNorm(probeRoiDraftNorm);
-                if (probeRoiEnabled && normalized) {
-                    probeRoiNorm = normalized;
-                }
-            }
-            probeRoiDraftNorm = null;
-            probeRoiDrawState = null;
-            updateProbeRoiUi();
-        }
-
-        function beginProbeRoiDraw(event) {
-            if (!probeRoiEnabled || !probeRoiLayer) return;
-            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
-            if (!point) return;
-            event.preventDefault();
-            probeRoiDrawState = {
-                pointerId: event.pointerId,
-                startX: point.x,
-                startY: point.y,
-                currentX: point.x,
-                currentY: point.y,
-            };
-            probeRoiDraftNorm = {
-                x: point.x,
-                y: point.y,
-                w: 0.001,
-                h: 0.001,
-            };
-            probeRoiLayer.setPointerCapture(event.pointerId);
-            renderProbeRoiBox();
-        }
-
-        function updateProbeRoiDraw(event) {
-            if (!probeRoiEnabled || !probeRoiDrawState) return;
-            const point = viewportPointToProbeNorm(event.clientX, event.clientY);
-            if (!point) return;
-            probeRoiDrawState.currentX = point.x;
-            probeRoiDrawState.currentY = point.y;
-            const x0 = Math.min(probeRoiDrawState.startX, probeRoiDrawState.currentX);
-            const y0 = Math.min(probeRoiDrawState.startY, probeRoiDrawState.currentY);
-            const x1 = Math.max(probeRoiDrawState.startX, probeRoiDrawState.currentX);
-            const y1 = Math.max(probeRoiDrawState.startY, probeRoiDrawState.currentY);
-            probeRoiDraftNorm = {
-                x: x0,
-                y: y0,
-                w: x1 - x0,
-                h: y1 - y0,
-            };
-            renderProbeRoiBox();
-        }
-
-        function setPreviewState(text, clearImage = false) {
-            if (probePreviewOverlay) {
-                probePreviewOverlay.style.display = text ? 'flex' : 'none';
-                if (text) probePreviewOverlay.textContent = text;
-            }
-            if (clearImage && probePreviewImg) {
-                probePreviewImg.src = '';
-            }
-            renderProbeRoiBox();
-        }
-
-        function stopProbePreview() {
-            if (probePreviewTimer) {
-                clearInterval(probePreviewTimer);
-                probePreviewTimer = null;
-            }
-            probePreviewChannelId = null;
-        }
-
-        function startProbePreview(channelId) {
-            if (!probePreviewImg) return;
-            if (probePreviewTimer && probePreviewChannelId === channelId) return;
-            stopProbePreview();
-            if (!channelId && channelId !== 0) {
-                setPreviewState('No channel', true);
-                return;
-            }
-            const refresh = () => {
-                if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
-                probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
-            };
-            probePreviewImg.onload = () => {
-                setPreviewState('');
-                renderProbeRoiBox();
-            };
-            probePreviewImg.onerror = () => setPreviewState('Preview failed');
-            probePreviewChannelId = channelId;
-            refresh();
-            const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
-            probePreviewTimer = setInterval(refresh, intervalMs);
-        }
-
-        function syncProbePreview(channelIdOverride = null) {
-            const channelId = Number.isFinite(channelIdOverride) ? channelIdOverride : getSelectedProbeChannelId();
-            if (!probeEditorModal || probeEditorModal.style.display !== 'block') {
-                stopProbePreview();
-                return;
-            }
-            if (!channelId && channelId !== 0) {
-                stopProbePreview();
-                setPreviewState('No channel', true);
-                return;
-            }
-            const runtimeState = getProbeRuntimeState(channelId);
-            const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : true;
-            if (enabled && runtimeState === 'running') {
-                startProbePreview(channelId);
-                setPreviewState('');
-                return;
-            }
-            stopProbePreview();
-            if (!enabled) {
-                setPreviewState('Probe disabled');
-                return;
-            }
-            if (runtimeState === 'paused') {
-                setPreviewState('Paused');
-                return;
-            }
-            setPreviewState('No stream');
-        }
-
-        function updateProbeSnapScaleMode() {
-            if (!probeSnapPreview) return;
-            const useActualSize = Boolean(probeSnapActualSizeInput?.checked);
-            probeSnapPreview.classList.toggle('actual-size', useActualSize);
-        }
-
-        function _buildProbeSnapFilename(channelId, timestampMs, isRoi) {
-            const dt = new Date(Number(timestampMs) || Date.now());
-            const yyyy = dt.getFullYear();
-            const mm = String(dt.getMonth() + 1).padStart(2, '0');
-            const dd = String(dt.getDate()).padStart(2, '0');
-            const hh = String(dt.getHours()).padStart(2, '0');
-            const mi = String(dt.getMinutes()).padStart(2, '0');
-            const ss = String(dt.getSeconds()).padStart(2, '0');
-            const modeSuffix = isRoi ? '_roi' : '_full';
-            return `probe_snap_ch${channelId}_${yyyy}${mm}${dd}_${hh}${mi}${ss}${modeSuffix}.jpg`;
-        }
-
-        function captureProbeSnapshotFromPreview() {
-            if (!probePreviewImg || !probePreviewImg.complete) {
-                throw new Error('Preview frame is not ready yet.');
-            }
-            const naturalWidth = probePreviewImg.naturalWidth || 0;
-            const naturalHeight = probePreviewImg.naturalHeight || 0;
-            if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
-                throw new Error('No preview frame available to capture.');
-            }
-            const roiNorm = probeRoiEnabled ? normalizeProbeRoiNorm(probeRoiNorm) : null;
-            if (probeRoiEnabled && !roiNorm) {
-                throw new Error('ROI is enabled. Draw ROI before snapping.');
-            }
-            const sx = roiNorm ? Math.max(0, Math.min(naturalWidth - 1, Math.round(roiNorm.x * naturalWidth))) : 0;
-            const sy = roiNorm ? Math.max(0, Math.min(naturalHeight - 1, Math.round(roiNorm.y * naturalHeight))) : 0;
-            const swRaw = roiNorm ? Math.round(roiNorm.w * naturalWidth) : naturalWidth;
-            const shRaw = roiNorm ? Math.round(roiNorm.h * naturalHeight) : naturalHeight;
-            const sw = Math.max(1, Math.min(naturalWidth - sx, swRaw));
-            const sh = Math.max(1, Math.min(naturalHeight - sy, shRaw));
-            if (sw < 2 || sh < 2) {
-                throw new Error('Selected ROI is too small for a snapshot.');
-            }
-            const canvas = document.createElement('canvas');
-            canvas.width = sw;
-            canvas.height = sh;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-                throw new Error('Failed to initialize snapshot buffer.');
-            }
-            ctx.drawImage(probePreviewImg, sx, sy, sw, sh, 0, 0, sw, sh);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-            const commaIdx = dataUrl.indexOf(',');
-            const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : '';
-            if (!base64) {
-                throw new Error('Failed to encode snapshot.');
-            }
-            const timestampMs = Date.now();
-            const channelId = getSelectedProbeChannelId();
-            return {
-                dataUrl,
-                base64,
-                width: sw,
-                height: sh,
-                timestampMs,
-                channelId,
-                roi: Boolean(roiNorm),
-                filename: _buildProbeSnapFilename(channelId, timestampMs, Boolean(roiNorm)),
-            };
-        }
-
-        function openProbeSnapModalFromPreview() {
-            try {
-                const snap = captureProbeSnapshotFromPreview();
-                probeSnapState = snap;
-                if (probeSnapImg) {
-                    probeSnapImg.src = snap.dataUrl;
-                }
-                if (probeSnapMeta) {
-                    const mode = snap.roi ? 'ROI snapshot' : 'Full-frame snapshot';
-                    probeSnapMeta.textContent = `${mode} · ${snap.width}×${snap.height} · Channel #${snap.channelId}`;
-                }
-                if (probeSnapActualSizeInput) {
-                    probeSnapActualSizeInput.checked = false;
-                }
-                updateProbeSnapScaleMode();
-                setProbeSnapModalVisibility(true);
-            } catch (err) {
-                setProbeStatus(err.message || 'Failed to capture snapshot.', true);
-            }
-        }
-
-        function exportProbeSnapshot() {
-            if (!probeSnapState?.dataUrl) {
-                setProbeStatus('No snapshot to export.', true);
-                return;
-            }
-            const anchor = document.createElement('a');
-            anchor.href = probeSnapState.dataUrl;
-            anchor.download = probeSnapState.filename || 'probe_snapshot.jpg';
-            document.body.appendChild(anchor);
-            anchor.click();
-            document.body.removeChild(anchor);
-            setProbeStatus('Snapshot exported.');
-        }
-
-        function setProbeSnapshotAsImageProbe() {
-            if (!probeSnapState?.base64) {
-                setProbeStatus('No snapshot to apply.', true);
-                return;
-            }
-            probeImageState = {
-                name: probeSnapState.filename || 'probe_snapshot.jpg',
-                data: probeSnapState.base64,
-            };
-            applyImageThumb(probeSnapState.base64);
-            updateImageProbeStatus(true);
-            setProbeStatus('Snapshot set as image probe.');
-            setProbeSnapModalVisibility(false);
-        }
-
-        function ensurePairsSeed() {
-            if (!probePairsState || !probePairsState.length) {
-                probePairsState = [
-                    { pos: '', neg: '' },
-                    { pos: '', neg: '' },
-                ];
-            }
-        }
-
-        function renderPairs() {
-            if (!probePairRows) return;
-            ensurePairsSeed();
-            const rows = probePairsState.map((row, idx) => {
-                const canRemove = probePairsState.length > 1;
-                const removeBtn = canRemove ? `<button class="feature-btn probe-remove-btn" data-remove="${idx}">×</button>` : '<div class="probe-pair-idx">–</div>';
-                return `
-                    <div class="probe-pair-row" data-idx="${idx}">
-                        <div class="probe-pair-idx">${idx + 1}.</div>
-                        <input type="text" class="settings-input probe-pos" data-idx="${idx}" value="${escapeHtml(row.pos || '')}" placeholder="Positive probe ${idx + 1}">
-                        <input type="text" class="settings-input probe-neg" data-idx="${idx}" value="${escapeHtml(row.neg || '')}" placeholder="Negative probe ${idx + 1}">
-                        ${removeBtn}
-                    </div>
-                `;
-            }).join('');
-            probePairRows.innerHTML = `
-                ${rows}
-                <div class="probe-pair-row probe-pair-add-row">
-                    <div class="probe-pair-idx">${probePairsState.length + 1}.</div>
-                    <button type="button" class="feature-btn probe-add-pair-btn" data-add-pair="1">Add pair</button>
-                    <div class="probe-add-empty"></div>
-                    <div class="probe-pairs-spacer">&nbsp;</div>
-                </div>
-            `;
-        }
-
-        function applyImageThumb(base64) {
-            if (!probeImageThumb || !probeImageOverlay) return;
-            if (base64) {
-                probeImageThumb.src = `data:image/jpeg;base64,${base64}`;
-                probeImageOverlay.style.display = 'none';
-            } else {
-                probeImageThumb.src = '';
-                probeImageOverlay.style.display = 'flex';
-            }
-            if (probeImagePanel) {
-                probeImagePanel.classList.toggle('no-image', !base64);
-            }
-            if (probeImageFileName) {
-                const label = probeImageState?.name ? String(probeImageState.name) : 'No file selected';
-                probeImageFileName.textContent = label;
-                probeImageFileName.title = probeImageState?.name ? String(probeImageState.name) : '';
-            }
-        }
-
-        function clearProbeImageSelection() {
-            probeImageState = null;
-            if (probeImageFile) probeImageFile.value = '';
-            applyImageThumb('');
-            updateImageProbeStatus(false);
-        }
-
-        function setArchiveUploadName(file) {
-            if (!imageUploadName) return;
-            const label = file?.name ? String(file.name) : 'No file selected';
-            imageUploadName.textContent = label;
-            imageUploadName.title = file?.name ? String(file.name) : '';
-            imageUploadName.classList.toggle('is-hidden', !file?.name);
-        }
-
-        function setArchiveQueryPreview(file) {
-            if (!queryImagePreview || !queryImageThumb) return;
-            if (!file) {
-                queryImageThumb.src = '';
-                queryImagePreview.classList.add('is-empty');
-                queryImagePreview.classList.add('is-hidden');
-                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
-                return;
-            }
-            const reader = new FileReader();
-            reader.onload = () => {
-                const result = typeof reader.result === 'string' ? reader.result : '';
-                if (!result) {
-                    queryImageThumb.src = '';
-                    queryImagePreview.classList.add('is-empty');
-                    queryImagePreview.classList.add('is-hidden');
-                    if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
-                    return;
-                }
-                queryImageThumb.src = result;
-                queryImagePreview.classList.remove('is-empty');
-                queryImagePreview.classList.remove('is-hidden');
-                if (imageQueryPanel) imageQueryPanel.classList.add('has-image');
-            };
-            reader.onerror = () => {
-                queryImageThumb.src = '';
-                queryImagePreview.classList.add('is-empty');
-                queryImagePreview.classList.add('is-hidden');
-                if (imageQueryPanel) imageQueryPanel.classList.remove('has-image');
-            };
-            reader.readAsDataURL(file);
-        }
-
-        function updateImageProbeStatus(enabled) {
-            const hasImage = Boolean(probeImageState?.data);
-            imageProbeEnabled = Boolean(enabled && hasImage);
-            if (probeImageEnableToggle) {
-                probeImageEnableToggle.checked = imageProbeEnabled;
-                probeImageEnableToggle.disabled = !hasImage;
-            }
-            if (probeImageClearBtn) {
-                probeImageClearBtn.disabled = !hasImage;
-            }
-            if (probeImageClearRow) {
-                probeImageClearRow.classList.toggle('is-hidden', !hasImage);
-            }
-            if (probeImageStatus) {
-                const imageState = hasImage ? 'Ok' : 'Missing';
-                probeImageStatus.textContent = `Probe status: ${imageProbeEnabled ? 'Enabled' : 'Disabled'}; Image: ${imageState}.`;
-            }
-        }
-
-        function collectProbeForm() {
-            const positives = [];
-            const negatives = [];
-            const normalizedRoi = normalizeProbeRoiNorm(probeRoiNorm);
-            const roiActive = Boolean(probeRoiEnabled && normalizedRoi);
-            ensurePairsSeed();
-            probePairsState.forEach((row) => {
-                if (row.pos?.trim()) positives.push(row.pos.trim());
-                if (row.neg?.trim()) negatives.push(row.neg.trim());
-            });
-            const channelId = getSelectedProbeChannelId();
-            return {
-                id: activeProbeId,
-                name: (probeNameInput?.value || '').trim(),
-                channel_id: Number.isFinite(channelId) ? channelId : luxriotActiveChannel,
-                pairs: probePairsState.slice(),
-                positives,
-                negatives,
-                pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
-                margin: parseFloat(probeMarginInput?.value) || 0.05,
-                top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
-                window_sec: parseFloat(probeWindowSecInput?.value) || 300,
-                fps: parseFloat(probeFpsInput?.value) || 0,
-                severity: probeBookmarkSeverityInput ? probeBookmarkSeverityInput.value : 'info',
-                bookmark: probeBookmarkToggle ? probeBookmarkToggle.checked : true,
-                enabled: probeEnableToggle ? probeEnableToggle.checked : true,
-                image_probe: {
-                    data: probeImageState?.data,
-                    name: probeImageState?.name,
-                    pos_floor: probeImagePosInput ? (parseFloat(probeImagePosInput.value) || 0.7) : 0.7,
-                    enabled: imageProbeEnabled,
-                },
-                roi_enabled: roiActive,
-                roi_norm: roiActive ? normalizedRoi : null,
-            };
-        }
-
-        function probeHitsKey(probeId = activeProbeId) {
-            return probeId ? `probe:${probeId}` : 'probe:draft';
-        }
-
-        function renderProbeHitsSlice(hits) {
-            if (!hits || !hits.length) {
-                return '<div class="loading">No matches</div>';
-            }
-            return hits.map((hit) => {
-                const ts = hit.timestamp_ms ? new Date(hit.timestamp_ms).toLocaleString() : 'n/a';
-                return `
-                    <div class="probe-result">
-                        ${hit.thumbnail ? `<img src="data:image/jpeg;base64,${hit.thumbnail}" alt="probe hit" />` : ''}
-                        <div class="probe-result-time">${escapeHtml(ts)}</div>
-                        <div class="probe-result-score">P ${(hit.pos_score || 0).toFixed(3)} · N ${(hit.neg_score || 0).toFixed(3)} · M ${(hit.margin || 0).toFixed(3)}</div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        function renderProbeHitsPage(key = probeHitsKey()) {
-            const pageSize = 5;
-            const allHits = probeHitsCacheByKey[key] || [];
-            const total = allHits.length;
-            if (!Number.isFinite(probeHitsOffsetByKey[key])) probeHitsOffsetByKey[key] = 0;
-            if (probeHitsOffsetByKey[key] > Math.max(0, total - 1)) {
-                probeHitsOffsetByKey[key] = 0;
-            }
-            const offset = probeHitsOffsetByKey[key];
-            const pageSlice = allHits.slice(offset, offset + pageSize);
-            if (probeResults) {
-                probeResults.innerHTML = renderProbeHitsSlice(pageSlice);
-            }
-            lastProbeRefresh = probeHitsUpdatedByKey[key] || Date.now();
-            if (probeHitsMeta) {
-                const tsLabel = new Date(lastProbeRefresh).toLocaleTimeString();
-                const pageIdx = total ? Math.floor(offset / pageSize) + 1 : 1;
-                const pageCount = Math.max(1, Math.ceil(total / pageSize));
-                const frames = probeFramesByKey[key] || 0;
-                probeHitsMeta.textContent = `Frames: ${frames} · Hits: ${total} · Page: ${pageIdx}/${pageCount} · Updated: ${tsLabel}`;
-            }
-            if (probeDetLeftBtn) {
-                probeDetLeftBtn.disabled = offset <= 0;
-            }
-            if (probeDetRightBtn) {
-                probeDetRightBtn.disabled = offset + pageSize >= total;
-            }
-        }
-
-        function renderProbeHits(hits = [], framesIndexed = 0, windowSec = null, options = {}) {
-            const key = options.key || probeHitsKey();
-            const replace = options.replace === true;
-            const now = Date.now();
-            const parsedWindow = Number.parseFloat(windowSec);
-            const effectiveWindowSec = Number.isFinite(parsedWindow)
-                ? parsedWindow
-                : Number.parseFloat(probeWindowSecByKey[key]);
-            if (Number.isFinite(effectiveWindowSec) && effectiveWindowSec > 0) {
-                probeWindowSecByKey[key] = effectiveWindowSec;
-            }
-            const minTs = Number.isFinite(effectiveWindowSec) && effectiveWindowSec > 0
-                ? now - (effectiveWindowSec * 1000)
-                : null;
-            const merged = new Map();
-            const addHit = (hit) => {
-                if (!hit) return;
-                if (minTs && hit.timestamp_ms && hit.timestamp_ms < minTs) return;
-                const dedupeKey = `${hit.timestamp_ms || 0}-${(hit.pos_score || 0).toFixed(3)}-${(hit.neg_score || 0).toFixed(3)}-${(hit.margin || 0).toFixed(3)}`;
-                merged.set(dedupeKey, hit);
-            };
-            if (!replace) {
-                (probeHitsCacheByKey[key] || []).forEach(addHit);
-            }
-            (hits || []).forEach(addHit);
-            const combined = Array.from(merged.values())
-                .sort((a, b) => (b.timestamp_ms || 0) - (a.timestamp_ms || 0))
-                .slice(0, 50);
-            probeHitsCacheByKey[key] = combined;
-            probeFramesByKey[key] = Number.isFinite(framesIndexed) ? framesIndexed : (probeFramesByKey[key] || 0);
-            probeHitsUpdatedByKey[key] = now;
-            if (options.resetOffset !== false) {
-                probeHitsOffsetByKey[key] = 0;
-            }
-            if (key === probeHitsKey()) {
-                renderProbeHitsPage(key);
-            }
-        }
-
-        function probeActionIcon(action) {
-            const icons = {
-                expand: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/></svg>',
-                run: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m380-300 280-180-280-180v360Z"/></svg>',
-                enable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="m424-296 282-282-56-56-226 226-114-114-56 56 170 170Z"/></svg>',
-                disable: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M520-200v-560h160v560H520Zm-240 0v-560h160v560H280Z"/></svg>',
-                delete: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360Z"/></svg>',
-                new: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>',
-            };
-            return icons[action] || '';
-        }
-
-        function describeProbeBookmarkGate(rawGate, bookmarkEnabled) {
-            if (bookmarkEnabled === false) {
-                return { text: 'Gate: off', title: 'Bookmarks disabled for this probe' };
-            }
-            const gate = rawGate && typeof rawGate === 'object' ? rawGate : null;
-            if (!gate) {
-                return { text: 'Gate: n/a', title: 'No bookmark gate result yet' };
-            }
-            const reason = String(gate.reason || '').trim().toLowerCase();
-            const dtMs = Number(gate.dt_ms);
-            const sim = Number(gate.similarity);
-            const frameGap = Number(gate.frame_gap);
-            let text = 'Gate: n/a';
-            if (reason === 'sent') {
-                text = 'Gate: sent';
-            } else if (reason === 'cooldown') {
-                text = `Gate: cooldown${Number.isFinite(dtMs) ? ` (${(dtMs / 1000).toFixed(1)}s)` : ''}`;
-            } else if (reason === 'similar_recent_hit') {
-                text = `Gate: deduped${Number.isFinite(sim) ? ` (${(sim * 100).toFixed(1)}%)` : ''}`;
-            } else if (reason === 'send_error') {
-                text = 'Gate: send error';
-            } else if (reason === 'bookmark_disabled') {
-                text = 'Gate: off';
-            } else if (reason) {
-                text = `Gate: ${reason.replace(/_/g, ' ')}`;
-            }
-            const titleParts = [];
-            if (reason) titleParts.push(`reason: ${reason}`);
-            if (Number.isFinite(dtMs)) titleParts.push(`dt: ${(dtMs / 1000).toFixed(2)}s`);
-            if (Number.isFinite(sim)) titleParts.push(`sim: ${sim.toFixed(4)}`);
-            if (Number.isFinite(frameGap)) titleParts.push(`frame gap: ${frameGap.toFixed(2)}`);
-            if (gate.error) titleParts.push(`error: ${String(gate.error)}`);
-            return {
-                text,
-                title: titleParts.join(' · ') || 'No bookmark gate result yet',
-            };
-        }
-
-        function renderProbeCards() {
-            if (!probeCards) return;
-            if (!probeList.length) {
-                probeCards.innerHTML = `
-                    <div class="probe-mini-card new-probe-card">
-                        <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
-                            ${probeActionIcon('new')}
-                            <span>New Probe</span>
-                        </button>
-                    </div>`;
-                return;
-            }
-            const cards = probeList.map((p) => {
-                const last = p.last_hit;
-                const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-                const channelId = parseInt(String(p.channel_id || luxriotActiveChannel), 10);
-                const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
-                const status = p.enabled === false
-                    ? 'disabled'
-                    : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
-                const pillClass = status === 'disabled'
-                    ? 'pill-disabled'
-                    : status === 'running'
-                        ? 'pill-running'
-                        : status === 'paused'
-                            ? 'pill-paused'
-                            : 'pill-idle';
-                const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
-                const toggleAction = status === 'disabled' ? 'enable' : 'disable';
-                const toggleTitle = status === 'disabled' ? 'Enable probe' : 'Disable probe';
-                const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
-                const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
-                return `
-                    <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}">
-                        <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
-                            ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
-                            <div class="probe-mini-overlay">
-                                <div class="probe-mini-top">
-                                    <div class="probe-status-pill ${pillClass}">${status}</div>
-                                    <div class="probe-mini-actions">
-                                        <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Open probe" aria-label="Open probe">${probeActionIcon('expand')}</button>
-                                        <button class="probe-action-btn" data-action="run" data-id="${p.id}" title="Run probe" aria-label="Run probe">${probeActionIcon('run')}</button>
-                                        <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
-                                        <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
-                                    </div>
-                                </div>
-                                <div class="probe-mini-bottom">
-                                    <div class="probe-mini-name">${escapeHtml(p.name || 'unnamed')}</div>
-                                    <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
-                                    <div class="probe-mini-score">${scores}</div>
-                                    <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            });
-            cards.push(`
-                <div class="probe-mini-card new-probe-card">
-                    <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
-                        ${probeActionIcon('new')}
-                        <span>New Probe</span>
-                    </button>
-                </div>
-            `);
-            probeCards.innerHTML = cards.join('');
-        }
-
-        function setActiveProbe(probe) {
-            activeProbeId = probe && probe.id ? probe.id : null;
-            if (probeNameInput) probeNameInput.value = (probe && probe.name) || '';
-            if (probeChannelSelect && probe && probe.channel_id) {
-                probeChannelSelect.value = probe.channel_id;
-                syncProbePreview(probe.channel_id);
-            }
-            if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
-            if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
-            if (probeFpsInput) probeFpsInput.value = probe?.fps ?? 0;
-            if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
-            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
-            if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
-            if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
-            probePairsState = (probe?.pairs && Array.isArray(probe.pairs) ? probe.pairs : null) || (probe ? [] : probePairsState);
-            if (probe?.image_probe?.data) {
-                probeImageState = { data: probe.image_probe.data, name: probe.image_probe.name };
-                applyImageThumb(probe.image_probe.data);
-                if (probeImagePosInput) probeImagePosInput.value = probe.image_probe.pos_floor || 0.7;
-                const enabled = probe.image_probe.enabled !== false;
-                updateImageProbeStatus(enabled);
-            } else {
-                clearProbeImageSelection();
-            }
-            const legacyRoi = probe && probe.roi && typeof probe.roi === 'object' ? probe.roi : null;
-            const savedRoiNorm = probe?.roi_norm || (legacyRoi ? (legacyRoi.norm || legacyRoi) : null);
-            const hasSavedRoiNorm = Boolean(normalizeProbeRoiNorm(savedRoiNorm));
-            const savedRoiEnabled = (probe?.roi_enabled === true)
-                || (legacyRoi && legacyRoi.enabled === true)
-                || (probe?.roi_enabled == null && (!legacyRoi || legacyRoi.enabled == null) && hasSavedRoiNorm);
-            applyProbeRoiState(savedRoiEnabled, savedRoiNorm);
-            renderPairs();
-            const initialHits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
-                ? probe.recent_hits
-                : (probe?.last_hit ? [probe.last_hit] : []);
-            const key = probeHitsKey(activeProbeId);
-            renderProbeHits(
-                initialHits,
-                initialHits.length || (probe?.last_hit ? 1 : 0),
-                probe?.window_sec ?? null,
-                { key, replace: true, resetOffset: true }
-            );
-            updateProbeCaptureMeta(getSelectedProbeChannelId());
-            renderProbeCards();
-            setProbeStatus(activeProbeId ? `Editing: ${probe?.name || probe?.id}` : 'New probe');
-        }
-
-        function updateRunButton(running) {
-            if (!probeRunBtn) return;
-            probeRunBtn.textContent = running ? 'Stop probe' : 'Run probe';
-            probeRunBtn.classList.toggle('primary', running);
-        }
-
-        async function persistProbeEnabled(enabled) {
-            if (!activeProbeId) return;
-            const payload = collectProbeForm();
-            payload.id = activeProbeId;
-            payload.enabled = enabled;
-            try {
-                const resp = await fetch('/probes/save', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Save failed');
-                await loadProbeList();
-                if (probeEnableToggle) probeEnableToggle.checked = enabled;
-            } catch (err) {
-                setProbeStatus(err.message, true);
-            }
-        }
-
-        function stopProbeRunLoop(message) {
-            if (probeRunTimer) {
-                clearInterval(probeRunTimer);
-                probeRunTimer = null;
-            }
-            updateRunButton(false);
-            if (message) setProbeStatus(message);
-        }
-
-        async function loadProbeList(showStatus = false) {
-            try {
-                const resp = await fetch('/probes/list');
-                const data = await resp.json();
-                probeList = data.probes || [];
-                probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
-                await refreshProbeRuntimeState(false);
-                if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
-                const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
-                if (match) {
-                    setActiveProbe(match);
-                } else if (!activeProbeId && probeList.length) {
-                    setActiveProbe(probeList[0]);
-                } else {
-                    renderProbeHits([], 0, null, { key: probeHitsKey(activeProbeId), replace: true, resetOffset: true });
-                    renderProbeCards();
-                }
-            } catch (err) {
-                setProbeStatus('Failed to load probes: ' + err.message, true);
-            }
-        }
-
-        async function ensureProbeCapture(channelId, quiet = false, options = null) {
-            if (!channelId && channelId !== 0) return false;
-            const forceStart = Boolean(options && options.forceStart);
-            if (!forceStart && probeCaptureManualStop[channelId]) {
-                probeChannelRuntime[channelId] = 'idle';
-                updateProbeCaptureMeta(channelId);
-                syncProbePreview(channelId);
-                if (!quiet) {
-                    setProbeStatus('Stream stopped. Press Start Stream to resume.');
-                }
-                return false;
-            }
-            await refreshProbeRuntimeState(false);
-            const runtimeState = probeChannelRuntime[channelId];
-            if (runtimeState === 'running') {
-                probeCaptureState[channelId] = true;
-                delete probeCaptureManualStop[channelId];
-                updateProbeCaptureMeta(channelId);
-                setPreviewState('');
-                syncProbePreview(channelId);
-                if (!quiet) {
-                    await refreshProbeStatus(channelId);
-                }
-                return true;
-            }
-            try {
-                channelCaptureConfig[channelId] = {
-                    fps: parseFloat(probeFpsInput?.value) || 0,
-                    windowSec: parseFloat(probeWindowSecInput?.value) || 300,
-                };
-                const resp = await fetch('/probes/start_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: channelId,
-                        fps: channelCaptureConfig[channelId].fps,
-                        clear_pause: true,
-                    })
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to start capture');
-                probeCaptureState[channelId] = true;
-                probeChannelRuntime[channelId] = 'running';
-                delete probeCaptureManualStop[channelId];
-                renderProbeCards();
-                updateProbeCaptureMeta(channelId);
-                setPreviewState('');
-                syncProbePreview(channelId);
-                if (!quiet) {
-                    await refreshProbeStatus(channelId);
-                }
-                return true;
-            } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
-                if (!quiet) setProbeStatus(err.message, true);
-                updateProbeStreamToggleButton(channelId);
-                return false;
-            }
-        }
-
-        async function stopProbeCapture(channelId, reason = 'stopped') {
-            if (!channelId && channelId !== 0) return;
-            try {
-                const resp = await fetch('/probes/stop_capture', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        channel_id: channelId,
-                        pause: reason === 'paused',
-                    })
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Failed to stop capture');
-                delete probeCaptureState[channelId];
-                if (reason === 'paused') {
-                    probeChannelRuntime[channelId] = 'paused';
-                    delete probeCaptureManualStop[channelId];
-                    setPreviewState('Paused');
-                } else {
-                    probeChannelRuntime[channelId] = 'idle';
-                    probeCaptureManualStop[channelId] = true;
-                    setPreviewState('No stream');
-                }
-                renderProbeCards();
-                stopProbePreview();
-                syncProbePreview(channelId);
-                updateProbeCaptureMeta(channelId);
-                await refreshProbeStatus(channelId);
-            } catch (err) {
-                if (probeCaptureStatus) probeCaptureStatus.textContent = 'Stream: error | Capture: error';
-                setProbeStatus(err.message, true);
-                updateProbeStreamToggleButton(channelId);
-            }
-        }
-
-        async function refreshProbeStatus(channelIdOverride) {
-            const channelId = channelIdOverride || getSelectedProbeChannelId();
-            try {
-                const resp = await fetch(`/probes/status?channel_id=${channelId}`);
-                const data = await resp.json();
-                if (data.error) {
-                    setProbeStatus(data.error, true);
-                    return;
-                }
-                const range = data.time_range_ms && data.time_range_ms.length === 2
-                    ? `${new Date(data.time_range_ms[0]).toLocaleTimeString()} - ${new Date(data.time_range_ms[1]).toLocaleTimeString()}`
-                    : 'n/a';
-                setProbeStatus(`Frames: ${data.frames || 0} · Range: ${range}`);
-                updateProbeCaptureMeta(channelId, data);
-            } catch (err) {
-                setProbeStatus('Status error: ' + err.message, true);
-            }
-        }
-
-        async function saveActiveProbe() {
-            const payload = collectProbeForm();
-            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
-            if (!hasPos) {
-                setProbeStatus('Add a text positive or enable an image probe.', true);
-                return;
-            }
-            setProbeStatus('Saving...');
-            try {
-                const resp = await fetch('/probes/save', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) {
-                    throw new Error(data.error || 'Save failed');
-                }
-                const saved = data.probe;
-                activeProbeId = saved.id || activeProbeId;
-                setProbeStatus(`Saved probe ${saved.name || saved.id}`);
-                await loadProbeList();
-                if (saved?.enabled !== false) {
-                    await ensureProbeCapture(saved.channel_id || payload.channel_id, true);
-                } else {
-                    syncProbePreview(saved.channel_id || payload.channel_id);
-                }
-            } catch (err) {
-                setProbeStatus(err.message, true);
-            }
-            return activeProbeId;
-        }
-
-        async function runActiveProbe(quiet = false) {
-            if (probeRunInFlight) return;
-            const payload = collectProbeForm();
-            const hasPos = payload.positives.length > 0 || (payload.image_probe?.enabled && payload.image_probe?.data);
-            if (!hasPos) {
-                setProbeStatus('Add a text positive or enable an image probe.', true);
-                if (probeRunTimer) stopProbeRunLoop();
-                return;
-            }
-            const channelId = payload.channel_id;
-            const captureReady = await ensureProbeCapture(channelId, true);
-            if (!captureReady) {
-                if (!quiet) setProbeStatus('Stream stopped. Press Start Stream to resume.');
-                return;
-            }
-            if (!quiet) setProbeStatus('Running...');
-            probeRunInFlight = true;
-            try {
-                let resp;
-                if (activeProbeId) {
-                    resp = await fetch('/probes/run', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ id: activeProbeId })
-                    });
-                } else {
-                    resp = await fetch('/probes/query', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                }
-                const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Probe failed');
-                const hits = data.results || [];
-                const framesCount = data.frames_indexed || data.status?.frames || 0;
-                const persistedCount = Number.isFinite(data.persisted_hits) ? data.persisted_hits : hits.length;
-                renderProbeHits(hits, framesCount, payload.window_sec);
-                if (data.probe) {
-                    activeProbeId = data.probe.id || activeProbeId;
-                    await loadProbeList();
-                } else {
-                    renderProbeCards();
-                }
-                if (!quiet) setProbeStatus(`Hits: ${hits.length} · Stored: ${persistedCount} · Frames: ${framesCount}`);
-            } catch (err) {
-                renderProbeHits([], 0);
-                setProbeStatus(err.message, true);
-            } finally {
-                probeRunInFlight = false;
-            }
-        }
-
-        function startProbeRunLoop(quiet = false) {
-            stopProbeRunLoop();
-            updateRunButton(true);
-            runActiveProbe(quiet);
-            const windowSec = parseFloat(probeWindowSecInput?.value) || 30;
-            const intervalMs = Math.max(2000, Math.min(10000, (windowSec * 1000) / 2));
-            probeRunTimer = setInterval(() => runActiveProbe(true), intervalMs);
-            persistProbeEnabled(true);
-        }
-
-        function startProbeStatusPoll() {
-            if (probeStatusTimer) return;
-            refreshProbeStatus();
-            void refreshProbeRuntimeState(true);
-            probeStatusTimer = setInterval(() => {
-                refreshProbeStatus();
-                void refreshProbeRuntimeState(true);
-            }, 8000);
-        }
-
-        function stopProbeStatusPoll() {
-            if (probeStatusTimer) {
-                clearInterval(probeStatusTimer);
-                probeStatusTimer = null;
-            }
-        }
-
-        async function deleteProbe(id) {
-            if (!id) {
-                setProbeStatus('No probe selected', true);
-                return;
-            }
-            try {
-                const resp = await fetch('/probes/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id })
-                });
-                const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Delete failed');
-                if (activeProbeId === id) activeProbeId = null;
-                setProbeStatus('Probe deleted');
-                await loadProbeList(true);
-                stopProbeRunLoop();
-            } catch (err) {
-                setProbeStatus(err.message, true);
-            }
-        }
-
-        function resetProbeDraftEditor() {
-            activeProbeId = null;
-            probePairsState = [];
-            clearProbeRoi(false);
-            clearProbeImageSelection();
-            renderPairs();
-            renderProbeHits([], 0, null, { key: probeHitsKey(null), replace: true, resetOffset: true });
-            if (probeNameInput) probeNameInput.value = '';
-            if (probeEnableToggle) probeEnableToggle.checked = true;
-            if (probeBookmarkToggle) probeBookmarkToggle.checked = true;
-            if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
-            if (probePosFloorInput) probePosFloorInput.value = '0.2';
-            if (probeMarginInput) probeMarginInput.value = '0.05';
-            if (probeFpsInput) probeFpsInput.value = '0';
-            if (probeWindowSecInput) probeWindowSecInput.value = '300';
-            updateProbeCaptureMeta(getSelectedProbeChannelId());
-        }
-
-        function handleProbeCardClick(event) {
-            const btn = event.target.closest('button[data-action]');
-            if (!btn) return;
-            const id = btn.getAttribute('data-id');
-            const action = btn.getAttribute('data-action');
-            const probe = probeList.find(p => String(p.id) === String(id));
-            if (!action) return;
-            if (action === 'expand' && probe) {
-                setActiveProbe(probe);
-                if (probeEditorModal) {
-                    setProbeEditorModalVisibility(true);
-                }
-            } else if (action === 'run' && probe) {
-                setActiveProbe(probe);
-                startProbeRunLoop();
-            } else if (action === 'enable' && probe) {
-                setActiveProbe(probe);
-                persistProbeEnabled(true);
-                ensureProbeCapture(probe.channel_id || luxriotActiveChannel, true);
-            } else if (action === 'delete') {
-                deleteProbe(id);
-            } else if (action === 'disable' && probe) {
-                setActiveProbe(probe);
-                persistProbeEnabled(false);
-                stopProbeRunLoop();
-            } else if (action === 'new') {
-                resetProbeDraftEditor();
-                setProbeStatus('New probe');
-                if (probeEditorModal) {
-                    setProbeEditorModalVisibility(true);
-                }
-            }
-        }
-
-        if (probeRunBtn) {
-            probeRunBtn.addEventListener('click', () => {
-                if (probeRunTimer) {
-                    stopProbeRunLoop('Stopped probe loop');
-                    persistProbeEnabled(false);
-                } else {
-                    if (!activeProbeId) {
-                        saveActiveProbe().then(() => startProbeRunLoop());
-                    } else {
-                        startProbeRunLoop();
-                    }
-                }
-            });
-        }
-        if (probeSaveBtn) {
-            probeSaveBtn.addEventListener('click', async () => {
-                const savedId = await saveActiveProbe();
-                if (savedId && probeEditorModal) {
-                    setProbeEditorModalVisibility(false);
-                }
-            });
-        }
-        if (probeDeleteBtn) probeDeleteBtn.addEventListener('click', () => {
-            if (activeProbeId) deleteProbe(activeProbeId);
-            else {
-                resetProbeDraftEditor();
-                setProbeStatus('Cleared unsaved probe');
-            }
-        });
-        if (probeStreamToggleBtn) {
-            probeStreamToggleBtn.addEventListener('click', () => {
-                if (probeEnableToggle) {
-                    probeEnableToggle.checked = !probeEnableToggle.checked;
-                    probeEnableToggle.dispatchEvent(new Event('change', { bubbles: true }));
-                    return;
-                }
-                const channelId = getSelectedProbeChannelId();
-                ensureProbeCapture(channelId, false, { forceStart: true });
-            });
-        }
-        if (probeChannelSelect) {
-            probeChannelSelect.addEventListener('change', () => {
-                const cid = getSelectedProbeChannelId();
-                syncProbePreview(cid);
-                updateProbeCaptureMeta(cid);
-                refreshProbeStatus(cid);
-            });
-        }
-        if (probeRoiToggleBtn) {
-            probeRoiToggleBtn.addEventListener('click', () => {
-                probeRoiEnabled = !probeRoiEnabled;
-                if (!probeRoiEnabled) {
-                    probeRoiDraftNorm = null;
-                    probeRoiDrawState = null;
-                }
-                updateProbeRoiUi();
-            });
-        }
-        if (probeRoiClearBtn) {
-            probeRoiClearBtn.addEventListener('click', () => {
-                clearProbeRoi(true);
-            });
-        }
-        if (probeRoiLayer) {
-            probeRoiLayer.addEventListener('pointerdown', (event) => {
-                beginProbeRoiDraw(event);
-            });
-            probeRoiLayer.addEventListener('pointermove', (event) => {
-                updateProbeRoiDraw(event);
-            });
-            probeRoiLayer.addEventListener('pointerup', () => {
-                stopProbeRoiDraw(true);
-            });
-            probeRoiLayer.addEventListener('pointercancel', () => {
-                stopProbeRoiDraw(false);
-            });
-        }
-        window.addEventListener('resize', () => {
-            renderProbeRoiBox();
-        });
-        if (probeCards) {
-            probeCards.addEventListener('click', handleProbeCardClick);
-        }
-        if (probeNewBtn) {
-            probeNewBtn.addEventListener('click', () => {
-                resetProbeDraftEditor();
-                setProbeStatus('New probe');
-                if (probeEditorModal) {
-                    setProbeEditorModalVisibility(true);
-                }
-            });
-        }
-        if (probeReloadBtn) {
-            probeReloadBtn.addEventListener('click', () => loadProbeList(true));
-        }
-        if (imageUpload) {
-            imageUpload.addEventListener('change', () => {
-                const file = imageUpload.files && imageUpload.files[0];
-                setArchiveUploadName(file || null);
-                setArchiveQueryPreview(file || null);
-            });
-        }
-        if (probeImageFile) {
-            probeImageFile.addEventListener('change', () => {
-                const file = probeImageFile.files && probeImageFile.files[0];
-                if (!file) {
-                    clearProbeImageSelection();
-                    return;
-                }
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const base64 = reader.result.split(',')[1];
-                    probeImageState = { name: file.name, data: base64 };
-                    applyImageThumb(base64);
-                    updateImageProbeStatus(imageProbeEnabled);
-                };
-                reader.readAsDataURL(file);
-            });
-        }
-        if (probeImageClearBtn) {
-            probeImageClearBtn.addEventListener('click', () => {
-                clearProbeImageSelection();
-            });
-        }
-        if (probePairsContainer) {
-            probePairsContainer.addEventListener('input', (e) => {
-                const target = e.target;
-                const idx = parseInt(target.getAttribute('data-idx') || '-1', 10);
-                if (!Number.isFinite(idx) || idx < 0 || idx >= probePairsState.length) return;
-                if (target.classList.contains('probe-pos')) {
-                    probePairsState[idx].pos = target.value;
-                } else if (target.classList.contains('probe-neg')) {
-                    probePairsState[idx].neg = target.value;
-                }
-            });
-            probePairsContainer.addEventListener('click', (e) => {
-                const addBtn = e.target.closest('button[data-add-pair]');
-                if (addBtn) {
-                    probePairsState.push({ pos: '', neg: '' });
-                    renderPairs();
-                    return;
-                }
-                const btn = e.target.closest('button[data-remove]');
-                if (!btn) return;
-                const idx = parseInt(btn.getAttribute('data-remove') || '-1', 10);
-                if (!Number.isFinite(idx) || idx < 0 || probePairsState.length <= 1) return;
-                probePairsState.splice(idx, 1);
-                renderPairs();
-            });
-        }
-        if (probeDetLeftBtn && probeResults) {
-            probeDetLeftBtn.addEventListener('click', () => {
-                const key = probeHitsKey();
-                const allHits = probeHitsCacheByKey[key] || [];
-                if (!allHits.length) return;
-                const pageSize = 5;
-                const currentOffset = Number.isFinite(probeHitsOffsetByKey[key]) ? probeHitsOffsetByKey[key] : 0;
-                probeHitsOffsetByKey[key] = Math.max(0, currentOffset - pageSize);
-                renderProbeHitsPage(key);
-            });
-        }
-        if (probeDetRightBtn && probeResults) {
-            probeDetRightBtn.addEventListener('click', () => {
-                const key = probeHitsKey();
-                const allHits = probeHitsCacheByKey[key] || [];
-                if (!allHits.length) return;
-                const pageSize = 5;
-                const currentOffset = Number.isFinite(probeHitsOffsetByKey[key]) ? probeHitsOffsetByKey[key] : 0;
-                if (currentOffset + pageSize < allHits.length) {
-                    probeHitsOffsetByKey[key] = currentOffset + pageSize;
-                }
-                renderProbeHitsPage(key);
-            });
-        }
-        if (probeEnableToggle) {
-            probeEnableToggle.addEventListener('change', (e) => {
-                const enabled = e.target.checked;
-                persistProbeEnabled(enabled);
-                if (enabled) {
-                    ensureProbeCapture(getSelectedProbeChannelId(), true);
-                    runActiveProbe(true);
-                } else {
-                    stopProbeRunLoop('Probe disabled');
-                }
-                syncProbePreview(getSelectedProbeChannelId());
-                updateProbeStreamToggleButton(getSelectedProbeChannelId());
-            });
-        }
-        if (probeImageEnableToggle) {
-            probeImageEnableToggle.addEventListener('change', () => {
-                if (!probeImageState?.data) {
-                    updateImageProbeStatus(false);
-                    setProbeStatus('Select an image first.', true);
-                    return;
-                }
-                updateImageProbeStatus(Boolean(probeImageEnableToggle.checked));
-            });
-        }
-        if (probeBenchBtn && probeBenchOutput) {
-            probeBenchBtn.addEventListener('click', async () => {
-                setButtonBusy(probeBenchBtn, true);
-                probeBenchOutput.textContent = 'Benchmark running...';
-                try {
-                    const resp = await fetch('/probes/bench');
-                    const data = await resp.json();
-                    if (!resp.ok || data.error) throw new Error(data.error || 'Benchmark failed');
-                    probeBenchOutput.textContent = `~${data.approx_fps} fps @ batch ${data.batch} on ${data.device} (elapsed ${data.elapsed_sec}s)`;
-                } catch (err) {
-                    probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
-                } finally {
-                    setButtonBusy(probeBenchBtn, false);
-                }
-            });
-        }
-        applyProbeRoiState(false, null);
-
-        // Mode switching
-        if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
-        if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
-        if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
-        if (loadDetectionsBtn) {
-            loadDetectionsBtn.addEventListener('click', () => {
-                setMode('archive');
-                loadDetectionsArchive(true);
-            });
-        }
-        if (refreshDetectionsFiltersBtn) {
-            refreshDetectionsFiltersBtn.addEventListener('click', () => refreshArchiveFilters());
-        }
-        if (archiveDetectionsPrevBtn) {
-            archiveDetectionsPrevBtn.addEventListener('click', () => {
-                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
-                const size = Number.isFinite(pageSize) ? pageSize : 24;
-                archiveDetectionsOffset = Math.max(0, archiveDetectionsOffset - size);
-                loadDetectionsArchive(false);
-            });
-        }
-        if (archiveDetectionsNextBtn) {
-            archiveDetectionsNextBtn.addEventListener('click', () => {
-                if (!archiveDetectionsHasMore) return;
-                const pageSize = Number.parseInt(archiveDetectionsLimit?.value || '24', 10);
-                const size = Number.isFinite(pageSize) ? pageSize : 24;
-                archiveDetectionsOffset += Math.max(1, size);
-                loadDetectionsArchive(false);
-            });
-        }
-        if (archiveChannelFilter) {
-            archiveChannelFilter.addEventListener('change', () => {
-                archiveDetectionsOffset = 0;
-                archiveDetectionsHasMore = false;
-                updateArchiveDetectionsNav();
-                refreshArchiveProbeFilter();
-            });
-        }
-        if (archiveProbeFilter) {
-            archiveProbeFilter.addEventListener('change', () => {
-                archiveDetectionsOffset = 0;
-                archiveDetectionsHasMore = false;
-                updateArchiveDetectionsNav();
-            });
-        }
-        if (archiveTimeFilter) {
-            archiveTimeFilter.addEventListener('change', () => {
-                archiveDetectionsOffset = 0;
-                archiveDetectionsHasMore = false;
-                updateArchiveDetectionsNav();
-            });
-        }
-        if (archiveDetectionsLimit) {
-            archiveDetectionsLimit.addEventListener('change', () => {
-                archiveDetectionsOffset = 0;
-                archiveDetectionsHasMore = false;
-                updateArchiveDetectionsNav();
-            });
-        }
-        if (searchScopeSelect) {
-            searchScopeSelect.addEventListener('change', () => {
-                updateSearchScopeUI();
-            });
-        }
-        
-        // Check index status
-        async function checkIndexStatus(folder) {
-            try {
-                const response = await fetch('/check_index', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder })
-                });
-                return await response.json();
-            } catch (error) {
-                return { indexed: false, available_modes: [] };
-            }
-        }
-
-        async function parseApiJson(response, fallbackMessage) {
-            let data = {};
-            try {
-                data = await response.json();
-            } catch (_) {
-                data = {};
-            }
-            if (!response.ok || data.error) {
-                const message = data.error || `${fallbackMessage} (${response.status})`;
-                throw new Error(message);
-            }
-            return data;
-        }
-        
-        // Index folder
-        indexBtn.addEventListener('click', async () => {
-            const folder = folderInput.value.trim();
-            if (!folder) return;
-            
-            indexStatus.textContent = 'Indexing...';
-            indexStatus.className = 'status';
-            setButtonBusy(indexBtn, true);
-            
-            try {
-                const response = await fetch('/index', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    const counts = data.counts || {};
-                    const summary = Object.keys(counts).length > 0
-                        ? Object.entries(counts).map(([mode, count]) => `${mode}: ${count}`).join(' | ')
-                        : `Active: ${data.count || 0}`;
-                    indexStatus.textContent = `Indexed successfully (${summary})`;
-                    indexStatus.className = 'status success';
-                    currentFolder = folder;
-                    const modes = data.modes || [];
-                    if (modes.includes(embedderSelect.value)) {
-                        applyEmbedderUI(embedderSelect.value);
-                    }
-                } else {
-                    indexStatus.textContent = data.error || 'Indexing failed';
-                    indexStatus.className = 'status error';
-                }
-            } catch (error) {
-                indexStatus.textContent = 'Error: ' + error.message;
-                indexStatus.className = 'status error';
-            } finally {
-                setButtonBusy(indexBtn, false);
-            }
-        });
-        
-        // Text search
-        searchBtn.addEventListener('click', async () => {
-            setMode('archive');
-            const query = searchInput.value.trim();
-            const folder = folderInput.value.trim();
-            const limit = resultLimitSelect.value;
-            const sortBy = sortBySelect.value;
-            const detectionsScope = isDetectionsScope();
-            
-            if (!query || (!detectionsScope && !folder)) return;
-            
-            setButtonBusy(searchBtn, true);
-            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
-            
-            try {
-                let response;
-                if (detectionsScope) {
-                    const payload = {
-                        query,
-                        limit,
-                        sort_by: sortBy,
-                        embedder: embedderSelect ? embedderSelect.value : 'clip',
-                        ...buildDetectionSearchFilters(),
-                    };
-                    response = await fetch('/detections/search_text', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload),
-                    });
-                } else {
-                    response = await fetch('/search', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
-                    });
-                }
-                
-                const data = await parseApiJson(response, 'Text search failed');
-                
-                if (data.results && data.results.length > 0) {
-                    const renderedResults = detectionsScope
-                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
-                        : data.results;
-                    displayResults(renderedResults);
-                    if (detectionsScope && data.mode_requested && data.mode_used && data.mode_requested !== data.mode_used) {
-                        indexStatus.textContent = `Detections text search uses ${data.mode_used.toUpperCase()} backend.`;
-                        indexStatus.className = 'status warning';
-                    }
-                } else {
-                    resultsContainer.innerHTML = '<div class="loading">No results found</div>';
-                }
-            } catch (error) {
-                resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
-            } finally {
-                setButtonBusy(searchBtn, false);
-            }
-        });
-        
-        // Image search
-        imageSearchBtn.addEventListener('click', async () => {
-            setMode('archive');
-            const folder = folderInput.value.trim();
-            const file = imageUpload.files[0];
-            const limit = resultLimitSelect.value;
-            const sortBy = sortBySelect.value;
-            const detectionsScope = isDetectionsScope();
-            
-            if (!file) {
-                alert('Please upload an image file.');
-                return;
-            }
-            if (!detectionsScope && !folder) {
-                alert('Please select a folder and upload an image file.');
-                return;
-            }
-            
-            setButtonBusy(imageSearchBtn, true);
-            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
-            
-            try {
-                const formData = new FormData();
-                formData.append('limit', limit);
-                formData.append('sort_by', sortBy);
-                formData.append('image', file);
-                if (detectionsScope) {
-                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
-                    const filters = buildDetectionSearchFilters();
-                    Object.entries(filters).forEach(([key, value]) => {
-                        if (value !== undefined && value !== null && String(value).length > 0) {
-                            formData.append(key, String(value));
-                        }
-                    });
-                } else {
-                    formData.append('folder', folder);
-                }
-                
-                const response = await fetch(detectionsScope ? '/detections/search_image' : '/search_by_image', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                const data = await parseApiJson(response, 'Image search failed');
-                
-                if (data.results && data.results.length > 0) {
-                    const renderedResults = detectionsScope
-                        ? decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested)
-                        : data.results;
-                    displayResults(renderedResults);
-                } else {
-                    resultsContainer.innerHTML = '<div class="loading">No results found</div>';
-                }
-            } catch (error) {
-                resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
-            } finally {
-                setButtonBusy(imageSearchBtn, false);
-            }
-        });
-
-        function renderVideoFrames(frames) {
-            if (!videoFrames) return;
-            if (!frames || !frames.length) {
-                videoFrames.innerHTML = '';
-                return;
-            }
-            const html = frames.map((frame, idx) => {
-                const ts = typeof frame.time_sec === 'number' ? `${frame.time_sec.toFixed(2)}s` : 'n/a';
-                return `<div title="Frame ${idx + 1} (${ts})"><img src="data:image/jpeg;base64,${frame.thumbnail}" alt="Frame ${idx + 1}" /></div>`;
-            }).join('');
-            videoFrames.innerHTML = html;
-        }
-
-        async function runVideoUnderstanding() {
-            const videoPath = videoPathInput.value.trim();
-            const frameCount = parseInt(videoFrameCount.value, 10) || 16;
-            const sampleFpsValue = Number.parseFloat(videoSampleFpsInput.value);
-            const prompt = videoPromptInput.value.trim();
-            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
-
-            if (!videoPath) {
-                videoStatus.textContent = 'Provide a video path.';
-                videoStatus.className = 'video-status error';
-                return;
-            }
-
-            if (saveVideoPromptInput && saveVideoPromptInput.checked) {
-                localStorage.setItem('evs_video_prompt', prompt);
-            } else {
-                localStorage.removeItem('evs_video_prompt');
-            }
-
-            setButtonBusy(videoRunBtn, true);
-            saveSummaryBtn.style.display = 'none';
-            lastSummaryText = '';
-            lastSummaryTarget = null;
-            videoStatus.dataset.base = 'Sampling frames and querying the model...';
-            videoStatus.textContent = videoStatus.dataset.base;
-            videoStatus.className = 'video-status';
-            videoOutput.style.display = 'none';
-            videoOutput.innerHTML = '';
-            renderVideoFrames([]);
-            startVideoTimer();
-
-            try {
-                const payload = {
-                    video: videoPath,
-                    frame_count: frameCount,
-                    prompt,
-                };
-                if (modelId) {
-                    payload.model = modelId;
-                }
-                if (Number.isFinite(sampleFpsValue) && sampleFpsValue > 0) {
-                    payload.sample_fps = sampleFpsValue;
-                }
-                const response = await fetch('/video_understanding', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                const data = await response.json();
-                if (!response.ok || data.error) {
-                    videoStatus.dataset.base = data.error || 'Video understanding request failed.';
-                    videoStatus.textContent = videoStatus.dataset.base;
-                    videoStatus.className = 'video-status error';
-                    stopVideoTimer();
-                    return;
-                }
-                const durationLabel = typeof data.duration_sec === 'number' ? ` · Duration: ${formatDuration(data.duration_sec)}` : '';
-                videoStatus.dataset.base = `Model: ${data.model || modelId || 'LM Studio'} · Frames sent: ${(data.frames || []).length || frameCount}${durationLabel}`;
-                videoStatus.textContent = videoStatus.dataset.base;
-                if (data.summary) {
-                    videoOutput.style.display = 'block';
-                    videoOutput.innerHTML = renderMarkdown(data.summary);
-                    lastSummaryText = data.summary;
-                    lastSummaryTarget = null;
-                    saveSummaryBtn.style.display = 'inline-flex';
-                } else {
-                    videoOutput.style.display = 'block';
-                    videoOutput.textContent = '(No summary returned)';
-                    lastSummaryText = '';
-                    lastSummaryTarget = null;
-                    saveSummaryBtn.style.display = 'none';
-                }
-                renderVideoFrames(data.frames || []);
-                stopVideoTimer(true);
-            } catch (error) {
-                videoStatus.dataset.base = 'Error: ' + error.message;
-                videoStatus.textContent = videoStatus.dataset.base;
-                videoStatus.className = 'video-status error';
-                stopVideoTimer(true);
-            } finally {
-                setButtonBusy(videoRunBtn, false);
-            }
-        }
-
-        if (videoRunBtn) {
-            videoRunBtn.addEventListener('click', runVideoUnderstanding);
-        }
-
-        async function saveSummaryAsComment() {
-            if (!lastSummaryText || !lastSummaryTarget || !lastSummaryTarget.path) {
-                alert('No summary or target image available to save.');
-                return;
-            }
-            const folder = folderInput.value.trim();
-            if (!folder) {
-                alert('Please enter a folder path first.');
-                return;
-            }
-            try {
-                const response = await fetch('/comments', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        folder,
-                        image_path: lastSummaryTarget.path,
-                        comment: lastSummaryText,
-                    }),
-                });
-                const data = await response.json();
-                if (data.success) {
-                    alert('Summary saved as comment.');
-                } else {
-                    alert('Failed to save comment: ' + (data.error || 'Unknown error'));
-                }
-            } catch (err) {
-                alert('Failed to save comment: ' + err.message);
-            }
-        }
-
-        if (saveSummaryBtn) {
-            saveSummaryBtn.addEventListener('click', saveSummaryAsComment);
-        }
-        
-        // Show commented images
-        showCommentedBtn.addEventListener('click', async () => {
-            const folder = folderInput.value.trim();
-            
-            if (!folder) {
-                alert('Please enter a folder path first');
-                return;
-            }
-            setMode('archive');
-            
-            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
-            
-            try {
-                const response = await fetch('/commented_images', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder })
-                });
-                
-                const data = await parseApiJson(response, 'Loading commented images failed');
-                
-                if (data.results && data.results.length > 0) {
-                    displayCommentedResults(data.results);
-                } else {
-                    resultsContainer.innerHTML = '<div class="loading">No commented images found</div>';
-                }
-            } catch (error) {
-                resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
-            }
-        });
-        
-        // Generate common HTML structure for result items
-        function generateResultItemHTML(result, index, isCommented = false) {
-            const similarityMarkup = buildSimilarityMetrics(result, isCommented);
-            const badgesMarkup = buildResultBadges(result);
-            const safeFilename = escapeHtml(result.filename || 'unnamed');
-            const rawPath = String(result.path || '');
-            const hasPath = rawPath.length > 0;
-            const showFilenameRow = !(result && result.is_detection);
-            const safePath = escapeHtml(rawPath);
-            const thumb = String(result.thumbnail || '').trim();
-            const fallbackSvg = encodeURIComponent(
-                '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="260">' +
-                '<rect width="100%" height="100%" fill="#1f2026"/>' +
-                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#9aa0ad" font-size="18">No thumbnail</text>' +
-                '</svg>'
-            );
-            const thumbnailSrc = thumb ? `data:image/jpeg;base64,${thumb}` : `data:image/svg+xml;charset=utf-8,${fallbackSvg}`;
-                
-            return `
-                <div class="image-container">
-                    <img src="${thumbnailSrc}" class="thumbnail" alt="" />
-                    <div class="image-overlay">
-                        ${hasPath ? `
-                            <div class="expand-collapse-icon" data-index="${index}">
-                                <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                                    <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                                </svg>
-                            </div>
-                        ` : ''}
-                    </div>
-                </div>
-                <div class="result-info">
-                    ${showFilenameRow ? `
-                        <div class="filename">
-                            ${safeFilename}
-                            <svg class="copy-icon" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="#888">
-                                <path d="M360-240q-29.7 0-50.85-21.15Q288-282.3 288-312v-480q0-29.7 21.15-50.85Q330.3-864 360-864h384q29.7 0 50.85 21.15Q816-821.7 816-792v480q0 29.7-21.15 50.85Q773.7-240 744-240H360Zm0-72h384v-480H360v480ZM216-96q-29.7 0-50.85-21.15Q144-138.3 144-168v-552h72v552h456v72H216Zm144-216v-480 480Z"/>
-                            </svg>
-                        </div>
-                    ` : ''}
-                    ${badgesMarkup}
-                    <div class="similarity">${similarityMarkup}</div>
-                    <div class="result-actions">
-                        <button class="action-icon describe-icon" data-index="${index}" data-path="${safePath}" title="Describe with LM">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
-                                <path d="M160-120q-33 0-56.5-23.5T80-200v-560q0-33 23.5-56.5T160-840h545q33 0 56.5 23.5T785-760v160h-80v-160H160v560h545v-160h80v160q0 33-23.5 56.5T705-120H160Zm520-240 57-57-143-143 143-143-57-57-143 143-143-143-57 57 143 143-143 143 57 57 143-143 143 143Z"/>
-                            </svg>
-                        </button>
-                        <button class="action-icon find-similar-icon" data-index="${index}" data-path="${safePath}" title="Find similar">
-                            <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="#e3e3e3">
-                                <path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56ZM380-400q75 0 127.5-52.5T560-580q0-75-52.5-127.5T380-760q-75 0-127.5 52.5T200-580q0 75 52.5 127.5T380-400Z"/>
-                            </svg>
-                        </button>
-                    </div>
-                </div>
-                ${hasPath ? `
-                    <div class="segments-panel" id="segments-${index}">
-                        <div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>
-                    </div>
-                    <div class="comment-section">
-                        <div class="lm-description" id="lm-desc-${index}">
-                            <div class="no-comments">No LLM description yet.</div>
-                        </div>
-                        <div class="lm-description-actions">
-                            <button class="save-comment-btn is-hidden" id="lm-save-btn-${index}">Save LLM as comment</button>
-                        </div>
-                        <div class="comments-list" id="comments-${index}">
-                            <div class="comment-loading">Loading comments...</div>
-                        </div>
-                        <div class="comment-form">
-                            <textarea class="comment-input" placeholder="Add a comment..." id="comment-input-${index}"></textarea>
-                            <button class="save-comment-btn" id="save-btn-${index}">Save</button>
-                        </div>
-                    </div>
-                ` : ''}
-            `;
-        }
-
-        // Setup event handlers for result item
-        function setupResultItemEventHandlers(item, result, index) {
-            // Handle expand/collapse via overlay icon
-            const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-            if (expandCollapseIcon && result.path) {
-                expandCollapseIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    toggleImageExpansion(item, result, index);
-                });
-            }
-            
-            // Handle copy icon click
-            const copyIcon = item.querySelector('.copy-icon');
-            if (copyIcon) {
-                if (result.path) {
-                    copyIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        copyImagePath(result.path);
-                    });
-                } else {
-                    copyIcon.style.display = 'none';
-                }
-            }
-            
-            
-            // Handle find similar button
-            const findSimilarIcon = item.querySelector('.find-similar-icon');
-            if (findSimilarIcon) {
-                if (result.path) {
-                    findSimilarIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        findSimilarImages(result.path, result);
-                    });
-                } else {
-                    findSimilarIcon.style.display = 'none';
-                }
-            }
-
-            const describeIcon = item.querySelector('.describe-icon');
-            if (describeIcon) {
-                if (result.path) {
-                    describeIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        describeImageWithLM(index, result.path, item, result);
-                    });
-                } else {
-                    describeIcon.style.display = 'none';
-                }
-            }
-            
-            // Add save comment functionality
-            const saveBtn = item.querySelector(`#save-btn-${index}`);
-            const commentInput = item.querySelector(`#comment-input-${index}`);
-            
-            if (saveBtn) {
-                if (result.path && !result.is_detection) {
-                    saveBtn.addEventListener('click', () => {
-                        saveComment(index, result.path, folderInput.value.trim(), commentInput.value.trim());
-                    });
-                } else {
-                    saveBtn.disabled = true;
-                }
-            }
-
-            const lmSaveBtn = item.querySelector(`#lm-save-btn-${index}`);
-            if (lmSaveBtn) {
-                if (result.path && !result.is_detection) {
-                    lmSaveBtn.addEventListener('click', () => {
-                        saveLmDescriptionAsComment(index, result.path);
-                    });
-                } else {
-                    lmSaveBtn.style.display = 'none';
-                }
-            }
-
-            const img = item.querySelector('.thumbnail');
-            if (img && result.path && !result.is_detection) {
-                img.addEventListener('click', (e) => {
-                    handleSegmentClick(e, result, index, item);
-                });
-            }
-        }
-
-        // Display results
-        function displayResults(results) {
-            resultsContainer.innerHTML = '';
-            segmentContextByIndex = {};
-            
-            results.forEach((result, index) => {
-                const item = document.createElement('div');
-                item.className = 'result-item';
-                item.dataset.resultIndex = index;
-                item.innerHTML = generateResultItemHTML(result, index, false);
-                
-                setupResultItemEventHandlers(item, result, index);
-                resetSegmentsPanel(item, index);
-                resultsContainer.appendChild(item);
-            });
-
-            refreshSegmentsPanels();
-        }
-        
-        // Display commented results (similar to displayResults but with comment info)
-        function displayCommentedResults(results) {
-            resultsContainer.innerHTML = '';
-            segmentContextByIndex = {};
-            
-            results.forEach((result, index) => {
-                const item = document.createElement('div');
-                item.className = 'result-item';
-                item.dataset.resultIndex = index;
-                item.innerHTML = generateResultItemHTML(result, index, true);
-                
-                setupResultItemEventHandlers(item, result, index);
-                resetSegmentsPanel(item, index);
-                resultsContainer.appendChild(item);
-            });
-
-            refreshSegmentsPanels();
-        }
-        
-        // Comment functionality
-        async function loadComments(index, imagePath, folder) {
-            const commentsContainer = document.getElementById(`comments-${index}`);
-            
-            try {
-                const response = await fetch(`/comments?folder=${encodeURIComponent(folder)}&image_path=${encodeURIComponent(imagePath)}`);
-                const data = await response.json();
-                
-                if (data.comments && data.comments.length > 0) {
-                    displayComments(commentsContainer, data.comments);
-                } else {
-                    commentsContainer.innerHTML = '<div class="no-comments">No comments yet. Be the first to add one!</div>';
-                }
-            } catch (error) {
-                console.error('Error loading comments:', error);
-                commentsContainer.innerHTML = '<div class="no-comments">Error loading comments</div>';
-            }
-        }
-        
-        function displayComments(container, comments) {
-            container.innerHTML = '';
-            comments.forEach(comment => {
-                const commentDiv = document.createElement('div');
-                commentDiv.className = 'comment-item';
-                
-                // Parse timestamp and comment text
-                const timestampMatch = comment.match(/^\\[(.*?)\\] (.*)$/);
-                if (timestampMatch) {
-                    const [, timestamp, text] = timestampMatch;
-                    commentDiv.innerHTML = `
-                        <div class="comment-timestamp">${timestamp}</div>
-                        <div class="comment-text">${escapeHtml(text)}</div>
-                    `;
-                } else {
-                    commentDiv.innerHTML = `<div class="comment-text">${escapeHtml(comment)}</div>`;
-                }
-                
-                container.appendChild(commentDiv);
-            });
-        }
-
-        function renderLmDescription(index, summary, modelLabel = '') {
-            const descContainer = document.getElementById(`lm-desc-${index}`);
-            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
-            if (!descContainer || !saveBtn) return;
-
-            const now = new Date().toLocaleString();
-            const modelSuffix = modelLabel ? ` · ${escapeHtml(modelLabel)}` : '';
-            descContainer.innerHTML = `
-                <div class="comment-item lm-comment">
-                    <div class="comment-timestamp">LLM Description${modelSuffix} · ${escapeHtml(now)}</div>
-                    <div class="comment-text">${renderMarkdown(summary || '')}</div>
-                </div>
-            `;
-            saveBtn.dataset.summary = summary || '';
-            saveBtn.style.display = 'inline-flex';
-            saveBtn.disabled = false;
-            saveBtn.textContent = 'Save LLM as comment';
-        }
-
-        async function saveLmDescriptionAsComment(index, imagePath) {
-            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
-            if (!saveBtn) return;
-            const summary = (saveBtn.dataset.summary || '').trim();
-            if (!summary) {
-                alert('No LLM description to save yet.');
-                return;
-            }
-            const folder = folderInput.value.trim();
-            if (!folder) {
-                alert('Please enter a folder path first.');
-                return;
-            }
-
-            setButtonBusy(saveBtn, true);
-            try {
-                const response = await fetch('/comments', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        folder,
-                        image_path: imagePath,
-                        comment: summary,
-                    }),
-                });
-                const data = await parseApiJson(response, 'Saving LLM description failed');
-                const commentsContainer = document.getElementById(`comments-${index}`);
-                if (commentsContainer && Array.isArray(data.comments)) {
-                    displayComments(commentsContainer, data.comments);
-                }
-                indexStatus.textContent = 'LLM description saved as comment.';
-                indexStatus.className = 'status success';
-            } catch (err) {
-                alert('Failed to save LLM description: ' + err.message);
-            } finally {
-                setButtonBusy(saveBtn, false);
-            }
-        }
-        
-        async function saveComment(index, imagePath, folder, comment) {
-            if (!comment) return;
-            
-            const saveBtn = document.getElementById(`save-btn-${index}`);
-            const commentInput = document.getElementById(`comment-input-${index}`);
-            
-            setButtonBusy(saveBtn, true);
-            
-            try {
-                const response = await fetch('/comments', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        folder: folder,
-                        image_path: imagePath,
-                        comment: comment
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    // Clear input and reload comments
-                    commentInput.value = '';
-                    const commentsContainer = document.getElementById(`comments-${index}`);
-                    displayComments(commentsContainer, data.comments);
-                } else {
-                    alert('Error saving comment: ' + (data.error || 'Unknown error'));
-                }
-            } catch (error) {
-                console.error('Error saving comment:', error);
-                alert('Error saving comment: ' + error.message);
-            } finally {
-                setButtonBusy(saveBtn, false);
-            }
-        }
-        
-        function toggleImageExpansion(item, result, index) {
-            const img = item.querySelector('.thumbnail');
-            const expandCollapseIcon = item.querySelector('.expand-collapse-icon');
-            const isExpanded = item.classList.contains('expanded');
-            
-            if (isExpanded) {
-                // Collapse: switch back to thumbnail
-                img.src = `data:image/jpeg;base64,${result.thumbnail}`;
-                item.classList.remove('expanded');
-                resetSegmentsPanel(item, index);
-                delete segmentContextByIndex[index];
-                img.classList.remove('segment-enabled');
-                // Update icon to expand
-                expandCollapseIcon.innerHTML = `
-                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                        <path d="M240-240v-240h72v168h168v72H240Zm408-240v-168H480v-72h240v240h-72Z"/>
-                    </svg>
-                `;
-            } else {
-                // Expand: show original image and load comments
-                const activeFolder = folderInput.value.trim();
-                const originalImageUrl = buildImageFetchUrl(result.path || '', result);
-                img.src = originalImageUrl;
-                item.classList.add('expanded');
-                if (!result.is_detection && activeFolder) {
-                    loadComments(index, result.path, activeFolder);
-                    prepareSegmentsPanel(item, result, index);
-                } else {
-                    const commentsContainer = document.getElementById(`comments-${index}`);
-                    if (commentsContainer) {
-                        commentsContainer.innerHTML = '<div class="no-comments">Comments are available for indexed-folder images only.</div>';
-                    }
-                    const panel = item.querySelector(`#segments-${index}`);
-                    if (panel) {
-                        panel.innerHTML = '<div class="segments-status warning">Segmentation is available for indexed-folder images only.</div>';
-                    }
-                }
-                if (segmentsEnabledInput.checked && !result.is_detection) {
-                    img.classList.add('segment-enabled');
-                }
-                // Update icon to collapse
-                expandCollapseIcon.innerHTML = `
-                    <svg xmlns="http://www.w3.org/2000/svg" height="20px" viewBox="0 -960 960 960" width="20px" fill="#e3e3e3">
-                        <path d="M432-432v240h-72v-168H192v-72h240Zm168-336v168h168v72H528v-240h72Z"/>
-                    </svg>
-                `;
-            }
-        }
-
-        function resetSegmentsPanel(item, index) {
-            const panel = item.querySelector(`#segments-${index}`);
-            if (!panel) return;
-            if (!segmentsEnabledInput.checked) {
-                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
-            } else {
-                panel.innerHTML = '<div class="segments-status">Expand the image and click on an area to propose regions.</div>';
-            }
-        }
-
-        function prepareSegmentsPanel(item, result, index) {
-            const panel = item.querySelector(`#segments-${index}`);
-            if (!panel) return;
-            if (!segmentsEnabledInput.checked) {
-                panel.innerHTML = '<div class="segments-status warning">Segments disabled. Enable in settings to propose regions.</div>';
-                return;
-            }
-            panel.innerHTML = '<div class="segments-status">Click inside the image to propose a region near the selected point.</div>';
-        }
-
-        function refreshSegmentsPanels() {
-            document.querySelectorAll('.result-item').forEach((item) => {
-                const indexAttr = item.dataset.resultIndex;
-                if (typeof indexAttr === 'undefined') return;
-                const index = parseInt(indexAttr, 10);
-                if (Number.isNaN(index)) return;
-                if (item.classList.contains('expanded')) {
-                    prepareSegmentsPanel(item, null, index);
-                    const img = item.querySelector('.thumbnail');
-                    if (img) {
-                        if (segmentsEnabledInput.checked) {
-                            img.classList.add('segment-enabled');
-                        } else {
-                            img.classList.remove('segment-enabled');
-                        }
-                    }
-                } else {
-                    resetSegmentsPanel(item, index);
-                    const img = item.querySelector('.thumbnail');
-                    if (img) {
-                        img.classList.remove('segment-enabled');
-                    }
-                }
-            });
-        }
-
-        function clamp01(value) {
-            if (!Number.isFinite(value)) return 0;
-            return Math.min(1, Math.max(0, value));
-        }
-
-        function stripBase64Payload(rawValue) {
-            const text = String(rawValue || '').trim();
-            if (!text) return '';
-            if (text.startsWith('data:')) {
-                const comma = text.indexOf(',');
-                return comma >= 0 ? text.slice(comma + 1) : '';
-            }
-            return text;
-        }
-
-        function extractSegmentMeta(segments) {
-            const ids = [];
-            const labels = {};
-            (segments || []).forEach((segment) => {
-                if (!segment || segment.segment_id === undefined || segment.segment_id === null) return;
-                const segId = String(segment.segment_id).trim();
-                if (!segId) return;
-                ids.push(segId);
-                if (segment.label !== undefined && segment.label !== null) {
-                    const label = String(segment.label).trim();
-                    if (label) {
-                        labels[segId] = label;
-                    }
-                }
-            });
-            return {
-                segmentIds: [...new Set(ids)],
-                segmentLabels: labels,
-            };
-        }
-
-        function showSegmentPanelNotice(panel, message, level = 'success') {
-            if (!panel) return;
-            const safeLevel = ['success', 'warning', 'error'].includes(level) ? level : 'success';
-            const notice = document.createElement('div');
-            notice.className = `segments-status ${safeLevel}`;
-            notice.textContent = message;
-            panel.prepend(notice);
-            setTimeout(() => {
-                notice.remove();
-            }, 5200);
-        }
-
-        function buildSegmentActionContext(result, data, xNorm, yNorm, baseImageSrc) {
-            if (!result || !result.path) {
-                return null;
-            }
-            const folder = folderInput.value.trim();
-            if (!folder) {
-                return null;
-            }
-            const overlay = data && data.overlay ? data.overlay : {};
-            const maskBase64 = stripBase64Payload(overlay.mask_raw_png || overlay.mask_png || '');
-            if (!maskBase64) {
-                return null;
-            }
-            const segments = Array.isArray(data && data.segments) ? data.segments : [];
-            const meta = extractSegmentMeta(segments);
-            return {
-                folder,
-                imagePath: String(result.path),
-                maskBase64,
-                segmentIds: meta.segmentIds,
-                segmentLabels: meta.segmentLabels,
-                overlay,
-                xNorm,
-                yNorm,
-                baseImageSrc: baseImageSrc || '',
-            };
-        }
-
-        async function runMaskSearchFromSegment(index, panel, triggerBtn = null) {
-            const context = segmentContextByIndex[index];
-            if (!context || !context.maskBase64) {
-                showSegmentPanelNotice(panel, 'Click the image to create a region mask first.', 'warning');
-                return;
-            }
-
-            const payload = {
-                folder: context.folder,
-                image_path: context.imagePath,
-                mask: context.maskBase64,
-                limit: parseInt(resultLimitSelect.value, 10) || 12,
-                sort_by: sortBySelect.value || 'similarity',
-                targets: ['images', 'segments'],
-            };
-            if (context.segmentLabels && Object.keys(context.segmentLabels).length) {
-                payload.segment_labels = context.segmentLabels;
-            }
-
-            const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
-            if (button) {
-                setButtonBusy(button, true);
-            }
-
-            try {
-                const response = await fetch('/search_by_mask', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                let data = {};
-                try {
-                    data = await response.json();
-                } catch (_) {
-                    data = {};
-                }
-                if (!response.ok || data.error) {
-                    const hint = data.hint ? ` ${data.hint}` : '';
-                    throw new Error(`${data.error || 'Mask search failed'}${hint}`);
-                }
-                const segments = Array.isArray(data.segments) ? data.segments : [];
-                const meta = extractSegmentMeta(segments);
-                const refreshedContext = {
-                    ...context,
-                    segmentIds: meta.segmentIds,
-                    segmentLabels: meta.segmentLabels,
-                };
-                segmentContextByIndex[index] = refreshedContext;
-                renderSegmentResponse(
-                    panel,
-                    { ...data, overlay: context.overlay || {} },
-                    context.xNorm,
-                    context.yNorm,
-                    context.baseImageSrc || '',
-                    { index, actionContext: refreshedContext, sourceLabel: 'Mask search' },
-                );
-                indexStatus.textContent = segments.length
-                    ? `Mask search returned ${segments.length} region candidate(s).`
-                    : 'Mask search returned no region candidates.';
-                indexStatus.className = segments.length ? 'status success' : 'status warning';
-            } catch (err) {
-                showSegmentPanelNotice(panel, `Mask search failed: ${err.message || String(err)}`, 'error');
-            } finally {
-                if (button) {
-                    setButtonBusy(button, false);
-                }
-            }
-        }
-
-        async function indexSegmentsFromMask(index, panel, triggerBtn = null) {
-            const context = segmentContextByIndex[index];
-            if (!context || !context.maskBase64) {
-                showSegmentPanelNotice(panel, 'Click the image to create a region mask first.', 'warning');
-                return;
-            }
-
-            const payload = {
-                folder: context.folder,
-                image_path: context.imagePath,
-                mask: context.maskBase64,
-                segment_labels: context.segmentLabels || {},
-            };
-
-            const button = triggerBtn instanceof HTMLButtonElement ? triggerBtn : null;
-            if (button) {
-                setButtonBusy(button, true);
-            }
-
-            try {
-                const response = await fetch('/index_segments', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                let data = {};
-                try {
-                    data = await response.json();
-                } catch (_) {
-                    data = {};
-                }
-                if (!response.ok || data.error) {
-                    const hint = data.hint ? ` ${data.hint}` : '';
-                    throw new Error(`${data.error || 'Segment indexing failed'}${hint}`);
-                }
-                const count = Array.isArray(data.segments_indexed)
-                    ? data.segments_indexed.length
-                    : Number(data.segment_count || 0);
-                showSegmentPanelNotice(panel, `Indexed ${count} segment(s) for this image.`, 'success');
-                const relaxedNote = data.min_patches_relaxed ? ' (min patch fallback used)' : '';
-                indexStatus.textContent = `Segment index updated (${count} segment${count === 1 ? '' : 's'})${relaxedNote}.`;
-                indexStatus.className = 'status success';
-            } catch (err) {
-                showSegmentPanelNotice(panel, `Segment indexing failed: ${err.message || String(err)}`, 'error');
-                indexStatus.textContent = `Segment indexing failed: ${err.message || String(err)}`;
-                indexStatus.className = 'status error';
-            } finally {
-                if (button) {
-                    setButtonBusy(button, false);
-                }
-            }
-        }
-
-        async function handleSegmentClick(event, result, index, item) {
-            if (!segmentsEnabledInput.checked) return;
-            if (!item.classList.contains('expanded')) return;
-
-            const folder = folderInput.value.trim();
-            if (!folder) {
-                const panel = item.querySelector(`#segments-${index}`);
-                if (panel) {
-                    panel.innerHTML = '<div class="segments-status error">Provide a folder path before running region proposals.</div>';
-                }
-                return;
-            }
-
-            if (item.dataset.segmentLoading === '1') {
-                return;
-            }
-
-            const panel = item.querySelector(`#segments-${index}`);
-            if (!panel) return;
-
-            const img = event.currentTarget;
-            const rect = img.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) return;
-
-            const xNorm = clamp01((event.clientX - rect.left) / rect.width);
-            const yNorm = clamp01((event.clientY - rect.top) / rect.height);
-
-            const limitValue = parseInt(resultLimitSelect.value, 10);
-            const payload = {
-                folder,
-                image_path: result.path,
-                x: xNorm,
-                y: yNorm,
-                limit: Number.isFinite(limitValue) ? limitValue : 12,
-                sort_by: sortBySelect.value || 'similarity',
-                targets: ['images', 'segments'],
-                threshold: segmentThreshold,
-            };
-
-            item.dataset.segmentLoading = '1';
-            panel.innerHTML = '<div class="segments-status">Proposing region around the selected point...</div>';
-
-            try {
-                const response = await fetch('/segment_from_point', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                });
-                const data = await response.json();
-                if (!response.ok || data.error) {
-                    throw new Error(data.error || 'Region proposal failed');
-                }
-                const actionContext = buildSegmentActionContext(result, data, xNorm, yNorm, img.currentSrc || img.src);
-                if (actionContext) {
-                    segmentContextByIndex[index] = actionContext;
-                } else {
-                    delete segmentContextByIndex[index];
-                }
-                renderSegmentResponse(panel, data, xNorm, yNorm, img.currentSrc || img.src, {
-                    index,
-                    actionContext,
-                    sourceLabel: 'Region proposal',
-                });
-            } catch (error) {
-                panel.innerHTML = `<div class="segments-status error">Segment error: ${escapeHtml(error.message || String(error))}</div>`;
-            } finally {
-                delete item.dataset.segmentLoading;
-            }
-        }
-
-        function renderSegmentResponse(panel, data, xNorm, yNorm, baseImageSrc, options = {}) {
-            const segments = Array.isArray(data && data.segments) ? data.segments : [];
-            const overlay = data && data.overlay ? data.overlay : {};
-            const pctX = (xNorm * 100).toFixed(1);
-            const pctY = (yNorm * 100).toFixed(1);
-            const safeBaseSrc = baseImageSrc ? escapeHtml(baseImageSrc) : '';
-            const sourceLabel = escapeHtml(String(options.sourceLabel || 'Region proposal'));
-            const parsedIndex = Number.isFinite(options.index)
-                ? Number(options.index)
-                : parseInt(String(options.index || ''), 10);
-            const actionContext = options.actionContext || null;
-            const hasActions = Number.isFinite(parsedIndex)
-                && actionContext
-                && actionContext.maskBase64
-                && actionContext.folder
-                && actionContext.imagePath;
-
-            const baseOverlayFigure = safeBaseSrc ? `
-                <figure class="segment-overlay-figure">
-                    <div class="segment-overlay-stack">
-                        <img src="${safeBaseSrc}" alt="Expanded image region" />
-                        ${overlay.heatmap_png ? `<img class="overlay-layer overlay-heatmap" src="data:image/png;base64,${overlay.heatmap_png}" alt="Heatmap overlay" />` : ''}
-                        ${overlay.mask_png ? `<img class="overlay-layer overlay-mask" src="data:image/png;base64,${overlay.mask_png}" alt="Refined mask overlay" />` : ''}
-                        <div class="overlay-crosshair" style="left: ${pctX}%; top: ${pctY}%"></div>
-                    </div>
-                    <figcaption>Region overlay</figcaption>
-                </figure>
-            ` : '';
-
-            const segmentationFigure = overlay.segmentation_png ? `
-                <figure class="segment-segmap-figure">
-                    <img class="segment-segmap" src="data:image/png;base64,${overlay.segmentation_png}" alt="Semantic segmentation" />
-                    <figcaption>Mask2Former segmentation</figcaption>
-                </figure>
-            ` : '';
-
-            const legendItems = Array.isArray(overlay.legend)
-                ? overlay.legend.map((entry) => {
-                    const color = escapeHtml(String(entry.color || '#888'));
-                    const labelText = entry.label ? escapeHtml(String(entry.label)) : escapeHtml(String(entry.id || 'class'));
-                    const highlightClass = entry.highlight ? ' highlight' : '';
-                    return `<div class="segment-legend-item${highlightClass}"><span class="segment-legend-swatch" style="background:${color};"></span><span>${labelText}</span></div>`;
-                }).join('')
-                : '';
-
-            const legendHtml = legendItems ? `<div class="segment-legend">${legendItems}</div>` : '';
-
-            const overlayHtml = (baseOverlayFigure || segmentationFigure)
-                ? `<div class="segment-overlay-grid">${baseOverlayFigure}${segmentationFigure}</div>${legendHtml}`
-                : legendHtml;
-
-            const listItems = segments.slice(0, 3).map((segment, idx) => {
-                const segId = escapeHtml(String(segment.segment_id || `region-${idx + 1}`));
-                const fraction = typeof segment.patch_fraction === 'number'
-                    ? `${(segment.patch_fraction * 100).toFixed(1)}% area`
-                    : 'Area n/a';
-                const patchCount = typeof segment.patch_count === 'number'
-                    ? `${segment.patch_count} patch${segment.patch_count === 1 ? '' : 'es'}`
-                    : '';
-                const humanLabel = segment.label ? ` · ${escapeHtml(String(segment.label))}` : '';
-
-                const matches = Array.isArray(segment.image_results) ? segment.image_results.slice(0, 3) : [];
-                const matchRows = matches.map((match, matchIdx) => {
-                    const label = escapeHtml(String(match.filename || match.path || `Match ${matchIdx + 1}`));
-                    const score = typeof match.similarity === 'number' ? `${(match.similarity * 100).toFixed(1)}%` : 'n/a';
-                    const thumb = match.thumbnail
-                        ? `<img class="segment-match-thumb" src="data:image/jpeg;base64,${match.thumbnail}" alt="${label}" />`
-                        : '<div class="segment-match-thumb placeholder"></div>';
-                    return `
-                        <div class="segment-match-row">
-                            ${thumb}
-                            <div class="segment-match-meta">
-                                <span>${label}</span>
-                                <span>Similarity: ${score}</span>
-                            </div>
-                        </div>
-                    `;
-                }).join('');
-
-                const matchList = matchRows || '<div class="segments-status warning">No close matches for this region.</div>';
-
-                return `
-                    <li>
-                        <span class="segment-title">#${idx + 1} · ${segId}${humanLabel}</span>
-                        <span class="segment-meta">${fraction}${patchCount ? ` · ${patchCount}` : ''}</span>
-                        <div class="segment-match-list">
-                            ${matchList}
-                        </div>
-                    </li>
-                `;
-            }).join('');
-
-            const refinementNote = overlay.refinement
-                ? `<div class="segment-meta">Mask source: ${escapeHtml(String(overlay.refinement))}${overlay.refined_label ? ` · ${escapeHtml(String(overlay.refined_label))}` : ''}</div>`
-                : '';
-            const areaNote = typeof overlay.mask_fraction === 'number'
-                ? `<div class="segment-meta">Refined mask coverage: ${(overlay.mask_fraction * 100).toFixed(1)}%</div>`
-                : '';
-            const resultsHtml = listItems
-                ? `<ul class="segment-results-list">${listItems}</ul>`
-                : '<div class="segments-status warning">Region proposals returned no matches.</div>';
-            const actionsHtml = hasActions ? `
-                <div class="segment-actions">
-                    <button class="segment-action-btn" data-segment-mask-search="${parsedIndex}">Search by mask</button>
-                    <button class="segment-action-btn primary" data-segment-index="${parsedIndex}">Index segments</button>
-                </div>
-            ` : '';
-
-            panel.innerHTML = `
-                <div class="segments-status success">${sourceLabel} near (${pctX}%, ${pctY}%) · ${segments.length} candidate(s)</div>
-                ${actionsHtml}
-                ${overlayHtml}
-                ${refinementNote}
-                ${typeof overlay.threshold === 'number' ? `<div class="segment-meta">Heatmap threshold: ${(overlay.threshold * 100).toFixed(1)}%</div>` : ''}
-                ${areaNote}
-                ${resultsHtml}
-            `;
-
-            if (hasActions) {
-                const maskSearchBtn = panel.querySelector(`[data-segment-mask-search="${parsedIndex}"]`);
-                if (maskSearchBtn) {
-                    maskSearchBtn.addEventListener('click', (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        runMaskSearchFromSegment(parsedIndex, panel, maskSearchBtn);
-                    });
-                }
-                const indexBtn = panel.querySelector(`[data-segment-index="${parsedIndex}"]`);
-                if (indexBtn) {
-                    indexBtn.addEventListener('click', (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        indexSegmentsFromMask(parsedIndex, panel, indexBtn);
-                    });
-                }
-            }
-        }
-        
-        async function copyImagePath(imagePath) {
-            try {
-                const textToCopy = imagePath;
-                
-                if (navigator.clipboard && window.isSecureContext) {
-                    // Use modern clipboard API
-                    await navigator.clipboard.writeText(textToCopy);
-                } else {
-                    // Fallback for older browsers
-                    const textArea = document.createElement('textarea');
-                    textArea.value = textToCopy;
-                    textArea.style.position = 'fixed';
-                    textArea.style.left = '-999999px';
-                    textArea.style.top = '-999999px';
-                    document.body.appendChild(textArea);
-                    textArea.focus();
-                    textArea.select();
-                    document.execCommand('copy');
-                    textArea.remove();
-                }
-                
-                // Simple console feedback for now (could add toast notification)
-                console.log('Copied to clipboard:', imagePath);
-                
-            } catch (error) {
-                console.error('Failed to copy:', error);
-            }
-        }
-        
-        function buildImageFetchUrl(imagePath, result = null) {
-            const params = new URLSearchParams();
-            params.set('image_path', imagePath || '');
-            if (result && result.is_detection) {
-                const activeFolder = folderInput.value.trim();
-                if (activeFolder && String(imagePath || '').startsWith(activeFolder)) {
-                    params.set('folder', activeFolder);
-                    return `/image?${params.toString()}`;
-                }
-                return `/detections/image?${params.toString()}`;
-            }
-            const activeFolder = folderInput.value.trim();
-            if (activeFolder) {
-                params.set('folder', activeFolder);
-            }
-            return `/image?${params.toString()}`;
-        }
-
-        async function findSimilarImages(imagePath, result = null) {
-            const folder = folderInput.value.trim();
-            const limit = resultLimitSelect.value;
-            const sortBy = sortBySelect.value;
-            const detectionResult = Boolean(result && result.is_detection);
-            
-            if (!detectionResult && !folder) {
-                alert('Please enter a folder path first');
-                return;
-            }
-            
-            indexStatus.textContent = 'Finding similar images...';
-            indexStatus.className = 'status';
-            
-            try {
-                const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
-                if (!imageResponse.ok) {
-                    throw new Error('Failed to load image file');
-                }
-                
-                const imageBlob = await imageResponse.blob();
-                const formData = new FormData();
-                formData.append('image', imageBlob, 'reference_image.jpg');
-                formData.append('limit', limit);
-                formData.append('sort_by', sortBy);
-
-                if (detectionResult || isDetectionsScope()) {
-                    const filters = buildDetectionSearchFilters();
-                    Object.entries(filters).forEach(([key, value]) => {
-                        if (value !== undefined && value !== null && String(value).trim() !== '') {
-                            formData.append(key, String(value));
-                        }
-                    });
-                    formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
-
-                    const response = await fetch('/detections/search_image', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    const data = await parseApiJson(response, 'Detection image search failed');
-                    const rendered = decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested);
-                    if (!rendered.length) {
-                        indexStatus.textContent = 'No similar detections found';
-                        indexStatus.className = 'status warning';
-                        return;
-                    }
-                    indexStatus.textContent = `Found ${rendered.length} similar detections`;
-                    indexStatus.className = 'status success';
-                    displayResults(rendered);
-                    return;
-                }
-
-                formData.append('folder', folder);
-                const response = await fetch('/search_by_image', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await parseApiJson(response, 'Image search failed');
-                const results = Array.isArray(data.results) ? data.results : [];
-                if (!results.length) {
-                    indexStatus.textContent = 'No similar images found';
-                    indexStatus.className = 'status warning';
-                    return;
-                }
-                indexStatus.textContent = `Found ${results.length} similar images`;
-                indexStatus.className = 'status success';
-                displayResults(results);
-            } catch (error) {
-                console.error('Find similar error:', error);
-                indexStatus.textContent = 'Error finding similar images: ' + error.message;
-                indexStatus.className = 'status error';
-            }
-        }
-
-        async function describeImageWithLM(index, imagePath, item = null, result = null) {
-            if (!imagePath) {
-                alert('No filesystem path is available for this image.');
-                return;
-            }
-            const detectionResult = Boolean(result && result.is_detection);
-            const folder = folderInput.value.trim();
-            const useFolderContext = !detectionResult || (folder && String(imagePath).startsWith(folder));
-            if (!useFolderContext && !detectionResult) {
-                alert('Please enter a folder path first.');
-                return;
-            }
-
-            const prompt = videoPromptInput.value.trim();
-            const modelId = videoModelInput ? videoModelInput.value.trim() : '';
-
-            setMode('archive');
-            const targetItem = item || document.querySelector(`.result-item[data-result-index="${index}"]`);
-            if (targetItem && !targetItem.classList.contains('expanded') && result) {
-                toggleImageExpansion(targetItem, result, index);
-            }
-
-            const descContainer = document.getElementById(`lm-desc-${index}`);
-            const saveBtn = document.getElementById(`lm-save-btn-${index}`);
-            if (!descContainer || !saveBtn) {
-                alert('Unable to render LLM description panel for this result.');
-                return;
-            }
-
-            descContainer.innerHTML = '<div class="comment-loading"><div class="spinner"></div> Generating LLM description...</div>';
-            saveBtn.style.display = 'none';
-            saveBtn.dataset.summary = '';
-
-            try {
-                const response = await fetch('/describe_image', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(
-                        useFolderContext
-                            ? {
-                                folder,
-                                image_path: imagePath,
-                                prompt,
-                                model: modelId
-                            }
-                            : {
-                                image_path: imagePath,
-                                prompt,
-                                model: modelId
-                            }
-                    ),
-                });
-                const data = await parseApiJson(response, 'Describe request failed');
-                if (data.summary) {
-                    renderLmDescription(index, data.summary, data.model || modelId || 'LM Studio');
-                    if (detectionResult && !useFolderContext) {
-                        saveBtn.style.display = 'none';
-                    }
-                    return;
-                }
-                descContainer.innerHTML = '<div class="no-comments">(No description returned)</div>';
-            } catch (err) {
-                descContainer.innerHTML = `<div class="no-comments">Error: ${escapeHtml(err.message || String(err))}</div>`;
-            }
-        }
-
-        updateArchiveDetectionsNav();
-        updateSearchScopeUI();
-        refreshArchiveFilters().catch(() => {
-            setArchiveDetectionsMeta('Detection filters unavailable. Run probes to populate archive.');
-        });
-        
-        // Enter key support
-        searchInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') searchBtn.click();
-        });
-        
-        folderInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') indexBtn.click();
-        });
-        
-        // Check index on folder change
-        folderInput.addEventListener('blur', async () => {
-            const folder = folderInput.value.trim();
-            if (folder) {
-                const status = await checkIndexStatus(folder);
-                if (status.indexed) {
-                    indexStatus.textContent = `Folder is indexed (${(status.available_modes || []).join(', ') || embedderSelect.value})`;
-                    indexStatus.className = 'status success';
-                } else {
-                    const available = (status.available_modes || []).join(', ');
-                    indexStatus.textContent = available ? `Folder indexed for: ${available}` : 'Folder not indexed';
-                    indexStatus.className = available ? 'status warning' : 'status';
-                }
-            }
-        });
-    </script>
-</body>
-</html>
-    '''
-    
-    # Replace the placeholder with actual options and timestamp
-    current_timestamp = str(int(time.time()))
-    response_html = html_template.replace('{result_options_html}', result_options_html)
-    response_html = response_html.replace('{luxriot_batch_options}', luxriot_batch_options_html)
-    response_html = response_html.replace('{video_frame_options_html}', video_frame_options_html)
-    response_html = response_html.replace('{segment_threshold_percent}', str(segment_threshold_percent))
-    response_html = response_html.replace('{segments_enabled_checked}', segments_enabled_checked)
-    response_html = response_html.replace('{segment_min_patches_default}', str(segment_min_patches_default))
-    response_html = response_html.replace('{timestamp}', current_timestamp)
-    response_html = response_html.replace('{app_version}', html_lib.escape(str(config.APP_VERSION or ''), quote=False))
-    response_html = response_html.replace('{lm_model}', html_lib.escape(str(config.LM_MODEL or ''), quote=True))
-    rollup_prompt_default = str(
-        getattr(
-            config,
-            "LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT",
-            getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", ""),
-        )
-        or ""
+    rollup_default = str(
+        getattr(config, "LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT",
+                getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", "")) or ""
     )
-    response_html = response_html.replace(
-        '{luxriot_system_prompt_default}',
-        html_lib.escape(str(LUXRIOT_SYSTEM_PROMPT_DEFAULT or ''), quote=False),
-    )
-    response_html = response_html.replace(
-        '{luxriot_rollup_prompt_l1}',
-        html_lib.escape(
-            str(getattr(config, "LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
-            quote=False,
-        ),
-    )
-    response_html = response_html.replace(
-        '{luxriot_rollup_prompt_l2}',
-        html_lib.escape(
-            str(getattr(config, "LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
-            quote=False,
-        ),
-    )
-    response_html = response_html.replace(
-        '{luxriot_rollup_prompt_l3}',
-        html_lib.escape(
-            str(getattr(config, "LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT", rollup_prompt_default) or rollup_prompt_default),
-            quote=False,
-        ),
-    )
-    response_html = response_html.replace(
-        '{luxriot_json_alert_prompt}',
-        html_lib.escape(
-            str(getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT),
-            quote=False,
-        ),
-    )
-    response_html = response_html.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
-    response_html = response_html.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
-    response_html = response_html.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
-    response_html = response_html.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
-    response_html = response_html.replace('{luxriot_batch_default}', str(luxriot_default_batch))
-    
-    # Create response with cache-busting headers
-    response = make_response(response_html)
+
+    response = make_response(render_template(
+        'index.html',
+        timestamp=str(int(time.time())),
+        app_version=config.APP_VERSION or '',
+        result_options_html=result_options_html,
+        segment_threshold_percent=min(99, max(40, int(round(float(config.DINO_HEATMAP_THRESHOLD) * 100)))),
+        segments_enabled_checked='checked' if config.DINO_SEGMENTS_ENABLED else '',
+        segment_min_patches_default=max(1, int(config.DINO_SEGMENT_MIN_PATCHES)),
+        luxriot_batch_options=luxriot_batch_options,
+        luxriot_snapshot_interval=config.LUXRIOT_SNAPSHOT_INTERVAL,
+        luxriot_snapshot_max_edge=config.LUXRIOT_SNAPSHOT_MAX_EDGE,
+        video_frame_options_html=video_frame_options_html,
+        luxriot_system_prompt_default=LUXRIOT_SYSTEM_PROMPT_DEFAULT or '',
+        luxriot_alert_policy_prompt=getattr(config, 'LUXRIOT_ALERT_POLICY_PROMPT', '') or '',
+        luxriot_rollup_prompt_l1=getattr(config, 'LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT', rollup_default) or rollup_default,
+        luxriot_rollup_prompt_l2=getattr(config, 'LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT', rollup_default) or rollup_default,
+        luxriot_rollup_prompt_l3=getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', rollup_default) or rollup_default,
+        luxriot_json_alert_prompt=getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT) or LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT,
+        auth_enabled=bool(config.AUTH_ENABLED),
+        offline_video_hidden_class='' if getattr(config, "OFFLINE_VIDEO_ENABLED", False) else 'deployment-hidden',
+        probe_snap_hidden_class='' if getattr(config, "PROBE_SNAP_ENABLED", False) else 'deployment-hidden',
+    ))
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
-    
     return response
 
 
 @app.route('/favicon.ico')
 def favicon():
     """Serve favicon if present; otherwise return no-content to avoid noisy 404 logs."""
-    icon_path = Path(__file__).resolve().parent / 'images' / 'favicon.ico'
+    icon_path = Path(__file__).resolve().parent / 'static' / 'images' / 'favicon.ico'
     if icon_path.exists():
         return send_file(icon_path, mimetype='image/x-icon', max_age=86400)
     return ('', 204)
@@ -11623,42 +1894,80 @@ def favicon():
 @app.route('/branding/logo')
 def branding_logo():
     """Serve application branding logo."""
-    logo_path = Path(__file__).resolve().parent / 'images' / 'lxrt-logo-darktheme.png'
+    logo_path = Path(__file__).resolve().parent / 'static' / 'images' / 'lxrt-logo-darktheme.png'
     if logo_path.exists():
         return send_file(logo_path, mimetype='image/png', max_age=86400)
     return ('', 204)
 
 
+@app.route('/js/app.js')
+def serve_app_js():
+    """Serve app.js with runtime config values injected (5 Luxriot defaults)."""
+    js_path = Path(__file__).resolve().parent / 'static' / 'js' / 'app.js'
+    js = js_path.read_text(encoding='utf-8')
+    luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    js = js.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
+    js = js.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
+    js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
+    js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
+    js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
+    js = js.replace('{auth_enabled_json}', json.dumps(bool(config.AUTH_ENABLED)))
+    js = js.replace(
+        '{auth_csrf_cookie_json}',
+        json.dumps(str(config.AUTH_CSRF_COOKIE)),
+    )
+    response = make_response(js)
+    response.headers['Content-Type'] = 'application/javascript; charset=utf-8'
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return response
+
+
 @app.route('/image', methods=['GET'])
 @app.route('/image/<path:filepath>', methods=['GET'])
 def serve_image(filepath: str = ""):
-    """Serve image files only from indexed folders."""
+    """Serve image files from indexed folders and keep legacy detection-archive URLs working."""
     try:
         folder_raw = request.args.get('folder')
-        if not folder_raw:
-            return "Missing folder parameter", 400
-        folder_path = _resolve_folder_path(folder_raw, require_index=True)
-
         source_path = request.args.get('image_path') or filepath
         if not source_path:
             return "Missing image path", 400
 
         decoded = unquote(source_path)
         path_obj = Path(decoded)
-        if not path_obj.is_absolute():
-            path_obj = folder_path / path_obj
-        abs_path = path_obj.resolve()
+        folder_path: Optional[Path] = None
+        if folder_raw:
+            folder_path = _resolve_folder_path(folder_raw, require_index=True)
+            if not path_obj.is_absolute():
+                path_obj = folder_path / path_obj
+            abs_path = path_obj.resolve()
+        else:
+            if not path_obj.is_absolute():
+                return "Missing folder parameter", 400
+            abs_path = path_obj.expanduser().resolve()
         if abs_path.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
             return "Unsupported file type", 403
-        if not _path_within(abs_path, folder_path):
-            return "Access denied", 403
+        if folder_path is not None:
+            if not _path_within(abs_path, folder_path):
+                return "Access denied", 403
+        else:
+            if not _path_within(abs_path, detection_archive.root):
+                return "Access denied", 403
         if not abs_path.exists() or not abs_path.is_file():
             return "Image not found", 404
         return send_file(str(abs_path))
     except ValueError as exc:
-        return str(exc), 400
+        app.logger.info(
+            "Image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return "Invalid image request", 400
     except Exception as exc:
-        return f"Error serving image: {exc}", 500
+        app.logger.exception(
+            "Image serving failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return "Image unavailable", 500
 
 
 @app.route('/detections/image', methods=['GET'])
@@ -11668,11 +1977,58 @@ def serve_detection_image():
         resolved = detection_archive.resolve_archive_image_path(image_path)
         return send_file(str(resolved))
     except ValueError as exc:
-        message = str(exc)
-        status = 404 if message.lower() == "image not found" else 400
-        return message, status
+        message = str(exc).lower()
+        status = 404 if message == "image not found" else 400
+        app.logger.info(
+            "Detection image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return ("Image not found" if status == 404 else "Invalid image request"), status
     except Exception as exc:
-        return f"Error serving detection image: {exc}", 500
+        app.logger.exception(
+            "Detection image serving failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return "Image unavailable", 500
+
+
+def _strip_image_data_url_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower().startswith("data:image/") and "," in text:
+        return text.split(",", 1)[1].strip()
+    return text
+
+
+@app.route('/detections/thumbnail/<int:detection_id>', methods=['GET'])
+def serve_detection_thumbnail(detection_id: int):
+    try:
+        rows = detections_store.fetch_detections_by_ids([detection_id], include_vectors=False)
+        if not rows:
+            return "Image not found", 404
+        thumbnail_b64 = _strip_image_data_url_prefix(rows[0].get("thumbnail"))
+        if not thumbnail_b64:
+            return "Image not found", 404
+        try:
+            image_bytes = base64.b64decode(thumbnail_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid thumbnail data") from exc
+        return Response(image_bytes, mimetype="image/jpeg")
+    except ValueError as exc:
+        app.logger.info(
+            "Detection thumbnail request rejected request_id=%s detection_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            detection_id,
+            exc,
+        )
+        return "Invalid image request", 400
+    except Exception:
+        app.logger.exception(
+            "Detection thumbnail serving failed request_id=%s detection_id=%s",
+            getattr(g, "request_id", ""),
+            detection_id,
+        )
+        return "Image unavailable", 500
 
 
 def _index_directory(folder_path: Union[str, Path], embedder: str) -> Path:
@@ -11697,6 +2053,294 @@ def _encode_jpeg(img: Image.Image, max_edge: Optional[int] = None, quality: int 
     buffer = BytesIO()
     img.save(buffer, format='JPEG', quality=quality)
     return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(int(minimum), min(int(maximum), parsed))
+
+
+def _clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    return max(float(minimum), min(float(maximum), parsed))
+
+
+def _render_road_scene_overlay_png(
+    base_image: Image.Image,
+    scene_result: Any,
+) -> str:
+    """Render an engineer-facing motion-zone preview over the current frame."""
+
+    image = base_image.convert("RGBA")
+    width, height = image.size
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    zones = tuple(getattr(getattr(scene_result, "scene_card", None), "zones", ()) or ())
+    for zone in zones:
+        if getattr(zone, "enabled", True) is False:
+            continue
+        polygon = tuple(getattr(zone, "polygon", ()) or ())
+        if not polygon:
+            points = [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)]
+        else:
+            points = [
+                (
+                    int(round(float(x) * max(1, width - 1))),
+                    int(round(float(y) * max(1, height - 1))),
+                )
+                for x, y in polygon
+            ]
+        if len(points) < 3:
+            continue
+        draw.polygon(points, fill=(0, 214, 143, 54), outline=(0, 255, 170, 230))
+        draw.line(points + [points[0]], fill=(0, 255, 170, 240), width=max(2, width // 360))
+
+        expected_flow = getattr(zone, "expected_flow", None)
+        if expected_flow is None:
+            continue
+        try:
+            dx, dy = float(expected_flow[0]), float(expected_flow[1])
+        except Exception:
+            continue
+        magnitude = math.hypot(dx, dy)
+        if magnitude <= 1e-9:
+            continue
+        dx, dy = dx / magnitude, dy / magnitude
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        cx = sum(xs) / max(1, len(xs))
+        cy = sum(ys) / max(1, len(ys))
+        length = max(36.0, min(width, height) * 0.18)
+        x0, y0 = cx - dx * length * 0.42, cy - dy * length * 0.42
+        x1, y1 = cx + dx * length * 0.58, cy + dy * length * 0.58
+        line_width = max(4, width // 180)
+        draw.line([(x0, y0), (x1, y1)], fill=(255, 209, 102, 245), width=line_width)
+        head_len = max(10.0, line_width * 3.2)
+        angle = math.atan2(dy, dx)
+        for side in (1, -1):
+            head_angle = angle + side * 2.55
+            hx = x1 + math.cos(head_angle) * head_len
+            hy = y1 + math.sin(head_angle) * head_len
+            draw.line([(x1, y1), (hx, hy)], fill=(255, 209, 102, 245), width=line_width)
+
+    combined = Image.alpha_composite(image, overlay).convert("RGB")
+    buffer = BytesIO()
+    combined.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _road_scene_buffered_frames(
+    channel_id: int,
+    limit: int,
+    *,
+    max_age_sec: Optional[float] = None,
+) -> List[DecodedVideoFrame]:
+    """Return frames EVA already captured for a channel without hitting Luxriot again."""
+
+    sessions: List[Any] = []
+    try:
+        with luxriot_manager.cache_lock:
+            video_session = luxriot_manager.sessions.get(int(channel_id))
+            analytics_session = luxriot_manager.probe_sessions.get(int(channel_id))
+        if video_session is not None:
+            sessions.append(video_session)
+        if analytics_session is not None and analytics_session is not video_session:
+            sessions.append(analytics_session)
+    except Exception:
+        sessions = []
+
+    decoded: List[DecodedVideoFrame] = []
+    frame_limit = max(1, int(limit))
+    for session in sessions:
+        try:
+            recent_fn = getattr(session, "recent_frame_items", None)
+            if callable(recent_fn):
+                raw_frames = list(recent_fn(frame_limit))
+            else:
+                with session.lock:
+                    raw_frames = list(session.frames)[-frame_limit:]
+        except Exception:
+            raw_frames = []
+        for raw in raw_frames:
+            if len(decoded) >= frame_limit:
+                break
+            if not isinstance(raw, Mapping):
+                continue
+            thumbnail = str(raw.get("thumbnail") or "").strip()
+            if not thumbnail:
+                continue
+            try:
+                with Image.open(BytesIO(base64.b64decode(thumbnail))) as opened:
+                    opened.load()
+                    image = opened.convert("RGB")
+                captured_at = float(raw.get("captured_at") or raw.get("time_sec") or time.time())
+                if max_age_sec is not None and (time.time() - captured_at) > float(max_age_sec):
+                    continue
+                decoded.append(
+                    DecodedVideoFrame(
+                        frame_index=len(decoded),
+                        timestamp_ms=int(captured_at * 1000.0),
+                        source_timestamp_ms=None,
+                        image=np.asarray(image),
+                    )
+                )
+            except Exception:
+                continue
+        if len(decoded) >= frame_limit:
+            break
+    return decoded
+
+
+def _luxriot_recent_frame_item(
+    channel_id: int,
+    mode: str = "latest",
+    *,
+    max_age_sec: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_mode = str(mode or "latest").strip().lower()
+    sessions: List[Any] = []
+    try:
+        with luxriot_manager.cache_lock:
+            video_session = luxriot_manager.sessions.get(int(channel_id))
+            analytics_session = luxriot_manager.probe_sessions.get(int(channel_id))
+        if video_session is not None:
+            sessions.append(video_session)
+        if analytics_session is not None and analytics_session is not video_session:
+            sessions.append(analytics_session)
+    except Exception:
+        sessions = []
+
+    for session in sessions:
+        try:
+            recent_fn = getattr(session, "recent_frame_items", None)
+            if callable(recent_fn):
+                raw_frames = list(recent_fn(60 if normalized_mode in {"cycle", "animated", "scan"} else 1))
+            else:
+                with session.lock:
+                    raw_frames = list(session.frames)[-60 if normalized_mode in {"cycle", "animated", "scan"} else -1:]
+        except Exception:
+            raw_frames = []
+        candidates = [
+            dict(raw)
+            for raw in raw_frames
+            if isinstance(raw, Mapping) and str(raw.get("thumbnail") or "").strip()
+        ]
+        if max_age_sec is not None:
+            fresh_candidates: List[Dict[str, Any]] = []
+            for candidate in candidates:
+                age_sec = _luxriot_recent_frame_age_sec(candidate)
+                if age_sec is not None and age_sec <= float(max_age_sec):
+                    fresh_candidates.append(candidate)
+            candidates = fresh_candidates
+        if not candidates:
+            continue
+        if normalized_mode in {"cycle", "animated", "scan"} and len(candidates) > 1:
+            try:
+                fps = max(1.0, min(6.0, float(request.args.get("fps") or 2.0)))
+            except Exception:
+                fps = 2.0
+            index = int(time.time() * fps) % len(candidates)
+            item = candidates[index]
+            item["_recent_frame_index"] = index
+            item["_recent_frame_count"] = len(candidates)
+            return item
+        for raw in reversed(candidates):
+            if not isinstance(raw, Mapping):
+                continue
+            thumbnail = str(raw.get("thumbnail") or "").strip()
+            if thumbnail:
+                raw["_recent_frame_index"] = len(candidates) - 1
+                raw["_recent_frame_count"] = len(candidates)
+                return raw
+    return None
+
+
+def _luxriot_recent_frame_timestamp_sec(frame_item: Mapping[str, Any]) -> Optional[float]:
+    for key in ("captured_at", "time_sec"):
+        value = frame_item.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    for key in ("timestamp_ms", "source_timestamp_ms"):
+        value = frame_item.get(key)
+        try:
+            parsed_ms = float(value)
+        except (TypeError, ValueError):
+            parsed_ms = 0.0
+        if parsed_ms > 0:
+            return parsed_ms / 1000.0
+    return None
+
+
+def _luxriot_recent_frame_age_sec(frame_item: Mapping[str, Any], *, now: Optional[float] = None) -> Optional[float]:
+    timestamp_sec = _luxriot_recent_frame_timestamp_sec(frame_item)
+    if timestamp_sec is None:
+        return None
+    return max(0.0, float(now if now is not None else time.time()) - timestamp_sec)
+
+
+def _luxriot_recent_frame_max_age_sec(raw_value: Any = None) -> float:
+    try:
+        max_age = float(raw_value) if raw_value not in (None, "") else float(config.LUXRIOT_RECENT_FRAME_MAX_AGE_SEC)
+    except (TypeError, ValueError):
+        max_age = float(config.LUXRIOT_RECENT_FRAME_MAX_AGE_SEC)
+    return max(3.0, min(300.0, max_age))
+
+
+def _luxriot_capture_status_for_channel(channel_id: int) -> Dict[str, Any]:
+    statuses: List[Dict[str, Any]] = []
+    try:
+        with luxriot_manager.cache_lock:
+            sessions = [
+                luxriot_manager.sessions.get(int(channel_id)),
+                luxriot_manager.probe_sessions.get(int(channel_id)),
+            ]
+        for session in sessions:
+            if session is None:
+                continue
+            status_fn = getattr(session, "status", None)
+            if callable(status_fn):
+                status = status_fn()
+                if isinstance(status, Mapping):
+                    statuses.append(dict(status))
+    except Exception:
+        statuses = []
+    if not statuses:
+        return {}
+    return {
+        "running": any(bool(status.get("running")) for status in statuses),
+        "recent_frame_count": max(int(status.get("recent_frame_count") or 0) for status in statuses),
+        "last_error": next((status.get("last_error") for status in statuses if status.get("last_error")), None),
+        "frozen_signal": any(bool(status.get("frozen_signal")) for status in statuses),
+        "frozen_signal_since": next(
+            (status.get("frozen_signal_since") for status in statuses if status.get("frozen_signal_since")),
+            None,
+        ),
+        "frozen_signal_age_sec": max(
+            (float(status.get("frozen_signal_age_sec") or 0.0) for status in statuses),
+            default=0.0,
+        )
+        or None,
+        "frozen_frame_count": max(int(status.get("frozen_frame_count") or 0) for status in statuses),
+        "active_capture_source": next(
+            (status.get("active_capture_source") for status in statuses if status.get("active_capture_source")),
+            None,
+        ),
+        "last_snapshot_at": max(
+            (float(status.get("last_snapshot_at") or 0.0) for status in statuses),
+            default=0.0,
+        )
+        or None,
+    }
 
 
 def _create_overlay_rgba(alpha_image: Image.Image, color: Tuple[int, int, int], opacity_scale: float = 1.0) -> Image.Image:
@@ -11788,6 +2432,43 @@ def _sample_video_frames(
     return frames, fps, duration
 
 
+def _uploaded_file_suffix(file_obj: Any, fallback: str = "") -> str:
+    filename = str(getattr(file_obj, "filename", "") or "").strip()
+    suffix = Path(filename).suffix.lower()
+    return suffix or fallback
+
+
+def _save_upload_to_temp(file_obj: Any, *, allowed_suffixes: Set[str], prefix: str) -> Path:
+    if file_obj is None or not str(getattr(file_obj, "filename", "") or "").strip():
+        raise ValueError("No upload supplied")
+    suffix = _uploaded_file_suffix(file_obj)
+    if suffix not in allowed_suffixes:
+        raise ValueError("Unsupported uploaded file type")
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        file_obj.save(str(tmp_path))
+        if tmp_path.stat().st_size <= 0:
+            raise ValueError("Uploaded file is empty")
+        return tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _cleanup_temp_upload(path_obj: Optional[Path]) -> None:
+    if path_obj is None:
+        return
+    try:
+        path_obj.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_prompt: str) -> List[Dict[str, Any]]:
     prompt = (user_prompt or '').strip() or "Summarize the key events, people, and objects in this video."
     intro = f"Video file: {Path(video_path).name}. {len(frames)} sampled frames are provided."
@@ -11844,27 +2525,358 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
     ]
 
 
-def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
-    base_url = (config.LM_BASE_URL or '').rstrip('/')
+def _configured_lm_profiles() -> Dict[str, Dict[str, Any]]:
+    profiles = getattr(config, "LM_PROFILES", None)
+    if isinstance(profiles, Mapping) and profiles:
+        return {
+            str(profile_id): dict(profile)
+            for profile_id, profile in profiles.items()
+            if str(profile_id).strip()
+        }
+    return {
+        "default": {
+            "id": "default",
+            "kind": "general",
+            "base_url": config.LM_BASE_URL,
+            "model": config.LM_MODEL,
+            "api_key": config.LM_API_KEY,
+            "timeout": config.LM_TIMEOUT,
+        }
+    }
+
+
+def _default_lm_profile_id(kind: str = "general") -> str:
+    profiles = _configured_lm_profiles()
+    configured = (
+        getattr(config, "LM_AGENT_PROFILE_ID", "")
+        if kind == "agent"
+        else getattr(config, "LM_VLM_PROFILE_ID", "")
+        if kind in {"vlm", "vision", "video"}
+        else "default"
+    )
+    profile_id = str(configured or "").strip()
+    if profile_id in profiles:
+        return profile_id
+    if kind in {"vlm", "vision", "video"}:
+        for candidate_id, profile in profiles.items():
+            if str(profile.get("kind") or "").lower() in {"vlm", "vision", "video"}:
+                return candidate_id
+    if kind == "agent":
+        for candidate_id, profile in profiles.items():
+            if str(profile.get("kind") or "").lower() == "agent":
+                return candidate_id
+    return "default" if "default" in profiles else next(iter(profiles))
+
+
+def _lm_profile_selector_value(profile: Mapping[str, Any]) -> str:
+    profile_id = str(profile.get("id") or "").strip()
+    model = str(profile.get("model") or "").strip()
+    if profile_id and profile_id != "default":
+        return profile_id
+    return model or profile_id
+
+
+LM_AUTO_BALANCE_SELECTOR = "__auto__"
+LM_AUTO_BALANCE_LABEL = "Auto balance"
+LM_AUTO_BALANCE_ALIASES = {
+    LM_AUTO_BALANCE_SELECTOR,
+    "auto",
+    "auto-balance",
+    "auto_balance",
+}
+VLM_PROFILE_KINDS = {"vlm", "vision", "video"}
+
+
+def _lm_profile_enabled(profile: Mapping[str, Any]) -> bool:
+    raw = profile.get("enabled")
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def _is_auto_lm_selector(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in LM_AUTO_BALANCE_ALIASES
+
+
+def _configured_vlm_balancer_profile_ids() -> List[str]:
+    profiles = _configured_lm_profiles()
+    raw_configured = getattr(config, "LM_VLM_BALANCER_PROFILES", ())
+    if isinstance(raw_configured, str):
+        configured_ids = [
+            item.strip()
+            for item in raw_configured.split(",")
+            if item.strip()
+        ]
+    else:
+        configured_ids = [
+            str(item).strip()
+            for item in (raw_configured or ())
+            if str(item).strip()
+        ]
+
+    profile_ids: List[str] = []
+    if configured_ids:
+        candidates = configured_ids
+    else:
+        candidates = [
+            profile_id
+            for profile_id, profile in profiles.items()
+            if str(profile.get("kind") or "").strip().lower() in VLM_PROFILE_KINDS
+        ]
+        if not candidates:
+            candidates = [_default_lm_profile_id("vlm")]
+
+    for profile_id in candidates:
+        if profile_id in profile_ids:
+            continue
+        profile = profiles.get(profile_id)
+        if not isinstance(profile, Mapping):
+            continue
+        if not _lm_profile_enabled(profile):
+            continue
+        if not str(profile.get("base_url") or "").strip():
+            continue
+        if not str(profile.get("model") or "").strip():
+            continue
+        profile_ids.append(profile_id)
+    return profile_ids
+
+
+def _vlm_balancer_enabled() -> bool:
+    return bool(getattr(config, "LM_VLM_BALANCER_ENABLED", False))
+
+
+def _stable_vlm_profile_for_channel(channel_id: int, profile_ids: Sequence[str]) -> Optional[str]:
+    return _stable_vlm_profile_for_key(str(int(channel_id)), profile_ids)
+
+
+def _stable_vlm_profile_for_key(key: str, profile_ids: Sequence[str]) -> Optional[str]:
+    if not profile_ids:
+        return None
+    normalized_key = str(key or "default").strip() or "default"
+    digest = hashlib.sha256(f"vlm:{normalized_key}".encode("utf-8")).digest()
+    slot = int.from_bytes(digest[:8], "big") % len(profile_ids)
+    return str(profile_ids[slot])
+
+
+def _resolve_vlm_auto_model_hint(
+    requested_model_hint: Optional[str],
+    *,
+    assignment_key: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    raw_hint = str(requested_model_hint or "").strip()
+    profiles = _configured_lm_profiles()
+    if raw_hint and not _is_auto_lm_selector(raw_hint):
+        return raw_hint, {
+            "mode": "manual",
+            "requested": raw_hint,
+            "assigned_profile_id": raw_hint if raw_hint in profiles else None,
+            "balancer_enabled": _vlm_balancer_enabled(),
+        }
+
+    default_profile = _resolve_lm_profile(kind="vlm")
+    default_selector = _lm_profile_selector_value(default_profile)
+    if not _vlm_balancer_enabled():
+        return (default_selector if raw_hint else None), {
+            "mode": "default",
+            "requested": raw_hint or None,
+            "assigned_profile_id": str(default_profile.get("id") or "").strip() or None,
+            "balancer_enabled": False,
+            "profile_count": len(_configured_vlm_balancer_profile_ids()),
+        }
+
+    profile_ids = _configured_vlm_balancer_profile_ids()
+    selected_profile_id = _stable_vlm_profile_for_key(assignment_key, profile_ids)
+    if not selected_profile_id:
+        return (default_selector if raw_hint else None), {
+            "mode": "default",
+            "requested": raw_hint or None,
+            "assigned_profile_id": str(default_profile.get("id") or "").strip() or None,
+            "balancer_enabled": True,
+            "profile_count": 0,
+            "reason": "no_vlm_profiles",
+        }
+    return selected_profile_id, {
+        "mode": "auto",
+        "requested": raw_hint or None,
+        "assigned_profile_id": selected_profile_id,
+        "balancer_enabled": True,
+        "profile_count": len(profile_ids),
+    }
+
+
+def _resolve_luxriot_vlm_model_hint(
+    channel_id: int,
+    requested_model_hint: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    return _resolve_vlm_auto_model_hint(
+        requested_model_hint,
+        assignment_key=str(int(channel_id)),
+    )
+
+
+def _resolve_offline_lm_model_hint(
+    requested_model_hint: Optional[str],
+    *,
+    assignment_key: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    raw_hint = str(requested_model_hint or "").strip()
+    if raw_hint:
+        if _is_auto_lm_selector(raw_hint):
+            return _resolve_vlm_auto_model_hint(raw_hint, assignment_key=assignment_key)
+        profiles = _configured_lm_profiles()
+        return raw_hint, {
+            "mode": "manual",
+            "requested": raw_hint,
+            "assigned_profile_id": raw_hint if raw_hint in profiles else None,
+            "balancer_enabled": _vlm_balancer_enabled(),
+        }
+
+    agent_profile = _resolve_lm_profile(kind="agent")
+    agent_selector = _lm_profile_selector_value(agent_profile)
+    return agent_selector, {
+        "mode": "default_agent",
+        "requested": None,
+        "assigned_profile_id": str(agent_profile.get("id") or "").strip() or None,
+        "balancer_enabled": False,
+        "profile_count": 1,
+    }
+
+
+def _offline_vlm_assignment_key(kind: str, value: Any) -> str:
+    raw = str(value or "").strip()
+    if len(raw) > 240:
+        raw = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"offline:{kind}:{raw or 'request'}"
+
+
+def _lm_profile_env_key(profile_id: str, suffix: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", profile_id).strip("_").upper()
+    return f"EVOSSEARCH_LM_PROFILE_{normalized or 'DEFAULT'}_{suffix}"
+
+
+def _resolve_lm_profile(
+    *,
+    profile_id: Optional[str] = None,
+    model_override: Optional[str] = None,
+    kind: str = "general",
+) -> Dict[str, Any]:
+    profiles = _configured_lm_profiles()
+    selected_profile_id = str(profile_id or "").strip()
+    selected_model_override = str(model_override or "").strip()
+    if not selected_profile_id and selected_model_override in profiles:
+        selected_profile_id = selected_model_override
+        selected_model_override = ""
+    if not selected_profile_id:
+        selected_profile_id = _default_lm_profile_id(kind)
+    if selected_profile_id not in profiles:
+        selected_profile_id = _default_lm_profile_id(kind)
+    profile = dict(profiles[selected_profile_id])
+    profile["id"] = selected_profile_id
+    profile["base_url"] = str(profile.get("base_url") or "").rstrip("/")
+    profile["model"] = selected_model_override or str(
+        profile.get("model") or config.LM_MODEL
+    ).strip()
+    profile["api_key"] = str(profile.get("api_key") or "").strip()
+    try:
+        profile["timeout"] = min(
+            3600,
+            max(1, int(profile.get("timeout") or config.LM_TIMEOUT)),
+        )
+    except (TypeError, ValueError):
+        profile["timeout"] = int(config.LM_TIMEOUT)
+    profile["kind"] = str(profile.get("kind") or kind or "general").lower()
+    return profile
+
+
+def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(profile.get("id") or ""),
+        "kind": str(profile.get("kind") or "general"),
+        "model": str(profile.get("model") or ""),
+        "selector": _lm_profile_selector_value(profile),
+        "timeout": int(profile.get("timeout") or config.LM_TIMEOUT),
+        "enabled": _lm_profile_enabled(profile),
+        "gpu": str(profile.get("gpu") or ""),
+    }
+
+
+def _call_lm_chat(
+    messages: List[Dict[str, Any]],
+    model_override: Optional[str] = None,
+    *,
+    profile_id: Optional[str] = None,
+    profile_kind: str = "vlm",
+) -> str:
+    profile = _resolve_lm_profile(
+        profile_id=profile_id,
+        model_override=model_override,
+        kind=profile_kind,
+    )
+    base_url = str(profile.get("base_url") or "").rstrip("/")
     if not base_url:
-        raise RuntimeError("EVOSSEARCH_LM_BASE_URL is not configured.")
+        raise RuntimeError("LM profile base URL is not configured.")
+    if not str(profile.get("model") or "").strip():
+        raise RuntimeError(f"LM profile {profile['id']} model is not configured.")
     endpoint = f"{base_url}/chat/completions"
     headers = {"Content-Type": "application/json"}
-    if config.LM_API_KEY:
-        headers["Authorization"] = f"Bearer {config.LM_API_KEY}"
+    if profile.get("api_key"):
+        headers["Authorization"] = f"Bearer {profile['api_key']}"
 
-    target_model = (model_override or config.LM_MODEL).strip()
     payload = {
-        "model": target_model,
+        "model": str(profile.get("model") or "").strip(),
         "messages": messages,
         "temperature": float(config.LM_VIDEO_TEMPERATURE),
         "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
     }
+    response: Optional[requests.Response] = None
+
+    def _response_error_detail(resp: Any) -> str:
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        if isinstance(data, Mapping):
+            error = data.get("error")
+            if isinstance(error, Mapping):
+                message = str(error.get("message") or "").strip()
+                error_type = str(error.get("type") or "").strip()
+                if message and error_type:
+                    return f"{message} ({error_type})"
+                if message:
+                    return message
+            message = str(data.get("message") or "").strip()
+            if message:
+                return message
+        text = str(getattr(resp, "text", "") or "").strip()
+        if text:
+            return text[:500]
+        return "empty error response"
+
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=config.LM_TIMEOUT)
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
+        )
         response.raise_for_status()
+    except requests.HTTPError as exc:
+        resp = getattr(exc, "response", None) or response
+        detail = _response_error_detail(resp) if resp is not None else str(exc)
+        status = getattr(resp, "status_code", None)
+        status_text = f"HTTP {status}" if status else "HTTP error"
+        raise RuntimeError(
+            f"LM request failed for profile {profile['id']} "
+            f"(model {payload['model']}): {status_text}; {detail}"
+        ) from exc
     except Exception as exc:
-        raise RuntimeError(f"LM Studio request failed: {exc}") from exc
+        raise RuntimeError(
+            f"LM request failed for profile {profile['id']} "
+            f"(model {payload['model']}): {exc}"
+        ) from exc
 
     data = response.json()
     choice = (data.get("choices") or [{}])[0]
@@ -11881,8 +2893,18 @@ def _call_lm_chat(messages: List[Dict[str, Any]], model_override: Optional[str] 
     return content_text or "(empty response from model)"
 
 
-def _call_video_understanding(messages: List[Dict[str, Any]], model_override: Optional[str] = None) -> str:
-    return _call_lm_chat(messages, model_override=model_override)
+def _call_video_understanding(
+    messages: List[Dict[str, Any]],
+    model_override: Optional[str] = None,
+    *,
+    profile_id: Optional[str] = None,
+) -> str:
+    return _call_lm_chat(
+        messages,
+        model_override=model_override,
+        profile_id=profile_id,
+        profile_kind="vlm",
+    )
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -11897,10 +2919,21 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
             return None
         title = (raw.get('title') or '').strip() or 'External event'
         description = (raw.get('description') or '').strip()
-        severity = str(raw.get('severity') or 'critical').lower()
+        severity = str(raw.get('severity') or 'normal').strip().lower()
+        severity_aliases = {
+            'information': 'info',
+            'informational': 'info',
+            'warn': 'low',
+            'warning': 'low',
+            'medium': 'normal',
+            'moderate': 'normal',
+            'danger': 'high',
+            'emergency': 'critical',
+        }
+        severity = severity_aliases.get(severity, severity)
         allowed_sev = {'info', 'low', 'normal', 'high', 'critical'}
         if severity not in allowed_sev:
-            severity = 'critical'
+            severity = 'normal'
         state = str(raw.get('state') or 'new').lower()
         allowed_state = {'none', 'new', 'inprogress', 'closed', 'hidden'}
         if state not in allowed_state:
@@ -12015,15 +3048,108 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
 
         return candidates
 
+    def _extract_prose_alerts(blob: str) -> List[Dict[str, Any]]:
+        severity_aliases = {
+            "info": "info",
+            "information": "info",
+            "informational": "info",
+            "low": "low",
+            "warn": "low",
+            "warning": "low",
+            "normal": "normal",
+            "moderate": "normal",
+            "high": "high",
+            "danger": "high",
+            "critical": "critical",
+            "emergency": "critical",
+        }
+        pattern = re.compile(
+            r"^\s*(?:[-*•]|\d+[.)])?\s*"
+            r"(?P<label>info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
+            r"\s*(?:level|alert|severity)?\s*[:\-–]\s*(?P<description>.+?)\s*$",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        out: List[Dict[str, Any]] = []
+        for match in pattern.finditer(blob or ""):
+            raw_label = str(match.group("label") or "").strip().lower()
+            severity = severity_aliases.get(raw_label, "normal")
+            description = " ".join(str(match.group("description") or "").strip().split())
+            if not description:
+                continue
+            title = re.split(r"\s*\(|[.;]\s*", description, maxsplit=1)[0].strip()
+            if not title:
+                title = description
+            if len(title) > 80:
+                title = title[:77].rstrip() + "..."
+            out.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "severity": severity,
+                    "state": "new",
+                    "channel_id": default_channel_id,
+                    "timestamp_ms": base_ts_ms,
+                }
+            )
+        return out
+
+    def _alert_token_set(raw: Dict[str, Any]) -> Set[str]:
+        text = f"{raw.get('title') or ''} {raw.get('description') or ''}".lower()
+        stop_words = {
+            "the", "and", "from", "with", "that", "this", "into", "onto", "person",
+            "detected", "observed", "visible", "snapshot", "snapshots", "approx",
+            "event", "level", "alert",
+        }
+        tokens = {
+            token.rstrip("s")
+            for token in re.findall(r"[a-zа-яё0-9]{3,}", text, flags=re.IGNORECASE)
+            if token not in stop_words
+        }
+        return {token for token in tokens if token}
+
+    def _is_near_duplicate_alert(candidate: Dict[str, Any], existing_alerts: Sequence[Dict[str, Any]]) -> bool:
+        candidate_tokens = _alert_token_set(candidate)
+        if len(candidate_tokens) < 2:
+            return False
+        candidate_severity = str(candidate.get("severity") or "").lower()
+        for existing in existing_alerts:
+            if str(existing.get("severity") or "").lower() != candidate_severity:
+                continue
+            existing_tokens = _alert_token_set(existing)
+            if len(candidate_tokens & existing_tokens) >= 2:
+                return True
+        return False
+
     alerts: List[Dict[str, Any]] = []
+    seen_alerts: Set[str] = set()
+    raw_alerts: List[Tuple[str, Any]] = []
     for candidate in _extract_candidates(text or ''):
         if isinstance(candidate, dict) and isinstance(candidate.get('alerts'), list):
             for raw_alert in candidate['alerts']:
-                validated = _validate_alert(raw_alert)
-                if validated:
-                    alerts.append(validated)
-            if alerts:
-                break
+                raw_alerts.append(("json", raw_alert))
+    raw_alerts.extend(("prose", raw_alert) for raw_alert in _extract_prose_alerts(text or ''))
+    for source, raw_alert in raw_alerts:
+        validated = _validate_alert(raw_alert)
+        if not validated:
+            continue
+        if source == "prose" and _is_near_duplicate_alert(validated, alerts):
+            continue
+        alert_key = json.dumps(
+            {
+                "title": validated.get("title"),
+                "description": validated.get("description"),
+                "severity": validated.get("severity"),
+                "state": validated.get("state"),
+                "channel_id": validated.get("channel_id"),
+                "timestamp_ms": validated.get("timestamp_ms"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if alert_key in seen_alerts:
+            continue
+        seen_alerts.add(alert_key)
+        alerts.append(validated)
 
     return alerts
 
@@ -12049,7 +3175,83 @@ LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT = (
     "You are a CCTV operations summarizer. Consolidate multiple short L0 summaries into one clear L1 rollup. "
     "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
 )
+PREVIOUS_LUXRIOT_ROLLUP_PROMPT_DEFAULTS = {
+    "L1": (
+        "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Scene baseline\n"
+        "### Key changes\n"
+        "### Alerts/signals\n"
+        "### Operator notes\n"
+        "Rules: keep factual language; deduplicate repeated observations; include timestamps when available; "
+        "avoid phrases like 'L1 rollup from L0'."
+    ),
+    "L2": (
+        "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Routine baseline\n"
+        "### Significant changes\n"
+        "### Alerts/signals\n"
+        "### Operator notes\n"
+        "Rules: preserve meaningful deviations from routine; avoid repeating unchanged background details; "
+        "keep concise, operator-facing language."
+    ),
+    "L3": (
+        "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
+        "Return Markdown using exactly these sections:\n"
+        "### Window snapshot\n"
+        "### Persistent patterns\n"
+        "### Notable events\n"
+        "### Risks and follow-ups\n"
+        "### Operator notes\n"
+        "Rules: emphasize trend shifts and durable signals; remove duplicate wording; focus on actionable context."
+    ),
+}
+PREVIOUS_LUXRIOT_GENERIC_ROLLUP_PROMPT_DEFAULTS = {
+    "L2": (
+        "You are a CCTV operations summarizer. Consolidate multiple short L1 summaries into one clear L2 rollup. "
+        "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+    ),
+    "L3": (
+        "You are a CCTV operations summarizer. Consolidate multiple short L2 summaries into one clear L3 rollup. "
+        "Remove repetition, keep concrete scene changes and timestamps, and avoid boilerplate."
+    ),
+}
 LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
+    "Machine-readable alert output for operator review:\n"
+    "- Always append exactly one block at the end, prefixed with ALERTS_JSON:.\n"
+    "- If no trigger matches, use {\"alerts\": []}.\n"
+    "- If one or more triggers match, include one alert object per distinct visible trigger using this schema:\n"
+    "ALERTS_JSON:\n"
+    "{\n"
+    "  \"alerts\": [\n"
+    "    {\n"
+    "      \"title\": \"Short event title\",\n"
+    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
+    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"state\": \"new\",\n"
+    "      \"channel_id\": {channel_id},\n"
+    "      \"timestamp_ms\": 0\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Alert candidates are defined by the Alert review policy and by visible immediate safety/security hazards. "
+    "General hazards include physical violence, a person falling/collapsing or appearing to need urgent help, "
+    "dangerous vehicle behavior, forced entry, property damage, theft-like tampering, weapon/fire/smoke, "
+    "critical camera obstruction, or crowd escalation. "
+    "Do not classify behavior as illegal/unlawful; describe visible facts requiring operator review. "
+    "Do not alert on littering, loitering, casual gestures, routine walking/parking/deliveries, or ambiguous movement "
+    "unless the Alert review policy explicitly asks for that review signal. "
+    "Rules: emit one alert object per distinct visible trigger in the batch, up to 8 objects; "
+    "do not merge unrelated triggers into one alert; do not output a prose-only Alerts section or Warning Level list; "
+    "if a matching event is described anywhere in the prose summary, it must also appear in ALERTS_JSON; "
+    "evaluate every operator-defined trigger independently against the current snapshots; "
+    "if two distinct triggers are visible in the same batch, emit two alert objects; "
+    "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown)."
+)
+PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2 = (
     "Optional bookmark output (emit only when a Task-defined trigger is observed in this batch):\n"
     "- If no trigger match: emit no JSON block.\n"
     "- If a trigger matches: append exactly one block at the end, prefixed with ALERTS_JSON:, using this schema:\n"
@@ -12090,6 +3292,7 @@ PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT = (
 )
 OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS = {
     LEGACY_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
+    PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2.strip(),
     PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
 }
 LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
@@ -12102,7 +3305,7 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "### Worth to remember\n"
     "2-6 concise bullet points with context useful for future rollups.\n"
     "Rules: separate routine baseline from deviations; keep it factual and concise; avoid repetition; "
-    "emit alerts JSON only when a Task-defined trigger is observed in this batch."
+    "the backend appends current-observation and ALERTS_JSON instructions; follow that final output contract."
 )
 
 current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()
@@ -12120,6 +3323,7 @@ luxriot_manager = LuxriotManager(
     jpeg_encoder=_encode_jpeg,
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
+    runtime_state_store=_build_luxriot_runtime_state_store(),
 )
 try:
     with luxriot_manager.cache_lock:
@@ -12136,6 +3340,14 @@ try:
             'L3': str(getattr(config, 'LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT', '') or '').strip(),
         }
         legacy_rollup_prompt = LEGACY_LUXRIOT_ROLLUP_PROMPT_DEFAULT.strip()
+        outdated_rollup_prompts = {
+            level: {
+                legacy_rollup_prompt,
+                str(PREVIOUS_LUXRIOT_ROLLUP_PROMPT_DEFAULTS.get(level, '') or '').strip(),
+                str(PREVIOUS_LUXRIOT_GENERIC_ROLLUP_PROMPT_DEFAULTS.get(level, '') or '').strip(),
+            }
+            for level in ('L1', 'L2', 'L3')
+        }
         if (
             not str(luxriot_manager.rollup_llm_system_prompt or '').strip()
             or str(luxriot_manager.rollup_llm_system_prompt or '').strip() == legacy_rollup_prompt
@@ -12148,7 +3360,7 @@ try:
         for level in ('L1', 'L2', 'L3'):
             current_level_prompt = str(luxriot_manager.rollup_llm_system_prompts.get(level) or '').strip()
             default_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompt
-            if not current_level_prompt or current_level_prompt == legacy_rollup_prompt:
+            if not current_level_prompt or current_level_prompt in outdated_rollup_prompts.get(level, set()):
                 luxriot_manager.rollup_llm_system_prompts[level] = default_level_prompt
                 changed_prompt_defaults = True
         for channel_id, raw_overrides in list(luxriot_manager.channel_prompt_overrides.items()):
@@ -12165,7 +3377,7 @@ try:
                 rollup_changed = False
                 for level in ('L1', 'L2', 'L3'):
                     raw_level_prompt = str(rollup_overrides.get(level) or '').strip()
-                    if (not raw_level_prompt) or raw_level_prompt == legacy_rollup_prompt:
+                    if (not raw_level_prompt) or raw_level_prompt in outdated_rollup_prompts.get(level, set()):
                         fallback_level_prompt = desired_rollup_prompts.get(level) or luxriot_manager.rollup_llm_system_prompts.get(level, '')
                         if fallback_level_prompt:
                             rollup_overrides[level] = fallback_level_prompt
@@ -12182,8 +3394,8 @@ except Exception:
     pass
 
 probe_manager = ProbeManager(
-    embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder="clip"),
-    embed_text_fn=lambda text: get_text_embedding(text),
+    embed_image_fn=get_probe_image_embedding_from_pil,
+    embed_text_fn=get_probe_text_embedding,
     jpeg_encoder=_encode_jpeg,
 )
 luxriot_manager.probe_manager = probe_manager
@@ -12192,6 +3404,8 @@ probe_daemon_stop = threading.Event()
 
 
 class ProbesStore:
+    backend = "json"
+
     def __init__(self, path: Union[str, Path] = "probes_store.json") -> None:
         self.path = Path(path)
         self.data: Dict[str, Any] = {"probes": []}
@@ -12249,19 +3463,1837 @@ class ProbesStore:
             self._save_locked()
             return True
 
+    def health(self) -> Dict[str, Any]:
+        try:
+            with self.lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            return {
+                "ok": True,
+                "status": "reachable",
+                "backend": self.backend,
+                "path": str(self.path),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "backend": self.backend,
+                "path": str(self.path),
+                "error": str(exc),
+            }
 
-probes_store = ProbesStore()
-detections_store = DetectionsStore()
+
+def _build_archive_stores() -> Tuple[Any, Any]:
+    if not _postgres_archive_enabled():
+        unavailable = _UnavailablePostgresStore("archive")
+        return unavailable, unavailable
+    try:
+        pool = _get_control_plane_db_pool()
+        tenant_id = _archive_tenant_id()
+        return (
+            PostgresProbesStore(pool, tenant_id),
+            PostgresDetectionsStore(
+                pool,
+                tenant_id,
+                max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+            )
+        )
+    except Exception as exc:
+        unavailable = _UnavailablePostgresStore("archive", exc)
+        return unavailable, unavailable
+
+
+probes_store, detections_store = _build_archive_stores()
+luxriot_manager.probes_store = probes_store
+APP_STARTED_AT = time.time()
+
+
+def _component_result(
+    ok: bool,
+    status: str,
+    *,
+    required: bool = True,
+    **details: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "ok": bool(ok),
+        "status": status,
+        "required": bool(required),
+    }
+    for key, value in details.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+_PUBLIC_READY_KEYS = frozenset({"ok", "status", "required"})
+
+
+def _public_ready_checks(
+    checks: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    public_checks: Dict[str, Dict[str, Any]] = {}
+    for name, payload in checks.items():
+        public_checks[str(name)] = {
+            key: payload[key]
+            for key in _PUBLIC_READY_KEYS
+            if key in payload
+        }
+    return public_checks
+
+
+def _embedder_loaded_state() -> Dict[str, Any]:
+    if active_embedder == "clip":
+        loaded = clip_model is not None and (clip_preprocess is not None or clip_processor is not None)
+    elif active_embedder == "dino":
+        loaded = dino_encoder is not None
+    elif active_embedder == "fusion":
+        loaded = (
+            clip_model is not None
+            and (clip_preprocess is not None or clip_processor is not None)
+            and dino_encoder is not None
+        )
+    else:
+        return _component_result(False, "unsupported", embedder=active_embedder)
+    return _component_result(
+        loaded,
+        "loaded" if loaded else "not_loaded",
+        embedder=active_embedder,
+        clip_model=clip_runtime_model or None,
+        backend=clip_backend_kind if clip_model is not None else None,
+    )
+
+
+def _check_database_ready() -> Dict[str, Any]:
+    required_postgres = _archive_store_required()
+    store_checks: Dict[str, Dict[str, Any]] = {}
+
+    for name, store in (
+        ("detections", detections_store),
+        ("probes", probes_store),
+    ):
+        try:
+            health_fn = getattr(store, "health")
+            health = dict(health_fn())
+        except Exception as exc:
+            health = {"ok": False, "status": "error", "error": type(exc).__name__}
+        if required_postgres and health.get("backend") != "postgres":
+            health["ok"] = False
+            health["status"] = "not_postgres"
+            health["required_backend"] = "postgres"
+        store_checks[name] = health
+
+    runtime_state_store = getattr(luxriot_manager, "runtime_state_store", None)
+    if runtime_state_store is not None:
+        try:
+            runtime_state = dict(runtime_state_store.health())
+        except Exception as exc:
+            runtime_state = {
+                "ok": False,
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+    else:
+        runtime_state = {
+            "ok": not required_postgres,
+            "status": "not_configured",
+            "backend": "postgres",
+            "required_backend": "postgres" if required_postgres else None,
+        }
+    store_checks["runtime_state"] = runtime_state
+
+    ok = all(bool(item.get("ok")) for item in store_checks.values())
+    first_status = next(
+        (
+            str(item.get("status") or "error")
+            for item in store_checks.values()
+            if not item.get("ok")
+        ),
+        "reachable",
+    )
+    return _component_result(
+        ok,
+        "reachable" if ok else first_status,
+        backend=str(store_checks["detections"].get("backend") or ""),
+        archive_store_mode=_archive_store_mode(),
+        tenant_id=_archive_tenant_id() or None,
+        stores=store_checks,
+        retention={
+            "enabled": bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+            "row_retention_days": float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+            "thumbnail_retention_days": float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+            "max_records": int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+            "prune_interval_sec": float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0)),
+            "last_result": dict(_archive_retention_last_result),
+        },
+    )
+
+
+def _inference_worker_database_dsn() -> str:
+    return str(
+        os.getenv("EVA_WORKER_DATABASE_DSN")
+        or os.getenv("EVOSSEARCH_WORKER_DATABASE_DSN")
+        or ""
+    ).strip()
+
+
+def _get_inference_worker_db_pool() -> PsycopgPool:
+    global _inference_worker_db_pool
+    with _inference_worker_db_lock:
+        if _inference_worker_db_pool is None:
+            dsn = _inference_worker_database_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "EVA_WORKER_DATABASE_DSN is required when local inference "
+                    "workers are enabled"
+                )
+            base_settings = DatabaseSettings.from_env()
+            worker_count = max(
+                1,
+                int(getattr(config, "INFERENCE_WORKER_COUNT", 0)),
+            )
+            _inference_worker_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    dsn=dsn,
+                    pool_min_size=0,
+                    pool_max_size=min(64, worker_count + 1),
+                    application_name="eva-ai-inference-worker",
+                )
+            )
+        return _inference_worker_db_pool
+
+
+def _configure_inference_queue() -> Optional[LuxriotInferenceQueueRuntime]:
+    global _inference_queue_runtime
+    if not bool(getattr(config, "INFERENCE_QUEUE_ENABLED", False)):
+        return None
+    with _inference_queue_lock:
+        if _inference_queue_runtime is not None:
+            return _inference_queue_runtime
+        tenant_id = str(
+            getattr(config, "INFERENCE_QUEUE_TENANT_ID", "") or ""
+        ).strip()
+        if not tenant_id:
+            raise RuntimeError(
+                "EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID is required when the "
+                "inference queue is enabled"
+            )
+        api_repository = PostgresInferenceQueueRepository(
+            _get_control_plane_db_pool(),
+            tenant_id,
+        )
+        worker_count = int(getattr(config, "INFERENCE_WORKER_COUNT", 0))
+        worker_repository = (
+            PostgresInferenceQueueRepository(
+                _get_inference_worker_db_pool(),
+                tenant_id,
+            )
+            if worker_count > 0
+            else None
+        )
+        runtime = LuxriotInferenceQueueRuntime(
+            manager=luxriot_manager,
+            enqueue_repository=api_repository,
+            worker_repository=worker_repository,
+            tenant_id=tenant_id,
+            capacity=int(config.INFERENCE_QUEUE_CAPACITY),
+            spool_directory=config.INFERENCE_QUEUE_SPOOL_DIR,
+            default_model=_lm_profile_selector_value(_resolve_lm_profile(kind="vlm")),
+            worker_count=worker_count,
+            poll_interval_seconds=float(
+                config.INFERENCE_WORKER_POLL_INTERVAL_SEC
+            ),
+            lease_seconds=float(config.INFERENCE_WORKER_LEASE_SEC),
+            spool_retention_hours=float(
+                config.INFERENCE_SPOOL_RETENTION_HOURS
+            ),
+        )
+        runtime.start()
+        luxriot_manager.set_summary_dispatcher(runtime.enqueue_summary)
+        _inference_queue_runtime = runtime
+        return runtime
+
+
+def _check_postgres_ready() -> Dict[str, Any]:
+    if not _postgres_database_configured():
+        return _component_result(False, "not_configured", required=False)
+    try:
+        pool = _get_control_plane_db_pool()
+        result = pool.check_readiness()
+        role_result = pool.check_runtime_role(
+            strict=bool(getattr(config, "DB_STRICT_RUNTIME_ROLES", False))
+        )
+        ok = result.ready and role_result.ready
+        return _component_result(
+            ok,
+            role_result.state.value if result.ready else result.state.value,
+            detail=result.detail,
+            latency_ms=result.latency_ms,
+            current_revision=result.current_revision,
+            expected_revision=result.expected_revision,
+            runtime_role_ok=role_result.ready,
+            runtime_role_status=role_result.state.value,
+            runtime_user=role_result.current_user,
+            session_user=role_result.session_user,
+            runtime_unsafe_reason=role_result.unsafe_reason,
+            strict_runtime_roles=bool(
+                getattr(config, "DB_STRICT_RUNTIME_ROLES", False)
+            ),
+        )
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=type(exc).__name__,
+        )
+
+
+def _secret_is_weak(value: str) -> bool:
+    secret = str(value or "").strip()
+    if not secret:
+        return False
+    if len(secret) < 32:
+        return True
+    lowered = secret.lower()
+    weak_values = {
+        "123",
+        "1234",
+        "12345",
+        "admin",
+        "password",
+        "changeme",
+        "change-me",
+        "secret",
+        "unit-token",
+    }
+    return lowered in weak_values or len(set(secret)) < 8
+
+
+def _check_deployment_security_ready() -> Dict[str, Any]:
+    secure_required = bool(
+        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+    )
+    issues: List[str] = []
+    if not bool(getattr(config, "AUTH_COOKIE_SECURE", False)):
+        issues.append("EVOSSEARCH_AUTH_COOKIE_SECURE=true is required behind TLS")
+    if not config.ALLOWED_ROOTS:
+        issues.append("EVOSSEARCH_ALLOWED_ROOTS must whitelist deployment data roots")
+    else:
+        invalid_roots = [
+            str(root)
+            for root in config.ALLOWED_ROOTS
+            if not Path(root).expanduser().exists()
+        ]
+        if invalid_roots:
+            issues.append("ALLOWED_ROOTS contains missing paths: " + ", ".join(invalid_roots[:3]))
+    if _secret_is_weak(getattr(config, "ADMIN_TOKEN", "")):
+        issues.append("EVOSSEARCH_ADMIN_TOKEN is set but weak; rotate or unset under named auth")
+    if _secret_is_weak(getattr(config, "LUXRIOT_PASSWORD", "")):
+        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD appears to be a placeholder")
+
+    ok = not secure_required or not issues
+    return _component_result(
+        ok,
+        "ready" if ok else "misconfigured",
+        required=secure_required,
+        issues=issues,
+        secure_deployment_required=secure_required,
+        auth_cookie_secure=bool(getattr(config, "AUTH_COOKIE_SECURE", False)),
+        allowed_roots_count=len(config.ALLOWED_ROOTS),
+        admin_token_set=bool(getattr(config, "ADMIN_TOKEN", "")),
+        settings_local_only=bool(getattr(config, "SETTINGS_LOCAL_ONLY", False)),
+    )
+
+
+def _check_auth_ready() -> Dict[str, Any]:
+    secure_required = bool(
+        getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+    )
+    if not _auth_enabled():
+        return _component_result(
+            False,
+            "disabled",
+            required=secure_required,
+            error=(
+                "EVOSSEARCH_AUTH_ENABLED=true is required for secure deployment"
+                if secure_required
+                else None
+            ),
+        )
+    if secure_required and not bool(
+        getattr(config, "DB_STRICT_RUNTIME_ROLES", False)
+    ):
+        return _component_result(
+            False,
+            "misconfigured",
+            error=(
+                "EVOSSEARCH_DB_STRICT_RUNTIME_ROLES=true is required for "
+                "secure deployment"
+            ),
+        )
+    tenant_id = str(getattr(config, "AUTH_TENANT_ID", "") or "").strip()
+    if not tenant_id:
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVOSSEARCH_AUTH_TENANT_ID is required",
+        )
+    try:
+        uuid.UUID(tenant_id)
+    except ValueError:
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVOSSEARCH_AUTH_TENANT_ID must be a UUID",
+        )
+    if not _postgres_database_configured():
+        return _component_result(
+            False,
+            "misconfigured",
+            error="PostgreSQL is required when authentication is enabled",
+        )
+    if not _audit_database_dsn():
+        return _component_result(
+            False,
+            "misconfigured",
+            error="EVA_AUDIT_DATABASE_DSN is required when authentication is enabled",
+        )
+    postgres = _check_postgres_ready()
+    try:
+        audit_pool = _get_audit_db_pool()
+        audit_database = audit_pool.check_health()
+        audit_role = audit_pool.check_runtime_role(
+            strict=bool(getattr(config, "DB_STRICT_RUNTIME_ROLES", False))
+        )
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=f"audit database unavailable ({type(exc).__name__})",
+            tenant_id=tenant_id,
+        )
+    ok = bool(postgres.get("ok")) and audit_database.ready and audit_role.ready
+    return _component_result(
+        ok,
+        "ready" if ok else "unavailable",
+        tenant_id=tenant_id,
+        audit_latency_ms=audit_database.latency_ms,
+        audit_runtime_role_ok=audit_role.ready,
+        audit_runtime_role_status=audit_role.state.value,
+        audit_runtime_user=audit_role.current_user,
+        audit_runtime_unsafe_reason=audit_role.unsafe_reason,
+    )
+
+
+def _check_inference_queue_ready() -> Dict[str, Any]:
+    if not bool(getattr(config, "INFERENCE_QUEUE_ENABLED", False)):
+        return _component_result(False, "disabled", required=False)
+    try:
+        runtime = _configure_inference_queue()
+        if runtime is None:
+            return _component_result(False, "disabled", required=False)
+        status = runtime.status()
+    except Exception as exc:
+        return _component_result(
+            False,
+            "unavailable",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    worker_count = int(status.get("worker_count") or 0)
+    workers_alive = int(status.get("workers_alive") or 0)
+    workers_ready = worker_count == 0 or workers_alive == worker_count
+    return _component_result(
+        workers_ready,
+        "ready" if workers_ready else "worker_unavailable",
+        **status,
+    )
+
+
+def _check_lm_profiles_ready(timeout_sec: float = 1.0) -> Dict[str, Any]:
+    profiles = _configured_lm_profiles()
+    named_profile_ids = [
+        profile_id
+        for profile_id in profiles
+        if str(profile_id).strip() and str(profile_id).strip() != "default"
+    ]
+    if not _vlm_balancer_enabled() and not named_profile_ids:
+        return _component_result(
+            False,
+            "not_configured",
+            required=False,
+            profile_count=0,
+            required_profile_ids=[],
+            profiles=[],
+        )
+    configured_required_ids: List[str] = []
+    if _vlm_balancer_enabled():
+        configured_required_ids.extend(_configured_vlm_balancer_profile_ids())
+
+    required_ids: List[str] = []
+    for profile_id in configured_required_ids:
+        if profile_id and profile_id not in required_ids:
+            required_ids.append(profile_id)
+
+    profile_payloads: List[Dict[str, Any]] = []
+    any_checked = False
+    required_ok = True
+    enabled_profile_ids = [
+        profile_id
+        for profile_id, profile in profiles.items()
+        if _lm_profile_enabled(profile)
+        and (_vlm_balancer_enabled() or profile_id in named_profile_ids)
+    ]
+    for profile_id in enabled_profile_ids:
+        try:
+            profile = _resolve_lm_profile(profile_id=profile_id)
+        except Exception as exc:
+            profile_required = profile_id in required_ids
+            required_ok = required_ok and not profile_required
+            profile_payloads.append(
+                {
+                    "id": profile_id,
+                    "required": profile_required,
+                    "ok": False,
+                    "status": "config_error",
+                    "error": type(exc).__name__,
+                }
+            )
+            continue
+
+        profile_required = profile_id in required_ids
+        base_url = str(profile.get("base_url") or "").rstrip("/")
+        model = str(profile.get("model") or "").strip()
+        public_profile = _public_lm_profile(profile)
+        profile_status: Dict[str, Any] = {
+            "id": profile_id,
+            "kind": public_profile.get("kind"),
+            "selector": public_profile.get("selector"),
+            "model": model,
+            "gpu": public_profile.get("gpu") or "",
+            "base_url": base_url,
+            "required": profile_required,
+            "ok": False,
+        }
+        if not base_url or not model:
+            profile_status["status"] = "not_configured"
+            if profile_required:
+                required_ok = False
+            profile_payloads.append(profile_status)
+            continue
+
+        any_checked = True
+        headers = {"Accept": "application/json"}
+        if profile.get("api_key"):
+            headers["Authorization"] = f"Bearer {profile['api_key']}"
+        start = time.monotonic()
+        try:
+            resp = requests.get(
+                f"{base_url}/models",
+                headers=headers,
+                timeout=(0.5, max(0.5, float(timeout_sec))),
+                stream=True,
+            )
+            try:
+                status_code = int(resp.status_code)
+                ok = 200 <= status_code < 400
+                profile_status.update(
+                    {
+                        "ok": ok,
+                        "status": "reachable" if ok else "http_error",
+                        "status_code": status_code,
+                        "latency_ms": round(
+                            max(0.0, time.monotonic() - start) * 1000.0,
+                            3,
+                        ),
+                    }
+                )
+            finally:
+                resp.close()
+        except Exception as exc:
+            profile_status.update(
+                {
+                    "ok": False,
+                    "status": "error",
+                    "error": type(exc).__name__,
+                }
+            )
+        if profile_required and not profile_status.get("ok"):
+            required_ok = False
+        profile_payloads.append(profile_status)
+
+    required = bool(required_ids)
+    if required:
+        ok = required_ok
+    else:
+        ok = any(bool(profile.get("ok")) for profile in profile_payloads)
+    return _component_result(
+        ok,
+        "ready" if ok else ("not_configured" if not any_checked else "unavailable"),
+        required=required,
+        profile_count=len(profile_payloads),
+        required_profile_ids=required_ids,
+        profiles=profile_payloads,
+    )
+
+
+def _luxriot_configured() -> bool:
+    base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip()
+    if not base_url or "luxriot-host" in base_url:
+        return False
+    return bool(str(getattr(config, "LUXRIOT_USERNAME", "") or "").strip())
+
+
+def _check_luxriot_ready(timeout_sec: float = 2.0) -> Dict[str, Any]:
+    base_url = str(getattr(config, "LUXRIOT_BASE_URL", "") or "").strip().rstrip("/")
+    if not _luxriot_configured():
+        return _component_result(False, "not_configured", required=False, base_url=base_url or None)
+    try:
+        auth = requests.auth.HTTPDigestAuth(config.LUXRIOT_USERNAME, config.LUXRIOT_PASSWORD)
+        resp = requests.get(
+            f"{base_url}/channels",
+            params={"health": 0},
+            headers={"Accept": "application/json"},
+            auth=auth,
+            timeout=(1.0, max(1.0, float(timeout_sec))),
+            stream=True,
+        )
+        try:
+            ok = 200 <= int(resp.status_code) < 400
+            return _component_result(
+                ok,
+                "reachable" if ok else "http_error",
+                status_code=int(resp.status_code),
+                base_url=base_url,
+            )
+        finally:
+            resp.close()
+    except Exception as exc:
+        return _component_result(False, "error", error=str(exc), base_url=base_url)
+
+
+_configure_inference_queue()
+_luxriot_restore_result: Dict[str, Any] = {}
+try:
+    _luxriot_restore_result = luxriot_manager.restore_desired_live_sessions()
+except Exception as exc:
+    _luxriot_restore_result = {
+        "ok": False,
+        "status": "error",
+        "error": type(exc).__name__,
+    }
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Liveness endpoint for process supervisors and load balancers."""
+    return jsonify(
+        {
+            "status": "ok",
+            "version": config.APP_VERSION,
+            "uptime_sec": round(max(0.0, time.time() - APP_STARTED_AT), 3),
+        }
+    )
+
+
+@app.route('/ready', methods=['GET'])
+def ready():
+    """Readiness endpoint with component-level dependency status."""
+    load_embedder = str(request.args.get("load") or "").strip().lower() in TRUE_BOOL_STRINGS
+    strict = str(request.args.get("strict") or "").strip().lower() in TRUE_BOOL_STRINGS
+    details_requested = str(request.args.get("details") or "").strip().lower() in TRUE_BOOL_STRINGS
+    secure_required = bool(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False))
+    details_allowed = not secure_required
+    if secure_required and (details_requested or load_embedder):
+        if not _auth_enabled():
+            return _auth_failure_response(
+                "Named-user authentication is disabled",
+                503,
+            )
+        guard = _session_guard(
+            permission=Permission.DIAGNOSTICS_VIEW,
+            require_csrf=False,
+            action="ready.details",
+        )
+        if guard is not None:
+            return guard
+        details_allowed = True
+    embedder_required = str(
+        os.getenv("EVOSSEARCH_EMBEDDER_REQUIRED", "true") or "true"
+    ).strip().lower() in TRUE_BOOL_STRINGS
+
+    checks: Dict[str, Dict[str, Any]] = {
+        "database": _check_database_ready(),
+        "postgresql": _check_postgres_ready(),
+        "authentication": _check_auth_ready(),
+        "deployment_security": _check_deployment_security_ready(),
+        "inference_queue": _check_inference_queue_ready(),
+        "lm_profiles": _check_lm_profiles_ready(),
+        "embedder": _embedder_loaded_state(),
+        "luxriot": _check_luxriot_ready(),
+        "luxriot_restore": _component_result(
+            bool(_luxriot_restore_result.get("ok", True)),
+            str(_luxriot_restore_result.get("status") or "unknown"),
+            required=False,
+            **{
+                key: value
+                for key, value in _luxriot_restore_result.items()
+                if key not in {"ok", "status"}
+            },
+        ),
+    }
+
+    if load_embedder and details_allowed and not checks["embedder"].get("ok"):
+        try:
+            ensure_embedder_loaded(active_embedder)
+            checks["embedder"] = _embedder_loaded_state()
+        except Exception as exc:
+            app.logger.warning(
+                "Readiness embedder load failed request_id=%s error=%s",
+                getattr(g, "request_id", ""),
+                exc,
+            )
+            checks["embedder"] = _component_result(
+                False,
+                "load_failed",
+                embedder=active_embedder,
+                error=type(exc).__name__,
+            )
+
+    required_names = ["database"]
+    if embedder_required:
+        required_names.append("embedder")
+    else:
+        checks["embedder"]["required"] = False
+    if checks["postgresql"].get("required"):
+        required_names.append("postgresql")
+    if checks["authentication"].get("required"):
+        required_names.append("authentication")
+    if checks["deployment_security"].get("required"):
+        required_names.append("deployment_security")
+    if checks["inference_queue"].get("required"):
+        required_names.append("inference_queue")
+    if checks["lm_profiles"].get("required"):
+        required_names.append("lm_profiles")
+    if strict or checks["luxriot"].get("required"):
+        required_names.append("luxriot")
+
+    is_ready = all(bool(checks[name].get("ok")) for name in required_names)
+    status_code = 200 if is_ready else 503
+    return jsonify(
+        {
+            "status": "ready" if is_ready else "not_ready",
+            "version": config.APP_VERSION,
+            "required": required_names,
+            "checks": checks if details_allowed else _public_ready_checks(checks),
+        }
+    ), status_code
+
+
+def _identity_payload(identity: Any) -> Dict[str, Any]:
+    return {
+        "id": identity.user_id,
+        "tenantId": identity.tenant_id,
+        "username": identity.username,
+        "displayName": identity.display_name,
+        "isActive": bool(getattr(identity, "is_active", True)),
+        "roles": sorted(identity.roles),
+        "permissions": sorted(identity.permissions),
+        "allowedChannelIds": sorted(
+            identity.allowed_channel_ids,
+            key=lambda value: str(value),
+        ),
+    }
+
+
+def _identity_session_payload(session: Any) -> Dict[str, Any]:
+    return {
+        "id": str(getattr(session, "session_id", "")),
+        "tenantId": str(getattr(session, "tenant_id", "")),
+        "userId": str(getattr(session, "user_id", "")),
+        "username": str(getattr(session, "username", "")),
+        "createdAt": getattr(session, "created_at").isoformat()
+        if getattr(session, "created_at", None) is not None
+        else None,
+        "lastSeenAt": getattr(session, "last_seen_at").isoformat()
+        if getattr(session, "last_seen_at", None) is not None
+        else None,
+        "expiresAt": getattr(session, "expires_at").isoformat()
+        if getattr(session, "expires_at", None) is not None
+        else None,
+        "revokedAt": getattr(session, "revoked_at").isoformat()
+        if getattr(session, "revoked_at", None) is not None
+        else None,
+        "revokeReason": getattr(session, "revoke_reason", None),
+        "clientIp": getattr(session, "client_ip", None),
+        "userAgent": getattr(session, "user_agent", None),
+    }
+
+
+def _role_payload(role: Role) -> Dict[str, Any]:
+    permissions = ROLE_PERMISSIONS[role]
+    return {
+        "name": role.value,
+        "permissions": sorted(permission.value for permission in permissions),
+    }
+
+
+def _auth_admin_guard(*, write: bool, action: str):
+    return _session_guard(
+        permission=Permission.USERS_MANAGE,
+        require_csrf=write,
+        action=action,
+    )
+
+
+def _body_value(data: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in data:
+            return data[name]
+    return None
+
+
+def _has_body_value(data: Mapping[str, Any], *names: str) -> bool:
+    return any(name in data for name in names)
+
+
+def _parse_roles_payload(value: Any, *, default: Sequence[str] | None = None) -> List[str]:
+    raw = default if value is None and default is not None else value
+    if isinstance(raw, str):
+        roles = [raw]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+        roles = [str(item) for item in raw]
+    else:
+        raise ValueError("roles must be a list")
+    if not roles:
+        raise ValueError("at least one role is required")
+    return roles
+
+
+def _parse_channel_ids_payload(value: Any) -> List[Union[int, str]]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int)):
+        raw_items: Sequence[Any] = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        raw_items = value
+    else:
+        raise ValueError("allowedChannelIds must be a list")
+    parsed: List[Union[int, str]] = []
+    for item in raw_items:
+        if str(item).strip() == ALL_CHANNELS:
+            parsed.append(ALL_CHANNELS)
+            continue
+        try:
+            channel_id = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("allowedChannelIds must contain positive integers") from exc
+        if channel_id <= 0:
+            raise ValueError("allowedChannelIds must contain positive integers")
+        parsed.append(channel_id)
+    return parsed
+
+
+def _audit_identity_admin_result(
+    *,
+    action: str,
+    result: str,
+    target_id: Optional[str] = None,
+    details: Optional[Mapping[str, Any]] = None,
+) -> None:
+    _write_security_audit(
+        context=_current_auth_context(),
+        action=action,
+        result=result,
+        target_type="iam_user",
+        target_id=target_id,
+        details=details,
+    )
+
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    data = _json_body()
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    if not username or not password:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="denied",
+                target_type="user",
+                details={"reason": "missing_credentials"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Username and password are required", 400)
+    try:
+        login = _get_auth_service().login(
+            username=username,
+            password=password,
+            client_ip=_source_ip(),
+            user_agent=str(request.headers.get("User-Agent") or "")[:1024] or None,
+        )
+    except LoginThrottled as exc:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="denied",
+                target_type="user",
+                details={"reason": "throttled"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        response = _auth_failure_response("Too many login attempts", 429)
+        response[0].headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response
+    except InvalidCredentials:
+        try:
+            _write_security_audit(
+                context=None,
+                action="auth.login",
+                result="failure",
+                target_type="user",
+                details={"reason": "invalid_credentials"},
+            )
+        except Exception:
+            return _auth_failure_response("Audit service unavailable", 503)
+        return _auth_failure_response("Invalid username or password", 401)
+    except Exception:
+        return _auth_failure_response("Authentication service unavailable", 503)
+
+    context = AuthContext(
+        user_id=login.identity.user_id,
+        tenant_id=login.identity.tenant_id,
+        roles=login.identity.roles,
+        permissions=login.identity.permissions,
+        allowed_channel_ids=login.identity.allowed_channel_ids,
+        request_id=g.request_id,
+    )
+    try:
+        _write_security_audit(
+            context=context,
+            action="auth.login",
+            result="success",
+            target_type="session",
+            target_id=login.session_id,
+        )
+    except Exception:
+        try:
+            _get_auth_service().logout(
+                login.session_token,
+                reason="audit_unavailable",
+            )
+        except Exception:
+            pass
+        return _auth_failure_response("Audit service unavailable", 503)
+
+    max_age = max(
+        1,
+        int((login.expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+    response = make_response(
+        jsonify(
+            {
+                "success": True,
+                "user": _identity_payload(login.identity),
+                "expiresAt": login.expires_at.isoformat(),
+                "csrfHeader": "X-CSRF-Token",
+            }
+        )
+    )
+    response.set_cookie(
+        config.AUTH_SESSION_COOKIE,
+        login.session_token,
+        max_age=max_age,
+        secure=bool(config.AUTH_COOKIE_SECURE),
+        httponly=True,
+        samesite="Strict",
+        path="/",
+    )
+    response.set_cookie(
+        config.AUTH_CSRF_COOKIE,
+        login.csrf_token,
+        max_age=max_age,
+        secure=bool(config.AUTH_COOKIE_SECURE),
+        httponly=False,
+        samesite="Strict",
+        path="/",
+    )
+    return response
+
+
+@app.route('/auth/me', methods=['GET'])
+def auth_me():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _session_guard(
+        permission=None,
+        require_csrf=False,
+        action="auth.me.read",
+    )
+    if guard is not None:
+        return guard
+    session_record = g.auth_session
+    return jsonify(
+        {
+            "success": True,
+            "user": _identity_payload(session_record.identity),
+            "expiresAt": session_record.expires_at.isoformat(),
+            "csrfHeader": "X-CSRF-Token",
+        }
+    )
+
+
+@app.route('/auth/roles', methods=['GET'])
+def auth_roles():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=False, action="auth.roles.read")
+    if guard is not None:
+        return guard
+    return jsonify(
+        {
+            "success": True,
+            "roles": [_role_payload(role) for role in Role],
+        }
+    )
+
+
+@app.route('/auth/users', methods=['GET', 'POST'])
+def auth_users():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=request.method == "POST",
+        action=(
+            "auth.users.create"
+            if request.method == "POST"
+            else "auth.users.list"
+        ),
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+
+    repository = _get_identity_repository()
+    if request.method == "GET":
+        include_inactive = _coerce_bool(
+            request.args.get("includeInactive"),
+            default=True,
+        )
+        try:
+            users = repository.list_users(
+                context.tenant_id,
+                actor_user_id=context.user_id,
+                include_inactive=include_inactive,
+            )
+        except Exception:
+            return _auth_failure_response("Identity service unavailable", 503)
+        return jsonify(
+            {
+                "success": True,
+                "users": [_identity_payload(user) for user in users],
+            }
+        )
+
+    data = _json_body()
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    display_name = _body_value(data, "displayName", "display_name")
+    is_active = _coerce_bool(_body_value(data, "isActive", "is_active"), True)
+    try:
+        roles = _parse_roles_payload(data.get("roles"), default=[Role.VIEWER.value])
+        channel_ids = _parse_channel_ids_payload(
+            _body_value(data, "allowedChannelIds", "allowed_channel_ids")
+        )
+        if not username or not password:
+            raise ValueError("username and password are required")
+        user = repository.create_user(
+            context.tenant_id,
+            actor_user_id=context.user_id,
+            username=username,
+            password=password,
+            display_name=None if display_name is None else str(display_name),
+            roles=roles,
+            allowed_channel_ids=channel_ids,
+            is_active=is_active,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.create.completed",
+            result="success",
+            target_id=user.user_id,
+            details={
+                "username": user.username,
+                "roles": sorted(user.roles),
+                "is_active": user.is_active,
+            },
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+
+    return jsonify({"success": True, "user": _identity_payload(user)}), 201
+
+
+@app.route('/auth/users/<user_id>', methods=['GET', 'PATCH'])
+def auth_user(user_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=request.method == "PATCH",
+        action=(
+            "auth.users.update"
+            if request.method == "PATCH"
+            else "auth.users.read"
+        ),
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+
+    repository = _get_identity_repository()
+    if request.method == "GET":
+        try:
+            user = repository.get_user(
+                context.tenant_id,
+                user_id,
+                actor_user_id=context.user_id,
+            )
+        except ValueError as exc:
+            return _auth_failure_response(str(exc), 400)
+        except Exception:
+            return _auth_failure_response("Identity service unavailable", 503)
+        if user is None:
+            return _auth_failure_response("User not found", 404)
+        return jsonify({"success": True, "user": _identity_payload(user)})
+
+    data = _json_body()
+    updates: Dict[str, Any] = {}
+    try:
+        if _has_body_value(data, "displayName", "display_name"):
+            updates["display_name"] = _body_value(
+                data,
+                "displayName",
+                "display_name",
+            )
+        if _has_body_value(data, "password"):
+            updates["password"] = str(data.get("password") or "")
+        if _has_body_value(data, "roles"):
+            updates["roles"] = _parse_roles_payload(data.get("roles"))
+        if _has_body_value(data, "allowedChannelIds", "allowed_channel_ids"):
+            updates["allowed_channel_ids"] = _parse_channel_ids_payload(
+                _body_value(data, "allowedChannelIds", "allowed_channel_ids")
+            )
+        if _has_body_value(data, "isActive", "is_active"):
+            updates["is_active"] = _coerce_bool(
+                _body_value(data, "isActive", "is_active"),
+                default=True,
+            )
+        if not updates:
+            raise ValueError("no user fields to update")
+        user = repository.update_user(
+            context.tenant_id,
+            user_id,
+            actor_user_id=context.user_id,
+            **updates,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.update.completed",
+            result="success",
+            target_id=user.user_id,
+            details={
+                "updated_fields": sorted(updates),
+                "roles": sorted(user.roles),
+                "is_active": user.is_active,
+            },
+        )
+    except LookupError:
+        return _auth_failure_response("User not found", 404)
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "user": _identity_payload(user)})
+
+
+@app.route('/auth/users/<user_id>/revoke-sessions', methods=['POST'])
+def auth_user_revoke_sessions(user_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(
+        write=True,
+        action="auth.users.revoke_sessions",
+    )
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    data = _json_body()
+    reason = str(data.get("reason") or "admin_revoked").strip()
+    try:
+        revoked = _get_identity_repository().revoke_user_sessions(
+            context.tenant_id,
+            user_id,
+            actor_user_id=context.user_id,
+            reason=reason,
+        )
+        _audit_identity_admin_result(
+            action="auth.users.revoke_sessions.completed",
+            result="success",
+            target_id=user_id,
+            details={"revoked_sessions": revoked, "reason": reason},
+        )
+    except LookupError:
+        return _auth_failure_response("User not found", 404)
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "revokedSessions": revoked})
+
+
+@app.route('/auth/sessions', methods=['GET'])
+def auth_sessions():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=False, action="auth.sessions.list")
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    user_id = (
+        str(request.args.get("userId") or request.args.get("user_id") or "").strip()
+        or None
+    )
+    active_only = _coerce_bool(
+        request.args.get("activeOnly") or request.args.get("active_only"),
+        default=True,
+    )
+    try:
+        sessions = _get_identity_repository().list_sessions(
+            context.tenant_id,
+            actor_user_id=context.user_id,
+            user_id=user_id,
+            active_only=active_only,
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify(
+        {
+            "success": True,
+            "sessions": [_identity_session_payload(session) for session in sessions],
+        }
+    )
+
+
+@app.route('/auth/sessions/<session_id>/revoke', methods=['POST'])
+def auth_session_revoke(session_id: str):
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _auth_admin_guard(write=True, action="auth.sessions.revoke")
+    if guard is not None:
+        return guard
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    data = _json_body()
+    reason = str(data.get("reason") or "admin_revoked").strip()
+    try:
+        revoked = _get_identity_repository().revoke_session_by_id(
+            context.tenant_id,
+            session_id,
+            actor_user_id=context.user_id,
+            reason=reason,
+        )
+        if not revoked:
+            return _auth_failure_response("Session not found", 404)
+        _write_security_audit(
+            context=context,
+            action="auth.sessions.revoke.completed",
+            result="success",
+            target_type="iam_session",
+            target_id=session_id,
+            details={"reason": reason},
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Identity service unavailable", 503)
+    return jsonify({"success": True, "revoked": True})
+
+
+@app.route('/audit/events', methods=['GET'])
+def audit_events():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    context = _current_auth_context()
+    if context is None:
+        return _auth_failure_response("Authentication required", 401)
+    try:
+        page = _get_audit_reader().list_events(
+            context,
+            limit=request.args.get("limit"),
+            cursor=request.args.get("cursor"),
+            since=request.args.get("since"),
+            until=request.args.get("until"),
+            actor_user_id=(
+                request.args.get("actorUserId")
+                or request.args.get("actor_user_id")
+            ),
+            action=request.args.get("action"),
+            target_type=(
+                request.args.get("targetType")
+                or request.args.get("target_type")
+            ),
+            target_id=(
+                request.args.get("targetId")
+                or request.args.get("target_id")
+            ),
+            channel_id=(
+                request.args.get("channelId")
+                or request.args.get("channel_id")
+            ),
+            result=request.args.get("result"),
+            request_id=(
+                request.args.get("requestId")
+                or request.args.get("request_id")
+            ),
+        )
+    except ValueError as exc:
+        return _auth_failure_response(str(exc), 400)
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    return jsonify(
+        {
+            "success": True,
+            "events": [event.to_dict() for event in page.events],
+            "nextCursor": page.next_cursor,
+        }
+    )
+
+
+@app.route('/auth/logout', methods=['POST'])
+def auth_logout():
+    if not _auth_enabled():
+        return _auth_failure_response("Named-user authentication is disabled", 503)
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    session_token = str(
+        request.cookies.get(config.AUTH_SESSION_COOKIE) or ""
+    )
+    context = _current_auth_context()
+    try:
+        revoked = _get_auth_service().logout(session_token, reason="logout")
+    except Exception:
+        return _auth_failure_response("Authentication service unavailable", 503)
+    try:
+        _write_security_audit(
+            context=context,
+            action="auth.logout.completed",
+            result="success",
+            target_type="session",
+            details={"revoked": bool(revoked)},
+        )
+    except Exception:
+        return _auth_failure_response("Audit service unavailable", 503)
+    response = make_response(jsonify({"success": True}))
+    response.delete_cookie(config.AUTH_SESSION_COOKIE, path="/")
+    response.delete_cookie(config.AUTH_CSRF_COOKIE, path="/")
+    return response
+
+# Agent runner — instantiated lazily on first /agent/chat request so that
+# all helper functions (get_text_embedding, _search_detections_archive, etc.)
+# are fully defined before the runner captures them as callables.
+_agent_runner: Optional[Any] = None
+_agent_runner_lock = threading.Lock()
+_agent_runtime_model_override: Optional[str] = None
+_skills_root = Path(__file__).resolve().parent / "skills"
+_lm_models_cache_lock = threading.Lock()
+_lm_models_cache_payload: Optional[Dict[str, Any]] = None
+_lm_models_cache_expires_at = 0.0
+
+
+def _slugify_skill_name(value: str) -> str:
+    text = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(value or "").strip())
+    parts = [part for part in text.split("-") if part]
+    return "-".join(parts)[:80]
+
+
+def _normalize_skill_token(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    token = "".join(ch if (ch.isalnum() or ch in "-_") else "-" for ch in raw)
+    while "--" in token:
+        token = token.replace("--", "-")
+    return token.strip("-_")[:80]
+
+
+def _candidate_skill_slugs(value: str) -> List[str]:
+    base = _normalize_skill_token(value)
+    if not base:
+        return []
+    variants: List[str] = []
+    for candidate in (base, base.replace("-", "_"), base.replace("_", "-")):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _skill_title_from_markdown(content: str, fallback_slug: str) -> str:
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            return line.lstrip("#").strip() or fallback_slug.replace("-", " ").title()
+        break
+    return fallback_slug.replace("-", " ").title()
+
+
+def _skill_summary_from_markdown(content: str) -> str:
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        return line[:180]
+    return "No summary yet."
+
+
+def _skill_markdown_template(name: str) -> str:
+    title = str(name or "New Skill").strip() or "New Skill"
+    return (
+        f"# {title}\n\n"
+        "Goal: describe when this playbook should be used.\n\n"
+        "Default order:\n"
+        "1. Clarify missing inputs if needed.\n"
+        "2. Inspect the relevant context.\n"
+        "3. Use the right tools in a safe order.\n"
+        "4. Summarize the result for the operator.\n\n"
+        "Notes:\n"
+        "- Add decision rules here.\n"
+        "- Add embedder/model-specific guidance here.\n"
+    )
+
+
+def _apply_skill_title_to_markdown(name: str, content: str, slug: str) -> str:
+    title = str(name or "").strip() or slug.replace("-", " ").title()
+    body = str(content or "").strip()
+    if not body:
+        return _skill_markdown_template(title)
+    lines = body.splitlines()
+    for idx, raw_line in enumerate(lines):
+        if not raw_line.strip():
+            continue
+        if raw_line.lstrip().startswith("#"):
+            lines[idx] = f"# {title}"
+            return "\n".join(lines).strip()
+        return f"# {title}\n\n{body}".strip()
+    return _skill_markdown_template(title)
+
+
+def _resolve_skill_path(slug: str) -> Path:
+    candidates = _candidate_skill_slugs(slug)
+    if not candidates:
+        raise ValueError("Invalid skill slug")
+    root = _skills_root.resolve()
+    existing_paths: List[Path] = []
+    for candidate in candidates:
+        skill_file = (_skills_root / candidate / "SKILL.md").resolve()
+        if root not in skill_file.parents:
+            raise ValueError("Skill path is outside skills root")
+        if skill_file.exists():
+            existing_paths.append(skill_file)
+    if existing_paths:
+        return existing_paths[0]
+    fallback = (_skills_root / candidates[0] / "SKILL.md").resolve()
+    if root not in fallback.parents:
+        raise ValueError("Skill path is outside skills root")
+    return fallback
+
+
+def _list_skill_records() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not _skills_root.exists():
+        return records
+    for skill_file in sorted(_skills_root.rglob("SKILL.md")):
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        slug = skill_file.parent.name
+        stat = skill_file.stat()
+        records.append({
+            "slug": slug,
+            "name": _skill_title_from_markdown(content, slug),
+            "summary": _skill_summary_from_markdown(content),
+            "path": str(skill_file.relative_to(Path(__file__).resolve().parent)),
+            "updated_at": stat.st_mtime,
+        })
+    return records
+
+
+def _load_skill_record(slug: str) -> Dict[str, Any]:
+    skill_file = _resolve_skill_path(slug)
+    if not skill_file.exists():
+        raise FileNotFoundError(f"Skill not found: {slug}")
+    content = skill_file.read_text(encoding="utf-8")
+    stat = skill_file.stat()
+    return {
+        "slug": skill_file.parent.name,
+        "name": _skill_title_from_markdown(content, skill_file.parent.name),
+        "summary": _skill_summary_from_markdown(content),
+        "content": content,
+        "path": str(skill_file.relative_to(Path(__file__).resolve().parent)),
+        "updated_at": stat.st_mtime,
+    }
+
+
+def _save_skill_record(slug: str, name: str, content: str) -> Dict[str, Any]:
+    skill_file = _resolve_skill_path(slug)
+    skill_file.parent.mkdir(parents=True, exist_ok=True)
+    final_content = _apply_skill_title_to_markdown(name, content, skill_file.parent.name)
+    skill_file.write_text(final_content.rstrip() + "\n", encoding="utf-8")
+    return _load_skill_record(skill_file.parent.name)
+
+
+def _get_agent_runner() -> Any:
+    """Return (creating if needed) the singleton AgentRunner."""
+    global _agent_runner
+    if _agent_runner is not None:
+        return _agent_runner
+    with _agent_runner_lock:
+        if _agent_runner is not None:
+            return _agent_runner
+        from agent import (
+            AGENT_MAX_MESSAGES_PER_SESSION,
+            AGENT_MAX_SESSIONS,
+            AGENT_SESSION_TTL_DAYS,
+            AgentRunner,
+        )
+        approval_store = None
+        if _auth_enabled():
+            from agent_security import PostgresPlanApprovalStore
+
+            approval_store = PostgresPlanApprovalStore(_get_control_plane_db_pool())
+
+        def _agent_search_folder(
+            *, query: str, folder: str, limit: int = 12, sort_by: str = "similarity"
+        ) -> List[Dict[str, Any]]:
+            idx_bundle = load_index(folder, embedder='clip')
+            index, image_paths, image_metadata, _ = idx_bundle
+            if index is None or not image_paths:
+                return []
+            vec = get_text_embedding(query)
+            from agent import _strip_thumbnails  # local import is fine here
+            results = _build_ranked_results(
+                index=index,
+                image_paths=image_paths,
+                image_metadata=image_metadata,
+                query_vec=vec,
+                limit=limit,
+                sort_by=sort_by,
+            )
+            return results
+
+        def _agent_search_detections(
+            *, query: str, probe_id: Optional[str] = None,
+            channel_id: Optional[int] = None,
+            source: Optional[str] = None,
+            since_ms: Optional[int] = None,
+            until_ms: Optional[int] = None,
+            limit: int = 12,
+            sort_by: str = "similarity",
+            candidate_limit: int = 20000,
+            mode: str = "clip",
+            include_coverage: bool = False,
+        ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+            vec = get_text_embedding(query)
+            payload = _search_detections_archive(
+                clip_query_vec=vec,
+                dino_query_vec=None,
+                mode=mode,
+                probe_id=probe_id,
+                channel_id=channel_id,
+                source=_normalize_archive_source_filter(source),
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                sort_by=sort_by,
+                candidate_limit=candidate_limit,
+                include_coverage=include_coverage,
+            )
+            if include_coverage and isinstance(payload, tuple):
+                results, coverage = payload
+                return {"results": results, "coverage": coverage}
+            return cast(List[Dict[str, Any]], payload)
+
+        def _agent_tool_lm_chat(messages: List[Dict[str, Any]]) -> str:
+            return _call_lm_chat(
+                messages,
+                model_override=_agent_runtime_model_override,
+                profile_kind="agent",
+            )
+
+        agent_profile = _resolve_lm_profile(
+            model_override=_agent_runtime_model_override,
+            kind="agent",
+        )
+        _agent_runner = AgentRunner(
+            embed_text_fn=lambda text: get_text_embedding(text),
+            embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder='clip'),
+            call_lm_fn=_agent_tool_lm_chat,
+            encode_jpeg_fn=_encode_jpeg,
+            probes_store=probes_store,
+            detections_store=detections_store,
+            luxriot_manager=luxriot_manager,
+            search_indexed_folder_fn=_agent_search_folder,
+            search_detections_fn=_agent_search_detections,
+            lm_base_url=str(agent_profile.get("base_url") or ""),
+            lm_model=str(agent_profile.get("model") or ""),
+            lm_api_key=str(agent_profile.get("api_key") or ""),
+            lm_timeout=int(agent_profile.get("timeout") or config.LM_TIMEOUT),
+            store=PostgresAgentStore(
+                _get_control_plane_db_pool(),
+                max_sessions=AGENT_MAX_SESSIONS,
+                max_messages_per_session=AGENT_MAX_MESSAGES_PER_SESSION,
+                session_ttl_days=AGENT_SESSION_TTL_DAYS,
+            ),
+            tool_audit_callback=_write_agent_tool_audit,
+            tool_plan_store=approval_store,
+            tool_approval_store=approval_store,
+        )
+        return _agent_runner
+
+
+def _get_agent_config_payload() -> Dict[str, Any]:
+    profile = _resolve_lm_profile(
+        model_override=_agent_runtime_model_override,
+        kind="agent",
+    )
+    default_profile = _resolve_lm_profile(kind="agent")
+    selected_value = (
+        str(_agent_runtime_model_override or "").strip()
+        or _lm_profile_selector_value(profile)
+    )
+    default_value = _lm_profile_selector_value(default_profile)
+    return {
+        "model": selected_value,
+        "resolved_model": str(profile.get("model") or "").strip(),
+        "profile_id": str(profile.get("id") or "").strip(),
+        "default_model": default_value,
+        "default_resolved_model": str(default_profile.get("model") or "").strip(),
+        "default_profile_id": str(default_profile.get("id") or "").strip(),
+        "override_model": str(_agent_runtime_model_override or "").strip() or None,
+        "source": "runtime_override" if _agent_runtime_model_override else "config",
+    }
+
+
+def _agent_session_owner() -> Dict[str, str]:
+    if not _auth_enabled():
+        return {}
+    context = _current_auth_context()
+    if context is None:
+        return {}
+    return {
+        "tenant_id": context.tenant_id,
+        "actor_id": context.user_id,
+    }
+
+
+def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
+    global _lm_models_cache_payload, _lm_models_cache_expires_at
+
+    now = time.monotonic()
+    with _lm_models_cache_lock:
+        if (
+            not force
+            and _lm_models_cache_payload is not None
+            and now < _lm_models_cache_expires_at
+        ):
+            return copy.deepcopy(_lm_models_cache_payload)
+
+    default_profile = _resolve_lm_profile(kind="vlm")
+    default_model = _lm_profile_selector_value(default_profile)
+    agent_default_profile = _resolve_lm_profile(kind="agent")
+    agent_default_model = _lm_profile_selector_value(agent_default_profile)
+    fallback_models: List[str] = []
+    profiles = [
+        _resolve_lm_profile(profile_id=profile_id)
+        for profile_id in _configured_lm_profiles()
+    ]
+    for profile in profiles:
+        for candidate in (
+            _lm_profile_selector_value(profile),
+            str(profile.get("model") or "").strip(),
+        ):
+            if candidate and candidate not in fallback_models:
+                fallback_models.append(candidate)
+    agent_selector = str(_agent_runtime_model_override or "").strip()
+    if agent_selector and agent_selector not in fallback_models:
+        fallback_models.append(agent_selector)
+
+    payload: Dict[str, Any] = {
+        "models": fallback_models,
+        "default_model": default_model,
+        "default_profile_id": str(default_profile.get("id") or "").strip(),
+        "agent_default_model": agent_default_model,
+        "agent_default_profile_id": str(agent_default_profile.get("id") or "").strip(),
+        "offline_default_model": agent_default_model,
+        "offline_default_profile_id": str(agent_default_profile.get("id") or "").strip(),
+        "profiles": [_public_lm_profile(profile) for profile in profiles],
+        "auto_model_selector": LM_AUTO_BALANCE_SELECTOR,
+        "auto_model_label": LM_AUTO_BALANCE_LABEL,
+        "vlm_balancer": {
+            "enabled": _vlm_balancer_enabled(),
+            "profile_ids": _configured_vlm_balancer_profile_ids(),
+        },
+        "profile_errors": {},
+        "source": "fallback",
+        "error": None,
+        "fetched_at": time.time(),
+    }
+
+    profile_errors: Dict[str, str] = {}
+    fetched_any = False
+    try:
+        model_ids: List[str] = []
+        for candidate in fallback_models:
+            if candidate and candidate not in model_ids:
+                model_ids.append(candidate)
+        available_by_profile: Dict[str, List[str]] = {}
+        for profile in profiles:
+            profile_id = str(profile.get("id") or "").strip()
+            base_url = str(profile.get("base_url") or "").rstrip("/")
+            if not base_url:
+                profile_errors[profile_id] = "base URL is not configured"
+                continue
+            headers = {"Content-Type": "application/json"}
+            if profile.get("api_key"):
+                headers["Authorization"] = f"Bearer {profile['api_key']}"
+            timeout_value = float(profile.get("timeout") or config.LM_TIMEOUT or 120)
+            timeout = (3.05, min(10.0, max(5.0, timeout_value)))
+            try:
+                response = requests.get(
+                    f"{base_url}/models",
+                    headers=headers,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                raw = response.json()
+                items = raw.get("data") if isinstance(raw, Mapping) else None
+                profile_models: List[str] = []
+                if isinstance(items, Sequence):
+                    for item in items:
+                        if not isinstance(item, Mapping):
+                            continue
+                        model_id = str(item.get("id") or item.get("model") or "").strip()
+                        if not model_id:
+                            continue
+                        if model_id not in profile_models:
+                            profile_models.append(model_id)
+                        if model_id not in model_ids:
+                            model_ids.append(model_id)
+                if profile_models:
+                    available_by_profile[profile_id] = profile_models
+                    fetched_any = True
+            except Exception as exc:
+                profile_errors[profile_id] = str(exc)
+        if available_by_profile:
+            by_id = {
+                str(profile.get("id") or ""): dict(profile)
+                for profile in payload["profiles"]
+                if isinstance(profile, Mapping)
+            }
+            for profile_id, models in available_by_profile.items():
+                if profile_id in by_id:
+                    by_id[profile_id]["available_models"] = models
+            payload["profiles"] = list(by_id.values())
+        payload.update({
+            "models": model_ids,
+            "source": "lm_profiles" if fetched_any else "fallback",
+            "profile_errors": profile_errors,
+            "error": None if not profile_errors else "; ".join(
+                f"{profile_id}: {error}"
+                for profile_id, error in profile_errors.items()
+            ),
+        })
+    except Exception as exc:
+        payload["error"] = str(exc)
+
+    with _lm_models_cache_lock:
+        _lm_models_cache_payload = copy.deepcopy(payload)
+        _lm_models_cache_expires_at = now + 15.0
+    return payload
+
 
 DETECTIONS_SEARCH_MAX_CANDIDATES = 100000
 DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
 DETECTIONS_SEARCH_SHARD_OVERFETCH = 200
 DETECTIONS_SEARCH_DINO_POOL_MIN = 64
 DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER = 8
+ARCHIVE_SOURCE_FILTERS = {"probe", "vlm_summary", "vlm_alert"}
+ARCHIVE_SOURCE_ALIASES = {
+    "probe": "probe",
+    "probes_run": "probe",
+    "probes_query": "probe",
+    "probe_daemon": "probe",
+    "detection": "probe",
+    "detections": "probe",
+    "vlm_summary": "vlm_summary",
+    "video_description": "vlm_summary",
+    "video_descriptions": "vlm_summary",
+    "vlm_alert": "vlm_alert",
+    "alert": "vlm_alert",
+    "alerts": "vlm_alert",
+}
+
+
+def _normalize_archive_source_filter(value: Any) -> Optional[str]:
+    source = str(value or "").strip().lower()
+    source = ARCHIVE_SOURCE_ALIASES.get(source, source)
+    return source if source in ARCHIVE_SOURCE_FILTERS else None
+
+
+def _archive_source_label(value: Any) -> str:
+    source = _normalize_archive_source_filter(value)
+    if source == "probe":
+        return "Probe hit"
+    if source == "vlm_summary":
+        return "Video description"
+    if source == "vlm_alert":
+        return "VLM alert"
+    return "Archive frame"
+
+
+def _archive_item_type(value: Any) -> str:
+    source = _normalize_archive_source_filter(value)
+    if source == "probe":
+        return "probe_detection"
+    if source == "vlm_summary":
+        return "video_description_frame"
+    if source == "vlm_alert":
+        return "video_description_alert"
+    return "archive_frame"
 
 
 class _DetectionClipShardCache:
-    def __init__(self, store: DetectionsStore) -> None:
+    def __init__(self, store: Any) -> None:
         self.store = store
         self.lock = threading.RLock()
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -12291,7 +5323,7 @@ class _DetectionClipShardCache:
                 self._cache.pop(shard, None)
             return None, None
 
-        index = faiss.IndexFlatIP(int(vectors.shape[1]))
+        index = _get_faiss().IndexFlatIP(int(vectors.shape[1]))
         _faiss_add_vectors(index, vectors)
         ids_arr = np.asarray(ids, dtype=np.int64)
 
@@ -12308,7 +5340,7 @@ detection_clip_shard_cache = _DetectionClipShardCache(detections_store)
 
 
 def _thumbnail_to_pil_image(thumbnail_b64: Any) -> Optional[Image.Image]:
-    raw_value = str(thumbnail_b64 or "").strip()
+    raw_value = _strip_image_data_url_prefix(thumbnail_b64)
     if not raw_value:
         return None
     try:
@@ -12367,6 +5399,45 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _parse_luxriot_capture_interval_sec(data: Mapping[str, Any]) -> Optional[float]:
+    interval_keys = (
+        "interval_sec",
+        "snapshot_interval_sec",
+        "sample_interval_sec",
+        "capture_interval_sec",
+    )
+    interval_present = False
+    interval_sec: Optional[float] = None
+    for key in interval_keys:
+        if key not in data:
+            continue
+        interval_present = True
+        interval_sec = _to_optional_float(data.get(key))
+        break
+    if interval_present and interval_sec is None:
+        raise ValueError("Provide a valid positive interval_sec")
+
+    fps_keys = ("fps", "target_fps", "sample_fps")
+    fps_present = False
+    fps: Optional[float] = None
+    for key in fps_keys:
+        if key not in data:
+            continue
+        fps_present = True
+        fps = _to_optional_float(data.get(key))
+        break
+    if interval_sec is None and fps_present:
+        if fps is None or fps <= 0 or not math.isfinite(fps):
+            raise ValueError("Provide a valid positive fps")
+        interval_sec = 1.0 / fps
+
+    if interval_sec is None:
+        return None
+    if interval_sec <= 0 or not math.isfinite(interval_sec):
+        raise ValueError("Provide a valid positive interval_sec")
+    return max(0.2, min(300.0, float(interval_sec)))
 
 
 def _probe_identity(probe_like: Mapping[str, Any]) -> str:
@@ -12639,6 +5710,88 @@ class _AdaptiveDetectionArchive:
 
 
 detection_archive = _AdaptiveDetectionArchive()
+_archive_retention_lock = threading.RLock()
+_archive_retention_last_run = 0.0
+_archive_retention_last_result: Dict[str, Any] = {}
+
+
+def _delete_retained_archive_images(image_paths: Sequence[Any]) -> Dict[str, Any]:
+    deleted = 0
+    skipped = 0
+    errors = 0
+    root = detection_archive.root
+    seen: Set[str] = set()
+    for raw_path in image_paths:
+        text = str(raw_path or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        try:
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = (root / path).resolve()
+            else:
+                path = path.resolve()
+            if not _path_within(path, root):
+                skipped += 1
+                continue
+            if path.exists() and path.is_file():
+                path.unlink()
+                deleted += 1
+            else:
+                skipped += 1
+        except Exception:
+            errors += 1
+    return {
+        "files_deleted": deleted,
+        "files_skipped": skipped,
+        "file_delete_errors": errors,
+    }
+
+
+def _apply_archive_retention(*, force: bool = False) -> Dict[str, Any]:
+    global _archive_retention_last_run, _archive_retention_last_result
+    if not bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)):
+        return {"ok": True, "status": "disabled"}
+    prune_fn = getattr(detections_store, "apply_retention", None)
+    if not callable(prune_fn):
+        return {"ok": True, "status": "unsupported", "backend": getattr(detections_store, "backend", "unknown")}
+    now = time.time()
+    interval = float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0))
+    with _archive_retention_lock:
+        if (
+            not force
+            and _archive_retention_last_run > 0
+            and now - _archive_retention_last_run < interval
+        ):
+            cached = dict(_archive_retention_last_result)
+            cached["status"] = "cached"
+            cached["next_run_in_sec"] = max(0.0, interval - (now - _archive_retention_last_run))
+            return cached
+        try:
+            result = dict(
+                prune_fn(
+                    row_retention_days=float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+                    thumbnail_retention_days=float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+                    max_records=int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+                    batch_size=int(getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000)),
+                )
+            )
+            deleted_paths = result.pop("deleted_image_paths", [])
+            result.update(_delete_retained_archive_images(deleted_paths))
+            result["status"] = "applied"
+            _archive_retention_last_run = now
+            _archive_retention_last_result = dict(result)
+            return result
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            _archive_retention_last_run = now
+            _archive_retention_last_result = dict(result)
+            return result
 
 
 class _ProbeBookmarkGate:
@@ -12682,6 +5835,28 @@ class _ProbeBookmarkGate:
         snapshot_interval = max(1, int(getattr(config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         return snapshot_interval * 1000
 
+    def probe_config(self, probe_like: Mapping[str, Any]) -> Dict[str, Any]:
+        cooldown_sec = _to_optional_float(probe_like.get("bookmark_cooldown_sec"))
+        dedupe_window_sec = _to_optional_float(probe_like.get("bookmark_dedupe_window_sec"))
+        return {
+            "cooldown_ms": int(
+                max(
+                    0.0,
+                    (cooldown_sec if cooldown_sec is not None else (self.cooldown_ms / 1000.0)) * 1000.0,
+                )
+            ),
+            "dedupe_window_ms": int(
+                max(
+                    500.0,
+                    (dedupe_window_sec if dedupe_window_sec is not None else (self.dedupe_window_ms / 1000.0)) * 1000.0,
+                )
+            ),
+            "sim_high": self.sim_high,
+            "margin_delta_thr": self.margin_delta_thr,
+            "score_delta_thr": self.score_delta_thr,
+            "max_frame_gap": self.max_frame_gap,
+        }
+
     def _prune_locked(self) -> None:
         if len(self._state) <= self.max_states:
             return
@@ -12703,11 +5878,19 @@ class _ProbeBookmarkGate:
         neg_score: float,
         margin: float,
         fps_hint: Optional[float],
+        probe_config: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[bool, Dict[str, Any]]:
         key = self._state_key(channel_id, probe_key)
         ts_ms = int(timestamp_ms) if int(timestamp_ms) > 0 else int(time.time() * 1000)
         frame_interval_ms = self._estimate_frame_interval_ms(fps_hint)
         normalized_vec = self._normalize_vec(clip_vec)
+        cfg = dict(probe_config or {})
+        cooldown_ms = int(max(0, int(cfg.get("cooldown_ms", self.cooldown_ms) or self.cooldown_ms)))
+        dedupe_window_ms = int(max(500, int(cfg.get("dedupe_window_ms", self.dedupe_window_ms) or self.dedupe_window_ms)))
+        sim_high = float(cfg.get("sim_high", self.sim_high) or self.sim_high)
+        margin_delta_thr = float(cfg.get("margin_delta_thr", self.margin_delta_thr) or self.margin_delta_thr)
+        score_delta_thr = float(cfg.get("score_delta_thr", self.score_delta_thr) or self.score_delta_thr)
+        max_frame_gap = int(max(1, int(cfg.get("max_frame_gap", self.max_frame_gap) or self.max_frame_gap)))
 
         with self._lock:
             prev = self._state.get(key)
@@ -12737,7 +5920,7 @@ class _ProbeBookmarkGate:
             pos_delta = abs(float(pos_score) - float(prev.get("pos_score") or 0.0))
             neg_delta = abs(float(neg_score) - float(prev.get("neg_score") or 0.0))
 
-            if self.cooldown_ms > 0 and dt_ms < self.cooldown_ms:
+            if cooldown_ms > 0 and dt_ms < cooldown_ms:
                 return False, {
                     "reason": "cooldown",
                     "timestamp_ms": ts_ms,
@@ -12747,16 +5930,16 @@ class _ProbeBookmarkGate:
                 }
 
             stable_scores = (
-                margin_delta < self.margin_delta_thr
-                and pos_delta < self.score_delta_thr
-                and neg_delta < self.score_delta_thr
+                margin_delta < margin_delta_thr
+                and pos_delta < score_delta_thr
+                and neg_delta < score_delta_thr
             )
             if (
-                dt_ms < self.dedupe_window_ms
+                dt_ms < dedupe_window_ms
                 and similarity is not None
-                and similarity >= self.sim_high
+                and similarity >= sim_high
                 and stable_scores
-                and frame_gap <= float(self.max_frame_gap)
+                and frame_gap <= float(max_frame_gap)
             ):
                 return False, {
                     "reason": "similar_recent_hit",
@@ -12822,6 +6005,8 @@ def _maybe_send_probe_bookmark(
 ) -> Tuple[bool, Dict[str, Any]]:
     if not bool(probe_like.get("bookmark", False)):
         return False, {"reason": "bookmark_disabled", "source": source}
+    if _auth_enabled() and not bool(probe_like.get("bookmark_authorized", False)):
+        return False, {"reason": "bookmark_not_authorized", "source": source}
 
     channel_id = _to_int(probe_like.get("channel_id"), config.LUXRIOT_DEFAULT_CHANNEL_ID)
     probe_key = _probe_bookmark_identity(probe_like)
@@ -12833,6 +6018,7 @@ def _maybe_send_probe_bookmark(
     margin = _to_float(hit.get("margin"), 0.0)
     fps_hint = _to_optional_float(probe_like.get("fps"))
     clip_vec = _embed_thumbnail_b64(hit.get("thumbnail"), "clip")
+    gate_config = probe_bookmark_gate.probe_config(probe_like)
 
     allow, gate_meta = probe_bookmark_gate.evaluate(
         channel_id=channel_id,
@@ -12843,8 +6029,11 @@ def _maybe_send_probe_bookmark(
         neg_score=neg_score,
         margin=margin,
         fps_hint=fps_hint,
+        probe_config=gate_config,
     )
     gate_meta["source"] = source
+    gate_meta["cooldown_sec"] = round(float(gate_config.get("cooldown_ms", 0)) / 1000.0, 3)
+    gate_meta["dedupe_window_sec"] = round(float(gate_config.get("dedupe_window_ms", 0)) / 1000.0, 3)
     if not allow:
         gate_meta["sent"] = False
         return False, gate_meta
@@ -12889,6 +6078,8 @@ def _store_probe_hits(
     if not hits:
         return 0
     probe_id = _probe_identity(probe_like)
+    origin_source = str(source or "probe").strip().lower() or "probe"
+    archive_source = _normalize_archive_source_filter(origin_source) or "probe"
     channel_id = int(probe_like.get("channel_id") or config.LUXRIOT_DEFAULT_CHANNEL_ID)
     probe_name = str(probe_like.get("name") or "").strip() or probe_id
     severity = str(probe_like.get("severity") or "normal").strip().lower() or "normal"
@@ -12923,7 +6114,7 @@ def _store_probe_hits(
         keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
             probe_id=probe_id,
             channel_id=channel_id,
-            source=source,
+            source=archive_source,
             timestamp_ms=ts_ms,
             clip_vec=clip_vec,
             thumbnail_b64=archive_thumbnail_b64,
@@ -12939,7 +6130,8 @@ def _store_probe_hits(
             "hit_index": idx,
             "probe_window_sec": probe_like.get("window_sec"),
             "probe_fps": probe_like.get("fps"),
-            "source": source,
+            "source": archive_source,
+            "origin": origin_source,
             "image_path": image_path,
             "retention": retention_meta,
             "hit": {
@@ -12954,7 +6146,7 @@ def _store_probe_hits(
             payload["context"] = extra_payload
         records.append(
             {
-                "dedupe_key": f"{probe_id}:{source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
+                "dedupe_key": f"{probe_id}:{archive_source}:{origin_source}:{ts_ms}:{pos_score:.4f}:{neg_score:.4f}:{margin:.4f}",
                 "timestamp_ms": ts_ms,
                 "probe_id": probe_id,
                 "probe_name": probe_name,
@@ -12968,17 +6160,391 @@ def _store_probe_hits(
                 "thumbnail_b64": thumbnail_b64,
                 "clip_vec": clip_vec,
                 "image_path": image_path,
-                "source": source,
+                "source": archive_source,
                 "payload": payload,
             }
         )
     if not records:
         return 0
     try:
-        return detections_store.add_detections(records)
+        inserted = detections_store.add_detections(records)
+        _apply_archive_retention()
+        return inserted
     except Exception as exc:
         print(f"Detections store write failed for {probe_id}: {exc}")
         return 0
+
+
+_VLM_ARCHIVE_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
+
+
+def _vlm_archive_alert_counts(raw_counts: Any) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if isinstance(raw_counts, Mapping):
+        for raw_severity, raw_count in raw_counts.items():
+            severity = str(raw_severity or "").strip().lower()
+            if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+                severity = "normal"
+            count = _to_int(raw_count, 0)
+            if count > 0:
+                counts[severity] = counts.get(severity, 0) + count
+    return {
+        severity: int(counts[severity])
+        for severity in _VLM_ARCHIVE_SEVERITY_ORDER
+        if counts.get(severity, 0) > 0
+    }
+
+
+def _vlm_archive_top_severity(alert_counts: Mapping[str, int]) -> str:
+    for severity in _VLM_ARCHIVE_SEVERITY_ORDER:
+        if int(alert_counts.get(severity, 0) or 0) > 0:
+            return severity
+    return "normal"
+
+
+def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str, Any]]:
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes, bytearray)):
+        return []
+    events: List[Dict[str, Any]] = []
+    for raw_event in raw_events[:32]:
+        if not isinstance(raw_event, Mapping):
+            continue
+        title = str(raw_event.get("title") or "Event").strip()[:120] or "Event"
+        description = str(raw_event.get("description") or "").strip()[:300]
+        severity = str(raw_event.get("severity") or "normal").strip().lower()
+        if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+            severity = "normal"
+        state = str(raw_event.get("state") or "new").strip().lower()[:20] or "new"
+        timestamp_ms = _to_optional_int(raw_event.get("timestamp_ms"))
+        event: Dict[str, Any] = {
+            "title": title,
+            "description": description,
+            "severity": severity,
+            "state": state,
+            "channel_id": channel_id,
+        }
+        if timestamp_ms is not None:
+            event["timestamp_ms"] = int(max(0, timestamp_ms))
+        status = str(raw_event.get("delivery_status") or "").strip().lower()
+        if status:
+            event["delivery_status"] = status[:40]
+        error = str(raw_event.get("error") or "").strip()
+        if error:
+            event["error"] = error[:240]
+        events.append(event)
+    return events
+
+
+def _vlm_archive_snapshot_hint(text: object) -> Optional[int]:
+    """Return the strongest 1-based snapshot/frame reference from alert prose.
+
+    VLM alerts often describe the decisive moment as "Snapshots 8-12" while
+    timestamp_ms is missing or parser-filled. Prefer the latest referenced
+    snapshot in a range; for motion events that is usually the most informative
+    anchor frame.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    hints: List[int] = []
+    pattern = re.compile(
+        r"\b(?:snapshot|snapshots|frame|frames)\s*#?\s*(\d{1,3})"
+        r"(?:\s*(?:-|–|—|to|through|and)\s*#?\s*(\d{1,3}))?",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(raw):
+        first = _to_optional_int(match.group(1))
+        second = _to_optional_int(match.group(2))
+        for value in (first, second):
+            if value is not None and 1 <= int(value) <= 512:
+                hints.append(int(value))
+    if not hints:
+        return None
+    return max(hints)
+
+
+def _vlm_archive_anchor_from_snapshot_hint(
+    valid_frames: Sequence[Mapping[str, Any]],
+    snapshot_hint: Optional[int],
+) -> Optional[Mapping[str, Any]]:
+    if snapshot_hint is None or not valid_frames:
+        return None
+    frame_indices = {
+        _to_int(frame.get("frame_index"), -1): frame
+        for frame in valid_frames
+        if isinstance(frame, Mapping)
+    }
+    hinted = int(snapshot_hint)
+    zero_based = hinted - 1
+    if zero_based in frame_indices:
+        return frame_indices[zero_based]
+    if hinted in frame_indices:
+        return frame_indices[hinted]
+    return min(
+        valid_frames,
+        key=lambda frame: abs(_to_int(frame.get("frame_index"), 0) - zero_based),
+    )
+
+
+def _select_vlm_alert_anchor(
+    valid_frames: Sequence[Mapping[str, Any]],
+    alert_event: Mapping[str, Any],
+    *,
+    fallback_timestamp_ms: int,
+    summary_text: str,
+    single_alert: bool,
+) -> Tuple[Mapping[str, Any], str, Optional[int]]:
+    event_text = " ".join(
+        str(alert_event.get(key) or "")
+        for key in ("title", "description")
+    )
+    snapshot_hint = _vlm_archive_snapshot_hint(event_text)
+    reason = "alert_snapshot_reference"
+    if snapshot_hint is None and single_alert:
+        snapshot_hint = _vlm_archive_snapshot_hint(summary_text)
+        reason = "summary_snapshot_reference"
+    anchor = _vlm_archive_anchor_from_snapshot_hint(valid_frames, snapshot_hint)
+    if anchor is not None:
+        return anchor, reason, snapshot_hint
+    event_ts = _to_int(alert_event.get("timestamp_ms"), fallback_timestamp_ms)
+    anchor = min(
+        valid_frames,
+        key=lambda frame: abs(int(frame.get("timestamp_ms") or 0) - int(event_ts)),
+    )
+    return anchor, "timestamp_nearest", None
+
+
+def _vlm_archive_excerpt(value: Any, limit: int) -> Tuple[str, bool]:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], int, int]:
+    raw_frames = entry.get("archive_frames")
+    if (
+        not isinstance(raw_frames, Sequence)
+        or isinstance(raw_frames, (str, bytes, bytearray))
+    ):
+        return [], 0, 0
+
+    channel_id = _to_int(entry.get("channel_id"), 0)
+    if channel_id < 1:
+        return [], 0, 0
+
+    created_at = _to_optional_float(entry.get("created_at")) or time.time()
+    created_ms = int(created_at * 1000.0)
+    batch_start_ms = _to_int(entry.get("batch_start_ms"), created_ms)
+    batch_end_ms = _to_int(entry.get("batch_end_ms"), batch_start_ms)
+    run_id = str(entry.get("run_id") or "").strip() or "manual"
+    summary_excerpt, summary_truncated = _vlm_archive_excerpt(entry.get("summary"), 4000)
+    prompt_excerpt, prompt_truncated = _vlm_archive_excerpt(entry.get("prompt"), 1000)
+    alert_counts = _vlm_archive_alert_counts(entry.get("alert_counts"))
+    alert_total = _to_int(entry.get("alert_total"), sum(alert_counts.values()))
+    bookmarks_sent = _to_int(entry.get("bookmarks_sent"), 0)
+    alert_events = _vlm_archive_alert_events(entry.get("alert_events"), channel_id)
+    frame_count = _to_int(entry.get("frame_count"), 0)
+    batch_size = _to_int(entry.get("batch_size"), 0)
+
+    base_payload = {
+        "run_id": run_id,
+        "batch_start_ms": batch_start_ms,
+        "batch_end_ms": batch_end_ms,
+        "frame_count": frame_count,
+        "batch_size": batch_size,
+        "duration_sec": _to_float(entry.get("duration_sec"), 0.0),
+        "summary": summary_excerpt,
+        "summary_truncated": summary_truncated,
+        "prompt": prompt_excerpt,
+        "prompt_truncated": prompt_truncated,
+        "alert_counts": alert_counts,
+        "alert_total": alert_total,
+        "bookmarks_sent": bookmarks_sent,
+        "state_observations": list(entry.get("state_observations") or [])[:64]
+        if isinstance(entry.get("state_observations"), Sequence)
+        and not isinstance(entry.get("state_observations"), (str, bytes, bytearray))
+        else [],
+        "state_transition_events": list(entry.get("state_transition_events") or [])[:32]
+        if isinstance(entry.get("state_transition_events"), Sequence)
+        and not isinstance(entry.get("state_transition_events"), (str, bytes, bytearray))
+        else [],
+        "state_transition_total": _to_int(entry.get("state_transition_total"), 0),
+        "vector_signal": dict(entry.get("vector_signal") or {})
+        if isinstance(entry.get("vector_signal"), Mapping)
+        else {},
+    }
+
+    records: List[Dict[str, Any]] = []
+    valid_frames: List[Dict[str, Any]] = []
+    for fallback_index, raw_frame in enumerate(raw_frames):
+        if not isinstance(raw_frame, Mapping):
+            continue
+        thumbnail_b64 = str(raw_frame.get("thumbnail") or raw_frame.get("thumbnail_b64") or "").strip()
+        if not thumbnail_b64:
+            continue
+        frame_index = _to_int(raw_frame.get("frame_index"), fallback_index)
+        timestamp_ms = _to_int(raw_frame.get("timestamp_ms"), batch_start_ms)
+        timestamp_ms = max(0, timestamp_ms)
+        anchor_role = str(raw_frame.get("anchor_role") or "sample").strip().lower() or "sample"
+        width = _to_optional_int(raw_frame.get("width"))
+        height = _to_optional_int(raw_frame.get("height"))
+        frame_payload = {
+            **base_payload,
+            "source": "vlm_summary",
+            "anchor_role": anchor_role,
+            "frame_index": frame_index,
+            "frame_timestamp_ms": timestamp_ms,
+            "captured_at": _to_optional_float(raw_frame.get("captured_at")),
+            "width": width,
+            "height": height,
+        }
+        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
+        records.append(
+            {
+                "dedupe_key": (
+                    f"vlm_summary:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
+                    f"{frame_index}:{timestamp_ms}:{anchor_role}"
+                ),
+                "timestamp_ms": timestamp_ms,
+                "probe_id": f"vlm_summary:{channel_id}",
+                "probe_name": f"VLM summary ch {channel_id}",
+                "channel_id": channel_id,
+                "severity": "info",
+                "bookmark_enabled": False,
+                "bookmark_sent": False,
+                "pos_score": 0.0,
+                "neg_score": 0.0,
+                "margin": 0.0,
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "source": "vlm_summary",
+                "payload": frame_payload,
+            }
+        )
+        valid_frames.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "frame_index": frame_index,
+                "anchor_role": anchor_role,
+                "thumbnail_b64": thumbnail_b64,
+                "clip_vec": clip_vec,
+                "payload": frame_payload,
+            }
+        )
+
+    summary_count = len(records)
+    alert_count = 0
+    if valid_frames and (alert_total > 0 or bookmarks_sent > 0 or alert_events):
+        events_for_archive = list(alert_events)
+        if not events_for_archive:
+            events_for_archive = [
+                {
+                    "title": "VLM alert batch",
+                    "description": "",
+                    "severity": _vlm_archive_top_severity(alert_counts),
+                    "state": "new",
+                    "channel_id": channel_id,
+                    "timestamp_ms": int(valid_frames[-1]["timestamp_ms"]),
+                    "delivery_status": "aggregate",
+                }
+            ]
+        archived_events = events_for_archive[:32]
+        for event_index, alert_event in enumerate(archived_events):
+            event_ts = _to_int(alert_event.get("timestamp_ms"), int(valid_frames[-1]["timestamp_ms"]))
+            anchor, anchor_selection, snapshot_hint = _select_vlm_alert_anchor(
+                valid_frames,
+                alert_event,
+                fallback_timestamp_ms=event_ts,
+                summary_text=summary_excerpt,
+                single_alert=len(archived_events) == 1,
+            )
+            severity = str(alert_event.get("severity") or "normal").strip().lower()
+            if severity not in _VLM_ARCHIVE_SEVERITY_ORDER:
+                severity = "normal"
+            event_payload = {
+                "title": str(alert_event.get("title") or "Event"),
+                "description": str(alert_event.get("description") or ""),
+                "severity": severity,
+                "state": str(alert_event.get("state") or "new"),
+                "timestamp_ms": event_ts,
+                "delivery_status": str(alert_event.get("delivery_status") or ""),
+            }
+            if alert_event.get("error"):
+                event_payload["error"] = str(alert_event.get("error") or "")[:240]
+            event_hash = hashlib.sha1(
+                json.dumps(event_payload, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
+            ).hexdigest()[:12]
+            alert_payload = {
+                **base_payload,
+                "source": "vlm_alert",
+                "severity": severity,
+                "alert_event": event_payload,
+                "alert_event_index": event_index,
+                "anchor_role": "alert_anchor",
+                "anchor_frame_index": anchor["frame_index"],
+                "anchor_frame_timestamp_ms": anchor["timestamp_ms"],
+                "anchor_source_role": anchor["anchor_role"],
+                "anchor_selection": anchor_selection,
+            }
+            if snapshot_hint is not None:
+                alert_payload["anchor_snapshot_hint"] = int(snapshot_hint)
+            records.append(
+                {
+                    "dedupe_key": (
+                        f"vlm_alert:{channel_id}:{run_id}:{batch_start_ms}:{batch_end_ms}:"
+                        f"{anchor['timestamp_ms']}:{severity}:{event_index}:{event_hash}"
+                    ),
+                    "timestamp_ms": int(anchor["timestamp_ms"]),
+                    "probe_id": f"vlm_alert:{channel_id}",
+                    "probe_name": f"VLM alert ch {channel_id}: {event_payload['title'][:64]}",
+                    "channel_id": channel_id,
+                    "severity": severity,
+                    "bookmark_enabled": False,
+                    "bookmark_sent": bookmarks_sent > 0,
+                    "pos_score": 0.0,
+                    "neg_score": 0.0,
+                    "margin": 0.0,
+                    "thumbnail_b64": anchor["thumbnail_b64"],
+                    "clip_vec": anchor["clip_vec"],
+                    "source": "vlm_alert",
+                    "payload": alert_payload,
+                }
+            )
+        alert_count = len(events_for_archive[:32])
+    return records, summary_count, alert_count
+
+
+def _store_vlm_summary_archive_frames(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    records, summary_count, alert_count = _vlm_summary_frame_records(entry)
+    if not records:
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "summary_frames": 0,
+            "alert_frames": 0,
+        }
+    try:
+        inserted = detections_store.add_detections(records)
+        _apply_archive_retention()
+        return {
+            "attempted": len(records),
+            "inserted": int(inserted),
+            "summary_frames": summary_count,
+            "alert_frames": alert_count,
+        }
+    except Exception as exc:
+        print(f"VLM summary archive write failed: {exc}")
+        return {
+            "attempted": len(records),
+            "inserted": 0,
+            "summary_frames": summary_count,
+            "alert_frames": alert_count,
+            "error": str(exc)[:240] or exc.__class__.__name__,
+        }
+
+
+luxriot_manager.set_summary_archive_callback(_store_vlm_summary_archive_frames)
 
 
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
@@ -13159,7 +6725,7 @@ def save_index(index_results: Dict[str, Tuple[faiss.Index, List[str], List[Dict[
         embed_dir = _index_directory(folder_path, embedder)
         embed_dir.mkdir(parents=True, exist_ok=True)
 
-        faiss.write_index(index, str(embed_dir / 'index.faiss'))
+        _get_faiss().write_index(index, str(embed_dir / 'index.faiss'))
 
         with open(embed_dir / 'paths.pkl', 'wb') as f:
             pickle.dump(image_paths, f)
@@ -13193,8 +6759,12 @@ def load_index(folder_path: Union[str, Path], embedder: Optional[str] = None) ->
         except json.JSONDecodeError:
             meta = {}
 
+    if not _index_metadata_compatible(target, meta):
+        print(f"Index metadata for {target} does not match current embedding model; rebuild index.")
+        return None, None, None, meta
+
     try:
-        index = faiss.read_index(str(embed_dir / 'index.faiss'))
+        index = _get_faiss().read_index(str(embed_dir / 'index.faiss'))
 
         with open(embed_dir / 'paths.pkl', 'rb') as f:
             image_paths = pickle.load(f)
@@ -13231,7 +6801,7 @@ def save_segment_index(
         raise ValueError("Segment embeddings must be a 2D array")
 
     if index_path.exists():
-        index = faiss.read_index(str(index_path))
+        index = _get_faiss().read_index(str(index_path))
         if index.d != embeddings.shape[1]:
             raise ValueError(
                 f"Segment embedding dimension mismatch: existing index expects {index.d}, got {embeddings.shape[1]}"
@@ -13239,13 +6809,13 @@ def save_segment_index(
         with open(metadata_path, 'rb') as fh:
             existing_meta: List[Dict[str, Any]] = pickle.load(fh)
     else:
-        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index = _get_faiss().IndexFlatIP(embeddings.shape[1])
         existing_meta = []
 
     _faiss_add_vectors(index, embeddings)
     existing_meta.extend(segment_metadata)
 
-    faiss.write_index(index, str(index_path))
+    _get_faiss().write_index(index, str(index_path))
     with open(metadata_path, 'wb') as fh:
         pickle.dump(existing_meta, fh)
 
@@ -13269,7 +6839,7 @@ def load_segment_index(folder_path: Union[str, Path]):
         return None, [], {}
 
     try:
-        index = faiss.read_index(str(index_path))
+        index = _get_faiss().read_index(str(index_path))
         with open(metadata_path, 'rb') as fh:
             segment_meta: List[Dict[str, Any]] = pickle.load(fh)
         meta_info = {}
@@ -13365,7 +6935,6 @@ def _build_result_entry(img_path: str, similarity: float, metadata: Optional[Dic
     except Exception as img_error:
         # Keep the result entry even if thumbnail creation fails so search never collapses to empty.
         # Frontend can still show filename/path and let operators inspect the source image directly.
-        result['metadata']['thumbnail_error'] = str(img_error)
         print(f"Warning: thumbnail generation failed for {img_path}: {img_error}")
     if extra:
         result.update(extra)
@@ -13602,6 +7171,7 @@ def _normalize_detection_search_mode(requested: Optional[str]) -> str:
 def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DETECTIONS_SEARCH_DEFAULT_HOURS) -> Dict[str, Any]:
     probe_raw = str(payload.get("probe_id") or "").strip()
     probe_id = probe_raw or None
+    source = _normalize_archive_source_filter(payload.get("source"))
 
     channel_raw = str(payload.get("channel_id") or "").strip()
     channel_id: Optional[int] = None
@@ -13623,6 +7193,7 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
     return {
         "probe_id": probe_id,
         "channel_id": channel_id,
+        "source": source,
         "since_ms": since_ms,
         "until_ms": until_ms,
     }
@@ -13631,6 +7202,7 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
 def _backfill_clip_vectors_for_filters(
     probe_id: Optional[str],
     channel_id: Optional[int],
+    source: Optional[str],
     since_ms: Optional[int],
     until_ms: Optional[int],
     *,
@@ -13640,6 +7212,7 @@ def _backfill_clip_vectors_for_filters(
     detections, _ = detections_store.list_detections(
         probe_id=probe_id,
         channel_id=channel_id,
+        source=source,
         since_ms=since_ms,
         until_ms=until_ms,
         limit=max_backfill,
@@ -13731,7 +7304,11 @@ def _search_detection_clip_shards(
     if len(seen) < len(candidate_map):
         remaining = [det_id for det_id in candidate_map.keys() if det_id not in seen]
         if remaining:
-            vec_rows = detections_store.fetch_detections_by_ids(remaining, include_vectors=True)
+            vec_rows = detections_store.fetch_detections_by_ids(
+                remaining,
+                include_vectors=True,
+                include_thumbnail=False,
+            )
             fallback_ranked: List[Tuple[int, float]] = []
             for row in vec_rows:
                 clip_vec = row.get("clip_vec")
@@ -13799,6 +7376,7 @@ def _build_detection_search_result(
     if not image_path and isinstance(payload_obj, dict):
         image_path = str(payload_obj.get("image_path") or "").strip()
 
+    origin = str(payload_obj.get("origin") or payload_obj.get("source") or "").strip()
     result: Dict[str, Any] = {
         "path": image_path,
         "filename": f"{probe_label} · {ts_label}",
@@ -13808,6 +7386,7 @@ def _build_detection_search_result(
             "mtime": ts_ms,
             "detection_id": item.get("id"),
             "source": item.get("source"),
+            "origin": origin,
             "probe_id": item.get("probe_id"),
             "probe_name": item.get("probe_name"),
             "channel_id": item.get("channel_id"),
@@ -13823,10 +7402,32 @@ def _build_detection_search_result(
         "neg_score": float(item.get("neg_score") or 0.0),
         "margin": float(item.get("margin") or 0.0),
         "source": item.get("source"),
+        "source_label": _archive_source_label(item.get("source")),
+        "archive_item_type": _archive_item_type(item.get("source")),
+        "origin": origin,
         "shard_key": item.get("shard_key"),
         "search_mode": mode,
         "dino_fallback": bool(dino_fallback),
     }
+    if payload_obj:
+        result["payload"] = payload_obj
+        summary_excerpt = str(payload_obj.get("summary") or "").strip()
+        if summary_excerpt:
+            result["summary"] = summary_excerpt
+        for key in (
+            "run_id",
+            "batch_start_ms",
+            "batch_end_ms",
+            "frame_timestamp_ms",
+            "anchor_frame_timestamp_ms",
+            "frame_index",
+            "anchor_frame_index",
+            "anchor_role",
+            "anchor_source_role",
+            "summary_truncated",
+        ):
+            if key in payload_obj:
+                result[key] = payload_obj.get(key)
     if mode in {"fusion", "dino"}:
         result["fusion"] = {
             "clip_similarity": float(clip_score),
@@ -13837,6 +7438,50 @@ def _build_detection_search_result(
     return result
 
 
+def _build_detection_search_coverage(
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    total_candidates: Optional[int],
+    candidate_limit: int,
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    source: Optional[str],
+    channel_id: Optional[int],
+) -> Dict[str, Any]:
+    scanned = len(candidates)
+    total = max(int(total_candidates), scanned) if total_candidates is not None else scanned
+    timestamps = [
+        int(item.get("timestamp_ms") or 0)
+        for item in candidates
+        if _to_optional_int(item.get("timestamp_ms")) is not None
+    ]
+    newest_ms = max(timestamps) if timestamps else None
+    oldest_ms = min(timestamps) if timestamps else None
+    truncated = total > scanned
+    note = "Search ranked the full candidate set for the requested filters."
+    if truncated:
+        note = (
+            "Search ranked a limited newest-first candidate window; older matching archive rows "
+            "may exist outside this search pass."
+        )
+    return {
+        "candidate_limit": int(candidate_limit),
+        "scanned_candidates": int(scanned),
+        "total_candidates": int(total),
+        "truncated": bool(truncated),
+        "result_limit": int(limit),
+        "source": source,
+        "channel_id": channel_id,
+        "requested_since_ms": since_ms,
+        "requested_until_ms": until_ms,
+        "scanned_oldest_ms": oldest_ms,
+        "scanned_newest_ms": newest_ms,
+        "must_state_coverage": bool(truncated),
+        "note": note,
+    }
+
+
 def _search_detections_archive(
     *,
     clip_query_vec: np.ndarray,
@@ -13844,29 +7489,46 @@ def _search_detections_archive(
     mode: str,
     probe_id: Optional[str],
     channel_id: Optional[int],
+    source: Optional[str],
     since_ms: Optional[int],
     until_ms: Optional[int],
     limit: int,
     sort_by: str,
     candidate_limit: int,
-) -> List[Dict[str, Any]]:
+    include_coverage: bool = False,
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
     limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
     candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
     clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
+    total_candidates: Optional[int] = None
+    try:
+        total_candidates = detections_store.count_vector_candidates(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            only_with_clip=True,
+        )
+    except AttributeError:
+        total_candidates = None
 
     candidates = detections_store.list_vector_candidates(
         probe_id=probe_id,
         channel_id=channel_id,
+        source=source,
         since_ms=since_ms,
         until_ms=until_ms,
         limit=candidate_limit,
         only_with_clip=True,
         include_vectors=False,
+        include_thumbnail=False,
     )
     if not candidates:
         updated = _backfill_clip_vectors_for_filters(
             probe_id,
             channel_id,
+            source,
             since_ms,
             until_ms,
             expected_dim=clip_dim,
@@ -13876,20 +7538,33 @@ def _search_detections_archive(
             candidates = detections_store.list_vector_candidates(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=source,
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=candidate_limit,
                 only_with_clip=True,
                 include_vectors=False,
+                include_thumbnail=False,
             )
     if not candidates:
-        return []
+        coverage = _build_detection_search_coverage(
+            candidates=[],
+            total_candidates=total_candidates,
+            candidate_limit=candidate_limit,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            source=source,
+            channel_id=channel_id,
+        )
+        return ([], coverage) if include_coverage else []
 
     clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
         updated = _backfill_clip_vectors_for_filters(
             probe_id,
             channel_id,
+            source,
             since_ms,
             until_ms,
             expected_dim=clip_dim,
@@ -13899,15 +7574,27 @@ def _search_detections_archive(
             candidates = detections_store.list_vector_candidates(
                 probe_id=probe_id,
                 channel_id=channel_id,
+                source=source,
                 since_ms=since_ms,
                 until_ms=until_ms,
                 limit=candidate_limit,
                 only_with_clip=True,
                 include_vectors=False,
+                include_thumbnail=False,
             )
             clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
-        return []
+        coverage = _build_detection_search_coverage(
+            candidates=candidates,
+            total_candidates=total_candidates,
+            candidate_limit=candidate_limit,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            source=source,
+            channel_id=channel_id,
+        )
+        return ([], coverage) if include_coverage else []
 
     alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
     if mode == "clip":
@@ -13920,9 +7607,12 @@ def _search_detections_archive(
         pool_size = min(len(clip_hits), max(DETECTIONS_SEARCH_DINO_POOL_MIN, limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER))
         pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
         dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
+        dino_dim = int(dino_query_vec.shape[0]) if dino_query_vec.ndim == 1 else 0
         for det_id in pool_ids:
             vec = dino_vectors.get(det_id)
             if vec is None:
+                continue
+            if dino_dim <= 0 or vec.ndim != 1 or int(vec.shape[0]) != dino_dim:
                 continue
             dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
 
@@ -13954,9 +7644,25 @@ def _search_detections_archive(
     else:
         scored.sort(key=lambda row: row[1], reverse=True)
 
+    top_scored = scored[:limit]
+    hydrated_by_id: Dict[int, Dict[str, Any]] = {}
+    try:
+        hydrated_rows = detections_store.fetch_detections_by_ids(
+            [det_id for det_id, *_rest in top_scored],
+            include_vectors=False,
+            include_thumbnail=True,
+        )
+        hydrated_by_id = {
+            int(row["id"]): row
+            for row in hydrated_rows
+            if isinstance(row, Mapping) and _to_optional_int(row.get("id")) is not None
+        }
+    except Exception:
+        hydrated_by_id = {}
+
     results: List[Dict[str, Any]] = []
-    for det_id, final_score, clip_score, dino_score, dino_fallback in scored[:limit]:
-        item = candidate_map.get(det_id)
+    for det_id, final_score, clip_score, dino_score, dino_fallback in top_scored:
+        item = hydrated_by_id.get(det_id) or candidate_map.get(det_id)
         if not item:
             continue
         results.append(
@@ -13970,7 +7676,17 @@ def _search_detections_archive(
                 dino_fallback=dino_fallback,
             )
         )
-    return results
+    coverage = _build_detection_search_coverage(
+        candidates=candidates,
+        total_candidates=total_candidates,
+        candidate_limit=candidate_limit,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        limit=limit,
+        source=source,
+        channel_id=channel_id,
+    )
+    return (results, coverage) if include_coverage else results
 
 
 def _build_segment_search_results(
@@ -14502,17 +8218,54 @@ def index_segments():
 
 @app.route('/video_understanding', methods=['POST'])
 def video_understanding():
-    data = _json_body()
-    video_path = (data.get('video') or '').strip()
-    if not video_path:
-        return jsonify({'error': 'Provide a video path.'}), 400
-    video_obj = Path(video_path).expanduser().resolve()
-    if not video_obj.exists() or not video_obj.is_file():
-        return jsonify({'error': f'Video file not found: {video_path}'}), 400
-    if config.ALLOWED_ROOTS:
-        allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
-        if not any(_path_within(video_obj, root) for root in allowed_roots):
-            return jsonify({'error': 'Video path is outside configured allowed roots'}), 400
+    is_multipart = bool(request.files)
+    data = request.form if is_multipart else _json_body()
+    upload_obj = request.files.get('video') or request.files.get('file')
+    uploaded_temp_path: Optional[Path] = None
+    uploaded_original_name = str(getattr(upload_obj, "filename", "") or "").strip()
+    diagnostics: Dict[str, Any] = {
+        "request_id": getattr(g, "request_id", ""),
+        "multipart": is_multipart,
+        "upload": bool(uploaded_original_name),
+    }
+
+    if upload_obj is not None and uploaded_original_name:
+        diagnostics["filename"] = Path(uploaded_original_name).name
+        diagnostics["suffix"] = Path(uploaded_original_name).suffix.lower()
+        try:
+            uploaded_temp_path = _save_upload_to_temp(
+                upload_obj,
+                allowed_suffixes=SUPPORTED_VIDEO_EXTENSIONS,
+                prefix="eva-video-",
+            )
+            diagnostics["upload_bytes"] = uploaded_temp_path.stat().st_size
+        except ValueError as exc:
+            diagnostics["stage"] = "upload"
+            diagnostics["reason"] = type(exc).__name__
+            return jsonify({'error': str(exc), 'diagnostics': diagnostics}), 400
+        video_obj = uploaded_temp_path
+        video_path = uploaded_original_name
+    else:
+        video_path = (data.get('video') or '').strip()
+        diagnostics["source"] = "server_path"
+        if not video_path:
+            diagnostics["stage"] = "input"
+            return jsonify({'error': 'Provide a video path or upload a video file.', 'diagnostics': diagnostics}), 400
+        video_obj = Path(video_path).expanduser().resolve()
+        if not video_obj.exists() or not video_obj.is_file():
+            diagnostics["stage"] = "path"
+            return jsonify({'error': 'Video file not found', 'diagnostics': diagnostics}), 400
+        if video_obj.suffix.lower() not in SUPPORTED_VIDEO_EXTENSIONS:
+            diagnostics["stage"] = "suffix"
+            diagnostics["suffix"] = video_obj.suffix.lower()
+            return jsonify({'error': 'Unsupported video file type', 'diagnostics': diagnostics}), 400
+        if config.ALLOWED_ROOTS:
+            allowed_roots = [Path(item).expanduser().resolve() for item in config.ALLOWED_ROOTS]
+            if not any(_path_within(video_obj, root) for root in allowed_roots):
+                diagnostics["stage"] = "allowed_roots"
+                diagnostics["allowed_roots_count"] = len(allowed_roots)
+                return jsonify({'error': 'Video path is outside configured allowed roots', 'diagnostics': diagnostics}), 400
+
     max_frames = data.get('frame_count') or config.LM_VIDEO_DEFAULT_FRAMES
     try:
         max_frames_int = int(max_frames)
@@ -14521,6 +8274,7 @@ def video_understanding():
     if max_frames_int < 1:
         max_frames_int = 1
     max_frames_int = min(max_frames_int, config.LM_VIDEO_MAX_FRAMES)
+    diagnostics["frame_count_requested"] = max_frames_int
 
     sample_fps_raw = data.get('sample_fps')
     try:
@@ -14529,21 +8283,96 @@ def video_understanding():
             sample_fps_val = None
     except (TypeError, ValueError):
         sample_fps_val = None
+    if sample_fps_val is not None:
+        diagnostics["sample_fps"] = sample_fps_val
 
     user_prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
+    profile_hint = (
+        str(data.get('profile_id') or data.get('profileId') or '').strip()
+        or None
+    )
+    effective_model_hint = model_hint or None
+    model_selection: Dict[str, Any] = {
+        "mode": "manual" if (model_hint or profile_hint) else "default",
+        "requested": model_hint or profile_hint or None,
+        "assigned_profile_id": profile_hint,
+        "balancer_enabled": _vlm_balancer_enabled(),
+    }
+    if profile_hint and _is_auto_lm_selector(effective_model_hint):
+        effective_model_hint = None
+    if not profile_hint:
+        assignment_key = _offline_vlm_assignment_key(
+            "video",
+            uploaded_original_name or video_path or str(video_obj),
+        )
+        effective_model_hint, model_selection = _resolve_offline_lm_model_hint(
+            model_hint or None,
+            assignment_key=assignment_key,
+        )
 
     try:
+        lm_profile = _resolve_lm_profile(
+            profile_id=profile_hint,
+            model_override=effective_model_hint,
+            kind="vlm",
+        )
+        diagnostics["profile_id"] = str(lm_profile.get('id') or '')
+        diagnostics["model"] = str(lm_profile.get('model') or '')
+        diagnostics["model_selection"] = model_selection.get("mode")
+        diagnostics["assigned_profile_id"] = model_selection.get("assigned_profile_id")
         frames, fps, duration = _sample_video_frames(
             str(video_obj),
             max_frames=max_frames_int,
             sample_fps=sample_fps_val,
             max_edge=config.LM_VIDEO_MAX_EDGE,
         )
+        diagnostics["fps"] = round(float(fps or 0.0), 3)
+        if duration is not None:
+            diagnostics["duration_sec"] = round(float(duration), 3)
+        diagnostics["frames_extracted"] = len(frames)
         if not frames:
-            return jsonify({'error': 'No frames could be extracted from the video.'}), 400
-        messages = _build_video_messages(str(video_obj), frames, user_prompt)
-        summary = _call_video_understanding(messages, model_override=model_hint or None)
+            diagnostics["stage"] = "frame_sampling"
+            audit_error = _write_completion_audit_or_error(
+                action="lm.video_understanding.completed",
+                result="failure",
+                target_type="video",
+                target_id=_audit_fingerprint(video_obj),
+                details={
+                    "reason": "no_frames",
+                    "frame_count_requested": max_frames_int,
+                    "sample_fps_supplied": sample_fps_raw is not None,
+                },
+            )
+            if audit_error is not None:
+                return audit_error
+            return jsonify({'error': 'No frames could be extracted from the video.', 'diagnostics': diagnostics}), 400
+        messages = _build_video_messages(video_path or str(video_obj), frames, user_prompt)
+        summary = _call_video_understanding(
+            messages,
+            model_override=effective_model_hint,
+            profile_id=profile_hint,
+        )
+        audit_error = _write_completion_audit_or_error(
+            action="lm.video_understanding.completed",
+            result="success",
+            target_type="video",
+            target_id=_audit_fingerprint(video_obj),
+            details={
+                "frames": len(frames),
+                "frame_count_requested": max_frames_int,
+                "sample_fps_supplied": sample_fps_raw is not None,
+                "prompt_supplied": bool(str(user_prompt).strip()),
+                "profile_id": str(lm_profile.get('id') or ''),
+                "model": str(lm_profile.get('model') or ''),
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'summary': summary,
@@ -14557,50 +8386,193 @@ def video_understanding():
                 ],
                 'fps': fps,
                 'duration_sec': duration,
-                'model': model_hint or config.LM_MODEL,
+                'model': str(lm_profile.get('model') or ''),
+                'profile_id': str(lm_profile.get('id') or ''),
+                'model_selector': _lm_profile_selector_value(lm_profile),
+                'model_selection': model_selection.get("mode"),
+                'assigned_profile_id': model_selection.get("assigned_profile_id"),
+                'uploaded': bool(uploaded_temp_path),
+                'filename': uploaded_original_name or Path(video_obj).name,
+                'diagnostics': diagnostics,
             }
         )
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        diagnostics["stage"] = "inference"
+        diagnostics["reason"] = type(exc).__name__
+        audit_error = _write_completion_audit_or_error(
+            action="lm.video_understanding.completed",
+            result="failure",
+            target_type="video",
+            target_id=_audit_fingerprint(video_obj if 'video_obj' in locals() else video_path),
+            details={
+                "reason": type(exc).__name__,
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
+        app.logger.exception(
+            "Video understanding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'video_understanding_failed', 'diagnostics': diagnostics}), 500
+    finally:
+        _cleanup_temp_upload(uploaded_temp_path)
 
 
 @app.route('/describe_image', methods=['POST'])
 def describe_image():
-    data = _json_body()
+    is_multipart = bool(request.files)
+    data = request.form if is_multipart else _json_body()
     folder_raw = data.get('folder')
+    upload_obj = request.files.get('image') or request.files.get('file')
+    uploaded_temp_path: Optional[Path] = None
+    uploaded_original_name = str(getattr(upload_obj, "filename", "") or "").strip()
     image_path = (data.get('image_path') or '').strip()
     prompt = data.get('prompt') or ''
     model_hint = (data.get('model') or '').strip()
-    if not image_path:
-        return jsonify({'error': 'image_path is required'}), 400
+    profile_hint = (
+        str(data.get('profile_id') or data.get('profileId') or '').strip()
+        or None
+    )
+    effective_model_hint = model_hint or None
+    model_selection: Dict[str, Any] = {
+        "mode": "manual" if (model_hint or profile_hint) else "default",
+        "requested": model_hint or profile_hint or None,
+        "assigned_profile_id": profile_hint,
+        "balancer_enabled": _vlm_balancer_enabled(),
+    }
+    if profile_hint and _is_auto_lm_selector(effective_model_hint):
+        effective_model_hint = None
+    if upload_obj is not None and uploaded_original_name:
+        try:
+            uploaded_temp_path = _save_upload_to_temp(
+                upload_obj,
+                allowed_suffixes=set(config.SUPPORTED_EXTENSIONS),
+                prefix="eva-image-",
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        image_path = uploaded_original_name
+    elif not image_path:
+        return jsonify({'error': 'image_path or image upload is required'}), 400
     try:
-        if folder_raw:
+        if uploaded_temp_path is not None:
+            path_obj = uploaded_temp_path
+            with Image.open(path_obj) as uploaded_img:
+                uploaded_img.verify()
+        elif folder_raw:
             folder_path = _resolve_folder_path(folder_raw, require_index=True)
             path_obj = Path(image_path).expanduser().resolve()
             if path_obj.suffix.lower() not in config.SUPPORTED_EXTENSIONS:
                 return jsonify({'error': 'Unsupported image file type'}), 400
             if not path_obj.exists() or not path_obj.is_file():
-                return jsonify({'error': f'Image not found: {image_path}'}), 400
+                return jsonify({'error': 'Image not found'}), 400
             if not _path_within(path_obj, folder_path):
                 return jsonify({'error': 'image_path must be inside folder'}), 400
         else:
             path_obj = detection_archive.resolve_archive_image_path(image_path)
+        if not profile_hint:
+            assignment_key = _offline_vlm_assignment_key(
+                "image",
+                uploaded_original_name or image_path or str(path_obj),
+            )
+            effective_model_hint, model_selection = _resolve_offline_lm_model_hint(
+                model_hint or None,
+                assignment_key=assignment_key,
+            )
+        lm_profile = _resolve_lm_profile(
+            profile_id=profile_hint,
+            model_override=effective_model_hint,
+            kind="vlm",
+        )
         messages = _build_image_messages(str(path_obj), prompt)
-        summary = _call_lm_chat(messages, model_override=model_hint or None)
+        summary = _call_lm_chat(
+            messages,
+            model_override=effective_model_hint,
+            profile_id=profile_hint,
+            profile_kind="vlm",
+        )
         with Image.open(path_obj) as src:
             thumb = _encode_jpeg(src, max_edge=config.THUMBNAIL_SIZE[0])
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="success",
+            target_type="image",
+            target_id=_audit_fingerprint(path_obj),
+            details={
+                "folder_supplied": bool(folder_raw),
+                "prompt_supplied": bool(str(prompt).strip()),
+                "thumbnail_returned": bool(thumb),
+                "profile_id": str(lm_profile.get('id') or ''),
+                "model": str(lm_profile.get('model') or ''),
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'summary': summary,
                 'thumbnail': thumb,
-                'model': model_hint or config.LM_MODEL,
-                'image_path': str(path_obj),
+                'model': str(lm_profile.get('model') or ''),
+                'profile_id': str(lm_profile.get('id') or ''),
+                'model_selector': _lm_profile_selector_value(lm_profile),
+                'model_selection': model_selection.get("mode"),
+                'assigned_profile_id': model_selection.get("assigned_profile_id"),
+                'uploaded': bool(uploaded_temp_path),
+                'filename': uploaded_original_name or Path(path_obj).name,
             }
         )
     except ValueError as exc:
-        return jsonify({'error': str(exc)}), 400
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="failure",
+            target_type="image",
+            target_id=_audit_fingerprint(image_path),
+            details={
+                "reason": type(exc).__name__,
+                "folder_supplied": bool(folder_raw),
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
+        app.logger.info(
+            "Describe image request rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'Invalid image request'}), 400
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        audit_error = _write_completion_audit_or_error(
+            action="lm.describe_image.completed",
+            result="failure",
+            target_type="image",
+            target_id=_audit_fingerprint(path_obj if 'path_obj' in locals() else image_path),
+            details={
+                "reason": type(exc).__name__,
+                "folder_supplied": bool(folder_raw),
+                "model_supplied": bool(model_hint),
+                "profile_supplied": bool(profile_hint),
+            },
+        )
+        if audit_error is not None:
+            return audit_error
+        app.logger.exception(
+            "Describe image failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'image_description_failed'}), 500
+    finally:
+        _cleanup_temp_upload(uploaded_temp_path)
+
+
 @app.route('/search', methods=['POST'])
 def search():
     """Search for images using text queries."""
@@ -15111,6 +9083,13 @@ def luxriot_channels():
     force = str(request.args.get('force', '')).lower() in {'1', 'true', 'yes'}
     try:
         channels = luxriot_manager.get_channels(force=force)
+        context = _current_auth_context()
+        if _auth_enabled() and context is not None:
+            channels = [
+                channel
+                for channel in channels
+                if _can_access_context_channel(context, channel.get("id"))
+            ]
         return jsonify({'channels': channels})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -15132,6 +9111,240 @@ def luxriot_snapshot(channel_id: int):
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/recent_frame/<int:channel_id>', methods=['GET'])
+def luxriot_recent_frame(channel_id: int):
+    """Serve a fresh EVA-captured frame.
+
+    Stale buffered frames are treated as signal loss so the operator does not
+    watch replayed history while the model is no longer receiving current input.
+    """
+
+    stream_type = request.args.get('stream', 'mainStream')
+    fallback_raw = str(request.args.get('fallback') or 'snapshot').strip().lower()
+    fallback_snapshot = fallback_raw in {'1', 'true', 'yes', 'on', 'snapshot', 'luxriot'}
+    fallback_probe = fallback_raw in {'probe', 'diagnostic', 'analytics'}
+    mode = str(request.args.get('mode') or 'latest').strip().lower()
+    max_age_sec = _luxriot_recent_frame_max_age_sec(request.args.get('max_age_sec'))
+    allow_stale = str(request.args.get('allow_stale') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    try:
+        capture_status = _luxriot_capture_status_for_channel(channel_id)
+        frame_item = _luxriot_recent_frame_item(
+            channel_id,
+            mode=mode,
+            max_age_sec=None if allow_stale else max_age_sec,
+        )
+        stale_frame: Optional[Dict[str, Any]] = None
+        frame_age_sec = _luxriot_recent_frame_age_sec(frame_item) if frame_item else None
+        frozen_signal = bool(capture_status.get("frozen_signal")) and not allow_stale
+        if frozen_signal:
+            frame_item = None
+            frame_age_sec = None
+        if frame_item is None and not allow_stale:
+            latest_frame = _luxriot_recent_frame_item(channel_id, mode="latest")
+            latest_age_sec = _luxriot_recent_frame_age_sec(latest_frame) if latest_frame else None
+            if latest_frame and (latest_age_sec is None or latest_age_sec > max_age_sec):
+                stale_frame = latest_frame
+        encoded = str((frame_item or {}).get("thumbnail") or "").strip()
+        source = 'eva_recent'
+        meta: Dict[str, Any] = {}
+        if frame_item:
+            meta = {
+                "width": frame_item.get("width"),
+                "height": frame_item.get("height"),
+                "captured_at": frame_item.get("captured_at") or frame_item.get("time_sec"),
+            }
+        if not encoded and fallback_probe:
+            encoded = luxriot_manager.probe_frame_thumbnail(channel_id) or ""
+            if encoded:
+                source = 'probe_thumbnail_fallback'
+        if not encoded and fallback_snapshot and stale_frame is None and not frozen_signal:
+            encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
+            source = 'luxriot_snapshot_fallback'
+        if not encoded:
+            response_status = 503 if stale_frame is not None or frozen_signal else 409
+            stale_age = _luxriot_recent_frame_age_sec(stale_frame) if stale_frame else None
+            error_code = 'signal_frozen' if frozen_signal else ('signal_lost' if stale_frame is not None else 'no_eva_frame')
+            return jsonify(
+                {
+                    'success': False,
+                    'error_code': error_code,
+                    'error': (
+                        'EVA frame source is frozen; live signal is not currently changing for the model.'
+                        if frozen_signal
+                        else (
+                        'EVA frame buffer is stale; live signal is not currently reaching the model.'
+                        if stale_frame is not None
+                        else 'No fresh EVA frame is available for this channel yet.'
+                        )
+                    ),
+                    'channel_id': int(channel_id),
+                    'stream': stream_type,
+                    'source': 'eva_recent',
+                    'max_age_sec': max_age_sec,
+                    'last_frame_age_sec': stale_age,
+                    'recent_frame_count': capture_status.get("recent_frame_count"),
+                    'running': capture_status.get("running"),
+                    'active_capture_source': capture_status.get("active_capture_source"),
+                    'last_error': capture_status.get("last_error"),
+                    'frozen_signal': capture_status.get("frozen_signal"),
+                    'frozen_signal_since': capture_status.get("frozen_signal_since"),
+                    'frozen_signal_age_sec': capture_status.get("frozen_signal_age_sec"),
+                    'frozen_frame_count': capture_status.get("frozen_frame_count"),
+                }
+            ), response_status
+        encoded = _strip_image_data_url_prefix(encoded)
+        img_bytes = base64.b64decode(encoded)
+        response = make_response(img_bytes)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'no-store, must-revalidate'
+        response.headers['X-EVA-Frame-Source'] = source
+        if frame_age_sec is not None:
+            response.headers['X-EVA-Frame-Age-Sec'] = f"{frame_age_sec:.3f}"
+        response.headers['X-EVA-Signal'] = 'fresh' if source == 'eva_recent' else 'fallback'
+        response.headers['X-EVA-Max-Frame-Age-Sec'] = f"{max_age_sec:.3f}"
+        if frame_item and frame_item.get('_recent_frame_index') is not None:
+            response.headers['X-EVA-Frame-Index'] = str(frame_item.get('_recent_frame_index'))
+        if frame_item and frame_item.get('_recent_frame_count') is not None:
+            response.headers['X-EVA-Frame-Count'] = str(frame_item.get('_recent_frame_count'))
+        if meta.get('width') is not None:
+            response.headers['X-Image-Width'] = str(meta.get('width'))
+        if meta.get('height') is not None:
+            response.headers['X-Image-Height'] = str(meta.get('height'))
+        if meta.get('captured_at') is not None:
+            try:
+                response.headers['X-EVA-Frame-Timestamp-Ms'] = str(int(float(meta.get('captured_at')) * 1000.0))
+            except Exception:
+                pass
+        return response
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/road/scene_overlay/<int:channel_id>', methods=['GET'])
+def road_scene_overlay(channel_id: int):
+    """Generate a bounded engineer preview of the auto-inferred road mask."""
+
+    context = _current_auth_context()
+    if _auth_enabled() and context is not None:
+        try:
+            require_permission(context, Permission.STREAMS_VIEW)
+        except PermissionError:
+            return _auth_failure_response("Permission denied", 403)
+
+    stream_type = str(request.args.get('stream') or 'mainStream').strip() or 'mainStream'
+    sample_frames = _clamp_int(request.args.get('frames'), 60, 12, 120)
+    max_edge = _clamp_int(request.args.get('max_edge'), 240, 96, 480)
+    max_age_sec = _luxriot_recent_frame_max_age_sec(request.args.get('max_age_sec'))
+    try:
+        capture_status = _luxriot_capture_status_for_channel(channel_id)
+        if bool(capture_status.get("frozen_signal")):
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": "signal_frozen",
+                    "error": "EVA frame source is frozen; road mask grounding is paused until the Luxriot signal changes again.",
+                    "channel_id": int(channel_id),
+                    "stream": stream_type,
+                    "source": "eva_capture_buffer",
+                    "max_age_sec": max_age_sec,
+                    "recent_frame_count": capture_status.get("recent_frame_count"),
+                    "running": capture_status.get("running"),
+                    "last_error": capture_status.get("last_error"),
+                    "frozen_signal_age_sec": capture_status.get("frozen_signal_age_sec"),
+                    "frozen_frame_count": capture_status.get("frozen_frame_count"),
+                    "budget": {
+                        "frames": sample_frames,
+                        "max_edge": max_edge,
+                    },
+                }
+            ), 409
+        frames = _road_scene_buffered_frames(channel_id, sample_frames, max_age_sec=max_age_sec)
+        if not frames:
+            return jsonify(
+                {
+                    "success": False,
+                    "error_code": "no_fresh_eva_frames",
+                    "error": "No fresh buffered EVA frames are available for this channel. Start video summaries or restore the Luxriot signal first.",
+                    "channel_id": int(channel_id),
+                    "stream": stream_type,
+                    "source": "eva_capture_buffer",
+                    "max_age_sec": max_age_sec,
+                    "recent_frame_count": capture_status.get("recent_frame_count"),
+                    "running": capture_status.get("running"),
+                    "last_error": capture_status.get("last_error"),
+                    "budget": {
+                        "frames": sample_frames,
+                        "max_edge": max_edge,
+                    },
+                }
+            ), 409
+        base_array = frames[-1].image
+        base_image = Image.fromarray(base_array.astype(np.uint8), mode="RGB")
+        scene_result = infer_scene_card_from_frames(
+            int(channel_id),
+            f"Channel {channel_id}",
+            frames,
+            config=AutoSceneCardConfig(max_edge=max_edge),
+        )
+        overlay_b64 = _render_road_scene_overlay_png(base_image, scene_result)
+        return jsonify(
+            {
+                "success": True,
+                "channel_id": int(channel_id),
+                "stream": stream_type,
+                "source": "eva_capture_buffer",
+                "overlay_b64": overlay_b64,
+                "snapshot_meta": {
+                    "width": base_image.width,
+                    "height": base_image.height,
+                    "frame_count": len(frames),
+                    "latest_timestamp_ms": frames[-1].timestamp_ms,
+                },
+                "scene": scene_result.as_dict(),
+                "budget": {
+                    "frames": sample_frames,
+                    "max_edge": max_edge,
+                },
+            }
+        )
+    except Exception as exc:
+        app.logger.exception(
+            "Road scene overlay failed request_id=%s channel_id=%s",
+            getattr(g, "request_id", ""),
+            channel_id,
+        )
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route('/luxriot/snapshot/<int:channel_id>/capture', methods=['POST'])
+def luxriot_snapshot_capture(channel_id: int):
+    data = _json_body()
+    stream_type = str(data.get('stream') or request.args.get('stream') or 'mainStream').strip() or 'mainStream'
+    roi_enabled, roi_norm = _parse_probe_roi(data)
+    quality = data.get('quality') or 92
+    try:
+        encoded, meta = luxriot_manager.capture_snapshot_base64(
+            channel_id,
+            stream_type=stream_type,
+            roi_norm=roi_norm if roi_enabled else None,
+            quality=int(quality),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "snapshot_b64": encoded,
+                "meta": meta,
+                "channel_id": channel_id,
+                "filename": (
+                    f"probe_snap_ch{channel_id}_"
+                    f"{int(meta.get('captured_at_ms') or int(time.time() * 1000))}.jpg"
+                ),
+            }
+        )
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
 @app.route('/luxriot/start_capture', methods=['POST'])
 def luxriot_start_capture():
     guard = _mutation_guard_error()
@@ -15144,7 +9357,15 @@ def luxriot_start_capture():
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     batch_size = data.get('batch_size')
     prompt = data.get('prompt') or ''
-    model_hint = (data.get('model') or '').strip() or None
+    requested_model_hint = (data.get('model') or '').strip() or None
+    try:
+        interval_sec = _parse_luxriot_capture_interval_sec(data)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    model_hint, model_selection = _resolve_luxriot_vlm_model_hint(
+        channel_id,
+        requested_model_hint,
+    )
     system_prompt = (data.get('system_prompt') or '').strip() or None
     try:
         status = luxriot_manager.start_session(
@@ -15153,9 +9374,48 @@ def luxriot_start_capture():
             prompt=prompt,
             model_hint=model_hint,
             system_prompt=system_prompt,
+            interval_sec=interval_sec,
         )
+        if isinstance(status, Mapping):
+            status = dict(status)
+            status["model_selection"] = model_selection.get("mode")
+            status["assigned_profile_id"] = model_selection.get("assigned_profile_id")
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.start.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "batch_size_supplied": batch_size is not None,
+                "prompt_supplied": bool(str(prompt).strip()),
+                "system_prompt_supplied": bool(system_prompt),
+                "model_supplied": bool(requested_model_hint),
+                "interval_sec_supplied": interval_sec is not None,
+                "interval_sec": interval_sec,
+                "model_selection": model_selection.get("mode"),
+                "assigned_profile_id": model_selection.get("assigned_profile_id"),
+                "balancer_enabled": model_selection.get("balancer_enabled"),
+                "balancer_profile_count": model_selection.get("profile_count"),
+                "session_running": bool(status.get("running"))
+                if isinstance(status, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, 'session': status})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.start.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15188,6 +9448,14 @@ def luxriot_prompt_settings():
         raw_stream_prompt = data.get('system_prompt')
         stream_system_prompt = '' if raw_stream_prompt is None else str(raw_stream_prompt)
 
+    alert_policy_prompt: Optional[str] = None
+    if 'alert_policy_prompt' in data:
+        raw_alert_policy_prompt = data.get('alert_policy_prompt')
+        alert_policy_prompt = '' if raw_alert_policy_prompt is None else str(raw_alert_policy_prompt)
+    elif 'alert_prompt' in data:
+        raw_alert_policy_prompt = data.get('alert_prompt')
+        alert_policy_prompt = '' if raw_alert_policy_prompt is None else str(raw_alert_policy_prompt)
+
     json_alert_prompt: Optional[str] = None
     if 'json_alert_prompt' in data:
         raw_json_prompt = data.get('json_alert_prompt')
@@ -15207,6 +9475,12 @@ def luxriot_prompt_settings():
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('bookmark_cooldown_sec'), default=0.0))
     elif 'cooldown_sec' in data:
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('cooldown_sec'), default=0.0))
+    if json_alert_prompt is not None or bookmark_enabled is not None or bookmark_cooldown_sec is not None:
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.luxriot_prompt_settings.bookmark_settings",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
 
     rollup_prompt_updates: Optional[Dict[str, Any]] = None
     rollup_prompts_raw = data.get('rollup_prompts')
@@ -15228,13 +9502,44 @@ def luxriot_prompt_settings():
         settings = luxriot_manager.update_prompt_settings(
             channel_id=channel_id,
             stream_system_prompt=stream_system_prompt,
+            alert_policy_prompt=alert_policy_prompt,
             rollup_prompts=rollup_prompt_updates,
             json_alert_prompt=json_alert_prompt,
             bookmark_enabled=bookmark_enabled,
             bookmark_cooldown_sec=bookmark_cooldown_sec,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.prompt_settings.update.completed",
+            result="success",
+            target_type="luxriot_prompt_settings",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "stream_system_prompt_updated": stream_system_prompt is not None,
+                "alert_policy_prompt_updated": alert_policy_prompt is not None,
+                "rollup_prompts_updated": bool(rollup_prompt_updates),
+                "json_alert_prompt_updated": json_alert_prompt is not None,
+                "bookmark_enabled_updated": bookmark_enabled is not None,
+                "bookmark_cooldown_updated": bookmark_cooldown_sec is not None,
+                "rollup_levels": sorted(rollup_prompt_updates.keys())
+                if isinstance(rollup_prompt_updates, Mapping)
+                else [],
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, **settings})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.prompt_settings.update.completed",
+            result="failure",
+            target_type="luxriot_prompt_settings",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15250,8 +9555,32 @@ def luxriot_stop_capture():
         return jsonify({'error': 'Provide a valid channel_id'}), 400
     try:
         state = luxriot_manager.stop_session(channel_id)
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.stop.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "session_running": bool(state.get("running"))
+                if isinstance(state, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'success': True, 'session': state})
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.stop.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15268,9 +9597,43 @@ def luxriot_flush_capture():
     try:
         result = luxriot_manager.flush_session(channel_id)
         if not result.get('success'):
+            audit_error = _write_completion_audit_or_error(
+                action="luxriot.capture.flush.completed",
+                result="failure",
+                target_type="luxriot_capture",
+                target_id=str(channel_id),
+                channel_id=channel_id,
+                details={"reason": "flush_unsuccessful"},
+            )
+            if audit_error is not None:
+                return audit_error
             return jsonify(result), 400
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.flush.completed",
+            result="success",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "items": len(result.get("items") or [])
+                if isinstance(result, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(result)
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.flush.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15317,7 +9680,13 @@ def luxriot_summary_rollups():
 @app.route('/luxriot/streams', methods=['GET'])
 def luxriot_streams_status():
     try:
-        return jsonify(luxriot_manager.streams_status())
+        status = luxriot_manager.streams_status()
+        return jsonify(
+            _filter_stream_status_for_context(
+                status,
+                _current_auth_context(),
+            )
+        )
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
@@ -15336,10 +9705,50 @@ def luxriot_stop_stream():
     pause_analytics = _coerce_bool(data.get('pause_analytics'), True)
     try:
         result = luxriot_manager.stop_stream(channel_id, stream_type=stream_type, pause_analytics=pause_analytics)
-        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="success",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "stream_type": stream_type,
+                "pause_analytics": pause_analytics,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
+        return jsonify({
+            'success': True,
+            'result': result,
+            'streams': _filter_stream_status_for_context(
+                luxriot_manager.streams_status(),
+                _current_auth_context(),
+            ),
+        })
     except ValueError as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="failure",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop.completed",
+            result="failure",
+            target_type="luxriot_stream",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15360,8 +9769,35 @@ def luxriot_stop_all_streams():
             stop_analytics=stop_analytics,
             pause_analytics=pause_analytics,
         )
-        return jsonify({'success': True, 'result': result, 'streams': luxriot_manager.streams_status()})
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop_all.completed",
+            result="success",
+            target_type="luxriot_streams",
+            details={
+                "stop_video": stop_video,
+                "stop_analytics": stop_analytics,
+                "pause_analytics": pause_analytics,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
+        return jsonify({
+            'success': True,
+            'result': result,
+            'streams': _filter_stream_status_for_context(
+                luxriot_manager.streams_status(),
+                _current_auth_context(),
+            ),
+        })
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.stream.stop_all.completed",
+            result="failure",
+            target_type="luxriot_streams",
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15394,8 +9830,41 @@ def luxriot_bookmark():
             state=state,
             timestamp_ms=timestamp_ms,
         )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.bookmark.create.completed",
+            result="success",
+            target_type="luxriot_bookmark",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "severity": severity,
+                "state": state,
+                "timestamp_supplied": timestamp_ms is not None,
+                "title_length": len(title),
+                "description_length": len(str(description)),
+                "success": bool(result.get("success"))
+                if isinstance(result, Mapping)
+                else None,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(result)
     except Exception as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.bookmark.create.completed",
+            result="failure",
+            target_type="luxriot_bookmark",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={
+                "reason": type(exc).__name__,
+                "severity": severity,
+                "state": state,
+            },
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify({'error': str(exc)}), 500
 
 
@@ -15433,12 +9902,20 @@ def probes_query():
         "name": (data.get('name') or 'probe'),
         "channel_id": channel_id,
         "severity": (data.get('severity') or 'critical'),
-        "bookmark": bool(data.get('bookmark')),
+        "bookmark": _coerce_bool(data.get('bookmark'), default=False),
+        "bookmark_authorized": False,
         "window_sec": window_sec,
         "fps": data.get('fps'),
         "roi_enabled": probe_roi_enabled,
         "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
     }
+    if probe_like["bookmark"]:
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.probes_query.bookmark",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        probe_like["bookmark_authorized"] = True
     result = probe_manager.query(
         channel_id,
         positives,
@@ -15538,77 +10015,389 @@ def probes_stop_capture():
         return jsonify({'error': str(exc)}), 500
 
 
+def _probe_float(val: Any, default: float) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def _probe_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def _probe_text_values(raw: Any) -> List[str]:
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _find_probe_by_id(
+    probe_id: Any,
+    probes: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    normalized = str(probe_id or "").strip()
+    if not normalized:
+        return {}
+    try:
+        source = probes if probes is not None else probes_store.list_probes()
+        return dict(
+            next(
+                (p for p in source if str(p.get("id")) == normalized),
+                {},
+            )
+        )
+    except Exception:
+        return {}
+
+
+def _probe_bookmark_requested(
+    data: Mapping[str, Any],
+    existing_probe: Mapping[str, Any],
+) -> bool:
+    bookmark_field_present = 'bookmark' in data
+    if bookmark_field_present:
+        return _coerce_bool(data.get('bookmark'), default=False)
+    if existing_probe:
+        return bool(existing_probe.get('bookmark', False))
+    return False
+
+
+def _probe_bookmark_settings_touched(data: Mapping[str, Any]) -> bool:
+    return any(
+        key in data
+        for key in (
+            'bookmark_cooldown_sec',
+            'bookmark_dedupe_window_sec',
+        )
+    )
+
+
+def _probe_bookmark_guard_error(
+    data: Mapping[str, Any],
+    existing_probe: Mapping[str, Any],
+    *,
+    action: str,
+):
+    bookmark_requested = _probe_bookmark_requested(data, existing_probe)
+    bookmark_settings_touched = _probe_bookmark_settings_touched(data)
+    if bookmark_requested or (bool(existing_probe.get('bookmark')) and bookmark_settings_touched):
+        return _bookmark_permission_guard_error(action=action)
+    return None
+
+
+def _build_probe_payload(
+    data: Mapping[str, Any],
+    *,
+    existing_probe: Optional[Mapping[str, Any]] = None,
+    channel_id_override: Optional[int] = None,
+    probe_id_override: Optional[str] = None,
+    force_new: bool = False,
+    name_override: Optional[str] = None,
+    cast_group_id: Optional[str] = None,
+    cast_base_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        channel_id = int(channel_id_override if channel_id_override is not None else (data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID))
+    except Exception as exc:
+        raise ValueError('Provide a valid channel_id') from exc
+    if channel_id <= 0:
+        raise ValueError('Provide a valid channel_id')
+
+    positives = _probe_text_values(data.get('positives'))
+    negatives = _probe_text_values(data.get('negatives'))
+    raw_image_probe = data.get('image_probe') or {}
+    image_probe = dict(raw_image_probe) if isinstance(raw_image_probe, Mapping) else {}
+    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
+        raise ValueError('Provide at least one positive (text or image).')
+
+    existing = dict(existing_probe or {})
+    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
+    bookmark_requested = _probe_bookmark_requested(data, existing)
+    bookmark_authorized = bool(
+        bookmark_requested
+        and _current_request_has_permission(Permission.BOOKMARKS_CREATE)
+    )
+    pairs = data.get('pairs') or []
+    if not isinstance(pairs, list):
+        pairs = []
+    recent_hits = data.get('recent_hits') or []
+    if not isinstance(recent_hits, list):
+        recent_hits = []
+
+    if force_new:
+        probe_id = None
+    elif probe_id_override is not None:
+        probe_id = str(probe_id_override).strip() or None
+    else:
+        probe_id = data.get('id') or None
+
+    name = (name_override if name_override is not None else (data.get('name') or '')).strip()
+    if not name:
+        name = f"probe-{int(time.time())}"
+
+    probe = {
+        "id": probe_id,
+        "name": name,
+        "channel_id": channel_id,
+        "positives": positives,
+        "negatives": negatives,
+        "pos_floor": _probe_float(data.get('pos_floor'), 0.2),
+        "margin": max(0.0, _probe_float(data.get('margin'), 0.05)),
+        "bookmark_cooldown_sec": max(
+            0.0,
+            _probe_float(
+                data.get('bookmark_cooldown_sec'),
+                existing.get('bookmark_cooldown_sec', config.PROBE_BOOKMARK_COOLDOWN_SEC),
+            ),
+        ),
+        "bookmark_dedupe_window_sec": max(
+            0.5,
+            _probe_float(
+                data.get('bookmark_dedupe_window_sec'),
+                existing.get('bookmark_dedupe_window_sec', config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC),
+            ),
+        ),
+        "top_k": _probe_int(data.get('top_k'), 6),
+        "window_sec": _probe_float(data.get('window_sec'), 300.0),
+        "severity": (data.get('severity') or 'critical').lower(),
+        "bookmark": bookmark_requested,
+        "bookmark_authorized": bookmark_authorized,
+        "enabled": _coerce_bool(data.get('enabled'), True),
+        "image_probe": image_probe,
+        "roi_enabled": probe_roi_enabled,
+        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
+        "pairs": pairs,
+        "last_hit": data.get('last_hit'),
+        "recent_hits": recent_hits[:PROBE_MAX_STORED_HITS],
+        "bookmark_gate": existing.get("bookmark_gate"),
+        "bookmark_gate_updated_at_ms": existing.get("bookmark_gate_updated_at_ms"),
+    }
+    if cast_group_id:
+        probe["cast_group_id"] = str(cast_group_id)
+    if cast_base_name:
+        probe["cast_base_name"] = str(cast_base_name)
+    return probe
+
+
+def _matching_probe_for_channel(
+    probes: Sequence[Mapping[str, Any]],
+    *,
+    name: str,
+    channel_id: int,
+) -> Dict[str, Any]:
+    normalized_name = str(name or "").strip().casefold()
+    for probe in probes:
+        try:
+            probe_channel = int(probe.get("channel_id"))
+        except Exception:
+            continue
+        if probe_channel != channel_id:
+            continue
+        if str(probe.get("name") or "").strip().casefold() == normalized_name:
+            return dict(probe)
+    return {}
+
+
 @app.route('/probes/save', methods=['POST'])
 def probes_save():
     guard = _mutation_guard_error()
     if guard is not None:
         return guard
     data = _json_body()
+    existing_probe = _find_probe_by_id(data.get('id'))
+    bookmark_guard = _probe_bookmark_guard_error(
+        data,
+        existing_probe,
+        action="http.probes_save.bookmark_settings",
+    )
+    if bookmark_guard is not None:
+        return bookmark_guard
     try:
-        channel_id = int(data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID)
-    except Exception:
-        return jsonify({'error': 'Provide a valid channel_id'}), 400
-    positives = [str(x).strip() for x in (data.get('positives') or []) if str(x).strip()]
-    negatives = [str(x).strip() for x in (data.get('negatives') or []) if str(x).strip()]
-    image_probe = data.get('image_probe') or {}
-    if not positives and not (image_probe.get('data') and image_probe.get('enabled', True) is not False):
-        return jsonify({'error': 'Provide at least one positive (text or image).'}), 400
-
-    def _float(val, default):
-        try:
-            return float(val)
-        except Exception:
-            return default
-
-    def _int(val, default):
-        try:
-            return int(val)
-        except Exception:
-            return default
-
-    probe_roi_enabled, probe_roi_norm = _parse_probe_roi(data)
-
-    existing_probe: Dict[str, Any] = {}
-    probe_id_raw = data.get('id')
-    if probe_id_raw:
-        try:
-            existing_probe = next(
-                (p for p in probes_store.list_probes() if str(p.get('id')) == str(probe_id_raw)),
-                {},
-            )
-        except Exception:
-            existing_probe = {}
-
-    probe = {
-        "id": data.get('id') or None,
-        "name": (data.get('name') or '').strip() or f"probe-{int(time.time())}",
-        "channel_id": channel_id,
-        "positives": positives,
-        "negatives": negatives,
-        "pos_floor": _float(data.get('pos_floor'), 0.2),
-        "margin": _float(data.get('margin'), 0.05),
-        "top_k": _int(data.get('top_k'), 6),
-        "window_sec": _float(data.get('window_sec'), 300.0),
-        "severity": (data.get('severity') or 'critical').lower(),
-        "bookmark": bool(data.get('bookmark', True)),
-        "enabled": bool(data.get('enabled', True)),
-        "image_probe": image_probe,
-        "roi_enabled": probe_roi_enabled,
-        "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
-        "pairs": data.get('pairs') or [],
-        "last_hit": data.get('last_hit'),
-        "recent_hits": (data.get('recent_hits') or [])[:PROBE_MAX_STORED_HITS],
-        "bookmark_gate": existing_probe.get("bookmark_gate"),
-        "bookmark_gate_updated_at_ms": existing_probe.get("bookmark_gate_updated_at_ms"),
-    }
+        probe = _build_probe_payload(data, existing_probe=existing_probe)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     saved = probes_store.upsert_probe(probe)
     return jsonify({'success': True, 'probe': saved})
+
+
+@app.route('/probes/cast', methods=['POST'])
+def probes_cast():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_channel_ids = data.get("channel_ids")
+    if not isinstance(raw_channel_ids, (list, tuple)):
+        return jsonify({"error": "Provide channel_ids as a non-empty list."}), 400
+    channel_ids: List[int] = []
+    seen_channels: Set[int] = set()
+    for raw_channel_id in raw_channel_ids:
+        try:
+            channel_id = int(raw_channel_id)
+        except Exception:
+            continue
+        if channel_id <= 0 or channel_id in seen_channels:
+            continue
+        seen_channels.add(channel_id)
+        channel_ids.append(channel_id)
+    if not channel_ids:
+        return jsonify({"error": "Select at least one valid channel."}), 400
+    if len(channel_ids) > 500:
+        return jsonify({"error": "Too many channels for one cast operation."}), 400
+
+    conflict_policy = str(data.get("conflict") or "skip").strip().lower()
+    if conflict_policy not in {"skip", "create", "update"}:
+        return jsonify({"error": "Unsupported conflict policy."}), 400
+    copy_roi = _coerce_bool(data.get("copy_roi"), False)
+    cast_group_id = str(data.get("cast_group_id") or uuid.uuid4().hex).strip()
+    base_name = str(data.get("name") or "").strip() or f"probe-{int(time.time())}"
+
+    base_payload = dict(data)
+    base_payload.pop("id", None)
+    base_payload.pop("channel_ids", None)
+    base_payload.pop("channels", None)
+    base_payload.pop("conflict", None)
+    base_payload.pop("copy_roi", None)
+    base_payload["name"] = base_name
+    if not copy_roi:
+        base_payload["roi_enabled"] = False
+        base_payload["roi_norm"] = None
+        base_payload.pop("roi", None)
+
+    try:
+        existing_probes = probes_store.list_probes()
+    except Exception as exc:
+        app.logger.exception("Probe cast failed to list probes request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "Probe store is unavailable."}), 503
+
+    for channel_id in channel_ids:
+        existing_probe = (
+            _matching_probe_for_channel(existing_probes, name=base_name, channel_id=channel_id)
+            if conflict_policy == "update"
+            else {}
+        )
+        bookmark_guard = _probe_bookmark_guard_error(
+            base_payload,
+            existing_probe,
+            action="http.probes_cast.bookmark_settings",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        try:
+            _build_probe_payload(
+                base_payload,
+                existing_probe=existing_probe,
+                channel_id_override=channel_id,
+                probe_id_override=str(existing_probe.get("id") or "") if existing_probe else None,
+                force_new=not existing_probe,
+                cast_group_id=cast_group_id,
+                cast_base_name=base_name,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    created: List[Dict[str, Any]] = []
+    updated: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for channel_id in channel_ids:
+        matching_probe = _matching_probe_for_channel(
+            existing_probes,
+            name=base_name,
+            channel_id=channel_id,
+        )
+        if matching_probe and conflict_policy == "skip":
+            skipped.append(
+                {
+                    "channel_id": channel_id,
+                    "probe_id": matching_probe.get("id"),
+                    "reason": "matching_probe_exists",
+                }
+            )
+            continue
+        updating = bool(matching_probe and conflict_policy == "update")
+        try:
+            probe = _build_probe_payload(
+                base_payload,
+                existing_probe=matching_probe if updating else {},
+                channel_id_override=channel_id,
+                probe_id_override=str(matching_probe.get("id") or "") if updating else None,
+                force_new=not updating,
+                cast_group_id=cast_group_id,
+                cast_base_name=base_name,
+            )
+            saved = probes_store.upsert_probe(probe)
+            item = {
+                "channel_id": channel_id,
+                "probe_id": saved.get("id"),
+                "name": saved.get("name"),
+            }
+            if updating:
+                updated.append(item)
+            else:
+                created.append(item)
+        except Exception as exc:
+            failed.append({"channel_id": channel_id, "error": str(exc)})
+
+    status = 207 if failed and (created or updated or skipped) else (500 if failed else 200)
+    audit_error = _write_completion_audit_or_error(
+        action="probes.cast.completed",
+        result="partial" if failed and status == 207 else ("failure" if failed else "success"),
+        target_type="probe_cast",
+        target_id=cast_group_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "conflict": conflict_policy,
+            "copy_roi": copy_roi,
+            "created": len(created),
+            "updated": len(updated),
+            "skipped": len(skipped),
+            "failed": len(failed),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify(
+        {
+            "success": not failed,
+            "cast_group_id": cast_group_id,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+            "counts": {
+                "created": len(created),
+                "updated": len(updated),
+                "skipped": len(skipped),
+                "failed": len(failed),
+            },
+        }
+    ), status
 
 
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
     probes = probes_store.list_probes()
-    return jsonify({'probes': probes})
+    context = _current_auth_context()
+    if _auth_enabled() and context is not None:
+        probes = [
+            probe
+            for probe in probes
+            if _can_access_context_channel(
+                context,
+                probe.get("channel_id"),
+            )
+        ]
+    response = jsonify({'probes': probes})
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 
 @app.route('/probes/delete', methods=['POST'])
@@ -15639,6 +10428,13 @@ def probes_run():
     probe = probes.get(probe_id)
     if not probe:
         return jsonify({'error': 'Probe not found'}), 404
+    if probe.get('bookmark'):
+        bookmark_guard = _bookmark_permission_guard_error(
+            action="http.probes_run.bookmark",
+        )
+        if bookmark_guard is not None:
+            return bookmark_guard
+        probe['bookmark_authorized'] = True
     probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
     result = probe_manager.query(
         probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
@@ -15739,7 +10535,11 @@ def probes_bench():
             "resolution": target_size,
         })
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        app.logger.exception(
+            "Probe benchmark failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "probe_benchmark_failed"}), 500
 
 
 @app.route('/detections/search_text', methods=['POST'])
@@ -15775,36 +10575,59 @@ def detections_search_text():
     mode = 'clip'
 
     try:
-        clip_query_vec = get_text_embedding(query)
+        clip_query_vec = get_clip_text_embedding(query)
     except RuntimeError as exc:
-        return jsonify({'error': str(exc)}), 400
+        app.logger.info(
+            "Detection text query embedding unavailable request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'text_embedding_unavailable'}), 400
     except Exception as exc:
-        return jsonify({'error': f'Failed to embed text query: {exc}'}), 500
+        app.logger.exception(
+            "Detection text query embedding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'text_embedding_failed'}), 500
 
     try:
-        results = _search_detections_archive(
+        search_payload = _search_detections_archive(
             clip_query_vec=clip_query_vec,
             dino_query_vec=None,
             mode=mode,
             probe_id=filters['probe_id'],
             channel_id=filters['channel_id'],
+            source=filters['source'],
             since_ms=filters['since_ms'],
             until_ms=filters['until_ms'],
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
+            include_coverage=True,
         )
+        if isinstance(search_payload, tuple):
+            results, coverage = search_payload
+        else:
+            results = cast(List[Dict[str, Any]], search_payload)
+            coverage = {}
         return jsonify(
             {
                 'results': results,
+                'coverage': coverage,
                 'mode_requested': mode_requested,
                 'mode_used': mode,
                 'filters': filters,
                 'query': query,
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection text archive query failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/search_image', methods=['POST'])
@@ -15814,6 +10637,7 @@ def detections_search_image():
     filters_payload = {
         'probe_id': request.form.get('probe_id'),
         'channel_id': request.form.get('channel_id'),
+        'source': request.form.get('source'),
         'since_ms': request.form.get('since_ms'),
         'until_ms': request.form.get('until_ms'),
         'hours': request.form.get('hours'),
@@ -15848,12 +10672,21 @@ def detections_search_image():
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
     except Exception as exc:
-        return jsonify({'error': f'Failed to read uploaded image: {exc}'}), 400
+        app.logger.info(
+            "Detection image query upload rejected request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({'error': 'invalid_uploaded_image'}), 400
 
     try:
         clip_query_vec = get_image_embedding_from_pil(pil_image, embedder='clip')
     except Exception as exc:
-        return jsonify({'error': f'Failed to embed image query with CLIP: {exc}'}), 500
+        app.logger.exception(
+            "Detection image query CLIP embedding failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'image_embedding_failed'}), 500
 
     dino_query_vec: Optional[np.ndarray] = None
     if mode in {'dino', 'fusion'}:
@@ -15864,33 +10697,48 @@ def detections_search_image():
             dino_query_vec = None
 
     try:
-        results = _search_detections_archive(
+        search_payload = _search_detections_archive(
             clip_query_vec=clip_query_vec,
             dino_query_vec=dino_query_vec,
             mode=mode,
             probe_id=filters['probe_id'],
             channel_id=filters['channel_id'],
+            source=filters['source'],
             since_ms=filters['since_ms'],
             until_ms=filters['until_ms'],
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
+            include_coverage=True,
         )
+        if isinstance(search_payload, tuple):
+            results, coverage = search_payload
+        else:
+            results = cast(List[Dict[str, Any]], search_payload)
+            coverage = {}
         return jsonify(
             {
                 'results': results,
+                'coverage': coverage,
                 'mode_used': mode,
                 'filters': filters,
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection image archive query failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/list', methods=['GET'])
 def detections_list():
     probe_id_raw = (request.args.get('probe_id') or '').strip()
     probe_id = probe_id_raw or None
+    source = _normalize_archive_source_filter(request.args.get('source'))
 
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
@@ -15938,6 +10786,7 @@ def detections_list():
         detections, total = detections_store.list_detections(
             probe_id=probe_id,
             channel_id=channel_id,
+            source=source,
             since_ms=since_ms,
             until_ms=until_ms,
             limit=limit,
@@ -15953,17 +10802,25 @@ def detections_list():
                 'filters': {
                     'probe_id': probe_id,
                     'channel_id': channel_id,
+                    'source': source,
                     'since_ms': since_ms,
                     'until_ms': until_ms,
                 },
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection archive list failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
 
 
 @app.route('/detections/summary', methods=['GET'])
 def detections_summary():
+    source = _normalize_archive_source_filter(request.args.get('source'))
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
     if channel_id_raw:
@@ -15988,32 +10845,159 @@ def detections_summary():
         if hours > 0:
             since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
 
+    until_ms_raw = (request.args.get('until_ms') or '').strip()
+    until_ms: Optional[int] = None
+    if until_ms_raw:
+        try:
+            until_ms = int(until_ms_raw)
+        except Exception:
+            return jsonify({'error': 'until_ms must be an integer'}), 400
+
     try:
         limit = int(request.args.get('limit', 100))
     except Exception:
         limit = 100
 
     try:
-        summary = detections_store.summarize_by_probe(since_ms=since_ms, channel_id=channel_id, limit=limit)
+        summary = detections_store.summarize_by_probe(
+            since_ms=since_ms,
+            channel_id=channel_id,
+            source=source,
+            limit=limit,
+            until_ms=until_ms,
+        )
         return jsonify(
             {
                 'summary': summary,
                 'count': len(summary),
                 'filters': {
                     'channel_id': channel_id,
+                    'source': source,
                     'since_ms': since_ms,
+                    'until_ms': until_ms,
                 },
             }
         )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.exception(
+            "Detection archive summary failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_query_failed'}), 500
+
+
+@app.route('/detections/diagnostics', methods=['GET'])
+def detections_diagnostics():
+    source = _normalize_archive_source_filter(request.args.get('source'))
+    channel_id_raw = (request.args.get('channel_id') or '').strip()
+    channel_id: Optional[int] = None
+    if channel_id_raw:
+        try:
+            channel_id = int(channel_id_raw)
+        except Exception:
+            return jsonify({'error': 'channel_id must be an integer'}), 400
+
+    since_ms = _to_optional_int(request.args.get('since_ms'))
+    until_ms = _to_optional_int(request.args.get('until_ms'))
+    if since_ms is None:
+        hours_raw = (request.args.get('hours') or '').strip()
+        try:
+            hours = float(hours_raw) if hours_raw else 24.0
+        except Exception:
+            return jsonify({'error': 'hours must be numeric'}), 400
+        if hours > 0:
+            since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+
+    try:
+        limit = int(request.args.get('limit', 8))
+    except Exception:
+        limit = 8
+    limit = max(1, min(50, limit))
+
+    try:
+        source_summary_fn = getattr(detections_store, "summarize_by_source", None)
+        source_summary = (
+            list(source_summary_fn(since_ms=since_ms, channel_id=channel_id))
+            if callable(source_summary_fn)
+            else []
+        )
+        recent_rows, total = detections_store.list_detections(
+            channel_id=channel_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            offset=0,
+        )
+        recent: List[Dict[str, Any]] = []
+        for row in recent_rows:
+            thumbnail = str(row.get("thumbnail") or "")
+            recent.append(
+                {
+                    "id": row.get("id"),
+                    "source": row.get("source"),
+                    "channel_id": row.get("channel_id"),
+                    "probe_id": row.get("probe_id"),
+                    "probe_name": row.get("probe_name"),
+                    "timestamp_ms": row.get("timestamp_ms"),
+                    "severity": row.get("severity"),
+                    "has_thumbnail": bool(thumbnail),
+                    "thumbnail_chars": len(thumbnail),
+                    "has_clip": bool(row.get("has_clip")),
+                    "has_dino": bool(row.get("has_dino")),
+                    "shard_key": row.get("shard_key"),
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "filters": {
+                    "channel_id": channel_id,
+                    "source": source,
+                    "since_ms": since_ms,
+                    "until_ms": until_ms,
+                    "limit": limit,
+                },
+                "storage": _archive_storage_summary(),
+                "sources": source_summary,
+                "recent": recent,
+                "recent_total": total,
+            }
+        )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Detection archive diagnostics failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': 'archive_diagnostics_failed'}), 500
 
 
 ENV_PREFIX = "EVOSSEARCH_"
+_ENV_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]*$")
 
 
 def _bool_to_env(value: Any) -> str:
     return "true" if bool(value) else "false"
+
+
+def _decode_env_value(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        body = text[1:-1]
+        if text[0] == '"':
+            body = (
+                body
+                .replace("\\n", "\n")
+                .replace('\\"', '"')
+                .replace("\\$", "$")
+                .replace("\\\\", "\\")
+            )
+        return body
+    return text
 
 
 def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
@@ -16033,7 +11017,7 @@ def _read_env_file_map(path: Union[str, Path] = ".env") -> Dict[str, str]:
         key = key_raw.strip()
         if not key:
             continue
-        env_map[key] = value_raw.strip()
+        env_map[key] = _decode_env_value(value_raw)
     return env_map
 
 
@@ -16048,17 +11032,95 @@ def _parse_env_editor_text(raw_text: Any) -> Dict[str, str]:
         key = key_raw.strip()
         if not key or not key.startswith(ENV_PREFIX):
             continue
-        parsed[key] = value_raw.strip()
+        parsed[key] = _decode_env_value(value_raw)
     return parsed
 
 
 def _serialize_env_map(env_map: Dict[str, str]) -> str:
     keys_sorted = sorted(env_map.keys())
-    return "\n".join(f"{key}={env_map[key]}" for key in keys_sorted)
+    return "\n".join(f"{key}={_quote_env_value(env_map[key])}" for key in keys_sorted)
+
+
+def _quote_env_value(value: Any) -> str:
+    text = str(value or "")
+    if text and "\n" not in text and _ENV_SAFE_VALUE_RE.fullmatch(text):
+        return text
+    escaped = (
+        text
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+    )
+    return f'"{escaped}"'
+
+
+def _write_env_file_atomic(content: str, path: Union[str, Path] = ".env") -> None:
+    env_path = Path(path)
+    if not hasattr(env_path, "with_name"):
+        env_path.write_text(content, encoding="utf-8")
+        return
+    tmp_path = env_path.with_name(f".{env_path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, env_path)
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+
+ENV_SECRET_REDACTION = "__EVOSSEARCH_SECRET_SET__"
+ENV_SECRET_KEY_PARTS = (
+    "PASSWORD",
+    "TOKEN",
+    "SECRET",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "DSN",
+    "DATABASE_URL",
+)
+
+
+def _is_secret_env_key(key: str) -> bool:
+    normalized = str(key or "").strip().upper()
+    return any(part in normalized for part in ENV_SECRET_KEY_PARTS)
+
+
+def _redact_env_map(env_map: Mapping[str, str]) -> Dict[str, str]:
+    return {
+        str(key): (
+            ENV_SECRET_REDACTION
+            if _is_secret_env_key(str(key)) and bool(str(value or ""))
+            else str(value or "")
+        )
+        for key, value in env_map.items()
+    }
+
+
+def _restore_redacted_env_secrets(
+    target_env: Mapping[str, str],
+    current_env: Mapping[str, str],
+) -> Dict[str, str]:
+    restored = {str(key): str(value) for key, value in target_env.items()}
+    for key, value in list(restored.items()):
+        if not _is_secret_env_key(key) or value != ENV_SECRET_REDACTION:
+            continue
+        restored[key] = str(current_env.get(key) or "")
+    return restored
 
 
 def _runtime_env_map() -> Dict[str, str]:
     sev = config.LUXRIOT_SEVERITY_MAP or {}
+    lm_profiles = _configured_lm_profiles()
+    lm_profile_ids = [
+        profile_id
+        for profile_id in lm_profiles
+        if str(profile_id).strip() and str(profile_id).strip() != "default"
+    ]
     env: Dict[str, str] = {
         "EVOSSEARCH_HOST": str(config.HOST),
         "EVOSSEARCH_PORT": str(config.PORT),
@@ -16085,11 +11147,45 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LM_MODEL": str(config.LM_MODEL),
         "EVOSSEARCH_LM_API_KEY": str(config.LM_API_KEY),
         "EVOSSEARCH_LM_TIMEOUT": str(config.LM_TIMEOUT),
+        "EVOSSEARCH_LM_PROFILES": ",".join(lm_profile_ids),
+        "EVOSSEARCH_LM_AGENT_PROFILE_ID": str(
+            getattr(config, "LM_AGENT_PROFILE_ID", "")
+        ),
+        "EVOSSEARCH_LM_VLM_PROFILE_ID": str(
+            getattr(config, "LM_VLM_PROFILE_ID", "")
+        ),
+        "EVOSSEARCH_LM_VLM_BALANCER_ENABLED": _bool_to_env(
+            getattr(config, "LM_VLM_BALANCER_ENABLED", False)
+        ),
+        "EVOSSEARCH_LM_VLM_BALANCER_PROFILES": ",".join(
+            _configured_vlm_balancer_profile_ids()
+        ),
         "EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES": str(config.LM_VIDEO_DEFAULT_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_FRAMES": str(config.LM_VIDEO_MAX_FRAMES),
         "EVOSSEARCH_LM_VIDEO_MAX_EDGE": str(config.LM_VIDEO_MAX_EDGE),
         "EVOSSEARCH_LM_VIDEO_MAX_TOKENS": str(config.LM_VIDEO_MAX_TOKENS),
+        "EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS": str(
+            getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000)
+        ),
+        "EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS": str(
+            getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)
+        ),
         "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
+        "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000"
+        ),
+        "EVOSSEARCH_OFFLINE_VIDEO_ENABLED": _bool_to_env(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
+        "EVOSSEARCH_PROBE_SNAP_ENABLED": _bool_to_env(getattr(config, "PROBE_SNAP_ENABLED", False)),
+        "EVOSSEARCH_INDEXED_FOLDER_ENABLED": _bool_to_env(getattr(config, "INDEXED_FOLDER_ENABLED", False)),
         "EVOSSEARCH_LUXRIOT_BASE_URL": str(config.LUXRIOT_BASE_URL),
         "EVOSSEARCH_LUXRIOT_USERNAME": str(config.LUXRIOT_USERNAME),
         "EVOSSEARCH_LUXRIOT_PASSWORD": str(config.LUXRIOT_PASSWORD),
@@ -16097,7 +11193,24 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": str(config.LUXRIOT_SNAPSHOT_INTERVAL),
         "EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE": str(config.LUXRIOT_SNAPSHOT_MAX_EDGE),
         "EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES": str(config.LUXRIOT_MAX_BUFFER_FRAMES),
+        "EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS": str(
+            getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0)
+        ),
+        "EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT": str(
+            getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600)
+        ),
         "EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS": _bool_to_env(config.LUXRIOT_AUTO_BOOKMARKS),
+        "EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH": str(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)),
+        "EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT": str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "")),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED": _bool_to_env(
+            getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)
+        ),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES": str(
+            getattr(config, "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES", 2)
+        ),
+        "EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS": _bool_to_env(
+            getattr(config, "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS", True)
+        ),
         "EVOSSEARCH_LUXRIOT_SEV_INFO": str(sev.get("info", "info")),
         "EVOSSEARCH_LUXRIOT_SEV_LOW": str(sev.get("low", "low")),
         "EVOSSEARCH_LUXRIOT_SEV_NORMAL": str(sev.get("normal", "normal")),
@@ -16132,9 +11245,63 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_MAX_FILE_SIZE_MB": str(config.MAX_FILE_SIZE_MB),
         "EVOSSEARCH_ADMIN_TOKEN": str(config.ADMIN_TOKEN),
         "EVOSSEARCH_SETTINGS_LOCAL_ONLY": _bool_to_env(config.SETTINGS_LOCAL_ONLY),
+        "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED": _bool_to_env(
+            getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
+        ),
+        "EVOSSEARCH_ARCHIVE_STORE": str(getattr(config, "ARCHIVE_STORE", "auto")),
+        "EVOSSEARCH_ARCHIVE_TENANT_ID": str(
+            getattr(config, "ARCHIVE_TENANT_ID", "")
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED": _bool_to_env(
+            getattr(config, "ARCHIVE_RETENTION_ENABLED", True)
+        ),
+        "EVOSSEARCH_ARCHIVE_MAX_RECORDS": str(
+            getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)
+        ),
+        "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS": str(
+            getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS": str(
+            getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC": str(
+            getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE": str(
+            getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS": str(
+            getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH": str(
+            getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB": str(
+            getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0)
+        ),
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY": str(
+            getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
+        ),
         "EVOSSEARCH_CORS_ALLOWED_ORIGINS": ",".join(config.CORS_ALLOWED_ORIGINS),
         "EVOSSEARCH_ALLOWED_ROOTS": os.pathsep.join(config.ALLOWED_ROOTS),
     }
+    for profile_id in lm_profile_ids:
+        profile = lm_profiles[profile_id]
+        env[_lm_profile_env_key(profile_id, "KIND")] = str(
+            profile.get("kind") or "general"
+        )
+        env[_lm_profile_env_key(profile_id, "BASE_URL")] = str(
+            profile.get("base_url") or ""
+        )
+        env[_lm_profile_env_key(profile_id, "MODEL")] = str(profile.get("model") or "")
+        env[_lm_profile_env_key(profile_id, "API_KEY")] = str(profile.get("api_key") or "")
+        env[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(
+            profile.get("timeout") or config.LM_TIMEOUT
+        )
+        env[_lm_profile_env_key(profile_id, "ENABLED")] = _bool_to_env(
+            _lm_profile_enabled(profile)
+        )
+        env[_lm_profile_env_key(profile_id, "GPU")] = str(profile.get("gpu") or "")
     return env
 
 
@@ -16151,12 +11318,12 @@ def _effective_env_map() -> Dict[str, str]:
 def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
     existing_map = _read_env_file_map(".env")
     extra_evos = [
-        f"{key}={value}"
+        f"{key}={_quote_env_value(value)}"
         for key, value in sorted(existing_map.items())
         if key.startswith(ENV_PREFIX) and key not in known_keys
     ]
     extra_other = [
-        f"{key}={value}"
+        f"{key}={_quote_env_value(value)}"
         for key, value in sorted(existing_map.items())
         if not key.startswith(ENV_PREFIX)
     ]
@@ -16172,13 +11339,216 @@ def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
     return ("\n" + "\n".join(chunks) + "\n") if chunks else ""
 
 
+def _archive_storage_summary() -> Dict[str, Any]:
+    summary_fn = getattr(detections_store, "storage_summary", None)
+    if not callable(summary_fn):
+        return {
+            "available": False,
+            "backend": getattr(detections_store, "backend", "unknown"),
+        }
+    try:
+        summary = dict(summary_fn())
+        summary["available"] = True
+        return summary
+    except Exception as exc:
+        app.logger.warning(
+            "Archive storage summary failed request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return {
+            "available": False,
+            "backend": getattr(detections_store, "backend", "unknown"),
+            "error": type(exc).__name__,
+        }
+
+
+def _archive_capacity_estimate(
+    *,
+    channels: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    snapshot_interval_sec: Optional[float] = None,
+    frames_per_batch: Optional[float] = None,
+    avg_jpeg_kb: Optional[float] = None,
+    probe_records_per_channel_day: Optional[float] = None,
+    summary_retention_days: Optional[float] = None,
+    summary_history_limit: Optional[int] = None,
+    frame_retention_days: Optional[float] = None,
+    thumbnail_retention_days: Optional[float] = None,
+    max_records: Optional[int] = None,
+) -> Dict[str, Any]:
+    channel_count = max(
+        1,
+        int(channels if channels is not None else getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)),
+    )
+    default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    batch = max(1, int(batch_size if batch_size is not None else default_batch))
+    interval = max(
+        0.2,
+        float(snapshot_interval_sec if snapshot_interval_sec is not None else config.LUXRIOT_SNAPSHOT_INTERVAL),
+    )
+    frames = max(
+        0.0,
+        float(frames_per_batch if frames_per_batch is not None else getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5)),
+    )
+    jpeg_kb = max(
+        1.0,
+        float(avg_jpeg_kb if avg_jpeg_kb is not None else getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0)),
+    )
+    probe_daily = max(
+        0.0,
+        float(
+            probe_records_per_channel_day
+            if probe_records_per_channel_day is not None
+            else getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
+        ),
+    )
+    summary_days = max(
+        0.0,
+        float(summary_retention_days if summary_retention_days is not None else getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0)),
+    )
+    summary_cap = max(
+        40,
+        int(summary_history_limit if summary_history_limit is not None else getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600)),
+    )
+    frame_days = max(
+        0.0,
+        float(frame_retention_days if frame_retention_days is not None else getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0)),
+    )
+    thumb_days = max(
+        0.0,
+        float(thumbnail_retention_days if thumbnail_retention_days is not None else getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0)),
+    )
+    record_cap = max(
+        1000,
+        int(max_records if max_records is not None else getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
+    )
+
+    batches_per_channel_day = 86400.0 / max(1.0, interval * batch)
+    l0_per_channel_day = batches_per_channel_day
+    l1_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L1_WINDOW_SEC", 900)))
+    l2_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L2_WINDOW_SEC", 3600)))
+    l3_window = max(1.0, float(getattr(config, "LUXRIOT_ROLLUP_L3_WINDOW_SEC", 21600)))
+    summary_per_channel_day = (
+        l0_per_channel_day
+        + 86400.0 / l1_window
+        + 86400.0 / l2_window
+        + 86400.0 / l3_window
+    )
+    summary_rows_day = channel_count * summary_per_channel_day
+    frame_rows_day = channel_count * (
+        batches_per_channel_day * frames + probe_daily
+    )
+    uncapped_frame_rows = frame_rows_day * frame_days
+    retained_frame_rows = min(float(record_cap), uncapped_frame_rows)
+    retained_thumbnail_rows = min(
+        retained_frame_rows,
+        frame_rows_day * min(frame_days, thumb_days),
+    )
+    summary_rows_retained = channel_count * min(
+        float(summary_cap),
+        summary_per_channel_day * summary_days,
+    )
+
+    jpeg_bytes = jpeg_kb * 1024.0
+    db_thumbnail_bytes = retained_thumbnail_rows * jpeg_bytes * 4.0 / 3.0
+    fs_jpeg_bytes = retained_frame_rows * jpeg_bytes
+    vector_and_meta_bytes = retained_frame_rows * 8192.0
+    summary_bytes = summary_rows_retained * 4096.0
+    db_total_bytes = db_thumbnail_bytes + vector_and_meta_bytes + summary_bytes
+    total_bytes = db_total_bytes + fs_jpeg_bytes
+
+    return {
+        "inputs": {
+            "channels": channel_count,
+            "batch_size": batch,
+            "snapshot_interval_sec": interval,
+            "frames_per_batch": frames,
+            "avg_jpeg_kb": jpeg_kb,
+            "probe_records_per_channel_day": probe_daily,
+            "summary_retention_days": summary_days,
+            "summary_history_limit": summary_cap,
+            "frame_retention_days": frame_days,
+            "thumbnail_retention_days": thumb_days,
+            "max_records": record_cap,
+        },
+        "daily": {
+            "batches_per_channel": batches_per_channel_day,
+            "summary_rows": summary_rows_day,
+            "frame_rows": frame_rows_day,
+        },
+        "retained": {
+            "summary_rows": summary_rows_retained,
+            "frame_rows": retained_frame_rows,
+            "thumbnail_rows": retained_thumbnail_rows,
+            "capped_by_max_records": uncapped_frame_rows > float(record_cap),
+        },
+        "bytes": {
+            "database": db_total_bytes,
+            "database_thumbnails": db_thumbnail_bytes,
+            "database_vectors_meta": vector_and_meta_bytes,
+            "database_summaries": summary_bytes,
+            "archive_files": fs_jpeg_bytes,
+            "total": total_bytes,
+        },
+    }
+
+
+@app.route('/settings/archive_capacity', methods=['GET'])
+def settings_archive_capacity():
+    guard = _settings_guard(write=False)
+    if guard is not None:
+        return guard
+    try:
+        def _optional_float(name: str) -> Optional[float]:
+            raw = request.args.get(name)
+            if raw is None or str(raw).strip() == "":
+                return None
+            return float(raw)
+
+        def _optional_int(name: str) -> Optional[int]:
+            raw = request.args.get(name)
+            if raw is None or str(raw).strip() == "":
+                return None
+            return int(float(raw))
+
+        estimate = _archive_capacity_estimate(
+            channels=_optional_int("channels"),
+            batch_size=_optional_int("batch_size"),
+            snapshot_interval_sec=_optional_float("snapshot_interval_sec"),
+            frames_per_batch=_optional_float("frames_per_batch"),
+            avg_jpeg_kb=_optional_float("avg_jpeg_kb"),
+            probe_records_per_channel_day=_optional_float("probe_records_per_channel_day"),
+            summary_retention_days=_optional_float("summary_retention_days"),
+            summary_history_limit=_optional_int("summary_history_limit"),
+            frame_retention_days=_optional_float("frame_retention_days"),
+            thumbnail_retention_days=_optional_float("thumbnail_retention_days"),
+            max_records=_optional_int("max_records"),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "estimate": estimate,
+                "current": _archive_storage_summary(),
+                "retention": dict(_archive_retention_last_result),
+            }
+        )
+    except Exception as exc:
+        app.logger.info(
+            "Archive capacity estimate failed request_id=%s error=%s",
+            getattr(g, "request_id", ""),
+            exc,
+        )
+        return jsonify({"success": False, "error": "Invalid archive capacity request"}), 400
+
+
 @app.route('/settings/env', methods=['GET'])
 def get_settings_env():
     guard = _settings_guard(write=False)
     if guard is not None:
         return guard
     try:
-        env_map = _effective_env_map()
+        env_map = _redact_env_map(_effective_env_map())
         return jsonify(
             {
                 'success': True,
@@ -16188,7 +11558,11 @@ def get_settings_env():
             }
         )
     except Exception as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
+        app.logger.exception(
+            "Settings env read failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_env_unavailable'}), 500
 
 
 @app.route('/settings/env', methods=['POST'])
@@ -16213,6 +11587,7 @@ def save_settings_env():
         if not target_env:
             return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
 
+        target_env = _restore_redacted_env_secrets(target_env, _effective_env_map())
         existing_map = _read_env_file_map(".env")
         preserved_other = {
             key: value
@@ -16222,10 +11597,17 @@ def save_settings_env():
         merged_map = dict(preserved_other)
         merged_map.update(target_env)
 
-        env_lines = [f"{key}={merged_map[key]}" for key in sorted(merged_map.keys())]
         header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
-        Path(".env").write_text(header + "\n".join(env_lines) + "\n", encoding="utf-8")
+        _write_env_file_atomic(header + _serialize_env_map(merged_map) + "\n")
 
+        audit_error = _write_completion_audit_or_error(
+            action="settings.env.write.completed",
+            result="success",
+            target_type="settings_env",
+            details=_audit_key_details("keys", target_env.keys()),
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(
             {
                 'success': True,
@@ -16234,7 +11616,11 @@ def save_settings_env():
             }
         )
     except Exception as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
+        app.logger.exception(
+            "Settings env write failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_env_unavailable'}), 500
 
 
 @app.route('/settings', methods=['GET'])
@@ -16244,23 +11630,31 @@ def get_settings():
     if guard is not None:
         return guard
     try:
-        requested_embedder = config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder
+        experimental_embedders_enabled = _experimental_embedding_models_enabled()
+        requested_embedder = _normalize_embedder_for_policy(
+            config.EMBEDDER if config.EMBEDDER in SUPPORTED_EMBEDDERS else active_embedder,
+            bool(config.FUSION_ENABLED),
+        )
+        clip_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
+        index_mode = _normalize_index_mode_for_policy(config.INDEX_MODE)
         settings = {
             'host': config.HOST,
             'port': config.PORT,
             'debug': config.DEBUG,
             'appVersion': config.APP_VERSION,
+            'experimentalEmbeddersEnabled': experimental_embedders_enabled,
+            'productionClipModel': _production_clip_model(),
             'embedder': requested_embedder,
-            'clipModel': config.CLIP_MODEL,
+            'clipModel': clip_model,
             'dinoModel': config.DINO_MODEL,
             'dinoEmbedDim': config.EMB_DIM_DINO,
             'dinoWeightsPath': config.DINO_WEIGHTS_PATH,
-            'indexMode': config.INDEX_MODE,
-            'fusionEnabled': config.FUSION_ENABLED,
+            'indexMode': index_mode,
+            'fusionEnabled': bool(config.FUSION_ENABLED) if experimental_embedders_enabled else False,
             'fusionAlpha': config.FUSION_ALPHA,
             'rerankEnabled': config.RERANK_ENABLED,
             'rerankTopK': config.RERANK_TOP_K,
-            'segmentsEnabled': config.DINO_SEGMENTS_ENABLED,
+            'segmentsEnabled': bool(config.DINO_SEGMENTS_ENABLED) if experimental_embedders_enabled else False,
             'segmentMinPatches': config.DINO_SEGMENT_MIN_PATCHES,
             'segmentThreshold': config.DINO_HEATMAP_THRESHOLD,
             'luxriotBaseUrl': config.LUXRIOT_BASE_URL,
@@ -16271,6 +11665,13 @@ def get_settings():
             'luxriotSnapshotMaxEdge': config.LUXRIOT_SNAPSHOT_MAX_EDGE,
             'luxriotDefaultChannelId': config.LUXRIOT_DEFAULT_CHANNEL_ID,
             'luxriotMaxBufferFrames': config.LUXRIOT_MAX_BUFFER_FRAMES,
+            'luxriotSummaryRetentionDays': getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0),
+            'luxriotSummaryHistoryLimit': getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600),
+            'luxriotSummaryArchiveFramesPerBatch': getattr(
+                config,
+                "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH",
+                4,
+            ),
             'luxriotAutoBookmarks': config.LUXRIOT_AUTO_BOOKMARKS,
             'luxriotSeverityMap': config.LUXRIOT_SEVERITY_MAP,
             'probeBookmarkCooldownSec': config.PROBE_BOOKMARK_COOLDOWN_SEC,
@@ -16290,13 +11691,36 @@ def get_settings():
             'indexFolderName': config.INDEX_FOLDER_NAME,
             'settingsLocalOnly': config.SETTINGS_LOCAL_ONLY,
             'adminTokenSet': bool(config.ADMIN_TOKEN),
+            'offlineVideoEnabled': bool(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
+            'probeSnapEnabled': bool(getattr(config, "PROBE_SNAP_ENABLED", False)),
+            'indexedFolderEnabled': bool(getattr(config, "INDEXED_FOLDER_ENABLED", False)),
             'corsAllowedOrigins': list(config.CORS_ALLOWED_ORIGINS),
             'allowedRoots': list(config.ALLOWED_ROOTS),
+            'archiveRetentionEnabled': getattr(config, "ARCHIVE_RETENTION_ENABLED", True),
+            'archiveMaxRecords': getattr(config, "ARCHIVE_MAX_RECORDS", 5000000),
+            'archiveRowRetentionDays': getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0),
+            'archiveThumbnailRetentionDays': getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0),
+            'archiveRetentionPruneIntervalSec': getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0),
+            'archiveRetentionBatchSize': getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000),
+            'archiveEstimateChannels': getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50),
+            'archiveEstimateFramesPerBatch': getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5),
+            'archiveEstimateAvgJpegKb': getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0),
+            'archiveEstimateProbeRecordsPerChannelDay': getattr(
+                config,
+                "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY",
+                250.0,
+            ),
+            'archiveCapacityEstimate': _archive_capacity_estimate(),
+            'archiveStorageSummary': _archive_storage_summary(),
             'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        app.logger.exception(
+            "Settings read failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_unavailable'}), 500
 
 @app.route('/settings', methods=['POST'])
 def save_settings():
@@ -16316,6 +11740,7 @@ def save_settings():
             if field not in data:
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
         debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
+        experimental_embedders_enabled = _experimental_embedding_models_enabled()
 
         try:
             port = int(data['port'])
@@ -16335,6 +11760,8 @@ def save_settings():
             return jsonify({'success': False, 'error': f'Invalid number format: {str(e)}'}), 400
 
         fusion_enabled = _coerce_bool(data.get('fusionEnabled', config.FUSION_ENABLED), config.FUSION_ENABLED)
+        if not experimental_embedders_enabled:
+            fusion_enabled = False
 
         try:
             fusion_alpha = float(data.get('fusionAlpha', config.FUSION_ALPHA))
@@ -16352,6 +11779,8 @@ def save_settings():
             rerank_top_k = 1
 
         segments_enabled = _coerce_bool(data.get('segmentsEnabled', config.DINO_SEGMENTS_ENABLED), config.DINO_SEGMENTS_ENABLED)
+        if not experimental_embedders_enabled:
+            segments_enabled = False
 
         try:
             segment_min_patches = int(data.get('segmentMinPatches', config.DINO_SEGMENT_MIN_PATCHES))
@@ -16395,6 +11824,115 @@ def save_settings():
             luxriot_max_buffer_frames = config.LUXRIOT_MAX_BUFFER_FRAMES
         if luxriot_max_buffer_frames < 12:
             luxriot_max_buffer_frames = 12
+        try:
+            luxriot_summary_retention_days = float(
+                data.get(
+                    'luxriotSummaryRetentionDays',
+                    getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_retention_days = float(getattr(config, "LUXRIOT_SUMMARY_RETENTION_DAYS", 7.0))
+        luxriot_summary_retention_days = max(0.0, min(3650.0, luxriot_summary_retention_days))
+        try:
+            luxriot_summary_history_limit = int(
+                data.get(
+                    'luxriotSummaryHistoryLimit',
+                    getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
+        luxriot_summary_history_limit = max(40, min(1000000, luxriot_summary_history_limit))
+        try:
+            luxriot_summary_archive_frames_per_batch = int(
+                data.get(
+                    'luxriotSummaryArchiveFramesPerBatch',
+                    getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4),
+                )
+            )
+        except (TypeError, ValueError):
+            luxriot_summary_archive_frames_per_batch = int(
+                getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4)
+            )
+        luxriot_summary_archive_frames_per_batch = max(
+            1,
+            min(16, luxriot_summary_archive_frames_per_batch),
+        )
+        archive_retention_enabled = _coerce_bool(
+            data.get('archiveRetentionEnabled', getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+            bool(getattr(config, "ARCHIVE_RETENTION_ENABLED", True)),
+        )
+        try:
+            archive_max_records = int(data.get('archiveMaxRecords', getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)))
+        except (TypeError, ValueError):
+            archive_max_records = int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000))
+        archive_max_records = max(1000, min(500000000, archive_max_records))
+        try:
+            archive_row_retention_days = float(
+                data.get('archiveRowRetentionDays', getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0))
+            )
+        except (TypeError, ValueError):
+            archive_row_retention_days = float(getattr(config, "ARCHIVE_ROW_RETENTION_DAYS", 90.0))
+        archive_row_retention_days = max(0.0, min(3650.0, archive_row_retention_days))
+        try:
+            archive_thumbnail_retention_days = float(
+                data.get('archiveThumbnailRetentionDays', getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0))
+            )
+        except (TypeError, ValueError):
+            archive_thumbnail_retention_days = float(getattr(config, "ARCHIVE_THUMBNAIL_RETENTION_DAYS", 14.0))
+        archive_thumbnail_retention_days = max(0.0, min(3650.0, archive_thumbnail_retention_days))
+        try:
+            archive_retention_prune_interval_sec = float(
+                data.get(
+                    'archiveRetentionPruneIntervalSec',
+                    getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0),
+                )
+            )
+        except (TypeError, ValueError):
+            archive_retention_prune_interval_sec = float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0))
+        archive_retention_prune_interval_sec = max(60.0, min(86400.0, archive_retention_prune_interval_sec))
+        try:
+            archive_retention_batch_size = int(
+                data.get('archiveRetentionBatchSize', getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000))
+            )
+        except (TypeError, ValueError):
+            archive_retention_batch_size = int(getattr(config, "ARCHIVE_RETENTION_BATCH_SIZE", 5000))
+        archive_retention_batch_size = max(100, min(50000, archive_retention_batch_size))
+        try:
+            archive_estimate_channels = int(data.get('archiveEstimateChannels', getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)))
+        except (TypeError, ValueError):
+            archive_estimate_channels = int(getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50))
+        archive_estimate_channels = max(1, min(10000, archive_estimate_channels))
+        try:
+            archive_estimate_frames_per_batch = float(
+                data.get('archiveEstimateFramesPerBatch', getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5))
+            )
+        except (TypeError, ValueError):
+            archive_estimate_frames_per_batch = float(getattr(config, "ARCHIVE_ESTIMATE_FRAMES_PER_BATCH", 2.5))
+        archive_estimate_frames_per_batch = max(0.0, min(32.0, archive_estimate_frames_per_batch))
+        try:
+            archive_estimate_avg_jpeg_kb = float(
+                data.get('archiveEstimateAvgJpegKb', getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0))
+            )
+        except (TypeError, ValueError):
+            archive_estimate_avg_jpeg_kb = float(getattr(config, "ARCHIVE_ESTIMATE_AVG_JPEG_KB", 100.0))
+        archive_estimate_avg_jpeg_kb = max(1.0, min(5000.0, archive_estimate_avg_jpeg_kb))
+        try:
+            archive_estimate_probe_records_per_channel_day = float(
+                data.get(
+                    'archiveEstimateProbeRecordsPerChannelDay',
+                    getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0),
+                )
+            )
+        except (TypeError, ValueError):
+            archive_estimate_probe_records_per_channel_day = float(
+                getattr(config, "ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY", 250.0)
+            )
+        archive_estimate_probe_records_per_channel_day = max(
+            0.0,
+            min(100000.0, archive_estimate_probe_records_per_channel_day),
+        )
         luxriot_auto_bookmarks = _coerce_bool(
             data.get('luxriotAutoBookmarks', config.LUXRIOT_AUTO_BOOKMARKS),
             config.LUXRIOT_AUTO_BOOKMARKS,
@@ -16438,11 +11976,8 @@ def save_settings():
             if key in severity_map:
                 merged_sev[key] = str(severity_map[key] or merged_sev.get(key, key)).lower()
 
-        embedder = str(data.get('embedder', active_embedder)).strip().lower()
-        if embedder == 'fusion' and not fusion_enabled:
-            embedder = 'clip'
-        if embedder not in SUPPORTED_EMBEDDERS:
-            embedder = 'clip'
+        clip_model = _normalize_clip_model_for_policy(data.get('clipModel', config.CLIP_MODEL))
+        embedder = _normalize_embedder_for_policy(data.get('embedder', active_embedder), fusion_enabled)
         dino_model = str(data.get('dinoModel', config.DINO_MODEL)).strip() or config.DINO_MODEL
         try:
             dino_dim = int(data.get('dinoEmbedDim', config.EMB_DIM_DINO))
@@ -16452,9 +11987,7 @@ def save_settings():
         dino_weights_path = data.get('dinoWeightsPath', config.DINO_WEIGHTS_PATH) or ''
         dino_device = str(data.get('dinoDevice', config.DINO_DEVICE)).strip()
 
-        index_mode = str(data.get('indexMode', config.INDEX_MODE)).strip().lower()
-        if index_mode not in {'clip', 'dino', 'dual'}:
-            index_mode = 'clip'
+        index_mode = _normalize_index_mode_for_policy(data.get('indexMode', config.INDEX_MODE))
 
         batch_size = int(data.get('batchSize', config.BATCH_SIZE))
         thumbnail_quality = int(data.get('thumbnailQuality', config.THUMBNAIL_QUALITY))
@@ -16472,8 +12005,10 @@ EVOSSEARCH_DEBUG={str(debug_enabled).lower()}
 EVOSSEARCH_APP_VERSION="{config.APP_VERSION}"
 
 # Embedder configuration
+EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED={str(experimental_embedders_enabled).lower()}
+EVOSSEARCH_PRODUCTION_CLIP_MODEL={_production_clip_model()}
 EVOSSEARCH_EMBEDDER={embedder}
-EVOSSEARCH_CLIP_MODEL={data['clipModel']}
+EVOSSEARCH_CLIP_MODEL={clip_model}
 EVOSSEARCH_DINO_MODEL={dino_model}
 EVOSSEARCH_EMB_DIM_DINO={dino_dim}
 EVOSSEARCH_DINO_WEIGHTS_PATH={dino_weights_path}
@@ -16500,7 +12035,16 @@ EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES={config.LM_VIDEO_DEFAULT_FRAMES}
 EVOSSEARCH_LM_VIDEO_MAX_FRAMES={config.LM_VIDEO_MAX_FRAMES}
 EVOSSEARCH_LM_VIDEO_MAX_EDGE={config.LM_VIDEO_MAX_EDGE}
 EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
+EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS={getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000)}
+EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS={getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)}
 EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
+EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN={os.getenv("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4")}
+EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000")}
+EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000")}
+EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000")}
+EVOSSEARCH_OFFLINE_VIDEO_ENABLED={str(getattr(config, "OFFLINE_VIDEO_ENABLED", False)).lower()}
+EVOSSEARCH_PROBE_SNAP_ENABLED={str(getattr(config, "PROBE_SNAP_ENABLED", False)).lower()}
+EVOSSEARCH_INDEXED_FOLDER_ENABLED={str(getattr(config, "INDEXED_FOLDER_ENABLED", False)).lower()}
 
 # Luxriot Evo integration
 EVOSSEARCH_LUXRIOT_BASE_URL={luxriot_base_url}
@@ -16510,7 +12054,15 @@ EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID={luxriot_default_channel_id}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL={luxriot_snapshot_interval}
 EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE={luxriot_snapshot_max_edge}
 EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES={luxriot_max_buffer_frames}
+EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS={luxriot_summary_retention_days}
+EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT={luxriot_summary_history_limit}
+EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH={luxriot_summary_archive_frames_per_batch}
 EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS={str(luxriot_auto_bookmarks).lower()}
+EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH={getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8)}
+EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT={getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "")}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED={str(getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)).lower()}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES={getattr(config, "LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES", 2)}
+EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS={str(getattr(config, "LUXRIOT_STATE_TRANSITION_ALERT_EVENTS", True)).lower()}
 EVOSSEARCH_LUXRIOT_SEV_INFO={merged_sev['info']}
 EVOSSEARCH_LUXRIOT_SEV_LOW={merged_sev['low']}
 EVOSSEARCH_LUXRIOT_SEV_NORMAL={merged_sev['normal']}
@@ -16559,23 +12111,51 @@ EVOSSEARCH_MAX_COMMENT_LENGTH={max_comment_length}
 EVOSSEARCH_MAX_FILE_SIZE_MB={max_file_size}
 EVOSSEARCH_ADMIN_TOKEN={config.ADMIN_TOKEN}
 EVOSSEARCH_SETTINGS_LOCAL_ONLY={str(config.SETTINGS_LOCAL_ONLY).lower()}
+EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED={str(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)).lower()}
+EVOSSEARCH_ARCHIVE_STORE={getattr(config, "ARCHIVE_STORE", "auto")}
+EVOSSEARCH_ARCHIVE_TENANT_ID={getattr(config, "ARCHIVE_TENANT_ID", "")}
+EVOSSEARCH_ARCHIVE_RETENTION_ENABLED={str(archive_retention_enabled).lower()}
+EVOSSEARCH_ARCHIVE_MAX_RECORDS={archive_max_records}
+EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS={archive_row_retention_days}
+EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS={archive_thumbnail_retention_days}
+EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC={archive_retention_prune_interval_sec}
+EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE={archive_retention_batch_size}
+EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS={archive_estimate_channels}
+EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH={archive_estimate_frames_per_batch}
+EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB={archive_estimate_avg_jpeg_kb}
+EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY={archive_estimate_probe_records_per_channel_day}
 EVOSSEARCH_CORS_ALLOWED_ORIGINS={','.join(config.CORS_ALLOWED_ORIGINS)}
 EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
 
-        known_env_keys = set(_parse_env_editor_text(env_content).keys())
-        env_content = env_content.rstrip() + _preserve_additional_env_lines(known_env_keys)
+        parsed_env_content = _parse_env_editor_text(env_content)
+        known_env_keys = set(parsed_env_content.keys())
+        env_content = (
+            "# evo-ssearch Configuration\n"
+            "# Generated by settings panel\n\n"
+            + _serialize_env_map(parsed_env_content)
+            + _preserve_additional_env_lines(known_env_keys)
+        )
         if not env_content.endswith("\n"):
             env_content += "\n"
 
-        with open('.env', 'w', encoding='utf-8') as f:
-            f.write(env_content)
+        _write_env_file_atomic(env_content)
 
         config.HOST = data['host']
         config.PORT = port
         config.DEBUG = debug_enabled
+        embedder_state_changed = (
+            str(config.EMBEDDER) != str(embedder)
+            or str(config.CLIP_MODEL) != str(clip_model)
+            or str(config.INDEX_MODE) != str(index_mode)
+            or bool(config.FUSION_ENABLED) != bool(fusion_enabled)
+            or bool(config.DINO_SEGMENTS_ENABLED) != bool(segments_enabled)
+        )
+
+        config.EXPERIMENTAL_EMBEDDERS_ENABLED = experimental_embedders_enabled
+        config.PRODUCTION_CLIP_MODEL = _production_clip_model()
         config.EMBEDDER = embedder
-        config.CLIP_MODEL = data['clipModel']
+        config.CLIP_MODEL = clip_model
         config.DINO_MODEL = dino_model
         config.EMB_DIM_DINO = dino_dim
         config.DINO_WEIGHTS_PATH = dino_weights_path
@@ -16604,8 +12184,24 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.LUXRIOT_SNAPSHOT_INTERVAL = luxriot_snapshot_interval
         config.LUXRIOT_SNAPSHOT_MAX_EDGE = luxriot_snapshot_max_edge
         config.LUXRIOT_MAX_BUFFER_FRAMES = luxriot_max_buffer_frames
+        config.LUXRIOT_SUMMARY_RETENTION_DAYS = luxriot_summary_retention_days
+        config.LUXRIOT_SUMMARY_HISTORY_LIMIT = luxriot_summary_history_limit
+        config.LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = luxriot_summary_archive_frames_per_batch
         config.LUXRIOT_AUTO_BOOKMARKS = luxriot_auto_bookmarks
         config.LUXRIOT_SEVERITY_MAP = merged_sev
+        luxriot_manager.summary_retention_days = luxriot_summary_retention_days
+        luxriot_manager.summary_history_limit = luxriot_summary_history_limit
+        luxriot_manager.summary_archive_frames_per_batch = luxriot_summary_archive_frames_per_batch
+        config.ARCHIVE_RETENTION_ENABLED = archive_retention_enabled
+        config.ARCHIVE_MAX_RECORDS = archive_max_records
+        config.ARCHIVE_ROW_RETENTION_DAYS = archive_row_retention_days
+        config.ARCHIVE_THUMBNAIL_RETENTION_DAYS = archive_thumbnail_retention_days
+        config.ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC = archive_retention_prune_interval_sec
+        config.ARCHIVE_RETENTION_BATCH_SIZE = archive_retention_batch_size
+        config.ARCHIVE_ESTIMATE_CHANNELS = archive_estimate_channels
+        config.ARCHIVE_ESTIMATE_FRAMES_PER_BATCH = archive_estimate_frames_per_batch
+        config.ARCHIVE_ESTIMATE_AVG_JPEG_KB = archive_estimate_avg_jpeg_kb
+        config.ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY = archive_estimate_probe_records_per_channel_day
         config.PROBE_BOOKMARK_COOLDOWN_SEC = probe_bookmark_cooldown_sec
         config.PROBE_BOOKMARK_DEDUPE_WINDOW_SEC = probe_bookmark_dedupe_window_sec
         config.PROBE_BOOKMARK_SIM_HIGH = probe_bookmark_sim_high
@@ -16618,15 +12214,51 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
             active_embedder = 'clip'
         reset_embedder_runtime_state()
+        if embedder_state_changed:
+            try:
+                probe_manager.clear_all()
+            except Exception:
+                pass
+            try:
+                detection_clip_shard_cache.clear()
+            except Exception:
+                pass
         warmup_warning = warm_start_embedder()
         message = 'Settings saved successfully. Restart the server if issues persist.'
         payload: Dict[str, Any] = {'success': True, 'message': message}
         if warmup_warning:
-            payload['warning'] = warmup_warning
+            app.logger.warning(
+                "Embedder warmup warning after settings save request_id=%s warning=%s",
+                getattr(g, "request_id", ""),
+                warmup_warning,
+            )
+            payload['warning'] = 'Embedder warmup failed; restart or check server logs.'
+        audit_details = _audit_key_details("fields", data.keys())
+        audit_details.update(
+            {
+                "embedder": embedder,
+                "index_mode": index_mode,
+                "debug": debug_enabled,
+                "luxriot_password_supplied": luxriot_password_raw is not None,
+                "warmup_warning": bool(warmup_warning),
+            }
+        )
+        audit_error = _write_completion_audit_or_error(
+            action="settings.write.completed",
+            result="success",
+            target_type="settings",
+            details=audit_details,
+        )
+        if audit_error is not None:
+            return audit_error
         return jsonify(payload)
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        app.logger.exception(
+            "Settings write failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'success': False, 'error': 'settings_update_failed'}), 500
 
 
 def _stop_probe_daemon_thread() -> None:
@@ -16634,6 +12266,20 @@ def _stop_probe_daemon_thread() -> None:
     probe_daemon_stop.set()
     if probe_daemon_thread is not None and probe_daemon_thread.is_alive():
         probe_daemon_thread.join(timeout=1.5)
+
+
+def ensure_probe_daemon_thread() -> None:
+    """Start the saved-probe daemon for production entrypoints."""
+    global probe_daemon_thread
+    if probe_daemon_thread is not None and probe_daemon_thread.is_alive():
+        return
+    probe_daemon_stop.clear()
+    probe_daemon_thread = threading.Thread(
+        target=_probe_daemon,
+        name="eva-probe-daemon",
+        daemon=True,
+    )
+    probe_daemon_thread.start()
 
 
 def _port_is_available(host: str, port: int) -> bool:
@@ -16651,10 +12297,278 @@ def _port_is_available(host: str, port: int) -> bool:
             return False
 
 
+@app.route('/agent/chat', methods=['POST'])
+def agent_chat():
+    """SSE streaming agent chat endpoint."""
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    message = str(data.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'message is required'}), 400
+    session_id = str(data.get('session_id') or '').strip() or None
+    image_b64  = str(data.get('image_b64') or '').strip() or None
+    tool_context = None
+    auth_context = _current_auth_context()
+    if _auth_enabled() and auth_context is not None:
+        tool_context = ToolExecutionContext(
+            actor_id=auth_context.user_id,
+            tenant_id=auth_context.tenant_id,
+            roles=auth_context.roles,
+            permissions=auth_context.permissions,
+            allowed_channel_ids={
+                str(channel_id)
+                for channel_id in auth_context.allowed_channel_ids
+            },
+            agent_session_id=session_id,
+            request_id=auth_context.request_id,
+            client_ip=_source_ip(),
+        )
+
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+
+    def _generate():
+        yield from runner.stream_chat(
+            session_id=session_id,
+            message=message,
+            image_b64=image_b64,
+            tool_context=tool_context,
+        )
+
+    response = Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+    )
+    response.headers['Cache-Control']     = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection']        = 'keep-alive'
+    return response
+
+
+@app.route('/agent/action-plans/<plan_id>/execute', methods=['POST'])
+def agent_action_plan_execute(plan_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('session_id') or '').strip() or None
+    auth_context = _current_auth_context()
+    if _auth_enabled() and auth_context is None:
+        return jsonify({'error': 'Authentication required'}), 401
+    if not _auth_enabled() or auth_context is None:
+        return jsonify({'error': 'Durable approvals require named users'}), 403
+    tool_context = ToolExecutionContext(
+        actor_id=auth_context.user_id,
+        tenant_id=auth_context.tenant_id,
+        roles=auth_context.roles,
+        permissions=auth_context.permissions,
+        allowed_channel_ids={
+            str(channel_id)
+            for channel_id in auth_context.allowed_channel_ids
+        },
+        agent_session_id=session_id,
+        request_id=auth_context.request_id,
+        client_ip=_source_ip(),
+    )
+    try:
+        runner = _get_agent_runner()
+        result = runner.approve_action_plan(plan_id, tool_context)
+        return jsonify({'success': True, 'result': result})
+    except ToolGatewayError as exc:
+        status = 403 if getattr(exc, 'code', '') in {'permission_denied', 'channel_access_denied'} else 409
+        return jsonify({'success': False, 'error': str(exc), 'code': getattr(exc, 'code', 'tool_error')}), status
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@app.route('/agent/sessions', methods=['GET'])
+def agent_sessions():
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+    return jsonify({
+        'sessions': runner.store.list_sessions(**_agent_session_owner())
+    })
+
+
+@app.route('/agent/config', methods=['GET', 'POST'])
+def agent_config():
+    global _agent_runner, _agent_runtime_model_override
+    if request.method == 'GET':
+        return jsonify(_get_agent_config_payload())
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_model = str(data.get('model') or '').strip()
+    default_profile = _resolve_lm_profile(kind="agent")
+    default_values = {
+        _lm_profile_selector_value(default_profile),
+        str(default_profile.get("model") or "").strip(),
+    }
+    default_values.discard("")
+    with _agent_runner_lock:
+        _agent_runtime_model_override = raw_model if raw_model and raw_model not in default_values else None
+        _agent_runner = None
+    return jsonify({'success': True, **_get_agent_config_payload()})
+
+
+@app.route('/lm/models', methods=['GET'])
+def lm_models():
+    force = str(request.args.get('force') or '').strip().lower() in TRUE_BOOL_STRINGS
+    payload = _fetch_lm_model_catalog(force=force)
+    payload['agent'] = _get_agent_config_payload()
+    profiles = payload.get("profiles") if isinstance(payload, Mapping) else None
+    models = payload.get("models") if isinstance(payload, Mapping) else None
+    audit_error = _write_completion_audit_or_error(
+        action="lm.models.completed",
+        result="success",
+        target_type="lm_catalog",
+        details={
+            "force": force,
+            "profile_count": len(profiles) if isinstance(profiles, Sequence) else 0,
+            "model_count": len(models) if isinstance(models, Sequence) else 0,
+            "has_error": bool(payload.get("error")) if isinstance(payload, Mapping) else False,
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify(payload)
+
+
+@app.route('/agent/skills', methods=['GET'])
+def agent_skills():
+    try:
+        return jsonify({'skills': _list_skill_records()})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/agent/skills/create', methods=['POST'])
+def agent_skills_create():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    raw_name = str(data.get('name') or '').strip()
+    raw_slug = str(data.get('slug') or '').strip()
+    slug = _slugify_skill_name(raw_slug or raw_name)
+    if not raw_name:
+        return jsonify({'error': 'name is required'}), 400
+    if not slug:
+        return jsonify({'error': 'Could not derive a valid skill slug'}), 400
+    try:
+        skill_file = _resolve_skill_path(slug)
+        if skill_file.exists():
+            return jsonify({'error': f'Skill already exists: {slug}'}), 409
+        skill = _save_skill_record(slug, raw_name, str(data.get('content') or ''))
+        return jsonify({'success': True, 'skill': skill})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/agent/skills/<slug>', methods=['GET', 'POST'])
+def agent_skill_detail(slug: str):
+    if request.method == 'GET':
+        try:
+            return jsonify(_load_skill_record(slug))
+        except FileNotFoundError:
+            return jsonify({'error': 'Skill not found'}), 404
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        current = _load_skill_record(slug)
+    except FileNotFoundError:
+        return jsonify({'error': 'Skill not found'}), 404
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    try:
+        updated = _save_skill_record(
+            slug=current['slug'],
+            name=str(data.get('name') or current.get('name') or current['slug']),
+            content=str(data.get('content') or current.get('content') or ''),
+        )
+        return jsonify({'success': True, 'skill': updated})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/agent/session/<session_id>', methods=['GET', 'DELETE'])
+def agent_session(session_id: str):
+    try:
+        runner = _get_agent_runner()
+    except Exception as exc:
+        return jsonify({'error': f'Agent unavailable: {exc}'}), 503
+    if request.method == 'DELETE':
+        guard = _mutation_guard_error()
+        if guard is not None:
+            return guard
+        ok = runner.store.delete_session(
+            session_id,
+            **_agent_session_owner(),
+        )
+        if not ok:
+            return jsonify({'error': 'Session not found'}), 404
+        return jsonify({'status': 'deleted'})
+    session = runner.store.get_session(
+        session_id,
+        **_agent_session_owner(),
+    )
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+    return jsonify(session)
+
+
 @atexit.register
 def _shutdown_background_workers() -> None:
+    global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
+    global _identity_repository
+    global _inference_queue_runtime, _inference_worker_db_pool
     try:
-        luxriot_manager.stop_all_streams(stop_video=True, stop_analytics=True, pause_analytics=False)
+        if _inference_queue_runtime is not None:
+            _inference_queue_runtime.stop()
+            _inference_queue_runtime = None
+    except Exception:
+        pass
+    try:
+        if _inference_worker_db_pool is not None:
+            _inference_worker_db_pool.close()
+            _inference_worker_db_pool = None
+    except Exception:
+        pass
+    try:
+        if _audit_db_pool is not None:
+            _audit_db_pool.close()
+            _audit_db_pool = None
+            _audit_writer = None
+    except Exception:
+        pass
+    try:
+        if _control_plane_db_pool is not None:
+            _control_plane_db_pool.close()
+            _control_plane_db_pool = None
+            _audit_reader = None
+            _identity_repository = None
+    except Exception:
+        pass
+    try:
+        luxriot_manager.stop_all_streams(
+            stop_video=True,
+            stop_analytics=True,
+            pause_analytics=False,
+            update_desired=False,
+        )
     except Exception:
         pass
     try:
@@ -16680,7 +12594,5 @@ if __name__ == '__main__':
     if warmup_warning:
         print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
-    if probe_daemon_thread is None:
-        probe_daemon_thread = threading.Thread(target=_probe_daemon, daemon=True)
-        probe_daemon_thread.start()
+    ensure_probe_daemon_thread()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

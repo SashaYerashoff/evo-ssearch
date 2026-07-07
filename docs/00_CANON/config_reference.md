@@ -1,0 +1,178 @@
+# Configuration Reference
+
+Canonical list of deployment-relevant environment variables. **Source of truth
+for behavior is `config.py`**; this table is the human reference. Secrets
+(`*_PASSWORD`, `*_API_KEY`, `*_DSN`, `*_ADMIN_TOKEN`) live only in the on-host
+`.env` (mode `0600`) and are **never** committed or placed in shareable docs.
+
+Defaults shown are the code defaults, not the pilot values. Pilot/field values
+live in the internal field-rollout doc with `[FIELD]` markers.
+
+Last reviewed: 2026-07-02 (β 0.8.3)
+
+## Secure-pilot required set
+
+These must be set for a secure deployment (see release notes):
+
+```env
+EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED=true
+EVOSSEARCH_AUTH_ENABLED=true
+EVA_DB_STRICT_RUNTIME_ROLES=true
+EVOSSEARCH_ARCHIVE_STORE=postgres
+EVOSSEARCH_EMBEDDER=clip
+EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
+EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=false
+EVOSSEARCH_GUNICORN_WORKERS=1
+EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
+```
+
+## Database / DSN (secrets — `.env` only)
+
+| Var | Purpose |
+|---|---|
+| `EVA_DATABASE_DSN` | API role DSN |
+| `EVA_AUDIT_DATABASE_DSN` | Audit role DSN |
+| `EVA_WORKER_DATABASE_DSN` | Worker role DSN (required if local inference workers enabled) |
+| `EVA_DB_STRICT_RUNTIME_ROLES` (`false`) | Enforce separated runtime roles |
+
+## Server & deployment
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_HOST` (`0.0.0.0`) | Bind host |
+| `EVOSSEARCH_PORT` (`5000`) | Internal Gunicorn HTTP port. TLS is provided by reverse proxy/TLS boundary, not by this variable |
+| `EVOSSEARCH_DEBUG` (`false`) | Keep false in prod |
+| `EVOSSEARCH_APP_VERSION` | Overrides `VERSION` only if set; keep in sync with release |
+| `EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED` | Gate for secure-mode checks + single-worker enforcement |
+| `EVOSSEARCH_GUNICORN_WORKERS` (`1`) | Must stay `1` |
+| `EVOSSEARCH_SETTINGS_LOCAL_ONLY` (`true`) | Restrict settings writes |
+
+## Auth
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_AUTH_ENABLED` (`false`) | Must be `true` in pilot |
+| `EVOSSEARCH_AUTH_TENANT_ID` | Tenant UUID |
+| `EVOSSEARCH_AUTH_COOKIE_SECURE` (`true`) | Requires the browser-facing URL to be HTTPS. Use `false` only for HTTP-only lab/demo |
+| `EVOSSEARCH_AUTH_SESSION_TTL_HOURS` (`12`) | Session lifetime |
+| `EVOSSEARCH_AUTH_SESSION_COOKIE` / `_CSRF_COOKIE` | Cookie names |
+| `EVOSSEARCH_ADMIN_TOKEN` | **Legacy**; not the current auth model |
+
+## Luxriot integration (password is a secret)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_BASE_URL` | Luxriot Evo host `[FIELD]` |
+| `EVOSSEARCH_LUXRIOT_USERNAME` / `_PASSWORD` | Credentials `[FIELD]` |
+| `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID` (`1`) | Default channel |
+| `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
+| `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
+| `EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES` (`180`) | Per-channel frame buffer cap |
+| `EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC` (`45`) | Max age for UI live-preview EVA frames; stale buffers render as signal loss instead of replay |
+| `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC` (`20`) | Exact repeated-frame duration before a live source is marked frozen |
+| `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT` (`3`) | Minimum identical captured frames before frozen-source detection can trigger |
+| `EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS` (`false`) | Push alerts as Luxriot bookmarks |
+| `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`60`) | Dedup cooldown |
+| `EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH` (`8`) | Max alerts per batch |
+| `EVOSSEARCH_LUXRIOT_SEV_*` | Severity token mapping to Luxriot |
+
+## Video-description / summaries
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | History retention |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT` | Per-channel history cap |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH` (`4`) | Frames archived per batch for search |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
+| `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |
+| `EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT` (`empty`) | Optional default operator alert criteria appended separately from role/summary prompt |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED` (`true`) | Backend diff of L0 current-observed-state rows across batches |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES` (`2`) | Confirmation hysteresis before appearance/disappearance is emitted |
+| `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS` (`true`) | Store confirmed transitions as internal VLM alert events/evidence; does not send Luxriot bookmarks by itself |
+
+## LM profiles (API keys are secrets)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
+| `EVOSSEARCH_LM_*_PROFILE_*` | Per-profile base_url / model / timeout / kind `[FIELD]` |
+| `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
+| `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
+| `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |
+| `EVOSSEARCH_LM_VIDEO_MAX_TOKENS` / `_TEMPERATURE` | VLM output sampling limits |
+| `EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS` (`24000`) | Warning threshold for text-side VLM/rollup input payloads |
+| `EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS` (`2500000`) | Warning threshold for base64 image payload size |
+
+## Agent context budget
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`4`) | Conservative token estimator divisor |
+| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`12000`) | Old chat history budget before trimming |
+| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`45000`) | Adds an internal compact-answer warning before the next model call |
+| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and asks the agent to answer with gathered evidence |
+
+## Inference queue (disabled by default)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_INFERENCE_QUEUE_ENABLED` (`false`) | Durable summary queue; keep off until validated |
+| `EVOSSEARCH_INFERENCE_QUEUE_CAPACITY` (`200`) | Max queued batches |
+| `EVOSSEARCH_INFERENCE_WORKER_COUNT` (`0`) | Local worker threads |
+| `EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID` / `_SPOOL_DIR` | Tenant + spool |
+
+## Frame archive & retention
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_ARCHIVE_STORE` (`postgres`) | Must be postgres in pilot |
+| `EVOSSEARCH_ARCHIVE_TENANT_ID` | Tenant UUID |
+| `EVOSSEARCH_ARCHIVE_MAX_RECORDS` (`5000000`) | Row cap. **Raise for 2-week window** (see sizing) |
+| `EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS` (`90`) | Row time-retention |
+| `EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS` (`14`) | Thumbnail retention |
+| `EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC` (`3600`) | Prune cadence |
+| `EVOSSEARCH_ARCHIVE_ESTIMATE_*` | Capacity-estimator inputs |
+
+## Probes & detections archive
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
+| `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
+| `EVOSSEARCH_PROBE_BOOKMARK_*` | Probe bookmark cooldown/dedup/thresholds |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED` (`true`) | Feed compact CLIP/road-CV attention cues into L0 video-description prompts |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT` (`6`) | Max active channel probes scanned per L0 batch for vector/homeostasis cues |
+| `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS` (`2`) | Max live CLIP hits considered per probe signal |
+| `EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED` (`true`) | Persist detection frames |
+| `EVOSSEARCH_DETECTIONS_RETENTION_*` | Dedup/keep windows + similarity thresholds |
+
+## Road CV primitives (experimental)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS` (`true`) | Adds bounded road-motion cues to L0 vector signals from the current batch |
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES` (`24`) | Max frames sampled per L0 batch for road-CV cue extraction |
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE` (`240`) | Max edge used for L0 batch road-CV cue extraction |
+| `EVOSSEARCH_ROAD_CV_ENABLED` (`false`) | Reserved for dedicated road-event CV runners |
+| `EVOSSEARCH_ROAD_CV_SCENE_CARDS` (`empty`) | JSON scene-card path with channel road zones and expected flow vectors |
+| `EVOSSEARCH_ROAD_CV_MAX_EDGE` (`360`) | Max edge for motion analysis frames |
+| `EVOSSEARCH_ROAD_CV_MIN_MOTION_PX` (`0.7`) | Optical-flow magnitude threshold for active pixels |
+| `EVOSSEARCH_ROAD_CV_ACTIVE_RATIO_FLOOR` (`0.012`) | Minimum moving-pixel ratio inside a road zone |
+| `EVOSSEARCH_ROAD_CV_WRONG_WAY_ALIGNMENT` (`-0.45`) | Cosine alignment threshold for opposing-flow candidates |
+
+## Embedder / vision
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_EMBEDDER` (`clip`) | Production embedder |
+| `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`ViT-B/32`) | CLIP model |
+| `EVOSSEARCH_RERANK_ENABLED` / `_TOP_K` | Re-rank toggle |
+| `EVOSSEARCH_DINO_*`, `EVOSSEARCH_M2F_*`, `EVOSSEARCH_FUSION_*` | Experimental; disabled in prod |
+| `EVOSSEARCH_INDEXED_FOLDER_ENABLED` / `_OFFLINE_VIDEO_ENABLED` / `_PROBE_SNAP_ENABLED` (`false`) | Legacy/hidden feature flags |
+
+## Feature flags off in client pilot
+
+`EVOSSEARCH_OFFLINE_VIDEO_ENABLED=false`, `EVOSSEARCH_PROBE_SNAP_ENABLED=false`,
+`EVOSSEARCH_INDEXED_FOLDER_ENABLED=false` — these return 404 server-side and hide
+the corresponding UI.
