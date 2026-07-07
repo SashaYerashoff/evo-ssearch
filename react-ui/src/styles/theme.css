@@ -1,0 +1,86 @@
+/* EVA AI — command-console theme. Deep-space / Stellaris flavour. */
+
+:root {
+  /* space surfaces (lifted — lighter navy, still cosmic) */
+  --space-0: #10162e;   /* deepest void */
+  --space-1: #18203c;   /* app base */
+  --panel:   rgba(38, 50, 86, 0.78);   /* glassy panel */
+  --panel-2: rgba(46, 60, 100, 0.72);
+  --panel-solid: #212a49;
+  --void-tile: #1d2743;
+
+  /* lines */
+  --line:    rgba(150, 180, 245, 0.20);
+  --line-2:  rgba(150, 180, 245, 0.34);
+
+  /* text */
+  --text:      #eef2fc;
+  --text-2:    #b7c3e2;
+  --text-mut:  #8494b8;
+
+  /* accent — plasma cyan/teal */
+  --accent:    #38e0d4;
+  --accent-2:  #23b7c9;
+  --accent-bg: rgba(56, 224, 212, 0.14);
+  --accent-line: rgba(56, 224, 212, 0.5);
+  --glow: 0 0 0 1px rgba(56,224,212,0.35), 0 0 18px -2px rgba(56,224,212,0.45);
+
+  /* semantic */
+  --danger:  #ff5d73;  --danger-bg: rgba(255, 93, 115, 0.15);
+  --warning: #ffb454;  --warning-bg: rgba(255, 180, 84, 0.15);
+  --success: #3ee6a4;  --success-bg: rgba(62, 230, 164, 0.15);
+  --info:    #6aa8ff;  --info-bg: rgba(106, 168, 255, 0.14);
+
+  --radius: 10px;
+  --radius-lg: 16px;
+  --rail-w: 60px;
+  --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--space-1);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* cosmic backdrop: nebula glows + faint starfield */
+#root::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(1200px 700px at 82% -10%, rgba(56, 224, 212, 0.13), transparent 60%),
+    radial-gradient(1000px 800px at -8% 108%, rgba(135, 105, 255, 0.15), transparent 62%),
+    radial-gradient(1200px 800px at 50% 32%, rgba(74, 104, 170, 0.30), transparent 72%),
+    var(--space-0);
+}
+#root::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,0.7), transparent),
+    radial-gradient(1px 1px at 70% 20%, rgba(255,255,255,0.5), transparent),
+    radial-gradient(1px 1px at 40% 70%, rgba(255,255,255,0.6), transparent),
+    radial-gradient(1px 1px at 85% 65%, rgba(180,220,255,0.6), transparent),
+    radial-gradient(1px 1px at 12% 82%, rgba(255,255,255,0.4), transparent),
+    radial-gradient(1.5px 1.5px at 60% 48%, rgba(160,240,240,0.5), transparent);
+  opacity: 0.5;
+}
+
+/* scrollbars */
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: rgba(120,160,240,0.18); border-radius: 999px; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(120,160,240,0.3); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+button { font-family: inherit; cursor: pointer; }
+input, select { font-family: inherit; }

@@ -1572,13 +1572,17 @@ class _AgentLMClient:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
     ) -> _LMResponse:
-        """Blocking non-streaming call with tools. Returns parsed response."""
+        """Blocking non-streaming call with tools. Returns parsed response.
+
+        tool_choice: "auto" (model decides) or "required" (model must call a tool).
+        """
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "tools": _TOOL_SCHEMAS if tools is None else tools,
-            "tool_choice": "auto",
+            "tool_choice": tool_choice,
             "stream": False,
         }
         resp = requests.post(
@@ -7030,6 +7034,7 @@ class AgentRunner:
         message: str,
         image_b64: Optional[str] = None,
         tool_context: Optional[ToolExecutionContext] = None,
+        force_tools: bool = False,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
@@ -7294,11 +7299,15 @@ class AgentRunner:
                 )
             # Run the blocking LM call in a thread so we can emit heartbeats
             lm_response: _LMResponse
+            # Operator Mode: force a tool call on the first turn so the agent
+            # actually drives the console instead of answering from context.
+            turn_tool_choice = "required" if (force_tools and tool_calls_used == 0) else "auto"
             try:
                 lm_response = yield from _run_with_heartbeats(
                     fn=lambda: self._lm_client.call_with_tools(
                         in_flight,
                         tools=available_tool_schemas,
+                        tool_choice=turn_tool_choice,
                     ),
                     heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                 )

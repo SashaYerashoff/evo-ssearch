@@ -61,7 +61,13 @@ luxriot_rollups_cache.json
 luxriot_summary_state.json
 inference_spool/
 video/
+!react-ui/src/components/video/
+!react-ui/src/components/video/**
 node_modules
+react-ui/.vite/
+react-ui/*.tsbuildinfo
+react-ui/vite.config.js
+react-ui/vite.config.d.ts
 detections_archive/
 detections_store.sqlite3
 agent_sessions.sqlite3
