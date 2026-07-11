@@ -254,3 +254,239 @@ def test_agent_thumbnail_grid_has_missing_image_fallback():
     assert "img.addEventListener('error', showMissingImage, { once: true })" in JS
     assert "agent-thumb-missing-image" in JS
     assert ".agent-thumb-missing-image" in CSS
+
+
+def test_shared_channel_surfaces_abort_and_reject_stale_responses():
+    for token in (
+        "luxriotPromptFormChannelId",
+        "luxriotPromptRequestGeneration",
+        "luxriotSummaryRequestGeneration",
+        "luxriotSummaryActiveRequest",
+        "archiveEvidenceRequestGeneration",
+        "archiveFilterRequestGeneration",
+        "archiveReviewRequestGeneration",
+        "new AbortController()",
+        "signal: requestContext.controller.signal",
+    ):
+        assert token in JS
+    assert "The selected channel changed. Its prompt settings were reloaded" in JS
+    assert "getSelectedSummaryChannel() === requestContext.channelId" in JS
+    assert "archiveReviewContext === requestContext.context" in JS
+    assert "function invalidateArchiveResultContext" in JS
+    summary_poll = JS.split("function startLuxriotSummaryPoll()", 1)[1].split(
+        "async function startLuxriotCapture", 1
+    )[0]
+    assert "stopLuxriotSummaryPoll()" not in summary_poll
+
+
+def test_agent_cards_surface_coverage_and_incomplete_scope():
+    assert "function appendAgentCompleteness" in JS
+    assert "toolName === 'list_video_summary_channels'" in JS
+    for label in (
+        "Coverage: not reported by the backend",
+        "Backend truncated:",
+        "Result truncation:",
+        "Unchecked:",
+        "Deferred:",
+        "Errors:",
+    ):
+        assert label in JS
+    search_card = JS.split("if (toolName === 'search_archive')", 1)[1].split("toolName === 'get_detections'", 1)[0]
+    assert "alwaysCoverage: true" in search_card
+    assert "alwaysTruncation: true" in search_card
+
+
+def test_agent_sidebar_polls_analytics_runtime_and_lm_admission_only_when_active():
+    assert "Analytics Streams" in JS
+    assert "not the full camera inventory" in JS
+    assert "agentLoadAnalyticsStreams" in JS
+    assert "agentSetContextActive" in JS
+    assert "window._agentSetActive = agentSetContextActive" in JS
+    assert "fetch(`/luxriot/streams?t=${Date.now()}`" in JS
+    assert "fetch(`/lm/admission?t=${Date.now()}`" in JS
+    assert "oldest_queue_age_sec" in JS
+    assert "currentMode !== 'agent'" in JS
+
+
+def test_operator_media_uses_same_origin_broker_and_explicit_player_states():
+    assert "fetch(normalizedUrl" in JS
+    assert "normalizedUrl.startsWith('/luxriot/media/')" in JS
+    assert "normalizedUrl.startsWith('/luxriot/attention_stream/')" in JS
+    assert "`/luxriot/archive_snapshot/${encodeURIComponent(String(channelId))}" in JS
+    assert "method: 'HEAD'" in JS
+    assert "Media broker URL must be same-origin" in JS
+    for state in ("'loading'", "'playing'", "'degraded'", "'error'"):
+        assert state in JS
+    assert "Static frame fallback — not video" in JS
+    assert "this is not video or a snapshot slideshow" in JS
+    assert "function startLuxriotLegacySnapshotPreview" not in JS
+    assert "{luxriot_base_url_json}" not in JS
+    assert "luxriotDefaults.baseUrl" not in JS.split("function luxriotMediaBrokerUrl", 1)[1].split(
+        "function setRoadSceneGroundingConfidence", 1
+    )[0]
+
+
+def test_operator_media_rejects_late_channel_and_archive_player_responses():
+    assert "requestSeq === luxriotPreviewRequestSeq" in JS
+    assert "generation === probePreviewGeneration" in JS
+    assert "requestContext.generation === archiveMediaRequestGeneration" in JS
+    assert "archiveReviewFrameIdentity(requestContext.result) === requestContext.identity" in JS
+    assert "abortUiRequest(archiveMediaAbortController)" in JS
+    assert "abortUiRequest(probePreviewAbortController)" in JS
+
+
+def test_bounded_live_media_is_renewed_before_freeze_and_stalls_have_watchdogs():
+    assert "numericHeader('X-EVA-Media-Renew-After-Ms')" in JS
+    for token in (
+        "function scheduleLuxriotPreviewRenewal",
+        "function armLuxriotPreviewStallWatchdog",
+        "function scheduleProbePreviewRenewal",
+        "function armProbePreviewStallWatchdog",
+        "startProbePreview(channelId, true)",
+        "video.onprogress = clearLuxriotPreviewStallWatchdog",
+        "video.ontimeupdate = clearLuxriotPreviewStallWatchdog",
+        "video.onprogress = clearProbePreviewStallWatchdog",
+        "video.ontimeupdate = clearProbePreviewStallWatchdog",
+    ):
+        assert token in JS
+
+    live_preview = JS.split("function startLuxriotPreview(", 1)[1].split(
+        "function setRoadSceneGroundingConfidence", 1
+    )[0]
+    assert "negotiated.renewAfterMs" in live_preview
+    assert "Renewing the bounded MJPEG connection" in live_preview
+    assert "Renewing the bounded video connection" in live_preview
+    assert "options.reuseNegotiation" in live_preview
+    assert "Promise.resolve(cachedNegotiation)" in live_preview
+    assert "startLuxriotPreview({ reuseNegotiation: true })" in JS
+
+    stop_preview = JS.split("function stopLuxriotPreview", 1)[1].split(
+        "function setLuxriotPreviewSignalLost", 1
+    )[0]
+    assert "clearTimeout(luxriotPreviewRenewTimer)" in stop_preview
+    assert "clearTimeout(luxriotPreviewStallTimer)" in stop_preview
+
+    probe_preview = JS.split("function startProbePreview", 1)[1].split(
+        "function syncProbePreview", 1
+    )[0]
+    assert "!force" in probe_preview
+    assert "negotiated.renewAfterMs" in probe_preview
+    assert "probePreviewNegotiation" in probe_preview
+    assert "Promise.resolve(cachedNegotiation)" in probe_preview
+
+
+def test_running_analytics_uses_shared_attention_preview_unless_operator_requests_full_live():
+    for token in (
+        "/luxriot/attention_stream/",
+        "X-EVA-Attention-Preview",
+        "attentionPreview",
+        "useAttentionPreview",
+        "luxriotPreferFullOperatorMedia",
+        "maybeSwitchLuxriotPreviewToAttention",
+        "Full live",
+        "Model view",
+        "no second recorder stream competes with analytics",
+        "replaceLuxriotPreviewImageElement",
+        "replaceProbePreviewImageElement",
+    ):
+        assert token in JS
+    assert "Boolean(videoStream?.running) && !luxriotPreferFullOperatorMedia" in JS
+    assert "Boolean(sharedVideoStream?.running)" in JS
+    assert "currentSource.includes('/luxriot/attention_stream/')" in JS
+
+
+def test_live_runtime_surfaces_completed_and_inflight_attention_throughput():
+    for token in (
+        "last_live_segment_target_seconds",
+        "last_live_segment_summary_target_seconds",
+        "last_live_segment_represented_seconds",
+        "live_segment_inflight_target_seconds",
+        "live_segment_inflight_raw_frame_budget",
+        "live_segment_inflight_frames",
+        "live_segment_inflight_represented_seconds",
+        "attentionRealtimeRatio",
+        "attentionUnderfilled",
+        "attentionBehindRealtime",
+        "label: 'apex-lag'",
+        "dense frames",
+        "descriptions every",
+        "Dense capture progress",
+        "x realtime",
+    ):
+        assert token in JS
+    assert "activeCaptureSource !== 'live_segment'" in JS
+    assert "currentSnapshotSlow = source !== 'live_segment'" in JS
+
+
+def test_expected_summary_backpressure_is_not_rendered_as_a_capture_failure():
+    for token in (
+        "function classifyLuxriotStreamIssue",
+        "summary queue overflow",
+        "label: 'backpressure'",
+        "label: 'aggregating'",
+        "Aggregation backpressure: capture continues",
+        "aggregation backpressure",
+        "Boolean(streamIssue.hardError)",
+        "detailParts.push('backpressure')",
+    ):
+        assert token in JS
+    health = JS.split("function getLuxriotStreamHealth", 1)[1].split(
+        "function renderLuxriotHealthBadge", 1
+    )[0]
+    assert "if (issue.hardError)" in health
+    assert "if (issue.backpressure || droppedBatches > 0)" in health
+    assert health.index("if (issue.hardError)") < health.index("if (issue.backpressure || droppedBatches > 0)")
+
+
+def test_archive_media_consumes_segment_metadata_for_guarded_continuation():
+    assert "numericHeader('X-Stream-Last-Sample-Timestamp')" in JS
+    assert "numericHeader('X-EVA-Archive-Resolved-Time-Ms')" in JS
+    assert "X-EVA-Archive-Frame-Alignment" in JS
+    assert "X-EVA-HTML5-Compatible" in JS
+    assert "const nextTimeMs = Number(negotiated.lastSampleTimestampMs) + 1" in JS
+    assert "continuationTimeMs > timeMs" in JS
+    assert "isCurrentArchiveMediaRequest(requestContext)" in JS
+    assert "Loading the next recorded archive segment" in JS
+    assert "bounded archive segment ended without a next-sample timestamp" in JS
+
+
+def test_rollup_aggregation_progress_is_targeted_generation_safe_and_cleared():
+    rollups = JS.split("async function refreshLuxriotRollups", 1)[1].split(
+        "async function refreshLuxriotSummaryView", 1
+    )[0]
+    assert "params.set('target_level', targetLevel)" in rollups
+    assert "`Aggregating ${targetLevel}…`" in rollups
+    assert "renderAggregationProgress" in rollups
+    assert "isCurrentLuxriotSummaryRequest(requestContext)" in rollups
+    assert "shared LM queue" in rollups
+    assert "clearInterval(progressTimer)" in rollups
+
+
+def test_prompt_and_environment_setting_sources_are_operator_visible():
+    assert "luxriotPromptSettingSources" in JS
+    assert "persisted runtime default" in JS
+    assert "persistence error:" in JS
+    assert "saved revision" in JS
+    assert "different_process_and_file_keys" in JS
+    assert "declared_file_matches_project" in JS
+    assert ".settings-status.warning" in CSS
+
+
+def test_prompt_apply_only_posts_fields_changed_from_loaded_channel_settings():
+    collect = JS.split("function collectLuxriotPromptSettings", 1)[1].split(
+        "function applyLuxriotPromptSettingsFromPayload", 1
+    )[0]
+    assert "luxriotPromptLoadedSettings" in collect
+    assert "const payload = {}" in collect
+    assert "const changedRollups = {}" in collect
+    assert "payload.rollup_prompts = changedRollups" in collect
+    assert "current.bookmark_enabled" in collect
+    assert "baseline.bookmark_enabled" in collect
+
+
+def test_prompt_modal_can_explicitly_reset_channel_overrides_to_inherited_defaults():
+    assert 'id="luxriotPromptResetBtn"' in TEMPLATE
+    assert "function getClearableLuxriotPromptOverrideFields" in JS
+    assert "function resetLuxriotPromptOverrides" in JS
+    assert "clear_override_fields: clearOverrideFields" in JS
+    assert "use inherited defaults" in JS.lower()

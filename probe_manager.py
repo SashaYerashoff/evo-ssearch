@@ -3,7 +3,7 @@ import os
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -129,21 +129,49 @@ class ProbeBuffer:
                 self.roi_cache.pop(key, None)
             self.roi_cache_order = [key for key in self.roi_cache_order if key not in set(empty_keys)]
 
-    def add(self, embedding: np.ndarray, timestamp_ms: int, channel_id: int, thumb: str) -> None:
+    def add(
+        self,
+        embedding: np.ndarray,
+        timestamp_ms: int,
+        channel_id: int,
+        thumb: str,
+        provenance: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         emb = self._normalize_vec(embedding)
         if self.embeddings and emb.shape != self.embeddings[0].shape:
             self.clear()
         frame_uid = int(self.next_uid)
         self.next_uid += 1
         self.embeddings.append(emb)
-        self.meta.append(
-            {
-                "uid": frame_uid,
-                "timestamp_ms": timestamp_ms,
-                "channel_id": channel_id,
-                "thumb": thumb,
-            }
-        )
+        meta_row: Dict[str, Any] = {
+            "uid": frame_uid,
+            "timestamp_ms": timestamp_ms,
+            "channel_id": channel_id,
+            "thumb": thumb,
+        }
+        if isinstance(provenance, Mapping):
+            selection_provenance: Dict[str, Any] = {}
+            for key in (
+                "version",
+                "policy",
+                "bucket_start_ms",
+                "source_frame_indices",
+                "source_timestamps_ms",
+                "source_frame_hashes",
+                "selected_source_frame_index",
+                "selected_timestamp_ms",
+                "selected_frame_hash",
+                "selection_source",
+                "selection_score",
+                "score_source",
+                "apex_available",
+                "fallback_reason",
+            ):
+                if key in provenance:
+                    selection_provenance[key] = provenance.get(key)
+            if selection_provenance:
+                meta_row["selection_provenance"] = selection_provenance
+        self.meta.append(meta_row)
         if len(self.embeddings) > self.max_frames:
             excess = len(self.embeddings) - self.max_frames
             if excess > 0:
@@ -295,6 +323,11 @@ class ProbeBuffer:
                     "pos_score": p,
                     "neg_score": n,
                     "margin": m,
+                    **(
+                        {"selection_provenance": dict(meta_row.get("selection_provenance") or {})}
+                        if isinstance(meta_row.get("selection_provenance"), Mapping)
+                        else {}
+                    ),
                 }
             )
         return results
@@ -330,13 +363,19 @@ class ProbeManager:
             self.buffers[channel_id] = ProbeBuffer(self.max_frames, self.thumb_edge)
         return self.buffers[channel_id]
 
-    def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> None:
+    def add_frame(
+        self,
+        channel_id: int,
+        pil_image: Image.Image,
+        timestamp_ms: Optional[int],
+        provenance: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         ts_ms = timestamp_ms or int(time.time() * 1000)
         emb = self.embed_image_fn(pil_image)
         thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
         with self.lock:
             buf = self._buffer(channel_id)
-            buf.add(emb, ts_ms, channel_id, thumb)
+            buf.add(emb, ts_ms, channel_id, thumb, provenance=provenance)
 
     def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         embs = []

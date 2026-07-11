@@ -96,6 +96,46 @@ class EmbeddingPolicyTests(unittest.TestCase):
 
 
 class ProbeVectorGuardTests(unittest.TestCase):
+    def test_live_buffer_preserves_capture_apex_provenance(self) -> None:
+        manager = ProbeManager(
+            embed_image_fn=lambda _img: np.ones(4, dtype=np.float32),
+            embed_text_fn=lambda _text: np.ones(4, dtype=np.float32),
+            jpeg_encoder=lambda *_args, **_kwargs: "thumb",
+        )
+        image = Image.new("RGB", (8, 8), color="white")
+
+        manager.add_frame(
+            7,
+            image,
+            100500,
+            provenance={
+                "selection_source": "capture_cv_frame_delta",
+                "selected_source_frame_index": 2,
+                "selected_frame_hash": "frame-hash",
+                "source_frame_indices": [1, 2, 3],
+                "fallback_reason": "",
+                "ignored_secret": "must-not-be-stored",
+            },
+        )
+
+        stored = manager.buffers[7].meta[0]["selection_provenance"]
+        self.assertEqual(stored["selection_source"], "capture_cv_frame_delta")
+        self.assertEqual(stored["selected_source_frame_index"], 2)
+        self.assertEqual(stored["source_frame_indices"], [1, 2, 3])
+        self.assertNotIn("ignored_secret", stored)
+        result = manager.query(
+            7,
+            positives=["motion"],
+            negatives=[],
+            pos_floor=0.1,
+            margin_thr=0.0,
+            top_k=1,
+        )
+        self.assertEqual(
+            result["results"][0]["selection_provenance"]["selected_frame_hash"],
+            "frame-hash",
+        )
+
     def test_text_and_image_probe_dimension_mismatch_returns_error(self) -> None:
         manager = ProbeManager(
             embed_image_fn=lambda _img: np.ones(4, dtype=np.float32),

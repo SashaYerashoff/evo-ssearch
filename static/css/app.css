@@ -420,6 +420,12 @@
         border: 1px solid rgba(248, 113, 113, 0.3);
         color: #f87171;
     }
+
+    .settings-status.warning {
+        background: rgba(245, 158, 11, 0.1);
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        color: #fbbf24;
+    }
     
     .control-panel {
         background: var(--panel);

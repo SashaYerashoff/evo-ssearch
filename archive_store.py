@@ -1067,6 +1067,51 @@ class PostgresProbesStore(_TenantRepository):
                 )
         return copy.deepcopy(stored_probe)
 
+    def patch_probe_runtime(
+        self,
+        probe_id: str,
+        changes: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically merge daemon-owned runtime fields into an existing probe.
+
+        This deliberately uses UPDATE rather than UPSERT: a late daemon result
+        must not recreate a probe that the operator deleted, and it must not
+        overwrite concurrently edited thresholds, prompts, or bookmark policy.
+        """
+
+        normalized = str(probe_id or "").strip()
+        if not normalized:
+            raise ValueError("probe id is required")
+        allowed_runtime_fields = {
+            "last_hit",
+            "recent_hits",
+            "bookmark_gate",
+            "bookmark_gate_updated_at_ms",
+        }
+        runtime_patch = {
+            str(key): copy.deepcopy(value)
+            for key, value in dict(changes or {}).items()
+            if str(key) in allowed_runtime_fields
+        }
+        if not runtime_patch:
+            return None
+        with self.lock:
+            with self.pool.transaction(self._context()) as connection:
+                row = connection.execute(
+                    """
+                    UPDATE archive.probes
+                    SET payload_json = payload_json || %s,
+                        updated_at = clock_timestamp()
+                    WHERE tenant_id = %s AND probe_id = %s
+                    RETURNING payload_json
+                    """,
+                    (_jsonb(runtime_patch), self.tenant_id, normalized),
+                ).fetchone()
+        if row is None:
+            return None
+        payload = _decode_json_value(row[0])
+        return copy.deepcopy(payload) if isinstance(payload, dict) else None
+
     def delete_probe(self, probe_id: str) -> bool:
         normalized = str(probe_id or "").strip()
         if not normalized:
@@ -1154,8 +1199,12 @@ class PostgresRuntimeStateStore(_TenantRepository):
         runs_raw = payload.get("summary_runs")
         meta_payload = {
             "version": payload.get("version", 2),
+            "revision": payload.get("revision", 0),
             "updated_at": payload.get("updated_at"),
             "channel_routines": _plain_value(payload.get("channel_routines") or {}),
+            "road_scene_calibrations": _plain_value(
+                payload.get("road_scene_calibrations") or {}
+            ),
             "prompt_settings": _plain_value(payload.get("prompt_settings") or {}),
         }
         entries: Dict[str, Dict[str, Any]] = {self._SUMMARY_META_KEY: meta_payload}
@@ -1234,10 +1283,12 @@ class PostgresRuntimeStateStore(_TenantRepository):
                     summary_runs[str(channel_id)] = runs
         return {
             "version": meta.get("version", 2),
+            "revision": meta.get("revision", 0),
             "updated_at": meta.get("updated_at"),
             "summary_history": summary_history,
             "summary_runs": summary_runs,
             "channel_routines": meta.get("channel_routines") or {},
+            "road_scene_calibrations": meta.get("road_scene_calibrations") or {},
             "prompt_settings": meta.get("prompt_settings") or {},
         }
 

@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 import agent
@@ -13,9 +14,10 @@ from agent_security import ToolExecutionContext
 
 
 class _FakeStore:
-    def __init__(self, history=None) -> None:
+    def __init__(self, history=None, research_state=None) -> None:
         self.messages = []
         self.history = history
+        self.research_state = research_state
 
     def session_exists(self, _session_id, **_owner):
         return True
@@ -34,6 +36,12 @@ class _FakeStore:
             return list(self.history)
         return [{"role": "user", "content": "test"}]
 
+    def load_research_state(self, _session_id, **_owner):
+        return self.research_state
+
+    def save_research_state(self, _session_id, state, **_owner):
+        self.research_state = dict(state)
+
 
 class _FakeLMClient:
     def __init__(self, tool_rounds: int, tool_name: str = "list_channels") -> None:
@@ -43,7 +51,7 @@ class _FakeLMClient:
         self.final_messages = None
         self.tool_call_messages = []
 
-    def call_with_tools(self, _messages, tools=None):
+    def call_with_tools(self, _messages, tools=None, cancel_event=None):
         self.tools = tools
         self.tool_call_messages.append(list(_messages))
         if self.remaining > 0:
@@ -62,7 +70,7 @@ class _FakeLMClient:
             )
         return _LMResponse(content="done", finish_reason="stop", tool_calls=[])
 
-    def stream_text(self, messages):
+    def stream_text(self, messages, cancel_event=None):
         self.final_messages = list(messages)
         yield "done"
 
@@ -70,10 +78,12 @@ class _FakeLMClient:
 class _FakeTools:
     def __init__(self, result=None) -> None:
         self.calls = 0
+        self.call_args = []
         self.result = result
 
     def execute(self, name, args, progress_cb=None):
         self.calls += 1
+        self.call_args.append((name, dict(args)))
         if self.result is not None:
             return self.result
         return {"name": name, "args": args, "count": self.calls}
@@ -229,6 +239,108 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(runner._tools.calls, 64)
         self.assertTrue(any(item.get("type") == "tool_budget" for item in payloads))
         self.assertEqual(payloads[-1]["type"], "done")
+
+    def test_continue_uses_persisted_channel_ids_and_frozen_window(self):
+        research_state = {
+            "version": 1,
+            "kind": "video_summary_inventory",
+            "status": "pending",
+            "frozen_window": {"from_ts": 100.0, "to_ts": 200.0},
+            "requested_channel_ids": [1, 2, 3, 4],
+            "completed_channel_ids": [1, 2],
+            "remaining_channel_ids": [3, 4],
+            "updated_at": time.time(),
+        }
+        result = {
+            "time_window": {
+                "from_ts": 100.0,
+                "to_ts": 200.0,
+                "since_ms": 100_000,
+                "until_ms": 200_000,
+            },
+            "requested_channel_ids": [3, 4],
+            "checked_channel_ids": [3, 4],
+            "candidate_channels": [{"channel_id": 3}],
+            "deferred_channel_ids": [4],
+            "inactive_channel_ids": [],
+            "unchecked_channel_ids": [],
+            "errors": [],
+        }
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(research_state=research_state)
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="list_video_summary_channels",
+        )
+        runner._tools = _FakeTools(result=result)
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = list(runner.stream_chat("session-1", "Continue with the remaining channels"))
+        payloads = [
+            json.loads(event.removeprefix("data: ").strip())
+            for event in events
+            if event.startswith("data: ")
+        ]
+
+        tool_name, tool_args = runner._tools.call_args[0]
+        self.assertEqual(tool_name, "list_video_summary_channels")
+        self.assertEqual(tool_args["channel_ids"], [3, 4])
+        self.assertEqual(tool_args["from_ts"], 100.0)
+        self.assertEqual(tool_args["to_ts"], 200.0)
+        self.assertEqual(runner.store.research_state["completed_channel_ids"], [1, 2, 3])
+        self.assertEqual(runner.store.research_state["remaining_channel_ids"], [4])
+        state_event = next(item for item in payloads if item.get("type") == "research_state")
+        self.assertTrue(state_event["persisted"])
+        self.assertEqual(state_event["remaining_channel_ids"], [4])
+        first_lm_prompt = runner._lm_client.tool_call_messages[0]
+        self.assertTrue(
+            any(
+                "Trusted server research continuation ledger" in str(message.get("content") or "")
+                for message in first_lm_prompt
+            )
+        )
+
+    def test_unrelated_turn_does_not_apply_stale_research_defaults(self):
+        research_state = {
+            "version": 1,
+            "kind": "video_summary_inventory",
+            "status": "pending",
+            "frozen_window": {"from_ts": 100.0, "to_ts": 200.0},
+            "requested_channel_ids": [3, 4],
+            "completed_channel_ids": [3],
+            "remaining_channel_ids": [4],
+            "updated_at": time.time(),
+        }
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(research_state=research_state)
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="list_video_summary_channels",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "time_window": {"from_ts": 900.0, "to_ts": 1_000.0},
+                "requested_channel_ids": [],
+                "checked_channel_ids": [],
+                "candidate_channels": [],
+                "inactive_channel_ids": [],
+                "deferred_channel_ids": [],
+                "unchecked_channel_ids": [],
+                "errors": [],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        list(runner.stream_chat("session-1", "Show current stream status"))
+
+        _tool_name, tool_args = runner._tools.call_args[0]
+        self.assertNotIn("channel_ids", tool_args)
+        self.assertNotIn("from_ts", tool_args)
+        self.assertNotIn("to_ts", tool_args)
 
     def test_signal_ledger_is_final_prompt_only_and_uses_compacted_results(self):
         raw_result = {

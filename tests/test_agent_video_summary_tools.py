@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from agent import (
     AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN,
@@ -6,6 +7,7 @@ from agent import (
     _apply_turn_tool_context,
     _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
+    _format_epoch_minute,
     _format_turn_signal_ledger_message,
     _new_turn_signal_ledger,
     _record_turn_signal_ledger,
@@ -20,6 +22,7 @@ from agent import (
 
 class _SummaryManager:
     def __init__(self):
+        self.summary_rollup_requests = []
         self.channels = [
             {"id": 7, "title": "Kitchen"},
             {"id": 8, "title": "Door"},
@@ -121,7 +124,23 @@ class _SummaryManager:
             logs.append(dict(row))
         return {"running": False, "channel_id": channel_id, "logs": logs, "selected_run": None}
 
-    def summary_rollups(self, channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+    def summary_rollups(
+        self,
+        channel_id,
+        run_selector=None,
+        start_ts=None,
+        end_ts=None,
+        level_limit=None,
+        target_level=None,
+        synthesize=True,
+    ):
+        self.summary_rollup_requests.append(
+            {
+                "channel_id": channel_id,
+                "target_level": target_level,
+                "synthesize": synthesize,
+            }
+        )
         # Intentionally include out-of-window nodes to verify AgentTools performs strict post-filtering.
         nodes = [
             {
@@ -643,6 +662,36 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(args["since_hours"], 24)
         self.assertNotIn("since_ms", args)
 
+    def test_turn_context_fills_only_missing_exact_window_bound(self):
+        context = _seed_turn_tool_context("continue the same period")
+        context["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+
+        summary_args = _apply_turn_tool_context(
+            "get_video_summaries",
+            {"from_ts": 125.0},
+            context,
+        )
+        archive_args = _apply_turn_tool_context(
+            "search_archive",
+            {"until_ms": 175_000},
+            context,
+        )
+        report_args = _apply_turn_tool_context(
+            "generate_report",
+            {"to_ts": 180.0},
+            context,
+        )
+
+        self.assertEqual(summary_args, {"from_ts": 125.0, "to_ts": 200.0})
+        self.assertEqual(archive_args["since_ms"], 100_000)
+        self.assertEqual(archive_args["until_ms"], 175_000)
+        self.assertEqual(report_args, {"from_ts": 100.0, "to_ts": 180.0})
+
     def test_turn_context_does_not_convert_detection_describe_frame_to_live_snapshot(self):
         context = _seed_turn_tool_context("Confirm this frame with images.")
         context["channel_id"] = 7
@@ -686,6 +735,45 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["source"], "vlm_summary")
         self.assertEqual(result["source_label"], "Video-description frame")
         self.assertEqual(result["results"][0]["archive_item_type"], "video_description_frame")
+
+    def test_archive_search_compaction_preserves_coverage_and_similarity_alias(self):
+        def search_detections(**kwargs):
+            return {
+                "coverage": {
+                    "status": "partial",
+                    "candidate_count": 20_000,
+                    "truncated": True,
+                },
+                "results": [
+                    {
+                        "detection_id": 101,
+                        "timestamp_ms": 1781389900000,
+                        "source": "vlm_summary",
+                        "channel_id": 7,
+                        "similarity": 0.81,
+                    }
+                ],
+            }
+
+        result = _tools(search_detections_fn=search_detections).execute(
+            "search_archive",
+            {
+                "query": "vehicle drift",
+                "scope": "detections",
+                "source": "vlm_summary",
+                "channel_id": 7,
+            },
+        )
+        compact = _compact_tool_result_for_model("search_archive", result)
+
+        self.assertEqual(compact["coverage"]["status"], "partial")
+        self.assertTrue(compact["coverage"]["truncated"])
+        self.assertAlmostEqual(compact["results"][0]["score"], 0.81)
+        self.assertAlmostEqual(compact["results"][0]["similarity"], 0.81)
+        ledger = _new_turn_signal_ledger("find drift")
+        _record_turn_signal_ledger(ledger, "search_archive", compact)
+        self.assertEqual(ledger["evidence"][0]["coverage"]["status"], "partial")
+        self.assertAlmostEqual(ledger["evidence"][0]["best_similarity"], 0.81)
 
     def test_visual_window_signals_returns_pnm_attention_signal(self):
         calls = []
@@ -788,6 +876,22 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["to_ts"], 1781415000)
         self.assertEqual(result["since_ms"], 1781389800000)
         self.assertEqual(result["until_ms"], 1781415000000)
+
+    def test_site_timezone_is_default_and_formats_operator_timestamps_consistently(self):
+        with patch("agent.AGENT_SITE_TIMEZONE", "Asia/Tbilisi"):
+            result = _tools().execute(
+                "normalize_time_window",
+                {
+                    "date": "2026-06-14",
+                    "start_time": "01:30",
+                    "end_time": "08:30",
+                },
+            )
+
+            self.assertEqual(result["timezone"], "Asia/Tbilisi")
+            self.assertEqual(result["from_local"], "2026-06-14T01:30:00+04:00")
+            self.assertEqual(_format_epoch_minute(result["from_ts"]), "2026-06-14 01:30")
+            self.assertEqual(_format_epoch_minute(result["to_ts"]), "2026-06-14 08:30")
 
     def test_normalize_time_window_accepts_relative_last_two_hours(self):
         tools = _tools()
@@ -931,6 +1035,34 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["status"], "partial")
         self.assertEqual(result["coverage"]["returned"]["first_ts"], 1781389900.0)
         self.assertTrue(result["coverage"]["must_state_coverage"])
+
+    def test_summary_tools_request_only_the_selected_rollup_depth(self):
+        manager = _SummaryManager()
+        tools = _tools(manager)
+
+        tools.execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+        tools.execute(
+            "count_video_summary_events",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "entity_query": "person",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+
+        self.assertEqual(len(manager.summary_rollup_requests), 2)
+        self.assertTrue(all(row["target_level"] == "L1" for row in manager.summary_rollup_requests))
+        self.assertTrue(all(row["synthesize"] is False for row in manager.summary_rollup_requests))
 
     def test_get_video_summaries_samples_across_period_when_truncated(self):
         manager = _SummaryManager()
@@ -1224,6 +1356,71 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["evidence_frames"][0]["detection_id"], 501)
         self.assertEqual(compact["evidence_frames"][0]["score_semantics"], "not_applicable")
         self.assertIn("image_url", compact["evidence_frames"][0])
+
+    def test_get_video_summaries_samples_period_anchors_and_alert_window(self):
+        manager = _SummaryManager()
+
+        def rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            return {
+                "running": False,
+                "levels": {
+                    "L0": [],
+                    "L1": [
+                        {"level": "L1", "window_start": 100.0, "window_end": 110.0, "summary": "routine traffic"},
+                        {
+                            "level": "L1",
+                            "window_start": 490.0,
+                            "window_end": 510.0,
+                            "summary": "deviation: vehicle drift",
+                            "alert_total": 1,
+                        },
+                        {"level": "L1", "window_start": 890.0, "window_end": 900.0, "summary": "routine traffic"},
+                    ],
+                    "L2": [],
+                    "L3": [],
+                },
+            }
+
+        manager.summary_rollups = rollups
+        rows = [
+            {
+                "id": index,
+                "detection_id": index,
+                "timestamp_ms": (100 + index * 100) * 1000,
+                "source": "vlm_summary",
+                "channel_id": 7,
+            }
+            for index in range(9)
+        ]
+        rows.append({
+            "id": 50,
+            "detection_id": 50,
+            "timestamp_ms": 500_000,
+            "source": "vlm_alert",
+            "channel_id": 7,
+        })
+
+        result = _tools(manager, detections_store=_DetectionStore(rows)).execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 1_000.0,
+                "include_evidence_frames": True,
+                "evidence_frame_limit": 3,
+            },
+        )
+
+        self.assertEqual(result["evidence_selection_strategy"], "period_span_alert_priority")
+        self.assertEqual(result["evidence_priority_windows"][0]["since_ms"], 490_000)
+        self.assertEqual(
+            [row["detection_id"] for row in result["evidence_frames"]],
+            [0, 50, 8],
+        )
+        compact = _compact_tool_result_for_model("get_video_summaries", result)
+        self.assertEqual(compact["evidence_selection_strategy"], "period_span_alert_priority")
+        self.assertEqual(compact["evidence_priority_windows"][0]["until_ms"], 510_000)
 
     def test_count_video_summary_events_counts_presence_transitions_with_coverage(self):
         manager = _SummaryManager()
@@ -1996,6 +2193,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
         self.assertEqual(result["active_count"], 2)
         self.assertEqual(result["inactive_count"], 1)
+        self.assertEqual(result["inactive_channel_ids"], [9])
+        self.assertEqual(result["candidate_channel_ids"], [7, 8])
         self.assertFalse(result["requires_confirmation"])
         self.assertEqual(
             [row["channel_id"] for row in result["candidate_channels"]],
@@ -2015,6 +2214,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertTrue(stale_row["stale_signal"])
         compact = _compact_tool_result_for_model("list_video_summary_channels", result)
         self.assertEqual(compact["candidate_channels"][0]["recent_alerts"][0]["title"], "Doorway activity")
+        self.assertEqual(compact["inactive_channel_ids"], [9])
+        self.assertEqual(compact["candidate_channel_ids"], [7, 8])
         self.assertEqual(compact["candidate_channels"][0]["live_signal_status"], "frozen")
         self.assertTrue(compact["candidate_channels"][0]["frozen_signal"])
         self.assertEqual(compact["runtime_problem_channels"][0]["live_signal_status"], "frozen")
@@ -2081,6 +2282,21 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["time_window"]["since_ms"], 100_000)
         self.assertEqual(result["time_window"]["until_ms"], 300_000)
 
+    def test_channel_title_resolution_is_unicode_safe(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 112, "title": "თბილისის ქუჩა №1"}]
+
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {
+                "channel_ref": "თბილისის ქუჩა",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+
+        self.assertEqual(result["channel_id"], 112)
+
     def test_list_video_summary_channels_falls_back_to_local_history_when_channel_inventory_fails(self):
         manager = _SummaryManager()
 
@@ -2120,6 +2336,79 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["total_channels_checked"], 2)
         self.assertEqual(compact["channel_inventory_status"], "archive_fallback")
 
+    def test_list_video_summary_channels_augments_partial_live_inventory_with_provenance(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 7, "title": "Live channel"}]
+        manager.logs_by_channel = {
+            8: [{"created_at": 150.0, "summary": "history", "frame_count": 1}],
+        }
+
+        def streams_status():
+            return {
+                "video_streams": [{"channel_id": 9, "running": True, "title": "Runtime channel"}],
+                "channel_status_digest": [{"channel_id": 10, "title": "Digest channel"}],
+                "desired_video_channels": [11],
+                "desired_video_missing": [],
+            }
+
+        def session_status(channel_id, run_selector=None, start_ts=None, end_ts=None, limit=None):
+            return {
+                "running": int(channel_id) == 9,
+                "logs": [{"created_at": 150.0, "summary": f"channel {channel_id}", "frame_count": 1}],
+            }
+
+        manager.streams_status = streams_status
+        manager.session_status = session_status
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {
+                "channel_ids": [7, 8, 9, 10, 11, 99],
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "limit": 10,
+            },
+        )
+
+        self.assertEqual(result["channel_inventory_status"], "live_augmented")
+        self.assertEqual(result["live_inventory_count"], 1)
+        self.assertEqual(result["checked_channel_ids"], [7, 8, 9, 10, 11])
+        self.assertEqual(result["unchecked_channel_ids"], [99])
+        provenance = {row["channel_id"]: row["sources"] for row in result["inventory_provenance"]}
+        self.assertIn("live_inventory", provenance[7])
+        self.assertIn("logs_by_channel", provenance[8])
+        self.assertIn("runtime", provenance[9])
+        self.assertIn("status_digest", provenance[10])
+        self.assertIn("desired", provenance[11])
+        self.assertEqual(provenance[99], ["requested"])
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+        self.assertEqual(compact["scope"]["checked_channel_ids"], [7, 8, 9, 10, 11])
+        self.assertEqual(compact["scope"]["unchecked_channel_ids"], [99])
+
+    def test_list_video_summary_channels_marks_stale_cached_inventory(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 7, "title": "Cached channel"}]
+        manager.channel_inventory_status = lambda: {
+            "cached": True,
+            "count": 1,
+            "stale": True,
+            "cache_age_sec": 44.0,
+            "last_error": "temporary upstream timeout",
+            "stream": {"completion": "settled"},
+        }
+
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "limit": 10},
+        )
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+
+        self.assertEqual(result["channel_inventory_status"], "stale_cache_augmented")
+        self.assertIn("temporary upstream timeout", result["channel_inventory_error"])
+        self.assertTrue(result["channel_inventory_cache"]["stale"])
+        self.assertEqual(result["candidate_channels"][0]["channel_id"], 7)
+        self.assertEqual(compact["channel_inventory_status"], "stale_cache_augmented")
+        self.assertTrue(compact["channel_inventory_cache"]["stale"])
+
     def test_list_video_summary_channels_caps_candidates_when_confirmation_required(self):
         manager = _SummaryManager()
         manager.channels = [
@@ -2155,6 +2444,41 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(len(result["deferred_channel_ids"]), 3)
         self.assertEqual(compact["returned"], AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN)
         self.assertEqual(compact["deferred_count"], 3)
+        self.assertEqual(compact["scope"]["deferred_count"], 3)
+        self.assertEqual(compact["scope"]["deferred_channel_ids"], result["deferred_channel_ids"])
+
+    def test_list_video_summary_channel_scope_id_lists_are_bounded(self):
+        manager = _SummaryManager()
+        manager.channels = [
+            {"id": channel_id, "title": f"Channel {channel_id}"}
+            for channel_id in range(1, 131)
+        ]
+        manager.logs_by_channel = {
+            channel["id"]: [
+                {
+                    "created_at": 150.0,
+                    "summary": f"event on {channel['id']}",
+                    "frame_count": 1,
+                }
+            ]
+            for channel in manager.channels
+        }
+
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "limit": 100},
+        )
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+
+        self.assertEqual(result["total_channels_checked"], 130)
+        self.assertEqual(result["scope"]["checked_count"], 130)
+        self.assertTrue(result["scope"]["id_lists_truncated"])
+        self.assertEqual(result["scope"]["id_list_limit"], 100)
+        self.assertEqual(len(result["checked_channel_ids"]), 100)
+        self.assertEqual(result["deferred_count"], 122)
+        self.assertEqual(len(result["deferred_channel_ids"]), 100)
+        self.assertEqual(result["candidate_channel_ids"], list(range(1, 9)))
+        self.assertEqual(compact["scope"], result["scope"])
 
     def test_compact_list_video_summary_channels_preserves_errors_and_unchecked_counts(self):
         manager = _SummaryManager()
@@ -2193,6 +2517,9 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["unchecked_count"], 1)
         self.assertEqual(compact["error_count"], 1)
         self.assertEqual(compact["errors"][0]["channel_id"], 8)
+        self.assertEqual(compact["scope"]["checked_channel_ids"], [7, 8])
+        self.assertEqual(compact["scope"]["unchecked_channel_ids"], [99])
+        self.assertEqual(compact["scope"]["error_channel_ids"], [8])
 
     def test_generate_report_defaults_to_video_descriptions_and_avoids_probe_summary(self):
         class VideoReportStore(_DetectionStore):

@@ -21,6 +21,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -33,9 +34,21 @@ import numpy as np
 import requests
 from PIL import Image
 
+from agent_research import (
+    continuation_tool_defaults,
+    operator_requests_continuation,
+    research_state_from_inventory,
+    trusted_research_message,
+    usable_research_state,
+)
 from agent_security import ToolExecutionContext, ToolGatewayError
 from agent_security.audit import ToolAuditEvent
 from agent_security.eva_adapter import EvaAgentToolAdapter
+from lm_admission import (
+    configured_lm_capacity,
+    get_lm_admission_controller,
+    normalize_lm_resource,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -54,6 +67,7 @@ AGENT_MAX_TOOL_CALLS_PER_TURN  = 64
 AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN = 8
 AGENT_VIDEO_SUMMARY_DEFAULT_LEVEL_LIMIT = 500
 AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
+AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "Asia/Tbilisi").strip() or "Asia/Tbilisi"
 TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
 
 
@@ -604,7 +618,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "IANA timezone. Default: Europe/Riga.",
+                        "description": (
+                            "IANA timezone. Defaults to the deployment site timezone "
+                            f"({AGENT_SITE_TIMEZONE}; configure EVOSSEARCH_SITE_TIMEZONE)."
+                        ),
                     },
                 },
                 "required": [],
@@ -1562,16 +1579,33 @@ class _AgentLMClient:
         self.endpoint = base_url.rstrip("/") + "/chat/completions"
         self.model    = model
         self.timeout  = timeout
+        self.admission_resource = normalize_lm_resource(base_url, model)
+        self.admission_capacity = configured_lm_capacity("agent", default=1)
+        self.admission_controller = get_lm_admission_controller()
         self.connect_timeout = min(15, max(5, int(timeout or 120)))
         self.read_timeout = max(int(timeout or 120), 900)
         self.headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
 
+    def admission_status(self) -> Dict[str, Any]:
+        status = self.admission_controller.status()
+        for row in status.get("resources") or []:
+            if isinstance(row, Mapping) and row.get("resource") == self.admission_resource:
+                return dict(row)
+        return {
+            "resource": self.admission_resource,
+            "capacity": self.admission_capacity,
+            "active": 0,
+            "queued": 0,
+            "oldest_queue_age_sec": 0.0,
+        }
+
     def call_with_tools(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> _LMResponse:
         """Blocking non-streaming call with tools. Returns parsed response."""
         payload: Dict[str, Any] = {
@@ -1581,14 +1615,21 @@ class _AgentLMClient:
             "tool_choice": "auto",
             "stream": False,
         }
-        resp = requests.post(
-            self.endpoint,
-            json=payload,
-            headers=self.headers,
-            timeout=(self.connect_timeout, self.read_timeout),
-        )
-        resp.raise_for_status()
-        data   = resp.json()
+        with self.admission_controller.admission(
+            self.admission_resource,
+            workload="agent",
+            capacity=self.admission_capacity,
+            timeout=float(self.timeout or self.read_timeout),
+            cancel_event=cancel_event,
+        ):
+            resp = requests.post(
+                self.endpoint,
+                json=payload,
+                headers=self.headers,
+                timeout=(self.connect_timeout, self.read_timeout),
+            )
+            resp.raise_for_status()
+            data = resp.json()
         choice = data["choices"][0]
         msg    = choice.get("message", {}) or {}
         finish = choice.get("finish_reason", "stop")
@@ -1620,37 +1661,50 @@ class _AgentLMClient:
             finish_reason=finish,
         )
 
-    def stream_text(self, messages: List[Dict[str, Any]]) -> Iterator[str]:
+    def stream_text(
+        self,
+        messages: List[Dict[str, Any]],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Iterator[str]:
         """Streaming call without tools. Yields text delta chunks."""
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": True,
         }
-        with requests.post(
-            self.endpoint,
-            json=payload,
-            headers=self.headers,
-            timeout=(self.connect_timeout, self.read_timeout),
-            stream=True,
-        ) as resp:
-            resp.raise_for_status()
-            for raw_line in resp.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if line == "[DONE]":
-                    break
-                try:
-                    chunk  = json.loads(line)
-                    delta  = chunk["choices"][0]["delta"]
-                    text   = delta.get("content")
-                    if text:
-                        yield text
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+        with self.admission_controller.admission(
+            self.admission_resource,
+            workload="agent",
+            capacity=self.admission_capacity,
+            timeout=float(self.timeout or self.read_timeout),
+            cancel_event=cancel_event,
+        ):
+            with requests.post(
+                self.endpoint,
+                json=payload,
+                headers=self.headers,
+                timeout=(self.connect_timeout, self.read_timeout),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        chunk  = json.loads(line)
+                        delta  = chunk["choices"][0]["delta"]
+                        text   = delta.get("content")
+                        if text:
+                            yield text
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
 
 # ---------------------------------------------------------------------------
@@ -2679,7 +2733,7 @@ class AgentTools:
         from datetime import datetime, time as time_cls, timedelta
         from zoneinfo import ZoneInfo
 
-        tz_name = str(args.get("timezone") or "Europe/Riga").strip() or "Europe/Riga"
+        tz_name = str(args.get("timezone") or AGENT_SITE_TIMEZONE).strip() or AGENT_SITE_TIMEZONE
         try:
             tz = ZoneInfo(tz_name)
         except Exception as exc:
@@ -2847,6 +2901,36 @@ class AgentTools:
         except Exception as exc:
             channel_inventory_error = str(exc)[:300]
             channels = []
+        channel_inventory_cache: Dict[str, Any] = {}
+        inventory_status_fn = getattr(self._lxm, "channel_inventory_status", None)
+        if callable(inventory_status_fn):
+            try:
+                raw_inventory_cache = inventory_status_fn()
+                if isinstance(raw_inventory_cache, Mapping):
+                    channel_inventory_cache = {
+                        "cached": bool(raw_inventory_cache.get("cached")),
+                        "count": int(_opt_int(raw_inventory_cache.get("count")) or 0),
+                        "stale": bool(raw_inventory_cache.get("stale")),
+                        "cache_age_sec": _opt_float(raw_inventory_cache.get("cache_age_sec")),
+                        "last_attempt_at": _coerce_epoch_seconds(raw_inventory_cache.get("last_attempt_at")),
+                        "last_success_at": _coerce_epoch_seconds(raw_inventory_cache.get("last_success_at")),
+                        "last_error": str(raw_inventory_cache.get("last_error") or "").strip()[:300] or None,
+                        "stream": dict(raw_inventory_cache.get("stream") or {})
+                        if isinstance(raw_inventory_cache.get("stream"), Mapping)
+                        else {},
+                    }
+                    if channel_inventory_cache.get("stale") and channel_inventory_error is None:
+                        channel_inventory_error = (
+                            str(channel_inventory_cache.get("last_error") or "").strip()
+                            or "Luxriot channel inventory refresh failed; using a stale cached snapshot."
+                        )
+            except Exception as exc:
+                channel_inventory_cache = {
+                    "cached": bool(channels),
+                    "count": len(channels) if isinstance(channels, list) else 0,
+                    "stale": False,
+                    "status_error": str(exc)[:200],
+                }
         runtime_by_channel: Dict[int, Dict[str, Any]] = {}
         runtime_items: List[Dict[str, Any]] = []
         status_digest_by_channel: Dict[int, Dict[str, Any]] = {}
@@ -2890,46 +2974,81 @@ class AgentTools:
                 and _opt_int(row.get("channel_id")) is not None
                 and int(row.get("channel_id")) > 0
             }
-        if not isinstance(channels, list) or not channels:
-            fallback_ids: set[int] = set(requested_ids_set)
-            fallback_ids.update(runtime_by_channel)
-            fallback_ids.update(status_digest_by_channel)
-            fallback_ids.update(desired_video_channels)
-            fallback_ids.update(desired_missing_by_channel)
-            for attr_name in ("summary_history", "logs_by_channel"):
-                raw_map = getattr(self._lxm, attr_name, None)
-                if isinstance(raw_map, Mapping):
-                    for raw_channel_id in raw_map:
-                        parsed_channel_id = _opt_int(raw_channel_id)
-                        if parsed_channel_id is not None and parsed_channel_id > 0:
-                            fallback_ids.add(int(parsed_channel_id))
+        live_channels_by_id: Dict[int, Dict[str, Any]] = {}
+        inventory_sources_by_channel: Dict[int, set[str]] = collections.defaultdict(set)
 
-            def _fallback_channel_title(channel_id: int) -> str:
-                digest = status_digest_by_channel.get(channel_id, {})
-                runtime = runtime_by_channel.get(channel_id, {})
-                desired_missing = desired_missing_by_channel.get(channel_id, {})
-                for source in (digest, runtime, desired_missing):
-                    if not isinstance(source, Mapping):
-                        continue
-                    title = source.get("title") or source.get("name") or source.get("channel_title")
-                    if title:
-                        return str(title)
-                return f"channel-{channel_id}"
+        def _mark_inventory(channel_ids: Iterable[Any], source_name: str) -> None:
+            for raw_channel_id in channel_ids:
+                parsed_channel_id = _opt_int(raw_channel_id)
+                if parsed_channel_id is not None and parsed_channel_id > 0:
+                    inventory_sources_by_channel[int(parsed_channel_id)].add(source_name)
 
-            channels = [
-                {"id": channel_id, "title": _fallback_channel_title(channel_id)}
-                for channel_id in sorted(fallback_ids)
-            ]
-
-        valid_channel_ids: set[int] = set()
         for channel in channels if isinstance(channels, list) else []:
-            if not isinstance(channel, dict):
+            if not isinstance(channel, Mapping):
                 continue
             parsed_channel_id = _opt_int(channel.get("id"))
-            if parsed_channel_id is not None and parsed_channel_id > 0:
-                valid_channel_ids.add(int(parsed_channel_id))
-        requested_count = len(requested_ids_set) if requested_ids_set else len(valid_channel_ids)
+            if parsed_channel_id is None or parsed_channel_id <= 0:
+                continue
+            live_channels_by_id[int(parsed_channel_id)] = dict(channel)
+        _mark_inventory(live_channels_by_id, "live_inventory")
+        _mark_inventory(requested_ids_set, "requested")
+        _mark_inventory(runtime_by_channel, "runtime")
+        _mark_inventory(status_digest_by_channel, "status_digest")
+        _mark_inventory(desired_video_channels, "desired")
+        _mark_inventory(desired_missing_by_channel, "desired_missing")
+        for attr_name in ("summary_history", "logs_by_channel"):
+            raw_map = getattr(self._lxm, attr_name, None)
+            if isinstance(raw_map, Mapping):
+                _mark_inventory(raw_map, attr_name)
+
+        def _fallback_channel_title(channel_id: int) -> str:
+            live = live_channels_by_id.get(channel_id, {})
+            digest = status_digest_by_channel.get(channel_id, {})
+            runtime = runtime_by_channel.get(channel_id, {})
+            desired_missing = desired_missing_by_channel.get(channel_id, {})
+            for source in (live, digest, runtime, desired_missing):
+                if not isinstance(source, Mapping):
+                    continue
+                title = source.get("title") or source.get("name") or source.get("channel_title") or source.get("label")
+                if title:
+                    return str(title)
+            return f"channel-{channel_id}"
+
+        channels = []
+        for channel_id in sorted(inventory_sources_by_channel):
+            channel = dict(live_channels_by_id.get(channel_id, {}))
+            channel["id"] = channel_id
+            channel.setdefault("title", _fallback_channel_title(channel_id))
+            channel["_inventory_sources"] = sorted(inventory_sources_by_channel[channel_id])
+            channels.append(channel)
+
+        live_channel_ids = set(live_channels_by_id)
+        checkable_channel_ids = {
+            channel_id
+            for channel_id, sources in inventory_sources_by_channel.items()
+            if sources.difference({"requested"})
+        }
+        augmented_channel_ids = sorted(
+            channel_id
+            for channel_id, sources in inventory_sources_by_channel.items()
+            if channel_id not in live_channel_ids and sources.difference({"requested"})
+        )
+        requested_only_channel_ids = sorted(
+            channel_id
+            for channel_id, sources in inventory_sources_by_channel.items()
+            if sources == {"requested"}
+        )
+        if not live_channel_ids:
+            channel_inventory_status = "archive_fallback"
+        elif channel_inventory_cache.get("stale"):
+            channel_inventory_status = (
+                "stale_cache_augmented" if augmented_channel_ids else "stale_cache"
+            )
+        else:
+            channel_inventory_status = "live_augmented" if augmented_channel_ids else "live"
+        requested_count = len(requested_ids_set) if requested_ids_set else len(checkable_channel_ids)
         checked_channel_ids: set[int] = set()
+        inactive_channel_ids: set[int] = set()
         channel_rows: List[Dict[str, Any]] = []
         inactive_count = 0
         errors: List[Dict[str, Any]] = []
@@ -2945,6 +3064,12 @@ class AgentTools:
             if channel_id is None or channel_id <= 0:
                 continue
             if requested_ids_set and channel_id not in requested_ids_set:
+                continue
+            inventory_sources = list(channel.get("_inventory_sources") or [])
+            if set(inventory_sources) == {"requested"}:
+                # A caller-supplied ID that appears nowhere in live/runtime/archive
+                # inventory is explicitly unchecked; do not misreport an empty
+                # synthetic status lookup as authoritative coverage.
                 continue
             title = str(channel.get("title") or channel.get("name") or f"channel-{channel_id}")
             checked_channel_ids.add(channel_id)
@@ -2963,6 +3088,7 @@ class AgentTools:
             logs = logs if isinstance(logs, list) else []
             if not logs:
                 inactive_count += 1
+                inactive_channel_ids.add(channel_id)
                 continue
             starts: List[float] = []
             ends: List[float] = []
@@ -3143,6 +3269,7 @@ class AgentTools:
                 {
                     "channel_id": channel_id,
                     "title": title,
+                    "inventory_sources": inventory_sources,
                     "summary_depth_recommended": depth,
                     "summary_count": len(logs),
                     "first_ts": first_ts,
@@ -3223,6 +3350,11 @@ class AgentTools:
         per_turn_limit = AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN
         effective_limit = min(limit, per_turn_limit)
         candidate_channels = channel_rows[:effective_limit]
+        candidate_channel_ids = [
+            int(row["channel_id"])
+            for row in candidate_channels
+            if _opt_int(row.get("channel_id")) is not None
+        ]
         deferred_channel_ids = [
             int(row["channel_id"])
             for row in channel_rows[effective_limit:]
@@ -3332,23 +3464,96 @@ class AgentTools:
             )
         )
         channel_error_count = sum(1 for row in errors if _opt_int(row.get("channel_id")) is not None)
+        error_channel_ids = sorted({
+            int(row["channel_id"])
+            for row in errors
+            if _opt_int(row.get("channel_id")) is not None
+        })
+        scope_requested_channel_ids = (
+            sorted(requested_ids_set)
+            if requested_ids_set
+            else sorted(checkable_channel_ids)
+        )
+        inventory_provenance = [
+            {
+                "channel_id": channel_id,
+                "sources": sorted(inventory_sources_by_channel[channel_id]),
+            }
+            for channel_id in sorted(inventory_sources_by_channel)
+            if not requested_ids_set or channel_id in requested_ids_set
+        ]
+        checked_channel_ids_sorted = sorted(checked_channel_ids)
+        inactive_channel_ids_sorted = sorted(inactive_channel_ids)
+        scope_id_limit = 100
+        bounded_scope_lists = {
+            "requested_channel_ids": scope_requested_channel_ids[:scope_id_limit],
+            "checked_channel_ids": checked_channel_ids_sorted[:scope_id_limit],
+            "inactive_channel_ids": inactive_channel_ids_sorted[:scope_id_limit],
+            "candidate_channel_ids": candidate_channel_ids[:scope_id_limit],
+            "unchecked_channel_ids": unchecked_channel_ids[:scope_id_limit],
+            "deferred_channel_ids": deferred_channel_ids[:scope_id_limit],
+            "error_channel_ids": error_channel_ids[:scope_id_limit],
+        }
+        scope_ids_truncated = any(
+            len(values) > scope_id_limit
+            for values in (
+                scope_requested_channel_ids,
+                checked_channel_ids_sorted,
+                inactive_channel_ids_sorted,
+                candidate_channel_ids,
+                unchecked_channel_ids,
+                deferred_channel_ids,
+                error_channel_ids,
+            )
+        )
+        scope = {
+            "id_list_limit": scope_id_limit,
+            "id_lists_truncated": scope_ids_truncated,
+            "requested_count": requested_count,
+            "requested_channel_ids": bounded_scope_lists["requested_channel_ids"],
+            "checked_count": len(checked_channel_ids),
+            "checked_channel_ids": bounded_scope_lists["checked_channel_ids"],
+            "inactive_count": inactive_count,
+            "inactive_channel_ids": bounded_scope_lists["inactive_channel_ids"],
+            "candidate_count": len(candidate_channel_ids),
+            "candidate_channel_ids": bounded_scope_lists["candidate_channel_ids"],
+            "unchecked_count": unchecked_count,
+            "unchecked_channel_ids": bounded_scope_lists["unchecked_channel_ids"],
+            "deferred_count": len(deferred_channel_ids),
+            "deferred_channel_ids": bounded_scope_lists["deferred_channel_ids"],
+            "error_count": len(errors),
+            "channel_error_count": channel_error_count,
+            "error_channel_ids": bounded_scope_lists["error_channel_ids"],
+        }
         return {
             "depth": depth,
             "from_ts": from_ts,
             "to_ts": to_ts,
             "time_window": time_meta,
-            "channel_inventory_status": "archive_fallback" if channel_inventory_error else "live",
+            "channel_inventory_status": channel_inventory_status,
             "channel_inventory_error": channel_inventory_error,
+            "channel_inventory_cache": channel_inventory_cache,
+            "live_inventory_count": len(live_channel_ids),
+            "inventory_augmented_count": len(augmented_channel_ids),
+            "inventory_augmented_channel_ids": augmented_channel_ids[:scope_id_limit],
+            "requested_only_channel_ids": requested_only_channel_ids[:scope_id_limit],
+            "inventory_provenance": inventory_provenance[:scope_id_limit],
+            "scope": scope,
             "requested_count": requested_count,
+            "requested_channel_ids": bounded_scope_lists["requested_channel_ids"],
+            "checked_channel_ids": bounded_scope_lists["checked_channel_ids"],
+            "inactive_channel_ids": bounded_scope_lists["inactive_channel_ids"],
+            "candidate_channel_ids": bounded_scope_lists["candidate_channel_ids"],
             "unchecked_count": unchecked_count,
-            "unchecked_channel_ids": unchecked_channel_ids,
+            "unchecked_channel_ids": bounded_scope_lists["unchecked_channel_ids"],
             "total_channels_checked": active_count + inactive_count + channel_error_count,
             "active_count": active_count,
             "inactive_count": inactive_count,
             "error_count": len(errors),
+            "error_channel_ids": bounded_scope_lists["error_channel_ids"],
             "returned": len(candidate_channels),
             "deferred_count": len(deferred_channel_ids),
-            "deferred_channel_ids": deferred_channel_ids,
+            "deferred_channel_ids": bounded_scope_lists["deferred_channel_ids"],
             "per_turn_channel_limit": per_turn_limit,
             "requires_confirmation": active_count > per_turn_limit,
             "full_research_note": (
@@ -4093,6 +4298,7 @@ class AgentTools:
                 start_ts=from_ts,
                 end_ts=to_ts,
                 level_limit=level_limit,
+                target_level=depth,
             )
         except Exception as exc:
             raise ToolError(f"Could not fetch summaries: {exc}") from exc
@@ -4186,6 +4392,12 @@ class AgentTools:
             truncated=truncated,
             selection_strategy=selection_strategy,
         )
+        evidence_priority_windows = _summary_evidence_priority_windows(
+            returned_nodes,
+            from_ts,
+            to_ts,
+            min(6, evidence_frame_limit),
+        )
         evidence_sources = ("vlm_alert", "vlm_summary")
         evidence_frame_query = {
             "tool": "get_detections",
@@ -4208,23 +4420,35 @@ class AgentTools:
                 source_query["source"] = source
                 evidence_frame_queries.append(source_query)
                 evidence_attempted_sources.append(source)
-                rows, total = self._list_detection_window(
+                rows, total = self._sample_detection_window(
                     probe_id=None,
                     channel_id=channel_id,
                     source=source,
                     since_ms=evidence_frame_query["since_ms"],
                     until_ms=evidence_frame_query["until_ms"],
                     limit=evidence_frame_limit,
-                    offset=0,
-                    sort_by="oldest",
-                    max_scan=1000,
                 )
                 evidence_totals[source] = total
+                combined_rows = list(rows)
+                for priority_window in evidence_priority_windows:
+                    priority_rows, _priority_total = self._sample_detection_window(
+                        probe_id=None,
+                        channel_id=channel_id,
+                        source=source,
+                        since_ms=int(priority_window["since_ms"]),
+                        until_ms=int(priority_window["until_ms"]),
+                        limit=1,
+                    )
+                    combined_rows.extend(priority_rows)
                 source_rows[source] = [
                     _safe_detection(_annotate_archive_row(row))
-                    for row in rows
+                    for row in combined_rows
                 ]
-            evidence_frames = _select_evidence_frame_rows(source_rows, evidence_frame_limit)
+            evidence_frames = _select_evidence_frame_rows(
+                source_rows,
+                evidence_frame_limit,
+                evidence_priority_windows,
+            )
 
         return {
             "channel_id": channel_id,
@@ -4248,6 +4472,8 @@ class AgentTools:
             "run_filter_id": rollups.get("run_filter_id"),
             "running": bool(rollups.get("running")),
             "evidence_frame_query": evidence_frame_query,
+            "evidence_selection_strategy": "period_span_alert_priority",
+            "evidence_priority_windows": evidence_priority_windows,
             "evidence_frame_queries": evidence_frame_queries,
             "evidence_frame_attempted_sources": evidence_attempted_sources,
             "attempted_sources": evidence_attempted_sources,
@@ -4291,6 +4517,7 @@ class AgentTools:
                 start_ts=from_ts,
                 end_ts=to_ts,
                 level_limit=level_limit,
+                target_level=depth,
             )
         except Exception as exc:
             raise ToolError(f"Could not fetch summaries: {exc}") from exc
@@ -4937,7 +5164,8 @@ class AgentTools:
             )
             for det in all_rows:
                 ts = _detection_timestamp_ms(det)
-                hour_key = time.strftime("%Y-%m-%d %H:00", time.localtime(ts / 1000))
+                hour_label = _format_epoch_minute(ts / 1000)
+                hour_key = f"{hour_label[:13]}:00" if hour_label else "unknown"
                 activity_by_hour[hour_key] += 1
 
             probes_data.append({
@@ -4980,6 +5208,7 @@ class AgentTools:
         start_ts: float,
         end_ts: float,
         level_limit: int,
+        target_level: Optional[str] = None,
     ) -> Dict[str, Any]:
         kwargs = {
             "channel_id": channel_id,
@@ -4988,12 +5217,24 @@ class AgentTools:
             "end_ts": end_ts,
             "level_limit": level_limit,
         }
-        try:
-            return self._lxm.summary_rollups(**kwargs, synthesize=False)
-        except TypeError as exc:
-            if "synthesize" not in str(exc):
-                raise
-            return self._lxm.summary_rollups(**kwargs)
+        if target_level:
+            kwargs["target_level"] = str(target_level).strip().upper()
+        call_kwargs = {**kwargs, "synthesize": False}
+        while True:
+            try:
+                return self._lxm.summary_rollups(**call_kwargs)
+            except TypeError as exc:
+                # Compatibility with a pre-0.8.3 manager/test double.  Only remove
+                # explicitly rejected optional keywords; all other TypeErrors are
+                # real backend failures and must remain visible.
+                error_text = str(exc)
+                removed_optional = False
+                for optional_name in ("target_level", "synthesize"):
+                    if optional_name in call_kwargs and optional_name in error_text:
+                        call_kwargs.pop(optional_name, None)
+                        removed_optional = True
+                if not removed_optional:
+                    raise
 
     def _resolve_summary_time_window(
         self,
@@ -5034,6 +5275,7 @@ class AgentTools:
             float(from_ts),
             float(to_ts),
             {
+                "timezone": AGENT_SITE_TIMEZONE,
                 "from_ts": float(from_ts),
                 "to_ts": float(to_ts),
                 "since_ms": int(float(from_ts) * 1000.0),
@@ -5362,10 +5604,10 @@ class AgentTools:
 
     @staticmethod
     def _normalize_channel_ref(value: Any) -> str:
-        raw = str(value or "").strip().lower()
+        raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
         if raw.startswith("#"):
             raw = raw[1:]
-        return re.sub(r"[^a-z0-9]+", " ", raw).strip()
+        return re.sub(r"[\W_]+", " ", raw, flags=re.UNICODE).strip()
 
     def _resolve_channel_id(self, args: Dict[str, Any], *, required: bool = False) -> Optional[int]:
         channel_id = _opt_int(args.get("channel_id"))
@@ -6044,7 +6286,13 @@ def build_system_prompt(
     allowed_channel_ids: Optional[Sequence[str]] = None,
     secure_tool_mode: bool = False,
 ) -> str:
-    now_str = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        now_str = _dt.datetime.now(ZoneInfo(AGENT_SITE_TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        now_str = time.strftime("%Y-%m-%d %H:%M")
 
     # Configured probes are secondary semantic sensors in the current pilot.
     try:
@@ -6140,7 +6388,7 @@ def build_system_prompt(
         f"attention signal, tune probes when explicitly requested, adjust prompt settings, describe frames, "
         f"create bookmarks, and compile reports.\n"
         f"Be concise and operator-focused. Never fabricate detection data.\n\n"
-        f"Current time: {now_str}\n\n"
+        f"Current site time ({AGENT_SITE_TIMEZONE}): {now_str}\n\n"
         f"Video-description runtime:\n{video_stream_block}\n\n"
         f"Configured semantic probes ({len(probes)} total; secondary/internal unless explicitly requested):\n{probe_block}\n\n"
         f"Available channels: {channels_str}\n\n"
@@ -6248,32 +6496,68 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
 
 def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     prepared = dict(args or {})
+    continuation = (
+        context.get("research_continuation")
+        if isinstance(context.get("research_continuation"), Mapping)
+        else {}
+    )
+    if continuation and tool_name in {"list_video_summary_channels", "generate_report"}:
+        remaining = continuation.get("channel_ids")
+        if (
+            isinstance(remaining, Sequence)
+            and not isinstance(remaining, (str, bytes, bytearray))
+            and remaining
+            and not _has_any_arg(
+                prepared,
+                ("channel_id", "channel_ids", "channel_ref", "channel", "channel_title", "channel_name"),
+            )
+        ):
+            prepared["channel_ids"] = [int(item) for item in remaining]
+        if not _has_any_arg(prepared, ("since_hours", "until_hours")):
+            if prepared.get("from_ts") is None and continuation.get("from_ts") is not None:
+                prepared["from_ts"] = continuation.get("from_ts")
+            if prepared.get("to_ts") is None and continuation.get("to_ts") is not None:
+                prepared["to_ts"] = continuation.get("to_ts")
     time_window = context.get("time_window") if isinstance(context.get("time_window"), dict) else {}
     if time_window:
-        if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions", "calibrate_probe_from_archive", "prepare_probe_calibration_batch", "list_video_summary_channels"} and not _has_any_arg(
-            prepared,
-            ("from_ts", "to_ts", "since_hours"),
-        ):
-            if time_window.get("from_ts") is not None:
-                prepared["from_ts"] = time_window.get("from_ts")
-            if time_window.get("to_ts") is not None:
-                prepared["to_ts"] = time_window.get("to_ts")
+        summary_tools = {
+            "get_video_summaries",
+            "count_video_summary_events",
+            "track_visual_state_transitions",
+            "calibrate_probe_from_archive",
+            "prepare_probe_calibration_batch",
+            "list_video_summary_channels",
+        }
+        if tool_name in summary_tools and not _has_any_arg(prepared, ("since_hours", "until_hours")):
+            if _has_any_arg(prepared, ("since_ms", "until_ms")):
+                if prepared.get("since_ms") is None and time_window.get("since_ms") is not None:
+                    prepared["since_ms"] = time_window.get("since_ms")
+                if prepared.get("until_ms") is None and time_window.get("until_ms") is not None:
+                    prepared["until_ms"] = time_window.get("until_ms")
+            else:
+                if prepared.get("from_ts") is None and time_window.get("from_ts") is not None:
+                    prepared["from_ts"] = time_window.get("from_ts")
+                if prepared.get("to_ts") is None and time_window.get("to_ts") is not None:
+                    prepared["to_ts"] = time_window.get("to_ts")
         if tool_name in {"get_detections", "get_detection_summary", "search_archive"} and not _has_any_arg(
             prepared,
-            ("since_ms", "until_ms", "since_hours", "until_hours"),
+            ("since_hours", "until_hours"),
         ):
-            if time_window.get("since_ms") is not None:
+            if prepared.get("since_ms") is None and time_window.get("since_ms") is not None:
                 prepared["since_ms"] = time_window.get("since_ms")
-            if time_window.get("until_ms") is not None:
+            if prepared.get("until_ms") is None and time_window.get("until_ms") is not None:
                 prepared["until_ms"] = time_window.get("until_ms")
-        if tool_name == "generate_report" and not _has_any_arg(
-            prepared,
-            ("from_ts", "to_ts", "since_ms", "until_ms", "since_hours", "until_hours"),
-        ):
-            if time_window.get("from_ts") is not None:
-                prepared["from_ts"] = time_window.get("from_ts")
-            if time_window.get("to_ts") is not None:
-                prepared["to_ts"] = time_window.get("to_ts")
+        if tool_name == "generate_report" and not _has_any_arg(prepared, ("since_hours", "until_hours")):
+            if _has_any_arg(prepared, ("since_ms", "until_ms")):
+                if prepared.get("since_ms") is None and time_window.get("since_ms") is not None:
+                    prepared["since_ms"] = time_window.get("since_ms")
+                if prepared.get("until_ms") is None and time_window.get("until_ms") is not None:
+                    prepared["until_ms"] = time_window.get("until_ms")
+            else:
+                if prepared.get("from_ts") is None and time_window.get("from_ts") is not None:
+                    prepared["from_ts"] = time_window.get("from_ts")
+                if prepared.get("to_ts") is None and time_window.get("to_ts") is not None:
+                    prepared["to_ts"] = time_window.get("to_ts")
 
     channel_id = context.get("channel_id")
     should_default_channel = not (
@@ -6690,6 +6974,7 @@ def _record_turn_signal_ledger(
     if tool_name in {"search_archive", "get_detections", "build_research_batch"}:
         rows_key = "results" if tool_name == "search_archive" else "detections"
         rows = result.get(rows_key) if isinstance(result.get(rows_key), list) else []
+        coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else None
         _signal_ledger_append(
             ledger,
             "evidence",
@@ -6699,6 +6984,8 @@ def _record_turn_signal_ledger(
                 "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
                 "count": result.get("count") or result.get("returned") or len(rows),
                 "total": result.get("total_in_window"),
+                "coverage": dict(coverage) if coverage is not None else None,
+                "best_similarity": _best_search_score(rows) if tool_name == "search_archive" else None,
                 "image_url_count": sum(1 for row in rows if isinstance(row, Mapping) and row.get("image_url")),
                 "sample_ids": [
                     row.get("id") or row.get("detection_id")
@@ -7024,6 +7311,37 @@ class AgentRunner:
             # into an operator-visible failure.
             return
 
+    def _load_research_state(
+        self,
+        session_id: str,
+        owner: Mapping[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        loader = getattr(self.store, "load_research_state", None)
+        if not callable(loader):
+            return None
+        try:
+            state = loader(session_id, **dict(owner))
+        except Exception:
+            return None
+        return dict(state) if isinstance(state, Mapping) else None
+
+    def _save_research_state(
+        self,
+        session_id: str,
+        owner: Mapping[str, str],
+        state: Mapping[str, Any],
+    ) -> bool:
+        saver = getattr(self.store, "save_research_state", None)
+        if not callable(saver):
+            return False
+        try:
+            saver(session_id, dict(state), **dict(owner))
+        except Exception:
+            # The tool result remains valid for this turn. Persistence health is
+            # surfaced by the research_state event instead of corrupting the turn.
+            return False
+        return True
+
     def stream_chat(
         self,
         session_id: Optional[str],
@@ -7103,6 +7421,13 @@ class AgentRunner:
         requested_skill_slugs = _extract_requested_skill_slugs(user_content)
         user_text = _extract_text_from_message_content(user_content)
         turn_signal_ledger = _new_turn_signal_ledger(user_text)
+        continuation_requested = operator_requests_continuation(user_text)
+        previous_research_state = self._load_research_state(session_id, store_owner)
+        active_research_state = (
+            previous_research_state
+            if continuation_requested and usable_research_state(previous_research_state)
+            else None
+        )
         if "probe_tuning" in requested_skill_slugs:
             normalized_user_text = _normalize_probe_match_text(user_text)
             wants_all_probes = any(
@@ -7173,8 +7498,17 @@ class AgentRunner:
             )
 
         # Replace the stored user content with the full (possibly image-bearing) one
+        trusted_research_messages: List[Dict[str, Any]] = []
+        if active_research_state is not None:
+            trusted_research_messages.append(
+                {
+                    "role": "system",
+                    "content": trusted_research_message(active_research_state),
+                }
+            )
         in_flight: List[Dict[str, Any]] = (
             [{"role": "system", "content": system_prompt}]
+            + trusted_research_messages
             + history_prefix                         # all but the just-added user msg, trimmed by budget
             + [{"role": "user", "content": user_content}]
         )
@@ -7194,6 +7528,23 @@ class AgentRunner:
             else _TOOL_SCHEMAS
         )
         turn_tool_context = _seed_turn_tool_context(user_text)
+        if active_research_state is not None:
+            continuation_defaults = continuation_tool_defaults(active_research_state)
+            turn_tool_context["research_continuation"] = continuation_defaults
+            turn_tool_context["time_window"] = {
+                "from_ts": continuation_defaults.get("from_ts"),
+                "to_ts": continuation_defaults.get("to_ts"),
+                "since_ms": (
+                    int(float(continuation_defaults["from_ts"]) * 1000.0)
+                    if continuation_defaults.get("from_ts") is not None
+                    else None
+                ),
+                "until_ms": (
+                    int(float(continuation_defaults["to_ts"]) * 1000.0)
+                    if continuation_defaults.get("to_ts") is not None
+                    else None
+                ),
+            }
         try:
             mentioned_channel_id = self._tools._resolve_channel_id(
                 {"channel_ref": user_text},
@@ -7294,13 +7645,20 @@ class AgentRunner:
                 )
             # Run the blocking LM call in a thread so we can emit heartbeats
             lm_response: _LMResponse
+            lm_cancel_event = threading.Event()
             try:
                 lm_response = yield from _run_with_heartbeats(
                     fn=lambda: self._lm_client.call_with_tools(
                         in_flight,
                         tools=available_tool_schemas,
+                        cancel_event=lm_cancel_event,
                     ),
                     heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
+                    heartbeat_payload_fn=lambda: {
+                        "phase": "lm_tool_decision",
+                        "lm_admission": self._lm_client.admission_status(),
+                    },
+                    cancel_event=lm_cancel_event,
                 )
             except Exception as exc:
                 yield _sse({"type": "error", "message": f"LM error: {exc}"})
@@ -7361,6 +7719,7 @@ class AgentRunner:
                 tool_calls_used += 1
 
                 try:
+                    research_event: Optional[Dict[str, Any]] = None
                     result = yield from _run_with_heartbeats(
                         fn=lambda tc=tc, progress_queue=progress_queue: (
                             self._secure_tools.execute(
@@ -7380,7 +7739,35 @@ class AgentRunner:
                         heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                         progress_queue=progress_queue,
                     )
+                    if tc.name == "list_video_summary_channels" and isinstance(result, Mapping):
+                        next_research_state = research_state_from_inventory(
+                            result,
+                            previous=active_research_state,
+                            continuation=active_research_state is not None,
+                        )
+                        research_persisted = self._save_research_state(
+                            session_id,
+                            store_owner,
+                            next_research_state,
+                        )
+                        previous_research_state = next_research_state
+                        active_research_state = (
+                            next_research_state
+                            if usable_research_state(next_research_state)
+                            else None
+                        )
+                        research_event = {
+                            "status": next_research_state.get("status"),
+                            "requested_channel_ids": next_research_state.get("requested_channel_ids"),
+                            "completed_channel_ids": next_research_state.get("completed_channel_ids"),
+                            "remaining_channel_ids": next_research_state.get("remaining_channel_ids"),
+                            "frozen_window": next_research_state.get("frozen_window"),
+                            "window_mismatch": bool(next_research_state.get("window_mismatch")),
+                            "persisted": research_persisted,
+                        }
                     result_for_model = _compact_tool_result_for_model(tc.name, result)
+                    if research_event is not None and isinstance(result_for_model, dict):
+                        result_for_model["research_ledger"] = dict(research_event)
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(result_for_model, default=str)}
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
@@ -7390,6 +7777,8 @@ class AgentRunner:
                         "name": tc.name,
                         "result": _tool_result_for_ui(tc.name, result),
                     })
+                    if research_event is not None:
+                        yield _sse({"type": "research_state", **research_event})
                 except (ToolError, ToolGatewayError) as exc:
                     error_payload = {"error": str(exc)}
                     code = getattr(exc, "code", None)
@@ -7432,8 +7821,24 @@ class AgentRunner:
             in_flight.append({"role": "system", "content": signal_ledger_message})
 
         full_text_parts: List[str] = []
+        stream_cancel_event = threading.Event()
         try:
-            for chunk in self._lm_client.stream_text(in_flight):
+            for stream_kind, stream_value in _stream_items_with_heartbeats(
+                lambda: self._lm_client.stream_text(
+                    in_flight,
+                    cancel_event=stream_cancel_event,
+                ),
+                heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
+                heartbeat_payload_fn=lambda: {
+                    "phase": "lm_final_response",
+                    "lm_admission": self._lm_client.admission_status(),
+                },
+                cancel_event=stream_cancel_event,
+            ):
+                if stream_kind == "heartbeat":
+                    yield _sse(dict(stream_value))
+                    continue
+                chunk = str(stream_value)
                 full_text_parts.append(chunk)
                 yield _sse({"type": "text", "content": chunk})
         except Exception as exc:
@@ -7494,6 +7899,8 @@ def _run_with_heartbeats(
     fn: Callable[[], Any],
     heartbeat_interval: float = AGENT_HEARTBEAT_INTERVAL,
     progress_queue: Optional["queue.Queue[Dict[str, Any]]"] = None,
+    heartbeat_payload_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Generator[str, None, Any]:
     """
     Run fn() in a thread. Yield SSE heartbeat events every heartbeat_interval
@@ -7512,19 +7919,31 @@ def _run_with_heartbeats(
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     last_heartbeat = time.time()
-    while t.is_alive():
-        t.join(timeout=0.25)
-        if progress_queue is not None:
-            while True:
-                try:
-                    event = progress_queue.get_nowait()
-                except queue.Empty:
-                    break
-                yield _sse({"type": "tool_progress", **event})
-        now = time.time()
-        if t.is_alive() and now - last_heartbeat >= heartbeat_interval:
-            yield _sse({"type": "heartbeat"})
-            last_heartbeat = now
+    try:
+        while t.is_alive():
+            t.join(timeout=0.25)
+            if progress_queue is not None:
+                while True:
+                    try:
+                        event = progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    yield _sse({"type": "tool_progress", **event})
+            now = time.time()
+            if t.is_alive() and now - last_heartbeat >= heartbeat_interval:
+                heartbeat_payload: Dict[str, Any] = {"type": "heartbeat"}
+                if callable(heartbeat_payload_fn):
+                    try:
+                        extra = heartbeat_payload_fn()
+                        if isinstance(extra, Mapping):
+                            heartbeat_payload.update(dict(extra))
+                    except Exception:
+                        pass
+                yield _sse(heartbeat_payload)
+                last_heartbeat = now
+    finally:
+        if cancel_event is not None and t.is_alive():
+            cancel_event.set()
 
     if progress_queue is not None:
         while True:
@@ -7537,6 +7956,58 @@ def _run_with_heartbeats(
     if "v" in exc_holder:
         raise exc_holder["v"]
     return result_holder.get("v")
+
+
+def _stream_items_with_heartbeats(
+    iterator_fn: Callable[[], Iterator[str]],
+    *,
+    heartbeat_interval: float = AGENT_HEARTBEAT_INTERVAL,
+    heartbeat_payload_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> Generator[Tuple[str, Any], None, None]:
+    """Move a blocking streaming iterator to a thread while keeping SSE alive."""
+
+    item_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+
+    def _produce() -> None:
+        try:
+            for item in iterator_fn():
+                item_queue.put(("item", item))
+        except Exception as exc:
+            item_queue.put(("error", exc))
+        finally:
+            item_queue.put(("done", None))
+
+    thread = threading.Thread(target=_produce, daemon=True)
+    thread.start()
+    last_heartbeat = time.time()
+    try:
+        while True:
+            try:
+                kind, value = item_queue.get(timeout=0.25)
+            except queue.Empty:
+                now = time.time()
+                if thread.is_alive() and now - last_heartbeat >= heartbeat_interval:
+                    payload: Dict[str, Any] = {"type": "heartbeat"}
+                    if callable(heartbeat_payload_fn):
+                        try:
+                            extra = heartbeat_payload_fn()
+                            if isinstance(extra, Mapping):
+                                payload.update(dict(extra))
+                        except Exception:
+                            pass
+                    yield "heartbeat", payload
+                    last_heartbeat = now
+                continue
+            if kind == "item":
+                yield "item", value
+                continue
+            if kind == "error":
+                raise value
+            break
+    finally:
+        if cancel_event is not None and thread.is_alive():
+            cancel_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -7588,13 +8059,16 @@ def _coerce_epoch_seconds(v: Any) -> Optional[float]:
     return float(value)
 
 
-def _format_epoch_minute(v: Any) -> Optional[str]:
+def _format_epoch_minute(v: Any, timezone_name: Optional[str] = None) -> Optional[str]:
     value = _coerce_epoch_seconds(v)
     if value is None:
         return None
     try:
         import datetime as _dt
-        return _dt.datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        from zoneinfo import ZoneInfo
+
+        tz_name = str(timezone_name or AGENT_SITE_TIMEZONE).strip() or AGENT_SITE_TIMEZONE
+        return _dt.datetime.fromtimestamp(float(value), ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return None
 
@@ -8232,6 +8706,75 @@ def _summary_node_alert_score(node: Mapping[str, Any]) -> int:
         if marker in text:
             score += 1
     return score
+
+
+def _summary_evidence_priority_windows(
+    nodes: Sequence[Mapping[str, Any]],
+    from_ts: float,
+    to_ts: float,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    windows: List[Dict[str, Any]] = []
+    seen: set[Tuple[float, float]] = set()
+    requested_start = min(float(from_ts), float(to_ts))
+    requested_end = max(float(from_ts), float(to_ts))
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            continue
+        alert_score = _summary_node_alert_score(node)
+        state_transition_total = int(_opt_int(node.get("state_transition_total")) or 0)
+        vector_signal_total = int(_opt_int(node.get("vector_signal_total")) or 0)
+        raw_alert_events = node.get("alert_events")
+        structured_alert_count = (
+            len([item for item in raw_alert_events if isinstance(item, Mapping)])
+            if isinstance(raw_alert_events, Sequence)
+            and not isinstance(raw_alert_events, (str, bytes, bytearray))
+            else 0
+        )
+        priority = (
+            int(alert_score)
+            + min(8, state_transition_total * 2)
+            + min(4, vector_signal_total)
+            + min(4, structured_alert_count * 2)
+        )
+        if priority <= 0:
+            continue
+        start, end = _summary_node_bounds(node)
+        if start is None and end is None:
+            continue
+        if start is None:
+            start = end
+        if end is None:
+            end = start
+        if start is None or end is None:
+            continue
+        start_f = max(requested_start, min(float(start), float(end)))
+        end_f = min(requested_end, max(float(start), float(end)))
+        if end_f < start_f:
+            continue
+        key = (start_f, end_f)
+        if key in seen:
+            continue
+        seen.add(key)
+        reasons: List[str] = []
+        if alert_score > 0:
+            reasons.append("alert_or_deviation")
+        if state_transition_total > 0:
+            reasons.append("state_transition")
+        if vector_signal_total > 0:
+            reasons.append("vector_signal")
+        if structured_alert_count > 0:
+            reasons.append("structured_alert")
+        windows.append({
+            "from_ts": start_f,
+            "to_ts": end_f,
+            "since_ms": int(start_f * 1000.0),
+            "until_ms": int(end_f * 1000.0),
+            "priority": priority,
+            "reasons": reasons,
+        })
+    windows.sort(key=lambda row: (-int(row["priority"]), float(row["from_ts"]), float(row["to_ts"])))
+    return windows[: max(0, int(limit))]
 
 
 def _evenly_spaced_indices(total: int, limit: int) -> List[int]:
@@ -9304,41 +9847,84 @@ def _evidence_row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
 def _select_evidence_frame_rows(
     source_rows: Mapping[str, Sequence[Dict[str, Any]]],
     limit: int,
+    priority_windows: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     if limit <= 0:
         return []
 
     source_priority = {"vlm_alert": 0, "vlm_summary": 1}
-    selected: List[Dict[str, Any]] = []
-    seen: set[Tuple[Any, ...]] = set()
-
-    for source in ("vlm_alert", "vlm_summary"):
-        rows = source_rows.get(source) or []
-        if not rows or len(selected) >= limit:
-            continue
-        first = dict(rows[0])
-        key = _evidence_row_key(first)
-        selected.append(first)
-        seen.add(key)
-
-    remaining: List[Dict[str, Any]] = []
+    all_rows: List[Dict[str, Any]] = []
+    all_seen: set[Tuple[Any, ...]] = set()
     for rows in source_rows.values():
         for row in rows:
             key = _evidence_row_key(row)
-            if key in seen:
+            if key in all_seen:
                 continue
-            remaining.append(dict(row))
-
-    remaining.sort(
+            all_seen.add(key)
+            all_rows.append(dict(row))
+    all_rows.sort(
         key=lambda row: (
             _detection_timestamp_ms(row),
             source_priority.get(str(row.get("source") or ""), 9),
             _opt_int(row.get("id") or row.get("detection_id")) or 0,
         )
     )
-    for row in remaining:
+    if not all_rows:
+        return []
+
+    normalized_windows: List[Tuple[int, int, int]] = []
+    for window in priority_windows or []:
+        if not isinstance(window, Mapping):
+            continue
+        since_ms = _opt_int(window.get("since_ms"))
+        until_ms = _opt_int(window.get("until_ms"))
+        if since_ms is None or until_ms is None:
+            continue
+        normalized_windows.append((
+            min(since_ms, until_ms),
+            max(since_ms, until_ms),
+            int(_opt_int(window.get("priority")) or 1),
+        ))
+
+    def _row_priority(row: Mapping[str, Any]) -> int:
+        timestamp_ms = _detection_timestamp_ms(row)
+        return max(
+            (priority for since_ms, until_ms, priority in normalized_windows if since_ms <= timestamp_ms <= until_ms),
+            default=0,
+        )
+
+    proposals: List[Dict[str, Any]] = []
+    priority_rows = [row for row in all_rows if _row_priority(row) > 0]
+    if priority_rows:
+        proposals.append(min(
+            priority_rows,
+            key=lambda row: (
+                -_row_priority(row),
+                source_priority.get(str(row.get("source") or ""), 9),
+                _detection_timestamp_ms(row),
+            ),
+        ))
+
+    # Always retain period anchors when the budget permits. Together with a
+    # priority row this yields start/event/end rather than the oldest N frames.
+    proposals.extend((all_rows[0], all_rows[-1]))
+    for source in ("vlm_alert", "vlm_summary"):
+        source_candidates = [row for row in all_rows if str(row.get("source") or "") == source]
+        if source_candidates:
+            proposals.append(max(source_candidates, key=lambda row: (_row_priority(row), -_detection_timestamp_ms(row))))
+    for index in _evenly_spaced_indices(len(all_rows), min(limit, len(all_rows))):
+        proposals.append(all_rows[index])
+    proposals.extend(all_rows)
+
+    selected: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
+    for row in proposals:
         if len(selected) >= limit:
             break
+        key = _evidence_row_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
         selected.append(row)
 
     selected.sort(
@@ -9522,9 +10108,11 @@ def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
     detection_id = r.get("detection_id")
     if detection_id is None:
         detection_id = r.get("id")
+    similarity = _search_result_score(r)
     row: Dict[str, Any] = {
         "path": r.get("filepath") or r.get("path") or r.get("image_path"),
-        "score": r.get("score"),
+        "score": similarity,
+        "similarity": similarity,
         "timestamp_ms": _detection_timestamp_ms(r),
         "source": r.get("source"),
         "source_label": r.get("source_label") or _archive_source_label(r.get("source")),
@@ -9688,6 +10276,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "source": result.get("source"),
             "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "count": result.get("count"),
+            "coverage": result.get("coverage"),
             "results": [_compact_search_result_for_model(r) for r in rows[:8] if isinstance(r, dict)],
         }
 
@@ -9850,12 +10439,24 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "time_window": result.get("time_window"),
             "channel_inventory_status": result.get("channel_inventory_status"),
             "channel_inventory_error": result.get("channel_inventory_error"),
+            "channel_inventory_cache": result.get("channel_inventory_cache"),
+            "live_inventory_count": result.get("live_inventory_count"),
+            "inventory_augmented_count": result.get("inventory_augmented_count"),
+            "inventory_augmented_channel_ids": result.get("inventory_augmented_channel_ids"),
+            "requested_only_channel_ids": result.get("requested_only_channel_ids"),
+            "inventory_provenance": result.get("inventory_provenance"),
+            "scope": result.get("scope"),
             "requested_count": result.get("requested_count"),
+            "requested_channel_ids": result.get("requested_channel_ids"),
+            "checked_channel_ids": result.get("checked_channel_ids"),
+            "inactive_channel_ids": result.get("inactive_channel_ids"),
+            "candidate_channel_ids": result.get("candidate_channel_ids"),
             "unchecked_count": result.get("unchecked_count"),
             "unchecked_channel_ids": result.get("unchecked_channel_ids"),
             "active_count": result.get("active_count"),
             "inactive_count": result.get("inactive_count"),
             "error_count": result.get("error_count"),
+            "error_channel_ids": result.get("error_channel_ids"),
             "total_channels_checked": result.get("total_channels_checked"),
             "returned": result.get("returned"),
             "deferred_count": result.get("deferred_count"),
@@ -9899,6 +10500,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 {
                     "channel_id": row.get("channel_id"),
                     "title": row.get("title"),
+                    "inventory_sources": row.get("inventory_sources"),
                     "summary_count": row.get("summary_count"),
                     "first_time": row.get("first_time"),
                     "latest_time": row.get("latest_time"),
@@ -9955,6 +10557,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "selection_strategy": result.get("selection_strategy"),
             "running": result.get("running"),
             "evidence_frame_query": result.get("evidence_frame_query"),
+            "evidence_selection_strategy": result.get("evidence_selection_strategy"),
+            "evidence_priority_windows": result.get("evidence_priority_windows"),
             "evidence_frame_queries": result.get("evidence_frame_queries"),
             "evidence_frame_attempted_sources": result.get("evidence_frame_attempted_sources"),
             "attempted_sources": result.get("attempted_sources"),

@@ -4,7 +4,22 @@ Contains all configurable settings with environment variable support
 """
 import os
 import re
+import hashlib
 from pathlib import Path
+
+# Keep only names, never values.  After python-dotenv runs, ``os.environ`` no
+# longer reveals whether a setting came from systemd/process environment or the
+# project file.  Settings diagnostics use this frozen set to explain precedence
+# without exposing secrets.
+ENV_KEYS_BEFORE_DOTENV = frozenset(os.environ.keys())
+ENV_VALUE_HASHES_BEFORE_DOTENV = {
+    key: hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+    for key, value in os.environ.items()
+    if key.startswith("EVOSSEARCH_")
+}
+CONFIG_ENV_FILE_BEFORE_DOTENV = str(
+    os.environ.get("EVOSSEARCH_CONFIG_ENV_FILE") or ""
+).strip()
 
 # Load .env file if it exists
 try:
@@ -468,9 +483,9 @@ class Config:
     if LUXRIOT_CAPTURE_SOURCE not in {'auto', 'snapshot', 'live_segment'}:
         LUXRIOT_CAPTURE_SOURCE = 'auto'
     try:
-        LUXRIOT_LIVE_SEGMENT_SECONDS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS', '15.0'))
+        LUXRIOT_LIVE_SEGMENT_SECONDS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS', '60.0'))
     except (TypeError, ValueError):
-        LUXRIOT_LIVE_SEGMENT_SECONDS = 15.0
+        LUXRIOT_LIVE_SEGMENT_SECONDS = 60.0
     LUXRIOT_LIVE_SEGMENT_SECONDS = max(2.0, min(60.0, LUXRIOT_LIVE_SEGMENT_SECONDS))
     try:
         LUXRIOT_LIVE_SEGMENT_MB = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_MB', '8.0'))
@@ -501,6 +516,51 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = 5.0
     LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC))
+    try:
+        LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC', '3.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = 3.0
+    LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = max(0.25, min(30.0, LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC))
+    try:
+        LUXRIOT_MEDIA_READ_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_READ_TIMEOUT_SEC', '8.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_MEDIA_READ_TIMEOUT_SEC = 8.0
+    LUXRIOT_MEDIA_READ_TIMEOUT_SEC = max(0.5, min(60.0, LUXRIOT_MEDIA_READ_TIMEOUT_SEC))
+    try:
+        LUXRIOT_LIVE_MEDIA_MAX_SECONDS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS', '120.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_MEDIA_MAX_SECONDS = 120.0
+    LUXRIOT_LIVE_MEDIA_MAX_SECONDS = max(1.0, min(120.0, LUXRIOT_LIVE_MEDIA_MAX_SECONDS))
+    try:
+        LUXRIOT_LIVE_MEDIA_MAX_BYTES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_BYTES', str(256 * 1024 * 1024))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_MEDIA_MAX_BYTES = 256 * 1024 * 1024
+    LUXRIOT_LIVE_MEDIA_MAX_BYTES = max(1024, min(256 * 1024 * 1024, LUXRIOT_LIVE_MEDIA_MAX_BYTES))
+    try:
+        LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS', '45.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = 45.0
+    LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = max(1.0, min(300.0, LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS))
+    try:
+        LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES', str(128 * 1024 * 1024))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+    LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = max(
+        1024,
+        min(512 * 1024 * 1024, LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES),
+    )
     LUXRIOT_VECTOR_SIGNALS_ENABLED = os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
     try:
         LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT', '6'))

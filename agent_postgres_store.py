@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import uuid
@@ -38,6 +39,8 @@ class PostgresAgentStore:
     """AgentStore-compatible implementation using the secure `agent` schema."""
 
     backend = "postgres"
+    RESEARCH_STATE_KEY = "research_state"
+    MAX_RESEARCH_STATE_BYTES = 64_000
 
     def __init__(
         self,
@@ -115,6 +118,138 @@ class PostgresAgentStore:
                     RETURNING id
                     """,
                     (title, context.tenant_id, context.actor_id, session_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("agent session not found")
+
+    @classmethod
+    def _validated_research_state(cls, state: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(state, Mapping):
+            raise TypeError("research state must be an object")
+        payload = _plain_value(dict(state))
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > cls.MAX_RESEARCH_STATE_BYTES:
+            raise ValueError(
+                f"research state exceeds {cls.MAX_RESEARCH_STATE_BYTES} bytes"
+            )
+        return payload
+
+    def load_research_state(
+        self,
+        session_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the trusted server-side continuation ledger for a chat session."""
+
+        context = self._context(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            session_id=session_id,
+        )
+        with self.pool.transaction(context, readonly=True) as connection:
+            row = connection.execute(
+                """
+                SELECT metadata -> %s
+                FROM agent.sessions
+                WHERE tenant_id = %s
+                  AND user_id = %s
+                  AND id = %s
+                  AND status = 'active'
+                """,
+                (
+                    self.RESEARCH_STATE_KEY,
+                    context.tenant_id,
+                    context.actor_id,
+                    session_id,
+                ),
+            ).fetchone()
+        if row is None or not isinstance(row[0], Mapping):
+            return None
+        return copy.deepcopy(dict(row[0]))
+
+    def save_research_state(
+        self,
+        session_id: str,
+        state: Mapping[str, Any],
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> None:
+        """Persist a bounded continuation ledger without adding model-visible chat."""
+
+        payload = self._validated_research_state(state)
+        context = self._context(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            session_id=session_id,
+        )
+        with self._lock:
+            with self.pool.transaction(context) as connection:
+                row = connection.execute(
+                    """
+                    UPDATE agent.sessions
+                    SET metadata = jsonb_set(
+                            metadata,
+                            ARRAY[%s]::text[],
+                            %s,
+                            true
+                        ),
+                        updated_at = clock_timestamp()
+                    WHERE tenant_id = %s
+                      AND user_id = %s
+                      AND id = %s
+                      AND status = 'active'
+                    RETURNING id
+                    """,
+                    (
+                        self.RESEARCH_STATE_KEY,
+                        _jsonb(payload),
+                        context.tenant_id,
+                        context.actor_id,
+                        session_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise KeyError("agent session not found")
+
+    def clear_research_state(
+        self,
+        session_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> None:
+        context = self._context(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            session_id=session_id,
+        )
+        with self._lock:
+            with self.pool.transaction(context) as connection:
+                row = connection.execute(
+                    """
+                    UPDATE agent.sessions
+                    SET metadata = metadata - %s,
+                        updated_at = clock_timestamp()
+                    WHERE tenant_id = %s
+                      AND user_id = %s
+                      AND id = %s
+                      AND status = 'active'
+                    RETURNING id
+                    """,
+                    (
+                        self.RESEARCH_STATE_KEY,
+                        context.tenant_id,
+                        context.actor_id,
+                        session_id,
+                    ),
                 ).fetchone()
                 if row is None:
                     raise KeyError("agent session not found")

@@ -1,14 +1,15 @@
 # Configuration Reference
 
 Canonical list of deployment-relevant environment variables. **Source of truth
-for behavior is `config.py`**; this table is the human reference. Secrets
+for behavior is `config.py` and the direct consumers named below**; this table is
+the human reference. Secrets
 (`*_PASSWORD`, `*_API_KEY`, `*_DSN`, `*_ADMIN_TOKEN`) live only in the on-host
 `.env` (mode `0600`) and are **never** committed or placed in shareable docs.
 
 Defaults shown are the code defaults, not the pilot values. Pilot/field values
 live in the internal field-rollout doc with `[FIELD]` markers.
 
-Last reviewed: 2026-07-02 (β 0.8.3)
+Last reviewed: 2026-07-11 (β 0.8.3 stabilization RC)
 
 ## Secure-pilot required set
 
@@ -23,6 +24,7 @@ EVOSSEARCH_EMBEDDER=clip
 EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
 EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=false
 EVOSSEARCH_GUNICORN_WORKERS=1
+EVOSSEARCH_GUNICORN_THREADS=8
 EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 ```
 
@@ -45,7 +47,10 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_APP_VERSION` | Overrides `VERSION` only if set; keep in sync with release |
 | `EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED` | Gate for secure-mode checks + single-worker enforcement |
 | `EVOSSEARCH_GUNICORN_WORKERS` (`1`) | Must stay `1` |
+| `EVOSSEARCH_GUNICORN_THREADS` (`8`) | HTTP request threads inside the single required worker. Eight leaves capacity for bounded live-media responses plus Agent/status traffic |
 | `EVOSSEARCH_SETTINGS_LOCAL_ONLY` (`true`) | Restrict settings writes |
+| `EVOSSEARCH_CONFIG_ENV_FILE` | Absolute path declaration for Settings precedence/provenance, normally identical to systemd `EnvironmentFile`. It does not load or retarget the Settings editor by itself |
+| `EVOSSEARCH_SITE_TIMEZONE` (`Asia/Tbilisi`) | Agent calendar normalization and operator-facing period timestamps; read directly by `agent.py` |
 
 ## Auth
 
@@ -67,16 +72,30 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID` (`1`) | Default channel |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
+| `EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE` (`auto`) | `snapshot`, `live_segment`, or automatic fallback. A true intra-second CV apex requires `live_segment` |
+| `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS` (`60`) | Bounded lifetime of one incremental dense-capture pipe. Summaries are emitted inside the window; the longer lease amortizes recorder-open latency |
+| `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS` (`3`) | Raw dense candidates per source-second before one CV apex is selected |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC` (`5`) | Short timeout for per-frame snapshot capture; prevents stale UI when Luxriot stalls |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC` (`5`) | HTTP read timeout passed to ffmpeg live-segment capture |
 | `EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES` (`180`) | Per-channel frame buffer cap |
 | `EVOSSEARCH_LUXRIOT_RECENT_FRAME_MAX_AGE_SEC` (`45`) | Max age for UI live-preview EVA frames; stale buffers render as signal loss instead of replay |
 | `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MAX_SEC` (`20`) | Exact repeated-frame duration before a live source is marked frozen |
 | `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT` (`3`) | Minimum identical captured frames before frozen-source detection can trigger |
+| `EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC` (`3.0`) | Same-origin media broker connect timeout; clamped to 0.25–30 s |
+| `EVOSSEARCH_LUXRIOT_MEDIA_READ_TIMEOUT_SEC` (`8.0`) | Same-origin media broker upstream read timeout; clamped to 0.5–60 s |
+| `EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS` (`120.0`) | Maximum lifetime of one bounded live broker response; UI renews it proactively at 75%; clamped to 1–120 s |
+| `EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_BYTES` (`268435456`) | Maximum streamed bytes in one live broker response (256 MiB default and cap; data is relayed rather than retained) |
+| `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS` (`45.0`) | Maximum lifetime of one bounded archive broker response; clamped to 1–300 s |
+| `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES` (`134217728`) | Maximum bytes in one archive broker response (128 MiB default; clamp 1 KiB–512 MiB) |
 | `EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS` (`false`) | Push alerts as Luxriot bookmarks |
 | `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`60`) | Dedup cooldown |
 | `EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH` (`8`) | Max alerts per batch |
 | `EVOSSEARCH_LUXRIOT_SEV_*` | Severity token mapping to Luxriot |
+
+Live media uses Evo's server-side `addStreamToken` / `retrieveLiveStreamByToken`
+flow with a secret-safe direct-Digest fallback. When summaries are running, the UI
+defaults to the shared `/luxriot/attention_stream/<channel>` model view so operator
+preview does not open a second recorder stream; `Full live` is an explicit opt-in.
 
 ## Video-description / summaries
 
@@ -99,7 +118,9 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | Var (default) | Notes |
 |---|---|
 | `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
-| `EVOSSEARCH_LM_*_PROFILE_*` | Per-profile base_url / model / timeout / kind `[FIELD]` |
+| `EVOSSEARCH_LM_PROFILE_<ID>_*` | Per-profile base URL / model / timeout / kind `[FIELD]` |
+| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker |
+| `EVOSSEARCH_LM_PROFILE_<ID>_MAX_INFLIGHT` | Per-profile admission override, falling back to `EVOSSEARCH_LM_MAX_INFLIGHT`; profiles sharing an endpoint use the smallest configured capacity |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
 | `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
 | `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |

@@ -293,6 +293,46 @@ class _AgentRunner:
 
 
 class HttpAuthRouteTests(unittest.TestCase):
+    def test_video_lm_generation_preflight_runs_after_admission_before_http(self):
+        order = []
+
+        class Admission:
+            def __enter__(self):
+                order.append("admitted")
+                return "ticket"
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                order.append("released")
+                return False
+
+        class Superseded(RuntimeError):
+            superseded = True
+
+        marker = Superseded("old generation")
+
+        def preflight():
+            order.append("preflight")
+            raise marker
+
+        profile = {
+            "id": "vlm-test",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "qwen-test",
+            "api_key": "",
+            "timeout": 30,
+            "kind": "vlm",
+        }
+        with (
+            patch("oldapp._resolve_lm_profile", return_value=profile),
+            patch.object(oldapp._lm_admission_controller, "admission", return_value=Admission()),
+            patch("oldapp.requests.post") as post,
+        ):
+            with self.assertRaises(Superseded):
+                oldapp._call_video_understanding([], preflight=preflight)
+
+        self.assertEqual(order, ["admitted", "preflight", "released"])
+        post.assert_not_called()
+
     def setUp(self) -> None:
         self.original = {
             "AUTH_ENABLED": oldapp.config.AUTH_ENABLED,
@@ -494,6 +534,8 @@ class HttpAuthRouteTests(unittest.TestCase):
     def test_sensitive_reads_require_login_and_channel_scope(self) -> None:
         anonymous = self.client.get("/luxriot/channels")
         self.assertEqual(anonymous.status_code, 401)
+        anonymous_media = self.client.head("/luxriot/media/live/7")
+        self.assertEqual(anonymous_media.status_code, 401)
 
         self._login()
         allowed = self.client.get("/luxriot/channels")
@@ -501,6 +543,12 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         denied_snapshot = self.client.get("/luxriot/snapshot/8")
         self.assertEqual(denied_snapshot.status_code, 403)
+        denied_media = self.client.head("/luxriot/media/archive/8?time_ms=1700000000000")
+        self.assertEqual(denied_media.status_code, 403)
+        denied_archive_snapshot = self.client.get(
+            "/luxriot/archive_snapshot/8?time_ms=1700000000000"
+        )
+        self.assertEqual(denied_archive_snapshot.status_code, 403)
 
         self.assertTrue(
             any(
@@ -512,6 +560,22 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertTrue(
             any(
                 event.action == "http.luxriot_snapshot.access"
+                and event.result == "denied"
+                and event.channel_id == 8
+                for event in self.audit.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.action == "http.luxriot_media.access"
+                and event.result == "denied"
+                and event.channel_id == 8
+                for event in self.audit.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.action == "http.luxriot_archive_snapshot.access"
                 and event.result == "denied"
                 and event.channel_id == 8
                 for event in self.audit.events
@@ -1094,6 +1158,50 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_enabled"])
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_cooldown_sec"])
 
+        with patch("oldapp.luxriot_manager.update_prompt_settings") as update_settings:
+            denied_bookmark_reset = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "clear_override_fields": ["bookmark_enabled"]},
+            )
+
+        self.assertEqual(denied_bookmark_reset.status_code, 403)
+        update_settings.assert_not_called()
+
+        with patch(
+            "oldapp.luxriot_manager.update_prompt_settings",
+            return_value={"stream_system_prompt": "inherited"},
+        ) as update_settings:
+            allowed_prompt_reset = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "clear_override_fields": ["stream_system_prompt"]},
+            )
+
+        self.assertEqual(allowed_prompt_reset.status_code, 200, allowed_prompt_reset.get_json())
+        self.assertEqual(
+            update_settings.call_args.kwargs["clear_override_fields"],
+            ["stream_system_prompt"],
+        )
+
+    def test_luxriot_rollups_reject_invalid_target_level_as_bad_request(self) -> None:
+        self.repository.identity = replace(
+            self.repository.identity,
+            permissions=frozenset(
+                {
+                    Permission.REPORTS_VIEW.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        response = self.client.get("/luxriot/rollups?channel_id=7&target_level=L9")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("target_level", response.get_json()["error"])
+
     def test_probe_bookmark_save_requires_bookmark_permission(self) -> None:
         self.repository.identity = _Identity(
             permissions=frozenset(
@@ -1261,7 +1369,9 @@ class HttpAuthRouteTests(unittest.TestCase):
 
     def test_lm_models_requires_authenticated_diagnostics_permission(self) -> None:
         anonymous = self.client.get("/lm/models")
+        anonymous_admission = self.client.get("/lm/admission")
         self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous_admission.status_code, 401)
 
         self.repository.identity = _Identity(
             permissions=frozenset(
@@ -1287,7 +1397,10 @@ class HttpAuthRouteTests(unittest.TestCase):
             ),
         ):
             scoped_engineer = self.client.get("/lm/models?force=1")
+            admission = self.client.get("/lm/admission")
         self.assertEqual(scoped_engineer.status_code, 200)
+        self.assertEqual(admission.status_code, 200)
+        self.assertTrue(admission.get_json()["enabled"])
         event = next(
             event for event in self.audit.events if event.action == "lm.models.completed"
         )

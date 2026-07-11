@@ -120,6 +120,12 @@ class Transcript:
                 return result
         return None
 
+    def results_of(self, name: str) -> List[Any]:
+        return [result for n, result, _err in self.tool_results if n == name]
+
+    def errors_of(self, name: str) -> List[str]:
+        return [str(error) for n, _result, error in self.tool_results if n == name and error]
+
     def approval_plan_ids(self) -> List[str]:
         ids: List[str] = []
         for _n, result, _err in self.tool_results:
@@ -175,6 +181,26 @@ class EvaSession:
         resp = self.http.get(f"{self.base_url}/auth/me", timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
+
+    def get_json(
+        self,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """GET one authenticated frontend endpoint and require an object response."""
+
+        normalized = "/" + str(path or "").lstrip("/")
+        resp = self.http.get(
+            f"{self.base_url}{normalized}",
+            params=params or None,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise TypeError(f"{normalized} returned {type(payload).__name__}, expected object")
+        return payload
 
     def ask(self, message: str, session_id: Optional[str] = None, image_b64: Optional[str] = None) -> Transcript:
         body: Dict[str, Any] = {"message": message}

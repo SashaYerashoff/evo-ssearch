@@ -85,6 +85,7 @@ class LuxriotInferenceQueueRuntime:
         self._last_gc_at = 0.0
         self._completed_count = 0
         self._failed_count = 0
+        self._superseded_count = 0
 
     def start(self) -> None:
         with self._state_lock:
@@ -173,6 +174,7 @@ class LuxriotInferenceQueueRuntime:
             last_error = self._last_error
             completed = self._completed_count
             failed = self._failed_count
+            superseded = self._superseded_count
         return {
             "enabled": True,
             "started": started,
@@ -188,6 +190,7 @@ class LuxriotInferenceQueueRuntime:
             "dead_letter_count": metrics.dead_letter_count,
             "completed_count": completed,
             "failed_count": failed,
+            "superseded_count": superseded,
             "last_error": last_error,
         }
 
@@ -251,6 +254,9 @@ class LuxriotInferenceQueueRuntime:
         except Exception as exc:
             renew_stop.set()
             renew_thread.join(timeout=1.0)
+            if bool(getattr(exc, "superseded", False)):
+                self._complete_superseded_job(worker, job, exc)
+                return
             self._fail_job(worker, job, exc)
             return
         finally:
@@ -267,6 +273,28 @@ class LuxriotInferenceQueueRuntime:
         except Exception as exc:
             # The durable result remains in PostgreSQL and is retried by reconciliation.
             self._set_error(exc)
+
+    def _complete_superseded_job(self, worker: InferenceWorker, job: Any, exc: Exception) -> None:
+        reason = self._safe_error(exc)
+        try:
+            worker.complete(
+                job.id,
+                {
+                    "accepted": False,
+                    "superseded": True,
+                    "status": "superseded",
+                    "channel_id": job.channel_id,
+                    "run_id": str(job.payload.get("run_id") or ""),
+                    "stale_reason": reason,
+                },
+                metadata={"kind": _SPOOL_KIND, "status": "superseded"},
+            )
+            self._delete_spool(str(job.payload.get("spool_file") or ""))
+            with self._state_lock:
+                self._superseded_count += 1
+                self._last_error = None
+        except Exception as complete_exc:
+            self._fail_job(worker, job, complete_exc)
 
     def _fail_job(self, worker: InferenceWorker, job: Any, exc: Exception) -> None:
         error = self._safe_error(exc)

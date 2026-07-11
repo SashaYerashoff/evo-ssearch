@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import inspect
 import re
+import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -13,7 +15,9 @@ from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
     _SENSITIVE_ENDPOINT_PERMISSIONS,
     _build_detection_search_result,
+    _env_precedence_report,
     _store_vlm_summary_archive_frames,
+    ProbesStore,
     app,
     config,
 )
@@ -65,7 +69,13 @@ def _collect_frontend_and_backend_paths() -> Tuple[Set[str], Set[str]]:
     fetch_paths.extend(re.findall(r"fetch\(\s*`(/[^`]*)`", source))
     src_paths = re.findall(r"\.src\s*=\s*['\"](/[^'\"]+)['\"]", source)
     src_paths.extend(re.findall(r"\.src\s*=\s*`(/[^`]*)`", source))
-    frontend_paths = {_normalize_frontend_path(path) for path in fetch_paths + src_paths}
+    # URL-builder helpers (media broker, attention stream, image fetch) hand
+    # root-relative template literals to fetch()/media elements indirectly.
+    builder_paths = re.findall(r"return\s+`(/[^`]*)`", source)
+    frontend_paths = {
+        _normalize_frontend_path(path)
+        for path in fetch_paths + src_paths + builder_paths
+    }
     backend_routes = {path for _, path in re.findall(r"@app\.route\(\s*([`'\"])(/[^`'\"]+)\1", source)}
     return frontend_paths, backend_routes
 
@@ -101,6 +111,72 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         )
         self.assertEqual(unmatched, [], f"Frontend endpoints missing backend routes: {unmatched}")
 
+    def test_probe_runtime_patch_preserves_operator_edits_and_never_resurrects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ProbesStore(Path(temp_dir) / "probes.json")
+            original = store.upsert_probe(
+                {
+                    "id": "probe-1",
+                    "name": "Door watch",
+                    "bookmark": True,
+                    "pos_floor": 0.2,
+                }
+            )
+            stale_daemon_copy = dict(original)
+            store.upsert_probe(
+                {
+                    **original,
+                    "bookmark": False,
+                    "pos_floor": 0.8,
+                }
+            )
+
+            patched = store.patch_probe_runtime(
+                "probe-1",
+                {
+                    "last_hit": {"timestamp_ms": 123},
+                    "recent_hits": [{"timestamp_ms": 123}],
+                    "bookmark": True,
+                },
+            )
+
+            self.assertIsNotNone(patched)
+            self.assertFalse(patched["bookmark"])
+            self.assertEqual(patched["pos_floor"], 0.8)
+            self.assertEqual(patched["last_hit"]["timestamp_ms"], 123)
+            self.assertTrue(store.delete_probe("probe-1"))
+            self.assertIsNone(
+                store.patch_probe_runtime(
+                    "probe-1",
+                    {"last_hit": stale_daemon_copy},
+                )
+            )
+            self.assertEqual(store.list_probes(), [])
+
+    def test_env_precedence_reports_process_difference_without_values(self) -> None:
+        file_secret_hash = hashlib.sha256(b"different-secret").hexdigest()
+        report = _env_precedence_report(
+            file_map={
+                "EVOSSEARCH_LUXRIOT_PASSWORD": "file-secret",
+                "EVOSSEARCH_PORT": "5443",
+            },
+            process_keys={
+                "EVOSSEARCH_LUXRIOT_PASSWORD",
+                "EVOSSEARCH_HOST",
+            },
+            process_value_hashes={
+                "EVOSSEARCH_LUXRIOT_PASSWORD": file_secret_hash,
+            },
+        )
+
+        self.assertEqual(
+            report["different_process_and_file_keys"],
+            ["EVOSSEARCH_LUXRIOT_PASSWORD"],
+        )
+        self.assertIn("EVOSSEARCH_HOST", report["process_environment_keys"])
+        serialized = str(report)
+        self.assertNotIn("file-secret", serialized)
+
     def test_backend_only_endpoints_are_known(self) -> None:
         frontend_paths, backend_routes = _collect_frontend_and_backend_paths()
         backend_only = {
@@ -130,6 +206,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/image",
             "/image/<path:filepath>",
             "/js/app.js",
+            "/lm/admission",
             "/lm/models",
             "/luxriot/recent_frame/<int:channel_id>",
             "/ready",

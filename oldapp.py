@@ -21,8 +21,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
-from urllib.parse import unquote
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
+from urllib.parse import unquote, urlencode
 from threading import Lock
 
 import numpy as np
@@ -47,6 +47,11 @@ from eva_db import DatabaseSettings, PsycopgPool
 from inference_queue import (
     LuxriotInferenceQueueRuntime,
     PostgresInferenceQueueRepository,
+)
+from lm_admission import (
+    configured_lm_capacity,
+    get_lm_admission_controller,
+    normalize_lm_resource,
 )
 from luxriot_connector import LuxriotManager
 from probe_manager import ProbeManager
@@ -258,6 +263,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "describe_image": Permission.DETECTIONS_VIEW,
     "get_settings_env": Permission.SETTINGS_MANAGE,
     "lm_models": Permission.DIAGNOSTICS_VIEW,
+    "lm_admission_status": Permission.DIAGNOSTICS_VIEW,
     "settings_archive_capacity": Permission.DIAGNOSTICS_VIEW,
     "search": Permission.DETECTIONS_VIEW,
     "search_by_image": Permission.DETECTIONS_VIEW,
@@ -271,6 +277,9 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
     "luxriot_recent_frame": Permission.STREAMS_VIEW,
+    "luxriot_attention_stream": Permission.STREAMS_VIEW,
+    "luxriot_media": Permission.STREAMS_VIEW,
+    "luxriot_archive_snapshot": Permission.STREAMS_VIEW,
     "luxriot_snapshot": Permission.STREAMS_VIEW,
     "luxriot_snapshot_capture": Permission.STREAMS_VIEW,
     "road_scene_overlay": Permission.DIAGNOSTICS_VIEW,
@@ -1902,12 +1911,11 @@ def branding_logo():
 
 @app.route('/js/app.js')
 def serve_app_js():
-    """Serve app.js with runtime config values injected (5 Luxriot defaults)."""
+    """Serve app.js with non-secret runtime defaults injected."""
     js_path = Path(__file__).resolve().parent / 'static' / 'js' / 'app.js'
     js = js_path.read_text(encoding='utf-8')
     luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
     js = js.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
-    js = js.replace('{luxriot_base_url_json}', json.dumps(str(config.LUXRIOT_BASE_URL or "")))
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
@@ -2803,12 +2811,16 @@ def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+_lm_admission_controller = get_lm_admission_controller()
+
+
 def _call_lm_chat(
     messages: List[Dict[str, Any]],
     model_override: Optional[str] = None,
     *,
     profile_id: Optional[str] = None,
     profile_kind: str = "vlm",
+    preflight: Optional[Callable[[], None]] = None,
 ) -> str:
     profile = _resolve_lm_profile(
         profile_id=profile_id,
@@ -2832,6 +2844,9 @@ def _call_lm_chat(
         "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
     }
     response: Optional[requests.Response] = None
+    resource = normalize_lm_resource(base_url, str(profile.get("model") or ""))
+    capacity = configured_lm_capacity(str(profile.get("id") or ""), default=1)
+    workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
 
     def _response_error_detail(resp: Any) -> str:
         try:
@@ -2856,13 +2871,21 @@ def _call_lm_chat(
         return "empty error response"
 
     try:
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            json=payload,
-            timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
-        )
-        response.raise_for_status()
+        with _lm_admission_controller.admission(
+            resource,
+            workload=workload,
+            capacity=capacity,
+            timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
+        ):
+            if preflight is not None:
+                preflight()
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
+            )
+            response.raise_for_status()
     except requests.HTTPError as exc:
         resp = getattr(exc, "response", None) or response
         detail = _response_error_detail(resp) if resp is not None else str(exc)
@@ -2873,6 +2896,8 @@ def _call_lm_chat(
             f"(model {payload['model']}): {status_text}; {detail}"
         ) from exc
     except Exception as exc:
+        if bool(getattr(exc, "superseded", False)):
+            raise
         raise RuntimeError(
             f"LM request failed for profile {profile['id']} "
             f"(model {payload['model']}): {exc}"
@@ -2898,13 +2923,18 @@ def _call_video_understanding(
     model_override: Optional[str] = None,
     *,
     profile_id: Optional[str] = None,
+    preflight: Optional[Callable[[], None]] = None,
 ) -> str:
     return _call_lm_chat(
         messages,
         model_override=model_override,
         profile_id=profile_id,
         profile_kind="vlm",
+        preflight=preflight,
     )
+
+
+_call_video_understanding.eva_generation_preflight = True  # type: ignore[attr-defined]
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -3452,6 +3482,44 @@ class ProbesStore:
                 probe_list[existing] = stored_probe
             self._save_locked()
             return copy.deepcopy(stored_probe)
+
+    def patch_probe_runtime(
+        self,
+        probe_id: str,
+        changes: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Merge daemon-owned state without replacing operator configuration."""
+
+        normalized = str(probe_id or "").strip()
+        if not normalized:
+            raise ValueError("probe id is required")
+        allowed_runtime_fields = {
+            "last_hit",
+            "recent_hits",
+            "bookmark_gate",
+            "bookmark_gate_updated_at_ms",
+        }
+        runtime_patch = {
+            str(key): copy.deepcopy(value)
+            for key, value in dict(changes or {}).items()
+            if str(key) in allowed_runtime_fields
+        }
+        if not runtime_patch:
+            return None
+        with self.lock:
+            probes = self.data.get("probes", [])
+            if not isinstance(probes, list):
+                return None
+            for index, current in enumerate(probes):
+                if not isinstance(current, dict) or str(current.get("id") or "") != normalized:
+                    continue
+                merged = copy.deepcopy(current)
+                merged.update(runtime_patch)
+                probes[index] = merged
+                self._save_locked()
+                return copy.deepcopy(merged)
+        # A late result must not resurrect a probe deleted by the operator.
+        return None
 
     def delete_probe(self, probe_id: str) -> bool:
         with self.lock:
@@ -6634,8 +6702,9 @@ def _probe_daemon() -> None:
                                                 bookmark_gate.get("error") or "unknown error",
                                             )
                                         )
+                            bookmark_gate_updated_at_ms = int(time.time() * 1000)
                             probe['bookmark_gate'] = bookmark_gate
-                            probe['bookmark_gate_updated_at_ms'] = int(time.time() * 1000)
+                            probe['bookmark_gate_updated_at_ms'] = bookmark_gate_updated_at_ms
                             _store_probe_hits(
                                 probe,
                                 hits,
@@ -6648,7 +6717,18 @@ def _probe_daemon() -> None:
                                     'bookmark_gate': bookmark_gate,
                                 },
                             )
-                            probes_store.upsert_probe(probe)
+                            runtime_patch = {
+                                'last_hit': hits[0],
+                                'recent_hits': recent,
+                                'bookmark_gate': bookmark_gate,
+                                'bookmark_gate_updated_at_ms': bookmark_gate_updated_at_ms,
+                            }
+                            patch_runtime = getattr(probes_store, 'patch_probe_runtime', None)
+                            if not callable(patch_runtime):
+                                raise RuntimeError(
+                                    'Probe store does not support atomic runtime updates.'
+                                )
+                            patch_runtime(str(probe.get('id') or ''), runtime_patch)
                 except Exception as exc:
                     print(f"Probe daemon channel loop error (channel {ch}): {exc}")
                     continue
@@ -9097,7 +9177,15 @@ def luxriot_channels():
 
 @app.route('/luxriot/snapshot/<int:channel_id>', methods=['GET'])
 def luxriot_snapshot(channel_id: int):
-    stream_type = request.args.get('stream', 'mainStream')
+    stream_type = _luxriot_media_stream_name(request.args.get('stream', 'mainStream'))
+    if stream_type is None:
+        return _luxriot_media_error_response(
+            status=400,
+            error_code="invalid_snapshot_request",
+            message="Provide a valid stream name.",
+            media_kind="live",
+            channel_id=channel_id,
+        )
     try:
         encoded, meta = luxriot_manager.get_snapshot_base64(channel_id, stream_type=stream_type)
         img_bytes = base64.b64decode(encoded)
@@ -9108,7 +9196,695 @@ def luxriot_snapshot(channel_id: int):
         response.headers['X-Image-Height'] = str(meta.get('height'))
         return response
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        app.logger.warning(
+            "Luxriot snapshot failed request_id=%s channel_id=%s error_type=%s",
+            getattr(g, "request_id", ""),
+            channel_id,
+            type(exc).__name__,
+        )
+        return _luxriot_media_error_response(
+            status=504 if _luxriot_media_is_timeout(exc) else 502,
+            error_code="snapshot_timeout" if _luxriot_media_is_timeout(exc) else "snapshot_unavailable",
+            message="The Luxriot snapshot timed out." if _luxriot_media_is_timeout(exc) else "The Luxriot snapshot is unavailable.",
+            media_kind="live",
+            channel_id=channel_id,
+        )
+
+
+_LUXRIOT_MEDIA_STREAM_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_LUXRIOT_MEDIA_RANGE_RE = re.compile(r"^bytes=(?:(\d+)-(\d*)|-(\d+))$")
+_LUXRIOT_MEDIA_CHUNK_BYTES = 64 * 1024
+
+
+def _luxriot_media_config_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(getattr(config, name, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _luxriot_media_config_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(getattr(config, name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(int(minimum), min(int(maximum), value))
+
+
+def _luxriot_media_limits(media_kind: str) -> Tuple[Tuple[float, float], float, int]:
+    connect_timeout = _luxriot_media_config_float(
+        "LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC", 3.0, 0.25, 30.0
+    )
+    read_timeout = _luxriot_media_config_float(
+        "LUXRIOT_MEDIA_READ_TIMEOUT_SEC", 8.0, 0.5, 60.0
+    )
+    if media_kind == "archive":
+        max_seconds = _luxriot_media_config_float(
+            "LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS", 45.0, 1.0, 300.0
+        )
+        max_bytes = _luxriot_media_config_int(
+            "LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES", 128 * 1024 * 1024, 1024, 512 * 1024 * 1024
+        )
+    else:
+        max_seconds = _luxriot_media_config_float(
+            "LUXRIOT_LIVE_MEDIA_MAX_SECONDS", 120.0, 1.0, 120.0
+        )
+        max_bytes = _luxriot_media_config_int(
+            "LUXRIOT_LIVE_MEDIA_MAX_BYTES", 256 * 1024 * 1024, 1024, 256 * 1024 * 1024
+        )
+    return (connect_timeout, read_timeout), max_seconds, max_bytes
+
+
+def _luxriot_media_safe_header(value: Any, limit: int = 512) -> str:
+    return str(value or "").replace("\r", " ").replace("\n", " ").strip()[:limit]
+
+
+def _luxriot_media_stream_name(value: Any) -> Optional[str]:
+    stream = str(value or "mainStream").strip() or "mainStream"
+    return stream if _LUXRIOT_MEDIA_STREAM_RE.fullmatch(stream) else None
+
+
+def _luxriot_media_range_header(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.lower()
+    match = _LUXRIOT_MEDIA_RANGE_RE.fullmatch(normalized)
+    if match is None:
+        raise ValueError("Only one HTTP bytes range is supported.")
+    start_raw, end_raw, suffix_raw = match.groups()
+    if suffix_raw is not None:
+        if int(suffix_raw) <= 0:
+            raise ValueError("The suffix byte range must be positive.")
+        return normalized
+    start = int(start_raw or 0)
+    if end_raw:
+        end = int(end_raw)
+        if end < start:
+            raise ValueError("The byte range end precedes its start.")
+    return normalized
+
+
+def _luxriot_media_fallback_url(
+    media_kind: str,
+    channel_id: int,
+    stream: str,
+    time_ms: Optional[int],
+) -> str:
+    params: Dict[str, Any] = {"stream": stream}
+    if media_kind == "archive" and time_ms is not None:
+        params["time_ms"] = int(time_ms)
+        return f"/luxriot/archive_snapshot/{int(channel_id)}?{urlencode(params)}"
+    return f"/luxriot/snapshot/{int(channel_id)}?{urlencode(params)}"
+
+
+def _luxriot_media_error_response(
+    *,
+    status: int,
+    error_code: str,
+    message: str,
+    media_kind: str,
+    channel_id: int,
+    fallback_url: Optional[str] = None,
+    upstream_content_type: Optional[str] = None,
+):
+    payload: Dict[str, Any] = {
+        "success": False,
+        "error_code": error_code,
+        "error": message,
+        "media_kind": media_kind,
+        "channel_id": int(channel_id),
+    }
+    if fallback_url:
+        payload["fallback"] = {
+            "kind": "static_frame",
+            "url": fallback_url,
+            "is_video": False,
+        }
+    if upstream_content_type:
+        payload["upstream_content_type"] = _luxriot_media_safe_header(upstream_content_type, 160)
+    response = jsonify(payload)
+    response.status_code = int(status)
+    response.headers["Cache-Control"] = "no-store, private, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["X-EVA-Media-State"] = "error"
+    response.headers["X-EVA-Media-Error"] = error_code
+    if fallback_url:
+        response.headers["X-EVA-Media-Fallback"] = fallback_url
+    if status == 416:
+        response.headers["Content-Range"] = "bytes */*"
+    return response
+
+
+def _luxriot_media_is_timeout(exc: BaseException) -> bool:
+    current: Optional[BaseException] = exc
+    seen: Set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.Timeout, TimeoutError, socket.timeout)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _luxriot_media_http_status(exc: BaseException) -> Optional[int]:
+    current: Optional[BaseException] = exc
+    seen: Set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        try:
+            status = int(getattr(response, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status > 0:
+            return status
+        current = current.__cause__ or current.__context__
+    return None
+
+
+class _LuxriotArchiveGapError(RuntimeError):
+    pass
+
+
+def _luxriot_media_open_upstream(
+    *,
+    media_kind: str,
+    channel_id: int,
+    stream: str,
+    time_ms: Optional[int],
+    range_header: Optional[str],
+):
+    timeout, _, _ = _luxriot_media_limits(media_kind)
+    headers = {
+        "Accept": "video/mp4,video/webm,video/ogg,video/mp2t,multipart/x-mixed-replace,application/octet-stream,*/*",
+        "Accept-Encoding": "identity",
+    }
+    if media_kind == "archive":
+        headers["Streaming-Web-Ver"] = "1.3.0"
+    if range_header:
+        headers["Range"] = range_header
+    client = luxriot_manager.build_client()
+    media_meta: Dict[str, Any] = {}
+    if media_kind == "archive":
+        path = f"/archive/{int(channel_id)}/stream"
+        requested_time_ms = int(time_ms or 0)
+        resolved_time_ms = requested_time_ms
+        alignment = "requested_time"
+        frame_time_response = None
+        try:
+            frame_time_response = client._request(
+                "GET",
+                f"/archive/{int(channel_id)}/nextFrameTime",
+                params={"time": requested_time_ms, "streamType": stream},
+                headers={"Accept": "text/plain", "Accept-Encoding": "identity"},
+                stream=False,
+                timeout=timeout,
+            )
+            raw_frame_time = str(getattr(frame_time_response, "text", "") or "").strip()
+            parsed_frame_time = int(raw_frame_time) if raw_frame_time else 0
+            if parsed_frame_time <= 0:
+                raise _LuxriotArchiveGapError("No recorded archive frame exists at or after the requested time.")
+            resolved_time_ms = parsed_frame_time
+            alignment = "next_frame_time"
+        except _LuxriotArchiveGapError:
+            raise
+        except Exception:
+            # Older Evo variants may not expose nextFrameTime. Preserve legacy
+            # playback but make the missing alignment capability visible.
+            alignment = "next_frame_time_unavailable"
+            resolved_time_ms = requested_time_ms
+        finally:
+            if frame_time_response is not None:
+                frame_time_response.close()
+        params = {
+            "time": resolved_time_ms,
+            "streamType": stream,
+            "duration": 1,
+            "html5compatible": "true",
+        }
+        media_meta = {
+            "archive_requested_time_ms": requested_time_ms,
+            "archive_resolved_time_ms": resolved_time_ms,
+            "archive_frame_alignment": alignment,
+            "html5_compatible": "requested",
+        }
+    else:
+        path = f"/live/{int(channel_id)}/{stream}"
+        params = None
+    # Keep DigestAuth and any token/recorder redirects entirely server-side.
+    try:
+        if media_kind == "live":
+            open_live_stream = getattr(client, "open_live_stream", None)
+            if callable(open_live_stream):
+                upstream = open_live_stream(
+                    int(channel_id),
+                    stream=stream,
+                    headers=headers,
+                    timeout=timeout,
+                )
+            else:
+                # Clients without the token transport keep the legacy direct
+                # live path; the broker contract is duck-typed on _request.
+                upstream = client._request(
+                    "GET",
+                    path,
+                    params=params,
+                    headers=headers,
+                    stream=True,
+                    timeout=timeout,
+                )
+        else:
+            upstream = client._request(
+                "GET",
+                path,
+                params=params,
+                headers=headers,
+                stream=True,
+                timeout=timeout,
+            )
+    except Exception as exc:
+        if media_kind != "archive" or _luxriot_media_http_status(exc) not in {400, 404, 405, 422}:
+            raise
+        legacy_params = {
+            "time": int(media_meta["archive_resolved_time_ms"]),
+            "streamType": stream,
+        }
+        upstream = client._request(
+            "GET",
+            path,
+            params=legacy_params,
+            headers=headers,
+            stream=True,
+            timeout=timeout,
+        )
+        media_meta["html5_compatible"] = "unsupported_fallback"
+    try:
+        setattr(upstream, "_eva_media_meta", media_meta)
+    except Exception:
+        pass
+    return upstream
+
+
+def _luxriot_media_first_chunk(upstream: Any) -> Tuple[Any, bytes]:
+    iterator = upstream.iter_content(chunk_size=_LUXRIOT_MEDIA_CHUNK_BYTES)
+    for _ in range(32):
+        raw = next(iterator)
+        if raw is None:
+            continue
+        chunk = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+        if chunk:
+            return iterator, chunk
+    raise RuntimeError("Luxriot media stream returned no bytes.")
+
+
+def _luxriot_media_negotiation(
+    upstream_content_type: Any,
+    first_chunk: bytes,
+    *,
+    range_header: Optional[str],
+) -> Tuple[Optional[str], Optional[str], str]:
+    content_type = _luxriot_media_safe_header(upstream_content_type, 256)
+    base_type = content_type.split(";", 1)[0].strip().lower()
+    head = first_chunk[:4096]
+    if base_type == "multipart/x-mixed-replace":
+        if "boundary=" not in content_type.lower():
+            first_line = head.split(b"\r\n", 1)[0].strip()
+            if first_line.startswith(b"--"):
+                boundary = first_line[2:130].decode("ascii", errors="ignore").strip()
+                if boundary and re.fullmatch(r"[A-Za-z0-9'()+_,./:=?-]{1,128}", boundary):
+                    content_type = f"multipart/x-mixed-replace; boundary={boundary}"
+        return "mjpeg", content_type or "multipart/x-mixed-replace", ""
+    # Some Evo/recorder variants return the generic octet-stream type for
+    # multipart MJPEG.  Recover the boundary from the first part instead of
+    # asking the browser to decode it as MP4.
+    first_line = head.split(b"\r\n", 1)[0].strip()
+    if (
+        base_type in {"", "application/octet-stream"}
+        and first_line.startswith(b"--")
+        and b"content-type: image/jpeg" in head.lower()
+    ):
+        boundary = first_line[2:130].decode("ascii", errors="ignore").strip()
+        if boundary and re.fullmatch(r"[A-Za-z0-9'()+_,./:=?-]{1,128}", boundary):
+            return "mjpeg", f"multipart/x-mixed-replace; boundary={boundary}", ""
+    # Bytes are authoritative when a recorder labels a JPEG snapshot as video.
+    if base_type.startswith("image/") or head.startswith(b"\xff\xd8\xff"):
+        return None, None, "snapshot_only"
+    if base_type.startswith("video/"):
+        return "video", content_type, ""
+    if len(head) >= 8 and (head[4:8] in {b"ftyp", b"styp", b"moov", b"moof"} or b"ftyp" in head[:64]):
+        return "video", "video/mp4", ""
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "video", "video/webm", ""
+    if head.startswith(b"\x47") and (len(head) < 189 or head[188:189] == b"\x47"):
+        return "video", "video/mp2t", ""
+    if range_header and base_type in {"", "application/octet-stream"}:
+        # A later MP4 byte range need not contain the file signature. The browser
+        # still validates the codec/container before entering the playing state.
+        return "video", "video/mp4", ""
+    return None, None, "unsupported_media"
+
+
+def _luxriot_media_renew_after_ms(max_seconds: float) -> int:
+    """Tell live clients to reconnect before this bounded response is cut."""
+
+    lease_ms = max(1000, int(float(max_seconds) * 1000.0))
+    return max(750, min(lease_ms - 250, int(lease_ms * 0.75)))
+
+
+def _luxriot_media_response_headers(
+    upstream: Any,
+    *,
+    media_kind: str,
+    negotiated_kind: str,
+    content_type: str,
+    max_seconds: float,
+    max_bytes: int,
+    range_header: Optional[str],
+) -> Dict[str, str]:
+    upstream_headers = getattr(upstream, "headers", {}) or {}
+    headers = {
+        "Content-Type": content_type,
+        "Cache-Control": "no-store, private, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-EVA-Media-State": "playing",
+        "X-EVA-Media-Kind": negotiated_kind,
+        "X-EVA-Media-Source": f"luxriot-{media_kind}",
+        "X-EVA-Media-Bounded": "1",
+    }
+    if media_kind == "live":
+        headers["X-EVA-Media-Lease-Seconds"] = f"{float(max_seconds):g}"
+        headers["X-EVA-Media-Renew-After-Ms"] = str(
+            _luxriot_media_renew_after_ms(max_seconds)
+        )
+        live_transport = _luxriot_media_safe_header(
+            getattr(upstream, "_eva_live_transport", ""),
+            40,
+        )
+        if live_transport:
+            headers["X-EVA-Live-Transport"] = live_transport
+    for name in ("Content-Range", "Accept-Ranges"):
+        value = _luxriot_media_safe_header(upstream_headers.get(name) or upstream_headers.get(name.lower()))
+        if value:
+            headers[name] = value
+    headers.setdefault("Accept-Ranges", "bytes")
+    for name in ("X-Stream-Start-Time", "X-Stream-End-Time", "X-Stream-Last-Sample-Timestamp"):
+        value = _luxriot_media_safe_header(upstream_headers.get(name) or upstream_headers.get(name.lower()))
+        if value:
+            headers[name] = value
+    media_meta = getattr(upstream, "_eva_media_meta", None)
+    if isinstance(media_meta, Mapping):
+        meta_headers = {
+            "X-EVA-Archive-Requested-Time-Ms": media_meta.get("archive_requested_time_ms"),
+            "X-EVA-Archive-Resolved-Time-Ms": media_meta.get("archive_resolved_time_ms"),
+            "X-EVA-Archive-Frame-Alignment": media_meta.get("archive_frame_alignment"),
+            "X-EVA-HTML5-Compatible": media_meta.get("html5_compatible"),
+        }
+        for name, raw_value in meta_headers.items():
+            value = _luxriot_media_safe_header(raw_value, 80)
+            if value:
+                headers[name] = value
+    raw_length = _luxriot_media_safe_header(
+        upstream_headers.get("Content-Length") or upstream_headers.get("content-length"), 32
+    )
+    # A live response can end on our time lease before the recorder's advertised
+    # length has arrived.  Forwarding that length makes browsers wait forever on
+    # the final frame.  A concrete byte-range and archive segments remain safe.
+    if (
+        raw_length.isdigit()
+        and int(raw_length) <= max_bytes
+        and (media_kind == "archive" or bool(range_header))
+    ):
+        headers["Content-Length"] = raw_length
+    return headers
+
+
+@app.route('/luxriot/media/<media_kind>/<int:channel_id>', methods=['GET', 'HEAD'])
+def luxriot_media(media_kind: str, channel_id: int):
+    """Credential-safe, bounded passthrough for observed Luxriot live/archive media."""
+
+    normalized_kind = str(media_kind or "").strip().lower()
+    stream = _luxriot_media_stream_name(request.args.get("stream") or request.args.get("streamType"))
+    if normalized_kind not in {"live", "archive"} or stream is None:
+        return _luxriot_media_error_response(
+            status=400,
+            error_code="invalid_media_request",
+            message="Provide a valid live/archive media request and stream name.",
+            media_kind=normalized_kind or "unknown",
+            channel_id=channel_id,
+        )
+    time_ms: Optional[int] = None
+    if normalized_kind == "archive":
+        try:
+            time_ms = int(request.args.get("time_ms") or request.args.get("time") or 0)
+        except (TypeError, ValueError):
+            time_ms = 0
+        if time_ms <= 0:
+            return _luxriot_media_error_response(
+                status=400,
+                error_code="archive_time_required",
+                message="A positive archive time_ms is required.",
+                media_kind=normalized_kind,
+                channel_id=channel_id,
+            )
+    fallback_url = _luxriot_media_fallback_url(normalized_kind, channel_id, stream, time_ms)
+    try:
+        range_header = _luxriot_media_range_header(request.headers.get("Range"))
+    except ValueError:
+        return _luxriot_media_error_response(
+            status=416,
+            error_code="invalid_range",
+            message="Only a single valid HTTP bytes range is supported.",
+            media_kind=normalized_kind,
+            channel_id=channel_id,
+            fallback_url=fallback_url,
+        )
+    upstream = None
+    try:
+        upstream = _luxriot_media_open_upstream(
+            media_kind=normalized_kind,
+            channel_id=channel_id,
+            stream=stream,
+            time_ms=time_ms,
+            range_header=range_header,
+        )
+        iterator, first_chunk = _luxriot_media_first_chunk(upstream)
+    except Exception as exc:
+        if upstream is not None:
+            upstream.close()
+        archive_gap = isinstance(exc, _LuxriotArchiveGapError)
+        timed_out = _luxriot_media_is_timeout(exc)
+        range_not_satisfiable = bool(range_header) and _luxriot_media_http_status(exc) == 416
+        app.logger.warning(
+            "Luxriot media broker open failed request_id=%s kind=%s channel_id=%s error_type=%s",
+            getattr(g, "request_id", ""),
+            normalized_kind,
+            channel_id,
+            type(exc).__name__,
+        )
+        return _luxriot_media_error_response(
+            status=409 if archive_gap else (416 if range_not_satisfiable else (504 if timed_out else 502)),
+            error_code=(
+                "archive_gap"
+                if archive_gap
+                else "range_not_satisfiable"
+                if range_not_satisfiable
+                else "media_timeout"
+                if timed_out
+                else "media_unavailable"
+            ),
+            message=(
+                "No recorded archive frame exists at or after the requested time."
+                if archive_gap
+                else "The requested media byte range is not available."
+                if range_not_satisfiable
+                else "The Luxriot media source timed out."
+                if timed_out
+                else "The Luxriot media source is unavailable."
+            ),
+            media_kind=normalized_kind,
+            channel_id=channel_id,
+            fallback_url=fallback_url,
+        )
+
+    upstream_content_type = (getattr(upstream, "headers", {}) or {}).get("Content-Type") or (
+        getattr(upstream, "headers", {}) or {}
+    ).get("content-type")
+    negotiated_kind, content_type, negotiation_error = _luxriot_media_negotiation(
+        upstream_content_type,
+        first_chunk,
+        range_header=range_header,
+    )
+    if not negotiated_kind or not content_type:
+        upstream.close()
+        return _luxriot_media_error_response(
+            status=415,
+            error_code=negotiation_error or "unsupported_media",
+            message=(
+                "Luxriot returned a still image, not video."
+                if negotiation_error == "snapshot_only"
+                else "Luxriot returned media that this browser broker cannot safely identify as video."
+            ),
+            media_kind=normalized_kind,
+            channel_id=channel_id,
+            fallback_url=fallback_url,
+            upstream_content_type=upstream_content_type,
+        )
+
+    _, max_seconds, max_bytes = _luxriot_media_limits(normalized_kind)
+    headers = _luxriot_media_response_headers(
+        upstream,
+        media_kind=normalized_kind,
+        negotiated_kind=negotiated_kind,
+        content_type=content_type,
+        max_seconds=max_seconds,
+        max_bytes=max_bytes,
+        range_header=range_header,
+    )
+    upstream_status = int(getattr(upstream, "status_code", 200) or 200)
+    status = upstream_status if upstream_status in {200, 206} else 200
+    if request.method == "HEAD":
+        upstream.close()
+        response = Response(status=status)
+        for name, value in headers.items():
+            response.headers[name] = value
+        return response
+
+    def generate_media():
+        written = 0
+        deadline = time.monotonic() + max_seconds
+        try:
+            remaining = max_bytes - written
+            if remaining <= 0:
+                return
+            initial = first_chunk[:remaining]
+            written += len(initial)
+            if initial:
+                yield initial
+            for raw in iterator:
+                if time.monotonic() >= deadline:
+                    break
+                if raw is None:
+                    continue
+                data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+                if not data:
+                    continue
+                remaining = max_bytes - written
+                if remaining <= 0:
+                    break
+                chunk = data[:remaining]
+                written += len(chunk)
+                if chunk:
+                    yield chunk
+                if written >= max_bytes:
+                    break
+        except (requests.RequestException, OSError):
+            app.logger.warning(
+                "Luxriot media broker stream interrupted request_id=%s kind=%s channel_id=%s",
+                getattr(g, "request_id", ""),
+                normalized_kind,
+                channel_id,
+            )
+        finally:
+            upstream.close()
+
+    response = Response(stream_with_context(generate_media()), status=status, headers=headers)
+    response.call_on_close(upstream.close)
+    return response
+
+
+@app.route('/luxriot/archive_snapshot/<int:channel_id>', methods=['GET'])
+def luxriot_archive_snapshot(channel_id: int):
+    """Serve one archived frame as an explicitly degraded, non-video fallback."""
+
+    stream = _luxriot_media_stream_name(request.args.get("stream") or request.args.get("streamType"))
+    try:
+        time_ms = int(request.args.get("time_ms") or request.args.get("time") or 0)
+    except (TypeError, ValueError):
+        time_ms = 0
+    if stream is None or time_ms <= 0:
+        return _luxriot_media_error_response(
+            status=400,
+            error_code="invalid_archive_snapshot_request",
+            message="A positive archive time_ms and valid stream are required.",
+            media_kind="archive",
+            channel_id=channel_id,
+        )
+    timeout, _, _ = _luxriot_media_limits("archive")
+    upstream = None
+    try:
+        client = luxriot_manager.build_client()
+        snapshot_type = {
+            "mainstream": "video1",
+            "main": "video1",
+            "video1": "video1",
+            "substream": "video2",
+            "sub": "video2",
+            "video2": "video2",
+            "edgestream": "video3",
+            "edge": "video3",
+            "video3": "video3",
+        }.get(str(stream).strip().lower(), "video1")
+        try:
+            upstream = client._request(
+                "GET",
+                f"/archive/{int(channel_id)}/snapshot",
+                params={"time": int(time_ms), "type": snapshot_type},
+                headers={"Accept": "image/jpeg", "Accept-Encoding": "identity"},
+                stream=False,
+                timeout=timeout,
+            )
+        except Exception:
+            upstream = client._request(
+                "GET",
+                f"/archive/{int(channel_id)}/snapshot",
+                params={"time": int(time_ms), "streamType": stream},
+                headers={"Accept": "image/jpeg", "Accept-Encoding": "identity"},
+                stream=False,
+                timeout=timeout,
+            )
+        image_bytes = bytes(getattr(upstream, "content", b"") or b"")
+        upstream_type = _luxriot_media_safe_header(
+            (getattr(upstream, "headers", {}) or {}).get("Content-Type")
+            or (getattr(upstream, "headers", {}) or {}).get("content-type"),
+            160,
+        )
+        if not image_bytes or not (upstream_type.lower().startswith("image/") or image_bytes.startswith(b"\xff\xd8\xff")):
+            raise RuntimeError("Archive snapshot response was not an image.")
+    except Exception as exc:
+        if upstream is not None:
+            upstream.close()
+        timed_out = _luxriot_media_is_timeout(exc)
+        app.logger.warning(
+            "Luxriot archive snapshot failed request_id=%s channel_id=%s error_type=%s",
+            getattr(g, "request_id", ""),
+            channel_id,
+            type(exc).__name__,
+        )
+        return _luxriot_media_error_response(
+            status=504 if timed_out else 502,
+            error_code="media_timeout" if timed_out else "archive_snapshot_unavailable",
+            message="The archive snapshot timed out." if timed_out else "The archive snapshot is unavailable.",
+            media_kind="archive",
+            channel_id=channel_id,
+        )
+    finally:
+        if upstream is not None:
+            upstream.close()
+    response = make_response(image_bytes)
+    response.headers["Content-Type"] = upstream_type if upstream_type.lower().startswith("image/") else "image/jpeg"
+    response.headers["Content-Length"] = str(len(image_bytes))
+    response.headers["Cache-Control"] = "no-store, private, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-EVA-Media-State"] = "degraded"
+    response.headers["X-EVA-Media-Kind"] = "static_frame"
+    response.headers["X-EVA-Archive-Time-Ms"] = str(int(time_ms))
+    return response
 
 
 @app.route('/luxriot/recent_frame/<int:channel_id>', methods=['GET'])
@@ -9218,6 +9994,116 @@ def luxriot_recent_frame(channel_id: int):
         return response
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/attention_stream/<int:channel_id>', methods=['GET', 'HEAD'])
+def luxriot_attention_stream(channel_id: int):
+    """Stream the exact per-second apex frames already feeding EVA analytics.
+
+    This model-view transport deliberately does not open a second recorder
+    stream. It protects dense capture from operator-preview contention and makes
+    the UI honest about which frames reach CV, CLIP, VLM, and archive evidence.
+    """
+
+    max_age_sec = _luxriot_recent_frame_max_age_sec(request.args.get('max_age_sec'))
+    first_frame = _luxriot_recent_frame_item(
+        channel_id,
+        mode="latest",
+        max_age_sec=max_age_sec,
+    )
+    if not first_frame or not str(first_frame.get("thumbnail") or "").strip():
+        return _luxriot_media_error_response(
+            status=409,
+            error_code="no_fresh_eva_frame",
+            message="No fresh EVA attention frame is available for this channel yet.",
+            media_kind="live",
+            channel_id=channel_id,
+        )
+
+    boundary = "eva-attention-frame"
+    # Runtime health reports capture stalls independently. Keep the model-view
+    # transport lease long enough that MJPEG renewal itself is not visible.
+    _, lease_seconds, _ = _luxriot_media_limits("live")
+    headers = {
+        "Content-Type": f"multipart/x-mixed-replace; boundary={boundary}",
+        "Cache-Control": "no-store, private, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-EVA-Media-State": "playing",
+        "X-EVA-Media-Kind": "mjpeg",
+        "X-EVA-Media-Source": "eva-attention",
+        "X-EVA-Attention-Preview": "1",
+        "X-EVA-Media-Bounded": "1",
+        "X-EVA-Media-Lease-Seconds": f"{lease_seconds:g}",
+        "X-EVA-Media-Renew-After-Ms": str(_luxriot_media_renew_after_ms(lease_seconds)),
+    }
+    if request.method == "HEAD":
+        return Response(status=200, headers=headers)
+
+    def frame_identity(frame_item: Mapping[str, Any]) -> str:
+        selection = frame_item.get("capture_selection")
+        selected_hash = (
+            selection.get("selected_frame_hash")
+            if isinstance(selection, Mapping)
+            else None
+        )
+        return "|".join(
+            (
+                str(frame_item.get("captured_at") or frame_item.get("time_sec") or ""),
+                str(frame_item.get("frame_hash") or selected_hash or ""),
+            )
+        )
+
+    def encode_part(frame_item: Mapping[str, Any]) -> Optional[bytes]:
+        encoded = _strip_image_data_url_prefix(str(frame_item.get("thumbnail") or "").strip())
+        if not encoded:
+            return None
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except Exception:
+            return None
+        if not payload:
+            return None
+        timestamp_sec = frame_item.get("captured_at") or frame_item.get("time_sec")
+        try:
+            timestamp_ms = int(float(timestamp_sec) * 1000.0)
+        except (TypeError, ValueError):
+            timestamp_ms = 0
+        part_headers = [
+            f"--{boundary}",
+            "Content-Type: image/jpeg",
+            f"Content-Length: {len(payload)}",
+        ]
+        if timestamp_ms > 0:
+            part_headers.append(f"X-EVA-Frame-Timestamp-Ms: {timestamp_ms}")
+        prefix = ("\r\n".join(part_headers) + "\r\n\r\n").encode("ascii")
+        return prefix + payload + b"\r\n"
+
+    def generate_attention_media():
+        deadline = time.monotonic() + lease_seconds
+        last_identity = ""
+        while time.monotonic() < deadline:
+            frame_item = _luxriot_recent_frame_item(
+                channel_id,
+                mode="latest",
+                max_age_sec=max_age_sec,
+            )
+            if frame_item:
+                identity = frame_identity(frame_item)
+                if identity and identity != last_identity:
+                    part = encode_part(frame_item)
+                    if part:
+                        last_identity = identity
+                        yield part
+            time.sleep(0.1)
+        yield f"--{boundary}--\r\n".encode("ascii")
+
+    response = Response(
+        stream_with_context(generate_attention_media()),
+        status=200,
+        headers=headers,
+    )
+    return response
 
 
 @app.route('/road/scene_overlay/<int:channel_id>', methods=['GET'])
@@ -9475,7 +10361,29 @@ def luxriot_prompt_settings():
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('bookmark_cooldown_sec'), default=0.0))
     elif 'cooldown_sec' in data:
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('cooldown_sec'), default=0.0))
-    if json_alert_prompt is not None or bookmark_enabled is not None or bookmark_cooldown_sec is not None:
+    clear_override_fields: Optional[List[str]] = None
+    if 'clear_override_fields' in data:
+        raw_clear_fields = data.get('clear_override_fields')
+        if not isinstance(raw_clear_fields, list):
+            return jsonify({'error': 'clear_override_fields must be a list of setting names'}), 400
+        clear_override_fields = [str(field or '').strip() for field in raw_clear_fields]
+        if len(clear_override_fields) > 9:
+            return jsonify({'error': 'clear_override_fields contains too many entries'}), 400
+    protected_bookmark_fields = {
+        'bookmark_enabled',
+        'bookmark_cooldown_sec',
+        'json_alert_prompt',
+    }
+    clears_bookmark_field = any(
+        field in protected_bookmark_fields
+        for field in (clear_override_fields or [])
+    )
+    if (
+        json_alert_prompt is not None
+        or bookmark_enabled is not None
+        or bookmark_cooldown_sec is not None
+        or clears_bookmark_field
+    ):
         bookmark_guard = _bookmark_permission_guard_error(
             action="http.luxriot_prompt_settings.bookmark_settings",
         )
@@ -9507,6 +10415,7 @@ def luxriot_prompt_settings():
             json_alert_prompt=json_alert_prompt,
             bookmark_enabled=bookmark_enabled,
             bookmark_cooldown_sec=bookmark_cooldown_sec,
+            clear_override_fields=clear_override_fields,
         )
         audit_error = _write_completion_audit_or_error(
             action="luxriot.prompt_settings.update.completed",
@@ -9521,6 +10430,7 @@ def luxriot_prompt_settings():
                 "json_alert_prompt_updated": json_alert_prompt is not None,
                 "bookmark_enabled_updated": bookmark_enabled is not None,
                 "bookmark_cooldown_updated": bookmark_cooldown_sec is not None,
+                "cleared_override_fields": sorted(clear_override_fields or []),
                 "rollup_levels": sorted(rollup_prompt_updates.keys())
                 if isinstance(rollup_prompt_updates, Mapping)
                 else [],
@@ -9529,6 +10439,18 @@ def luxriot_prompt_settings():
         if audit_error is not None:
             return audit_error
         return jsonify({'success': True, **settings})
+    except ValueError as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.prompt_settings.update.completed",
+            result="failure",
+            target_type="luxriot_prompt_settings",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         audit_error = _write_completion_audit_or_error(
             action="luxriot.prompt_settings.update.completed",
@@ -9664,6 +10586,7 @@ def luxriot_summary_rollups():
     from_ts = request.args.get('from_ts', default=None, type=float)
     to_ts = request.args.get('to_ts', default=None, type=float)
     level_limit = request.args.get('level_limit', default=60, type=int)
+    target_level = (request.args.get('target_level') or '').strip().upper() or None
     try:
         rollups = luxriot_manager.summary_rollups(
             channel_id=channel_id,
@@ -9671,8 +10594,11 @@ def luxriot_summary_rollups():
             start_ts=from_ts,
             end_ts=to_ts,
             level_limit=level_limit,
+            target_level=target_level,
         )
         return jsonify(rollups)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
@@ -11315,6 +12241,90 @@ def _effective_env_map() -> Dict[str, str]:
     return merged
 
 
+def _env_precedence_report(
+    file_map: Optional[Mapping[str, str]] = None,
+    process_keys: Optional[Iterable[str]] = None,
+    process_value_hashes: Optional[Mapping[str, str]] = None,
+    file_path: Union[str, Path] = ".env",
+) -> Dict[str, Any]:
+    """Describe effective configuration ownership without returning values."""
+
+    project_map = dict(file_map) if isinstance(file_map, Mapping) else _read_env_file_map(file_path)
+    frozen_process_keys = set(
+        process_keys
+        if process_keys is not None
+        else getattr(config, "ENV_KEYS_BEFORE_DOTENV", frozenset())
+    )
+    project_keys = {
+        str(key) for key in project_map
+        if str(key).startswith(ENV_PREFIX)
+    }
+    process_env_keys = {
+        str(key) for key in frozen_process_keys
+        if str(key).startswith(ENV_PREFIX)
+    }
+    frozen_hashes = dict(
+        process_value_hashes
+        if isinstance(process_value_hashes, Mapping)
+        else getattr(config, "ENV_VALUE_HASHES_BEFORE_DOTENV", {})
+    )
+    process_precedence_keys = sorted(project_keys.intersection(process_env_keys))
+    aligned_keys: List[str] = []
+    different_keys: List[str] = []
+    for key in process_precedence_keys:
+        current_hash = str(frozen_hashes.get(key) or "")
+        file_hash = hashlib.sha256(
+            str(project_map.get(key) or "").encode("utf-8", errors="replace")
+        ).hexdigest()
+        if current_hash and secrets.compare_digest(current_hash, file_hash):
+            aligned_keys.append(key)
+        else:
+            different_keys.append(key)
+    effective_keys = set(_effective_env_map())
+    runtime_default_keys = sorted(effective_keys.difference(project_keys).difference(process_env_keys))
+    process_only_keys = sorted(process_env_keys.difference(project_keys))
+    declared_env_file = str(getattr(config, "CONFIG_ENV_FILE_BEFORE_DOTENV", "") or "").strip()
+    declared_matches_project = False
+    if declared_env_file:
+        try:
+            declared_matches_project = Path(declared_env_file).resolve(strict=False) == Path(file_path).resolve(strict=False)
+        except Exception:
+            declared_matches_project = False
+    return {
+        "order": ["process_environment", "project_.env", "runtime_default"],
+        "process_environment_keys": sorted(process_env_keys),
+        "project_env_keys": sorted(project_keys),
+        "process_precedence_keys": process_precedence_keys,
+        "aligned_process_and_file_keys": aligned_keys,
+        "different_process_and_file_keys": different_keys,
+        "process_only_keys": process_only_keys,
+        "runtime_default_keys": runtime_default_keys,
+        "different_count": len(different_keys),
+        "declared_config_env_file": declared_env_file or None,
+        "declared_file_matches_project": declared_matches_project,
+        "source_confidence": "declared_env_file" if declared_matches_project else "process_origin_unknown",
+        "note": (
+            "Process environment wins at runtime. A differing value is either pending restart "
+            "or supplied by an external service override; declared_config_env_file distinguishes the known file case."
+        ),
+    }
+
+
+def _env_values_different_from_started_process(values: Mapping[str, str]) -> List[str]:
+    hashes = dict(getattr(config, "ENV_VALUE_HASHES_BEFORE_DOTENV", {}) or {})
+    different: List[str] = []
+    for key, value in values.items():
+        started_hash = str(hashes.get(str(key)) or "")
+        if not started_hash:
+            continue
+        next_hash = hashlib.sha256(
+            str(value or "").encode("utf-8", errors="replace")
+        ).hexdigest()
+        if not secrets.compare_digest(started_hash, next_hash):
+            different.append(str(key))
+    return sorted(different)
+
+
 def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
     existing_map = _read_env_file_map(".env")
     extra_evos = [
@@ -11549,12 +12559,14 @@ def get_settings_env():
         return guard
     try:
         env_map = _redact_env_map(_effective_env_map())
+        precedence = _env_precedence_report()
         return jsonify(
             {
                 'success': True,
                 'envVariables': env_map,
                 'envText': _serialize_env_map(env_map),
                 'count': len(env_map),
+                'precedence': precedence,
             }
         )
     except Exception as exc:
@@ -11608,11 +12620,21 @@ def save_settings_env():
         )
         if audit_error is not None:
             return audit_error
+        pending_or_overridden_keys = _env_values_different_from_started_process(target_env)
+        precedence = _env_precedence_report(file_map=merged_map)
+        message = 'Environment variables saved to .env. Restart the server to apply changes.'
+        if pending_or_overridden_keys and not precedence.get("declared_file_matches_project"):
+            message = (
+                'Environment variables saved to .env. Some values differ from the running process; '
+                'restart may apply them, but the service environment source is not declared and must be checked.'
+            )
         return jsonify(
             {
                 'success': True,
-                'message': 'Environment variables saved to .env. Restart the server to apply all changes.',
+                'message': message,
                 'count': len(target_env),
+                'pendingOrOverriddenKeys': pending_or_overridden_keys,
+                'precedence': precedence,
             }
         )
     except Exception as exc:
@@ -12225,7 +13247,25 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
                 pass
         warmup_warning = warm_start_embedder()
         message = 'Settings saved successfully. Restart the server if issues persist.'
-        payload: Dict[str, Any] = {'success': True, 'message': message}
+        pending_or_overridden_keys = _env_values_different_from_started_process(parsed_env_content)
+        precedence = _env_precedence_report(file_map=parsed_env_content)
+        if pending_or_overridden_keys:
+            if precedence.get("declared_file_matches_project"):
+                message = (
+                    'Settings saved. Runtime-safe fields were applied; restart is required for '
+                    f'{len(pending_or_overridden_keys)} environment-backed change(s).'
+                )
+            else:
+                message = (
+                    'Settings saved, but some values differ from the running process and the service '
+                    'environment source is not declared. Restart may apply them; inspect the service override.'
+                )
+        payload: Dict[str, Any] = {
+            'success': True,
+            'message': message,
+            'pendingOrOverriddenKeys': pending_or_overridden_keys,
+            'precedence': precedence,
+        }
         if warmup_warning:
             app.logger.warning(
                 "Embedder warmup warning after settings save request_id=%s warning=%s",
@@ -12440,6 +13480,19 @@ def lm_models():
     if audit_error is not None:
         return audit_error
     return jsonify(payload)
+
+
+@app.route('/lm/admission', methods=['GET'])
+def lm_admission_status():
+    """Credential-free shared-model queue state for diagnostics and operator UI."""
+
+    return jsonify(
+        {
+            "enabled": True,
+            "status": "ready",
+            **_lm_admission_controller.status(),
+        }
+    )
 
 
 @app.route('/agent/skills', methods=['GET'])
