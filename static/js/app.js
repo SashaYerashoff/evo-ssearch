@@ -15382,11 +15382,27 @@
             }, 0);
             const dotCls = queued > 0 ? 'warn' : (active > 0 ? 'on' : 'off');
             const score = `${active} active · ${queued} queued · oldest ${oldest.toFixed(1)}s`;
+            const profiles = Array.isArray(admission.profiles) ? admission.profiles : [];
+            const modelChecks = profiles.map((profile) => {
+                if (profile && profile.model_match === false) {
+                    const configured = String(profile.configured_model || 'unknown');
+                    const servedModels = Array.isArray(profile.served_models)
+                        ? profile.served_models.map((model) => String(model || '')).filter(Boolean)
+                        : [];
+                    const served = servedModels.length ? servedModels.join(', ') : 'none';
+                    const message = `LM model mismatch: configured ${configured}, serving ${served}`;
+                    return `<div class="agent-lm-model-badge mismatch" title="${escapeHtml(message)}">${escapeHtml(message)}</div>`;
+                }
+                if (profile && profile.model_match === 'unknown') {
+                    return '<div class="agent-lm-model-badge unknown">model check unavailable</div>';
+                }
+                return '';
+            }).filter(Boolean).join('');
             return `<div class="agent-probe-mini">
                 <div class="agent-probe-dot ${dotCls}"></div>
                 <span class="agent-probe-name">LM admission</span>
                 <span class="agent-probe-score" title="Shared model admission queue">${escapeHtml(score)}</span>
-            </div>`;
+            </div>${modelChecks}`;
         }
 
         function renderAgentAnalyticsStreams(data, admission) {

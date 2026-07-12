@@ -1395,6 +1395,7 @@ class HttpAuthRouteTests(unittest.TestCase):
                 "oldapp._get_agent_config_payload",
                 return_value={"model": "qwen35-9b"},
             ),
+            patch("oldapp._lm_admission_profiles", return_value=[]),
         ):
             scoped_engineer = self.client.get("/lm/models?force=1")
             admission = self.client.get("/lm/admission")
@@ -1408,6 +1409,84 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(event.details["profile_count"], 1)
         self.assertEqual(event.details["model_count"], 1)
         self.assertTrue(event.details["force"])
+
+    def test_lm_admission_reports_served_model_match_without_credentials(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset({Permission.DIAGNOSTICS_VIEW.value}),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        profiles = {
+            "match": {
+                "id": "match",
+                "kind": "vlm",
+                "base_url": "https://user:password@lm-match.example/v1",
+                "model": "model-a",
+                "api_key": "bearer-secret",
+                "timeout": 30,
+            },
+            "mismatch": {
+                "id": "mismatch",
+                "kind": "agent",
+                "base_url": "https://lm-mismatch.example/v1",
+                "model": "model-b",
+                "api_key": "",
+                "timeout": 30,
+            },
+            "unreachable": {
+                "id": "unreachable",
+                "kind": "vlm",
+                "base_url": "https://lm-down.example/v1",
+                "model": "model-c",
+                "api_key": "down-secret",
+                "timeout": 30,
+            },
+        }
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        def get_models(url, **_kwargs):
+            if "lm-match.example" in url:
+                return Response({"data": [{"id": "model-a", "max_model_len": 32768}]})
+            if "lm-mismatch.example" in url:
+                return Response({"data": [{"id": "actually-served"}]})
+            raise oldapp.requests.Timeout("credential-bearing endpoint unavailable")
+
+        with oldapp._lm_served_models_cache_lock:
+            oldapp._lm_served_models_cache.clear()
+        with (
+            patch("oldapp._configured_lm_profiles", return_value=profiles),
+            patch("oldapp.requests.get", side_effect=get_models) as get,
+        ):
+            response = self.client.get("/lm/admission")
+            cached_response = self.client.get("/lm/admission")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(cached_response.status_code, 200, cached_response.get_json())
+        self.assertEqual(get.call_count, 3)
+        rows = {row["id"]: row for row in response.get_json()["profiles"]}
+        self.assertIs(rows["match"]["model_match"], True)
+        self.assertEqual(rows["match"]["served_models"], ["model-a"])
+        self.assertEqual(rows["match"]["served_context_length"], 32768)
+        self.assertIs(rows["mismatch"]["model_match"], False)
+        self.assertEqual(rows["mismatch"]["served_models"], ["actually-served"])
+        self.assertEqual(rows["unreachable"]["model_match"], "unknown")
+        self.assertEqual(rows["unreachable"]["served_models"], [])
+        serialized = str(response.get_json())
+        for secret in ("user", "password", "bearer-secret", "down-secret"):
+            self.assertNotIn(secret, serialized)
+        match_call = next(call for call in get.call_args_list if "lm-match.example" in call.args[0])
+        self.assertEqual(match_call.kwargs["headers"]["Authorization"], "Bearer bearer-secret")
+        self.assertEqual(match_call.kwargs["timeout"], 3.0)
 
     def test_settings_env_write_audits_keys_without_secret_values(self) -> None:
         self.repository.identity = _Identity(

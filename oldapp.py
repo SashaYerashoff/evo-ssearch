@@ -2848,6 +2848,150 @@ def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+_LM_SERVED_MODELS_CACHE_TTL_SEC = 60.0
+_lm_served_models_cache_lock = threading.Lock()
+_lm_served_models_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _reported_lm_context_length(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _probe_served_lm_models(
+    base_url: str,
+    *,
+    api_key: str = "",
+) -> Dict[str, Any]:
+    """Return a cached, credential-free view of one OpenAI-compatible endpoint."""
+
+    resource = normalize_lm_resource(base_url, "")
+    if not resource:
+        return {"known": False, "served_models": [], "contexts": {}}
+    now = time.monotonic()
+    with _lm_served_models_cache_lock:
+        cached = _lm_served_models_cache.get(resource)
+        if cached is not None and now < cached[0]:
+            return copy.deepcopy(cached[1])
+
+        result: Dict[str, Any] = {
+            "known": False,
+            "served_models": [],
+            "contexts": {},
+        }
+        headers = {"Accept": "application/json"}
+        if str(api_key or "").strip():
+            headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        try:
+            response = requests.get(
+                f"{str(base_url or '').rstrip('/')}/models",
+                headers=headers,
+                timeout=3.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload.get("data") if isinstance(payload, Mapping) else None
+            if isinstance(items, Sequence) and not isinstance(items, (str, bytes, bytearray)):
+                served_models: List[str] = []
+                contexts: Dict[str, int] = {}
+                for item in items:
+                    if not isinstance(item, Mapping):
+                        continue
+                    model_id = str(item.get("id") or item.get("model") or "").strip()
+                    if not model_id:
+                        continue
+                    if model_id not in served_models:
+                        served_models.append(model_id)
+                    for key in ("max_model_len", "max_context_length", "context_length"):
+                        context_length = _reported_lm_context_length(item.get(key))
+                        if context_length is not None:
+                            contexts[model_id] = context_length
+                            break
+                if served_models:
+                    result = {
+                        "known": True,
+                        "served_models": served_models,
+                        "contexts": contexts,
+                    }
+                    for key in ("max_model_len", "max_context_length", "context_length"):
+                        context_length = _reported_lm_context_length(payload.get(key))
+                        if context_length is not None:
+                            result["endpoint_context_length"] = context_length
+                            break
+        except Exception:
+            # Unreachable and malformed endpoints are explicitly unknown. Never
+            # echo transport errors because their URLs may contain credentials.
+            pass
+
+        _lm_served_models_cache[resource] = (
+            now + _LM_SERVED_MODELS_CACHE_TTL_SEC,
+            copy.deepcopy(result),
+        )
+        return result
+
+
+def _lm_admission_profiles() -> List[Dict[str, Any]]:
+    profiles = [
+        _resolve_lm_profile(profile_id=profile_id)
+        for profile_id in _configured_lm_profiles()
+    ]
+    endpoint_results: Dict[str, Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+    for profile in profiles:
+        base_url = str(profile.get("base_url") or "").rstrip("/")
+        resource = normalize_lm_resource(base_url, "")
+        if resource not in endpoint_results:
+            endpoint_results[resource] = _probe_served_lm_models(
+                base_url,
+                api_key=str(profile.get("api_key") or ""),
+            )
+        served = endpoint_results[resource]
+        configured_model = str(profile.get("model") or "").strip()
+        served_models = [
+            str(model_id)
+            for model_id in served.get("served_models", [])
+            if str(model_id).strip()
+        ]
+        if not bool(served.get("known")) or not configured_model:
+            model_match: Union[bool, str] = "unknown"
+        else:
+            model_match = configured_model in served_models
+        row = {
+            "id": str(profile.get("id") or ""),
+            "kind": str(profile.get("kind") or "general"),
+            "base_url": resource,
+            "configured_model": configured_model,
+            "served_models": served_models[:8],
+            "model_match": model_match,
+        }
+        contexts = served.get("contexts")
+        context_length = (
+            _reported_lm_context_length(contexts.get(configured_model))
+            if isinstance(contexts, Mapping)
+            else None
+        )
+        if context_length is None:
+            context_length = _reported_lm_context_length(served.get("endpoint_context_length"))
+        if context_length is None and isinstance(contexts, Mapping):
+            distinct_contexts = {
+                parsed
+                for parsed in (
+                    _reported_lm_context_length(value)
+                    for value in contexts.values()
+                )
+                if parsed is not None
+            }
+            if len(distinct_contexts) == 1:
+                context_length = next(iter(distinct_contexts))
+        if context_length is not None:
+            row["served_context_length"] = context_length
+        rows.append(row)
+    return rows
+
+
 _lm_admission_controller = get_lm_admission_controller()
 
 
@@ -13575,6 +13719,7 @@ def lm_admission_status():
         {
             "enabled": True,
             "status": "ready",
+            "profiles": _lm_admission_profiles(),
             **_lm_admission_controller.status(),
         }
     )

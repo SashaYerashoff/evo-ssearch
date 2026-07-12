@@ -370,6 +370,10 @@ def test_agent_sidebar_polls_analytics_runtime_and_lm_admission_only_when_active
     assert "fetch(`/luxriot/streams?t=${Date.now()}`" in JS
     assert "fetch(`/lm/admission?t=${Date.now()}`" in JS
     assert "oldest_queue_age_sec" in JS
+    assert "LM model mismatch: configured" in JS
+    assert "model check unavailable" in JS
+    assert "profile.model_match === false" in JS
+    assert ".agent-lm-model-badge.mismatch" in CSS
     assert "currentMode !== 'agent'" in JS
 
 

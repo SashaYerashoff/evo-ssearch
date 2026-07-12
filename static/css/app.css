@@ -4395,6 +4395,24 @@
     font-family: 'Courier New', monospace;
 }
 
+.agent-lm-model-badge {
+    padding: 6px 9px;
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    font: 11px/1.35 'Courier New', monospace;
+}
+
+.agent-lm-model-badge.mismatch {
+    color: #ff9aa6;
+    border-color: rgba(255, 88, 106, 0.55);
+    background: rgba(118, 20, 34, 0.28);
+}
+
+.agent-lm-model-badge.unknown {
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.02);
+}
+
 .agent-skill-list {
     display: flex;
     flex-direction: column;
