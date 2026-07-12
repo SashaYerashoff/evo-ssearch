@@ -509,6 +509,15 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
 
 class OfflineInstallerCliTests(unittest.TestCase):
+    def test_bundle_builder_excludes_local_runtime_and_private_release_artifacts(self):
+        builder = (ROOT / "scripts" / "build_patch_bundle.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"--exclude=.local"', builder)
+        self.assertIn('"--exclude=.env"', builder)
+        self.assertIn('"--exclude=.env.*"', builder)
+
     def test_fresh_noninteractive_dry_run_uses_process_env_and_wheelhouse_without_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

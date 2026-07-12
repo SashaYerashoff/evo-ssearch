@@ -115,6 +115,7 @@ log "Creating working-tree snapshot from ${REPO_ROOT}"
 
 COMMON_EXCLUDES=(
   "--exclude=.git"
+  "--exclude=.local"
   "--exclude=.venv"
   "--exclude=.venv*"
   "--exclude=__pycache__"
@@ -142,6 +143,8 @@ COMMON_EXCLUDES=(
   "--exclude=*.sqlite3"
   "--exclude=*.db"
   "--exclude=*.log"
+  "--exclude=*.pid"
+  "--exclude=*.sock"
 )
 
 if command -v rsync >/dev/null 2>&1; then
