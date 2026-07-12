@@ -232,6 +232,36 @@ def test_attention_stream_reuses_selected_apex_without_opening_evo(
     assert jpeg in first_part
 
 
+def test_attention_stream_reemits_static_apex_as_keepalive(
+    app_client,
+    monkeypatch,
+):
+    jpeg = b"\xff\xd8\xffstatic-model-visible-apex\xff\xd9"
+    frame = {
+        "thumbnail": base64.b64encode(jpeg).decode("ascii"),
+        "captured_at": 1700000000.125,
+        "frame_hash": "static-apex-hash",
+    }
+    clock = [100.0]
+
+    monkeypatch.setattr(oldapp, "_luxriot_recent_frame_item", lambda *_args, **_kwargs: dict(frame))
+    monkeypatch.setattr(oldapp, "_luxriot_media_limits", lambda _kind: ((1, 1), 12.0, 1))
+    monkeypatch.setattr(oldapp.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(oldapp.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    response = app_client.get("/luxriot/attention_stream/7", buffered=False)
+    iterator = iter(response.response)
+    started_at = clock[0]
+    parts = [next(iterator), next(iterator)]
+    elapsed = clock[0] - started_at
+    response.close()
+
+    assert response.status_code == 200
+    assert elapsed <= 11.0
+    assert parts[0] == parts[1]
+    assert all(jpeg in part for part in parts)
+
+
 def test_media_negotiation_recovers_mjpeg_boundary_from_octet_stream():
     first_chunk = (
         b"--eva-boundary\r\n"

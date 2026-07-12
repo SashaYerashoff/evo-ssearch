@@ -10145,6 +10145,8 @@ def luxriot_attention_stream(channel_id: int):
     def generate_attention_media():
         deadline = time.monotonic() + lease_seconds
         last_identity = ""
+        last_part: Optional[bytes] = None
+        last_emit_at = time.monotonic()
         while time.monotonic() < deadline:
             frame_item = _luxriot_recent_frame_item(
                 channel_id,
@@ -10157,7 +10159,14 @@ def luxriot_attention_stream(channel_id: int):
                     part = encode_part(frame_item)
                     if part:
                         last_identity = identity
+                        last_part = part
+                        last_emit_at = time.monotonic()
                         yield part
+            if last_part is not None:
+                now = time.monotonic()
+                if now - last_emit_at >= 5.0:
+                    last_emit_at = now
+                    yield last_part
             time.sleep(0.1)
         yield f"--{boundary}--\r\n".encode("ascii")
 
