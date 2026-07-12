@@ -7,6 +7,7 @@ from agent import (
     _apply_turn_tool_context,
     _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
+    _compact_vector_signal_for_model,
     _format_epoch_minute,
     _format_turn_signal_ledger_message,
     _new_turn_signal_ledger,
@@ -15,6 +16,7 @@ from agent import (
     _seed_turn_tool_context,
     _safe_detection,
     _strip_thumbnails,
+    _summary_node_alert_score,
     _tool_result_for_ui,
     build_system_prompt,
 )
@@ -2746,6 +2748,67 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             [row["detection_id"] for row in compact["probes"][0]["representative_events"]],
             [0, 4, 8],
         )
+
+    def test_capture_attention_survives_model_compaction(self):
+        compact = _compact_vector_signal_for_model(
+            {
+                "capture_attention": {
+                    "policy": "capture_per_second_cv_apex_v2",
+                    "baseline": {"level": 0.0012, "warmup": False},
+                    "seconds": [
+                        {"snapshot": 3, "mode": "burst", "activity_x": 11.12, "sharper_companion": True},
+                        {"snapshot": 5, "mode": "normal", "activity_x": 3.4},
+                        {"snapshot": 6, "mode": "quiet"},
+                        {"snapshot": None, "mode": "burst"},
+                    ],
+                }
+            }
+        )
+
+        attention = compact["capture_attention"]
+        self.assertEqual(attention["baseline"], {"level": 0.0012, "warmup": False})
+        self.assertEqual(
+            attention["seconds"],
+            [
+                {"snapshot": 3, "mode": "burst", "activity_x": 11.12, "sharper_companion": True},
+                {"snapshot": 5, "mode": "normal", "activity_x": 3.4},
+            ],
+        )
+
+    def test_burst_windows_outrank_plain_summaries_for_evidence(self):
+        quiet_node = {"summary": "corridor is calm", "alert_total": 0}
+        burst_node = {
+            "summary": "corridor is calm",
+            "alert_total": 0,
+            "vector_signal": {
+                "capture_attention": {
+                    "seconds": [
+                        {"snapshot": 2, "mode": "burst", "activity_x": 9.5},
+                        {"snapshot": 4, "mode": "burst", "activity_x": 4.1},
+                    ]
+                }
+            },
+        }
+
+        self.assertEqual(_summary_node_alert_score(quiet_node), 0)
+        self.assertEqual(_summary_node_alert_score(burst_node), 4)
+        self.assertGreater(
+            _summary_node_alert_score(burst_node),
+            _summary_node_alert_score(quiet_node),
+        )
+
+    def test_system_prompt_explains_capture_attention_semantics(self):
+        prompt = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+        )
+
+        self.assertIn("vector_signal.capture_attention", prompt)
+        self.assertIn("mode=burst", prompt)
+        self.assertIn("Motion blur on burst frames is expected physics", prompt)
+        self.assertIn("anchor_role=burst_companion", prompt)
+        self.assertIn("statistical attention, not semantic proof", prompt)
 
     def test_turn_context_applies_normalized_time_window_to_generate_report(self):
         context = _seed_turn_tool_context("Generate a video report for the selected channel.")

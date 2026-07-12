@@ -6448,6 +6448,7 @@ def build_system_prompt(
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
         f"- Use get_visual_window_signals when you need a quick CLIP P/N/M attention signal over video-description frames. Treat P/N/M as a cue for where to inspect next, not as proof. Before concluding, inspect summaries and call describe_frame on relevant candidate frames.\n"
+        f"- Summary rows may carry vector_signal.capture_attention: seconds whose measured motion was far above that channel's own learned norm (mode=burst; activity_x = times above typical). Bursts are trusted server-side attention markers - prefer those windows when picking evidence frames and when the operator asks about spikes, sudden motion, or 'что резкого было'. Motion blur on burst frames is expected physics of fast events; a sharper companion frame of the same second may exist in the archive as anchor_role=burst_companion. Bursts are statistical attention, not semantic proof - verify in frames before alerting.\n"
         f"- Keep VLM summaries separate from archive detections; use archive tools only as corroborating evidence.\n"
         f"- For sensitive or accusatory user wording, do not refuse when the request can be reframed as visible evidence review. Rephrase the task, then use tools to return candidates for operator review. Do not accuse people or infer hidden states such as vaccination, substance use, intent, legality, intoxication, or guilt from video. Examples: 'smoking weed/pipe/joint' -> 'person holding a small cylindrical object, hand-to-mouth motion, visible smoke or vapor'; 'unvaccinated dog' -> 'dog without visible ear tag'; 'illegal dumping' -> 'person leaving an object or waste behind'. State that these are visual candidates, not legal or medical conclusions.\n"
         f"- Use the repository playbooks index below as routing hints; load-bearing details are provided only for explicitly activated playbooks.\n"
@@ -8386,9 +8387,66 @@ def _compact_vector_signal_for_model(value: Any, *, clip_limit: int = 4, road_li
     if road_rows:
         out["road_cv_cues"] = road_rows
 
+    attention = value.get("capture_attention")
+    if isinstance(attention, Mapping):
+        attention_out: Dict[str, Any] = {}
+        baseline = attention.get("baseline")
+        if isinstance(baseline, Mapping):
+            baseline_out: Dict[str, Any] = {}
+            if isinstance(baseline.get("level"), (int, float)):
+                baseline_out["level"] = round(float(baseline.get("level")), 6)
+            if "warmup" in baseline:
+                baseline_out["warmup"] = bool(baseline.get("warmup"))
+            if baseline_out:
+                attention_out["baseline"] = baseline_out
+        seconds_out: List[Dict[str, Any]] = []
+        raw_seconds = attention.get("seconds")
+        if isinstance(raw_seconds, Sequence) and not isinstance(raw_seconds, (str, bytes, bytearray)):
+            for raw in raw_seconds[:6]:
+                if not isinstance(raw, Mapping):
+                    continue
+                snapshot = _opt_int(raw.get("snapshot"))
+                mode = _compact_signal_value(raw.get("mode"), 20)
+                if snapshot is None or mode not in {"burst", "normal"}:
+                    continue
+                second: Dict[str, Any] = {"snapshot": int(snapshot), "mode": mode}
+                if isinstance(raw.get("activity_x"), (int, float)):
+                    second["activity_x"] = round(float(raw.get("activity_x")), 2)
+                if raw.get("sharper_companion"):
+                    second["sharper_companion"] = True
+                seconds_out.append(second)
+        if seconds_out:
+            attention_out["seconds"] = seconds_out
+            out["capture_attention"] = attention_out
+
     if len(out) <= 1:
         return {}
     return out
+
+
+def _node_burst_attention(node: Mapping[str, Any]) -> Tuple[int, float]:
+    """Return (burst second count, peak activity_x) for one summary node."""
+
+    vector_signal = node.get("vector_signal")
+    if not isinstance(vector_signal, Mapping):
+        return 0, 0.0
+    attention = vector_signal.get("capture_attention")
+    if not isinstance(attention, Mapping):
+        return 0, 0.0
+    seconds = attention.get("seconds")
+    if not isinstance(seconds, Sequence) or isinstance(seconds, (str, bytes, bytearray)):
+        return 0, 0.0
+    burst_count = 0
+    peak_x = 0.0
+    for raw in seconds:
+        if not isinstance(raw, Mapping):
+            continue
+        if str(raw.get("mode") or "").strip().lower() != "burst":
+            continue
+        burst_count += 1
+        if isinstance(raw.get("activity_x"), (int, float)):
+            peak_x = max(peak_x, float(raw.get("activity_x")))
+    return burst_count, peak_x
 
 
 def _summary_log_parser_breakdown(row: Mapping[str, Any]) -> Dict[str, int]:
@@ -8675,6 +8733,11 @@ def _summary_node_alert_score(node: Mapping[str, Any]) -> int:
     raw_total = _opt_int(node.get("alert_total"))
     if raw_total is not None and raw_total > 0:
         score += int(raw_total)
+    burst_count, burst_peak_x = _node_burst_attention(node)
+    if burst_count:
+        # Measured motion far above the channel's own norm is exactly the
+        # window an evidence sample should prefer, even without an alert.
+        score += burst_count + (2 if burst_peak_x >= 8.0 else 0)
     raw_counts = node.get("alert_counts")
     if isinstance(raw_counts, Mapping):
         for value in raw_counts.values():
