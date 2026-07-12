@@ -124,6 +124,11 @@
     const luxriotSummaryFromInput = document.getElementById('luxriotSummaryFromInput');
     const luxriotSummaryToInput = document.getElementById('luxriotSummaryToInput');
     const luxriotSummaryApplyFiltersBtn = document.getElementById('luxriotSummaryApplyFiltersBtn');
+    const luxriotSummaryDateNav = document.getElementById('luxriotSummaryDateNav');
+    const luxriotSummaryDateLabel = document.getElementById('luxriotSummaryDateLabel');
+    const luxriotSummaryPreviousPeriodBtn = document.getElementById('luxriotSummaryPreviousPeriod');
+    const luxriotSummaryNextPeriodBtn = document.getElementById('luxriotSummaryNextPeriod');
+    const luxriotSummaryLoadEarlierBtn = document.getElementById('luxriotSummaryLoadEarlierBtn');
     const luxriotSummaryBackBtn = document.getElementById('luxriotSummaryBackBtn');
     const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
     const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
@@ -290,11 +295,16 @@
     const luxriotSummarySeenKeys = {};
     let luxriotSummaryUnread = 0;
     let luxriotSummaryChannel = null;
-    let luxriotSummaryRunFilter = 'latest';
-    let luxriotSummaryRangePreset = '6h';
+    let luxriotSummaryRunFilter = 'live';
+    let luxriotSummaryRangePreset = 'live';
     let luxriotSummaryFromTs = null;
     let luxriotSummaryToTs = null;
     let luxriotSummaryLevel = 'L0';
+    let luxriotSummaryResolutionMode = 'AUTO';
+    let luxriotSummaryArchiveOffset = 0;
+    let luxriotSummaryArchiveHasMore = false;
+    let luxriotSummaryArchiveEvidenceTotal = 0;
+    let luxriotSummaryArchiveLoading = false;
     let luxriotSummaryRollupStack = [];
     let luxriotSummaryRollupRows = [];
     const luxriotSummaryRollupCache = {};
@@ -308,6 +318,13 @@
         snapshotMaxEdge: {luxriot_snapshot_max_edge},
         batchSize: {luxriot_batch_default}
     };
+    const luxriotConfiguredSiteTimezone = {site_timezone_json};
+    let luxriotSiteTimezone = luxriotConfiguredSiteTimezone;
+    try {
+        new Intl.DateTimeFormat('en', { timeZone: luxriotSiteTimezone }).format(new Date());
+    } catch (_) {
+        luxriotSiteTimezone = 'UTC';
+    }
     let luxriotActiveChannel = luxriotDefaults.channelId;
     let luxriotPreviewTimer = null;
     let luxriotPreviewRenewTimer = null;
@@ -2355,16 +2372,116 @@
 
     function normalizeSummaryRangePreset(value) {
         const text = String(value || '').trim().toLowerCase();
-        if (text === '6h' || text === '24h' || text === '3d' || text === '7d' || text === '30d' || text === 'all' || text === 'custom') {
+        if (
+            text === 'live'
+            || text === 'today'
+            || text === 'yesterday'
+            || text === 'day_before_yesterday'
+            || text === '6h'
+            || text === '24h'
+            || text === '3d'
+            || text === '7d'
+            || text === '30d'
+            || text === 'all'
+            || text === 'custom'
+        ) {
             return text;
         }
-        return '24h';
+        return 'live';
+    }
+
+    function summarySiteDateParts(epochSec = null) {
+        const hasEpoch = epochSec !== null && epochSec !== '' && Number.isFinite(Number(epochSec));
+        const date = hasEpoch
+            ? new Date(Number(epochSec) * 1000)
+            : new Date();
+        const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotSiteTimezone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        }).formatToParts(date);
+        const values = {};
+        parts.forEach((part) => {
+            if (part.type !== 'literal') values[part.type] = Number(part.value);
+        });
+        return { year: values.year, month: values.month, day: values.day };
+    }
+
+    function shiftSummarySiteDate(parts, dayDelta) {
+        const shifted = new Date(Date.UTC(
+            Number(parts.year),
+            Number(parts.month) - 1,
+            Number(parts.day) + Number(dayDelta || 0),
+        ));
+        return {
+            year: shifted.getUTCFullYear(),
+            month: shifted.getUTCMonth() + 1,
+            day: shifted.getUTCDate(),
+        };
+    }
+
+    function summarySiteLocalToEpoch(parts) {
+        const desiredMs = Date.UTC(
+            Number(parts.year),
+            Number(parts.month) - 1,
+            Number(parts.day),
+            Number(parts.hour || 0),
+            Number(parts.minute || 0),
+            Number(parts.second || 0),
+        );
+        let guessMs = desiredMs;
+        const formatter = new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotSiteTimezone,
+            hourCycle: 'h23',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const observed = {};
+            formatter.formatToParts(new Date(guessMs)).forEach((part) => {
+                if (part.type !== 'literal') observed[part.type] = Number(part.value);
+            });
+            const observedMs = Date.UTC(
+                observed.year,
+                observed.month - 1,
+                observed.day,
+                observed.hour || 0,
+                observed.minute || 0,
+                observed.second || 0,
+            );
+            const correction = desiredMs - observedMs;
+            guessMs += correction;
+            if (Math.abs(correction) < 1000) break;
+        }
+        return guessMs / 1000;
+    }
+
+    function summarySiteDayBounds(dayDelta = 0) {
+        const today = summarySiteDateParts();
+        const startParts = shiftSummarySiteDate(today, dayDelta);
+        const endParts = shiftSummarySiteDate(startParts, 1);
+        return {
+            fromTs: summarySiteLocalToEpoch(startParts),
+            toTs: summarySiteLocalToEpoch(endParts) - 0.001,
+        };
     }
 
     function getSummaryRangeBounds(rangePreset, nowSec = null) {
         const normalized = normalizeSummaryRangePreset(rangePreset);
         const now = Number.isFinite(nowSec) ? Number(nowSec) : Math.floor(Date.now() / 1000);
         const toTs = now;
+        if (normalized === 'live' || normalized === 'all') return { fromTs: null, toTs: null };
+        if (normalized === 'today') {
+            const bounds = summarySiteDayBounds(0);
+            return { fromTs: bounds.fromTs, toTs: now };
+        }
+        if (normalized === 'yesterday') return summarySiteDayBounds(-1);
+        if (normalized === 'day_before_yesterday') return summarySiteDayBounds(-2);
         if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
         if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
         if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
@@ -2375,6 +2492,10 @@
 
     function getSummaryRangeLabel() {
         const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'live') return 'live';
+        if (preset === 'today') return 'today';
+        if (preset === 'yesterday') return 'yesterday';
+        if (preset === 'day_before_yesterday') return 'day before yesterday';
         if (preset === '6h') return '6h';
         if (preset === '24h') return '1d';
         if (preset === '3d') return '3d';
@@ -2387,6 +2508,40 @@
         return 'custom';
     }
 
+    function formatSummarySiteTimestamp(ts, options = {}) {
+        if (ts === null || ts === '' || typeof ts === 'undefined') return 'n/a';
+        const sec = Number(ts);
+        if (!Number.isFinite(sec)) return 'n/a';
+        return new Intl.DateTimeFormat(undefined, {
+            timeZone: luxriotSiteTimezone,
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: options.dateOnly ? undefined : '2-digit',
+            minute: options.dateOnly ? undefined : '2-digit',
+        }).format(new Date(sec * 1000));
+    }
+
+    function getSummaryEffectiveBounds() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'custom') {
+            return { fromTs: luxriotSummaryFromTs, toTs: luxriotSummaryToTs };
+        }
+        return getSummaryRangeBounds(preset);
+    }
+
+    function summaryPeriodLabel() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        const bounds = getSummaryEffectiveBounds();
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
+            return `${formatSummarySiteTimestamp(bounds.fromTs, { dateOnly: true })} · ${luxriotSiteTimezone}`;
+        }
+        if (Number.isFinite(bounds.fromTs) && Number.isFinite(bounds.toTs)) {
+            return `${formatSummarySiteTimestamp(bounds.fromTs)} – ${formatSummarySiteTimestamp(bounds.toTs)} · ${luxriotSiteTimezone}`;
+        }
+        return `All retained history · ${luxriotSiteTimezone}`;
+    }
+
     function syncSummaryRangeUI() {
         const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
         if (luxriotSummaryRangeSelect) {
@@ -2395,31 +2550,61 @@
         if (luxriotSummaryCustomTime) {
             luxriotSummaryCustomTime.classList.toggle('is-hidden', preset !== 'custom');
         }
+        if (luxriotSummaryDateNav) {
+            luxriotSummaryDateNav.classList.toggle('is-hidden', preset === 'live');
+        }
+        if (luxriotSummaryDateLabel && preset !== 'live') {
+            luxriotSummaryDateLabel.textContent = summaryPeriodLabel();
+        }
+        if (luxriotSummaryNextPeriodBtn) {
+            const bounds = getSummaryEffectiveBounds();
+            luxriotSummaryNextPeriodBtn.disabled = !Number.isFinite(bounds.toTs) || bounds.toTs >= (Date.now() / 1000) - 1;
+        }
     }
 
     function parseSummaryDatetimeInput(value) {
         const text = String(value || '').trim();
         if (!text) return null;
-        const ms = Date.parse(text);
-        if (!Number.isFinite(ms)) return null;
-        return ms / 1000;
+        const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+        if (!match) return null;
+        return summarySiteLocalToEpoch({
+            year: Number(match[1]),
+            month: Number(match[2]),
+            day: Number(match[3]),
+            hour: Number(match[4]),
+            minute: Number(match[5]),
+        });
     }
 
     function formatSummaryDatetimeInput(ts) {
+        if (ts === null || ts === '' || typeof ts === 'undefined') return '';
         const sec = Number(ts);
         if (!Number.isFinite(sec)) return '';
-        const d = new Date(sec * 1000);
-        const yyyy = d.getFullYear();
-        const mm = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        const hh = String(d.getHours()).padStart(2, '0');
-        const mi = String(d.getMinutes()).padStart(2, '0');
+        const values = {};
+        new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotSiteTimezone,
+            hourCycle: 'h23',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+        }).formatToParts(new Date(sec * 1000)).forEach((part) => {
+            if (part.type !== 'literal') values[part.type] = part.value;
+        });
+        const yyyy = values.year;
+        const mm = values.month;
+        const dd = values.day;
+        const hh = values.hour;
+        const mi = values.minute;
         return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
     }
 
     function readSummaryFiltersFromInputs() {
-        const run = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
         const rangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect ? luxriotSummaryRangeSelect.value : luxriotSummaryRangePreset);
+        const currentRun = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
+        const isExplicitRun = !['latest', 'live', 'all'].includes(String(currentRun).toLowerCase());
+        const run = rangePreset === 'live' ? 'live' : (isExplicitRun ? currentRun : 'all');
         let fromTs = null;
         let toTs = null;
         if (rangePreset === 'custom') {
@@ -2454,18 +2639,23 @@
         if (luxriotSummaryToInput) {
             luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
         }
+        const livePeriod = luxriotSummaryRangePreset === 'live';
+        luxriotSummaryFollowLive = livePeriod;
+        if (livePeriod) luxriotSummaryAutoRefresh = true;
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
     }
 
     function clearSummaryFilters() {
-        luxriotSummaryRunFilter = 'latest';
-        luxriotSummaryRangePreset = '6h';
+        luxriotSummaryRunFilter = 'live';
+        luxriotSummaryRangePreset = 'live';
         luxriotSummaryFromTs = null;
         luxriotSummaryToTs = null;
         if (luxriotSummaryRunSelect) {
-            luxriotSummaryRunSelect.value = 'latest';
+            luxriotSummaryRunSelect.value = 'live';
         }
         if (luxriotSummaryRangeSelect) {
-            luxriotSummaryRangeSelect.value = '6h';
+            luxriotSummaryRangeSelect.value = 'live';
         }
         if (luxriotSummaryFromInput) {
             luxriotSummaryFromInput.value = '';
@@ -2474,6 +2664,49 @@
             luxriotSummaryToInput.value = '';
         }
         syncSummaryRangeUI();
+        luxriotSummaryFollowLive = true;
+        luxriotSummaryAutoRefresh = true;
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
+    }
+
+    function shiftSelectedSummaryPeriod(direction) {
+        const delta = Number(direction) < 0 ? -1 : 1;
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        const bounds = getSummaryEffectiveBounds();
+        if (!Number.isFinite(bounds.fromTs) || !Number.isFinite(bounds.toTs)) return false;
+        let fromTs;
+        let toTs;
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
+            const currentDate = summarySiteDateParts(bounds.fromTs + 1);
+            const nextDate = shiftSummarySiteDate(currentDate, delta);
+            const afterNext = shiftSummarySiteDate(nextDate, 1);
+            fromTs = summarySiteLocalToEpoch(nextDate);
+            toTs = summarySiteLocalToEpoch(afterNext) - 0.001;
+        } else {
+            const durationSec = Math.max(60, bounds.toTs - bounds.fromTs);
+            fromTs = bounds.fromTs + delta * durationSec;
+            toTs = bounds.toTs + delta * durationSec;
+        }
+        const now = Date.now() / 1000;
+        if (toTs > now) {
+            const durationSec = toTs - fromTs;
+            toTs = now;
+            fromTs = Math.max(0, toTs - durationSec);
+        }
+        luxriotSummaryRangePreset = 'custom';
+        luxriotSummaryRunFilter = 'all';
+        luxriotSummaryFromTs = fromTs;
+        luxriotSummaryToTs = toTs;
+        luxriotSummaryFollowLive = false;
+        if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'custom';
+        if (luxriotSummaryFromInput) luxriotSummaryFromInput.value = formatSummaryDatetimeInput(fromTs);
+        if (luxriotSummaryToInput) luxriotSummaryToInput.value = formatSummaryDatetimeInput(toTs);
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
+        syncSummaryRangeUI();
+        setSummaryUnread(0);
+        return true;
     }
 
     function buildSummaryQueryParams(channelId) {
@@ -2585,12 +2818,50 @@
         return 'L0';
     }
 
-    function setSummaryBaseLevel(level) {
+    function normalizeSummaryResolutionMode(value) {
+        const text = String(value || '').trim().toUpperCase();
+        if (text === 'AUTO') return 'AUTO';
+        return normalizeSummaryLevel(text);
+    }
+
+    function resolveAutoSummaryLevel() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'live') return 'L0';
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday' || preset === '24h') {
+            return 'L1';
+        }
+        if (preset === '3d' || preset === '7d') return 'L2';
+        if (preset === '30d' || preset === 'all') return 'L3';
+        const bounds = getSummaryEffectiveBounds();
+        const durationSec = Number(bounds.toTs) - Number(bounds.fromTs);
+        if (!Number.isFinite(durationSec) || durationSec <= 0) return 'L3';
+        if (durationSec <= 8 * 3600) return 'L0';
+        if (durationSec <= 36 * 3600) return 'L1';
+        if (durationSec <= 8 * 24 * 3600) return 'L2';
+        return 'L3';
+    }
+
+    function applySummaryResolutionMode() {
+        const mode = normalizeSummaryResolutionMode(luxriotSummaryResolutionMode);
+        const level = mode === 'AUTO' ? resolveAutoSummaryLevel() : normalizeSummaryLevel(mode);
+        luxriotSummaryLevel = level;
+        luxriotSummaryRollupStack = [{ level, sourceIds: null, label: level }];
+        if (luxriotSummaryLevelSelect) {
+            luxriotSummaryLevelSelect.value = mode;
+        }
+        updateSummaryControlsUI();
+        return level;
+    }
+
+    function setSummaryBaseLevel(level, preserveResolutionMode = false) {
         const normalized = normalizeSummaryLevel(level);
         luxriotSummaryLevel = normalized;
+        if (!preserveResolutionMode) luxriotSummaryResolutionMode = normalized;
         luxriotSummaryRollupStack = [{ level: normalized, sourceIds: null, label: normalized }];
         if (luxriotSummaryLevelSelect) {
-            luxriotSummaryLevelSelect.value = normalized;
+            luxriotSummaryLevelSelect.value = preserveResolutionMode
+                ? normalizeSummaryResolutionMode(luxriotSummaryResolutionMode)
+                : normalized;
         }
     }
 
@@ -2756,13 +3027,16 @@
 
     function updateSummaryControlsUI() {
         const rollupMode = isRollupViewActive();
+        const historicalMode = !isLiveSummaryPeriod();
         if (luxriotSummaryFollowBtn) {
-            const liveOn = !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
+            const liveOn = !historicalMode && !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
             luxriotSummaryFollowBtn.classList.toggle('primary', liveOn);
-            luxriotSummaryFollowBtn.textContent = rollupMode
-                ? '▶ Live n/a'
-                : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
-            luxriotSummaryFollowBtn.disabled = rollupMode;
+            luxriotSummaryFollowBtn.textContent = historicalMode
+                ? '▶ Go live'
+                : rollupMode
+                    ? '▶ Live observations'
+                    : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
+            luxriotSummaryFollowBtn.disabled = false;
         }
         if (luxriotSummaryPauseBtn) {
             luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
@@ -2793,6 +3067,7 @@
         if (luxriotSummaryApplyFiltersBtn) {
             luxriotSummaryApplyFiltersBtn.disabled = normalizeSummaryRangePreset(luxriotSummaryRangePreset) !== 'custom';
         }
+        updateSummaryArchivePagingUI();
     }
 
     function syncLuxriotSummaryChannelSelect() {
@@ -3866,6 +4141,125 @@
         luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
     }
 
+    function isLiveSummaryPeriod() {
+        return normalizeSummaryRangePreset(luxriotSummaryRangePreset) === 'live';
+    }
+
+    function resetSummaryArchivePaging() {
+        luxriotSummaryArchiveOffset = 0;
+        luxriotSummaryArchiveHasMore = false;
+        luxriotSummaryArchiveEvidenceTotal = 0;
+        luxriotSummaryArchiveLoading = false;
+        if (luxriotSummaryLoadEarlierBtn) {
+            luxriotSummaryLoadEarlierBtn.classList.add('is-hidden');
+            luxriotSummaryLoadEarlierBtn.disabled = false;
+            luxriotSummaryLoadEarlierBtn.textContent = '← Load earlier';
+        }
+    }
+
+    function updateSummaryArchivePagingUI() {
+        if (!luxriotSummaryLoadEarlierBtn) return;
+        const show = !isLiveSummaryPeriod()
+            && !isRollupViewActive()
+            && (luxriotSummaryArchiveHasMore || luxriotSummaryArchiveLoading);
+        luxriotSummaryLoadEarlierBtn.classList.toggle('is-hidden', !show);
+        luxriotSummaryLoadEarlierBtn.disabled = luxriotSummaryArchiveLoading;
+        luxriotSummaryLoadEarlierBtn.textContent = luxriotSummaryArchiveLoading
+            ? '← Loading earlier…'
+            : '← Load earlier';
+    }
+
+    function showLuxriotSummaryLoading(label = 'Loading descriptions…', preserveRows = false) {
+        if (!luxriotSummaries) return;
+        luxriotSummaries.setAttribute('aria-busy', 'true');
+        luxriotSummaries.classList.add('is-loading-history');
+        setLuxriotSummaryMeta(`${label} · ${summaryPeriodLabel()}`);
+        if (!preserveRows) {
+            luxriotSummaries.innerHTML = `
+                <div class="luxriot-feed-loading" role="status" aria-live="polite">
+                    <span class="luxriot-feed-loading-spinner" aria-hidden="true"></span>
+                    <strong>${escapeHtml(label)}</strong>
+                    <span>${escapeHtml(summaryPeriodLabel())}</span>
+                </div>
+            `;
+        }
+    }
+
+    function finishLuxriotSummaryLoading() {
+        if (!luxriotSummaries) return;
+        luxriotSummaries.removeAttribute('aria-busy');
+        luxriotSummaries.classList.remove('is-loading-history');
+    }
+
+    function archiveSummaryBatchKey(log) {
+        return [
+            String(log?.run_id || ''),
+            Number(log?.batch_start_ms || 0),
+            Number(log?.batch_end_ms || 0),
+        ].join('|');
+    }
+
+    async function refreshLuxriotArchivedSummaries(channelId, requestContext = null, append = false) {
+        if (!channelId || luxriotSummaryArchiveLoading) return false;
+        const requestKey = luxriotSummaryRequestKey(channelId);
+        const offset = append ? luxriotSummaryArchiveOffset : 0;
+        const pageLimit = 120;
+        const bounds = getSummaryEffectiveBounds();
+        const params = new URLSearchParams({
+            channel_id: String(channelId),
+            limit: String(pageLimit),
+            offset: String(offset),
+        });
+        if (Number.isFinite(bounds.fromTs)) params.set('from_ts', String(bounds.fromTs));
+        if (Number.isFinite(bounds.toTs)) params.set('to_ts', String(bounds.toTs));
+        luxriotSummaryArchiveLoading = true;
+        updateSummaryArchivePagingUI();
+        showLuxriotSummaryLoading(append ? 'Loading earlier descriptions…' : 'Loading archived descriptions…', append);
+        try {
+            const response = await fetch(`/luxriot/history?${params.toString()}`, {
+                signal: requestContext?.controller?.signal,
+            });
+            const data = await parseApiJson(response, 'Failed to load archived descriptions');
+            const stillCurrent = requestContext
+                ? isCurrentLuxriotSummaryRequest(requestContext)
+                : (
+                    currentMode === 'video'
+                    && Number(getSelectedSummaryChannel()) === Number(channelId)
+                    && luxriotSummaryRequestKey(channelId) === requestKey
+                );
+            if (!stillCurrent) return false;
+            const pageLogs = Array.isArray(data.logs) ? data.logs : [];
+            const combined = new Map();
+            if (append) {
+                (Array.isArray(luxriotSummaryLogCache) ? luxriotSummaryLogCache : []).forEach((log) => {
+                    combined.set(archiveSummaryBatchKey(log), log);
+                });
+            }
+            pageLogs.forEach((log) => combined.set(archiveSummaryBatchKey(log), log));
+            luxriotSummaryArchiveOffset = offset + pageLogs.length;
+            luxriotSummaryArchiveEvidenceTotal = Math.max(0, Number(data.total || 0));
+            luxriotSummaryArchiveHasMore = Boolean(data.has_more);
+            renderLuxriotSummaries(Array.from(combined.values()), channelId);
+            const channelLabel = getLuxriotChannelLabel(channelId);
+            const batchCount = combined.size;
+            const pageLabel = luxriotSummaryArchiveHasMore ? ' · more available' : ' · complete period';
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(
+                `${channelLabel} · Observations · ${batchCount} loaded of ${luxriotSummaryArchiveEvidenceTotal} archived batches${pageLabel} · all runs · ${getSummaryRangeLabel()}`
+            ));
+            setLuxriotStatus(`Loaded ${batchCount} archived description batches`);
+            return true;
+        } catch (error) {
+            if (error && error.name === 'AbortError') return false;
+            setLuxriotSummaryMeta(`Failed to load archived descriptions: ${error.message || 'Unknown error'}`, true);
+            setLuxriotStatus(error.message || 'Failed to load archived descriptions', true);
+            return false;
+        } finally {
+            luxriotSummaryArchiveLoading = false;
+            finishLuxriotSummaryLoading();
+            updateSummaryArchivePagingUI();
+        }
+    }
+
     const SUMMARY_ALERT_SEVERITIES = ['critical', 'high', 'normal', 'low', 'info'];
 
     function normalizeSummaryAlertCounts(row) {
@@ -4005,8 +4399,7 @@
                 const createdMs = Number.isFinite(createdAtSec) && createdAtSec > 0 ? Math.round(createdAtSec * 1000) : 0;
                 const batchStartMs = Number(log.batch_start_ms || log.window_start_ms || 0);
                 const batchEndMs = Number(log.batch_end_ms || log.window_end_ms || 0);
-                const ts = createdMs ? new Date(createdMs) : null;
-                const tsLabel = ts ? ts.toLocaleString() : 'n/a';
+                const tsLabel = createdMs ? formatSummarySiteTimestamp(createdAtSec) : 'n/a';
                 const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
                 const modelLabel = String(log.model || '').trim();
                 const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
@@ -4016,7 +4409,7 @@
                     : 'Unknown channel';
                 if (log.coverage_gap) {
                     const gapWindow = Number.isFinite(batchStartMs) && batchStartMs > 0 && Number.isFinite(batchEndMs) && batchEndMs > batchStartMs
-                        ? `${new Date(batchStartMs).toLocaleTimeString()}–${new Date(batchEndMs).toLocaleTimeString()}`
+                        ? `${formatSummarySiteTimestamp(batchStartMs / 1000)}–${formatSummarySiteTimestamp(batchEndMs / 1000)}`
                         : tsLabel;
                     const gapReason = String(log.gap_reason || 'dropped batch').replace(/_/g, ' ');
                     return `
@@ -4083,8 +4476,8 @@
     function formatRollupRange(windowStart, windowEnd) {
         const start = Number(windowStart);
         const end = Number(windowEnd);
-        const startLabel = Number.isFinite(start) ? new Date(start * 1000).toLocaleString() : 'n/a';
-        const endLabel = Number.isFinite(end) ? new Date(end * 1000).toLocaleString() : 'n/a';
+        const startLabel = Number.isFinite(start) ? formatSummarySiteTimestamp(start) : 'n/a';
+        const endLabel = Number.isFinite(end) ? formatSummarySiteTimestamp(end) : 'n/a';
         return `${startLabel} -> ${endLabel}`;
     }
 
@@ -4162,6 +4555,7 @@
             label: String(label || normalized).trim() || normalized,
         });
         luxriotSummaryLevel = normalized;
+        luxriotSummaryResolutionMode = normalized;
         if (luxriotSummaryLevelSelect) {
             luxriotSummaryLevelSelect.value = normalized;
         }
@@ -4174,6 +4568,7 @@
         luxriotSummaryRollupStack.pop();
         const ctx = getCurrentSummaryRollupContext();
         luxriotSummaryLevel = normalizeSummaryLevel(ctx?.level || 'L0');
+        luxriotSummaryResolutionMode = luxriotSummaryLevel;
         if (luxriotSummaryLevelSelect) {
             luxriotSummaryLevelSelect.value = luxriotSummaryLevel;
         }
@@ -4282,6 +4677,7 @@
             setLuxriotStatus(detail);
         };
         try {
+            showLuxriotSummaryLoading(aggregationLabel);
             const params = buildSummaryQueryParams(channelId);
             params.set('level_limit', '240');
             params.set('target_level', targetLevel);
@@ -4331,6 +4727,23 @@
             }
             luxriotSummaryRollupCache[channelId] = data;
             const renderedCount = renderLuxriotRollups(data, channelId);
+            if (
+                renderedCount === 0
+                && normalizeSummaryResolutionMode(luxriotSummaryResolutionMode) === 'AUTO'
+                && !isLiveSummaryPeriod()
+                && !(Array.isArray(rollupContext?.sourceIds) && rollupContext.sourceIds.length)
+            ) {
+                luxriotSummaryLevel = 'L0';
+                luxriotSummaryRollupStack = [{ level: 'L0', sourceIds: null, label: 'L0' }];
+                if (luxriotSummaryLevelSelect) luxriotSummaryLevelSelect.value = 'AUTO';
+                setLuxriotSummaryMeta('No precomputed rollup covers this period · loading archived observations…');
+                window.setTimeout(() => {
+                    if (currentMode === 'video' && Number(getSelectedSummaryChannel()) === Number(channelId)) {
+                        void refreshLuxriotSummaryView(channelId, true, false);
+                    }
+                }, 0);
+                return true;
+            }
             const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
             const ctx = getCurrentSummaryRollupContext();
             const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
@@ -4371,6 +4784,7 @@
                 clearInterval(progressTimer);
                 progressTimer = null;
             }
+            finishLuxriotSummaryLoading();
         }
     }
 
@@ -5019,8 +5433,16 @@
 
     async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true, requestContext = null) {
         if (!channelId) return;
+        if (!isLiveSummaryPeriod()) {
+            if (!force) return false;
+            return refreshLuxriotArchivedSummaries(channelId, requestContext, false);
+        }
         if (!luxriotSummaryAutoRefresh && !force) return;
         try {
+            showLuxriotSummaryLoading(
+                'Loading live descriptions…',
+                Array.isArray(luxriotSummaryLogCache) && luxriotSummaryLogCache.length > 0,
+            );
             const params = buildSummaryQueryParams(channelId);
             params.set('limit', '240');
             params.set('view', 'feed');
@@ -5084,6 +5506,8 @@
             setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
             return false;
+        } finally {
+            finishLuxriotSummaryLoading();
         }
     }
 
@@ -5095,7 +5519,7 @@
         luxriotSummaryTimer = setInterval(() => {
             if (currentMode !== 'video') return;
             const channelId = getSelectedSummaryChannel();
-            refreshLuxriotSummaryView(channelId);
+            if (isLiveSummaryPeriod()) refreshLuxriotSummaryView(channelId);
             refreshLuxriotStreams();
         }, 8000);
     }
@@ -5280,7 +5704,7 @@
     syncProbeChannelSelect();
     syncSummaryRunSelectOptions([], luxriotSummaryRunFilter);
     applySummaryFiltersFromInputs();
-    setSummaryBaseLevel(luxriotSummaryLevel);
+    applySummaryResolutionMode();
 
     setMode(currentMode);
     
@@ -8923,7 +9347,8 @@
     if (luxriotSummaryChannelSelect) {
         luxriotSummaryChannelSelect.addEventListener('change', () => {
             luxriotSummaryChannel = getSelectedSummaryChannel();
-            setSummaryBaseLevel(luxriotSummaryLevel);
+            resetSummaryArchivePaging();
+            applySummaryResolutionMode();
             setSummaryUnread(0);
             refreshLuxriotSummaryView(luxriotSummaryChannel, true);
         });
@@ -8938,19 +9363,32 @@
     if (luxriotSummaryRangeSelect) {
         luxriotSummaryRangeSelect.addEventListener('change', () => {
             luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
-            syncSummaryRangeUI();
             if (luxriotSummaryRangePreset === 'custom') {
+                if (!Number.isFinite(luxriotSummaryFromTs) || !Number.isFinite(luxriotSummaryToTs)) {
+                    const initial = summarySiteDayBounds(-1);
+                    luxriotSummaryFromTs = initial.fromTs;
+                    luxriotSummaryToTs = initial.toTs;
+                    if (luxriotSummaryFromInput) luxriotSummaryFromInput.value = formatSummaryDatetimeInput(initial.fromTs);
+                    if (luxriotSummaryToInput) luxriotSummaryToInput.value = formatSummaryDatetimeInput(initial.toTs);
+                }
+                luxriotSummaryRunFilter = 'all';
+                luxriotSummaryFollowLive = false;
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
                 updateSummaryControlsUI();
                 return;
             }
             applySummaryFiltersFromInputs();
+            syncSummaryRangeUI();
             setSummaryUnread(0);
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
         });
     }
     if (luxriotSummaryLevelSelect) {
         luxriotSummaryLevelSelect.addEventListener('change', () => {
-            setSummaryBaseLevel(luxriotSummaryLevelSelect.value);
+            luxriotSummaryResolutionMode = normalizeSummaryResolutionMode(luxriotSummaryLevelSelect.value);
+            applySummaryResolutionMode();
             setSummaryUnread(0);
             updateSummaryControlsUI();
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
@@ -9000,6 +9438,20 @@
     }
     if (luxriotSummaryFollowBtn) {
         luxriotSummaryFollowBtn.addEventListener('click', () => {
+            if (!isLiveSummaryPeriod() || isRollupViewActive()) {
+                luxriotSummaryRangePreset = 'live';
+                luxriotSummaryRunFilter = 'live';
+                luxriotSummaryFollowLive = true;
+                luxriotSummaryAutoRefresh = true;
+                if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                return;
+            }
             const enableLive = !(luxriotSummaryAutoRefresh && luxriotSummaryFollowLive);
             luxriotSummaryAutoRefresh = enableLive;
             luxriotSummaryFollowLive = enableLive;
@@ -9052,11 +9504,38 @@
     }
     if (luxriotSummaryJumpBtn) {
         luxriotSummaryJumpBtn.addEventListener('click', () => {
-            if (isRollupViewActive()) return;
+            if (!isLiveSummaryPeriod() || isRollupViewActive()) {
+                luxriotSummaryRangePreset = 'live';
+                luxriotSummaryRunFilter = 'live';
+                luxriotSummaryAutoRefresh = true;
+                if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
+            }
             luxriotSummaryFollowLive = true;
             setSummaryUnread(0);
             updateSummaryControlsUI();
-            scrollSummaryToLatest();
+            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+        });
+    }
+    if (luxriotSummaryPreviousPeriodBtn) {
+        luxriotSummaryPreviousPeriodBtn.addEventListener('click', () => {
+            if (shiftSelectedSummaryPeriod(-1)) {
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            }
+        });
+    }
+    if (luxriotSummaryNextPeriodBtn) {
+        luxriotSummaryNextPeriodBtn.addEventListener('click', () => {
+            if (shiftSelectedSummaryPeriod(1)) {
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            }
+        });
+    }
+    if (luxriotSummaryLoadEarlierBtn) {
+        luxriotSummaryLoadEarlierBtn.addEventListener('click', () => {
+            void refreshLuxriotArchivedSummaries(getSelectedSummaryChannel(), null, true);
         });
     }
     if (luxriotSummaries) {
@@ -9176,9 +9655,15 @@
                 if (Number.isFinite(summaryChannelId)) {
                     luxriotSummaryChannel = summaryChannelId;
                     syncLuxriotSummaryChannelSelect();
-                    setSummaryBaseLevel(luxriotSummaryLevel);
+                    luxriotSummaryRangePreset = 'live';
+                    luxriotSummaryRunFilter = 'live';
+                    if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                    resetSummaryArchivePaging();
+                    applySummaryResolutionMode();
+                    syncSummaryRangeUI();
                     setSummaryUnread(0);
                     luxriotSummaryFollowLive = true;
+                    luxriotSummaryAutoRefresh = true;
                     updateSummaryControlsUI();
                     refreshLuxriotSummaryView(summaryChannelId, true);
                     if (!isRollupViewActive()) {
@@ -9208,7 +9693,8 @@
             luxriotActiveChannel = getSelectedLuxriotChannel();
             syncProbeChannelSelect();
             syncLuxriotSummaryChannelSelect();
-            setSummaryBaseLevel(luxriotSummaryLevel);
+            resetSummaryArchivePaging();
+            applySummaryResolutionMode();
             syncLuxriotLiveIntervalInput(luxriotActiveChannel, { force: true });
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
@@ -12405,6 +12891,7 @@
         if (luxriotSummaryToInput) {
             luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
         }
+        resetSummaryArchivePaging();
         syncSummaryRangeUI();
         setSummaryUnread(0);
         setLuxriotStatus(`Opening VLM feed around ${formatArchiveTimestamp(summaryWindow.targetMs)}...`);

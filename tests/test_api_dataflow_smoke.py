@@ -432,6 +432,56 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
 
+    def test_detections_list_can_skip_thumbnail_payload_for_history_reader(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?source=vlm_summary&channel_id=7&since_ms=1000"
+                "&until_ms=2000&include_thumbnail=0"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertFalse(captured["include_thumbnail"])
+        self.assertFalse(response.get_json()["filters"]["include_thumbnail"])
+
+    def test_luxriot_history_returns_compact_postgres_batch_page(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_vlm_summary_batches(self, **kwargs):
+                captured.update(kwargs)
+                return [
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-a",
+                        "created_at": 2.0,
+                        "batch_start_ms": 1000,
+                        "batch_end_ms": 2000,
+                        "summary": "A person crossed the road.",
+                    }
+                ], 3
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/luxriot/history?channel_id=7&from_ts=1&to_ts=2&limit=1&offset=0"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["storage"], "postgres")
+        self.assertEqual(payload["run"], "all")
+        self.assertEqual(payload["total"], 3)
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["logs"][0]["summary"], "A person crossed the road.")
+        self.assertEqual(captured["since_ms"], 1000)
+        self.assertEqual(captured["until_ms"], 2000)
+
     def test_detections_list_normalizes_probe_source_aliases(self) -> None:
         captured: Dict[str, Any] = {}
 

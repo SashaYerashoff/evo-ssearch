@@ -291,30 +291,45 @@
                                         <select id="luxriotSummaryChannelSelect" class="luxriot-mini-input"></select>
                                     </div>
                                     <div class="luxriot-summary-filter">
-                                        <label for="luxriotSummaryRangeSelect">History</label>
+                                        <label for="luxriotSummaryRangeSelect">Period</label>
                                         <select id="luxriotSummaryRangeSelect" class="luxriot-mini-input">
-                                            <option value="6h" selected>last 6 hours</option>
-                                            <option value="24h">last day</option>
-                                            <option value="3d">last 3 days</option>
-                                            <option value="7d">last week</option>
-                                            <option value="30d">last month</option>
-                                            <option value="all">all history</option>
+                                            <option value="live" selected>Live</option>
+                                            <option value="today">Today</option>
+                                            <option value="yesterday">Yesterday</option>
+                                            <option value="day_before_yesterday">Day before yesterday</option>
+                                            <option value="7d">Last 7 days</option>
+                                            <option value="30d">Last 30 days</option>
+                                            <option value="custom">Custom range…</option>
                                         </select>
                                     </div>
                                     <div class="luxriot-summary-filter">
-                                        <label for="luxriotSummaryLevelSelect">Depth</label>
+                                        <label for="luxriotSummaryLevelSelect">Resolution</label>
                                         <select id="luxriotSummaryLevelSelect" class="luxriot-mini-input">
-                                            <option value="L0" selected>Live</option>
-                                            <option value="L1">Minutes</option>
-                                            <option value="L2">Hours</option>
-                                            <option value="L3">Days</option>
+                                            <option value="AUTO" selected>Auto</option>
+                                            <option value="L0">Observations</option>
+                                            <option value="L1">15 minute summaries</option>
+                                            <option value="L2">1 hour summaries</option>
+                                            <option value="L3">6 hour summaries</option>
                                         </select>
                                     </div>
+                                </div>
+                                <div id="luxriotSummaryDateNav" class="luxriot-summary-date-nav is-hidden" aria-label="Selected history window">
+                                    <button id="luxriotSummaryPreviousPeriod" class="feature-btn" type="button" title="Previous period">‹</button>
+                                    <span id="luxriotSummaryDateLabel" class="luxriot-summary-date-label"></span>
+                                    <button id="luxriotSummaryNextPeriod" class="feature-btn" type="button" title="Next period">›</button>
+                                </div>
+                                <div id="luxriotSummaryCustomTime" class="luxriot-summary-custom-time is-hidden">
+                                    <label for="luxriotSummaryFromInput">From</label>
+                                    <input id="luxriotSummaryFromInput" class="luxriot-mini-input luxriot-mini-time" type="datetime-local">
+                                    <label for="luxriotSummaryToInput">To</label>
+                                    <input id="luxriotSummaryToInput" class="luxriot-mini-input luxriot-mini-time" type="datetime-local">
+                                    <button id="luxriotSummaryApplyFiltersBtn" class="feature-btn" type="button">Apply</button>
                                 </div>
                                 <div class="luxriot-summary-actions-row">
                                     <button id="luxriotRefreshSummaries" class="feature-btn">⟳ Refresh</button>
                                     <button id="luxriotSummaryFollowBtn" class="feature-btn">▶ Live</button>
                                     <button id="luxriotSummaryJumpBtn" class="feature-btn is-hidden">⬇ Jump to latest</button>
+                                    <button id="luxriotSummaryLoadEarlierBtn" class="feature-btn is-hidden">← Load earlier</button>
                                     <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
                                     <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
                                 </div>

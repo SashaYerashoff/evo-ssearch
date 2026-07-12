@@ -187,7 +187,7 @@ def test_live_media_broker_cuts_at_lease_and_closes_upstream(
 ):
     monkeypatch.setattr(oldapp.config, "LUXRIOT_LIVE_MEDIA_MAX_SECONDS", 12.0)
     ticks = iter((100.0, 101.0, 112.1))
-    monkeypatch.setattr(oldapp.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(oldapp, "_luxriot_media_monotonic", lambda: next(ticks))
     upstream = FakeUpstream(
         [MP4_BYTES, b"inside-lease", b"after-lease"],
         headers={"Content-Type": "video/mp4"},

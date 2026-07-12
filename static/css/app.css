@@ -8324,17 +8324,64 @@ textarea::placeholder {
 .video-feed-head .luxriot-summary-toolbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "filters actions"
+        "period period"
+        "custom custom";
     align-items: end;
     gap: 10px 14px;
     min-width: 0;
 }
 
 .video-feed-head .luxriot-summary-filters {
+    grid-area: filters;
     display: grid;
     grid-template-columns: minmax(150px, 1.25fr) minmax(125px, 0.9fr) minmax(100px, 0.7fr);
     align-items: end;
     gap: 8px;
     min-width: 0;
+}
+
+.video-feed-head .luxriot-summary-date-nav,
+.video-feed-head .luxriot-summary-custom-time {
+    grid-column: 1 / -1;
+}
+
+.video-feed-head .luxriot-summary-date-nav {
+    grid-area: period;
+}
+
+.video-feed-head .luxriot-summary-custom-time {
+    grid-area: custom;
+}
+
+.luxriot-summary-date-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.luxriot-summary-date-label {
+    min-width: 0;
+    color: var(--muted);
+    font-size: 0.76rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.luxriot-summary-date-nav .feature-btn {
+    min-width: 34px;
+    padding-inline: 8px;
+}
+
+.luxriot-summary-custom-time label {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
 }
 
 .video-feed-head .luxriot-summary-filter {
@@ -8357,6 +8404,7 @@ textarea::placeholder {
 }
 
 .video-feed-head .luxriot-summary-actions-row {
+    grid-area: actions;
     justify-content: flex-end;
     width: auto;
 }
@@ -8364,6 +8412,44 @@ textarea::placeholder {
 .video-feed-head .luxriot-summary-actions-row .feature-btn {
     min-height: 34px;
     padding-inline: 10px;
+}
+
+.luxriot-feed-loading {
+    min-height: min(42vh, 420px);
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 10px;
+    padding: 28px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.luxriot-feed-loading strong {
+    color: var(--text);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.82rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.luxriot-feed-loading-spinner {
+    width: 32px;
+    height: 32px;
+    border: 2px solid rgba(73, 105, 126, 0.42);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: luxriot-feed-spin 0.8s linear infinite;
+}
+
+@keyframes luxriot-feed-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .luxriot-feed-loading-spinner {
+        animation-duration: 1.8s;
+    }
 }
 
 .luxriot-selected-runtime {
@@ -9400,6 +9486,11 @@ textarea::placeholder {
 
     .video-feed-head .luxriot-summary-toolbar {
         grid-template-columns: 1fr;
+        grid-template-areas:
+            "filters"
+            "period"
+            "custom"
+            "actions";
     }
 
     .video-feed-head .luxriot-summary-actions-row {
@@ -9484,6 +9575,11 @@ textarea::placeholder {
 
     .video-feed-head .luxriot-summary-toolbar {
         grid-template-columns: 1fr;
+        grid-template-areas:
+            "filters"
+            "period"
+            "custom"
+            "actions";
     }
 
     .video-feed-head .luxriot-summary-actions-row {

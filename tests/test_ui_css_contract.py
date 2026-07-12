@@ -615,3 +615,32 @@ def test_rollup_ui_reads_precomputed_windows_without_triggering_llm():
     assert "request.args.get('synthesize')" in route
     assert "synthesize=synthesize" in route
     assert "rollups['levels']" in route
+
+
+def test_video_history_controls_separate_period_resolution_and_live_following():
+    for token in (
+        'value="live" selected>Live',
+        'value="day_before_yesterday">Day before yesterday',
+        'value="custom">Custom range…',
+        'value="AUTO" selected>Auto',
+        '>Observations<',
+        '>15 minute summaries<',
+        'id="luxriotSummaryPreviousPeriod"',
+        'id="luxriotSummaryNextPeriod"',
+        'id="luxriotSummaryLoadEarlierBtn"',
+    ):
+        assert token in TEMPLATE
+    for token in (
+        "function resolveAutoSummaryLevel",
+        "function shiftSelectedSummaryPeriod",
+        "function summarySiteLocalToEpoch",
+        "rangePreset === 'live' ? 'live'",
+        "fetch(`/luxriot/history?${params.toString()}`",
+        "function refreshLuxriotArchivedSummaries",
+        "all runs",
+        "Loading archived descriptions…",
+        "No precomputed rollup covers this period · loading archived observations…",
+    ):
+        assert token in JS
+    assert ".luxriot-feed-loading" in CSS
+    assert ".luxriot-feed-loading-spinner" in CSS

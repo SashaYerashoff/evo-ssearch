@@ -577,6 +577,7 @@ class PostgresDetectionsStore(_TenantRepository):
         limit: int = 50,
         offset: int = 0,
         source: Optional[str] = None,
+        include_thumbnail: bool = True,
     ) -> Tuple[List[Dict[str, Any]], int]:
         limit = max(1, min(500, int(limit or 50)))
         offset = max(0, int(offset or 0))
@@ -596,7 +597,7 @@ class PostgresDetectionsStore(_TenantRepository):
                     ).fetchone()
                     rows = connection.execute(
                         f"""
-                        SELECT {self._select_columns()}
+                        SELECT {self._select_columns(include_thumbnail=include_thumbnail)}
                         FROM archive.detections
                         {where_sql}
                         ORDER BY event_timestamp_ms DESC, id DESC
@@ -610,6 +611,126 @@ class PostgresDetectionsStore(_TenantRepository):
             raise
         total = int(total_row[0] or 0) if total_row else 0
         return [self._row_to_dict(row) for row in rows], total
+
+    def list_vlm_summary_batches(
+        self,
+        *,
+        channel_id: int,
+        since_ms: Optional[int] = None,
+        until_ms: Optional[int] = None,
+        limit: int = 120,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return one compact text row per archived VLM batch.
+
+        Each archived batch has several evidence-frame rows. Grouping them in
+        PostgreSQL avoids sending the same summary payload and large thumbnail
+        columns repeatedly to the operator history reader.
+        """
+        limit = max(1, min(240, int(limit or 120)))
+        offset = max(0, int(offset or 0))
+        where_sql, params = self._build_where(
+            channel_id=channel_id,
+            source="vlm_summary",
+            since_ms=since_ms,
+            until_ms=until_ms,
+        )
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    rows = connection.execute(
+                        f"""
+                        WITH candidates AS (
+                            SELECT
+                                id,
+                                event_timestamp_ms,
+                                payload_json,
+                                COALESCE(NULLIF(payload_json->>'run_id', ''), 'manual') AS run_id,
+                                COALESCE(
+                                    NULLIF(payload_json->>'batch_start_ms', '')::bigint,
+                                    event_timestamp_ms
+                                ) AS batch_start_ms,
+                                COALESCE(
+                                    NULLIF(payload_json->>'batch_end_ms', '')::bigint,
+                                    event_timestamp_ms
+                                ) AS batch_end_ms
+                            FROM archive.detections
+                            {where_sql}
+                        ), batches AS (
+                            SELECT DISTINCT ON (run_id, batch_start_ms, batch_end_ms)
+                                id,
+                                event_timestamp_ms,
+                                payload_json,
+                                run_id,
+                                batch_start_ms,
+                                batch_end_ms
+                            FROM candidates
+                            ORDER BY
+                                run_id,
+                                batch_start_ms,
+                                batch_end_ms,
+                                event_timestamp_ms DESC,
+                                id DESC
+                        )
+                        SELECT
+                            id,
+                            event_timestamp_ms,
+                            payload_json,
+                            batch_start_ms,
+                            batch_end_ms,
+                            COUNT(*) OVER () AS total_batches
+                        FROM batches
+                        ORDER BY batch_end_ms DESC, id DESC
+                        LIMIT %s OFFSET %s
+                        """,
+                        tuple(params + [limit, offset]),
+                    ).fetchall()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _archive_not_ready(exc) from exc
+            raise
+
+        total = int(rows[0][5] or 0) if rows else 0
+        logs: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = _decode_json_value(row[2])
+            if not isinstance(payload, Mapping):
+                continue
+            vector_signal_raw = payload.get("vector_signal")
+            capture_attention = (
+                vector_signal_raw.get("capture_attention")
+                if isinstance(vector_signal_raw, Mapping)
+                else None
+            )
+            compact_vector_signal = (
+                {"capture_attention": dict(capture_attention)}
+                if isinstance(capture_attention, Mapping)
+                else {}
+            )
+            batch_start_ms = int(row[3] or payload.get("batch_start_ms") or row[1] or 0)
+            batch_end_ms = int(row[4] or payload.get("batch_end_ms") or row[1] or batch_start_ms)
+            logs.append(
+                {
+                    "archive_id": int(row[0]),
+                    "channel_id": int(channel_id),
+                    "run_id": str(payload.get("run_id") or "").strip(),
+                    "created_at": float(batch_end_ms) / 1000.0,
+                    "batch_start_ms": batch_start_ms,
+                    "batch_end_ms": batch_end_ms,
+                    "frame_count": int(payload.get("frame_count") or payload.get("batch_size") or 0),
+                    "batch_size": int(payload.get("batch_size") or 0),
+                    "duration_sec": float(payload.get("duration_sec") or 0.0),
+                    "summary": str(payload.get("summary") or ""),
+                    "alert_counts": dict(payload.get("alert_counts") or {})
+                    if isinstance(payload.get("alert_counts"), Mapping)
+                    else {},
+                    "alert_total": int(payload.get("alert_total") or 0),
+                    "bookmarks_sent": int(payload.get("bookmarks_sent") or 0),
+                    "vector_signal": compact_vector_signal,
+                    "archive_backed": True,
+                }
+            )
+        return logs, total
 
     def list_vector_candidates(
         self,

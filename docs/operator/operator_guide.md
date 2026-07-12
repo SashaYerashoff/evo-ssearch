@@ -31,12 +31,15 @@ This is where the system's always-on description of each channel lives.
   the desired live session, so the service can restore it after restart.
 - **Stream context** — channel, cadence, batch size, model, queue, and runtime
   state.
-- **Summary Lens** — filters what level/source you are reading in the VLM feed.
-  It does not change what happened in the video; it changes which summaries are
-  shown.
-- **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = live per-batch)
-  and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries). Collapsed summary
-  rows show **alert badges** when something was flagged.
+- **VLM Feed controls** keep three choices separate: **Period** (Live, Today,
+  Yesterday, a calendar range), **Resolution** (Auto, observations, 15 min,
+  1 h, 6 h), and **Follow live**. Historical periods span service restarts and
+  are read from the PostgreSQL archive in pages; `Load earlier` retrieves the
+  next page without restarting analysis.
+- **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = per-batch
+  observations) and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries).
+  `Auto` chooses a practical resolution for the selected period. Collapsed
+  summary rows show **alert badges** when something was flagged.
 - **Channel Runtime / stream health** — whether the channel is actively
   producing descriptions and whether there are **coverage gaps / dropped
   batches**. A channel that is *quiet* is fine; a channel that is *blind* (gaps)

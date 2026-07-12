@@ -284,6 +284,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_snapshot_capture": Permission.STREAMS_VIEW,
     "road_scene_overlay": Permission.DIAGNOSTICS_VIEW,
     "luxriot_session_status": Permission.STREAMS_VIEW,
+    "luxriot_summary_history": Permission.REPORTS_VIEW,
     "luxriot_summary_rollups": Permission.REPORTS_VIEW,
     "luxriot_streams_status": Permission.STREAMS_VIEW,
     "probes_status": Permission.STREAMS_VIEW,
@@ -323,6 +324,7 @@ _DEFAULT_CHANNEL_ENDPOINTS = frozenset(
         "luxriot_bookmark",
         "luxriot_flush_capture",
         "luxriot_session_status",
+        "luxriot_summary_history",
         "luxriot_start_capture",
         "luxriot_stop_capture",
         "luxriot_stop_stream",
@@ -1919,6 +1921,10 @@ def serve_app_js():
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
+    js = js.replace(
+        '{site_timezone_json}',
+        json.dumps(os.getenv('EVOSSEARCH_SITE_TIMEZONE', 'Asia/Tbilisi').strip() or 'Asia/Tbilisi'),
+    )
     js = js.replace('{auth_enabled_json}', json.dumps(bool(config.AUTH_ENABLED)))
     js = js.replace(
         '{auth_csrf_cookie_json}',
@@ -9437,6 +9443,11 @@ def _luxriot_media_limits(media_kind: str) -> Tuple[Tuple[float, float], float, 
     return (connect_timeout, read_timeout), max_seconds, max_bytes
 
 
+# Narrow clock seam: media lease tests must not monkeypatch the process-wide
+# time module used concurrently by live capture workers.
+_luxriot_media_monotonic = time.monotonic
+
+
 def _luxriot_media_safe_header(value: Any, limit: int = 512) -> str:
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()[:limit]
 
@@ -9963,7 +9974,7 @@ def luxriot_media(media_kind: str, channel_id: int):
 
     def generate_media():
         written = 0
-        deadline = time.monotonic() + max_seconds
+        deadline = _luxriot_media_monotonic() + max_seconds
         try:
             remaining = max_bytes - written
             if remaining <= 0:
@@ -9973,7 +9984,7 @@ def luxriot_media(media_kind: str, channel_id: int):
             if initial:
                 yield initial
             for raw in iterator:
-                if time.monotonic() >= deadline:
+                if _luxriot_media_monotonic() >= deadline:
                     break
                 if raw is None:
                     continue
@@ -10833,6 +10844,48 @@ def luxriot_summary_rollups():
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/luxriot/history', methods=['GET'])
+def luxriot_summary_history():
+    channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    from_ts = request.args.get('from_ts', default=None, type=float)
+    to_ts = request.args.get('to_ts', default=None, type=float)
+    limit = max(1, min(240, request.args.get('limit', default=120, type=int) or 120))
+    offset = max(0, request.args.get('offset', default=0, type=int) or 0)
+    if from_ts is not None and to_ts is not None and from_ts > to_ts:
+        from_ts, to_ts = to_ts, from_ts
+    try:
+        logs, total = detections_store.list_vlm_summary_batches(
+            channel_id=channel_id,
+            since_ms=int(from_ts * 1000.0) if from_ts is not None else None,
+            until_ms=int(to_ts * 1000.0) if to_ts is not None else None,
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify(
+            {
+                'logs': logs,
+                'total': total,
+                'limit': limit,
+                'offset': offset,
+                'has_more': offset + len(logs) < total,
+                'channel_id': channel_id,
+                'from_ts': from_ts,
+                'to_ts': to_ts,
+                'run': 'all',
+                'storage': 'postgres',
+            }
+        )
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "VLM summary history query failed request_id=%s channel_id=%s",
+            getattr(g, "request_id", ""),
+            channel_id,
+        )
+        return jsonify({'error': 'summary_history_query_failed'}), 500
 
 
 @app.route('/luxriot/streams', methods=['GET'])
@@ -11942,6 +11995,9 @@ def detections_list():
         offset = int(request.args.get('offset', 0))
     except Exception:
         offset = 0
+    include_thumbnail = str(request.args.get('include_thumbnail') or '1').strip().lower() not in {
+        '0', 'false', 'no', 'off'
+    }
 
     try:
         detections, total = detections_store.list_detections(
@@ -11952,6 +12008,7 @@ def detections_list():
             until_ms=until_ms,
             limit=limit,
             offset=offset,
+            include_thumbnail=include_thumbnail,
         )
         return jsonify(
             {
@@ -11966,6 +12023,7 @@ def detections_list():
                     'source': source,
                     'since_ms': since_ms,
                     'until_ms': until_ms,
+                    'include_thumbnail': include_thumbnail,
                 },
             }
         )
