@@ -644,6 +644,8 @@ def test_video_history_controls_separate_period_resolution_and_live_following():
         assert token in JS
     assert ".luxriot-feed-loading" in CSS
     assert ".luxriot-feed-loading-spinner" in CSS
+    assert 'grid-template-areas:\n        "filters"\n        "period"\n        "custom"\n        "actions"' in CSS
+    assert ".video-feed-head .luxriot-summary-actions-row" in CSS
 
 
 def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():

@@ -8355,13 +8355,14 @@ textarea::placeholder {
 
 .video-feed-head .luxriot-summary-toolbar {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-        "filters actions"
-        "period period"
-        "custom custom";
+        "filters"
+        "period"
+        "custom"
+        "actions";
     align-items: end;
-    gap: 10px 14px;
+    gap: 10px;
     min-width: 0;
 }
 
@@ -8437,8 +8438,9 @@ textarea::placeholder {
 
 .video-feed-head .luxriot-summary-actions-row {
     grid-area: actions;
-    justify-content: flex-end;
-    width: auto;
+    justify-content: flex-start;
+    width: 100%;
+    min-width: 0;
 }
 
 .video-feed-head .luxriot-summary-actions-row .feature-btn {
@@ -9644,6 +9646,10 @@ textarea::placeholder {
     .agent-chat-topbar > div:first-child {
         flex-direction: column;
         gap: 3px;
+    }
+
+    .video-feed-head .luxriot-summary-filters {
+        grid-template-columns: minmax(0, 1fr);
     }
 
     .agent-model-controls {
