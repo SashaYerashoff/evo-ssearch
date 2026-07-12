@@ -632,6 +632,14 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
             self.assertIn("Measured motion homeostasis", system_prompt)
             self.assertIn("typical per-second motion on this channel is low", system_prompt)
 
+    def test_observation_contract_forbids_intent_and_safety_conclusions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            prompt = manager.compose_live_system_prompt(7, "Describe the stream.")
+            self.assertIn("Never assert intent or skill", prompt)
+            self.assertIn("Never declare 'no safety hazard'", prompt)
+            self.assertIn("visually unconfirmed", prompt)
+
     def test_quiet_batches_do_not_spend_prompt_tokens_on_attention(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

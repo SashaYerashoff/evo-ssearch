@@ -148,7 +148,14 @@ LIVE_OBSERVATION_STATE_PROMPT = (
     "present|absent|uncertain with snapshot numbers or timestamps as evidence.\n"
     "- If two distinct triggers are visible in the same batch, report both and emit two alert objects.\n"
     "- Claim enter/leave only when the current snapshots show a before/after transition; otherwise report the "
-    "current state and let backend continuity tools compare adjacent batches."
+    "current state and let backend continuity tools compare adjacent batches.\n"
+    "- Never assert intent or skill: words like 'intentional', 'controlled', 'stunt', 'deliberate', 'showing off' "
+    "are conclusions cameras cannot prove. Describe the visible dynamics (speed, trajectory, smoke, proximity to "
+    "people/objects) and let severity reflect the visible risk.\n"
+    "- Never declare 'no safety hazard' or 'no danger': absence of visible harm in sampled snapshots is not proof "
+    "of safety. Say what is visible and what remains uncertain.\n"
+    "- A vector/attention cue never confirms an event by itself; only current snapshots confirm. If the images do "
+    "not support the cue, say the cue is visually unconfirmed."
 )
 
 VECTOR_SIGNAL_PROMPT_PREFIX = (

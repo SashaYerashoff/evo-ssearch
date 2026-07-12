@@ -2749,6 +2749,97 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             [0, 4, 8],
         )
 
+    def test_list_attention_bursts_ranks_windows_and_reports_gaps(self):
+        class _BurstSummaryManager(_SummaryManager):
+            def summary_rollups(self, channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None, target_level=None, synthesize=True):
+                nodes = [
+                    {
+                        "level": "L0",
+                        "window_start": 100.0,
+                        "window_end": 112.0,
+                        "batch_start_ms": 100_000,
+                        "batch_end_ms": 112_000,
+                        "summary": "car drifting across the lot with smoke",
+                        "vector_signal": {
+                            "capture_attention": {
+                                "baseline": {"level": 0.001, "warmup": False},
+                                "seconds": [
+                                    {"snapshot": 3, "mode": "burst", "activity_x": 11.1, "sharper_companion": True},
+                                    {"snapshot": 5, "mode": "normal", "activity_x": 3.0},
+                                ],
+                            }
+                        },
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 112.0,
+                        "window_end": 124.0,
+                        "batch_start_ms": 112_000,
+                        "batch_end_ms": 124_000,
+                        "summary": "quiet lot",
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 124.0,
+                        "window_end": 136.0,
+                        "batch_start_ms": 124_000,
+                        "batch_end_ms": 136_000,
+                        "summary": "[coverage gap] dropped",
+                        "coverage_gap": True,
+                        "gap_reason": "lm_backpressure_dropped_batch",
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 136.0,
+                        "window_end": 148.0,
+                        "batch_start_ms": 136_000,
+                        "batch_end_ms": 148_000,
+                        "summary": "person runs through",
+                        "vector_signal": {
+                            "capture_attention": {
+                                "seconds": [
+                                    {"snapshot": 1, "mode": "burst", "activity_x": 5.5},
+                                ]
+                            }
+                        },
+                    },
+                ]
+                return {"levels": {"L0": nodes}, "source_counts": {"L0": len(nodes)}}
+
+        tools = _tools(manager=_BurstSummaryManager())
+        result = tools.execute(
+            "list_attention_bursts",
+            {"channel_id": 7, "from_ts": 90.0, "to_ts": 200.0, "min_activity_x": 2.0},
+        )
+
+        self.assertEqual(result["burst_count"], 2)
+        self.assertEqual(result["bursts"][0]["activity_x"], 11.1)
+        self.assertEqual(result["bursts"][0]["snapshot"], 3)
+        self.assertTrue(result["bursts"][0]["sharper_companion"])
+        self.assertEqual(result["bursts"][0]["baseline_level"], 0.001)
+        self.assertIn("drifting", result["bursts"][0]["summary_excerpt"])
+        self.assertEqual(result["bursts"][1]["activity_x"], 5.5)
+        self.assertNotIn(5, [row["snapshot"] for row in result["bursts"]])
+        self.assertEqual(result["backpressure_gap_count"], 1)
+        self.assertIn("unknowable, not absent", result["backpressure_note"])
+        self.assertIn("not semantic proof", result["semantics"])
+
+        strict = tools.execute(
+            "list_attention_bursts",
+            {"channel_id": 7, "from_ts": 90.0, "to_ts": 200.0, "min_activity_x": 6.0},
+        )
+        self.assertEqual(strict["burst_count"], 1)
+        self.assertEqual(strict["bursts"][0]["activity_x"], 11.1)
+
+    def test_system_prompt_routes_spike_questions_to_the_burst_tool(self):
+        prompt = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+        )
+        self.assertIn("call list_attention_bursts FIRST", prompt)
+        self.assertIn("unknown intervals, never as calm", prompt)
+
     def test_capture_attention_survives_model_compaction(self):
         compact = _compact_vector_signal_for_model(
             {

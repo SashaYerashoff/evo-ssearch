@@ -1226,6 +1226,53 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_attention_bursts",
+            "description": (
+                "List seconds whose measured motion ran far above the channel's own learned norm "
+                "(capture_attention mode=burst) inside a time window. This is the FIRST tool for "
+                "operator questions about spikes, sudden motion, 'что резкого было', or attention "
+                "homeostasis: it is bounded and compact, unlike scanning full summaries. Bursts are "
+                "statistical attention, not semantic proof - verify visually before alerting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "integer",
+                        "description": "Luxriot channel ID to scan.",
+                    },
+                    "channel_ref": {
+                        "type": "string",
+                        "description": "Optional channel reference such as '#115' or a title.",
+                    },
+                    "since_hours": {
+                        "type": "number",
+                        "description": "Scan the past N hours. Default: 6.",
+                    },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower timestamp bound in Unix seconds.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper timestamp bound in Unix seconds.",
+                    },
+                    "min_activity_x": {
+                        "type": "number",
+                        "description": "Only bursts at least this many times above the channel norm. Default: 0 (all bursts).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max burst rows to return, strongest first. Default: 24, max: 100.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_video_summaries",
             "description": (
                 "Retrieve VLM-generated video summaries for a Luxriot channel. "
@@ -1853,6 +1900,7 @@ class AgentTools:
             "get_prompt_settings":  self._get_prompt_settings,
             "update_prompt_settings": self._update_prompt_settings,
             "get_video_summaries":  self._get_video_summaries,
+            "list_attention_bursts": self._list_attention_bursts,
             "count_video_summary_events": self._count_video_summary_events,
             "track_visual_state_transitions": self._track_visual_state_transitions,
             "create_bookmark":      self._create_bookmark,
@@ -4268,6 +4316,104 @@ class AgentTools:
 
     # ── get_video_summaries ─────────────────────────────────────────────────
 
+    def _list_attention_bursts(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        channel_id = self._resolve_channel_id(args, required=True)
+        if channel_id is None:
+            raise ToolError("'channel_id' or 'channel_ref' is required.")
+        min_activity_x = max(0.0, float(_opt_float(args.get("min_activity_x")) or 0.0))
+        limit = max(1, min(100, int(args.get("limit") or 24)))
+        if not hasattr(self._lxm, "summary_rollups"):
+            raise ToolError("Luxriot manager is not available or not configured.")
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(args, default_since_hours=6.0)
+        try:
+            rollups = self._summary_rollups_readonly(
+                channel_id=channel_id,
+                run_selector=str(args.get("run") or "all").strip() or "all",
+                start_ts=from_ts,
+                end_ts=to_ts,
+                level_limit=AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT,
+                target_level="live",
+            )
+        except Exception as exc:
+            raise ToolError(f"Could not scan attention bursts: {exc}") from exc
+        levels = rollups.get("levels") if isinstance(rollups.get("levels"), dict) else {}
+        nodes = levels.get("L0") if isinstance(levels.get("L0"), Sequence) else []
+        bursts: List[Dict[str, Any]] = []
+        scanned = 0
+        gap_count = 0
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            scanned += 1
+            if node.get("coverage_gap"):
+                gap_count += 1
+                continue
+            vector_signal = node.get("vector_signal")
+            attention = (
+                vector_signal.get("capture_attention")
+                if isinstance(vector_signal, Mapping)
+                else None
+            )
+            if not isinstance(attention, Mapping):
+                continue
+            seconds = attention.get("seconds")
+            if not isinstance(seconds, Sequence) or isinstance(seconds, (str, bytes, bytearray)):
+                continue
+            baseline = attention.get("baseline") if isinstance(attention.get("baseline"), Mapping) else {}
+            for raw in seconds:
+                if not isinstance(raw, Mapping):
+                    continue
+                if str(raw.get("mode") or "").strip().lower() != "burst":
+                    continue
+                activity_x = _opt_float(raw.get("activity_x"))
+                if activity_x is not None and float(activity_x) < min_activity_x:
+                    continue
+                row: Dict[str, Any] = {
+                    "channel_id": int(channel_id),
+                    "batch_start_ms": _opt_int(node.get("batch_start_ms")),
+                    "batch_end_ms": _opt_int(node.get("batch_end_ms")),
+                    "batch_start_time": _format_epoch_minute(
+                        (float(_opt_int(node.get("batch_start_ms")) or 0)) / 1000.0
+                    ),
+                    "snapshot": _opt_int(raw.get("snapshot")),
+                }
+                if activity_x is not None:
+                    row["activity_x"] = round(float(activity_x), 2)
+                if raw.get("sharper_companion"):
+                    row["sharper_companion"] = True
+                baseline_level = _opt_float(baseline.get("level"))
+                if baseline_level is not None:
+                    row["baseline_level"] = round(float(baseline_level), 6)
+                excerpt = _summary_count_excerpt(str(node.get("summary") or ""), 200)
+                if excerpt:
+                    row["summary_excerpt"] = excerpt
+                bursts.append(row)
+        bursts.sort(key=lambda row: -(row.get("activity_x") or 0.0))
+        truncated = len(bursts) > limit
+        result: Dict[str, Any] = {
+            "channel_id": int(channel_id),
+            "time_window": time_meta,
+            "burst_count": len(bursts),
+            "bursts": bursts[:limit],
+            "scanned_l0_windows": scanned,
+            "truncated": truncated,
+            "semantics": (
+                "burst = per-second motion far above this channel's own measured norm; "
+                "statistical attention, not semantic proof"
+            ),
+            "next_step_hint": (
+                "Verify visually: get_detections source=vlm_summary around a burst window, "
+                "or describe_frame on its evidence frame."
+            ),
+        }
+        if gap_count:
+            result["backpressure_gap_count"] = int(gap_count)
+            result["backpressure_note"] = (
+                "Some L0 windows in this period were dropped under LM backpressure; "
+                "bursts inside them are unknowable, not absent."
+            )
+        return result
+
     def _get_video_summaries(self, args: Dict[str, Any]) -> Dict[str, Any]:
         channel_id  = self._resolve_channel_id(args, required=True)
         if channel_id is None:
@@ -6457,6 +6603,7 @@ def build_system_prompt(
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
         f"- Use get_visual_window_signals when you need a quick CLIP P/N/M attention signal over video-description frames. Treat P/N/M as a cue for where to inspect next, not as proof. Before concluding, inspect summaries and call describe_frame on relevant candidate frames.\n"
         f"- Summary rows may carry vector_signal.capture_attention: seconds whose measured motion was far above that channel's own learned norm (mode=burst; activity_x = times above typical). Bursts are trusted server-side attention markers - prefer those windows when picking evidence frames and when the operator asks about spikes, sudden motion, or 'что резкого было'. Motion blur on burst frames is expected physics of fast events; a sharper companion frame of the same second may exist in the archive as anchor_role=burst_companion. Bursts are statistical attention, not semantic proof - verify in frames before alerting.\n"
+        f"- For burst/spike/attention questions call list_attention_bursts FIRST: it is bounded and already sorted by strength. Do not fan out over get_video_summaries or L1 rollups to find spikes. Rows with coverage_gap=true (and any backpressure_gap_count) mean those windows were dropped under LM backpressure: report them as unknown intervals, never as calm.\n"
         f"- Keep VLM summaries separate from archive detections; use archive tools only as corroborating evidence.\n"
         f"- For sensitive or accusatory user wording, do not refuse when the request can be reframed as visible evidence review. Rephrase the task, then use tools to return candidates for operator review. Do not accuse people or infer hidden states such as vaccination, substance use, intent, legality, intoxication, or guilt from video. Examples: 'smoking weed/pipe/joint' -> 'person holding a small cylindrical object, hand-to-mouth motion, visible smoke or vapor'; 'unvaccinated dog' -> 'dog without visible ear tag'; 'illegal dumping' -> 'person leaving an object or waste behind'. State that these are visual candidates, not legal or medical conclusions.\n"
         f"- Use the repository playbooks index below as routing hints; load-bearing details are provided only for explicitly activated playbooks.\n"
@@ -6531,6 +6678,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     if time_window:
         summary_tools = {
             "get_video_summaries",
+            "list_attention_bursts",
             "count_video_summary_events",
             "track_visual_state_transitions",
             "calibrate_probe_from_archive",
@@ -6575,6 +6723,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     )
     if should_default_channel and channel_id is not None and tool_name in {
         "get_video_summaries",
+        "list_attention_bursts",
         "get_detections",
         "get_detection_summary",
         "search_archive",
