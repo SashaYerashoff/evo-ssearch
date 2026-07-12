@@ -7838,6 +7838,32 @@ textarea::placeholder {
     min-width: 0;
 }
 
+.luxriot-runtime-config-state {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-height: 20px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.luxriot-runtime-config-state[hidden],
+.luxriot-runtime-config-pending[hidden] {
+    display: none;
+}
+
+.luxriot-runtime-config-pending {
+    padding: 3px 7px;
+    border: 1px solid rgba(239, 181, 71, 0.45);
+    border-radius: 999px;
+    color: #efb547;
+    background: rgba(239, 181, 71, 0.08);
+}
+
 .video-command-panel > .luxriot-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, max-content));

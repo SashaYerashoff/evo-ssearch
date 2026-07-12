@@ -74,6 +74,9 @@
     const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
     const luxriotLiveIntervalInput = document.getElementById('luxriotLiveIntervalSec');
     const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
+    const luxriotRuntimeConfigState = document.getElementById('luxriotRuntimeConfigState');
+    const luxriotRuntimeConfigRunning = document.getElementById('luxriotRuntimeConfigRunning');
+    const luxriotRuntimeConfigPending = document.getElementById('luxriotRuntimeConfigPending');
     const luxriotStatusLabel = document.getElementById('luxriotStatus');
     let luxriotPreviewImg = document.getElementById('luxriotPreview');
     const luxriotViewport = document.getElementById('luxriotViewport');
@@ -324,6 +327,7 @@
     let luxriotSummaryRequestGeneration = 0;
     let luxriotSummaryActiveRequest = null;
     let luxriotStreamsCache = [];
+    let luxriotLiveIntervalDirtyChannelId = null;
     const luxriotChannelNameById = {};
     const luxriotChannelMetaById = {};
     const luxriotCaptureRunningByChannel = {};
@@ -1335,6 +1339,27 @@
             || 5;
     }
 
+    function markLuxriotLiveIntervalDirty() {
+        const channelId = getSelectedLuxriotChannel();
+        luxriotLiveIntervalDirtyChannelId = Number.isFinite(channelId) ? channelId : null;
+    }
+
+    function clearLuxriotLiveIntervalDirty(channelIdOverride = null) {
+        const channelId = Number.isFinite(channelIdOverride)
+            ? channelIdOverride
+            : getSelectedLuxriotChannel();
+        if (!Number.isFinite(channelId) || luxriotLiveIntervalDirtyChannelId === channelId) {
+            luxriotLiveIntervalDirtyChannelId = null;
+        }
+    }
+
+    function isLuxriotLiveIntervalDirty(channelIdOverride = null) {
+        const channelId = Number.isFinite(channelIdOverride)
+            ? channelIdOverride
+            : getSelectedLuxriotChannel();
+        return Number.isFinite(channelId) && luxriotLiveIntervalDirtyChannelId === channelId;
+    }
+
     function formatLuxriotDuration(intervalSec) {
         const seconds = Number(intervalSec);
         if (!Number.isFinite(seconds) || seconds <= 0) return 'n/a';
@@ -1355,7 +1380,10 @@
             ? channelIdOverride
             : getSelectedLuxriotChannel();
         if (!Number.isFinite(channelId)) return;
-        if (!options.force && document.activeElement === luxriotLiveIntervalInput) return;
+        if (!options.force && (
+            document.activeElement === luxriotLiveIntervalInput
+            || isLuxriotLiveIntervalDirty(channelId)
+        )) return;
         const videoStream = selectedLuxriotStream(channelId, 'video');
         const interval = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
             || getStoredLuxriotLiveInterval(channelId)
@@ -1373,7 +1401,35 @@
         const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
         const summaryLabel = batchSize > 0 ? ` · batch ~${formatLuxriotDuration(intervalSec * batchSize)}` : '';
         luxriotBatchInfo.textContent = `~${fpsLabel} fps${summaryLabel} · ${luxriotDefaults.snapshotMaxEdge}px`;
+        updateLuxriotRuntimeConfigHint();
         updateLuxriotStreamContext();
+    }
+
+    function updateLuxriotRuntimeConfigHint() {
+        if (!luxriotRuntimeConfigState || !luxriotRuntimeConfigRunning || !luxriotRuntimeConfigPending) return;
+        const channelId = getSelectedLuxriotChannel();
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        if (!videoStream?.running) {
+            luxriotRuntimeConfigState.hidden = true;
+            luxriotRuntimeConfigRunning.textContent = '';
+            luxriotRuntimeConfigPending.hidden = true;
+            return;
+        }
+        const runningBatch = Number(videoStream.batch_size);
+        const runningInterval = normalizeLuxriotLiveInterval(videoStream.interval_sec);
+        const selectedBatch = Number(luxriotBatchSizeSelect?.value);
+        const selectedInterval = getLuxriotLiveIntervalInputValue();
+        const batchLabel = Number.isFinite(runningBatch) && runningBatch > 0 ? String(runningBatch) : 'n/a';
+        const intervalLabel = runningInterval !== null ? formatLuxriotDuration(runningInterval) : 'n/a';
+        luxriotRuntimeConfigRunning.textContent = `running: batch ${batchLabel} · ${intervalLabel}`;
+        const batchChanged = Number.isFinite(runningBatch)
+            && runningBatch > 0
+            && Number.isFinite(selectedBatch)
+            && selectedBatch !== runningBatch;
+        const intervalChanged = runningInterval !== null
+            && Math.abs(selectedInterval - runningInterval) > 0.0005;
+        luxriotRuntimeConfigPending.hidden = !(batchChanged || intervalChanged);
+        luxriotRuntimeConfigState.hidden = false;
     }
 
     function setTextContentSafe(element, text) {
@@ -1660,6 +1716,7 @@
     }
 
     function updateLuxriotStreamContext() {
+        updateLuxriotRuntimeConfigHint();
         if (!luxriotStreamName && !luxriotStreamState) return;
         const channelId = getSelectedLuxriotChannel();
         const selectedRaw = luxriotChannelSelect ? String(luxriotChannelSelect.value || '').trim() : String(channelId || '');
@@ -3064,11 +3121,14 @@
             const selectedChannel = getSelectedLuxriotChannel();
             const interval = normalizeLuxriotLiveInterval(settings.capture_interval_sec);
             if (interval !== null && (!Number.isFinite(payloadChannel) || payloadChannel === selectedChannel)) {
-                if (document.activeElement !== luxriotLiveIntervalInput) {
+                if (
+                    document.activeElement !== luxriotLiveIntervalInput
+                    && !isLuxriotLiveIntervalDirty(selectedChannel)
+                ) {
                     luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(interval);
+                    storeLuxriotLiveInterval(selectedChannel, interval);
+                    updateLuxriotBatchInfo();
                 }
-                storeLuxriotLiveInterval(selectedChannel, interval);
-                updateLuxriotBatchInfo();
             }
         }
         if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
@@ -3257,6 +3317,7 @@
                 throw new Error(`Prompt settings response channel ${responseChannel} did not match saved channel ${channelId}`);
             }
             applyLuxriotPromptSettingsFromPayload(data);
+            clearLuxriotLiveIntervalDirty(channelId);
             luxriotPromptFormChannelId = channelId;
             return data;
         } finally {
@@ -5083,6 +5144,7 @@
             if (!resp.ok || data.error) {
                 throw new Error(data.error || 'Luxriot start failed');
             }
+            clearLuxriotLiveIntervalDirty(channelId);
             setLuxriotCaptureRunning(channelId, true);
             updateLuxriotCaptureToggleButton(channelId);
             const modelLabel = data?.session?.model || (luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '') || '';
@@ -8739,7 +8801,14 @@
     applyEmbedderUI(embedderSelect.value);
     if (luxriotRefreshChannelsBtn) {
         luxriotRefreshChannelsBtn.addEventListener('click', () => {
-            fetchLuxriotChannels(true).then(syncProbeChannelSelect);
+            const channelId = getSelectedLuxriotChannel();
+            clearLuxriotLiveIntervalDirty(channelId);
+            fetchLuxriotChannels(true).then(() => {
+                syncProbeChannelSelect();
+                syncLuxriotLiveIntervalInput(channelId, { force: true });
+                void refreshLuxriotPromptSettings(false, channelId);
+                refreshLuxriotStreams();
+            });
         });
     }
     if (luxriotToggleCaptureBtn) {
@@ -8761,8 +8830,12 @@
         luxriotBatchSizeSelect.addEventListener('change', updateLuxriotBatchInfo);
     }
     if (luxriotLiveIntervalInput) {
-        luxriotLiveIntervalInput.addEventListener('input', updateLuxriotBatchInfo);
+        luxriotLiveIntervalInput.addEventListener('input', () => {
+            markLuxriotLiveIntervalDirty();
+            updateLuxriotBatchInfo();
+        });
         luxriotLiveIntervalInput.addEventListener('change', () => {
+            markLuxriotLiveIntervalDirty();
             const intervalSec = getLuxriotLiveIntervalInputValue();
             luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(intervalSec);
             storeLuxriotLiveInterval(getSelectedLuxriotChannel(), intervalSec);
@@ -9130,11 +9203,12 @@
     }
     if (luxriotChannelSelect) {
         luxriotChannelSelect.addEventListener('change', () => {
+            clearLuxriotLiveIntervalDirty();
             luxriotActiveChannel = getSelectedLuxriotChannel();
             syncProbeChannelSelect();
             syncLuxriotSummaryChannelSelect();
             setSummaryBaseLevel(luxriotSummaryLevel);
-            syncLuxriotLiveIntervalInput(luxriotActiveChannel);
+            syncLuxriotLiveIntervalInput(luxriotActiveChannel, { force: true });
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
             void refreshLuxriotPromptSettings(false, luxriotActiveChannel);

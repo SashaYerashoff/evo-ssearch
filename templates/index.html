@@ -249,6 +249,10 @@
                             </span>
                             <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
                         </div>
+                        <div id="luxriotRuntimeConfigState" class="luxriot-runtime-config-state" aria-live="polite" hidden>
+                            <span id="luxriotRuntimeConfigRunning"></span>
+                            <span id="luxriotRuntimeConfigPending" class="luxriot-runtime-config-pending" hidden>applies on summaries restart</span>
+                        </div>
                         <div class="luxriot-row video-model-row">
                             <label for="luxriotLiveModel">Live model:</label>
                             <select id="luxriotLiveModel" class="luxriot-mini-input">

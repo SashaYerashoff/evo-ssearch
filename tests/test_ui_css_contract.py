@@ -587,3 +587,19 @@ def test_prompt_modal_can_explicitly_reset_channel_overrides_to_inherited_defaul
     assert "function resetLuxriotPromptOverrides" in JS
     assert "clear_override_fields: clearOverrideFields" in JS
     assert "use inherited defaults" in JS.lower()
+
+
+def test_live_summary_controls_preserve_edits_and_disclose_pending_restart():
+    for token in (
+        "function markLuxriotLiveIntervalDirty",
+        "function clearLuxriotLiveIntervalDirty",
+        "function isLuxriotLiveIntervalDirty",
+        "function updateLuxriotRuntimeConfigHint",
+        "applies on summaries restart",
+        "running: batch",
+        'id="luxriotRuntimeConfigState"',
+    ):
+        assert token in JS or token in TEMPLATE
+    assert "batch_size: batchSize" in JS
+    assert "interval_sec: intervalSec" in JS
+    assert ".luxriot-runtime-config-pending" in CSS
