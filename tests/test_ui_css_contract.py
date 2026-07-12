@@ -654,6 +654,8 @@ def test_video_history_controls_separate_period_resolution_and_live_following():
 def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():
     for token in (
         "semantic · cached",
+        "semantic · refreshing",
+        "semantic_refresh_pending",
         "aggregation pending",
         "semantic queued",
         "semantic retry available",

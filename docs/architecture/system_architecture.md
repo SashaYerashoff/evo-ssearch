@@ -72,7 +72,7 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 |---|---|---|
 | Frame archive (vectors + thumbnails) | `archive.detections` (Postgres) | row + thumbnail retention (configurable) |
 | Probe definitions | `archive.probes` | persistent |
-| Summary history / rollup cache / prompt settings / desired sessions | `archive.runtime_state` (Postgres) | summary retention days |
+| Summary history / semantic L1–L3 rows / hot rollup cache / prompt settings / desired sessions | `archive.runtime_state` (Postgres) | summary retention days |
 | IAM / sessions / audit | dedicated schemas (RLS) | per policy |
 
 ## Runtime model & durability

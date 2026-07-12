@@ -102,7 +102,7 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | History retention |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | Retention for hot L0 history and independently queryable PostgreSQL L1–L3 rows |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT` | Per-channel history cap |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_STATE_HOT_LIMIT` (`2160`) | Bounded hot L0 rows per channel (about 6 h at 12 frames × 1 fps plus margin); older evidence stays in archive and closed context survives as L1–L3 |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH` (`4`) | Frames archived per batch for search |

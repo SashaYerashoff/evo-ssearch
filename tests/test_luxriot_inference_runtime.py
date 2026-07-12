@@ -100,6 +100,44 @@ class MemoryRuntimeStateStore:
         self.payloads[key] = payload
 
 
+class DurableRollupMemoryStateStore(MemoryRuntimeStateStore):
+    def __init__(self):
+        super().__init__()
+        self.rollups = {}
+
+    def save_rollup(self, payload):
+        self.rollups[str(payload["rollup_id"])] = dict(payload)
+
+    def load_rollup(self, rollup_id):
+        payload = self.rollups.get(str(rollup_id))
+        return dict(payload) if payload else None
+
+    def list_rollups(self, *, channel_id, start_ts=None, end_ts=None, levels=None, limit=10000):
+        allowed = {str(level).upper() for level in (levels or ("L1", "L2", "L3"))}
+        rows = []
+        for payload in self.rollups.values():
+            if int(payload.get("channel_id") or 0) != int(channel_id):
+                continue
+            if str(payload.get("level") or "").upper() not in allowed:
+                continue
+            if start_ts is not None and float(payload.get("window_end") or 0) < float(start_ts):
+                continue
+            if end_ts is not None and float(payload.get("window_start") or 0) > float(end_ts):
+                continue
+            rows.append(dict(payload))
+        rows.sort(key=lambda row: float(row.get("window_start") or 0))
+        return rows[:limit]
+
+    def prune_rollups(self, cutoff_ts):
+        before = len(self.rollups)
+        self.rollups = {
+            key: payload
+            for key, payload in self.rollups.items()
+            if float(payload.get("window_end") or 0) >= float(cutoff_ts)
+        }
+        return before - len(self.rollups)
+
+
 class BlockingPostgresRuntimeStateStore(MemoryRuntimeStateStore):
     backend = "postgres"
 
@@ -1454,6 +1492,57 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             "high",
         )
         self.assertEqual(payload["capture_baselines"]["7"]["buckets"], 600)
+
+    def test_postgres_runtime_state_bulk_promotes_rollups_with_queryable_keys(self):
+        calls = []
+
+        class Connection:
+            def execute(self, query, params=None):
+                calls.append((query, params))
+                return SimpleNamespace(rowcount=1)
+
+        class Transaction:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, *_args):
+                return False
+
+        class Pool:
+            def transaction(self, *_args, **_kwargs):
+                return Transaction()
+
+        store = PostgresRuntimeStateStore(Pool(), uuid4())
+        written = store.save_rollups(
+            [
+                {
+                    "rollup_id": "l1-ch112-w900-1783880100",
+                    "channel_id": 112,
+                    "level": "L1",
+                    "window_start": 1_783_880_100.0,
+                    "window_end": 1_783_881_000.0,
+                    "summary": "semantic L1",
+                },
+                {
+                    "rollup_id": "l2-ch112-w3600-1783879200",
+                    "channel_id": 112,
+                    "level": "L2",
+                    "window_start": 1_783_879_200.0,
+                    "window_end": 1_783_882_800.0,
+                    "summary": "semantic L2",
+                },
+            ]
+        )
+
+        self.assertEqual(written, 2)
+        keys = [str(params[1]) for _query, params in calls]
+        self.assertEqual(
+            keys,
+            [
+                "luxriot_rollup:112:l1:1783880100",
+                "luxriot_rollup:112:l2:1783879200",
+            ],
+        )
 
     def test_channel_inventory_refresh_failure_retains_and_marks_stale_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4465,6 +4554,121 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("Distinctive semantic L1 narrative", l2_inputs[0])
             self.assertNotIn("Semantic L1 aggregation is queued", l2_inputs[0])
             self.assertEqual(result["levels"]["L2"][0]["summary_kind"], "llm")
+
+    def test_semantic_rollup_survives_hot_cache_eviction_and_remains_queryable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            window_start = 1_781_700_000.0
+            summary = operator_rollup_response(
+                "A person worked at the desk and briefly left before returning."
+            )
+
+            manager._put_cached_rollup_summary(
+                "l1-ch7-w900-1781700000",
+                summary,
+                channel_id=7,
+                level="L1",
+                source_level="L0",
+                window_start=window_start,
+                window_end=window_start + 900.0,
+                window_sec=900,
+                item_count=12,
+                frame_count=144,
+                source_tokens=1200,
+                run_ids=["run-7"],
+                source_ids=["l0-a"],
+                source_signature="sig-a",
+                summary_kind="llm",
+                generation_status="ready",
+                format_version=2,
+            )
+            manager.rollup_summary_cache.clear()
+
+            result = manager.summary_rollups(
+                7,
+                run_selector="all",
+                start_ts=window_start,
+                end_ts=window_start + 900.0,
+                target_level="L1",
+                synthesize=False,
+            )
+
+            self.assertEqual(result["stored_rollups_count"], 1)
+            self.assertEqual(len(result["levels"]["L1"]), 1)
+            self.assertIn("briefly left", result["levels"]["L1"][0]["summary"])
+            self.assertEqual(result["levels"]["L1"][0]["generation_status"], "ready")
+
+    def test_readonly_rollup_keeps_last_semantic_narrative_while_refresh_is_pending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            base = {
+                "rollup_id": "l1-ch7-w900-1781700000",
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": 1_781_700_000.0,
+                "window_end": 1_781_700_900.0,
+                "window_sec": 900,
+                "format_version": 2,
+            }
+            stored = {
+                **base,
+                "summary": operator_rollup_response(
+                    "A person worked at the desk and briefly left."
+                ),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "source_signature": "old-source",
+            }
+            generated = {
+                **base,
+                "summary": "Semantic L1 aggregation is queued.",
+                "summary_kind": "queued",
+                "generation_status": "queued",
+                "source_signature": "expanded-source",
+            }
+
+            merged = manager._merge_rollup_rows([generated], [stored])[0]
+
+            self.assertIn("briefly left", merged["summary"])
+            self.assertEqual(merged["summary_kind"], "llm_cached")
+            self.assertEqual(merged["generation_status"], "refresh_pending")
+            self.assertTrue(merged["semantic_refresh_pending"])
+
+    def test_durable_rollup_prevents_regeneration_after_hot_cache_eviction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(True)
+                return operator_rollup_response("Generated only once.")
+
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lm_callback,
+                runtime_state_store=state_store,
+            )
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Person remains at the desk.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            manager.summary_rollups(7, target_level="L1")
+            self.assertEqual(len(calls), 1)
+            manager.rollup_summary_cache.clear()
+            manager.summary_rollups(7, target_level="L1")
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn("l1-ch7-w900-1781699400", manager.rollup_summary_cache)
 
     def test_rollup_operator_summary_and_memory_are_stored_separately(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -639,6 +639,43 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(detection_args["until_ms"], 200_000)
         self.assertEqual(detection_args["source"], "vlm_summary")
 
+    def test_operator_relative_period_overrides_model_invented_calendar_dates(self):
+        context = _seed_turn_tool_context(
+            "Show channel 112 L1 and L2 summaries for the last 3 days."
+        )
+
+        normalize_args = _apply_turn_tool_context(
+            "normalize_time_window",
+            {
+                "date": "2026-03-15",
+                "start_time": "05:20",
+                "end_time": "08:00",
+            },
+            context,
+        )
+        summary_args = _apply_turn_tool_context(
+            "get_video_summaries",
+            {
+                "channel_id": 112,
+                "depth": "L1",
+                "from_ts": 1_773_550_800,
+                "to_ts": 1_773_733_200,
+            },
+            context,
+        )
+
+        self.assertNotIn("date", normalize_args)
+        self.assertNotIn("start_time", normalize_args)
+        self.assertIn("last 3 days", normalize_args["relative_range"])
+        self.assertIn("last 3 days", summary_args["relative_range"])
+
+    def test_operator_explicit_calendar_range_is_not_replaced_by_relative_words(self):
+        context = _seed_turn_tool_context(
+            "Compare 2026-03-15 through 2026-03-17 with the last 3 days."
+        )
+
+        self.assertNotIn("operator_relative_range", context)
+
     def test_turn_context_does_not_override_explicit_source_or_time(self):
         context = _seed_turn_tool_context("Check video descriptions and confirm with images.")
         context["channel_id"] = 7
@@ -942,6 +979,32 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["to_ts"] - result["from_ts"], 604_800)
         self.assertEqual(result["until_ms"] - result["since_ms"], 604_800_000)
 
+    def test_get_video_summaries_resolves_last_three_days_on_server_clock(self):
+        tools = _tools()
+        fixed_now = 1_783_900_000.0
+
+        with patch("agent.time.time", return_value=fixed_now):
+            result = tools.execute(
+                "get_video_summaries",
+                {
+                    "channel_id": 7,
+                    "depth": "L1",
+                    "relative_range": "last 3 days",
+                },
+            )
+
+        self.assertEqual(result["time_window"]["to_ts"], fixed_now)
+        self.assertEqual(result["time_window"]["from_ts"], fixed_now - 259_200)
+        self.assertEqual(result["time_window"]["duration_sec"], 259_200)
+        self.assertEqual(
+            result["time_window"]["window_source"],
+            "operator_relative_range",
+        )
+        self.assertEqual(
+            result["coverage"]["available"]["requested_span_sec"],
+            259_200,
+        )
+
     def test_normalize_time_window_accepts_date_without_clock_as_calendar_day(self):
         tools = _tools()
         result = tools.execute(
@@ -1112,6 +1175,60 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         )
         self.assertEqual(result["coverage"]["returned"]["first_ts"], 100.0)
         self.assertEqual(result["coverage"]["returned"]["last_ts"], 670.0)
+
+    def test_get_video_summaries_keeps_completed_semantics_in_period_sample(self):
+        manager = _SummaryManager()
+
+        def rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            nodes = [
+                {
+                    "level": "L1",
+                    "window_start": 100.0 + index * 60.0,
+                    "window_end": 130.0 + index * 60.0,
+                    "summary": f"queued-{index}",
+                    "summary_kind": "queued",
+                    "generation_status": "queued",
+                    "frame_count": 12,
+                }
+                for index in range(10)
+            ]
+            nodes[4].update(
+                {
+                    "summary": "full semantic behavior narrative",
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                }
+            )
+            return {
+                "running": False,
+                "selected_run": None,
+                "run_filter_id": None,
+                "levels": {"L0": [], "L1": nodes, "L2": [], "L3": []},
+            }
+
+        manager.summary_rollups = rollups
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 700.0,
+                "limit": 3,
+            },
+        )
+
+        self.assertEqual(
+            result["selection_strategy"],
+            "period_sample_semantic_alert_priority",
+        )
+        semantic = [
+            row for row in result["entries"]
+            if row.get("summary_kind") == "llm"
+        ]
+        self.assertEqual(len(semantic), 1)
+        self.assertEqual(semantic[0]["summary"], "full semantic behavior narrative")
+        self.assertEqual(semantic[0]["generation_status"], "ready")
 
     def test_get_video_summaries_uses_high_bounded_scan_limit_by_default(self):
         manager = _SummaryManager()

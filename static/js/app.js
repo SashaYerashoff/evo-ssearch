@@ -4691,15 +4691,20 @@
             const semanticReady = summaryKind === 'llm' || summaryKind === 'llm_cached';
             const pending = summaryKind === 'pending_context' || generationStatus === 'pending';
             const queued = summaryKind === 'queued' || generationStatus === 'queued' || generationStatus === 'deferred';
+            const semanticRefreshPending = generationStatus === 'refresh_pending' || row?.semantic_refresh_pending === true;
             const statusLabel = semanticReady
-                ? (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic')
+                ? (semanticRefreshPending
+                    ? 'semantic · refreshing'
+                    : (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic'))
                 : pending
                     ? 'aggregation pending'
                     : queued
                         ? 'semantic queued'
                         : 'semantic retry available';
             const statusClass = semanticReady ? 'ready' : pending ? 'pending' : queued ? 'queued' : 'degraded';
-            const statusTitle = statusClass === 'degraded'
+            const statusTitle = semanticRefreshPending
+                ? 'Showing the last completed semantic narrative while newly retained source observations are folded into this closed window.'
+                : statusClass === 'degraded'
                 ? 'The semantic pass did not complete; source observations remain available and the window can be retried.'
                 : statusClass === 'queued'
                     ? 'Background semantic aggregation is queued behind live descriptions.'

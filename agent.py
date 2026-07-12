@@ -654,6 +654,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "number",
                         "description": "Return coverage from the past N hours. Default: 6.",
                     },
+                    "relative_range": {
+                        "type": "string",
+                        "description": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock.",
+                    },
                     "from_ts": {
                         "type": "number",
                         "description": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted and normalized.",
@@ -1249,6 +1253,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "number",
                         "description": "Scan the past N hours. Default: 6.",
                     },
+                    "relative_range": {
+                        "type": "string",
+                        "description": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock.",
+                    },
                     "from_ts": {
                         "type": "number",
                         "description": "Optional absolute lower timestamp bound in Unix seconds.",
@@ -1303,6 +1311,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "since_hours": {
                         "type": "number",
                         "description": "Return summaries from the past N hours. Default: 6.",
+                    },
+                    "relative_range": {
+                        "type": "string",
+                        "description": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock.",
                     },
                     "from_ts": {
                         "type": "number",
@@ -1386,6 +1398,10 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "since_hours": {
                         "type": "number",
                         "description": "Return summaries from the past N hours. Default: 6.",
+                    },
+                    "relative_range": {
+                        "type": "string",
+                        "description": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock.",
                     },
                     "from_ts": {
                         "type": "number",
@@ -4462,7 +4478,7 @@ class AgentTools:
         level_limit_applied = _opt_int(rollups.get("level_limit")) or level_limit
         backend_truncated = bool(
             level_limit_applied > 0
-            and any(count >= int(level_limit_applied) for count in source_counts.values())
+            and source_counts.get(depth, 0) >= int(level_limit_applied)
         )
         nodes = levels.get(depth) or []
 
@@ -4488,7 +4504,17 @@ class AgentTools:
             if end is not None:
                 entry["window_end"] = end
                 entry["window_end_time"] = _format_epoch_minute(end)
-            for key in ("level", "frame_count", "item_count", "alert_total", "alert_counts", "alert_severities"):
+            for key in (
+                "level",
+                "frame_count",
+                "item_count",
+                "alert_total",
+                "alert_counts",
+                "alert_severities",
+                "summary_kind",
+                "generation_status",
+                "semantic_refresh_pending",
+            ):
                 if key in node:
                     entry[key] = node.get(key)
             parser_breakdown = _compact_int_breakdown(node.get("alert_parser_breakdown"))
@@ -4531,7 +4557,9 @@ class AgentTools:
                 entry["coalesced_batches"] = int(_opt_int(coalesced_info.get("batches")) or 0)
             text = str(node.get("summary") or "").strip()
             if text:
-                entry["summary"] = text[:800]
+                semantic_kind = str(node.get("summary_kind") or "").strip().lower()
+                summary_limit = 2400 if semantic_kind in {"llm", "llm_cached"} else 1000
+                entry["summary"] = text[:summary_limit]
             if entry.get("summary"):
                 entries.append(entry)
 
@@ -5396,6 +5424,34 @@ class AgentTools:
         *,
         default_since_hours: float,
     ) -> Tuple[float, float, Dict[str, Any]]:
+        raw_relative = args.get("relative_range")
+        parsed_relative = _parse_relative_window_seconds(raw_relative)
+        if parsed_relative is not None:
+            duration_sec, normalized_relative = parsed_relative
+            resolved_at = time.time()
+            from_ts = max(0.0, float(resolved_at) - float(duration_sec))
+            to_ts = float(resolved_at)
+            return (
+                from_ts,
+                to_ts,
+                {
+                    "timezone": AGENT_SITE_TIMEZONE,
+                    "from_ts": from_ts,
+                    "to_ts": to_ts,
+                    "since_ms": int(from_ts * 1000.0),
+                    "until_ms": int(to_ts * 1000.0),
+                    "from_time": _format_epoch_minute(from_ts),
+                    "to_time": _format_epoch_minute(to_ts),
+                    "relative_range": normalized_relative,
+                    "duration_sec": int(duration_sec),
+                    "resolved_at": to_ts,
+                    "window_source": "operator_relative_range",
+                    "normalized_input_units": {
+                        "from_ts": "server_relative",
+                        "to_ts": "server_now",
+                    },
+                },
+            )
         raw_from = args.get("from_ts")
         raw_to = args.get("to_ts")
         from_ts = _coerce_epoch_seconds(raw_from)
@@ -5425,6 +5481,7 @@ class AgentTools:
                 from_ts = max(0.0, float(to_ts) - default_since_hours * 3600.0)
         if from_ts > to_ts:
             from_ts, to_ts = to_ts, from_ts
+        duration_sec = max(0.0, float(to_ts) - float(from_ts))
         return (
             float(from_ts),
             float(to_ts),
@@ -5436,6 +5493,9 @@ class AgentTools:
                 "until_ms": int(float(to_ts) * 1000.0),
                 "from_time": _format_epoch_minute(from_ts),
                 "to_time": _format_epoch_minute(to_ts),
+                "duration_sec": duration_sec,
+                "resolved_at": time.time(),
+                "window_source": "absolute_or_default",
                 "normalized_input_units": normalized_units,
             },
         )
@@ -6598,6 +6658,7 @@ def build_system_prompt(
         f"- Archive source semantics: source=probe rows are real probe hits/detections; source=vlm_summary rows are sampled frames saved from video-description batches; source=vlm_alert rows are frames anchored to VLM alerts from video descriptions.\n"
         f"- Do not call vlm_summary or vlm_alert rows probe detections. When answering from archive tools, name the source class and separate probe hits, video-description frames, and VLM alert frames.\n"
         f"- When answering from video summaries, state the returned coverage window from get_video_summaries.coverage before conclusions when the operator asked about a period. Never imply that missing summary windows were reviewed. If coverage.status is partial/no_data/truncated, say which part was actually reviewed and which part remains unchecked.\n"
+        f"- Treat time_window.duration_sec and coverage.available.requested_span_sec as authoritative server arithmetic. Do not recalculate or relabel their duration; 259200 seconds is 72 hours / 3 days. If returned absolute dates conflict with the operator's relative phrase, stop and normalize the relative phrase again.\n"
         f"- If the operator asks to confirm video-summary findings with images/snaps, use get_video_summaries with include_evidence_frames=true or call get_detections with source=vlm_summary/source=vlm_alert, the same channel, and the same since_ms/until_ms. Do not use semantic search as the first proof step for exact time evidence.\n"
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
@@ -6644,14 +6705,32 @@ def _operator_focuses_video_summaries(text: Any) -> bool:
 
 
 def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
-    return {
+    context = {
         "wants_video_evidence": _operator_wants_video_evidence(user_text),
         "focus_video_summaries": _operator_focuses_video_summaries(user_text),
     }
+    user_text_value = str(user_text or "").strip()
+    explicit_calendar_range = len(
+        re.findall(r"\b\d{4}-\d{2}-\d{2}\b", user_text_value)
+    ) >= 2
+    if (
+        _parse_relative_window_seconds(user_text_value) is not None
+        and not explicit_calendar_range
+    ):
+        # Keep the operator's phrase authoritative. Small local models can turn
+        # "last 3 days" into plausible-looking but stale absolute dates.
+        context["operator_relative_range"] = user_text_value
+    return context
 
 
 def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     prepared = dict(args or {})
+    operator_relative_range = str(context.get("operator_relative_range") or "").strip()
+    if operator_relative_range and tool_name == "normalize_time_window":
+        timezone = prepared.get("timezone")
+        prepared = {"relative_range": operator_relative_range}
+        if timezone:
+            prepared["timezone"] = timezone
     continuation = (
         context.get("research_continuation")
         if isinstance(context.get("research_continuation"), Mapping)
@@ -6674,17 +6753,19 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
                 prepared["from_ts"] = continuation.get("from_ts")
             if prepared.get("to_ts") is None and continuation.get("to_ts") is not None:
                 prepared["to_ts"] = continuation.get("to_ts")
+    summary_tools = {
+        "get_video_summaries",
+        "list_attention_bursts",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+        "calibrate_probe_from_archive",
+        "prepare_probe_calibration_batch",
+        "list_video_summary_channels",
+    }
+    if operator_relative_range and tool_name in summary_tools:
+        prepared["relative_range"] = operator_relative_range
     time_window = context.get("time_window") if isinstance(context.get("time_window"), dict) else {}
     if time_window:
-        summary_tools = {
-            "get_video_summaries",
-            "list_attention_bursts",
-            "count_video_summary_events",
-            "track_visual_state_transitions",
-            "calibrate_probe_from_archive",
-            "prepare_probe_calibration_batch",
-            "list_video_summary_channels",
-        }
         if tool_name in summary_tools and not _has_any_arg(prepared, ("since_hours", "until_hours")):
             if _has_any_arg(prepared, ("since_ms", "until_ms")):
                 if prepared.get("since_ms") is None and time_window.get("since_ms") is not None:
@@ -6769,6 +6850,8 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "until_ms": result.get("until_ms"),
                 "from_local": result.get("from_local"),
                 "to_local": result.get("to_local"),
+                "relative_range": result.get("relative_range"),
+                "duration_sec": result.get("duration_sec"),
             }
         return
 
@@ -8335,11 +8418,13 @@ def _parse_relative_window_seconds(value: Any) -> Optional[Tuple[int, str]]:
         if implicit:
             raw_number = "1"
             unit = implicit.group("unit")
+            relative_label = implicit.group(0).strip()
         else:
             return None
     else:
         raw_number = match.group("num")
         unit = match.group("unit")
+        relative_label = match.group(0).strip()
 
     if raw_number in _RELATIVE_NUMBER_WORDS:
         amount = float(_RELATIVE_NUMBER_WORDS[raw_number])
@@ -8363,7 +8448,7 @@ def _parse_relative_window_seconds(value: Any) -> Optional[Tuple[int, str]]:
         return None
     if seconds <= 0:
         return None
-    return seconds, normalized
+    return seconds, relative_label
 
 
 def _normalize_summary_depth(value: Any) -> str:
@@ -8874,7 +8959,9 @@ def _video_summary_coverage_contract(
     note = str(returned.get("note") or available.get("note") or "").strip()
     if truncated:
         sampled_note = (
-            " Returned entries were selected across the requested period with alert/deviation priority."
+            " Returned entries were selected across the requested period with completed semantic narratives and alert/deviation priority."
+            if selection_strategy == "period_sample_semantic_alert_priority"
+            else " Returned entries were selected across the requested period with alert/deviation priority."
             if selection_strategy == "period_sample_alert_priority"
             else ""
         )
@@ -9031,7 +9118,29 @@ def _select_summary_nodes_for_period(
         return [], "none"
 
     total = len(nodes)
-    selected = set(_evenly_spaced_indices(total, limit))
+    semantic_indices = [
+        index
+        for index, node in enumerate(nodes)
+        if isinstance(node, Mapping)
+        and str(node.get("summary_kind") or "").strip().lower()
+        in {"llm", "llm_cached"}
+    ]
+    if len(semantic_indices) > limit:
+        selected = {
+            semantic_indices[index]
+            for index in _evenly_spaced_indices(len(semantic_indices), limit)
+        }
+    else:
+        selected = set(semantic_indices)
+        for index in _evenly_spaced_indices(total, limit):
+            if len(selected) >= limit:
+                break
+            selected.add(index)
+        if len(selected) < limit:
+            for index in range(total):
+                selected.add(index)
+                if len(selected) >= limit:
+                    break
     alert_indices = [
         index
         for index, node in enumerate(nodes)
@@ -9043,7 +9152,7 @@ def _select_summary_nodes_for_period(
             index,
         )
     )
-    protected = {0, total - 1}
+    protected = {0, total - 1, *semantic_indices}
     for alert_index in alert_indices:
         if alert_index in selected:
             continue
@@ -9061,7 +9170,12 @@ def _select_summary_nodes_for_period(
         selected.add(alert_index)
 
     ordered = sorted(selected)
-    return [nodes[index] for index in ordered], "period_sample_alert_priority"
+    strategy = (
+        "period_sample_semantic_alert_priority"
+        if semantic_indices
+        else "period_sample_alert_priority"
+    )
+    return [nodes[index] for index in ordered], strategy
 
 
 _COUNT_EVENT_APPEARANCE_PATTERNS = (
@@ -10809,6 +10923,9 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "window_end": row.get("window_end"),
                     "window_end_time": row.get("window_end_time"),
                     "level": row.get("level"),
+                    "summary_kind": row.get("summary_kind"),
+                    "generation_status": row.get("generation_status"),
+                    "semantic_refresh_pending": row.get("semantic_refresh_pending"),
                     "frame_count": row.get("frame_count"),
                     "item_count": row.get("item_count"),
                     "alert_total": row.get("alert_total"),

@@ -50,7 +50,7 @@ Last reviewed: 2026-07-02 (β 0.8.3)
 | Browser entrypoint | HTTPS/TLS reverse proxy or site TLS boundary `[FIELD]`; office/demo may use HTTP-only internally |
 | Liveness / readiness | `GET /health`, `GET /ready` |
 | Inference queue | Present but **disabled by default**; summary dispatch is synchronous in-process |
-| Graceful-restart durability | Gunicorn worker hooks flush summary state + rollup cache (`gunicorn_conf.py`) |
+| Rollup durability | Closed semantic L1–L3 windows are stored as queryable `archive.runtime_state` rows; a bounded hot cache is also flushed by Gunicorn worker hooks (`gunicorn_conf.py`) |
 
 HTTP/TLS invariant: port number alone does not make the app HTTPS. If operators
 open EVA AI through HTTPS (reverse proxy or TLS-terminating service), set

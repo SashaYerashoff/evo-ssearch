@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 import uuid
@@ -1256,6 +1257,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
     _SUMMARY_META_KEY = "luxriot_summary_state:meta"
     _SUMMARY_HISTORY_PREFIX = "luxriot_summary_state:history:"
     _SUMMARY_RUNS_PREFIX = "luxriot_summary_state:runs:"
+    _ROLLUP_PREFIX = "luxriot_rollup:"
 
     def health(self) -> Dict[str, Any]:
         try:
@@ -1303,6 +1305,136 @@ class PostgresRuntimeStateStore(_TenantRepository):
             self._save_split_summary_state(payload)
             return
         self._save_state_exact(normalized, payload)
+
+    @classmethod
+    def _rollup_state_key(cls, payload: Mapping[str, Any]) -> str:
+        channel_id = int(payload.get("channel_id") or 0)
+        level = str(payload.get("level") or "").strip().lower()
+        window_start = float(payload.get("window_start"))
+        if channel_id < 1 or level not in {"l1", "l2", "l3"}:
+            raise ValueError("rollup requires a positive channel_id and level L1, L2, or L3")
+        return _state_key(
+            f"{cls._ROLLUP_PREFIX}{channel_id}:{level}:{int(window_start)}"
+        )
+
+    def save_rollup(self, payload: Mapping[str, Any]) -> None:
+        """Persist one semantic rollup as an independently queryable state row."""
+
+        payload_dict = dict(payload)
+        key = self._rollup_state_key(payload_dict)
+        self._save_state_exact(key, payload_dict)
+
+    def save_rollups(self, payloads: Sequence[Mapping[str, Any]]) -> int:
+        """Promote a legacy hot-cache payload in one transaction during upgrade."""
+
+        entries: List[Tuple[str, Dict[str, Any], str]] = []
+        for payload in payloads:
+            payload_dict = dict(payload)
+            key = self._rollup_state_key(payload_dict)
+            entries.append((key, payload_dict, _payload_digest(payload_dict)))
+        if not entries:
+            return 0
+        written = 0
+        with self.lock:
+            with self.pool.transaction(self._context()) as connection:
+                for key, payload_dict, digest in entries:
+                    cache_key = f"exact:{key}"
+                    if self._last_state_hashes.get(cache_key) == digest:
+                        continue
+                    self._upsert_state_locked(connection, key, payload_dict)
+                    self._last_state_hashes[cache_key] = digest
+                    written += 1
+        return written
+
+    def load_rollup(self, rollup_id: str) -> Optional[Dict[str, Any]]:
+        """Load a canonical L1-L3 rollup without scanning the shared hot cache."""
+
+        match = re.fullmatch(
+            r"(?P<level>l[123])-ch(?P<channel>\d+)-w\d+-(?P<start>\d+)",
+            str(rollup_id or "").strip().lower(),
+        )
+        if match is None:
+            return None
+        key = _state_key(
+            f"{self._ROLLUP_PREFIX}{int(match.group('channel'))}:"
+            f"{match.group('level')}:{int(match.group('start'))}"
+        )
+        payload = self.load_state(key)
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("rollup_id") or "").strip().lower() != str(rollup_id or "").strip().lower():
+            return None
+        return payload
+
+    def list_rollups(
+        self,
+        *,
+        channel_id: int,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
+        levels: Optional[Sequence[str]] = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        """Read persisted rollups overlapping a requested time window."""
+
+        normalized_channel = int(channel_id)
+        if normalized_channel < 1:
+            return []
+        normalized_levels = {
+            str(level or "").strip().upper()
+            for level in (levels or ("L1", "L2", "L3"))
+            if str(level or "").strip().upper() in {"L1", "L2", "L3"}
+        }
+        if not normalized_levels:
+            return []
+        clauses = ["tenant_id = %s", "state_key LIKE %s"]
+        params: List[Any] = [
+            self.tenant_id,
+            f"{self._ROLLUP_PREFIX}{normalized_channel}:%",
+        ]
+        level_placeholders = ", ".join(["%s"] * len(normalized_levels))
+        clauses.append(f"upper(payload_json->>'level') IN ({level_placeholders})")
+        params.extend(sorted(normalized_levels))
+        if start_ts is not None:
+            clauses.append("(payload_json->>'window_end')::double precision >= %s")
+            params.append(float(start_ts))
+        if end_ts is not None:
+            clauses.append("(payload_json->>'window_start')::double precision <= %s")
+            params.append(float(end_ts))
+        bounded_limit = max(1, min(50000, int(limit)))
+        params.append(bounded_limit)
+        query = f"""
+            SELECT payload_json
+            FROM archive.runtime_state
+            WHERE {' AND '.join(clauses)}
+            ORDER BY (payload_json->>'window_start')::double precision ASC
+            LIMIT %s
+        """
+        with self.lock:
+            with self.pool.transaction(self._context(), readonly=True) as connection:
+                rows = connection.execute(query, tuple(params)).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = _decode_json_value(row[0])
+            if isinstance(payload, dict):
+                out.append(copy.deepcopy(payload))
+        return out
+
+    def prune_rollups(self, cutoff_ts: float) -> int:
+        """Remove semantic rollups whose covered window ended before retention."""
+
+        with self.lock:
+            with self.pool.transaction(self._context()) as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM archive.runtime_state
+                    WHERE tenant_id = %s
+                      AND state_key LIKE %s
+                      AND (payload_json->>'window_end')::double precision < %s
+                    """,
+                    (self.tenant_id, f"{self._ROLLUP_PREFIX}%", float(cutoff_ts)),
+                )
+        return int(cursor.rowcount or 0)
 
     def _save_state_exact(self, key: str, payload: Mapping[str, Any]) -> None:
         payload_dict = dict(payload)
