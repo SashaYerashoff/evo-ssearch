@@ -4375,6 +4375,14 @@ class AgentTools:
                 entry["unconfirmed_prose_note"] = (
                     "Prose-only alert-like text requires frame or structured-signal corroboration."
                 )
+            if node.get("coverage_gap"):
+                entry["coverage_gap"] = True
+                gap_reason = str(node.get("gap_reason") or "").strip()
+                if gap_reason:
+                    entry["gap_reason"] = gap_reason
+            coalesced_info = node.get("coalesced")
+            if isinstance(coalesced_info, Mapping) and _opt_int(coalesced_info.get("batches")):
+                entry["coalesced_batches"] = int(_opt_int(coalesced_info.get("batches")) or 0)
             text = str(node.get("summary") or "").strip()
             if text:
                 entry["summary"] = text[:800]
@@ -8582,8 +8590,13 @@ def _summary_coverage_from_nodes(
     requested_span = max(0.0, requested_end - requested_start)
 
     intervals: List[Tuple[float, float]] = []
+    backpressure_gap_count = 0
     for node in nodes:
         if not isinstance(node, Mapping):
+            continue
+        if node.get("coverage_gap"):
+            # A dropped-batch marker describes a HOLE, never covered time.
+            backpressure_gap_count += 1
             continue
         start, end = _summary_node_bounds(node)
         if start is None and end is None:
@@ -8609,6 +8622,12 @@ def _summary_coverage_from_nodes(
         "requested_to_time": _format_epoch_minute(requested_end),
         "requested_span_sec": requested_span,
     }
+    if backpressure_gap_count:
+        base["backpressure_gap_count"] = int(backpressure_gap_count)
+        base["backpressure_note"] = (
+            "Some L0 windows in this period were dropped under LM backpressure; "
+            "their intervals are holes, not quiet time."
+        )
     if not intervals:
         return {
             **base,

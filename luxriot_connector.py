@@ -185,6 +185,13 @@ _CAPTURE_SHARPNESS_DISCRIMINATION = 1.15 # in-bucket sharpness spread required t
 _CAPTURE_COMPANION_ACTIVITY_BAND = 0.5   # companion must still belong to the action
 _CAPTURE_COMPANION_SHARPNESS_GAIN = 1.3  # companion must be meaningfully sharper than the apex
 
+# LM backpressure: instead of silently dropping the oldest queued 12-second
+# window, adjacent windows are coalesced into one wider batch (graceful loss
+# of temporal resolution). One merged batch may span at most this many
+# original batches; beyond that the oldest window is dropped WITH an explicit
+# coverage-gap history entry.
+_SUMMARY_COALESCE_MAX_BATCHES = 4
+
 
 class ProbeManagerLike(Protocol):
     def add_frame(
@@ -1087,6 +1094,7 @@ class LuxriotCaptureSession:
         )
         self.summary_condition = threading.Condition(self.lock)
         self.summary_queue: List[Tuple[List[Dict[str, Any]], str, Dict[str, Any]]] = []
+        self.summary_coalesced_batches = 0
         self.summary_inflight = False
         self.summary_worker_thread = threading.Thread(target=self._summary_worker, daemon=True)
         self.last_error: Optional[str] = None
@@ -2681,6 +2689,12 @@ class LuxriotCaptureSession:
                     or None
                 ),
             )
+            coalesced_meta = job_meta.get("coalesced")
+            if isinstance(coalesced_meta, Mapping):
+                batch["coalesced"] = {
+                    "batches": max(1, int(_parse_optional_int(coalesced_meta.get("batches")) or 1)),
+                    "omitted_frames": max(0, int(_parse_optional_int(coalesced_meta.get("omitted_frames")) or 0)),
+                }
             outcome = self.manager.dispatch_summary_batch(
                 batch,
                 workload_class=workload_class,
@@ -2735,12 +2749,163 @@ class LuxriotCaptureSession:
             "session_generation": self.session_generation,
         }
 
+    @staticmethod
+    def _frame_capture_mode(frame: Mapping[str, Any]) -> str:
+        selection = frame.get("capture_selection")
+        if isinstance(selection, Mapping):
+            return str(selection.get("selection_mode") or "").strip().lower()
+        return ""
+
+    @staticmethod
+    def _frame_activity_x(frame: Mapping[str, Any]) -> float:
+        selection = frame.get("capture_selection")
+        if isinstance(selection, Mapping):
+            try:
+                return float(selection.get("activity_x") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    @staticmethod
+    def _frame_captured_at(frame: Mapping[str, Any]) -> float:
+        for key in ("captured_at", "time_sec"):
+            try:
+                value = float(frame.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 0.0
+
+    @classmethod
+    def _subsample_coalesced_frames(
+        cls,
+        frames: Sequence[Mapping[str, Any]],
+        target_count: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Thin a merged window to target size, never sacrificing burst seconds."""
+
+        items = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
+        items.sort(key=cls._frame_captured_at)
+        target = max(1, int(target_count))
+        if len(items) <= target:
+            return items, 0
+        keep: Set[int] = set()
+        burst_indices = [
+            index for index, frame in enumerate(items)
+            if cls._frame_capture_mode(frame) == "burst"
+        ]
+        for index in burst_indices[:target]:
+            keep.add(index)
+        if len(keep) < target:
+            # Strong normal seconds may claim at most half the remaining
+            # slots; the rest is even temporal fill so a coalesced window
+            # stays representative when activity does not discriminate.
+            normal_slots = (target - len(keep)) // 2
+            normal_indices = sorted(
+                (
+                    index for index, frame in enumerate(items)
+                    if index not in keep
+                    and cls._frame_capture_mode(frame) == "normal"
+                    and cls._frame_activity_x(frame) > 0.0
+                ),
+                key=lambda index: -cls._frame_activity_x(items[index]),
+            )
+            for index in normal_indices[:normal_slots]:
+                keep.add(index)
+        if len(keep) < target:
+            remaining = [index for index in range(len(items)) if index not in keep]
+            need = target - len(keep)
+            step = len(remaining) / float(need)
+            for slot in range(need):
+                keep.add(remaining[min(len(remaining) - 1, int(slot * step))])
+        kept = [items[index] for index in sorted(keep)]
+        return kept, len(items) - len(kept)
+
+    def _coalesce_oldest_queued_batches_locked(self) -> bool:
+        if len(self.summary_queue) < 2:
+            return False
+        frames_a, workload_a, meta_a = self.summary_queue[0]
+        frames_b, _workload_b, meta_b = self.summary_queue[1]
+
+        def merged_batch_count(meta: Mapping[str, Any]) -> int:
+            info = meta.get("coalesced")
+            if isinstance(info, Mapping):
+                return max(1, int(_parse_optional_int(info.get("batches")) or 1))
+            return 1
+
+        def omitted_count(meta: Mapping[str, Any]) -> int:
+            info = meta.get("coalesced")
+            if isinstance(info, Mapping):
+                return max(0, int(_parse_optional_int(info.get("omitted_frames")) or 0))
+            return 0
+
+        total_batches = merged_batch_count(meta_a) + merged_batch_count(meta_b)
+        if total_batches > _SUMMARY_COALESCE_MAX_BATCHES:
+            return False
+        target = max(1, int(_parse_optional_int(meta_a.get("batch_size")) or self.batch_size))
+        merged_frames, omitted = self._subsample_coalesced_frames(
+            list(frames_a) + list(frames_b),
+            target,
+        )
+        merged_meta = dict(meta_a)
+        merged_meta["coalesced"] = {
+            "batches": total_batches,
+            "omitted_frames": omitted_count(meta_a) + omitted_count(meta_b) + int(omitted),
+        }
+        self.summary_queue[0:2] = [(merged_frames, workload_a, merged_meta)]
+        self.summary_coalesced_batches += 1
+        return True
+
+    def _note_summary_coverage_gap(self, frames: Sequence[Mapping[str, Any]]) -> None:
+        """Write an explicit history gap for a window dropped under backpressure.
+
+        Must be called WITHOUT holding the session lock: the manager recorder
+        takes its own cache lock and the safe order is manager -> session.
+        """
+
+        recorder = getattr(self.manager, "record_summary_log", None)
+        if not callable(recorder) or not frames:
+            return
+        stamps = [
+            self._frame_captured_at(frame)
+            for frame in frames
+            if isinstance(frame, Mapping)
+        ]
+        stamps = [stamp for stamp in stamps if stamp > 0]
+        now = time.time()
+        start_sec = min(stamps) if stamps else now
+        end_sec = max(stamps) if stamps else now
+        entry = {
+            "channel_id": int(self.channel_id),
+            "run_id": self.run_id,
+            "summary": (
+                "[coverage gap] L0 batch dropped under LM backpressure; "
+                "this interval has no description."
+            ),
+            "coverage_gap": True,
+            "gap_reason": "lm_backpressure_dropped_batch",
+            "frame_count": len(frames),
+            "batch_size": int(self.batch_size),
+            "batch_start_ms": int(start_sec * 1000.0),
+            "batch_end_ms": int(end_sec * 1000.0),
+            "created_at": now,
+        }
+        try:
+            recorder(self.channel_id, entry)
+        except Exception:
+            # The counters already recorded the drop; the gap entry is honesty,
+            # not a second failure channel.
+            pass
+
     def _enqueue_summary_batch(
         self,
         workload_class: str = "heartbeat",
         *,
         frame_limit: Optional[int] = None,
     ) -> bool:
+        gap_batches: List[List[Dict[str, Any]]] = []
+        queued = False
         with self.summary_condition:
             take_count = len(self.frames)
             if frame_limit is not None:
@@ -2756,14 +2921,21 @@ class LuxriotCaptureSession:
                 pass
             else:
                 while len(self.summary_queue) >= self.summary_queue_max_batches:
+                    if self._coalesce_oldest_queued_batches_locked():
+                        continue
                     dropped_frames, _, _ = self.summary_queue.pop(0)
                     self._record_summary_failure_locked(
                         "summary queue overflow: oldest pending batch dropped",
                         dropped_frames=len(dropped_frames),
                     )
+                    gap_batches.append(dropped_frames)
                 self.summary_queue.append((frames_copy, str(workload_class or "heartbeat"), metadata))
                 self.summary_condition.notify_all()
-                return True
+                queued = True
+        for dropped_frames in gap_batches:
+            self._note_summary_coverage_gap(dropped_frames)
+        if queued:
+            return True
         return self._dispatch_summary_frames(
             frames_copy,
             workload_class=workload_class,
@@ -2911,6 +3083,7 @@ class LuxriotCaptureSession:
             "flush_count": self.total_flushes,
             "queue_submissions": self.queue_submissions,
             "queue_dropped_batches": self.queue_dropped_batches,
+            "summary_coalesced_batches": self.summary_coalesced_batches,
             "last_queue_job_id": self.last_queue_job_id,
             "last_error": last_error,
             "capture_last_error": capture_last_error,
@@ -6069,6 +6242,20 @@ class LuxriotManager:
                 normalized[field] = max(0, int(value))
         if "archive_error" in entry:
             normalized["archive_error"] = _safe_error_text(entry.get("archive_error"), 240)
+        if entry.get("coverage_gap"):
+            normalized["coverage_gap"] = True
+            gap_reason = str(entry.get("gap_reason") or "").strip().lower()[:80]
+            if gap_reason:
+                normalized["gap_reason"] = gap_reason
+        coalesced_raw = entry.get("coalesced")
+        if isinstance(coalesced_raw, Mapping):
+            coalesced_out: Dict[str, int] = {}
+            for coalesced_key in ("batches", "omitted_frames"):
+                parsed_value = _parse_optional_int(coalesced_raw.get(coalesced_key))
+                if parsed_value is not None and parsed_value > 0:
+                    coalesced_out[coalesced_key] = int(parsed_value)
+            if coalesced_out.get("batches", 0) > 1:
+                normalized["coalesced"] = coalesced_out
         return normalized
 
     def _normalize_summary_run_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -9627,6 +9814,12 @@ class LuxriotManager:
         }
         if frame_selection:
             entry["frame_selection"] = frame_selection
+        coalesced_info = batch.get("coalesced")
+        if isinstance(coalesced_info, Mapping):
+            entry["coalesced"] = {
+                "batches": max(1, int(_parse_optional_int(coalesced_info.get("batches")) or 1)),
+                "omitted_frames": max(0, int(_parse_optional_int(coalesced_info.get("omitted_frames")) or 0)),
+            }
         session_generation = str(batch.get("session_generation") or "").strip()
         if session_generation:
             entry["session_generation"] = session_generation

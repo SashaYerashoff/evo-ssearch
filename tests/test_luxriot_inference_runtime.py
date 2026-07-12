@@ -424,6 +424,173 @@ def _burst_batch_frame(
     return frame
 
 
+class LuxriotSummaryBackpressureTests(unittest.TestCase):
+    def _make_session(self, temp: str, queue_max: int) -> Tuple[LuxriotManager, LuxriotCaptureSession]:
+        manager = build_manager(
+            Path(temp),
+            config_overrides={"LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES": queue_max},
+        )
+        session = LuxriotCaptureSession(
+            manager,
+            channel_id=7,
+            batch_size=4,
+            prompt="Describe activity.",
+            run_id="run-7",
+            interval_override=0.2,
+        )
+        return manager, session
+
+    @staticmethod
+    def _frames(start_sec: float, count: int, *, mode: str = "normal", activity_x: float = 1.0):
+        return [
+            {
+                "captured_at": start_sec + index,
+                "time_sec": start_sec + index,
+                "thumbnail": f"jpeg-{start_sec + index:g}",
+                "frame_hash": f"hash-{start_sec + index:g}",
+                "capture_selection": {
+                    "selection_mode": mode,
+                    "activity_x": activity_x,
+                },
+            }
+            for index in range(count)
+        ]
+
+    def test_backpressure_coalesces_windows_instead_of_dropping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp, queue_max=2)
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_dispatcher(_batch, _workload):
+                started.set()
+                release.wait(timeout=5.0)
+                return {"queued": False, "accepted": True}
+
+            session.manager.set_summary_dispatcher(slow_dispatcher)
+            session.summary_worker_thread.start()
+            try:
+                # First batch goes inflight into the blocked dispatcher; the
+                # next two fill the queue; the fourth forces backpressure.
+                session.frames = self._frames(100.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                self.assertTrue(started.wait(timeout=2.0))
+                session.frames = self._frames(112.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                session.frames = self._frames(124.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                session.frames = self._frames(136.0, 4, mode="burst", activity_x=9.0)
+                self.assertTrue(session._enqueue_summary_batch())
+
+                with session.lock:
+                    queue_snapshot = [
+                        (list(frames), dict(meta))
+                        for frames, _workload, meta in session.summary_queue
+                    ]
+                self.assertEqual(session.summary_coalesced_batches, 1)
+                self.assertEqual(session.queue_dropped_batches, 0)
+                merged_frames, merged_meta = queue_snapshot[0]
+                self.assertEqual(merged_meta["coalesced"]["batches"], 2)
+                self.assertEqual(merged_meta["coalesced"]["omitted_frames"], 4)
+                self.assertEqual(len(merged_frames), 4)
+                spans = [frame["captured_at"] for frame in merged_frames]
+                self.assertLess(min(spans), 116.0)
+                self.assertGreater(max(spans), 123.0)
+                self.assertEqual(session.status()["summary_coalesced_batches"], 1)
+            finally:
+                release.set()
+                session.stop_event.set()
+                with session.summary_condition:
+                    session.summary_condition.notify_all()
+
+    def test_coalescing_preserves_burst_frames(self):
+        combined = (
+            self._frames(100.0, 6, mode="quiet", activity_x=0.0)
+            + self._frames(110.0, 3, mode="burst", activity_x=8.0)
+            + self._frames(120.0, 6, mode="normal", activity_x=2.0)
+        )
+        kept, omitted = LuxriotCaptureSession._subsample_coalesced_frames(combined, 6)
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(omitted, 9)
+        kept_modes = [frame["capture_selection"]["selection_mode"] for frame in kept]
+        self.assertEqual(kept_modes.count("burst"), 3)
+        stamps = [frame["captured_at"] for frame in kept]
+        self.assertEqual(stamps, sorted(stamps))
+
+    def test_exhausted_coalescing_leaves_an_explicit_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager, session = self._make_session(temp, queue_max=2)
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_dispatcher(_batch, _workload):
+                started.set()
+                release.wait(timeout=5.0)
+                return {"queued": False, "accepted": True}
+
+            manager.set_summary_dispatcher(slow_dispatcher)
+            session.summary_worker_thread.start()
+            try:
+                # Batch 1 goes inflight; batches 2 and 3 fill the queue.
+                session.frames = self._frames(100.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                self.assertTrue(started.wait(timeout=2.0))
+                session.frames = self._frames(112.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                session.frames = self._frames(124.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+                # Poison the queued batches as already fully coalesced so the
+                # merge path refuses and the drop-with-gap path runs.
+                with session.lock:
+                    poisoned = []
+                    for frames, workload, meta in session.summary_queue:
+                        meta = dict(meta)
+                        meta["coalesced"] = {"batches": _capture_max_coalesce(), "omitted_frames": 0}
+                        poisoned.append((frames, workload, meta))
+                    session.summary_queue[:] = poisoned
+                session.frames = self._frames(136.0, 4)
+                self.assertTrue(session._enqueue_summary_batch())
+
+                self.assertEqual(session.queue_dropped_batches, 1)
+                logs = manager.summary_history.get(7) or []
+                gap_logs = [log for log in logs if log.get("coverage_gap")]
+                self.assertEqual(len(gap_logs), 1)
+                gap = gap_logs[0]
+                self.assertEqual(gap["gap_reason"], "lm_backpressure_dropped_batch")
+                self.assertIn("coverage gap", gap["summary"])
+                self.assertEqual(gap["batch_start_ms"], 112_000)
+                self.assertEqual(gap["batch_end_ms"], 115_000)
+            finally:
+                release.set()
+                session.stop_event.set()
+                with session.summary_condition:
+                    session.summary_condition.notify_all()
+
+    def test_coalesced_info_reaches_the_summary_entry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lambda _messages, _hint: "All calm.")
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=4,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=self._frames(100.0, 4),
+            )
+            batch["coalesced"] = {"batches": 2, "omitted_frames": 4}
+            entry = manager.run_summary_batch(batch)
+            self.assertEqual(entry["coalesced"], {"batches": 2, "omitted_frames": 4})
+            normalized = manager._normalize_summary_log_entry(entry)
+            self.assertEqual(normalized["coalesced"], {"batches": 2, "omitted_frames": 4})
+
+
+def _capture_max_coalesce() -> int:
+    from luxriot_connector import _SUMMARY_COALESCE_MAX_BATCHES
+
+    return _SUMMARY_COALESCE_MAX_BATCHES
+
+
 class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
     def test_burst_seconds_reach_vector_signal_and_prompt_contract(self):
         with tempfile.TemporaryDirectory() as temp:

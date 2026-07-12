@@ -3953,6 +3953,21 @@
                 const channelLabel = Number.isFinite(rowChannelId)
                     ? getLuxriotChannelLabel(rowChannelId)
                     : 'Unknown channel';
+                if (log.coverage_gap) {
+                    const gapWindow = Number.isFinite(batchStartMs) && batchStartMs > 0 && Number.isFinite(batchEndMs) && batchEndMs > batchStartMs
+                        ? `${new Date(batchStartMs).toLocaleTimeString()}–${new Date(batchEndMs).toLocaleTimeString()}`
+                        : tsLabel;
+                    const gapReason = String(log.gap_reason || 'dropped batch').replace(/_/g, ' ');
+                    return `
+                        <div class="luxriot-summary luxriot-summary-gap" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(gapWindow)} · <strong>coverage gap</strong> — no description exists for this window (${escapeHtml(gapReason)})</div>
+                        </div>
+                    `;
+                }
+                const coalescedBatches = Number(log.coalesced?.batches || 0);
+                const coalescedLabel = coalescedBatches > 1
+                    ? ` · coalesced ×${coalescedBatches}`
+                    : '';
                 const summary = String(log.summary || '').trim();
                 const summaryParts = splitSummaryAndJson(summary);
                 const summaryMain = summaryParts.main || summary;
@@ -3968,7 +3983,7 @@
                 return `
                     <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
                         <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}${attentionBadge}</div>
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${coalescedLabel}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}${attentionBadge}</div>
                             <div class="luxriot-summary-actions">
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
                                     ${collapsed ? 'Expand' : 'Collapse'}
