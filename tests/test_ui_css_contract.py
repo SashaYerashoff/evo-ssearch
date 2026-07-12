@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CSS = (ROOT / "static/css/app.css").read_text(encoding="utf-8")
 JS = (ROOT / "static/js/app.js").read_text(encoding="utf-8")
 TEMPLATE = (ROOT / "templates/index.html").read_text(encoding="utf-8")
+OLDAPP = (ROOT / "oldapp.py").read_text(encoding="utf-8")
 
 
 def _cef_safe_section() -> str:
@@ -603,3 +604,14 @@ def test_live_summary_controls_preserve_edits_and_disclose_pending_restart():
     assert "batch_size: batchSize" in JS
     assert "interval_sec: intervalSec" in JS
     assert ".luxriot-runtime-config-pending" in CSS
+
+
+def test_l0_feed_requests_compact_operator_rows():
+    assert "params.set('view', 'feed')" in JS
+
+
+def test_rollup_ui_reads_precomputed_windows_without_triggering_llm():
+    route = OLDAPP.split("def luxriot_summary_rollups():", 1)[1].split("def luxriot_streams_status", 1)[0]
+    assert "request.args.get('synthesize')" in route
+    assert "synthesize=synthesize" in route
+    assert "rollups['levels']" in route

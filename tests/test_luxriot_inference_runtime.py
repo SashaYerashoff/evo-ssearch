@@ -100,6 +100,21 @@ class MemoryRuntimeStateStore:
         self.payloads[key] = payload
 
 
+class BlockingPostgresRuntimeStateStore(MemoryRuntimeStateStore):
+    backend = "postgres"
+
+    def __init__(self):
+        super().__init__()
+        self.save_started = threading.Event()
+        self.release_save = threading.Event()
+
+    def save_state(self, key, payload):
+        self.save_started.set()
+        if not self.release_save.wait(timeout=3.0):
+            raise RuntimeError("test persistence release timed out")
+        super().save_state(key, payload)
+
+
 def sample_frames(start: float = 100.0):
     return [
         {
@@ -356,6 +371,149 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertAlmostEqual(float(session.capture_activity_baseline_level), 0.0125)
             self.assertEqual(session.capture_activity_baseline_buckets, 640)
             self.assertFalse(session.status()["capture_activity_baseline"]["warmup"])
+
+    def test_postgres_history_persistence_does_not_hold_runtime_cache_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = BlockingPostgresRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=store)
+            started = time.monotonic()
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Vehicle moved through the junction.",
+                    "frame_count": 2,
+                    "created_at": 1_781_700_000.0,
+                    "frame_selection": {
+                        "groups": [
+                            {
+                                "selected_source_frame_index": 2,
+                                "selection_source": "road_cv_cue",
+                                "apex_available": True,
+                                "source_frame_indices": list(range(1, 25)),
+                                "source_timestamps_ms": list(range(100_000, 124_000, 1000)),
+                                "source_frame_hashes": ["a" * 40] * 24,
+                            }
+                        ]
+                    },
+                    "vector_signal": {
+                        "channel_id": 7,
+                        "road_cv_cues": [{"cue_type": "motion", "score": 0.8}],
+                        "road_cv_frame_scores": [
+                            {"source_frame_index": index, "timestamp_ms": 100_000 + index * 1000, "attention_score": 0.5}
+                            for index in range(1, 25)
+                        ],
+                    },
+                },
+            )
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(store.save_started.wait(timeout=1.0))
+
+            settings_started = time.monotonic()
+            settings = manager.get_prompt_settings(channel_id=7)
+            self.assertEqual(settings["channel_id"], 7)
+            self.assertLess(time.monotonic() - settings_started, 0.2)
+
+            stored = manager.summary_history[7][0]
+            self.assertNotIn("road_cv_frame_scores", stored["vector_signal"])
+            self.assertNotIn("source_frame_indices", stored["frame_selection"]["groups"][0])
+            self.assertEqual(stored["frame_selection"]["groups"][0]["selection_source"], "road_cv_cue")
+
+            store.release_save.set()
+            deadline = time.monotonic() + 2.0
+            while manager.summary_state_revision < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(manager.summary_state_revision, 1)
+
+    def test_manager_cache_lock_allows_layered_runtime_reads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            completed = threading.Event()
+
+            def layered_read():
+                with manager.cache_lock:
+                    manager.get_prompt_settings(channel_id=7)
+                completed.set()
+
+            worker = threading.Thread(target=layered_read, daemon=True)
+            worker.start()
+            self.assertTrue(completed.wait(timeout=0.5))
+
+    def test_compact_summary_feed_omits_internal_frame_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Sudden movement near the gate.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                    "prompt": "large internal prompt",
+                    "frame_selection": {
+                        "groups": [
+                            {
+                                "selected_source_frame_index": 2,
+                                "selection_source": "capture_cv_apex",
+                                "apex_available": True,
+                            }
+                        ]
+                    },
+                    "vector_signal": {
+                        "channel_id": 7,
+                        "road_cv_frame_scores": [
+                            {"source_frame_index": 2, "timestamp_ms": 1_781_700_000_000, "attention_score": 0.8}
+                        ],
+                        "capture_attention": {
+                            "policy": "per_second_cv_apex_v2",
+                            "seconds": [{"snapshot": 2, "mode": "burst", "activity_x": 8.0}],
+                        },
+                    },
+                },
+            )
+
+            full_log = manager.session_status(7, run_selector="all")["logs"][0]
+            feed_log = manager.session_status(7, run_selector="all", compact_feed=True)["logs"][0]
+            self.assertIn("frame_selection", full_log)
+            self.assertNotIn("frame_selection", feed_log)
+            self.assertNotIn("prompt", feed_log)
+            self.assertEqual(
+                feed_log["vector_signal"]["capture_attention"]["seconds"][0]["mode"],
+                "burst",
+            )
+
+    def test_scheduled_rollup_targets_only_the_latest_closed_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            calls = []
+            with patch.object(
+                manager,
+                "summary_rollups",
+                side_effect=lambda **kwargs: calls.append(kwargs) or {"levels": {}},
+            ):
+                manager._run_scheduled_rollup(7, "L1", 3_701.0)
+
+            self.assertEqual(calls[0]["channel_id"], 7)
+            self.assertEqual(calls[0]["target_level"], "L1")
+            self.assertEqual(calls[0]["start_ts"], 2_700.0)
+            self.assertEqual(calls[0]["end_ts"], 3_599.999)
+            self.assertIsNone(calls[0]["level_limit"])
+
+    def test_rollup_scheduler_staggers_channels_deterministically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_scheduler_initial_delay_sec = 30.0
+            manager.rollup_scheduler_spacing_sec = 5.0
+            due = [
+                manager._rollup_initial_due(channel_id, "L1", 1_000.0, 50)
+                for channel_id in range(1, 51)
+            ]
+
+            self.assertGreater(len(set(due)), 20)
+            self.assertGreaterEqual(min(due), 1_030.0)
+            self.assertLess(max(due), 1_280.0)
 
     def test_selector_bias_is_a_channel_setting_with_reset(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1200,6 +1358,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                             "revision": 7,
                             "updated_at": 123.0,
                             "road_scene_calibrations": {"7": {"confidence": "high"}},
+                            "capture_baselines": {"7": {"level": 0.012, "buckets": 600}},
                             "prompt_settings": {"bookmark_enabled": False},
                         },
                     )
@@ -1228,6 +1387,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             payload["road_scene_calibrations"]["7"]["confidence"],
             "high",
         )
+        self.assertEqual(payload["capture_baselines"]["7"]["buckets"], 600)
 
     def test_channel_inventory_refresh_failure_retains_and_marks_stale_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3030,6 +3190,31 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(normalize.call_count, 1)
             self.assertEqual(len(manager.summary_history[7]), 6)
             self.assertEqual(manager.summary_history[7][-1]["summary"], "new summary")
+
+    def test_hot_l0_history_is_bounded_for_hierarchical_rollups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_SUMMARY_HISTORY_LIMIT": 5000,
+                    "LUXRIOT_SUMMARY_STATE_HOT_LIMIT": 240,
+                },
+            )
+            base = 1_781_700_000.0
+            for index in range(260):
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": f"summary {index}",
+                        "frame_count": 12,
+                        "created_at": base + index,
+                    },
+                )
+
+            self.assertEqual(len(manager.summary_history[7]), 240)
+            self.assertEqual(manager.summary_history[7][0]["summary"], "summary 20")
 
     def test_summary_history_duplicate_preserves_existing_alert_metadata(self):
         with tempfile.TemporaryDirectory() as temp:

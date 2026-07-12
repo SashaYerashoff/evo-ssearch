@@ -1205,6 +1205,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
             "road_scene_calibrations": _plain_value(
                 payload.get("road_scene_calibrations") or {}
             ),
+            "capture_baselines": _plain_value(payload.get("capture_baselines") or {}),
             "prompt_settings": _plain_value(payload.get("prompt_settings") or {}),
         }
         entries: Dict[str, Dict[str, Any]] = {self._SUMMARY_META_KEY: meta_payload}
@@ -1289,6 +1290,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
             "summary_runs": summary_runs,
             "channel_routines": meta.get("channel_routines") or {},
             "road_scene_calibrations": meta.get("road_scene_calibrations") or {},
+            "capture_baselines": meta.get("capture_baselines") or {},
             "prompt_settings": meta.get("prompt_settings") or {},
         }
 

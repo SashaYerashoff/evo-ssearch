@@ -10789,6 +10789,7 @@ def luxriot_session_status():
     from_ts = request.args.get('from_ts', default=None, type=float)
     to_ts = request.args.get('to_ts', default=None, type=float)
     limit = request.args.get('limit', default=None, type=int)
+    compact_feed = str(request.args.get('view') or '').strip().lower() == 'feed'
     try:
         status = luxriot_manager.session_status(
             channel_id,
@@ -10796,6 +10797,7 @@ def luxriot_session_status():
             start_ts=from_ts,
             end_ts=to_ts,
             limit=limit,
+            compact_feed=compact_feed,
         )
         return jsonify(status)
     except Exception as exc:
@@ -10810,6 +10812,7 @@ def luxriot_summary_rollups():
     to_ts = request.args.get('to_ts', default=None, type=float)
     level_limit = request.args.get('level_limit', default=60, type=int)
     target_level = (request.args.get('target_level') or '').strip().upper() or None
+    synthesize = str(request.args.get('synthesize') or '').strip().lower() in {'1', 'true', 'yes'}
     try:
         rollups = luxriot_manager.summary_rollups(
             channel_id=channel_id,
@@ -10818,7 +10821,13 @@ def luxriot_summary_rollups():
             end_ts=to_ts,
             level_limit=level_limit,
             target_level=target_level,
+            synthesize=synthesize,
         )
+        levels = rollups.get('levels') if isinstance(rollups, Mapping) else None
+        if target_level and isinstance(levels, Mapping):
+            rollups['levels'] = {
+                target_level: list(levels.get(target_level) or []),
+            }
         return jsonify(rollups)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400

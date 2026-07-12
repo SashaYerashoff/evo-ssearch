@@ -3370,7 +3370,11 @@ class LuxriotManager:
         self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
         self.shared_probe_channels: Set[int] = set()
         self.paused_probe_channels: Set[int] = set()
-        self.cache_lock = threading.Lock()
+        # Manager helpers are layered (status/prompt/rollup paths call compact
+        # helpers that may need the same cache). A re-entrant lock prevents one
+        # request/background callback from permanently owning the global state
+        # when those layers meet.
+        self.cache_lock = threading.RLock()
         self.channels_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
         self.channels_cache_stale = False
         self.channels_cache_last_error: Optional[str] = None
@@ -3387,7 +3391,12 @@ class LuxriotManager:
             history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
         except Exception:
             history_limit = 600
-        self.summary_history_limit = max(40, history_limit)
+        try:
+            hot_history_limit = int(getattr(config, "LUXRIOT_SUMMARY_STATE_HOT_LIMIT", 2160))
+        except Exception:
+            hot_history_limit = 2160
+        self.summary_state_hot_limit = max(240, min(10000, hot_history_limit))
+        self.summary_history_limit = min(max(40, history_limit), self.summary_state_hot_limit)
         try:
             archive_frames_per_batch = int(
                 getattr(config, "LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH", 4)
@@ -3410,8 +3419,12 @@ class LuxriotManager:
         self._summary_state_last_persist = 0.0
         self._summary_state_dirty = False
         self.summary_state_revision = 0
+        self._summary_state_revision_issued = 0
         self.summary_state_last_success_at: Optional[float] = None
         self.summary_state_last_error: Optional[str] = None
+        self._summary_persist_condition = threading.Condition()
+        self._summary_persist_pending: Optional[Dict[str, Any]] = None
+        self._summary_persist_thread: Optional[threading.Thread] = None
         self.summary_state_backend = "runtime_state" if runtime_state_store is not None else "file"
         self._persisted_prompt_default_fields: Set[str] = set()
         try:
@@ -3529,6 +3542,33 @@ class LuxriotManager:
             "L2": max(900, l2_window),
             "L3": max(1800, l3_window),
         }
+        self.rollup_scheduler_enabled = bool(
+            getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_ENABLED", False)
+        )
+        try:
+            scheduler_initial_delay = float(
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC", 30.0)
+            )
+        except Exception:
+            scheduler_initial_delay = 30.0
+        self.rollup_scheduler_initial_delay_sec = max(1.0, min(600.0, scheduler_initial_delay))
+        try:
+            scheduler_spacing = float(
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC", 5.0)
+            )
+        except Exception:
+            scheduler_spacing = 5.0
+        self.rollup_scheduler_spacing_sec = max(1.0, min(300.0, scheduler_spacing))
+        self._rollup_scheduler_due: Dict[Tuple[int, str], float] = {}
+        self._rollup_scheduler_stop = threading.Event()
+        self._rollup_scheduler_thread: Optional[threading.Thread] = None
+        self._rollup_scheduler_status: Dict[str, Any] = {
+            "enabled": self.rollup_scheduler_enabled,
+            "running": False,
+            "jobs_completed": 0,
+            "jobs_deferred_for_l0": 0,
+            "last_error": None,
+        }
         try:
             self.rollup_highlight_limit = max(1, int(getattr(config, "LUXRIOT_ROLLUP_HIGHLIGHTS", 3)))
         except Exception:
@@ -3620,7 +3660,162 @@ class LuxriotManager:
             cache_path = Path.cwd() / cache_path
         self.rollup_cache_file = cache_path
         self._load_summary_state_from_disk()
+        self._summary_state_revision_issued = int(self.summary_state_revision)
         self._load_rollup_cache_from_disk()
+        if self.rollup_scheduler_enabled:
+            self._start_rollup_scheduler()
+
+    def _start_rollup_scheduler(self) -> None:
+        if self._rollup_scheduler_thread is not None and self._rollup_scheduler_thread.is_alive():
+            return
+        self._rollup_scheduler_thread = threading.Thread(
+            target=self._rollup_scheduler_loop,
+            daemon=True,
+            name="eva-rollup-scheduler",
+        )
+        self._rollup_scheduler_thread.start()
+
+    def _rollup_scheduler_channels(self) -> List[int]:
+        with self.cache_lock:
+            channels = {
+                int(channel_id)
+                for channel_id, logs in self.summary_history.items()
+                if logs
+            }
+            channels.update(int(channel_id) for channel_id in self.sessions)
+        try:
+            desired = self._load_desired_live_sessions()
+        except Exception:
+            desired = {}
+        channels.update(
+            int(channel_id)
+            for channel_id, state in desired.items()
+            if bool(state.get("enabled"))
+        )
+        return sorted(channel_id for channel_id in channels if channel_id > 0)
+
+    def _rollup_initial_due(self, channel_id: int, level: str, now: float, channel_count: int) -> float:
+        window_sec = max(1, int(self.rollup_windows[level]))
+        spread_sec = min(
+            float(window_sec),
+            max(60.0, float(max(1, channel_count)) * self.rollup_scheduler_spacing_sec),
+        )
+        digest = hashlib.sha1(f"{int(channel_id)}:{level}".encode("utf-8")).hexdigest()
+        offset = int(digest[:12], 16) % max(1, int(spread_sec))
+        return float(now) + self.rollup_scheduler_initial_delay_sec + float(offset)
+
+    def _l0_backpressure_active(self, channel_id: Optional[int] = None) -> bool:
+        with self.cache_lock:
+            if channel_id is None:
+                sessions = list(self.sessions.values())
+            else:
+                session = self.sessions.get(int(channel_id))
+                sessions = [session] if session is not None else []
+        for session in sessions:
+            try:
+                status = session.status()
+            except Exception:
+                continue
+            if bool(status.get("summary_inflight")):
+                return True
+            if int(_parse_optional_int(status.get("summary_queue_depth")) or 0) > 0:
+                return True
+        return False
+
+    def _run_scheduled_rollup(self, channel_id: int, level: str, now: float) -> Dict[str, Any]:
+        window_sec = max(1, int(self.rollup_windows[level]))
+        closed_window_end = int(float(now) // window_sec) * window_sec
+        if closed_window_end <= 0:
+            return {"levels": {}, "source_counts": {}}
+        return self.summary_rollups(
+            channel_id=int(channel_id),
+            run_selector="all",
+            start_ts=float(closed_window_end - window_sec),
+            end_ts=float(closed_window_end) - 0.001,
+            level_limit=None,
+            synthesize=True,
+            target_level=level,
+        )
+
+    def _rollup_scheduler_loop(self) -> None:
+        while not self._rollup_scheduler_stop.is_set():
+            now = time.time()
+            channels = self._rollup_scheduler_channels()
+            for channel_id in channels:
+                for level in ("L1", "L2", "L3"):
+                    key = (int(channel_id), level)
+                    self._rollup_scheduler_due.setdefault(
+                        key,
+                        self._rollup_initial_due(channel_id, level, now, len(channels)),
+                    )
+            due_items = [
+                (due_at, key)
+                for key, due_at in self._rollup_scheduler_due.items()
+                if key[0] in channels
+            ]
+            if not due_items:
+                self._rollup_scheduler_stop.wait(10.0)
+                continue
+            due_at, (channel_id, level) = min(due_items, key=lambda item: item[0])
+            wait_sec = float(due_at) - time.time()
+            if wait_sec > 0:
+                self._rollup_scheduler_stop.wait(min(10.0, wait_sec))
+                continue
+            if self._l0_backpressure_active(channel_id):
+                self._rollup_scheduler_due[(channel_id, level)] = time.time() + max(
+                    15.0,
+                    self.rollup_scheduler_spacing_sec,
+                )
+                with self.cache_lock:
+                    self._rollup_scheduler_status["jobs_deferred_for_l0"] = int(
+                        self._rollup_scheduler_status.get("jobs_deferred_for_l0") or 0
+                    ) + 1
+                continue
+
+            started_at = time.time()
+            with self.cache_lock:
+                self._rollup_scheduler_status.update(
+                    {
+                        "running": True,
+                        "active_channel_id": int(channel_id),
+                        "active_level": level,
+                        "last_started_at": started_at,
+                        "last_error": None,
+                    }
+                )
+            error: Optional[str] = None
+            try:
+                self._run_scheduled_rollup(channel_id, level, started_at)
+            except Exception as exc:
+                error = _safe_error_text(exc, 240) or exc.__class__.__name__
+                LOGGER.warning(
+                    "Scheduled Luxriot rollup failed channel_id=%s level=%s error=%s",
+                    channel_id,
+                    level,
+                    error,
+                )
+            completed_at = time.time()
+            next_due = float(due_at) + float(self.rollup_windows[level])
+            while next_due <= completed_at:
+                next_due += float(self.rollup_windows[level])
+            self._rollup_scheduler_due[(channel_id, level)] = next_due
+            with self.cache_lock:
+                self._rollup_scheduler_status.update(
+                    {
+                        "running": False,
+                        "active_channel_id": None,
+                        "active_level": None,
+                        "last_completed_at": completed_at,
+                        "last_duration_sec": round(max(0.0, completed_at - started_at), 3),
+                        "last_channel_id": int(channel_id),
+                        "last_level": level,
+                        "last_error": error,
+                        "jobs_completed": int(
+                            self._rollup_scheduler_status.get("jobs_completed") or 0
+                        ) + (0 if error else 1),
+                    }
+                )
+            self._rollup_scheduler_stop.wait(self.rollup_scheduler_spacing_sec)
 
     def _session_side_effect_lock_for(self, channel_id: int) -> Any:
         channel_key = int(channel_id)
@@ -5177,6 +5372,89 @@ class LuxriotManager:
             return {}
         return out
 
+    @classmethod
+    def _compact_summary_history_entry(cls, value: Mapping[str, Any]) -> Dict[str, Any]:
+        """Keep operator/agent evidence while dropping per-candidate diagnostics.
+
+        Exact candidate arrays and hashes have already been written to the frame
+        archive before an L0 entry reaches history. Repeating them in every
+        runtime-state row made ordinary feed reads and persistence scale with
+        tens of megabytes per channel.
+        """
+
+        out = dict(value)
+        frame_selection = cls._compact_frame_selection(value.get("frame_selection"))
+        if frame_selection:
+            compact_selection = {
+                key: frame_selection[key]
+                for key in (
+                    "version",
+                    "policy",
+                    "time_bucket_ms",
+                    "source_frame_count",
+                    "selected_frame_count",
+                    "apex_selected_count",
+                    "fallback_count",
+                    "single_frame_count",
+                    "timestamp_unavailable_count",
+                    "selection_sources",
+                )
+                if key in frame_selection
+            }
+            compact_groups: List[Dict[str, Any]] = []
+            for raw_group in frame_selection.get("groups") or []:
+                if not isinstance(raw_group, Mapping):
+                    continue
+                group = {
+                    key: raw_group[key]
+                    for key in (
+                        "bucket_start_ms",
+                        "selected_timestamp_ms",
+                        "selected_source_frame_index",
+                        "selection_source",
+                        "apex_available",
+                        "fallback_reason",
+                    )
+                    if key in raw_group
+                }
+                if group:
+                    compact_groups.append(group)
+            if compact_groups:
+                compact_selection["groups"] = compact_groups[:64]
+            out["frame_selection"] = compact_selection
+        else:
+            out.pop("frame_selection", None)
+
+        vector_signal = cls._compact_vector_signal(value.get("vector_signal"))
+        if vector_signal:
+            history_signal: Dict[str, Any] = {
+                key: vector_signal[key]
+                for key in ("version", "semantics", "channel_id", "batch_start_ms", "batch_end_ms")
+                if key in vector_signal
+            }
+            clip_signals = vector_signal.get("clip_probe_signals")
+            if isinstance(clip_signals, list) and clip_signals:
+                history_signal["clip_probe_signals"] = [dict(item) for item in clip_signals[:4]]
+            road_cues = vector_signal.get("road_cv_cues")
+            if isinstance(road_cues, list) and road_cues:
+                history_signal["road_cv_cues"] = [dict(item) for item in road_cues[:4]]
+            road_episodes = vector_signal.get("road_episodes")
+            if isinstance(road_episodes, list) and road_episodes:
+                history_signal["road_episodes"] = [dict(item) for item in road_episodes[:4]]
+            attention = vector_signal.get("capture_attention")
+            if isinstance(attention, Mapping):
+                history_signal["capture_attention"] = dict(attention)
+            if any(
+                key in history_signal
+                for key in ("clip_probe_signals", "road_cv_cues", "road_episodes", "capture_attention")
+            ):
+                out["vector_signal"] = history_signal
+            else:
+                out.pop("vector_signal", None)
+        else:
+            out.pop("vector_signal", None)
+        return out
+
     @staticmethod
     def _batch_frame_timestamp_ms(frame: Mapping[str, Any]) -> Optional[int]:
         for key in ("timestamp_ms", "captured_at_ms"):
@@ -6361,7 +6639,7 @@ class LuxriotManager:
             "json_alert_prompt",
         }
 
-    def _persist_summary_state_locked(self) -> bool:
+    def _build_summary_state_payload_locked(self, revision: Optional[int] = None) -> Dict[str, Any]:
         history_payload: Dict[str, List[Dict[str, Any]]] = {}
         for channel_id, logs in self.summary_history.items():
             if not logs:
@@ -6397,7 +6675,11 @@ class LuxriotManager:
         }
         payload = {
             "version": 2,
-            "revision": int(self.summary_state_revision) + 1,
+            "revision": int(
+                revision
+                if revision is not None
+                else max(self.summary_state_revision, self._summary_state_revision_issued) + 1
+            ),
             "updated_at": time.time(),
             "summary_history": history_payload,
             "summary_runs": runs_payload,
@@ -6414,14 +6696,15 @@ class LuxriotManager:
             },
             "prompt_settings": prompt_payload,
         }
+        return payload
+
+    def _write_summary_state_payload(self, payload: Mapping[str, Any]) -> Optional[str]:
         state_store = getattr(self, "runtime_state_store", None)
         if state_store is not None:
             try:
                 state_store.save_state("luxriot_summary_state", payload)
             except Exception as exc:
-                self.summary_state_last_error = _safe_error_text(exc, 500) or exc.__class__.__name__
-                self._summary_state_dirty = True
-                return False
+                return _safe_error_text(exc, 500) or exc.__class__.__name__
         else:
             path = self.summary_state_file
             try:
@@ -6430,15 +6713,75 @@ class LuxriotManager:
                 tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 tmp_file.replace(path)
             except Exception as exc:
-                self.summary_state_last_error = _safe_error_text(exc, 500) or exc.__class__.__name__
-                self._summary_state_dirty = True
-                return False
-        self.summary_state_revision = int(payload["revision"])
-        self.summary_state_last_success_at = float(payload["updated_at"])
-        self.summary_state_last_error = None
-        self._summary_state_dirty = False
+                return _safe_error_text(exc, 500) or exc.__class__.__name__
+        return None
+
+    def _mark_summary_state_write_result_locked(
+        self,
+        payload: Mapping[str, Any],
+        error: Optional[str],
+    ) -> bool:
+        revision = int(_parse_optional_int(payload.get("revision")) or 0)
+        if error:
+            self.summary_state_last_error = str(error)[:500]
+            self._summary_state_dirty = True
+            return False
+        if revision >= int(self.summary_state_revision):
+            self.summary_state_revision = revision
+            self.summary_state_last_success_at = self._coerce_float(payload.get("updated_at")) or time.time()
+            self.summary_state_last_error = None
+        with self._summary_persist_condition:
+            has_newer_pending = self._summary_persist_pending is not None
+        self._summary_state_dirty = bool(
+            has_newer_pending or revision < int(self._summary_state_revision_issued)
+        )
         self._persisted_prompt_default_fields.update(self._prompt_default_field_names())
         return True
+
+    def _persist_summary_state_locked(self) -> bool:
+        revision = max(self.summary_state_revision, self._summary_state_revision_issued) + 1
+        self._summary_state_revision_issued = int(revision)
+        payload = self._build_summary_state_payload_locked(revision)
+        error = self._write_summary_state_payload(payload)
+        return self._mark_summary_state_write_result_locked(payload, error)
+
+    def _summary_state_async_persistence_enabled(self) -> bool:
+        state_store = getattr(self, "runtime_state_store", None)
+        return str(getattr(state_store, "backend", "") or "").strip().lower() == "postgres"
+
+    def _summary_persist_worker(self) -> None:
+        while True:
+            with self._summary_persist_condition:
+                while self._summary_persist_pending is None:
+                    self._summary_persist_condition.wait()
+                payload = self._summary_persist_pending
+                self._summary_persist_pending = None
+            if not isinstance(payload, Mapping):
+                continue
+            revision = int(_parse_optional_int(payload.get("revision")) or 0)
+            with self.cache_lock:
+                issued_revision = int(self._summary_state_revision_issued)
+            if revision < issued_revision:
+                continue
+            error = self._write_summary_state_payload(payload)
+            with self.cache_lock:
+                self._mark_summary_state_write_result_locked(payload, error)
+
+    def _schedule_summary_state_persist_locked(self) -> None:
+        revision = max(self.summary_state_revision, self._summary_state_revision_issued) + 1
+        self._summary_state_revision_issued = int(revision)
+        payload = self._build_summary_state_payload_locked(revision)
+        self._summary_state_dirty = True
+        with self._summary_persist_condition:
+            self._summary_persist_pending = payload
+            if self._summary_persist_thread is None or not self._summary_persist_thread.is_alive():
+                self._summary_persist_thread = threading.Thread(
+                    target=self._summary_persist_worker,
+                    daemon=True,
+                    name="eva-summary-state",
+                )
+                self._summary_persist_thread.start()
+            self._summary_persist_condition.notify()
 
     def _persist_summary_state_if_due_locked(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -6452,7 +6795,9 @@ class LuxriotManager:
             return
         self._summary_state_last_persist = now
         self._summary_state_dirty = False
-        if not self._persist_summary_state_locked():
+        if self._summary_state_async_persistence_enabled():
+            self._schedule_summary_state_persist_locked()
+        elif not self._persist_summary_state_locked():
             self._summary_state_dirty = True
 
     def _load_summary_state_from_disk(self) -> None:
@@ -6492,7 +6837,7 @@ class LuxriotManager:
                         continue
                     normalized = self._normalize_summary_log_entry(cast(Mapping[str, Any], raw_log))
                     if normalized is not None:
-                        normalized_logs.append(normalized)
+                        normalized_logs.append(self._compact_summary_history_entry(normalized))
                 if not normalized_logs:
                     continue
                 combined = self._filter_summary_history_retention(
@@ -9334,7 +9679,7 @@ class LuxriotManager:
         for raw_log in logs:
             if not isinstance(raw_log, Mapping):
                 continue
-            incoming = dict(raw_log)
+            incoming = self._compact_summary_history_entry(raw_log)
             key = self._summary_log_key(incoming)
             index = key_to_index.get(key)
             if index is not None:
@@ -10884,6 +11229,7 @@ class LuxriotManager:
         start_ts: Optional[float] = None,
         end_ts: Optional[float] = None,
         limit: Optional[int] = None,
+        compact_feed: bool = False,
     ) -> Dict[str, Any]:
         if start_ts is not None and end_ts is not None and start_ts > end_ts:
             start_ts, end_ts = end_ts, start_ts
@@ -10928,6 +11274,8 @@ class LuxriotManager:
             status["from_ts"] = start_ts
             status["to_ts"] = end_ts
             status["limit"] = limit
+            if compact_feed:
+                status["logs"] = [self._compact_summary_feed_entry(log) for log in filtered_logs]
             return status
         all_logs = list(history_logs)
         log_count_by_run: Dict[str, int] = {}
@@ -10946,7 +11294,7 @@ class LuxriotManager:
         filtered_logs = self._filter_summary_logs(all_logs, selected_run_id, start_ts, end_ts)
         if isinstance(limit, int) and limit > 0 and len(filtered_logs) > limit:
             filtered_logs = filtered_logs[-limit:]
-        return {
+        result = {
             "running": False,
             "channel_id": channel_id,
             "run_id": active_run_id,
@@ -10970,6 +11318,42 @@ class LuxriotManager:
             "to_ts": end_ts,
             "limit": limit,
         }
+        if compact_feed:
+            result["logs"] = [self._compact_summary_feed_entry(log) for log in filtered_logs]
+        return result
+
+    @classmethod
+    def _compact_summary_feed_entry(cls, value: Mapping[str, Any]) -> Dict[str, Any]:
+        fields = (
+            "channel_id",
+            "run_id",
+            "summary",
+            "frame_count",
+            "source_frame_count",
+            "selected_frame_count",
+            "batch_size",
+            "created_at",
+            "batch_start_ms",
+            "batch_end_ms",
+            "duration_sec",
+            "model",
+            "alert_counts",
+            "alert_total",
+            "alert_severities",
+            "bookmarks_sent",
+            "bookmark_failed_count",
+            "bookmark_last_error",
+            "coverage_gap",
+            "gap_reason",
+            "coalesced",
+            "archive_inserted",
+        )
+        out = {key: value[key] for key in fields if key in value}
+        vector_signal = cls._compact_vector_signal(value.get("vector_signal"))
+        attention = vector_signal.get("capture_attention") if isinstance(vector_signal, Mapping) else None
+        if isinstance(attention, Mapping):
+            out["vector_signal"] = {"capture_attention": dict(attention)}
+        return out
 
     def summary_rollups(
         self,
@@ -11218,6 +11602,7 @@ class LuxriotManager:
                 for channel_id, digest in self.channel_status_digest.items()
                 if isinstance(digest, Mapping)
             }
+            rollup_scheduler_status = dict(self._rollup_scheduler_status)
         video_streams = [
             self._compact_stream_status("video", session.status(), paused)
             for _, session in video_items
@@ -11325,6 +11710,7 @@ class LuxriotManager:
             "running_total": len(video_streams) + len(analytics_streams),
             "capture_thread_total": len(video_streams) + len(analytics_items),
             "shared_analytics_count": sum(1 for item in analytics_streams if bool(item.get("shared_capture"))),
+            "rollup_scheduler": rollup_scheduler_status,
         }
 
     def system_status_digest(

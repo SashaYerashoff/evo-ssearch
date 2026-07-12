@@ -5023,6 +5023,7 @@
         try {
             const params = buildSummaryQueryParams(channelId);
             params.set('limit', '240');
+            params.set('view', 'feed');
             const resp = await fetch(`/luxriot/session?${params.toString()}`, {
                 signal: requestContext?.controller?.signal,
             });

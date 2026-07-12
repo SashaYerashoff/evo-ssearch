@@ -104,8 +104,15 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 |---|---|
 | `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | History retention |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT` | Per-channel history cap |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_STATE_HOT_LIMIT` (`2160`) | Bounded hot L0 rows per channel (about 6 h at 12 frames × 1 fps plus margin); older evidence stays in archive and closed context survives as L1–L3 |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH` (`4`) | Frames archived per batch for search |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES` (`2`) | Per-channel VLM summary backlog cap; live capture keeps refreshing while older queued batches may be dropped under load |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L1_WINDOW_SEC` (`900`) | L1 aggregation window and proactive cadence (15 min) |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L2_WINDOW_SEC` (`3600`) | L2 aggregation window and proactive cadence (60 min) |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC` (`21600`) | L3 aggregation window and proactive cadence (6 h) |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED` (`true`) | Build closed L1–L3 windows in the background instead of waiting for the first operator view |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC` (`30`) | Startup grace before staggered rollup work begins |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum spacing between channel/level rollup jobs; deterministic channel phases spread fleet load |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |
