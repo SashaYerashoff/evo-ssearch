@@ -33,11 +33,27 @@ def _channel_ids(values: Any) -> Set[int]:
 
 
 def operator_requests_continuation(text: Any) -> bool:
+    """Detect an explicit continuation command, not a merely similar word.
+
+    Bare stems are dangerous: ``продолж`` matches «продолжительность»,
+    ``остальн`` matches «опиши остальную сцену», bare ``remaining``/«дальше»
+    match ordinary temporal questions. A false positive injects the frozen
+    research window into an unrelated question, so every branch here requires
+    either an imperative verb form or an explicit channels/scope context.
+    """
+
     value = str(text or "").strip().casefold()
     return bool(
         re.search(
-            r"\b(?:continue|remaining|next\s+(?:chunk|batch|channels?)|resume)\b"
-            r"|продолж|остальн|следующ(?:ий|ая|ее|ие)\s+(?:чанк|пакет|канал)|\bдальше\b",
+            r"\b(?:continue|resume)\b"
+            r"|\bnext\s+(?:chunk|batch|channels?)\b"
+            r"|\bremaining\s+(?:channels?|cameras?|ids?|scope|list)\b"
+            r"|\bпродолж(?:и|ай|айте|им|ить|аем)\b"
+            r"|\bдавай\s+дальше\b"
+            r"|\bдальше\s+по\s+(?:списку|каналам|остальн\w*)\b"
+            r"|следующ(?:ий|ая|ее|ие)\s+(?:чанк|пакет|канал)"
+            r"|остальн\w*\s+(?:канал\w*|камер\w*)"
+            r"|оставш\w*\s+(?:канал\w*|камер\w*)",
             value,
             flags=re.IGNORECASE,
         )

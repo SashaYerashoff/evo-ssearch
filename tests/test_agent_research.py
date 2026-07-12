@@ -13,7 +13,19 @@ class AgentResearchLedgerTests(unittest.TestCase):
     def test_continuation_language_is_detected_without_matching_ordinary_text(self):
         self.assertTrue(operator_requests_continuation("Continue with the remaining channels"))
         self.assertTrue(operator_requests_continuation("давай дальше по остальным"))
+        self.assertTrue(operator_requests_continuation("продолжи"))
+        self.assertTrue(operator_requests_continuation("Продолжай проверку остальных каналов"))
+        self.assertTrue(operator_requests_continuation("check the remaining cameras"))
+        self.assertTrue(operator_requests_continuation("следующий чанк"))
         self.assertFalse(operator_requests_continuation("Show channel 118"))
+
+    def test_ordinary_questions_do_not_trigger_continuation(self):
+        # Each of these used to hijack the frozen research window.
+        self.assertFalse(operator_requests_continuation("какая продолжительность события на канале 5?"))
+        self.assertFalse(operator_requests_continuation("что было дальше по времени?"))
+        self.assertFalse(operator_requests_continuation("опиши остальную сцену"))
+        self.assertFalse(operator_requests_continuation("summarize the remaining footage quality"))
+        self.assertFalse(operator_requests_continuation("сколько длилось событие?"))
 
     def test_first_chunk_conserves_named_scope(self):
         state = research_state_from_inventory(
