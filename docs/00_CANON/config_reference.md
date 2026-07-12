@@ -89,6 +89,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES` (`134217728`) | Maximum bytes in one archive broker response (128 MiB default; clamp 1 KiB–512 MiB) |
 | `EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS` (`false`) | Push alerts as Luxriot bookmarks |
 | `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`60`) | Dedup cooldown |
+| `EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC` (`600`) | Per-channel bookmark delivery dedupe by normalized alert title + severity; `0` disables, clamped to 0–86400 s. Alert records remain in history/archive |
 | `EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH` (`8`) | Max alerts per batch |
 | `EVOSSEARCH_LUXRIOT_SEV_*` | Severity token mapping to Luxriot |
 

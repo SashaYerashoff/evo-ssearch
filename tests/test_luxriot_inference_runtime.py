@@ -42,6 +42,7 @@ def build_manager(
         LUXRIOT_SUMMARY_RETENTION_DAYS=0,
         LUXRIOT_AUTO_BOOKMARKS=False,
         LUXRIOT_BOOKMARK_COOLDOWN_SEC=60.0,
+        LUXRIOT_ALERT_DEDUPE_WINDOW_SEC=600.0,
         LUXRIOT_ALERTS_MAX_PER_BATCH=8,
         LUXRIOT_SUMMARY_STATE_FILE=str(directory / "summaries.json"),
         LUXRIOT_ROLLUP_CACHE_FILE=str(directory / "rollups.json"),
@@ -3316,6 +3317,83 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("evo down", result.last_error)
             self.assertIn("Luxriot bookmark send failed", "\n".join(logs.output))
 
+    def test_bookmark_delivery_deduplicates_normalized_title_and_severity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = {"title": "Vehicle   burnout", "severity": "HIGH"}
+
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [{"title": current["title"], "description": "Looped clip", "severity": current["severity"]}]
+
+            manager = build_manager(
+                Path(temp),
+                alert_parser=parse_alerts,
+                config_overrides={
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 0.0,
+                    "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
+                },
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
+                first = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+                current["title"] = "  vehicle burnout  "
+                current["severity"] = "high"
+                second = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(second.parsed, 1)
+            self.assertEqual(second.alert_events[0]["delivery_status"], "deduplicated")
+
+    def test_bookmark_content_dedupe_keeps_title_and_severity_distinct(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = {"title": "Burnout", "severity": "normal"}
+
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [{"title": current["title"], "description": "Visible event", "severity": current["severity"]}]
+
+            manager = build_manager(
+                Path(temp),
+                alert_parser=parse_alerts,
+                config_overrides={
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 0.0,
+                    "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
+                },
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
+                first = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+                current["title"] = "Drifting"
+                second = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+                current["severity"] = "high"
+                third = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+
+            self.assertEqual((first, second, third), (1, 1, 1))
+            self.assertEqual(len(sent), 3)
+
+    def test_bookmark_content_dedupe_window_zero_disables_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {"title": "Burnout", "description": "Looped clip", "severity": "high"}
+                ],
+                config_overrides={
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 0.0,
+                    "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 0.0,
+                },
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
+                first = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+                second = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
+
+            self.assertEqual((first, second), (1, 1))
+            self.assertEqual(len(sent), 2)
+
     def test_high_severity_bookmarks_bypass_info_cooldown(self):
         with tempfile.TemporaryDirectory() as temp:
             current = {"severity": "info"}
@@ -3332,6 +3410,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager = build_manager(Path(temp), alert_parser=parse_alerts)
             manager.default_bookmark_enabled = True
             manager.default_bookmark_cooldown_sec = 60.0
+            manager.alert_dedupe_window_sec = 0.0
             sent = []
 
             with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):

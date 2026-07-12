@@ -3414,12 +3414,18 @@ class LuxriotManager:
         self.summary_state_persist_interval_sec = max(0.0, persist_interval)
         self.live_session_restore_errors: Dict[int, str] = {}
         self.channel_bookmark_fingerprints: Dict[int, Dict[str, int]] = {}
+        self.channel_bookmark_content_keys: Dict[int, Dict[str, int]] = {}
         self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         try:
             cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 60.0))
         except Exception:
             cooldown_value = 60.0
         self.default_bookmark_cooldown_sec = max(0.0, cooldown_value)
+        try:
+            alert_dedupe_value = float(getattr(config, "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC", 600.0))
+        except Exception:
+            alert_dedupe_value = 600.0
+        self.alert_dedupe_window_sec = max(0.0, min(86400.0, alert_dedupe_value))
         try:
             max_alerts_value = int(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8))
         except Exception:
@@ -10336,6 +10342,20 @@ class LuxriotManager:
         return False
 
     @classmethod
+    def _bookmark_content_key(cls, alert: Mapping[str, Any]) -> str:
+        title = " ".join(str(alert.get("title") or "").casefold().split())
+        severity = cls._normalize_alert_severity(alert.get("severity"))
+        return f"{title}|{severity}"
+
+    def _bookmark_content_recently_sent_locked(self, channel_id: int, content_key: str, now_ms: int) -> bool:
+        window_sec = float(getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0)
+        if window_sec <= 0:
+            return False
+        channel_cache = self.channel_bookmark_content_keys.get(int(channel_id)) or {}
+        last_ts = channel_cache.get(content_key)
+        return isinstance(last_ts, int) and (now_ms - last_ts) < int(window_sec * 1000)
+
+    @classmethod
     def _bookmark_cooldown_for_severity(cls, base_cooldown_sec: float, severity: Any) -> float:
         base = max(0.0, float(base_cooldown_sec or 0.0))
         normalized = cls._normalize_alert_severity(severity)
@@ -10355,6 +10375,21 @@ class LuxriotManager:
         if len(channel_cache) > 2000:
             newest = sorted(channel_cache.items(), key=lambda item: item[1], reverse=True)[:1200]
             self.channel_bookmark_fingerprints[channel_key] = dict(newest)
+
+    def _mark_bookmark_content_sent_locked(self, channel_id: int, content_key: str, ts_ms: int) -> None:
+        window_sec = float(getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0)
+        if window_sec <= 0:
+            return
+        channel_key = int(channel_id)
+        channel_cache = self.channel_bookmark_content_keys.setdefault(channel_key, {})
+        channel_cache[content_key] = int(ts_ms)
+        prune_before = int(ts_ms) - int(window_sec * 1000)
+        stale_keys = [key for key, value in channel_cache.items() if isinstance(value, int) and value < prune_before]
+        for key in stale_keys:
+            channel_cache.pop(key, None)
+        if len(channel_cache) > 2000:
+            newest = sorted(channel_cache.items(), key=lambda item: item[1], reverse=True)[:1200]
+            self.channel_bookmark_content_keys[channel_key] = dict(newest)
 
     def process_summary_alerts(
         self,
@@ -10440,9 +10475,13 @@ class LuxriotManager:
                 alert_events.append({**alert, "delivery_status": "bookmark_disabled"})
                 continue
             fingerprint = self._bookmark_fingerprint(alert)
+            content_key = self._bookmark_content_key(alert)
             now_ms = int(time.time() * 1000)
             alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
             with self.cache_lock:
+                if self._bookmark_content_recently_sent_locked(int(channel_id), content_key, now_ms):
+                    alert_events.append({**alert, "delivery_status": "deduplicated"})
+                    continue
                 if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, alert_cooldown_sec):
                     skipped_duplicate_count += 1
                     alert_events.append({**alert, "delivery_status": "cooldown_skipped"})
@@ -10470,6 +10509,7 @@ class LuxriotManager:
                 continue
             with self.cache_lock:
                 self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
+                self._mark_bookmark_content_sent_locked(int(channel_id), content_key, now_ms)
             sent_count += 1
             alert_events.append({**alert, "delivery_status": "sent"})
         return AlertDeliveryResult(
