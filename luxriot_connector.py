@@ -3555,12 +3555,30 @@ class LuxriotManager:
         self.rollup_scheduler_initial_delay_sec = max(1.0, min(600.0, scheduler_initial_delay))
         try:
             scheduler_spacing = float(
-                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC", 5.0)
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC", 15.0)
             )
         except Exception:
-            scheduler_spacing = 5.0
+            scheduler_spacing = 15.0
         self.rollup_scheduler_spacing_sec = max(1.0, min(300.0, scheduler_spacing))
+        try:
+            scheduler_backfill_windows = int(
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS", 2)
+            )
+        except Exception:
+            scheduler_backfill_windows = 2
+        self.rollup_scheduler_backfill_windows = max(1, min(12, scheduler_backfill_windows))
+        try:
+            scheduler_max_deferral_windows = float(
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS", 2.0)
+            )
+        except Exception:
+            scheduler_max_deferral_windows = 2.0
+        self.rollup_scheduler_max_deferral_windows = max(
+            0.0,
+            min(10.0, scheduler_max_deferral_windows),
+        )
         self._rollup_scheduler_due: Dict[Tuple[int, str], float] = {}
+        self._rollup_scheduler_deferred_since: Dict[Tuple[int, str], float] = {}
         self._rollup_scheduler_stop = threading.Event()
         self._rollup_scheduler_thread: Optional[threading.Thread] = None
         self._rollup_scheduler_status: Dict[str, Any] = {
@@ -3568,6 +3586,16 @@ class LuxriotManager:
             "running": False,
             "jobs_completed": 0,
             "jobs_deferred_for_l0": 0,
+            "jobs_forced_after_deferral": 0,
+            "backfill_windows_generated": 0,
+            "invalid_operator_contract": 0,
+            "corrective_retries": 0,
+            "corrective_retry_successes": 0,
+            "semantic_guard_retries": 0,
+            "semantic_guard_retry_successes": 0,
+            "semantic_guard_failures": 0,
+            "semantic_guard_sanitized": 0,
+            "cached_semantic_guard_rejections": 0,
             "last_error": None,
         }
         try:
@@ -3706,6 +3734,8 @@ class LuxriotManager:
         return float(now) + self.rollup_scheduler_initial_delay_sec + float(offset)
 
     def _l0_backpressure_active(self, channel_id: Optional[int] = None) -> bool:
+        """Return true only for a saturated queued backlog, not normal inference."""
+
         with self.cache_lock:
             if channel_id is None:
                 sessions = list(self.sessions.values())
@@ -3717,11 +3747,29 @@ class LuxriotManager:
                 status = session.status()
             except Exception:
                 continue
-            if bool(status.get("summary_inflight")):
-                return True
-            if int(_parse_optional_int(status.get("summary_queue_depth")) or 0) > 0:
+            queue_depth = int(_parse_optional_int(status.get("summary_queue_depth")) or 0)
+            queue_limit = int(_parse_optional_int(status.get("summary_queue_max_batches")) or 0)
+            if queue_limit > 0 and queue_depth >= queue_limit:
                 return True
         return False
+
+    def _rollup_deferral_exhausted(
+        self,
+        key: Tuple[int, str],
+        level: str,
+        now: float,
+    ) -> bool:
+        max_deferral_sec = (
+            float(self.rollup_windows[level])
+            * float(self.rollup_scheduler_max_deferral_windows)
+        )
+        if max_deferral_sec <= 0:
+            return True
+        first_deferred_at = self._rollup_scheduler_deferred_since.get(key)
+        return bool(
+            first_deferred_at is not None
+            and float(now) - float(first_deferred_at) >= max_deferral_sec
+        )
 
     def _run_scheduled_rollup(self, channel_id: int, level: str, now: float) -> Dict[str, Any]:
         window_sec = max(1, int(self.rollup_windows[level]))
@@ -3731,11 +3779,16 @@ class LuxriotManager:
         return self.summary_rollups(
             channel_id=int(channel_id),
             run_selector="all",
-            start_ts=float(closed_window_end - window_sec),
+            # Scan all retained hot L0 context. Cached windows are free; the
+            # scheduler-specific generation budget drains newest missing
+            # windows first without turning a restart into an LM stampede.
+            start_ts=None,
             end_ts=float(closed_window_end) - 0.001,
             level_limit=None,
             synthesize=True,
             target_level=level,
+            synthesize_levels={level},
+            max_new_per_level=self.rollup_scheduler_backfill_windows,
         )
 
     def _rollup_scheduler_loop(self) -> None:
@@ -3762,7 +3815,18 @@ class LuxriotManager:
             if wait_sec > 0:
                 self._rollup_scheduler_stop.wait(min(10.0, wait_sec))
                 continue
-            if self._l0_backpressure_active(channel_id):
+            scheduler_key = (channel_id, level)
+            l0_backpressure = self._l0_backpressure_active(channel_id)
+            deferral_exhausted = bool(
+                l0_backpressure
+                and self._rollup_deferral_exhausted(
+                    scheduler_key,
+                    level,
+                    time.time(),
+                )
+            )
+            if l0_backpressure and not deferral_exhausted:
+                self._rollup_scheduler_deferred_since.setdefault(scheduler_key, time.time())
                 self._rollup_scheduler_due[(channel_id, level)] = time.time() + max(
                     15.0,
                     self.rollup_scheduler_spacing_sec,
@@ -3771,7 +3835,16 @@ class LuxriotManager:
                     self._rollup_scheduler_status["jobs_deferred_for_l0"] = int(
                         self._rollup_scheduler_status.get("jobs_deferred_for_l0") or 0
                     ) + 1
+                    self._rollup_scheduler_status["last_deferred_channel_id"] = int(channel_id)
+                    self._rollup_scheduler_status["last_deferred_level"] = level
+                    self._rollup_scheduler_status["last_deferred_at"] = time.time()
                 continue
+            self._rollup_scheduler_deferred_since.pop(scheduler_key, None)
+            if deferral_exhausted:
+                with self.cache_lock:
+                    self._rollup_scheduler_status["jobs_forced_after_deferral"] = int(
+                        self._rollup_scheduler_status.get("jobs_forced_after_deferral") or 0
+                    ) + 1
 
             started_at = time.time()
             with self.cache_lock:
@@ -3785,8 +3858,18 @@ class LuxriotManager:
                     }
                 )
             error: Optional[str] = None
+            generated_windows = 0
             try:
-                self._run_scheduled_rollup(channel_id, level, started_at)
+                result = self._run_scheduled_rollup(channel_id, level, started_at)
+                levels_raw = result.get("levels") if isinstance(result, Mapping) else None
+                rows_raw = levels_raw.get(level) if isinstance(levels_raw, Mapping) else None
+                rows = rows_raw if isinstance(rows_raw, Sequence) and not isinstance(rows_raw, (str, bytes, bytearray)) else []
+                generated_windows = sum(
+                    1
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("summary_kind") or "").strip().lower() == "llm"
+                )
             except Exception as exc:
                 error = _safe_error_text(exc, 240) or exc.__class__.__name__
                 LOGGER.warning(
@@ -3810,7 +3893,11 @@ class LuxriotManager:
                         "last_duration_sec": round(max(0.0, completed_at - started_at), 3),
                         "last_channel_id": int(channel_id),
                         "last_level": level,
+                        "last_generated_windows": int(generated_windows),
                         "last_error": error,
+                        "backfill_windows_generated": int(
+                            self._rollup_scheduler_status.get("backfill_windows_generated") or 0
+                        ) + int(generated_windows),
                         "jobs_completed": int(
                             self._rollup_scheduler_status.get("jobs_completed") or 0
                         ) + (0 if error else 1),
@@ -4028,6 +4115,9 @@ class LuxriotManager:
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
             "- Never compress alerts, deviations, coverage gaps, or operator-review incidents into routine.",
             "- Do not classify behavior as illegal/unlawful; describe observable security/safety facts.",
+            "- Never infer intent, motive, identity, skill, or blame, and never ask the operator to confirm intent.",
+            "- Sampled snapshots cannot prove complete scene coverage, absence outside the sampled frames, or the absence of blind spots.",
+            "- If source prose and structured alerts conflict, state the conflict briefly instead of silently choosing one claim.",
             "",
             "Task:",
             f"- Write one readable {normalized_level} behavioral summary for a municipal CCTV operator.",
@@ -4037,6 +4127,8 @@ class LuxriotManager:
             "- Deduplicate repeated scene descriptions, names, boilerplate, and unchanged background.",
             "- Explain each alert's observable meaning and outcome; do not merely repeat severity counters.",
             "- Report camera/feed interruptions and missing coverage separately from observed behavior.",
+            "- Distinguish 'no interruption recorded in metadata' from a claim that visual coverage was complete.",
+            "- Recommend operator follow-up only for a grounded unresolved safety/security issue, not routine presence changes or low-confidence cues.",
             "- If the period is routine, say so plainly and keep the report short.",
             "- Do not invent entities, times, or counts.",
             "",
@@ -7886,19 +7978,126 @@ class LuxriotManager:
         return operator_summary, normalized
 
     @staticmethod
-    def _rollup_operator_contract_valid(value: object) -> bool:
-        text = str(value or "").lower()
-        return all(
-            heading in text
-            for heading in (
-                "### period overview",
-                "### routine and behavior",
-                "### notable observations and exceptions",
-                "### alerts and meaning",
-                "### coverage and interruptions",
-                "### operator takeaway",
-            )
+    def _normalize_rollup_operator_headings(value: object) -> str:
+        """Normalize harmless small-model heading drift to the v2 contract."""
+
+        heading_specs = (
+            ("Period Overview", r"period\s+overview"),
+            ("Routine and Behavior", r"routine\s+(?:and|&)\s+behavio[u]?r"),
+            (
+                "Notable Observations and Exceptions",
+                r"notable\s+observations?\s+(?:and|&)\s+exceptions?",
+            ),
+            ("Alerts and Meaning", r"alerts?\s+(?:and|&)\s+meaning"),
+            (
+                "Coverage and Interruptions",
+                r"coverage\s+(?:and|&)\s+interruptions?",
+            ),
+            ("Operator Takeaway", r"operator\s+takeaway"),
         )
+        normalized_lines: List[str] = []
+        for line in str(value or "").splitlines():
+            replacement: Optional[str] = None
+            for canonical, body_pattern in heading_specs:
+                if re.match(
+                    rf"^\s*#{{2,3}}\s*(?:\d+\s*[.)-]\s*)?{body_pattern}\s*[:\-–—]?\s*$",
+                    line,
+                    flags=re.IGNORECASE,
+                ):
+                    replacement = f"### {canonical}"
+                    break
+            normalized_lines.append(replacement or line)
+        return "\n".join(normalized_lines).strip()
+
+    @classmethod
+    def _rollup_operator_contract_valid(cls, value: object) -> bool:
+        normalized = cls._normalize_rollup_operator_headings(value)
+        expected = [
+            "### Period Overview",
+            "### Routine and Behavior",
+            "### Notable Observations and Exceptions",
+            "### Alerts and Meaning",
+            "### Coverage and Interruptions",
+            "### Operator Takeaway",
+        ]
+        observed = [line.strip() for line in normalized.splitlines() if line.strip() in expected]
+        return observed == expected
+
+    def _increment_rollup_status_counter(self, name: str) -> None:
+        key = str(name or "").strip()
+        if not key:
+            return
+        with self.cache_lock:
+            self._rollup_scheduler_status[key] = int(
+                self._rollup_scheduler_status.get(key) or 0
+            ) + 1
+
+    @staticmethod
+    def _rollup_operator_semantic_guard_issues(value: object) -> List[str]:
+        """Catch a few high-risk claims that sampled CCTV summaries cannot support."""
+
+        text = " ".join(str(value or "").split()).casefold()
+        issues: List[str] = []
+        patterns = (
+            (
+                "intent_followup",
+                r"\b(?:confirm|determine|verify|establish)\s+(?:the\s+)?(?:person(?:'s)?\s+)?intent\b",
+            ),
+            (
+                "complete_coverage_claim",
+                r"\b(?:no\s+blind\s+spots?|no\s+missing\s+coverage|complete\s+(?:visual\s+)?coverage|coverage\s+(?:was|is)\s+complete)\b",
+            ),
+            (
+                "categorical_safety_absence",
+                r"\bno\s+(?:immediate\s+)?(?:safety|security)(?:\s+(?:or|and)\s+(?:safety|security))?\s+(?:concerns?|hazards?|risks?|issues?)\b",
+            ),
+        )
+        for issue, pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            if issue == "complete_coverage_claim":
+                prefix = text[max(0, match.start() - 56) : match.start()]
+                if re.search(
+                    r"\b(?:not|cannot|can't|do\s+not|does\s+not|never)\b[^.]{0,48}$",
+                    prefix,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+            issues.append(issue)
+        return issues
+
+    @classmethod
+    def _sanitize_rollup_operator_overclaims(cls, value: object) -> str:
+        """Replace a narrow set of unsafe sampled-evidence overclaims."""
+
+        output: List[str] = []
+        for raw_line in str(value or "").splitlines():
+            line = raw_line
+            issues = set(cls._rollup_operator_semantic_guard_issues(line))
+            prefix_match = re.match(r"^(\s*(?:[-*•]\s+|\d+[.)]\s+)?)", line)
+            prefix = prefix_match.group(1) if prefix_match else ""
+            if "complete_coverage_claim" in issues:
+                line = (
+                    prefix
+                    + "No camera/feed interruption was recorded in metadata; sampled frames are partial evidence."
+                )
+                issues.discard("complete_coverage_claim")
+            if "categorical_safety_absence" in issues:
+                line = (
+                    prefix
+                    + "No immediate safety/security issue was identified in the sampled observations; this does not establish absence outside them."
+                )
+                issues.discard("categorical_safety_absence")
+            if "intent_followup" in issues:
+                line = re.sub(
+                    r"\b(?:confirm|determine|verify|establish)\s+(?:the\s+)?(?:person(?:'s)?\s+)?intent(?:\s+or\s+context)?\b",
+                    "review the observable sequence and context",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            output.append(line)
+        return "\n".join(output).strip()
 
     @staticmethod
     def _is_legacy_fallback_rollup(value: object) -> bool:
@@ -8800,16 +8999,16 @@ class LuxriotManager:
         return "\n\n".join(
             [
                 "### Period Overview\n"
-                f"A semantic {level} behavioral summary has not been generated for this {duration} window. "
+                f"Semantic {level} aggregation is queued for this {duration} window. "
                 f"EVA retained {evidence} across {len(run_ids)} run(s).",
                 "### Routine and Behavior\n"
-                "Routine and behavioral development are not inferred from concatenated batch text. Drill down to observations for the source account.",
+                "The background semantic pass will describe routine and behavioral development. Source observations remain available while it runs.",
                 "### Notable Observations and Exceptions\n"
-                "No semantic exception narrative is available until rollup generation completes.",
+                "The semantic exception narrative is pending; drill down for the current source observations.",
                 "### Alerts and Meaning\n" + alert_section,
                 "### Coverage and Interruptions\n" + coverage_text,
                 "### Operator Takeaway\n"
-                "Semantic summary unavailable. Review the source observations; do not treat this degraded card as a behavioral conclusion.",
+                "Background aggregation is pending. Source observations can be reviewed now; the period-level narrative will replace this card automatically.",
             ]
         )
 
@@ -8952,6 +9151,9 @@ class LuxriotManager:
         generation_status = str(entry.get("generation_status") or "").strip()
         if not generation_status:
             generation_status = "cached" if summary_kind in {"llm", "llm_cached"} else "stale"
+        if self._rollup_operator_semantic_guard_issues(summary):
+            summary_kind = "degraded"
+            generation_status = "semantic_guard_rejected"
         memory_raw = entry.get("memory_update")
         memory_update = dict(memory_raw) if isinstance(memory_raw, Mapping) else embedded_memory
         alert_meta = self._alert_meta_from_counts(entry.get("alert_counts"))
@@ -9493,13 +9695,99 @@ class LuxriotManager:
             )
             with self.cache_lock:
                 model_hint = self._get_rollup_model_hint_locked(channel_id)
-            raw_summary = str(self.lm_callback(messages, model_hint)).strip()
+            if bool(getattr(self.lm_callback, "eva_workload_class", False)):
+                raw_summary = str(
+                    self.lm_callback(
+                        messages,
+                        model_hint,
+                        workload_class="rollup",
+                    )
+                ).strip()
+            else:
+                raw_summary = str(self.lm_callback(messages, model_hint)).strip()
             operator_summary, memory_update = self._split_rollup_operator_output(raw_summary)
-            if not operator_summary:
-                return fallback_summary, {}, "empty_operator_summary"
-            if not self._rollup_operator_contract_valid(operator_summary):
+            operator_summary = self._normalize_rollup_operator_headings(operator_summary)
+            contract_valid = bool(
+                operator_summary
+                and self._rollup_operator_contract_valid(operator_summary)
+            )
+            semantic_issues = self._rollup_operator_semantic_guard_issues(operator_summary)
+            if contract_valid and not semantic_issues:
+                return operator_summary, memory_update, None
+
+            if not contract_valid:
+                self._increment_rollup_status_counter("invalid_operator_contract")
+            if semantic_issues:
+                self._increment_rollup_status_counter("semantic_guard_retries")
+            self._increment_rollup_status_counter("corrective_retries")
+            corrective_messages = list(messages)
+            if raw_summary:
+                corrective_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": self._truncate_text(raw_summary, 8000),
+                            }
+                        ],
+                    }
+                )
+            corrective_messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Correct the complete operator report. Return it again with "
+                                "exactly these six headings, in this order: ### Period Overview; "
+                                "### Routine and Behavior; ### Notable Observations and Exceptions; "
+                                "### Alerts and Meaning; ### Coverage and Interruptions; ### Operator Takeaway. "
+                                "Keep grounded factual content, but resolve internal presence/absence contradictions. "
+                                "Never claim complete coverage, no blind spots, or categorical absence of safety/security concerns from sampled frames. "
+                                "Never ask anyone to confirm intent; describe only the observable sequence or uncertainty. "
+                                "Append MEMORY_UPDATE_JSON only after all six sections."
+                            ),
+                        }
+                    ],
+                }
+            )
+            if bool(getattr(self.lm_callback, "eva_workload_class", False)):
+                retry_raw = str(
+                    self.lm_callback(
+                        corrective_messages,
+                        model_hint,
+                        workload_class="rollup",
+                    )
+                ).strip()
+            else:
+                retry_raw = str(self.lm_callback(corrective_messages, model_hint)).strip()
+            retry_summary, retry_memory = self._split_rollup_operator_output(retry_raw)
+            retry_summary = self._normalize_rollup_operator_headings(retry_summary)
+            retry_contract_valid = bool(
+                retry_summary
+                and self._rollup_operator_contract_valid(retry_summary)
+            )
+            retry_semantic_issues = self._rollup_operator_semantic_guard_issues(retry_summary)
+            if retry_contract_valid and not retry_semantic_issues:
+                self._increment_rollup_status_counter("corrective_retry_successes")
+                if semantic_issues:
+                    self._increment_rollup_status_counter("semantic_guard_retry_successes")
+                return retry_summary, retry_memory, None
+            if retry_contract_valid and retry_semantic_issues:
+                sanitized_summary = self._sanitize_rollup_operator_overclaims(
+                    retry_summary
+                )
+                if not self._rollup_operator_semantic_guard_issues(sanitized_summary):
+                    self._increment_rollup_status_counter("corrective_retry_successes")
+                    self._increment_rollup_status_counter("semantic_guard_sanitized")
+                    return sanitized_summary, retry_memory, None
+                self._increment_rollup_status_counter("semantic_guard_failures")
+                return fallback_summary, {}, "unsafe_operator_claims"
+            if raw_summary or retry_raw:
                 return fallback_summary, {}, "invalid_operator_contract"
-            return operator_summary, memory_update, None
+            return fallback_summary, {}, "empty_operator_summary"
         except Exception as exc:
             error_code = type(exc).__name__
             LOGGER.warning(
@@ -9541,10 +9829,14 @@ class LuxriotManager:
         level: str,
         source_level: str,
         node_children_pairs: Sequence[Tuple[Dict[str, Any], Sequence[Mapping[str, Any]]]],
+        max_new: Optional[int] = None,
     ) -> None:
         if level not in self.rollup_llm_levels or not node_children_pairs:
             return
-        remaining_budget = self.rollup_llm_max_new_per_call
+        remaining_budget = max(
+            1,
+            int(max_new if max_new is not None else self.rollup_llm_max_new_per_call),
+        )
         pairs = sorted(
             node_children_pairs,
             key=lambda pair: float(self._coerce_float(pair[0].get("window_start")) or 0.0),
@@ -9584,11 +9876,19 @@ class LuxriotManager:
                 cached_summary = str(cached.get("summary") or "").strip()
                 cached_signature = str(cached.get("source_signature") or "").strip()
                 cached_format_version = _parse_optional_int(cached.get("format_version")) or 1
+                cached_semantic_issues = self._rollup_operator_semantic_guard_issues(
+                    cached_summary
+                )
+                if cached_semantic_issues:
+                    self._increment_rollup_status_counter(
+                        "cached_semantic_guard_rejections"
+                    )
                 if (
                     cached_summary
                     and cached_signature
                     and cached_signature == source_signature
                     and cached_format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+                    and not cached_semantic_issues
                 ):
                     node["summary"] = cached_summary
                     node["operator_summary"] = cached_summary
@@ -9774,6 +10074,7 @@ class LuxriotManager:
         source_nodes: Sequence[Mapping[str, Any]],
         *,
         synthesize: bool = True,
+        max_new: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not source_nodes:
             return []
@@ -9849,8 +10150,8 @@ class LuxriotManager:
                     "source_signature": source_signature,
                     "summary": summary,
                     "operator_summary": summary,
-                    "summary_kind": "degraded",
-                    "generation_status": "degraded",
+                    "summary_kind": "queued",
+                    "generation_status": "queued",
                     "format_version": ROLLUP_OPERATOR_FORMAT_VERSION,
                     "created_at": end_ts,
                     "signal_digest": signal_digest,
@@ -9868,6 +10169,7 @@ class LuxriotManager:
                 level=level,
                 source_level=source_level,
                 node_children_pairs=llm_pairs,
+                max_new=max_new,
             )
         return out
 
@@ -11582,12 +11884,25 @@ class LuxriotManager:
         level_limit: Optional[int] = 60,
         synthesize: bool = True,
         target_level: Optional[str] = None,
+        synthesize_levels: Optional[Set[str]] = None,
+        max_new_per_level: Optional[int] = None,
     ) -> Dict[str, Any]:
         aggregation_started = time.monotonic()
         raw_target_level = str(target_level or "").strip().upper()
         if raw_target_level and raw_target_level not in {"L0", "L1", "L2", "L3"}:
             raise ValueError("target_level must be one of L0, L1, L2, or L3")
         requested_target = raw_target_level or None
+        requested_synthesis_levels = {
+            self._normalize_rollup_level(level)
+            for level in (synthesize_levels or set())
+            if self._normalize_rollup_level(level) in {"L1", "L2", "L3"}
+        }
+
+        def should_synthesize(level: str) -> bool:
+            if not synthesize:
+                return False
+            return not requested_synthesis_levels or level in requested_synthesis_levels
+
         target_rank = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(
             requested_target or "L3",
             3,
@@ -11603,6 +11918,28 @@ class LuxriotManager:
         logs = logs_raw if isinstance(logs_raw, list) else []
 
         l0_nodes = self._l0_nodes_from_logs(channel_id, logs)
+        selected_run_id = str(status.get("run_filter_id") or "").strip() or None
+        stored_rollups = self._list_cached_rollups(
+            channel_id=channel_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        if selected_run_id:
+            stored_rollups = [
+                row
+                for row in stored_rollups
+                if self._rollup_matches_run_selector(row, selected_run_id)
+            ]
+        stored_by_level: Dict[str, List[Dict[str, Any]]] = {
+            "L1": [],
+            "L2": [],
+            "L3": [],
+        }
+        for row in stored_rollups:
+            stored_level = self._normalize_rollup_level(row.get("level"))
+            if stored_level in stored_by_level:
+                stored_by_level[stored_level].append(dict(row))
+
         l1_nodes: List[Dict[str, Any]] = []
         l2_nodes: List[Dict[str, Any]] = []
         l3_nodes: List[Dict[str, Any]] = []
@@ -11613,8 +11950,10 @@ class LuxriotManager:
                 source_level="L0",
                 window_sec=self.rollup_windows["L1"],
                 source_nodes=l0_nodes,
-                synthesize=synthesize,
+                synthesize=should_synthesize("L1"),
+                max_new=max_new_per_level,
             )
+            l1_nodes = self._merge_rollup_rows(l1_nodes, stored_by_level["L1"])
         if target_rank >= 2:
             l2_nodes = self._build_rollup_level(
                 channel_id=channel_id,
@@ -11622,8 +11961,10 @@ class LuxriotManager:
                 source_level="L1",
                 window_sec=self.rollup_windows["L2"],
                 source_nodes=l1_nodes,
-                synthesize=synthesize,
+                synthesize=should_synthesize("L2"),
+                max_new=max_new_per_level,
             )
+            l2_nodes = self._merge_rollup_rows(l2_nodes, stored_by_level["L2"])
         if target_rank >= 3:
             l3_nodes = self._build_rollup_level(
                 channel_id=channel_id,
@@ -11631,24 +11972,9 @@ class LuxriotManager:
                 source_level="L2",
                 window_sec=self.rollup_windows["L3"],
                 source_nodes=l2_nodes,
-                synthesize=synthesize,
+                synthesize=should_synthesize("L3"),
+                max_new=max_new_per_level,
             )
-
-        selected_run_id = str(status.get("run_filter_id") or "").strip() or None
-        stored_rollups = self._list_cached_rollups(channel_id=channel_id, start_ts=start_ts, end_ts=end_ts)
-        if selected_run_id:
-            stored_rollups = [row for row in stored_rollups if self._rollup_matches_run_selector(row, selected_run_id)]
-        stored_by_level: Dict[str, List[Dict[str, Any]]] = {"L1": [], "L2": [], "L3": []}
-        for row in stored_rollups:
-            level = self._normalize_rollup_level(row.get("level"))
-            if level in stored_by_level:
-                stored_by_level[level].append(dict(row))
-
-        if target_rank >= 1:
-            l1_nodes = self._merge_rollup_rows(l1_nodes, stored_by_level["L1"])
-        if target_rank >= 2:
-            l2_nodes = self._merge_rollup_rows(l2_nodes, stored_by_level["L2"])
-        if target_rank >= 3:
             l3_nodes = self._merge_rollup_rows(l3_nodes, stored_by_level["L3"])
 
         if isinstance(level_limit, int) and level_limit > 0:

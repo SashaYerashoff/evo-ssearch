@@ -2304,15 +2304,21 @@
     }
 
     .luxriot-rollup-status.pending {
-        border-color: rgba(214, 163, 72, 0.72);
-        color: #e5c27d;
-        background: rgba(111, 74, 15, 0.2);
+        border-color: rgba(77, 151, 196, 0.68);
+        color: #9ccce8;
+        background: rgba(27, 78, 111, 0.2);
+    }
+
+    .luxriot-rollup-status.queued {
+        border-color: rgba(91, 128, 154, 0.68);
+        color: #b7cad8;
+        background: rgba(49, 74, 92, 0.2);
     }
 
     .luxriot-rollup-status.degraded {
-        border-color: rgba(210, 92, 92, 0.76);
-        color: #ffaaa2;
-        background: rgba(118, 35, 35, 0.2);
+        border-color: rgba(121, 132, 143, 0.7);
+        color: #c0c8cf;
+        background: rgba(73, 81, 88, 0.2);
     }
 
     .luxriot-summary-channel-pill {

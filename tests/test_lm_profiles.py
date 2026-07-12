@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import oldapp
@@ -95,15 +96,22 @@ class LmProfileRuntimeTests(unittest.TestCase):
             captured["timeout"] = kwargs.get("timeout")
             return _Response({"choices": [{"message": {"content": "ok"}}]})
 
+        class AdmissionCapture:
+            def admission(self, _resource, *, workload, **_kwargs):
+                captured["workload"] = workload
+                return nullcontext()
+
         with (
             patch.object(oldapp.config, "LM_PROFILES", profiles),
             patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
             patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
         ):
             result = oldapp._call_lm_chat(
                 [{"role": "user", "content": "describe"}],
                 model_override="vlm-a",
                 profile_kind="vlm",
+                workload_class="rollup",
             )
 
         self.assertEqual(result, "ok")
@@ -111,6 +119,7 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["json"]["model"], "qwen3.5-vl-4b")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer vlm-secret")
         self.assertEqual(captured["timeout"], 321)
+        self.assertEqual(captured["workload"], "rollup")
 
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {

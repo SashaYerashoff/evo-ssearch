@@ -3004,6 +3004,7 @@ def _call_lm_chat(
     profile_id: Optional[str] = None,
     profile_kind: str = "vlm",
     preflight: Optional[Callable[[], None]] = None,
+    workload_class: Optional[str] = None,
 ) -> str:
     profile = _resolve_lm_profile(
         profile_id=profile_id,
@@ -3029,7 +3030,9 @@ def _call_lm_chat(
     response: Optional[requests.Response] = None
     resource = normalize_lm_resource(base_url, str(profile.get("model") or ""))
     capacity = configured_lm_capacity(str(profile.get("id") or ""), default=1)
-    workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
+    default_workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
+    requested_workload = str(workload_class or "").strip().lower()
+    workload = requested_workload if requested_workload in {"agent", "interactive", "alert", "describe", "video", "vlm", "heartbeat", "rollup", "background"} else default_workload
 
     def _response_error_detail(resp: Any) -> str:
         try:
@@ -3107,6 +3110,7 @@ def _call_video_understanding(
     *,
     profile_id: Optional[str] = None,
     preflight: Optional[Callable[[], None]] = None,
+    workload_class: Optional[str] = None,
 ) -> str:
     return _call_lm_chat(
         messages,
@@ -3114,10 +3118,12 @@ def _call_video_understanding(
         profile_id=profile_id,
         profile_kind="vlm",
         preflight=preflight,
+        workload_class=workload_class,
     )
 
 
 _call_video_understanding.eva_generation_preflight = True  # type: ignore[attr-defined]
+_call_video_understanding.eva_workload_class = True  # type: ignore[attr-defined]
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:

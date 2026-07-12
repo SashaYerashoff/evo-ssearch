@@ -4568,24 +4568,34 @@
             triggerBtn.textContent = 'Generating…';
         }
         setLuxriotStatus(`Generating ${level} semantic summary for ${getLuxriotChannelLabel(channelId)}…`);
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 60000);
         try {
-            const response = await fetch(`/luxriot/rollups?${params.toString()}`, { cache: 'no-store' });
+            const response = await fetch(`/luxriot/rollups?${params.toString()}`, {
+                cache: 'no-store',
+                signal: controller.signal,
+            });
             const data = await parseApiJson(response, 'Semantic rollup generation failed');
             const rows = Array.isArray(data?.levels?.[level]) ? data.levels[level] : [];
             const generated = rows.find((candidate) => String(candidate?.rollup_id || '') === String(row?.rollup_id || '')) || rows[0];
             const kind = String(generated?.summary_kind || '').trim().toLowerCase();
             if (!['llm', 'llm_cached'].includes(kind)) {
                 const reason = String(generated?.generation_error || generated?.generation_status || 'LM unavailable');
-                throw new Error(`Semantic summary unavailable: ${reason}`);
+                throw new Error(`Semantic pass did not complete: ${reason}`);
             }
             setLuxriotStatus(`${level} semantic summary generated`);
             await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true, false);
         } catch (error) {
-            setLuxriotStatus(error.message || 'Semantic rollup generation failed', true);
+            if (error?.name === 'AbortError') {
+                setLuxriotStatus('Semantic pass remains queued behind live descriptions and will appear automatically.');
+            } else {
+                setLuxriotStatus(error.message || 'Semantic rollup generation failed', true);
+            }
         } finally {
+            window.clearTimeout(timeoutId);
             if (triggerBtn) {
                 triggerBtn.disabled = false;
-                triggerBtn.textContent = originalLabel || 'Generate semantic';
+                triggerBtn.textContent = originalLabel || 'Retry semantic';
             }
         }
     }
@@ -4669,7 +4679,7 @@
             const sourceLevel = String(row?.source_level || '').trim();
             const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
             const summary = String(row?.summary || '').trim();
-            const summaryKind = String(row?.summary_kind || 'degraded').trim().toLowerCase();
+            const summaryKind = String(row?.summary_kind || 'queued').trim().toLowerCase();
             const generationStatus = String(row?.generation_status || summaryKind).trim().toLowerCase();
             const summaryParts = splitSummaryAndJson(summary);
             const summaryMain = summaryParts.main || summary;
@@ -4680,17 +4690,22 @@
             const alertBadges = renderSummaryAlertBadges(row, rowLevel);
             const semanticReady = summaryKind === 'llm' || summaryKind === 'llm_cached';
             const pending = summaryKind === 'pending_context' || generationStatus === 'pending';
+            const queued = summaryKind === 'queued' || generationStatus === 'queued' || generationStatus === 'deferred';
             const statusLabel = semanticReady
                 ? (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic')
                 : pending
                     ? 'aggregation pending'
-                    : 'semantic unavailable';
-            const statusClass = semanticReady ? 'ready' : pending ? 'pending' : 'degraded';
+                    : queued
+                        ? 'semantic queued'
+                        : 'semantic retry available';
+            const statusClass = semanticReady ? 'ready' : pending ? 'pending' : queued ? 'queued' : 'degraded';
             const statusTitle = statusClass === 'degraded'
-                ? 'This is a coverage/status fallback, not a period-level behavioral conclusion.'
+                ? 'The semantic pass did not complete; source observations remain available and the window can be retried.'
+                : statusClass === 'queued'
+                    ? 'Background semantic aggregation is queued behind live descriptions.'
                 : statusLabel;
-            const generateButton = statusClass === 'degraded'
-                ? `<button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-generate="${idx}">Generate semantic</button>`
+            const generateButton = !semanticReady && !pending
+                ? `<button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-generate="${idx}">${queued ? 'Generate now' : 'Retry semantic'}</button>`
                 : '';
             return `
                 <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
@@ -4824,23 +4839,31 @@
             const pendingCount = luxriotSummaryRollupRows
                 .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
                 .length;
-            const degradedCount = luxriotSummaryRollupRows
+            const queuedCount = luxriotSummaryRollupRows
                 .filter((row) => {
                     const kind = String(row?.summary_kind || '').trim().toLowerCase();
-                    return kind && !['llm', 'llm_cached', 'pending_context'].includes(kind);
+                    const status = String(row?.generation_status || '').trim().toLowerCase();
+                    return kind === 'queued' || status === 'queued' || status === 'deferred';
+                })
+                .length;
+            const retryCount = luxriotSummaryRollupRows
+                .filter((row) => {
+                    const kind = String(row?.summary_kind || '').trim().toLowerCase();
+                    return kind && !['llm', 'llm_cached', 'pending_context', 'queued'].includes(kind);
                 })
                 .length;
             const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
             const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
             const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
-            const degradedLabel = degradedCount > 0 ? ` · semantic unavailable ${degradedCount}` : '';
+            const queuedLabel = queuedCount > 0 ? ` · semantic queued ${queuedCount}` : '';
+            const retryLabel = retryCount > 0 ? ` · retry available ${retryCount}` : '';
             const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
             const aggregationElapsed = Number(data.aggregation?.elapsed_sec);
             const elapsedLabel = Number.isFinite(aggregationElapsed)
                 ? ` · aggregated ${aggregationElapsed.toFixed(1)}s`
                 : '';
             const channelLabel = getLuxriotChannelLabel(channelId);
-            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${degradedLabel}${waitLabel}${elapsedLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${queuedLabel}${retryLabel}${waitLabel}${elapsedLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
             setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
             return true;
         } catch (err) {

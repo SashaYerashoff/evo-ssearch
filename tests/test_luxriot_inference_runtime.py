@@ -506,9 +506,10 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 "burst",
             )
 
-    def test_scheduled_rollup_targets_only_the_latest_closed_window(self):
+    def test_scheduled_rollup_scans_retained_history_with_bounded_target_backfill(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
+            manager.rollup_scheduler_backfill_windows = 3
             calls = []
             with patch.object(
                 manager,
@@ -519,9 +520,52 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
 
             self.assertEqual(calls[0]["channel_id"], 7)
             self.assertEqual(calls[0]["target_level"], "L1")
-            self.assertEqual(calls[0]["start_ts"], 2_700.0)
+            self.assertIsNone(calls[0]["start_ts"])
             self.assertEqual(calls[0]["end_ts"], 3_599.999)
             self.assertIsNone(calls[0]["level_limit"])
+            self.assertEqual(calls[0]["synthesize_levels"], {"L1"})
+            self.assertEqual(calls[0]["max_new_per_level"], 3)
+
+    def test_l0_backpressure_ignores_normal_inflight_and_requires_saturated_queue(self):
+        class StatusSession:
+            def __init__(self, status):
+                self._status = status
+
+            def status(self):
+                return dict(self._status)
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.sessions[7] = StatusSession(
+                {
+                    "summary_inflight": True,
+                    "summary_queue_depth": 1,
+                    "summary_queue_max_batches": 2,
+                }
+            )
+            self.assertFalse(manager._l0_backpressure_active(7))
+
+            manager.sessions[7] = StatusSession(
+                {
+                    "summary_inflight": True,
+                    "summary_queue_depth": 2,
+                    "summary_queue_max_batches": 2,
+                }
+            )
+            self.assertTrue(manager._l0_backpressure_active(7))
+
+    def test_rollup_backpressure_deferral_has_a_hard_window_ceiling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.rollup_scheduler_max_deferral_windows = 2.0
+            manager._rollup_scheduler_deferred_since[(7, "L1")] = 1_000.0
+
+            self.assertFalse(manager._rollup_deferral_exhausted((7, "L1"), "L1", 2_799.9))
+            self.assertTrue(manager._rollup_deferral_exhausted((7, "L1"), "L1", 2_800.0))
+
+            manager.rollup_scheduler_max_deferral_windows = 0.0
+            self.assertTrue(manager._rollup_deferral_exhausted((8, "L1"), "L1", 1_000.0))
 
     def test_rollup_scheduler_staggers_channels_deterministically(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4284,7 +4328,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             settings = manager.get_prompt_settings(channel_id=7)
             self.assertIn("prompt_layers", settings)
-            self.assertIn("Explain each alert's observable meaning", settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"])
+            backend_instructions = settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"]
+            self.assertIn("Explain each alert's observable meaning", backend_instructions)
+            self.assertIn("never ask the operator to confirm intent", backend_instructions)
+            self.assertIn("Sampled snapshots cannot prove complete scene coverage", backend_instructions)
+            self.assertIn("no interruption recorded in metadata", backend_instructions)
 
             rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
             self.assertTrue(captured_user_texts)
@@ -4329,8 +4377,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(calls, [])
             row = rollups["levels"]["L1"][0]
-            self.assertEqual(row["summary_kind"], "degraded")
-            self.assertIn("Semantic summary unavailable", row["summary"])
+            self.assertEqual(row["summary_kind"], "queued")
+            self.assertIn("Semantic L1 aggregation is queued", row["summary"])
             self.assertNotIn("Highlights:", row["summary"])
 
     def test_rollup_cache_signature_changes_when_child_metadata_changes(self):
@@ -4373,6 +4421,50 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             second = manager.summary_rollups(7, run_selector="all", level_limit=10)
             self.assertEqual(len(calls), 2)
             self.assertIn("cache pass 2", second["levels"]["L2"][0]["summary"])
+
+    def test_higher_rollup_uses_cached_semantic_children_before_synthesis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            l2_inputs = []
+
+            def lm_callback(messages, _model):
+                user_text = messages[1]["content"][0]["text"]
+                if "Target level: L2" in user_text:
+                    l2_inputs.append(user_text)
+                    return operator_rollup_response("Hour narrative built from semantic L1 context.")
+                return operator_rollup_response(
+                    "Distinctive semantic L1 narrative: a person left the desk and later returned."
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1", "L2"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Person leaves and returns.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            manager.summary_rollups(
+                7,
+                run_selector="all",
+                target_level="L1",
+                synthesize_levels={"L1"},
+            )
+            result = manager.summary_rollups(
+                7,
+                run_selector="all",
+                target_level="L2",
+                synthesize_levels={"L2"},
+            )
+
+            self.assertTrue(l2_inputs)
+            self.assertIn("Distinctive semantic L1 narrative", l2_inputs[0])
+            self.assertNotIn("Semantic L1 aggregation is queued", l2_inputs[0])
+            self.assertEqual(result["levels"]["L2"][0]["summary_kind"], "llm")
 
     def test_rollup_operator_summary_and_memory_are_stored_separately(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4432,8 +4524,204 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(row["generation_status"], "failed")
             self.assertEqual(row["generation_error"], "invalid_operator_contract")
             self.assertNotIn("raw internal list", row["summary"])
+            self.assertEqual(manager._rollup_scheduler_status["invalid_operator_contract"], 1)
+            self.assertEqual(manager._rollup_scheduler_status["corrective_retries"], 1)
 
-    def test_degraded_rollup_is_honest_and_does_not_leak_homeostasis(self):
+    def test_rollup_contract_accepts_harmless_heading_drift_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(1)
+                return (
+                    "## 1. Period Overview:\nRoutine window.\n\n"
+                    "## Routine & Behaviour\nDesk work continued.\n\n"
+                    "### Notable Observation & Exception\nA brief absence.\n\n"
+                    "## Alerts & Meaning\nNo alerts.\n\n"
+                    "### Coverage & Interruption\nCoverage complete.\n\n"
+                    "## Operator Takeaway\nNo action.\n\n"
+                    "MEMORY_UPDATE_JSON:\n{}"
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Desk work with a brief absence.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertIn("### Routine and Behavior", row["summary"])
+            self.assertIn("### Coverage and Interruptions", row["summary"])
+
+    def test_rollup_contract_gets_one_corrective_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(1)
+                if len(calls) == 1:
+                    return "Period report without the required sections."
+                return operator_rollup_response("Routine window after format correction.")
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Routine window.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertEqual(manager._rollup_scheduler_status["corrective_retries"], 1)
+            self.assertEqual(manager._rollup_scheduler_status["corrective_retry_successes"], 1)
+
+    def test_rollup_semantic_guard_retries_unsupported_coverage_claims(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(1)
+                if len(calls) == 1:
+                    return operator_rollup_response(
+                        "Routine sampled window.",
+                        coverage="No blind spots or missing coverage were found.",
+                        takeaway="No safety or security concerns require operator review.",
+                    )
+                return operator_rollup_response(
+                    "Routine sampled window.",
+                    coverage="No camera interruption was recorded in metadata; sampled frames are partial evidence.",
+                    takeaway="No immediate issue was identified in the sampled observations.",
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Routine sampled window.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertNotIn("No blind spots", row["summary"])
+            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retries"], 1)
+            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retry_successes"], 1)
+
+    def test_cached_rollup_with_unsupported_claim_is_rejected_for_regeneration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            unsafe_summary = operator_rollup_response(
+                "Routine sampled window.",
+                coverage="No blind spots or missing coverage were found.",
+            )
+
+            manager._put_cached_rollup_summary(
+                "l1-ch7-w900-1781700000",
+                unsafe_summary,
+                channel_id=7,
+                level="L1",
+                source_level="L0",
+                window_start=1_781_700_000.0,
+                window_end=1_781_700_900.0,
+                window_sec=900,
+                source_signature="source-v1",
+                summary_kind="llm",
+                generation_status="ready",
+                format_version=2,
+            )
+
+            cached = manager._get_cached_rollup_record("l1-ch7-w900-1781700000")
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["summary_kind"], "degraded")
+            self.assertEqual(cached["generation_status"], "semantic_guard_rejected")
+
+    def test_rollup_semantic_guard_sanitizes_persistent_overclaim_after_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(1)
+                return operator_rollup_response(
+                    "Routine sampled window.",
+                    coverage="- No blind spots or missing coverage were found.",
+                    takeaway="No safety or security concerns require operator review to confirm intent.",
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Routine sampled window.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertNotIn("No blind spots", row["summary"])
+            self.assertNotIn("confirm intent", row["summary"])
+            self.assertIn("sampled frames are partial evidence", row["summary"])
+            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_sanitized"], 1)
+
+    def test_rollup_uses_background_admission_workload_when_callback_supports_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workloads = []
+
+            def lm_callback(_messages, _model, *, workload_class=None):
+                workloads.append(workload_class)
+                return operator_rollup_response("Routine window.")
+
+            lm_callback.eva_workload_class = True
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Routine window.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertEqual(workloads, ["rollup"])
+
+    def test_queued_rollup_is_honest_and_does_not_leak_homeostasis(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -4465,9 +4753,9 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             row = rollups["levels"]["L1"][0]
             summary = row["summary"]
 
-            self.assertEqual(row["summary_kind"], "degraded")
+            self.assertEqual(row["summary_kind"], "queued")
             self.assertIn("source contains high=1", summary)
-            self.assertIn("Semantic summary unavailable", summary)
+            self.assertIn("Semantic L1 aggregation is queued", summary)
             self.assertNotIn("vehicle drifting", summary)
             self.assertNotIn("Signal digest", summary)
             self.assertNotIn("alert tuning", summary.lower())

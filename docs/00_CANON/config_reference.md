@@ -112,7 +112,9 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC` (`21600`) | L3 aggregation window and proactive cadence (6 h) |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED` (`true`) | Build closed L1–L3 windows in the background instead of waiting for the first operator view |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC` (`30`) | Startup grace before staggered rollup work begins |
-| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum spacing between channel/level rollup jobs; deterministic channel phases spread fleet load |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`15`) | Minimum spacing between channel/level rollup jobs; deterministic channel phases spread fleet load without crowding live descriptions |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS` (`2`) | Maximum newest missing windows synthesized by one scheduled level job while cached windows are skipped |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS` (`2`) | Maximum time, in target-level windows, that a saturated L0 queue may defer rollups before one job is admitted anyway; `0` disables deferral |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |

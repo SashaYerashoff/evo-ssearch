@@ -655,15 +655,20 @@ def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():
     for token in (
         "semantic · cached",
         "aggregation pending",
-        "semantic unavailable",
-        "not a period-level behavioral conclusion",
+        "semantic queued",
+        "semantic retry available",
+        "Background semantic aggregation is queued behind live descriptions.",
         "generation_status",
         "summary_kind",
         "function generateLuxriotSemanticRollup",
-        "Generate semantic",
+        "Generate now",
+        "Retry semantic",
+        "Semantic pass remains queued behind live descriptions and will appear automatically.",
+        "window.setTimeout(() => controller.abort(), 60000)",
         "synthesize: '1'",
     ):
         assert token in JS
     assert ".luxriot-rollup-status.ready" in CSS
     assert ".luxriot-rollup-status.pending" in CSS
+    assert ".luxriot-rollup-status.queued" in CSS
     assert ".luxriot-rollup-status.degraded" in CSS

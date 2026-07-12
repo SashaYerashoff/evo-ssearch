@@ -29,8 +29,10 @@ Scaffold for release notes; final prose to be assembled from commits
   duck-typed live media open, attention-stream keepalive, strict archive
   source filters, explicit-intent agent research continuation; L1–L3 operator
   narratives are separated from machine homeostasis, legacy concatenation is
-  rejected, and unavailable semantic aggregation is reported honestly with an
-  explicit per-window retry.
+  rejected, queued semantic aggregation is reported without alarm styling, and
+  explicit per-window retry remains available. The background scheduler now
+  distinguishes ordinary inference from a saturated L0 backlog, has a bounded
+  deferral ceiling, and backfills newest missing closed windows after downtime.
 - **Install:** offline dry-run-first installer orchestrator; version gate
   reads the bundled VERSION file; adopt upgrade rehearsed against a field
   tree copy (code-only, schema stays at head, no wheelhouse needed); guided
