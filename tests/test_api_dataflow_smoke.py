@@ -451,6 +451,54 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["until_ms"], 2000)
         self.assertEqual(response.get_json()["filters"]["source"], "probe")
 
+    def test_detections_list_rejects_unknown_source_filter(self) -> None:
+        class Store:
+            def list_detections(self, **_kwargs):
+                raise AssertionError("invalid source must not reach the archive store")
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get("/detections/list?source=everything")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "source must be one of: probe, vlm_summary, vlm_alert"},
+        )
+
+    def test_detections_summary_rejects_unknown_source_filter(self) -> None:
+        class Store:
+            def summarize_by_probe(self, **_kwargs):
+                raise AssertionError("invalid source must not reach the archive store")
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get("/detections/summary?source=everything")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "source must be one of: probe, vlm_summary, vlm_alert"},
+        )
+
+    def test_detection_routes_keep_empty_source_as_no_filter(self) -> None:
+        captured_sources = []
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured_sources.append(kwargs.get("source"))
+                return [], 0
+
+            def summarize_by_probe(self, **kwargs):
+                captured_sources.append(kwargs.get("source"))
+                return []
+
+        with patch("oldapp.detections_store", Store()):
+            list_response = self.client.get("/detections/list?source=%20")
+            summary_response = self.client.get("/detections/summary?source=")
+
+        self.assertEqual(list_response.status_code, 200, list_response.get_json())
+        self.assertEqual(summary_response.status_code, 200, summary_response.get_json())
+        self.assertEqual(captured_sources, [None, None])
+
     def test_detection_text_search_passes_archive_source_filter(self) -> None:
         captured: Dict[str, Any] = {}
 

@@ -11743,7 +11743,10 @@ def detections_search_image():
 def detections_list():
     probe_id_raw = (request.args.get('probe_id') or '').strip()
     probe_id = probe_id_raw or None
-    source = _normalize_archive_source_filter(request.args.get('source'))
+    source_raw = request.args.get('source')
+    source = _normalize_archive_source_filter(source_raw)
+    if source_raw is not None and str(source_raw).strip() and source is None:
+        return jsonify({'error': 'source must be one of: probe, vlm_summary, vlm_alert'}), 400
 
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
@@ -11825,7 +11828,10 @@ def detections_list():
 
 @app.route('/detections/summary', methods=['GET'])
 def detections_summary():
-    source = _normalize_archive_source_filter(request.args.get('source'))
+    source_raw = request.args.get('source')
+    source = _normalize_archive_source_filter(source_raw)
+    if source_raw is not None and str(source_raw).strip() and source is None:
+        return jsonify({'error': 'source must be one of: probe, vlm_summary, vlm_alert'}), 400
     channel_id_raw = (request.args.get('channel_id') or '').strip()
     channel_id: Optional[int] = None
     if channel_id_raw:
