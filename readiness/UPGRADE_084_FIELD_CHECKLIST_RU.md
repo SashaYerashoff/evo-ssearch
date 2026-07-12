@@ -49,35 +49,46 @@ systemd, рестарт), power-loss recovery. `--apply` на дев-машин�
 6. Версионный гейт инсталлера теперь читает `VERSION` из bundle
    (β 0.8.4) — отдельно ничего править не нужно.
 
-## Маршрут инженера
+## Маршрут инженера (основной — скрипт-проводник)
+
+0.8.4 — code-only релиз: при схеме на голове `20260614_0006` база данных не
+изменяется вообще. Поэтому полевой маршрут идёт через
+`scripts/field_upgrade_084.sh`, который: проверяет, что запущен из bundle;
+делает снимок состояния; **read-only** проверяет версию схемы и жёстко
+останавливается, если она не на голове (миграции в поле выполняет только
+разработчик — привилегированный DSN скрипту в принципе не известен);
+прогоняет dry-run; требует напечатать `UPGRADE`; применяет с `--no-migrate`;
+проверяет `/health`/`/ready`; сохраняет команду отката в
+`ROLLBACK_COMMAND.txt` и все журналы в evidence-каталог.
 
 ```bash
 # 0. Дома: собрать и проверить bundle
 scripts/build_patch_bundle.sh --name eva-ai-0.8.4-offline
-sha256sum -c dist/eva-ai-0.8.4-offline.tar.gz.sha256
+(cd dist && sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256)
 
-# 1. На хосте: распаковать, dry-run (по умолчанию), читать каждый FAIL/WARN
+# 1. На хосте: распаковать и запустить проводник
 tar xzf eva-ai-0.8.4-offline.tar.gz && cd eva-ai-0.8.4-offline/repo
-./scripts/install_eva_083.py --dry-run --non-interactive \
-  --source-dir "$PWD" --bundle-dir "$PWD/.." \
-  --app-dir /opt/eva-ai/evo-ssearch --env-file /etc/eva-ai/eva-ai.env
+sudo ./scripts/field_upgrade_084.sh
 
-# 2. Устранить все FAIL (см. находки выше), повторить dry-run до чистого плана
-
-# 3. Apply — только после чистого dry-run
-read -rsp 'Migration DSN: ' EVA_INSTALL_MIGRATION_DSN; echo; export EVA_INSTALL_MIGRATION_DSN
-sudo --preserve-env=EVA_INSTALL_MIGRATION_DSN ./scripts/install_eva_083.py --apply --non-interactive \
-  --source-dir "$PWD" --bundle-dir "$PWD/.." \
-  --app-dir /opt/eva-ai/evo-ssearch --env-file /etc/eva-ai/eva-ai.env
-unset EVA_INSTALL_MIGRATION_DSN
-
-# 4. Проверка
-systemctl status eva-ai --no-pager -l
-curl -sS http://127.0.0.1:5000/health && curl -sS http://127.0.0.1:5000/ready
-
-# 5. Если плохо — rollback командой, которую напечатал инсталлер
-#    (backup_dir указан в выводе; БД restore — отдельное осознанное действие)
+# 2. Скрипт сам остановится на любой проблеме и скажет, что диктовать по
+#    телефону. Ничего не «чинить творчески» на месте.
 ```
+
+Правила для инженера в серверной:
+
+- Любая строка `STOP:` = конец самостоятельных действий, звонок разработчику.
+- Команда отката уже записана в evidence-каталоге
+  (`/var/tmp/eva-upgrade-084-*/ROLLBACK_COMMAND.txt`) — выполнять её только
+  по инструкции с телефона.
+- `bash scripts/client_diagnostics.sh > diag.txt` — единственная команда
+  диагностики, файл отправить разработчику.
+
+## Ручной маршрут (только разработчик)
+
+Полный маршрут с миграциями и транзиентным `EVA_INSTALL_MIGRATION_DSN` —
+в `docs/install/offline_installer_083.md` (§4–§5). В поле он нужен только
+если схема оказалась НЕ на голове — тогда апгрейд ведёт разработчик, не
+инженер с флешкой.
 
 ## После апгрейда — smoke на месте (10 минут)
 

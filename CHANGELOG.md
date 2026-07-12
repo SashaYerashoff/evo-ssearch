@@ -23,13 +23,17 @@ Scaffold for release notes; final prose to be assembled from commits
 - **Agent:** persisted research continuation ledger, composite channel
   inventory, shared LM admission queue, context/token budget observability
   (`estimated_context_tokens`).
-- **UI:** vertical workspace layout rework, burst attention badges (pending),
+- **UI:** vertical workspace layout rework, burst attention badges,
   review-modal filmstrip roles.
 - **Stability:** capture thumbnail/frozen-signal contract restoration,
-  duck-typed live media open, attention-stream keepalive (pending),
-  strict archive source filters (pending).
-- **Install:** offline dry-run-first installer orchestrator for 0.8.1+ adopt
-  (rehearsal pending).
+  duck-typed live media open, attention-stream keepalive, strict archive
+  source filters, explicit-intent agent research continuation.
+- **Install:** offline dry-run-first installer orchestrator; version gate
+  reads the bundled VERSION file; adopt upgrade rehearsed against a field
+  tree copy (code-only, schema stays at head, no wheelhouse needed); guided
+  field upgrade script (`scripts/field_upgrade_084.sh`) with a read-only
+  schema gate, dry-run-then-confirm flow, and recorded rollback command
+  (`readiness/UPGRADE_084_FIELD_CHECKLIST_RU.md`).
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
 
 ## β 0.8.3 — 2026-07-02 (road-event and live-signal stabilization)
