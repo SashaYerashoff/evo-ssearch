@@ -4,6 +4,34 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## β 0.8.4 — unreleased (attention decider, media broker, stabilization)
+
+Scaffold for release notes; final prose to be assembled from commits
+`728081c..HEAD` before tagging.
+
+- **Capture apex decider v2:** per-second quiet/normal/burst classification
+  against a persisted per-channel motion baseline (homeostasis); sharpness-aware
+  frame selection; burst companion frames to archive and (one per batch) to the
+  VLM; `capture_attention` in `VECTOR_SIGNALS_JSON`; measured-homeostasis line in
+  channel memory prompts; `capture_selector_bias` channel setting
+  (auto/action/clarity).
+- **Operator media:** tokenized same-origin live/archive broker with lease
+  renewal and stall watchdogs; shared EVA attention preview (`Model view`) with
+  60 s freshness window and auto-recovery; archive review modal is
+  evidence-first with opt-in playback; archive segments support bounded
+  `duration_sec`.
+- **Agent:** persisted research continuation ledger, composite channel
+  inventory, shared LM admission queue, context/token budget observability
+  (`estimated_context_tokens`).
+- **UI:** vertical workspace layout rework, burst attention badges (pending),
+  review-modal filmstrip roles.
+- **Stability:** capture thumbnail/frozen-signal contract restoration,
+  duck-typed live media open, attention-stream keepalive (pending),
+  strict archive source filters (pending).
+- **Install:** offline dry-run-first installer orchestrator for 0.8.1+ adopt
+  (rehearsal pending).
+- Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
+
 ## β 0.8.3 — 2026-07-02 (road-event and live-signal stabilization)
 
 - **Road-event foundation:** added lightweight road-motion CV primitives,
