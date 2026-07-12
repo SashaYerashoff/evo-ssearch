@@ -134,6 +134,28 @@ def sample_frames(start: float = 100.0):
     ]
 
 
+def operator_rollup_response(
+    overview: str,
+    *,
+    routine: str = "No stable routine established.",
+    observations: str = "No distinct exception recorded.",
+    alerts: str = "No structured alerts recorded.",
+    coverage: str = "No coverage interruption recorded.",
+    takeaway: str = "No operator action suggested.",
+    memory: Optional[Dict[str, Any]] = None,
+) -> str:
+    return (
+        f"### Period Overview\n{overview}\n\n"
+        f"### Routine and Behavior\n{routine}\n\n"
+        f"### Notable Observations and Exceptions\n{observations}\n\n"
+        f"### Alerts and Meaning\n{alerts}\n\n"
+        f"### Coverage and Interruptions\n{coverage}\n\n"
+        f"### Operator Takeaway\n{takeaway}\n\n"
+        "MEMORY_UPDATE_JSON:\n"
+        + json.dumps(memory or {}, ensure_ascii=False)
+    )
+
+
 def _jpeg_b64(frame: np.ndarray) -> str:
     image = Image.fromarray(frame.astype(np.uint8), "RGB")
     out = BytesIO()
@@ -4009,7 +4031,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(l1["alert_parser_breakdown"]["prose_only_signal_count"], 1)
             self.assertEqual(l1["alert_delivery_breakdown"]["cooldown_skipped"], 1)
             self.assertEqual(l1["state_transition_total"], 1)
-            self.assertNotIn("alert_events", l1)
+            self.assertEqual(l1["alert_events"][0]["title"], "Person down")
+            self.assertEqual(l1["alert_events"][0]["delivery_status"], "cooldown_skipped")
             self.assertNotIn("state_observations", l1)
             self.assertNotIn("state_transition_events", l1)
 
@@ -4223,13 +4246,13 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             def lm_callback(messages, _model):
                 captured_user_texts.append(messages[1]["content"][0]["text"])
-                return (
-                    "### Window Snapshot\n"
-                    "Window with source alerts.\n\n"
-                    "### Alert Ledger\n"
-                    "- normal=1, low=1 preserved from source alerts.\n\n"
-                    "MEMORY_UPDATE_JSON:\n"
-                    "{\"routine_baseline\":\"quiet test scene\",\"alert_tuning_notes\":[\"preserve source alerts\"]}"
+                return operator_rollup_response(
+                    "Window with source alerts.",
+                    alerts="Normal and low review alerts were preserved with their observable meaning.",
+                    memory={
+                        "routine_baseline": "quiet test scene",
+                        "alert_tuning_notes": ["preserve source alerts"],
+                    },
                 )
 
             manager = build_manager(Path(temp), lm_callback=lm_callback)
@@ -4261,7 +4284,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             settings = manager.get_prompt_settings(channel_id=7)
             self.assertIn("prompt_layers", settings)
-            self.assertIn("Alert Ledger must mention every source alert", settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"])
+            self.assertIn("Explain each alert's observable meaning", settings["prompt_layers"]["rollups"]["L1"]["backend_instructions"])
 
             rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
             self.assertTrue(captured_user_texts)
@@ -4305,7 +4328,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             rollups = manager.summary_rollups(7, run_selector="all", level_limit=10, synthesize=False)
 
             self.assertEqual(calls, [])
-            self.assertIn("L1 rollup from L0", rollups["levels"]["L1"][0]["summary"])
+            row = rollups["levels"]["L1"][0]
+            self.assertEqual(row["summary_kind"], "degraded")
+            self.assertIn("Semantic summary unavailable", row["summary"])
+            self.assertNotIn("Highlights:", row["summary"])
 
     def test_rollup_cache_signature_changes_when_child_metadata_changes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4313,11 +4339,9 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             def lm_callback(messages, _model):
                 calls.append(messages[1]["content"][0]["text"])
-                return (
-                    "### Window Snapshot\n"
-                    f"L2 cache pass {len(calls)}.\n\n"
-                    "MEMORY_UPDATE_JSON:\n"
-                    f"{{\"routine_baseline\":\"cache pass {len(calls)}\"}}"
+                return operator_rollup_response(
+                    f"L2 cache pass {len(calls)}.",
+                    memory={"routine_baseline": f"cache pass {len(calls)}"},
                 )
 
             manager = build_manager(Path(temp), lm_callback=lm_callback)
@@ -4350,7 +4374,66 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIn("cache pass 2", second["levels"]["L2"][0]["summary"])
 
-    def test_fallback_rollup_summary_preserves_alerts_deviations_and_signal_digest(self):
+    def test_rollup_operator_summary_and_memory_are_stored_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def lm_callback(_messages, _model):
+                return operator_rollup_response(
+                    "A person remained at the desk through the window.",
+                    routine="Desk work remained the stable behavior.",
+                    observations="The person briefly left and returned.",
+                    memory={
+                        "routine_baseline": "desk work",
+                        "active_watchlist": ["brief absence"],
+                    },
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_llm_max_new_per_call = 10
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Person works at desk, briefly leaves, then returns.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all", level_limit=10)["levels"]["L1"][0]
+
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertEqual(row["format_version"], 2)
+            self.assertNotIn("MEMORY_UPDATE_JSON", row["summary"])
+            self.assertNotIn("active_watchlist", row["summary"])
+            self.assertEqual(row["memory_update"]["routine_baseline"], "desk work")
+            self.assertIn("desk work", manager.channel_routine_context[7]["routine"])
+
+    def test_invalid_rollup_operator_contract_is_degraded_and_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lambda _messages, _model: "raw internal list ...")
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_llm_max_new_per_call = 10
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Routine corridor activity.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all", level_limit=10)["levels"]["L1"][0]
+
+            self.assertEqual(row["summary_kind"], "degraded")
+            self.assertEqual(row["generation_status"], "failed")
+            self.assertEqual(row["generation_error"], "invalid_operator_contract")
+            self.assertNotIn("raw internal list", row["summary"])
+
+    def test_degraded_rollup_is_honest_and_does_not_leak_homeostasis(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -4379,54 +4462,50 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
 
             rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
-            summary = rollups["levels"]["L1"][0]["summary"]
+            row = rollups["levels"]["L1"][0]
+            summary = row["summary"]
 
-            self.assertIn("Alert counts: high=1", summary)
-            self.assertIn("Preserved deviations:", summary)
-            self.assertIn("vehicle drifting", summary)
-            self.assertIn("Signal digest:", summary)
-            self.assertIn("Alerts: high=1", summary)
+            self.assertEqual(row["summary_kind"], "degraded")
+            self.assertIn("source contains high=1", summary)
+            self.assertIn("Semantic summary unavailable", summary)
+            self.assertNotIn("vehicle drifting", summary)
+            self.assertNotIn("Signal digest", summary)
+            self.assertNotIn("alert tuning", summary.lower())
 
     def test_summary_rollups_preserve_deviation_memory_across_levels(self):
         with tempfile.TemporaryDirectory() as temp:
             def lm_callback(messages, _model):
                 user_text = messages[1]["content"][0]["text"]
                 if "Target level: L3" in user_text:
-                    return (
-                        "### Window Snapshot\n"
-                        "Longer period mostly routine.\n\n"
-                        "### Routine Baseline\n"
-                        "Quiet exterior road.\n\n"
-                        "### Preserved Deviations\n"
-                        "- 02:10 vehicle drifting near the gate.\n\n"
-                        "### Alert Ledger\n"
-                        "- high | 02:10 | vehicle drifting | sliding turns visible.\n\n"
-                        "MEMORY_UPDATE_JSON:\n"
-                        "{\"routine_baseline\":\"quiet exterior road\","
-                        "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns visible\"}],"
-                        "\"alert_tuning_notes\":[\"do not collapse drifting into routine traffic\"],"
-                        "\"ignore_as_routine\":[\"normal parked cars\"]}"
+                    return operator_rollup_response(
+                        "Longer period mostly routine.",
+                        routine="Quiet exterior road.",
+                        observations="At 02:10 a vehicle drifted near the gate.",
+                        alerts="High review alert at 02:10 for visible sliding turns.",
+                        memory={
+                            "routine_baseline": "quiet exterior road",
+                            "preserved_deviations": [{"time": "02:10", "severity": "high", "event": "vehicle drifting", "evidence": "sliding turns visible"}],
+                            "alert_tuning_notes": ["do not collapse drifting into routine traffic"],
+                            "ignore_as_routine": ["normal parked cars"],
+                        },
                     )
                 if "Target level: L2" in user_text:
-                    return (
-                        "### Window Snapshot\n"
-                        "Hour mostly routine with one security event.\n\n"
-                        "### Routine Baseline\n"
-                        "Low traffic near the gate.\n\n"
-                        "### Preserved Deviations\n"
-                        "- 02:10 vehicle drifting.\n\n"
-                        "MEMORY_UPDATE_JSON:\n"
-                        "{\"routine_baseline\":\"low traffic near the gate\","
-                        "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"repeated sharp turns\"}]}"
+                    return operator_rollup_response(
+                        "Hour mostly routine with one security event.",
+                        routine="Low traffic near the gate.",
+                        observations="At 02:10 a vehicle drifted.",
+                        memory={
+                            "routine_baseline": "low traffic near the gate",
+                            "preserved_deviations": [{"time": "02:10", "severity": "high", "event": "vehicle drifting", "evidence": "repeated sharp turns"}],
+                        },
                     )
-                return (
-                    "### Window Snapshot\n"
-                    "Short window with a drifting event.\n\n"
-                    "### Preserved Deviations\n"
-                    "- 02:10 vehicle drifting.\n\n"
-                    "MEMORY_UPDATE_JSON:\n"
-                    "{\"active_watchlist\":[\"east gate vehicle\"],"
-                    "\"preserved_deviations\":[{\"time\":\"02:10\",\"severity\":\"high\",\"event\":\"vehicle drifting\",\"evidence\":\"sliding turns\"}]}"
+                return operator_rollup_response(
+                    "Short window with a drifting event.",
+                    observations="At 02:10 a vehicle drifted.",
+                    memory={
+                        "active_watchlist": ["east gate vehicle"],
+                        "preserved_deviations": [{"time": "02:10", "severity": "high", "event": "vehicle drifting", "evidence": "sliding turns"}],
+                    },
                 )
 
             manager = build_manager(Path(temp), lm_callback=lm_callback)

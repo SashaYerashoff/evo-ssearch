@@ -482,6 +482,38 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["since_ms"], 1000)
         self.assertEqual(captured["until_ms"], 2000)
 
+    def test_luxriot_rollup_api_never_exposes_internal_memory_or_signal_digest(self) -> None:
+        rollup_payload = {
+            "channel_id": 7,
+            "routine_context": {"routine": "internal homeostasis"},
+            "levels": {
+                "L1": [
+                    {
+                        "rollup_id": "l1-7",
+                        "summary": "### Period Overview\nRoutine window.",
+                        "operator_summary": "### Period Overview\nRoutine window.",
+                        "memory_update": {"routine_baseline": "internal homeostasis"},
+                        "signal_digest": {"watchlist": ["internal item"]},
+                        "highlights": ["internal source excerpt"],
+                        "llm_input_stats": {"source_chars_selected": 100},
+                    }
+                ]
+            },
+        }
+        with patch("oldapp.luxriot_manager.summary_rollups", return_value=rollup_payload):
+            response = self.client.get("/luxriot/rollups?channel_id=7&target_level=L1")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertNotIn("routine_context", payload)
+        row = payload["levels"]["L1"][0]
+        self.assertEqual(row["summary"], "### Period Overview\nRoutine window.")
+        self.assertNotIn("operator_summary", row)
+        self.assertNotIn("memory_update", row)
+        self.assertNotIn("signal_digest", row)
+        self.assertNotIn("highlights", row)
+        self.assertNotIn("llm_input_stats", row)
+
     def test_detections_list_normalizes_probe_source_aliases(self) -> None:
         captured: Dict[str, Any] = {}
 

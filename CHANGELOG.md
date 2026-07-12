@@ -27,7 +27,10 @@ Scaffold for release notes; final prose to be assembled from commits
   review-modal filmstrip roles.
 - **Stability:** capture thumbnail/frozen-signal contract restoration,
   duck-typed live media open, attention-stream keepalive, strict archive
-  source filters, explicit-intent agent research continuation.
+  source filters, explicit-intent agent research continuation; L1–L3 operator
+  narratives are separated from machine homeostasis, legacy concatenation is
+  rejected, and unavailable semantic aggregation is reported honestly with an
+  explicit per-window retry.
 - **Install:** offline dry-run-first installer orchestrator; version gate
   reads the bundled VERSION file; adopt upgrade rehearsed against a field
   tree copy (code-only, schema stays at head, no wheelhouse needed); guided

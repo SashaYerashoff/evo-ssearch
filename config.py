@@ -856,54 +856,28 @@ class Config:
     LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: keep factual language; preserve every grounded "
-            "alert/deviation even when the rest of the window is routine; do not classify behavior as illegal; "
-            "describe observable security/safety facts requiring operator review; avoid phrases like 'L1 rollup from L0'."
+            "You are a CCTV operations analyst. Turn L0 observations into a readable 15-minute behavioral account. "
+            "Describe what persisted, what changed, the meaning and outcome of alerts, exceptions, and any loss of coverage. "
+            "Do not enumerate source batches or expose internal memory, detector, token, or prompt-tuning details. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: preserve meaningful deviations from routine; "
-            "never compress alerts or operator-review incidents into routine; avoid repeating unchanged background details; "
-            "keep concise, operator-facing language."
+            "You are a CCTV operations analyst. Turn L1 windows into a readable hour-scale account of behavioral episodes, "
+            "routine shifts, meaningful recurrence, alerts and their outcome, exceptions, and coverage interruptions. "
+            "Do not concatenate lower-level summaries or expose internal memory and detector mechanics. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with durable routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: emphasize trend shifts and durable signals; "
-            "preserve real security/safety deviations; remove duplicate wording; focus on actionable context."
+            "You are a CCTV operations analyst. Turn L2 windows into a readable six-hour operational account: durable routine, "
+            "repeated or changing behavior, unresolved incidents, alert meaning, exceptions, and coverage quality. "
+            "Do not concatenate lower-level summaries or expose internal memory and detector mechanics. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'

@@ -10839,7 +10839,27 @@ def luxriot_summary_rollups():
             rollups['levels'] = {
                 target_level: list(levels.get(target_level) or []),
             }
-        return jsonify(rollups)
+        operator_payload = dict(rollups)
+        operator_payload.pop('routine_context', None)
+        operator_levels = operator_payload.get('levels')
+        if isinstance(operator_levels, Mapping):
+            sanitized_levels: Dict[str, List[Dict[str, Any]]] = {}
+            for level, raw_rows in operator_levels.items():
+                rows = raw_rows if isinstance(raw_rows, Sequence) and not isinstance(raw_rows, (str, bytes, bytearray)) else []
+                sanitized_rows: List[Dict[str, Any]] = []
+                for raw_row in rows:
+                    if not isinstance(raw_row, Mapping):
+                        continue
+                    row = dict(raw_row)
+                    row.pop('memory_update', None)
+                    row.pop('operator_summary', None)
+                    row.pop('signal_digest', None)
+                    row.pop('llm_input_stats', None)
+                    row.pop('highlights', None)
+                    sanitized_rows.append(row)
+                sanitized_levels[str(level)] = sanitized_rows
+            operator_payload['levels'] = sanitized_levels
+        return jsonify(operator_payload)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:

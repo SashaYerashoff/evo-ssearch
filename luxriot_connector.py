@@ -49,6 +49,7 @@ except Exception:  # pragma: no cover - road CV is optional in minimal installs
     iter_luxriot_live_segment_frames = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger(__name__)
+ROLLUP_OPERATOR_FORMAT_VERSION = 2
 
 
 class SummaryBatchSuperseded(RuntimeError):
@@ -4013,36 +4014,42 @@ class LuxriotManager:
     @classmethod
     def _rollup_backend_instruction_lines(cls, level: str) -> List[str]:
         normalized_level = cls._normalize_rollup_level(level) or str(level or "").strip().upper() or "rollup"
+        level_focus = {
+            "L1": "Describe the behavior and changes across this 15-minute window as one short sequence.",
+            "L2": "Describe hour-scale episodes, routine shifts, meaningful recurrence, and unresolved exceptions.",
+            "L3": "Describe the longer operational pattern, repeated behavior, unresolved incidents, and coverage quality.",
+        }.get(normalized_level, "Describe behavior and change across the complete period.")
         return [
             "Context constraints:",
             "- All source entries are from the same channel and continuous timeline window above.",
             "- Source entries may be model-generated summaries from a lower level; avoid compounding uncertainty.",
-            "- Window signal digest is a compact routing map for alerts, deviations, watch items, missing data, and uncertainty; use it to keep continuity, but treat source summaries as evidence.",
+            "- Window signal digest and channel memory are internal routing context, not operator prose and not independent evidence.",
             "- Preserve rare but important events even if they appear once.",
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
-            "- Never compress alerts, deviations, or operator-review incidents into routine.",
-            "- Alert Ledger must mention every source alert/count, including normal/info alerts, even when the event is routine or needs no action.",
+            "- Never compress alerts, deviations, coverage gaps, or operator-review incidents into routine.",
             "- Do not classify behavior as illegal/unlawful; describe observable security/safety facts.",
             "",
             "Task:",
-            f"- Write one concise {normalized_level} summary for operators.",
-            "- Deduplicate repeated scene descriptions and boilerplate.",
-            "- Keep meaningful changes in short timeline bullets across the full window.",
-            "- Mention risks/signals only when grounded in source text.",
-            "- If activity is routine, say so clearly without repeating identical details.",
-            "- Keep routine baseline separate from preserved deviations and alert ledger.",
+            f"- Write one readable {normalized_level} behavioral summary for a municipal CCTV operator.",
+            f"- {level_focus}",
+            "- Synthesize behavior over time; do not enumerate, concatenate, or paraphrase every source batch.",
+            "- Use prose for the period narrative. Use bullets only for distinct observations, alerts, interruptions, or follow-up items.",
+            "- Deduplicate repeated scene descriptions, names, boilerplate, and unchanged background.",
+            "- Explain each alert's observable meaning and outcome; do not merely repeat severity counters.",
+            "- Report camera/feed interruptions and missing coverage separately from observed behavior.",
+            "- If the period is routine, say so plainly and keep the report short.",
             "- Do not invent entities, times, or counts.",
             "",
-            "Output format (Markdown):",
-            "### Window Snapshot",
-            "### Routine Baseline",
-            "### Preserved Deviations",
-            "### Alert Ledger",
-            "### Alert Tuning Notes",
-            "### Alerts/Signals",
-            "### Operator Notes",
+            "Operator output format (Markdown, use exactly these sections):",
+            "### Period Overview",
+            "### Routine and Behavior",
+            "### Notable Observations and Exceptions",
+            "### Alerts and Meaning",
+            "### Coverage and Interruptions",
+            "### Operator Takeaway",
+            "Do not expose signal digests, prompt tuning, watchlist mechanics, memory terminology, source tokens, or internal detector plumbing in these sections.",
             "",
-            "Append exactly one compact machine-readable memory block:",
+            "After the operator sections, append exactly one compact machine-readable block for EVA internal use. It is not shown to operators:",
             "MEMORY_UPDATE_JSON:",
             "{",
             "  \"routine_baseline\": \"normal pattern for this channel, if grounded\",",
@@ -7858,6 +7865,46 @@ class LuxriotManager:
         memory["text"] = self._render_channel_memory_text(memory)
         return {key: value for key, value in memory.items() if value}
 
+    def _split_rollup_operator_output(self, value: object) -> Tuple[str, Dict[str, Any]]:
+        """Separate human-facing Markdown from the machine-only memory block."""
+
+        text = str(value or "").strip()
+        if not text:
+            return "", {}
+        marker = "MEMORY_UPDATE_JSON:"
+        marker_index = text.upper().find(marker)
+        operator_summary = text[:marker_index].strip() if marker_index >= 0 else text
+        raw_memory = self._extract_json_marker_payload(text, marker)
+        if not isinstance(raw_memory, Mapping):
+            return operator_summary, {}
+        if not raw_memory:
+            return operator_summary, {}
+        normalized = self._extract_memory_update(
+            marker + "\n" + json.dumps(dict(raw_memory), ensure_ascii=False)
+        )
+        normalized.pop("text", None)
+        return operator_summary, normalized
+
+    @staticmethod
+    def _rollup_operator_contract_valid(value: object) -> bool:
+        text = str(value or "").lower()
+        return all(
+            heading in text
+            for heading in (
+                "### period overview",
+                "### routine and behavior",
+                "### notable observations and exceptions",
+                "### alerts and meaning",
+                "### coverage and interruptions",
+                "### operator takeaway",
+            )
+        )
+
+    @staticmethod
+    def _is_legacy_fallback_rollup(value: object) -> bool:
+        text = " ".join(str(value or "").strip().split()).lower()
+        return bool(re.match(r"^l[123] rollup from l[012]:", text))
+
     def _update_channel_routine_context(
         self,
         channel_id: int,
@@ -7865,8 +7912,17 @@ class LuxriotManager:
         summary_text: object,
         window_end: Optional[float],
         level: Optional[str] = None,
+        memory_update: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        extracted_memory = self._extract_memory_update(summary_text)
+        if isinstance(memory_update, Mapping):
+            if not memory_update:
+                return
+            extracted_memory = self._extract_memory_update(
+                "MEMORY_UPDATE_JSON:\n"
+                + json.dumps(dict(memory_update), ensure_ascii=False)
+            )
+        else:
+            extracted_memory = self._extract_memory_update(summary_text)
         if not extracted_memory:
             return
         channel_key = int(channel_id)
@@ -8357,8 +8413,8 @@ class LuxriotManager:
                     "active_memory": active_memory,
                     "notes": [
                         "The editable prompt is the system prompt.",
-                        "Backend instructions are always appended as the user task layer.",
-                        "Alert Ledger must preserve alert counts even when a window is routine.",
+                        "The operator-format contract is always appended to the system prompt.",
+                        "Alerts remain a separate operator section and must explain their observable meaning.",
                     ],
                 }
                 for level in ("L1", "L2", "L3")
@@ -8659,6 +8715,31 @@ class LuxriotManager:
                     return output
         return output
 
+    @classmethod
+    def _collect_rollup_alert_events(
+        cls,
+        nodes: Sequence[Mapping[str, Any]],
+        max_items: int = 16,
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, int]] = set()
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            for event in cls._compact_alert_events(node.get("alert_events")):
+                key = (
+                    str(event.get("title") or "").strip().casefold(),
+                    str(event.get("severity") or "").strip().casefold(),
+                    int(_parse_optional_int(event.get("timestamp_ms")) or 0),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append(event)
+                if len(events) >= max(1, int(max_items)):
+                    return events
+        return events
+
     def _format_rollup_signal_text(self, alert_counts: object, signal_digest: object) -> str:
         parts: List[str] = []
         alert_text = self._format_alert_counts(alert_counts)
@@ -8692,23 +8773,45 @@ class LuxriotManager:
         alert_counts: object = None,
         signal_digest: object = None,
     ) -> str:
-        base = (
-            f"{level} rollup from {source_level}: {item_count} items over ~{max(1, int(window_sec // 60))} min"
+        duration = (
+            f"about {max(1, int(window_sec // 60))} minutes"
             if window_sec < 3600
-            else f"{level} rollup from {source_level}: {item_count} items over ~{max(1, int(window_sec // 3600))} hr"
+            else f"about {max(1, int(window_sec // 3600))} hours"
         )
+        evidence = f"{item_count} source observations"
         if frame_count > 0:
-            base += f" ({frame_count} frames)"
-        if run_ids:
-            base += f", {len(run_ids)} run(s)"
-        if highlights:
-            base += ". Highlights: " + "; ".join(highlights[: self.rollup_highlight_limit])
-        else:
-            base += "."
-        signal_text = self._format_rollup_signal_text(alert_counts, signal_digest)
-        if signal_text:
-            base += " " + signal_text
-        return base
+            evidence += f" covering {frame_count} frames"
+        alert_text = self._format_alert_counts(alert_counts)
+        missing_items = self._coerce_memory_items(
+            signal_digest.get("missing_data") if isinstance(signal_digest, Mapping) else None,
+            max_items=3,
+            max_len=180,
+        )
+        coverage_text = (
+            "Reported coverage issues: " + "; ".join(missing_items)
+            if missing_items
+            else "No structured coverage interruption was recorded in the available source metadata."
+        )
+        alert_section = (
+            f"The source contains {alert_text}. Their behavioral meaning requires the lower-level observations or a completed semantic rollup."
+            if alert_text
+            else "No structured alerts were recorded in the available source metadata."
+        )
+        return "\n\n".join(
+            [
+                "### Period Overview\n"
+                f"A semantic {level} behavioral summary has not been generated for this {duration} window. "
+                f"EVA retained {evidence} across {len(run_ids)} run(s).",
+                "### Routine and Behavior\n"
+                "Routine and behavioral development are not inferred from concatenated batch text. Drill down to observations for the source account.",
+                "### Notable Observations and Exceptions\n"
+                "No semantic exception narrative is available until rollup generation completes.",
+                "### Alerts and Meaning\n" + alert_section,
+                "### Coverage and Interruptions\n" + coverage_text,
+                "### Operator Takeaway\n"
+                "Semantic summary unavailable. Review the source observations; do not treat this degraded card as a behavioral conclusion.",
+            ]
+        )
 
     @classmethod
     def _rollup_child_salience_score(cls, child: Mapping[str, Any]) -> int:
@@ -8803,7 +8906,8 @@ class LuxriotManager:
 
     def _normalize_cached_rollup_entry(self, entry: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         rollup_id = str(entry.get("rollup_id") or "").strip()
-        summary = str(entry.get("summary") or "").strip()
+        raw_summary = str(entry.get("operator_summary") or entry.get("summary") or "").strip()
+        summary, embedded_memory = self._split_rollup_operator_output(raw_summary)
         if not summary:
             return None
         level = self._normalize_rollup_level(entry.get("level"))
@@ -8839,7 +8943,17 @@ class LuxriotManager:
         if not source_signature:
             source_signature = self._source_signature(source_ids)
         highlights = self._coerce_str_list(entry.get("highlights"))
-        summary_kind = str(entry.get("summary_kind") or "").strip() or "llm_cached"
+        format_version = _parse_optional_int(entry.get("format_version")) or 1
+        summary_kind = str(entry.get("summary_kind") or "").strip()
+        if not summary_kind:
+            summary_kind = "llm_cached" if format_version >= ROLLUP_OPERATOR_FORMAT_VERSION else "legacy_cached"
+        if self._is_legacy_fallback_rollup(summary):
+            summary_kind = "degraded"
+        generation_status = str(entry.get("generation_status") or "").strip()
+        if not generation_status:
+            generation_status = "cached" if summary_kind in {"llm", "llm_cached"} else "stale"
+        memory_raw = entry.get("memory_update")
+        memory_update = dict(memory_raw) if isinstance(memory_raw, Mapping) else embedded_memory
         alert_meta = self._alert_meta_from_counts(entry.get("alert_counts"))
         if not alert_meta.get("alert_total"):
             raw_total = _parse_optional_int(entry.get("alert_total")) or 0
@@ -8850,6 +8964,7 @@ class LuxriotManager:
             signal_digest = {}
         alert_delivery_breakdown = self._compact_count_breakdown(entry.get("alert_delivery_breakdown"))
         alert_parser_breakdown = self._compact_count_breakdown(entry.get("alert_parser_breakdown"))
+        alert_events = self._compact_alert_events(entry.get("alert_events"))
         state_transition_total = int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0))
         vector_signal_total = int(max(0, _parse_optional_int(entry.get("vector_signal_total")) or 0))
         created_at = self._coerce_float(entry.get("created_at"))
@@ -8871,13 +8986,19 @@ class LuxriotManager:
             "highlights": highlights,
             "source_signature": source_signature,
             "summary": summary,
+            "operator_summary": summary,
+            "memory_update": memory_update,
             "summary_kind": summary_kind,
+            "generation_status": generation_status,
+            "format_version": int(format_version),
             "created_at": float(created_at),
             "signal_digest": dict(signal_digest),
             **alert_meta,
         }
         if alert_delivery_breakdown:
             normalized["alert_delivery_breakdown"] = alert_delivery_breakdown
+        if alert_events:
+            normalized["alert_events"] = alert_events
         if alert_parser_breakdown:
             normalized["alert_parser_breakdown"] = alert_parser_breakdown
         if state_transition_total > 0:
@@ -9080,13 +9201,23 @@ class LuxriotManager:
                     generated_signature = str(row_dict.get("source_signature") or "").strip()
                     current_signature = str(current.get("source_signature") or "").strip()
                     if (
-                        generated_kind == "pending_context"
-                        and current_kind in {"llm", "llm_cached"}
+                        current_kind in {"llm", "llm_cached"}
+                        and generated_kind not in {"llm", "llm_cached"}
                         and generated_signature
                         and generated_signature == current_signature
+                        and int(_parse_optional_int(current.get("format_version")) or 1)
+                        >= ROLLUP_OPERATOR_FORMAT_VERSION
                     ):
-                        merged["summary"] = str(current.get("summary") or "")
-                        merged["summary_kind"] = current_kind
+                        for preserved_field in (
+                            "summary",
+                            "operator_summary",
+                            "memory_update",
+                            "summary_kind",
+                            "generation_status",
+                            "format_version",
+                        ):
+                            if preserved_field in current:
+                                merged[preserved_field] = current.get(preserved_field)
                     merged["rollup_id"] = row_id
                     merged_by_id[row_id] = merged
                 else:
@@ -9123,6 +9254,7 @@ class LuxriotManager:
             summary_text=summary,
             window_end=self._coerce_float(latest.get("window_end")),
             level="L2",
+            memory_update=latest.get("memory_update") if isinstance(latest.get("memory_update"), Mapping) else {},
         )
 
     def _refresh_channel_memory_from_rollups(
@@ -9161,6 +9293,7 @@ class LuxriotManager:
                 summary_text=row.get("summary"),
                 window_end=self._coerce_float(row.get("window_end")),
                 level=self._normalize_rollup_level(row.get("level")),
+                memory_update=row.get("memory_update") if isinstance(row.get("memory_update"), Mapping) else {},
             )
 
     def _select_rollup_source_lines(
@@ -9243,6 +9376,11 @@ class LuxriotManager:
         system_msg = self._get_rollup_system_prompt(level, channel_id=channel_id) or (
             "You summarize CCTV batches into concise operator-facing rollups."
         )
+        system_msg = (
+            system_msg.rstrip()
+            + "\n\nEVA operator rollup contract v2 (mandatory; overrides older section names):\n"
+            + self._rollup_backend_instruction_text(level)
+        )
         window_start = float(self._coerce_float(node.get("window_start")) or 0.0)
         window_end = float(self._coerce_float(node.get("window_end")) or 0.0)
         frame_count = _parse_optional_int(node.get("frame_count")) or 0
@@ -9255,6 +9393,30 @@ class LuxriotManager:
         routine_context = self._get_channel_routine_prompt(channel_id)
         window_alert_counts = self._format_alert_counts(node.get("alert_counts"))
         window_signal_digest = self._render_signal_digest(node.get("signal_digest"), max_len=1000)
+        alert_event_lines: List[str] = []
+        for event in self._compact_alert_events(node.get("alert_events"))[:16]:
+            timestamp_ms = _parse_optional_int(event.get("timestamp_ms"))
+            time_label = (
+                time.strftime("%H:%M:%S", time.localtime(float(timestamp_ms) / 1000.0))
+                if timestamp_ms is not None and timestamp_ms > 0
+                else "time n/a"
+            )
+            severity = self._normalize_alert_severity(event.get("severity"))
+            title = self._truncate_text(event.get("title"), 120) or "Event"
+            description = self._truncate_text(event.get("description"), 240)
+            delivery = str(event.get("delivery_status") or "").strip().lower()
+            detail = f"- {time_label} | {severity} | {title}"
+            if description:
+                detail += f" | {description}"
+            if delivery:
+                detail += f" | delivery={delivery}"
+            alert_event_lines.append(detail)
+        delivery_breakdown = self._compact_count_breakdown(node.get("alert_delivery_breakdown"))
+        delivery_text = ", ".join(
+            f"{key}={value}"
+            for key, value in sorted(delivery_breakdown.items())
+            if key != "total"
+        )
         backend_instruction_lines = self._rollup_backend_instruction_lines(level)
         user_text = "\n".join(
             [
@@ -9267,13 +9429,14 @@ class LuxriotManager:
                 f"Runs: {run_text}",
                 f"Approx source tokens: {int(source_tokens)}",
                 f"Source alert totals: {window_alert_counts or 'none'}",
+                f"Bookmark/delivery outcomes: {delivery_text or 'none recorded'}",
+                "Structured alert events:",
+                *(alert_event_lines or ["- none"]),
                 "",
                 "Window signal digest (compact continuity map):",
                 window_signal_digest or "none",
                 "",
-                *backend_instruction_lines,
-                "",
-                "Window Snapshot must begin with:",
+                "Period Overview must begin with:",
                 f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
                 "",
                 "Known long-window routine context (if available):",
@@ -9319,7 +9482,7 @@ class LuxriotManager:
         node: Mapping[str, Any],
         children: Sequence[Mapping[str, Any]],
         fallback_summary: str,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any], Optional[str]]:
         try:
             messages = self._build_rollup_messages(
                 channel_id=channel_id,
@@ -9330,10 +9493,22 @@ class LuxriotManager:
             )
             with self.cache_lock:
                 model_hint = self._get_rollup_model_hint_locked(channel_id)
-            summary = str(self.lm_callback(messages, model_hint)).strip()
-            return summary or fallback_summary
-        except Exception:
-            return fallback_summary
+            raw_summary = str(self.lm_callback(messages, model_hint)).strip()
+            operator_summary, memory_update = self._split_rollup_operator_output(raw_summary)
+            if not operator_summary:
+                return fallback_summary, {}, "empty_operator_summary"
+            if not self._rollup_operator_contract_valid(operator_summary):
+                return fallback_summary, {}, "invalid_operator_contract"
+            return operator_summary, memory_update, None
+        except Exception as exc:
+            error_code = type(exc).__name__
+            LOGGER.warning(
+                "Rollup synthesis failed channel_id=%s level=%s error=%s",
+                channel_id,
+                level,
+                error_code,
+            )
+            return fallback_summary, {}, error_code
 
     def _compose_pending_rollup_summary(
         self,
@@ -9346,14 +9521,19 @@ class LuxriotManager:
         alert_counts: object = None,
         signal_digest: object = None,
     ) -> str:
-        base = (
-            f"{level} pending from {source_level}: {item_count} items ({frame_count} frames). "
-            f"Collecting context {source_tokens}/{min_tokens} tokens."
+        alerts = self._format_alert_counts(alert_counts)
+        return "\n\n".join(
+            [
+                "### Period Overview\n"
+                f"EVA is still collecting context for this {level} window ({item_count} items, {frame_count} frames).",
+                "### Routine and Behavior\nNot available until this aggregation window closes.",
+                "### Notable Observations and Exceptions\nReview lower-level observations while aggregation is pending.",
+                "### Alerts and Meaning\n"
+                + (f"Structured alerts collected so far: {alerts}." if alerts else "No structured alerts collected so far."),
+                "### Coverage and Interruptions\nCoverage assessment is pending with the aggregation.",
+                "### Operator Takeaway\nAggregation in progress; no period-level behavioral conclusion is available yet.",
+            ]
         )
-        signal_text = self._format_rollup_signal_text(alert_counts, signal_digest)
-        if signal_text:
-            base += " " + signal_text
-        return base
 
     def _apply_rollup_llm_summaries(
         self,
@@ -9394,27 +9574,43 @@ class LuxriotManager:
                     alert_counts=node.get("alert_counts"),
                     signal_digest=node.get("signal_digest"),
                 )
+                node["operator_summary"] = node["summary"]
                 node["summary_kind"] = "pending_context"
+                node["generation_status"] = "pending"
+                node["format_version"] = ROLLUP_OPERATOR_FORMAT_VERSION
                 continue
             cached = self._get_cached_rollup_record(rollup_id)
             if cached:
                 cached_summary = str(cached.get("summary") or "").strip()
                 cached_signature = str(cached.get("source_signature") or "").strip()
-                if cached_summary and cached_signature and cached_signature == source_signature:
+                cached_format_version = _parse_optional_int(cached.get("format_version")) or 1
+                if (
+                    cached_summary
+                    and cached_signature
+                    and cached_signature == source_signature
+                    and cached_format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+                ):
                     node["summary"] = cached_summary
+                    node["operator_summary"] = cached_summary
+                    cached_memory = cached.get("memory_update")
+                    node["memory_update"] = dict(cached_memory) if isinstance(cached_memory, Mapping) else {}
                     node["summary_kind"] = "llm_cached"
+                    node["generation_status"] = "cached"
+                    node["format_version"] = cached_format_version
                     self._update_channel_routine_context(
                         channel_id=channel_id,
                         rollup_id=rollup_id,
                         summary_text=node.get("summary"),
                         window_end=self._coerce_float(node.get("window_end")),
                         level=level,
+                        memory_update=node.get("memory_update") if isinstance(node.get("memory_update"), Mapping) else {},
                     )
                     continue
             if remaining_budget <= 0:
+                node["generation_status"] = "deferred"
                 continue
             fallback = str(node.get("summary") or "").strip()
-            summary = self._synthesize_rollup_summary(
+            summary, memory_update, generation_error = self._synthesize_rollup_summary(
                 channel_id=channel_id,
                 level=level,
                 source_level=source_level,
@@ -9422,7 +9618,7 @@ class LuxriotManager:
                 children=children,
                 fallback_summary=fallback,
             )
-            if summary and summary != fallback:
+            if summary and summary != fallback and generation_error is None:
                 self._put_cached_rollup_summary(
                     rollup_id,
                     summary,
@@ -9444,19 +9640,34 @@ class LuxriotManager:
                     alert_severities=node.get("alert_severities"),
                     signal_digest=node.get("signal_digest"),
                     alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
+                    alert_events=node.get("alert_events"),
                     alert_parser_breakdown=node.get("alert_parser_breakdown"),
                     state_transition_total=node.get("state_transition_total"),
                     summary_kind="llm",
+                    operator_summary=summary,
+                    memory_update=memory_update,
+                    generation_status="ready",
+                    format_version=ROLLUP_OPERATOR_FORMAT_VERSION,
                 )
                 node["summary"] = summary
+                node["operator_summary"] = summary
+                node["memory_update"] = memory_update
                 node["summary_kind"] = "llm"
+                node["generation_status"] = "ready"
+                node["format_version"] = ROLLUP_OPERATOR_FORMAT_VERSION
                 self._update_channel_routine_context(
                     channel_id=channel_id,
                     rollup_id=rollup_id,
                     summary_text=summary,
                     window_end=self._coerce_float(node.get("window_end")),
                     level=level,
+                    memory_update=memory_update,
                 )
+            else:
+                node["summary_kind"] = "degraded"
+                node["generation_status"] = "failed" if generation_error else "degraded"
+                if generation_error:
+                    node["generation_error"] = generation_error
             remaining_budget -= 1
 
     def _l0_nodes_from_logs(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -9599,6 +9810,7 @@ class LuxriotManager:
                         if run_text:
                             run_ids.add(run_text)
             highlights = self._collect_highlights(children, self.rollup_highlight_limit)
+            alert_events = self._collect_rollup_alert_events(children)
             alert_meta = self._merge_alert_metadata(children)
             signal_digest = self._aggregate_signal_digest(
                 children,
@@ -9636,12 +9848,18 @@ class LuxriotManager:
                     "highlights": highlights,
                     "source_signature": source_signature,
                     "summary": summary,
+                    "operator_summary": summary,
+                    "summary_kind": "degraded",
+                    "generation_status": "degraded",
+                    "format_version": ROLLUP_OPERATOR_FORMAT_VERSION,
                     "created_at": end_ts,
                     "signal_digest": signal_digest,
                     **alert_meta,
                     **provenance_meta,
                 }
             )
+            if alert_events:
+                out[-1]["alert_events"] = alert_events
             if synthesize and level in self.rollup_llm_levels:
                 llm_pairs.append((out[-1], children))
         if synthesize and level in self.rollup_llm_levels and llm_pairs:

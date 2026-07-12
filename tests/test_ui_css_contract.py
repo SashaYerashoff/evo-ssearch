@@ -644,3 +644,21 @@ def test_video_history_controls_separate_period_resolution_and_live_following():
         assert token in JS
     assert ".luxriot-feed-loading" in CSS
     assert ".luxriot-feed-loading-spinner" in CSS
+
+
+def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():
+    for token in (
+        "semantic · cached",
+        "aggregation pending",
+        "semantic unavailable",
+        "not a period-level behavioral conclusion",
+        "generation_status",
+        "summary_kind",
+        "function generateLuxriotSemanticRollup",
+        "Generate semantic",
+        "synthesize: '1'",
+    ):
+        assert token in JS
+    assert ".luxriot-rollup-status.ready" in CSS
+    assert ".luxriot-rollup-status.pending" in CSS
+    assert ".luxriot-rollup-status.degraded" in CSS

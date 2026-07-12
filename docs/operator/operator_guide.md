@@ -40,6 +40,12 @@ This is where the system's always-on description of each channel lives.
   observations) and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries).
   `Auto` chooses a practical resolution for the selected period. Collapsed
   summary rows show **alert badges** when something was flagged.
+- Rollup status is explicit: **semantic** is a completed operator narrative,
+  **aggregation pending** is an open window, and **semantic unavailable** is a
+  coverage/status fallback rather than a behavioral conclusion. Use **Generate
+  semantic** to retry one degraded historical window, or **Drill L0** to inspect
+  its source observations. Internal homeostasis/memory payloads are not shown in
+  operator summaries.
 - **Channel Runtime / stream health** — whether the channel is actively
   producing descriptions and whether there are **coverage gaps / dropped
   batches**. A channel that is *quiet* is fine; a channel that is *blind* (gaps)

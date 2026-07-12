@@ -2283,6 +2283,38 @@
         font-size: 0.72rem;
     }
 
+    .luxriot-rollup-status {
+        display: inline-flex;
+        align-items: center;
+        margin-left: 0.3rem;
+        padding: 0.12rem 0.42rem;
+        border: 1px solid rgba(91, 111, 130, 0.72);
+        border-radius: 999px;
+        color: #b9c8d5;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.62rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
+
+    .luxriot-rollup-status.ready {
+        border-color: rgba(26, 181, 132, 0.68);
+        color: #8fe0bd;
+        background: rgba(13, 92, 70, 0.18);
+    }
+
+    .luxriot-rollup-status.pending {
+        border-color: rgba(214, 163, 72, 0.72);
+        color: #e5c27d;
+        background: rgba(111, 74, 15, 0.2);
+    }
+
+    .luxriot-rollup-status.degraded {
+        border-color: rgba(210, 92, 92, 0.76);
+        color: #ffaaa2;
+        background: rgba(118, 35, 35, 0.2);
+    }
+
     .luxriot-summary-channel-pill {
         display: inline-flex;
         align-items: center;

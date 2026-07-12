@@ -4544,6 +4544,52 @@
         setLuxriotStatus(`Exported ${filename}`);
     }
 
+    async function generateLuxriotSemanticRollup(rowIndex, triggerBtn = null) {
+        const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+        if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+        const row = luxriotSummaryRollupRows[idx] || {};
+        const channelId = Number(row?.channel_id) || getSelectedSummaryChannel();
+        const level = normalizeSummaryLevel(row?.level || luxriotSummaryLevel);
+        const windowStart = Number(row?.window_start);
+        const windowEnd = Number(row?.window_end);
+        if (!Number.isFinite(channelId) || !Number.isFinite(windowStart) || !Number.isFinite(windowEnd)) return;
+        const params = new URLSearchParams({
+            channel_id: String(channelId),
+            run: 'all',
+            from_ts: String(windowStart),
+            to_ts: String(Math.max(windowStart, windowEnd - 0.001)),
+            level_limit: '1',
+            target_level: level,
+            synthesize: '1',
+        });
+        const originalLabel = triggerBtn ? triggerBtn.textContent : '';
+        if (triggerBtn) {
+            triggerBtn.disabled = true;
+            triggerBtn.textContent = 'Generating…';
+        }
+        setLuxriotStatus(`Generating ${level} semantic summary for ${getLuxriotChannelLabel(channelId)}…`);
+        try {
+            const response = await fetch(`/luxriot/rollups?${params.toString()}`, { cache: 'no-store' });
+            const data = await parseApiJson(response, 'Semantic rollup generation failed');
+            const rows = Array.isArray(data?.levels?.[level]) ? data.levels[level] : [];
+            const generated = rows.find((candidate) => String(candidate?.rollup_id || '') === String(row?.rollup_id || '')) || rows[0];
+            const kind = String(generated?.summary_kind || '').trim().toLowerCase();
+            if (!['llm', 'llm_cached'].includes(kind)) {
+                const reason = String(generated?.generation_error || generated?.generation_status || 'LM unavailable');
+                throw new Error(`Semantic summary unavailable: ${reason}`);
+            }
+            setLuxriotStatus(`${level} semantic summary generated`);
+            await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true, false);
+        } catch (error) {
+            setLuxriotStatus(error.message || 'Semantic rollup generation failed', true);
+        } finally {
+            if (triggerBtn) {
+                triggerBtn.disabled = false;
+                triggerBtn.textContent = originalLabel || 'Generate semantic';
+            }
+        }
+    }
+
     function pushSummaryRollupContext(level, sourceIds = null, label = '') {
         const normalized = normalizeSummaryLevel(level);
         const ids = Array.isArray(sourceIds)
@@ -4623,6 +4669,8 @@
             const sourceLevel = String(row?.source_level || '').trim();
             const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
             const summary = String(row?.summary || '').trim();
+            const summaryKind = String(row?.summary_kind || 'degraded').trim().toLowerCase();
+            const generationStatus = String(row?.generation_status || summaryKind).trim().toLowerCase();
             const summaryParts = splitSummaryAndJson(summary);
             const summaryMain = summaryParts.main || summary;
             const summaryJson = summaryParts.json;
@@ -4630,14 +4678,29 @@
             const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
             const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
             const alertBadges = renderSummaryAlertBadges(row, rowLevel);
+            const semanticReady = summaryKind === 'llm' || summaryKind === 'llm_cached';
+            const pending = summaryKind === 'pending_context' || generationStatus === 'pending';
+            const statusLabel = semanticReady
+                ? (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic')
+                : pending
+                    ? 'aggregation pending'
+                    : 'semantic unavailable';
+            const statusClass = semanticReady ? 'ready' : pending ? 'pending' : 'degraded';
+            const statusTitle = statusClass === 'degraded'
+                ? 'This is a coverage/status fallback, not a period-level behavioral conclusion.'
+                : statusLabel;
+            const generateButton = statusClass === 'degraded'
+                ? `<button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-generate="${idx}">Generate semantic</button>`
+                : '';
             return `
                 <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
                     <div class="luxriot-summary-head">
-                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}${alertBadges}</div>
+                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-rollup-status ${escapeHtml(statusClass)}" title="${escapeHtml(statusTitle)}">${escapeHtml(statusLabel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}${alertBadges}</div>
                         <div class="luxriot-summary-actions">
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-export="${idx}">Export</button>
+                            ${generateButton}
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                         </div>
                     </div>
@@ -4761,16 +4824,23 @@
             const pendingCount = luxriotSummaryRollupRows
                 .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
                 .length;
+            const degradedCount = luxriotSummaryRollupRows
+                .filter((row) => {
+                    const kind = String(row?.summary_kind || '').trim().toLowerCase();
+                    return kind && !['llm', 'llm_cached', 'pending_context'].includes(kind);
+                })
+                .length;
             const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
             const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
             const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
+            const degradedLabel = degradedCount > 0 ? ` · semantic unavailable ${degradedCount}` : '';
             const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
             const aggregationElapsed = Number(data.aggregation?.elapsed_sec);
             const elapsedLabel = Number.isFinite(aggregationElapsed)
                 ? ` · aggregated ${aggregationElapsed.toFixed(1)}s`
                 : '';
             const channelLabel = getLuxriotChannelLabel(channelId);
-            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel}${elapsedLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${degradedLabel}${waitLabel}${elapsedLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
             setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
             return true;
         } catch (err) {
@@ -9591,6 +9661,14 @@
                 if (!Number.isFinite(idx)) return;
                 event.preventDefault();
                 exportLuxriotRollupFromRow(idx);
+                return;
+            }
+            const rollupGenerateBtn = target.closest('[data-luxriot-rollup-generate]');
+            if (rollupGenerateBtn instanceof HTMLButtonElement) {
+                const idx = parseInt(rollupGenerateBtn.dataset.luxriotRollupGenerate || '', 10);
+                if (!Number.isFinite(idx)) return;
+                event.preventDefault();
+                void generateLuxriotSemanticRollup(idx, rollupGenerateBtn);
                 return;
             }
             const rollupDrillBtn = target.closest('[data-luxriot-rollup-drill]');
