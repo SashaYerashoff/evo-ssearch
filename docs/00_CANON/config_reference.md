@@ -127,6 +127,7 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 | `EVOSSEARCH_LM_VIDEO_MAX_TOKENS` / `_TEMPERATURE` | VLM output sampling limits |
 | `EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS` (`24000`) | Warning threshold for text-side VLM/rollup input payloads |
 | `EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS` (`2500000`) | Warning threshold for base64 image payload size |
+| `EVOSSEARCH_LM_VIDEO_CONTEXT_TOKENS_WARN` (`7000`) | Rough VLM context estimate (chars/4 + ~300 visual tokens per image) that adds an `llm_input_stats` warning before the model truncates; align with the serving `--max-model-len` |
 
 ## Agent context budget
 
@@ -170,6 +171,21 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS` (`2`) | Max live CLIP hits considered per probe signal |
 | `EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED` (`true`) | Persist detection frames |
 | `EVOSSEARCH_DETECTIONS_RETENTION_*` | Dedup/keep windows + similarity thresholds |
+
+## Capture apex decider (per-second CV frame selection)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_CAPTURE_BURST_ZSCORE` (`6.0`) | Robust z-score over the channel's own measured activity baseline that marks a second as `burst` (motion peak wins outright, blur expected) |
+| `EVOSSEARCH_LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR` (`0.004`) | Mean-abs grayscale delta below this is sensor noise, not motion; such seconds are `quiet` and ship the sharpest frame |
+| `EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_BIAS` (`auto`) | Site default for the decider: `auto` (adaptive per-channel baseline), `action` (always motion peak), `clarity` (always sharpest). Per-channel override lives in channel prompt settings |
+
+The decider classifies every capture second as `quiet`/`normal`/`burst` relative to
+the channel's persisted motion baseline (homeostasis). `normal` seconds ship the
+sharpest frame of the action band; `burst` seconds ship the motion peak and may
+attach one sharper companion frame of the same second (archived as
+`burst_companion`, offered to the VLM as one extra labeled snapshot). Burst/normal
+markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 
 ## Road CV primitives (experimental)
 

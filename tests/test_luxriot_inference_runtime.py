@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 from uuid import uuid4
 
+import random
+
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from inference_queue import (
     InMemoryInferenceQueueRepository,
@@ -210,6 +212,346 @@ def load_lm_alert_parser():
             exec(compile(ast.Module([node], []), "oldapp.py", "exec"), namespace)
             return namespace["_parse_lm_alerts"]
     raise AssertionError("_parse_lm_alerts not found")
+
+
+def _deterministic_noise_frame(
+    seed: int,
+    blur_radius: float = 0.0,
+    size: Tuple[int, int] = (320, 180),
+) -> Image.Image:
+    rnd = random.Random(seed)
+    raw = bytes(rnd.randrange(256) for _ in range(size[0] * size[1]))
+    frame = Image.frombytes("L", size, raw).convert("RGB")
+    if blur_radius > 0:
+        frame = frame.filter(ImageFilter.GaussianBlur(blur_radius))
+    return frame
+
+
+class LuxriotCaptureApexDeciderTests(unittest.TestCase):
+    def _make_session(self, temp: str) -> Tuple[LuxriotManager, LuxriotCaptureSession]:
+        manager = build_manager(Path(temp))
+        session = LuxriotCaptureSession(
+            manager,
+            channel_id=7,
+            batch_size=12,
+            prompt="Describe activity.",
+            run_id="run-7",
+            interval_override=0.2,
+        )
+        return manager, session
+
+    def test_normal_second_prefers_sharp_frame_of_the_same_action(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp)
+            session._accept_captured_frame(_deterministic_noise_frame(1), 1_000, summarize=False)
+            blurry_peak = _deterministic_noise_frame(2, blur_radius=6.0)
+            # The sharp frame carries slightly less motion than the blurred
+            # peak but stays inside the active band; v1 would ship the smear.
+            sharp_active = Image.blend(blurry_peak, _deterministic_noise_frame(3), 0.75)
+            session._accept_captured_frame(blurry_peak, 2_100, summarize=False)
+            session._accept_captured_frame(sharp_active, 2_500, summarize=False)
+            session._flush_capture_apex_bucket()
+
+            selection = session.recent_frame_items()[-1]["capture_selection"]
+            self.assertEqual(selection["policy"], "capture_per_second_cv_apex_v2")
+            self.assertEqual(selection["selection_mode"], "normal")
+            self.assertEqual(selection["selection_source"], "capture_cv_sharp_active")
+            self.assertEqual(selection["selected_timestamp_ms"], 2_500)
+            self.assertTrue(selection["apex_available"])
+            self.assertTrue(selection["baseline"]["warmup"])
+            self.assertEqual(selection["score_source"], "find_edges_variance")
+
+    def test_burst_second_keeps_motion_peak_and_attaches_sharper_companion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp)
+            session.capture_activity_baseline_level = 0.001
+            session.capture_activity_baseline_dev = 0.0002
+            session.capture_activity_baseline_buckets = 500
+            session._accept_captured_frame(_deterministic_noise_frame(1), 1_000, summarize=False)
+            blurry_peak = _deterministic_noise_frame(2, blur_radius=6.0)
+            sharp_companion = Image.blend(blurry_peak, _deterministic_noise_frame(3), 0.6)
+            session._accept_captured_frame(blurry_peak, 2_100, summarize=False)
+            session._accept_captured_frame(sharp_companion, 2_400, summarize=False)
+            session._flush_capture_apex_bucket()
+
+            frame = session.recent_frame_items()[-1]
+            selection = frame["capture_selection"]
+            self.assertEqual(selection["selection_mode"], "burst")
+            self.assertEqual(selection["selection_source"], "capture_cv_frame_delta")
+            self.assertEqual(selection["selected_timestamp_ms"], 2_100)
+            self.assertGreater(selection.get("activity_x") or 0.0, 10.0)
+            self.assertFalse(selection["baseline"]["warmup"])
+            companion = frame.get("burst_companion")
+            self.assertIsNotNone(companion)
+            self.assertEqual(companion["timestamp_ms"], 2_400)
+            self.assertEqual(companion["thumbnail"], "jpeg")
+            self.assertEqual(companion["role"], "burst_sharp_companion")
+            self.assertEqual(selection["companion"]["timestamp_ms"], 2_400)
+            status = session.status()
+            self.assertEqual(status["capture_apex_companion_count"], 1)
+            self.assertEqual(status["capture_apex_mode_counts"].get("burst"), 1)
+
+    def test_clarity_bias_prefers_sharpest_regardless_of_motion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager, session = self._make_session(temp)
+            manager.update_prompt_settings(channel_id=7, capture_selector_bias="clarity")
+            session._accept_captured_frame(_deterministic_noise_frame(1), 1_000, summarize=False)
+            blurry_peak = _deterministic_noise_frame(2, blur_radius=6.0)
+            sharp_active = Image.blend(blurry_peak, _deterministic_noise_frame(3), 0.75)
+            session._accept_captured_frame(blurry_peak, 2_100, summarize=False)
+            session._accept_captured_frame(sharp_active, 2_500, summarize=False)
+            session._flush_capture_apex_bucket()
+
+            selection = session.recent_frame_items()[-1]["capture_selection"]
+            self.assertEqual(selection["selection_mode"], "quiet")
+            self.assertEqual(selection["selection_source"], "capture_cv_sharpest")
+            self.assertEqual(selection["selected_timestamp_ms"], 2_500)
+            self.assertEqual(selection["selector_bias"], "clarity")
+
+    def test_bucket_mode_is_relative_to_channel_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp)
+            statue = {"level": 0.0005, "dev": 0.0001, "buckets": 500, "warmup": False}
+            intersection = {"level": 0.05, "dev": 0.02, "buckets": 500, "warmup": False}
+            warmup = {"level": 0.0005, "dev": 0.0001, "buckets": 10, "warmup": True}
+            self.assertEqual(session._classify_capture_bucket_mode(0.02, statue, "auto"), "burst")
+            self.assertEqual(session._classify_capture_bucket_mode(0.02, intersection, "auto"), "normal")
+            self.assertEqual(session._classify_capture_bucket_mode(0.003, statue, "auto"), "quiet")
+            self.assertEqual(session._classify_capture_bucket_mode(0.5, warmup, "auto"), "normal")
+            self.assertEqual(session._classify_capture_bucket_mode(0.02, intersection, "action"), "burst")
+            self.assertEqual(session._classify_capture_bucket_mode(0.5, intersection, "clarity"), "quiet")
+
+    def test_activity_baseline_resists_burst_contamination(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp)
+            for _ in range(200):
+                session._update_capture_activity_baseline_locked(0.01)
+            level_before = float(session.capture_activity_baseline_level)
+            session._update_capture_activity_baseline_locked(0.9)
+            self.assertLess(float(session.capture_activity_baseline_level), level_before * 1.5)
+            self.assertEqual(session.capture_activity_baseline_buckets, 201)
+
+    def test_channel_baseline_persists_and_seeds_new_sessions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=store)
+            manager.note_capture_baseline(7, {"level": 0.0125, "dev": 0.003, "buckets": 640})
+            self.assertTrue(manager.persist_summary_state())
+
+            reloaded = build_manager(Path(temp), runtime_state_store=store)
+            restored = reloaded.get_persisted_capture_baseline(7)
+            self.assertIsNotNone(restored)
+            self.assertAlmostEqual(restored["level"], 0.0125)
+            self.assertEqual(restored["buckets"], 640)
+
+            session = LuxriotCaptureSession(
+                reloaded,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe activity.",
+                run_id="run-7",
+                interval_override=0.2,
+            )
+            self.assertAlmostEqual(float(session.capture_activity_baseline_level), 0.0125)
+            self.assertEqual(session.capture_activity_baseline_buckets, 640)
+            self.assertFalse(session.status()["capture_activity_baseline"]["warmup"])
+
+    def test_selector_bias_is_a_channel_setting_with_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            settings = manager.update_prompt_settings(channel_id=7, capture_selector_bias="action")
+            self.assertEqual(settings["capture_selector_bias"], "action")
+            self.assertIn("capture_selector_bias", settings["override_fields"])
+            self.assertEqual(settings["setting_sources"]["capture_selector_bias"], "channel_override")
+            self.assertEqual(manager.get_capture_selector_bias(7), "action")
+            self.assertEqual(manager.get_capture_selector_bias(8), "auto")
+
+            reset = manager.update_prompt_settings(
+                channel_id=7,
+                clear_override_fields=["capture_selector_bias"],
+            )
+            self.assertEqual(reset["capture_selector_bias"], "auto")
+            self.assertNotIn("capture_selector_bias", reset["override_fields"])
+
+            with self.assertRaises(ValueError):
+                manager.update_prompt_settings(channel_id=7, capture_selector_bias="fastest")
+
+
+def _burst_batch_frame(
+    *,
+    timestamp_ms: int,
+    thumbnail: str = "frame-b64",
+    mode: str = "burst",
+    activity_x: float = 12.4,
+    with_companion: bool = True,
+) -> Dict[str, Any]:
+    selection: Dict[str, Any] = {
+        "policy": "capture_per_second_cv_apex_v2",
+        "selection_mode": mode,
+        "activity_x": activity_x,
+        "activity_peak": 0.31,
+        "baseline": {"level": 0.002, "dev": 0.0004, "buckets": 500, "warmup": False},
+        "selected_timestamp_ms": int(timestamp_ms),
+        "selected_source_frame_index": 1,
+        "selection_source": "capture_cv_frame_delta",
+        "apex_available": True,
+    }
+    frame: Dict[str, Any] = {
+        "thumbnail": thumbnail,
+        "captured_at": timestamp_ms / 1000.0,
+        "time_sec": timestamp_ms / 1000.0,
+        "timestamp_ms": int(timestamp_ms),
+        "width": 320,
+        "height": 180,
+        "frame_hash": f"hash-{timestamp_ms}",
+        "capture_selection": selection,
+    }
+    if with_companion:
+        companion = {
+            "role": "burst_sharp_companion",
+            "thumbnail": f"companion-{timestamp_ms}",
+            "timestamp_ms": int(timestamp_ms) + 400,
+            "source_frame_index": 3,
+            "frame_hash": f"companion-hash-{timestamp_ms}",
+            "sharpness": 912.5,
+            "activity": 0.21,
+        }
+        frame["burst_companion"] = companion
+        selection["companion"] = {
+            key: companion[key]
+            for key in ("timestamp_ms", "source_frame_index", "frame_hash", "sharpness", "activity")
+        }
+    return frame
+
+
+class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
+    def test_burst_seconds_reach_vector_signal_and_prompt_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.note_capture_baseline(7, {"level": 0.002, "dev": 0.0004, "buckets": 600})
+            frames = [
+                _burst_batch_frame(timestamp_ms=100_000),
+                _burst_batch_frame(
+                    timestamp_ms=101_000,
+                    mode="normal",
+                    activity_x=1.1,
+                    with_companion=False,
+                ),
+            ]
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=12,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=frames,
+            )
+            attention = batch["vector_signal"].get("capture_attention")
+            self.assertIsNotNone(attention)
+            seconds = attention["seconds"]
+            self.assertEqual(len(seconds), 1)
+            self.assertEqual(seconds[0]["snapshot"], 1)
+            self.assertEqual(seconds[0]["mode"], "burst")
+            self.assertEqual(seconds[0]["blur"], "expected_motion")
+            self.assertTrue(seconds[0]["sharper_companion"])
+            self.assertAlmostEqual(seconds[0]["activity_x"], 12.4)
+            self.assertFalse(attention["baseline"]["warmup"])
+
+            system_prompt = batch["system_prompt"]
+            self.assertIn("VECTOR_SIGNALS_JSON", system_prompt)
+            self.assertIn("capture_attention marks snapshots", system_prompt)
+            self.assertIn("Measured motion homeostasis", system_prompt)
+            self.assertIn("typical per-second motion on this channel is low", system_prompt)
+
+    def test_quiet_batches_do_not_spend_prompt_tokens_on_attention(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            frames = [
+                _burst_batch_frame(
+                    timestamp_ms=100_000,
+                    mode="quiet",
+                    activity_x=0.4,
+                    with_companion=False,
+                )
+            ]
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=12,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=frames,
+            )
+            self.assertNotIn("capture_attention", batch["vector_signal"] or {})
+
+    def test_archive_sampler_keeps_burst_apex_and_companion(self):
+        frames = [
+            _burst_batch_frame(timestamp_ms=100_000, mode="normal", activity_x=1.0, with_companion=False),
+            _burst_batch_frame(timestamp_ms=101_000),
+            _burst_batch_frame(timestamp_ms=102_000, mode="normal", activity_x=1.0, with_companion=False),
+        ]
+        records = LuxriotManager._summary_archive_frames(
+            frames,
+            batch_start_ms=100_000,
+            batch_end_ms=102_000,
+            sample_count=2,
+        )
+        roles = [record["anchor_role"] for record in records]
+        self.assertIn("burst_apex", roles)
+        self.assertIn("burst_companion", roles)
+        companion_record = next(record for record in records if record["anchor_role"] == "burst_companion")
+        self.assertEqual(companion_record["thumbnail"], "companion-101000")
+        self.assertEqual(companion_record["timestamp_ms"], 101_400)
+        self.assertEqual(companion_record["companion_of_timestamp_ms"], 101_000)
+        apex_record = next(record for record in records if record["anchor_role"] == "burst_apex")
+        self.assertEqual(apex_record["timestamp_ms"], 101_000)
+
+    def test_message_builder_appends_single_burst_companion_frame(self):
+        import oldapp
+
+        frames = [
+            _burst_batch_frame(timestamp_ms=100_000, activity_x=5.0),
+            _burst_batch_frame(timestamp_ms=101_000, activity_x=20.0),
+            _burst_batch_frame(timestamp_ms=102_000, mode="normal", activity_x=1.0, with_companion=False),
+        ]
+        messages = oldapp._build_luxriot_messages("#7", frames, "Describe.", "System.")
+        user_content = messages[1]["content"]
+        image_parts = [part for part in user_content if part.get("type") == "image_url"]
+        self.assertEqual(len(image_parts), 4)
+        companion_notes = [
+            part["text"]
+            for part in user_content
+            if part.get("type") == "text" and "sharper companion" in str(part.get("text") or "")
+        ]
+        self.assertEqual(len(companion_notes), 1)
+        self.assertIn("Snapshot 4 - sharper companion of burst Snapshot 2", companion_notes[0])
+        self.assertIn("companion-101000", image_parts[-1]["image_url"]["url"])
+
+    def test_context_token_estimate_warns_before_model_truncation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            stats = manager._estimate_message_payload_chars(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            [{"type": "text", "text": "x" * 8_000}]
+                            + [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/jpeg;base64,abc", "detail": "high"},
+                                }
+                            ]
+                            * 20
+                        ),
+                    }
+                ]
+            )
+            self.assertGreaterEqual(stats["estimated_context_tokens"], 8_000)
+            warnings = manager._summary_input_warnings(stats)
+            self.assertTrue(any("estimated_context_tokens" in warning for warning in warnings))
 
 
 class LuxriotCaptureDispatchTests(unittest.TestCase):

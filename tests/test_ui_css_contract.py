@@ -167,6 +167,71 @@ def test_modal_markup_has_no_obvious_duplicate_wrappers_or_options():
     assert TEMPLATE.count('<option value="skip" selected>Skip matching</option>') == 1
 
 
+def test_video_workspace_keeps_preview_and_feed_controls_in_their_compact_panes():
+    channel = TEMPLATE.index('id="luxriotChannelSelect"')
+    preview = TEMPLATE.index('id="luxriotViewport"')
+    cadence = TEMPLATE.index('id="luxriotBatchSize"')
+    feed = TEMPLATE.index('class="luxriot-card luxriot-summaries-card')
+    feed_filters = TEMPLATE.index('id="luxriotSummaryChannelSelect"')
+    runtime = TEMPLATE.index('class="luxriot-selected-runtime"')
+    streams = TEMPLATE.index('id="luxriotStreams"')
+
+    assert channel < preview < cadence < feed < feed_filters < runtime < streams
+    assert TEMPLATE.count('id="luxriotViewport"') == 1
+    assert TEMPLATE.count('id="luxriotSummaryChannelSelect"') == 1
+    assert 'data-road-scene-grounding' not in TEMPLATE
+    assert '.luxriot-sidebar-preview .luxriot-viewport' in CSS
+    assert '.luxriot-summaries-card .video-feed-head' in CSS
+    assert '.luxriot-selected-runtime-facts' in CSS
+
+
+def test_video_workspace_compacts_controls_without_hiding_mobile_panes():
+    assert 'class="luxriot-row video-channel-row"' in TEMPLATE
+    assert 'class="luxriot-row video-model-row"' in TEMPLATE
+    assert TEMPLATE.count('class="runtime-fact-secondary"') == 2
+    assert '.video-command-panel #luxriotBatchInfo' in CSS
+    assert '.luxriot-stream-card > .studio-panel-head' in CSS
+    assert 'Narrow Video workspace: stack complete panes' in CSS
+
+    narrow = CSS.split('Narrow Video workspace: stack complete panes', 1)[1]
+    assert '.search-panel,' in narrow
+    assert '.video-box,' in narrow
+    assert '.video-rail,' in narrow
+    assert '.video-workspace' in narrow
+    assert 'overflow: visible;' in narrow
+    assert 'grid-auto-rows: max-content;' in narrow
+
+
+def test_remaining_studio_tabs_keep_inspectors_until_tablet_and_stack_on_mobile():
+    assert 'Compact density for the non-video workspaces' in CSS
+    compact = CSS.split('Compact density for the non-video workspaces', 1)[1]
+    for selector in (
+        '.archive-search-shell .archive-section',
+        '.monitor-selection-panel',
+        '.agent-chat-topbar',
+        '.agent-messages',
+    ):
+        assert selector in compact
+
+    tablet = CSS.split('@media (max-width: 1440px)', 1)[1].split(
+        '@media (max-width: 1260px)', 1
+    )[0]
+    assert '.monitor-box {' in tablet
+    assert '.agent-box {' in tablet
+    assert '.monitor-inspector' not in tablet
+    assert '.agent-inspector' not in tablet
+
+    assert 'Narrow Archive/Monitoring/Agent workspaces' in CSS
+    narrow = CSS.split('Narrow Archive/Monitoring/Agent workspaces', 1)[1]
+    assert '.archive-search-shell' in narrow
+    assert '.monitor-board-panel' in narrow
+    assert '.agent-chat-area' in narrow
+    assert 'grid-auto-rows: max-content;' in narrow
+    assert '.results-grid,' in narrow
+    assert '#probeCards,' in narrow
+    assert '.agent-messages' in narrow
+
+
 def test_escape_closes_all_primary_modals():
     for token in (
         "setProbeSnapModalVisibility(false)",
@@ -438,16 +503,25 @@ def test_expected_summary_backpressure_is_not_rendered_as_a_capture_failure():
     assert health.index("if (issue.hardError)") < health.index("if (issue.backpressure || droppedBatches > 0)")
 
 
-def test_archive_media_consumes_segment_metadata_for_guarded_continuation():
+def test_archive_media_loops_the_complete_description_batch():
     assert "numericHeader('X-Stream-Last-Sample-Timestamp')" in JS
     assert "numericHeader('X-EVA-Archive-Resolved-Time-Ms')" in JS
+    assert "numericHeader('X-EVA-Archive-Duration-Seconds')" in JS
     assert "X-EVA-Archive-Frame-Alignment" in JS
     assert "X-EVA-HTML5-Compatible" in JS
-    assert "const nextTimeMs = Number(negotiated.lastSampleTimestampMs) + 1" in JS
-    assert "continuationTimeMs > timeMs" in JS
+    assert "function archivePlaybackWindow" in JS
+    assert "Math.ceil(batchSpanMs / 1000) + 1" in JS
+    assert "Math.min(15, Math.ceil(batchSpanMs / 1000) + 1)" in JS
+    assert "params.set('duration_sec'" in JS
+    assert "durationSec * 3000 + 15000" in JS
+    assert "function fetchLuxriotMediaBlob" in JS
+    assert "URL.createObjectURL(negotiated.blob)" in JS
+    assert "URL.revokeObjectURL(archiveMediaObjectUrl)" in JS
+    assert ".archive-review-frame .feature-btn[hidden]" in CSS
+    assert "video.loop = true" in JS
+    assert "video.currentTime = 0" in JS
     assert "isCurrentArchiveMediaRequest(requestContext)" in JS
-    assert "Loading the next recorded archive segment" in JS
-    assert "bounded archive segment ended without a next-sample timestamp" in JS
+    assert "Loading the next recorded archive segment" not in JS
 
 
 def test_rollup_aggregation_progress_is_targeted_generation_safe_and_cleared():

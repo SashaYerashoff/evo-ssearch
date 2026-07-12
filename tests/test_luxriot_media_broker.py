@@ -284,7 +284,7 @@ def test_archive_media_broker_forwards_single_range_and_response_range_headers(
     _install_client(monkeypatch, fake)
 
     response = app_client.get(
-        "/luxriot/media/archive/9?time_ms=1700000000000&stream=subStream",
+        "/luxriot/media/archive/9?time_ms=1700000000000&stream=subStream&duration_sec=15",
         headers={"Range": "bytes=0-23"},
     )
 
@@ -294,6 +294,7 @@ def test_archive_media_broker_forwards_single_range_and_response_range_headers(
     assert response.headers["X-Stream-Start-Time"] == "1700000000000"
     assert response.headers["X-Stream-Last-Sample-Timestamp"] == "1700000000900"
     assert response.headers["X-EVA-Archive-Resolved-Time-Ms"] == "1700000000000"
+    assert response.headers["X-EVA-Archive-Duration-Seconds"] == "15"
     assert response.headers["X-EVA-Archive-Frame-Alignment"] == "next_frame_time"
     assert response.headers["X-EVA-HTML5-Compatible"] == "requested"
     frame_method, frame_path, frame_kwargs = fake.calls[0]
@@ -307,11 +308,12 @@ def test_archive_media_broker_forwards_single_range_and_response_range_headers(
     assert kwargs["params"] == {
         "time": 1700000000000,
         "streamType": "subStream",
-        "duration": 1,
+        "duration": 15,
         "html5compatible": "true",
     }
     assert kwargs["headers"]["Range"] == "bytes=0-23"
     assert kwargs["headers"]["Streaming-Web-Ver"] == "1.3.0"
+    assert kwargs["timeout"][1] >= 23.0
 
 
 def test_archive_media_broker_falls_back_when_html5_query_is_rejected(
@@ -357,6 +359,24 @@ def test_archive_media_broker_reports_gap_when_next_frame_time_is_empty(
     assert response.status_code == 409
     assert response.get_json()["error_code"] == "archive_gap"
     assert len(fake.calls) == 1
+
+
+def test_archive_media_broker_rejects_duration_beyond_bounded_proxy_limit(
+    app_client,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        oldapp.luxriot_manager,
+        "build_client",
+        lambda: (_ for _ in ()).throw(AssertionError("upstream must not be called")),
+    )
+
+    response = app_client.get(
+        "/luxriot/media/archive/9?time_ms=1700000000000&stream=mainStream&duration_sec=999"
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error_code"] == "invalid_archive_duration"
 
 
 def test_media_broker_rejects_malformed_or_multiple_ranges_before_upstream(

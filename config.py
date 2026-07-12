@@ -394,6 +394,13 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = 2500000
     LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = max(100000, LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS)
+    # Rough VLM context ceiling used only for llm_input_stats warnings
+    # (~4 chars/token + ~300 visual tokens per <=640px image).
+    try:
+        LM_VIDEO_CONTEXT_TOKENS_WARN = int(os.getenv('EVOSSEARCH_LM_VIDEO_CONTEXT_TOKENS_WARN', '7000'))
+    except (TypeError, ValueError):
+        LM_VIDEO_CONTEXT_TOKENS_WARN = 7000
+    LM_VIDEO_CONTEXT_TOKENS_WARN = max(1000, LM_VIDEO_CONTEXT_TOKENS_WARN)
     try:
         LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
     except (TypeError, ValueError):
@@ -561,6 +568,22 @@ class Config:
         1024,
         min(512 * 1024 * 1024, LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES),
     )
+    # Per-second CV apex decider (capture_per_second_cv_apex_v2).
+    try:
+        LUXRIOT_CAPTURE_BURST_ZSCORE = float(os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_BURST_ZSCORE', '6.0'))
+    except (TypeError, ValueError):
+        LUXRIOT_CAPTURE_BURST_ZSCORE = 6.0
+    LUXRIOT_CAPTURE_BURST_ZSCORE = max(1.0, min(50.0, LUXRIOT_CAPTURE_BURST_ZSCORE))
+    try:
+        LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR', '0.004')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = 0.004
+    LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = max(0.0, min(0.25, LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR))
+    LUXRIOT_CAPTURE_SELECTOR_BIAS = os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_BIAS', 'auto').strip().lower()
+    if LUXRIOT_CAPTURE_SELECTOR_BIAS not in {'auto', 'action', 'clarity'}:
+        LUXRIOT_CAPTURE_SELECTOR_BIAS = 'auto'
     LUXRIOT_VECTOR_SIGNALS_ENABLED = os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
     try:
         LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT', '6'))

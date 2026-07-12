@@ -143,6 +143,7 @@
     const luxriotJsonAlertPromptInput = document.getElementById('luxriotJsonAlertPrompt');
     const luxriotBookmarkEnabledInput = document.getElementById('luxriotBookmarkEnabled');
     const luxriotBookmarkCooldownInput = document.getElementById('luxriotBookmarkCooldown');
+    const luxriotSelectorBiasInput = document.getElementById('luxriotSelectorBias');
     const probeChannelSelect = document.getElementById('probeChannelSelect');
     const probeTopKInput = document.getElementById('probeTopK');
     const probePosFloorInput = document.getElementById('probePosFloor');
@@ -405,6 +406,8 @@
     let archiveMediaRequestGeneration = 0;
     let archiveMediaAbortController = null;
     let archiveMediaLoadTimer = null;
+    let archiveMediaLoopTimer = null;
+    let archiveMediaObjectUrl = null;
     let archiveMediaVideo = null;
     let archiveMediaRetryBtn = null;
     let archiveMediaStatus = null;
@@ -1895,11 +1898,48 @@
         params.set('stream', String(options.stream || 'mainStream'));
         if (mediaKind === 'archive' && Number.isFinite(Number(options.timeMs))) {
             params.set('time_ms', String(Math.trunc(Number(options.timeMs))));
+            if (Number.isFinite(Number(options.durationSec))) {
+                params.set('duration_sec', String(Math.max(1, Math.trunc(Number(options.durationSec)))));
+            }
         }
         return `/luxriot/media/${encodeURIComponent(mediaKind)}/${encodeURIComponent(String(channelId))}?${params.toString()}`;
     }
 
-    async function negotiateLuxriotMedia(mediaUrl, controller, timeoutMs = 6000) {
+    function parseLuxriotMediaResponse(response) {
+        const mediaKind = String(response.headers.get('X-EVA-Media-Kind') || '').trim().toLowerCase();
+        const errorCode = String(response.headers.get('X-EVA-Media-Error') || '').trim();
+        if (!response.ok || !['video', 'mjpeg'].includes(mediaKind)) {
+            const error = new Error(errorCode === 'snapshot_only'
+                ? 'Luxriot returned a static image instead of video.'
+                : `Browser-playable media is unavailable${errorCode ? ` (${errorCode})` : ''}.`);
+            error.code = errorCode || 'media_unavailable';
+            error.fallbackUrl = String(response.headers.get('X-EVA-Media-Fallback') || '').trim();
+            throw error;
+        }
+        const numericHeader = (name) => {
+            const rawValue = String(response.headers.get(name) || '').trim();
+            if (!/^\d+$/.test(rawValue)) return null;
+            const parsed = Number(rawValue);
+            return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+        };
+        return {
+            mediaKind,
+            contentType: String(response.headers.get('Content-Type') || ''),
+            bounded: response.headers.get('X-EVA-Media-Bounded') === '1',
+            attentionPreview: response.headers.get('X-EVA-Attention-Preview') === '1',
+            renewAfterMs: numericHeader('X-EVA-Media-Renew-After-Ms'),
+            streamStartTimeMs: numericHeader('X-Stream-Start-Time'),
+            streamEndTimeMs: numericHeader('X-Stream-End-Time'),
+            lastSampleTimestampMs: numericHeader('X-Stream-Last-Sample-Timestamp'),
+            requestedTimeMs: numericHeader('X-EVA-Archive-Requested-Time-Ms'),
+            resolvedTimeMs: numericHeader('X-EVA-Archive-Resolved-Time-Ms'),
+            durationSec: numericHeader('X-EVA-Archive-Duration-Seconds'),
+            frameAlignment: String(response.headers.get('X-EVA-Archive-Frame-Alignment') || '').trim(),
+            html5Compatibility: String(response.headers.get('X-EVA-HTML5-Compatible') || '').trim(),
+        };
+    }
+
+    function assertSameOriginMediaUrl(mediaUrl) {
         const normalizedUrl = String(mediaUrl || '');
         if (
             !normalizedUrl.startsWith('/luxriot/media/')
@@ -1907,6 +1947,11 @@
         ) {
             throw new Error('Media broker URL must be same-origin.');
         }
+        return normalizedUrl;
+    }
+
+    async function negotiateLuxriotMedia(mediaUrl, controller, timeoutMs = 6000) {
+        const normalizedUrl = assertSameOriginMediaUrl(mediaUrl);
         const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
         try {
             const response = await fetch(normalizedUrl, {
@@ -1914,36 +1959,25 @@
                 cache: 'no-store',
                 signal: controller.signal,
             });
-            const mediaKind = String(response.headers.get('X-EVA-Media-Kind') || '').trim().toLowerCase();
-            const errorCode = String(response.headers.get('X-EVA-Media-Error') || '').trim();
-            if (!response.ok || !['video', 'mjpeg'].includes(mediaKind)) {
-                const error = new Error(errorCode === 'snapshot_only'
-                    ? 'Luxriot returned a static image instead of video.'
-                    : `Browser-playable media is unavailable${errorCode ? ` (${errorCode})` : ''}.`);
-                error.code = errorCode || 'media_unavailable';
-                error.fallbackUrl = String(response.headers.get('X-EVA-Media-Fallback') || '').trim();
-                throw error;
-            }
-            const numericHeader = (name) => {
-                const rawValue = String(response.headers.get(name) || '').trim();
-                if (!/^\d+$/.test(rawValue)) return null;
-                const parsed = Number(rawValue);
-                return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-            };
-            return {
-                mediaKind,
-                contentType: String(response.headers.get('Content-Type') || ''),
-                bounded: response.headers.get('X-EVA-Media-Bounded') === '1',
-                attentionPreview: response.headers.get('X-EVA-Attention-Preview') === '1',
-                renewAfterMs: numericHeader('X-EVA-Media-Renew-After-Ms'),
-                streamStartTimeMs: numericHeader('X-Stream-Start-Time'),
-                streamEndTimeMs: numericHeader('X-Stream-End-Time'),
-                lastSampleTimestampMs: numericHeader('X-Stream-Last-Sample-Timestamp'),
-                requestedTimeMs: numericHeader('X-EVA-Archive-Requested-Time-Ms'),
-                resolvedTimeMs: numericHeader('X-EVA-Archive-Resolved-Time-Ms'),
-                frameAlignment: String(response.headers.get('X-EVA-Archive-Frame-Alignment') || '').trim(),
-                html5Compatibility: String(response.headers.get('X-EVA-HTML5-Compatible') || '').trim(),
-            };
+            return parseLuxriotMediaResponse(response);
+        } finally {
+            window.clearTimeout(timeoutId);
+        }
+    }
+
+    async function fetchLuxriotMediaBlob(mediaUrl, controller, timeoutMs) {
+        const normalizedUrl = assertSameOriginMediaUrl(mediaUrl);
+        const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(normalizedUrl, {
+                method: 'GET',
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            const metadata = parseLuxriotMediaResponse(response);
+            const blob = await response.blob();
+            if (!blob.size) throw new Error('The archive media response was empty.');
+            return { ...metadata, blob };
         } finally {
             window.clearTimeout(timeoutId);
         }
@@ -2965,6 +2999,9 @@
                 ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
                 : 0;
         }
+        current.capture_selector_bias = luxriotSelectorBiasInput
+            ? String(luxriotSelectorBiasInput.value || 'auto')
+            : 'auto';
         const baseline = luxriotPromptLoadedSettings && typeof luxriotPromptLoadedSettings === 'object'
             ? luxriotPromptLoadedSettings
             : {};
@@ -2995,6 +3032,9 @@
             if (Number(current.bookmark_cooldown_sec || 0) !== Number(baseline.bookmark_cooldown_sec || 0)) {
                 payload.bookmark_cooldown_sec = current.bookmark_cooldown_sec;
             }
+        }
+        if (String(current.capture_selector_bias || 'auto') !== String(baseline.capture_selector_bias || 'auto')) {
+            payload.capture_selector_bias = current.capture_selector_bias;
         }
         return payload;
     }
@@ -3041,6 +3081,10 @@
             const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
             luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
         }
+        if (luxriotSelectorBiasInput && Object.prototype.hasOwnProperty.call(settings, 'capture_selector_bias')) {
+            const bias = String(settings.capture_selector_bias || 'auto').toLowerCase();
+            luxriotSelectorBiasInput.value = ['auto', 'action', 'clarity'].includes(bias) ? bias : 'auto';
+        }
         luxriotPromptLayers = settings.prompt_layers && typeof settings.prompt_layers === 'object'
             ? settings.prompt_layers
             : null;
@@ -3064,6 +3108,7 @@
             json_alert_prompt: String(settings.json_alert_prompt || ''),
             bookmark_enabled: Boolean(settings.bookmark_enabled),
             bookmark_cooldown_sec: Math.max(0, Number(settings.bookmark_cooldown_sec || 0)),
+            capture_selector_bias: String(settings.capture_selector_bias || 'auto').toLowerCase(),
         };
         const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
         if (luxriotPromptModalInput && activeInput) {
@@ -6770,6 +6815,10 @@
         } catch (_) {
             // Best-effort media cleanup.
         }
+        if (archiveMediaObjectUrl) {
+            URL.revokeObjectURL(archiveMediaObjectUrl);
+            archiveMediaObjectUrl = null;
+        }
         archiveMediaVideo.style.display = 'none';
     }
 
@@ -6780,6 +6829,10 @@
         if (archiveMediaLoadTimer) {
             clearTimeout(archiveMediaLoadTimer);
             archiveMediaLoadTimer = null;
+        }
+        if (archiveMediaLoopTimer) {
+            clearTimeout(archiveMediaLoopTimer);
+            archiveMediaLoopTimer = null;
         }
         clearArchiveMediaVideo();
         if (archiveReviewImg) {
@@ -6947,7 +7000,31 @@
         showRecorderSnapshot();
     }
 
-    function startArchiveMediaPlayback(result, context, force = false, timeMsOverride = null) {
+    function archivePlaybackWindow(result) {
+        const payload = archiveResultPayload(result);
+        const frameTimeMs = Number(archiveFrameTimestampMs(result));
+        const rawStartMs = Number(payload.batch_start_ms ?? result?.batch_start_ms);
+        const rawEndMs = Number(payload.batch_end_ms ?? result?.batch_end_ms);
+        const hasBatchWindow = Number.isFinite(rawStartMs) && rawStartMs > 0
+            && Number.isFinite(rawEndMs) && rawEndMs > 0;
+        const startMs = hasBatchWindow
+            ? Math.trunc(Math.min(rawStartMs, rawEndMs))
+            : Math.trunc(frameTimeMs);
+        const batchSpanMs = hasBatchWindow ? Math.abs(rawEndMs - rawStartMs) : 0;
+        // Batch timestamps describe sampled instants, so include the final
+        // second instead of clipping the last evidence frame from playback.
+        const durationSec = hasBatchWindow
+            ? Math.max(1, Math.min(15, Math.ceil(batchSpanMs / 1000) + 1))
+            : 15;
+        return {
+            startMs,
+            endMs: startMs + durationSec * 1000,
+            durationSec,
+            hasBatchWindow,
+        };
+    }
+
+    function startArchiveMediaPlayback(result, context, force = false) {
         if (!result || !context || archiveReviewContext !== context) return;
         const identity = archiveReviewFrameIdentity(result);
         if (!force && context.mediaIdentity === identity && ['loading', 'playing', 'degraded'].includes(context.mediaState || '')) return;
@@ -6955,11 +7032,9 @@
         context.mediaIdentity = identity;
         context.mediaState = 'loading';
         const channelId = Number(result.channel_id);
-        const requestedOverride = Number(timeMsOverride);
-        const resultTimeMs = Number(archiveFrameTimestampMs(result));
-        const timeMs = Number.isSafeInteger(requestedOverride) && requestedOverride > 0
-            ? requestedOverride
-            : resultTimeMs;
+        const playbackWindow = archivePlaybackWindow(result);
+        const timeMs = Number(playbackWindow.startMs);
+        const durationSec = Number(playbackWindow.durationSec);
         if (!isVideoArchiveResult(result) || !Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(timeMs) || timeMs <= 0) {
             context.mediaState = 'degraded';
             setArchiveMediaState('degraded', 'This result has a static evidence frame, not playable archive video.');
@@ -6974,21 +7049,21 @@
             result,
             identity,
             timeMs,
+            durationSec,
         };
         const mediaUrl = luxriotMediaBrokerUrl('archive', channelId, {
             stream: 'mainStream',
             timeMs,
+            durationSec,
         });
-        setArchiveMediaState('loading', 'Negotiating archive video…');
-        void negotiateLuxriotMedia(mediaUrl, controller)
+        setArchiveMediaState('loading', `Preparing ${durationSec}s batch loop…`);
+        const negotiationTimeoutMs = Math.max(30000, Math.min(60000, durationSec * 3000 + 15000));
+        void fetchLuxriotMediaBlob(mediaUrl, controller, negotiationTimeoutMs)
             .then((negotiated) => {
                 if (!isCurrentArchiveMediaRequest(requestContext)) return;
                 context.mediaSegmentTimeMs = timeMs;
                 context.mediaLastSampleTimestampMs = negotiated.lastSampleTimestampMs;
-                const nextTimeMs = Number(negotiated.lastSampleTimestampMs) + 1;
-                context.mediaNextTimeMs = Number.isSafeInteger(nextTimeMs) && nextTimeMs > timeMs
-                    ? nextTimeMs
-                    : null;
+                context.mediaDurationSec = Number(negotiated.durationSec) || durationSec;
                 const capabilityDetail = [];
                 if (negotiated.resolvedTimeMs && negotiated.resolvedTimeMs !== timeMs) {
                     capabilityDetail.push(`aligned to ${new Date(negotiated.resolvedTimeMs).toLocaleTimeString()}`);
@@ -6998,7 +7073,9 @@
                 if (negotiated.html5Compatibility === 'unsupported_fallback') {
                     capabilityDetail.push('Evo rejected html5compatible; using its legacy stream response');
                 }
+                capabilityDetail.unshift(`${context.mediaDurationSec}s batch loop`);
                 const capabilitySuffix = capabilityDetail.length ? ` (${capabilityDetail.join('; ')})` : '';
+                archiveMediaObjectUrl = URL.createObjectURL(negotiated.blob);
                 const failToStatic = (reason) => {
                     if (archiveMediaLoadTimer) {
                         clearTimeout(archiveMediaLoadTimer);
@@ -7020,9 +7097,16 @@
                         archiveReviewImg.classList.remove('is-hidden');
                         if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.add('is-hidden');
                         setArchiveMediaState('playing', `Archive MJPEG playing${capabilitySuffix}`);
+                        if (!archiveMediaLoopTimer) {
+                            archiveMediaLoopTimer = window.setTimeout(() => {
+                                archiveMediaLoopTimer = null;
+                                if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                                startArchiveMediaPlayback(result, context, true);
+                            }, Math.max(1000, context.mediaDurationSec * 1000 + 500));
+                        }
                     };
                     archiveReviewImg.onerror = () => failToStatic('The archive MJPEG stream could not be decoded.');
-                    archiveReviewImg.src = `${mediaUrl}&request=${Date.now()}`;
+                    archiveReviewImg.src = archiveMediaObjectUrl;
                     return;
                 }
                 const ui = ensureArchiveMediaUi();
@@ -7034,6 +7118,7 @@
                 archiveReviewImg.classList.add('is-hidden');
                 if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.add('is-hidden');
                 video.style.display = 'block';
+                video.loop = true;
                 const markPlayable = (detail) => {
                     if (!isCurrentArchiveMediaRequest(requestContext)) return;
                     clearTimeout(archiveMediaLoadTimer);
@@ -7066,19 +7151,11 @@
                 };
                 video.onended = () => {
                     if (!isCurrentArchiveMediaRequest(requestContext)) return;
-                    const continuationTimeMs = Number(context.mediaNextTimeMs);
-                    if (Number.isSafeInteger(continuationTimeMs) && continuationTimeMs > timeMs) {
-                        context.mediaState = 'loading';
-                        setArchiveMediaState('loading', 'Loading the next recorded archive segment…');
-                        window.setTimeout(() => {
-                            if (!isCurrentArchiveMediaRequest(requestContext)) return;
-                            startArchiveMediaPlayback(result, context, true, continuationTimeMs);
-                        }, 250);
-                        return;
-                    }
-                    failToStatic('The bounded archive segment ended without a next-sample timestamp.');
+                    video.currentTime = 0;
+                    const playPromise = video.play();
+                    if (playPromise && typeof playPromise.catch === 'function') playPromise.catch(() => {});
                 };
-                video.src = `${mediaUrl}&request=${Date.now()}`;
+                video.src = archiveMediaObjectUrl;
                 video.load();
             })
             .catch((error) => {
@@ -7086,7 +7163,7 @@
                 context.mediaState = 'degraded';
                 showArchiveStaticFallback(
                     requestContext,
-                    controller.signal.aborted ? 'Archive media negotiation timed out.' : (error.message || 'Archive video is unavailable.'),
+                    controller.signal.aborted ? 'Archive batch preparation timed out.' : (error.message || 'Archive video is unavailable.'),
                 );
             });
     }

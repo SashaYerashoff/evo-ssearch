@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Proto
 from uuid import uuid4
 
 import requests
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 from requests.auth import HTTPDigestAuth
 try:
     from road_events import (
@@ -155,6 +155,9 @@ VECTOR_SIGNAL_PROMPT_PREFIX = (
     "Current vector/homeostasis signal contract:\n"
     "- VECTOR_SIGNALS_JSON is a secondary attention/arousal signal from CLIP probes and lightweight CV, not visual proof.\n"
     "- Use it to decide which current snapshots deserve extra scrutiny; verify any candidate directly in the current images.\n"
+    "- capture_attention marks snapshots whose motion is far above this channel's measured norm (activity_x = times above "
+    "typical). Motion blur on burst snapshots is expected physics of fast events - describe the action itself; use sharper "
+    "neighboring snapshots (or a provided sharper companion frame) for identity details.\n"
     "- If a vector cue and the current snapshots support an Alert review policy trigger, emit the normal ALERTS_JSON alert.\n"
     "- If the cue is not visually supported, mention uncertainty briefly and do not create an alert from the vector cue alone.\n"
 )
@@ -168,6 +171,19 @@ _OUTDATED_ALERT_PROMPT_MARKERS = (
 
 ALERT_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
 ALERT_SEVERITY_SET = set(ALERT_SEVERITY_ORDER)
+
+# Per-second CV apex decider (policy v2). Fast events produce only motion-blurred
+# frames, so sharpness may only steer the choice when it actually discriminates
+# inside the bucket; burst seconds are judged against the channel's own measured
+# activity baseline, never an absolute threshold.
+CAPTURE_APEX_POLICY = "capture_per_second_cv_apex_v2"
+CAPTURE_SELECTOR_BIASES = ("auto", "action", "clarity")
+_CAPTURE_BASELINE_ALPHA = 0.005          # EMA weight per finalized second (~3 min horizon)
+_CAPTURE_BASELINE_WARMUP_BUCKETS = 90    # seconds of history before burst mode is trusted
+_CAPTURE_NORMAL_ACTIVITY_BAND = 0.65     # normal mode picks sharpest among frames >= band * bucket peak
+_CAPTURE_SHARPNESS_DISCRIMINATION = 1.15 # in-bucket sharpness spread required to influence the choice
+_CAPTURE_COMPANION_ACTIVITY_BAND = 0.5   # companion must still belong to the action
+_CAPTURE_COMPANION_SHARPNESS_GAIN = 1.3  # companion must be meaningfully sharper than the apex
 
 
 class ProbeManagerLike(Protocol):
@@ -1136,6 +1152,30 @@ class LuxriotCaptureSession:
         self.capture_apex_probe_skipped_count = 0
         self.capture_apex_selection_sources: Dict[str, int] = {}
         self.capture_apex_last_selection: Dict[str, Any] = {}
+        self.capture_selector_bias = "auto"
+        self.capture_activity_baseline_level: Optional[float] = None
+        self.capture_activity_baseline_dev = 0.0
+        self.capture_activity_baseline_buckets = 0
+        self.capture_apex_mode_counts: Dict[str, int] = {}
+        self.capture_apex_companion_count = 0
+        baseline_getter = getattr(manager, "get_persisted_capture_baseline", None)
+        if callable(baseline_getter):
+            try:
+                persisted_baseline = baseline_getter(channel_id)
+            except Exception:
+                persisted_baseline = None
+            if isinstance(persisted_baseline, Mapping):
+                persisted_level = manager._finite_float(persisted_baseline.get("level"))
+                if persisted_level is not None and float(persisted_level) >= 0.0:
+                    self.capture_activity_baseline_level = float(persisted_level)
+                    self.capture_activity_baseline_dev = max(
+                        0.0,
+                        float(manager._finite_float(persisted_baseline.get("dev")) or 0.0),
+                    )
+                    self.capture_activity_baseline_buckets = max(
+                        0,
+                        int(_parse_optional_int(persisted_baseline.get("buckets")) or 0),
+                    )
 
     def _refresh_last_error_locked(self) -> None:
         self.last_error = self.summary_last_error or self.capture_last_error or self.probe_last_error
@@ -2053,6 +2093,33 @@ class LuxriotCaptureSession:
             return None
 
     @staticmethod
+    def _capture_cv_sharpness_score(gray: Optional[Image.Image]) -> Optional[float]:
+        """Edge-energy variance on the downscaled gray frame (motion-blur proxy)."""
+
+        if gray is None:
+            return None
+        try:
+            stat = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES))
+            if not stat.var:
+                return None
+            return max(0.0, float(stat.var[0]))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sharpness_discriminates(values: Sequence[Optional[float]]) -> bool:
+        present = [float(value) for value in values if value is not None]
+        if len(present) < 2:
+            return False
+        top = max(present)
+        if top <= 0.0:
+            return False
+        low = min(present)
+        if low <= 0.0:
+            return True
+        return (top / low) >= _CAPTURE_SHARPNESS_DISCRIMINATION
+
+    @staticmethod
     def _capture_cv_delta_score(previous: Optional[Image.Image], current: Optional[Image.Image]) -> Optional[float]:
         if previous is None or current is None:
             return None
@@ -2107,6 +2174,143 @@ class LuxriotCaptureSession:
                 self.capture_apex_probe_failure_count += 1
             self._set_probe_error(exc)
 
+    def _effective_selector_bias(self) -> str:
+        """Read the live channel setting; overrides apply without a restart."""
+
+        bias = "auto"
+        getter = getattr(self.manager, "get_capture_selector_bias", None)
+        if callable(getter):
+            try:
+                bias = str(getter(self.channel_id) or "auto").strip().lower()
+            except Exception:
+                bias = "auto"
+        else:
+            bias = str(self.capture_selector_bias or "auto").strip().lower()
+        if bias not in CAPTURE_SELECTOR_BIASES:
+            bias = "auto"
+        self.capture_selector_bias = bias
+        return bias
+
+    def _capture_noise_floor(self) -> float:
+        try:
+            floor = float(getattr(self.manager.config, "LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR", 0.004))
+        except (TypeError, ValueError):
+            floor = 0.004
+        return max(0.0, min(0.25, floor))
+
+    def _capture_burst_zscore(self) -> float:
+        try:
+            zscore = float(getattr(self.manager.config, "LUXRIOT_CAPTURE_BURST_ZSCORE", 6.0))
+        except (TypeError, ValueError):
+            zscore = 6.0
+        return max(1.0, min(50.0, zscore))
+
+    def _capture_baseline_snapshot_locked(self) -> Dict[str, Any]:
+        level = self.capture_activity_baseline_level
+        return {
+            "level": round(float(level), 6) if level is not None else None,
+            "dev": round(float(self.capture_activity_baseline_dev), 6),
+            "buckets": int(self.capture_activity_baseline_buckets),
+            "warmup": int(self.capture_activity_baseline_buckets) < _CAPTURE_BASELINE_WARMUP_BUCKETS,
+        }
+
+    def _update_capture_activity_baseline_locked(self, bucket_peak: float) -> None:
+        sample = max(0.0, float(bucket_peak))
+        level = self.capture_activity_baseline_level
+        noise_floor = self._capture_noise_floor()
+        if level is None:
+            self.capture_activity_baseline_level = sample
+            self.capture_activity_baseline_dev = 0.0
+        else:
+            # Winsorize the sample so a burst does not immediately raise the
+            # very baseline that detected it; genuine regime shifts still adapt.
+            ceiling = float(level) + 3.0 * max(float(self.capture_activity_baseline_dev), noise_floor / 2.0)
+            clamped = min(sample, ceiling)
+            alpha = _CAPTURE_BASELINE_ALPHA
+            next_level = ((1.0 - alpha) * float(level)) + (alpha * clamped)
+            self.capture_activity_baseline_level = next_level
+            deviation = abs(clamped - next_level)
+            self.capture_activity_baseline_dev = (
+                ((1.0 - alpha) * float(self.capture_activity_baseline_dev)) + (alpha * deviation)
+            )
+        self.capture_activity_baseline_buckets += 1
+
+    def _classify_capture_bucket_mode(
+        self,
+        bucket_peak: float,
+        baseline: Mapping[str, Any],
+        bias: str,
+    ) -> str:
+        noise_floor = self._capture_noise_floor()
+        if bias == "clarity":
+            return "quiet"
+        if bias == "action":
+            return "burst" if bucket_peak > noise_floor else "quiet"
+        if bucket_peak <= noise_floor:
+            return "quiet"
+        level = baseline.get("level")
+        if not bool(baseline.get("warmup")) and level is not None:
+            threshold = float(level) + self._capture_burst_zscore() * max(
+                float(baseline.get("dev") or 0.0),
+                noise_floor / 2.0,
+            )
+            if bucket_peak > threshold:
+                return "burst"
+        return "normal"
+
+    def _select_burst_companion(
+        self,
+        scored: Sequence[Mapping[str, Any]],
+        selected: Mapping[str, Any],
+        activity_peak: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Pick a meaningfully sharper frame of the same action second, if any."""
+
+        threshold = _CAPTURE_COMPANION_ACTIVITY_BAND * max(0.0, float(activity_peak))
+        pool: List[Tuple[float, Mapping[str, Any]]] = []
+        for item in scored:
+            if item is selected:
+                continue
+            sharpness = self.manager._finite_float(item.get("cv_sharpness_score"))
+            if sharpness is None or float(sharpness) <= 0.0:
+                continue
+            if float(self.manager._finite_float(item.get("cv_attention_score")) or 0.0) < threshold:
+                continue
+            pool.append((float(sharpness), item))
+        if not pool:
+            return None
+        best_sharpness, best = max(
+            pool,
+            key=lambda entry: (
+                entry[0],
+                -int(_parse_optional_int(entry[1].get("source_frame_index")) or 0),
+            ),
+        )
+        selected_sharpness = float(self.manager._finite_float(selected.get("cv_sharpness_score")) or 0.0)
+        if selected_sharpness > 0.0 and (best_sharpness / selected_sharpness) < _CAPTURE_COMPANION_SHARPNESS_GAIN:
+            return None
+        return dict(best)
+
+    def _encode_burst_companion(self, companion: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        image = companion.get("image")
+        if image is None:
+            return None
+        try:
+            thumbnail = self.manager.jpeg_encoder(image, max_edge=self.max_edge, quality=85)
+        except Exception:
+            return None
+        if not thumbnail:
+            return None
+        return {
+            "role": "burst_sharp_companion",
+            "thumbnail": thumbnail,
+            "timestamp_ms": int(_parse_optional_int(companion.get("timestamp_ms")) or 0),
+            "source_frame_index": int(_parse_optional_int(companion.get("source_frame_index")) or 0),
+            "frame_hash": str(companion.get("frame_hash") or "")[:40],
+            "sharpness": round(float(self.manager._finite_float(companion.get("cv_sharpness_score")) or 0.0), 6),
+            "activity": round(float(self.manager._finite_float(companion.get("cv_attention_score")) or 0.0), 6),
+        }
+
     def _finalize_capture_apex_bucket(self, bucket: Sequence[Mapping[str, Any]]) -> bool:
         candidates = [dict(item) for item in bucket if isinstance(item, Mapping)]
         if not candidates:
@@ -2117,31 +2321,83 @@ class LuxriotCaptureSession:
                 int(_parse_optional_int(item.get("source_frame_index")) or 0),
             )
         )
+        def activity_of(item: Mapping[str, Any]) -> float:
+            return float(self.manager._finite_float(item.get("cv_attention_score")) or 0.0)
+
+        def sharpness_of(item: Mapping[str, Any]) -> Optional[float]:
+            return self.manager._finite_float(item.get("cv_sharpness_score"))
+
+        def order_of(item: Mapping[str, Any]) -> int:
+            # Negated so that max() prefers the earliest source frame on ties.
+            return -int(_parse_optional_int(item.get("source_frame_index")) or 0)
+
+        activity_peak = max((activity_of(item) for item in candidates), default=0.0)
+        bias = self._effective_selector_bias()
+        with self.lock:
+            baseline = self._capture_baseline_snapshot_locked()
+            self._update_capture_activity_baseline_locked(activity_peak)
+        selection_mode = self._classify_capture_bucket_mode(activity_peak, baseline, bias)
+        activity_x: Optional[float] = None
+        baseline_level = baseline.get("level")
+        if baseline_level is not None and float(baseline_level) > 0.0:
+            activity_x = activity_peak / float(baseline_level)
+
         fallback_reason = ""
         selected_score: Optional[float] = None
+        score_source = ""
+        companion: Optional[Dict[str, Any]] = None
         if len(candidates) == 1:
             selected = candidates[0]
             selection_source = "single_frame"
             fallback_reason = "single_frame_only_no_intra_second_choice"
             apex_available = False
         else:
-            scored = [
-                item
-                for item in candidates
-                if (self.manager._finite_float(item.get("cv_attention_score")) or 0.0) > 0.0
-            ]
-            if scored:
-                selected = min(
+            scored = [item for item in candidates if activity_of(item) > 0.0]
+            all_sharpness = [sharpness_of(item) for item in candidates]
+            if selection_mode == "burst" and scored:
+                # Fast events only exist as motion-blurred frames; the blur is
+                # the evidence, so the motion peak wins outright.
+                selected = max(
                     scored,
-                    key=lambda item: (
-                        -float(self.manager._finite_float(item.get("cv_attention_score")) or 0.0),
-                        int(_parse_optional_int(item.get("source_frame_index")) or 0),
-                    ),
-                )
-                selected_score = float(
-                    self.manager._finite_float(selected.get("cv_attention_score")) or 0.0
+                    key=lambda item: (activity_of(item), sharpness_of(item) or 0.0, order_of(item)),
                 )
                 selection_source = "capture_cv_frame_delta"
+                selected_score = activity_of(selected)
+                score_source = "mean_absolute_grayscale_frame_delta"
+                apex_available = True
+                companion = self._select_burst_companion(scored, selected, activity_peak)
+            elif selection_mode == "normal" and scored:
+                band = [
+                    item
+                    for item in scored
+                    if activity_of(item) >= _CAPTURE_NORMAL_ACTIVITY_BAND * activity_peak
+                ]
+                if band and self._sharpness_discriminates([sharpness_of(item) for item in band]):
+                    selected = max(
+                        band,
+                        key=lambda item: (sharpness_of(item) or 0.0, activity_of(item), order_of(item)),
+                    )
+                    selection_source = "capture_cv_sharp_active"
+                    selected_score = sharpness_of(selected)
+                    score_source = "find_edges_variance"
+                else:
+                    selected = max(
+                        scored,
+                        key=lambda item: (activity_of(item), sharpness_of(item) or 0.0, order_of(item)),
+                    )
+                    selection_source = "capture_cv_frame_delta"
+                    selected_score = activity_of(selected)
+                    score_source = "mean_absolute_grayscale_frame_delta"
+                apex_available = True
+            elif self._sharpness_discriminates(all_sharpness):
+                # Quiet second (or clarity bias): ship the clearest frame.
+                selected = max(
+                    candidates,
+                    key=lambda item: (sharpness_of(item) or 0.0, activity_of(item), order_of(item)),
+                )
+                selection_source = "capture_cv_sharpest"
+                selected_score = sharpness_of(selected)
+                score_source = "find_edges_variance"
                 apex_available = True
             else:
                 timestamps = [
@@ -2174,8 +2430,8 @@ class LuxriotCaptureSession:
         selected_hash = str(selected.get("frame_hash") or "")[:40]
         bucket_start_ms = (source_timestamps[0] // 1000) * 1000
         provenance: Dict[str, Any] = {
-            "version": 1,
-            "policy": "capture_per_second_cv_apex_v1",
+            "version": 2,
+            "policy": CAPTURE_APEX_POLICY,
             "frame_hash_source": "normalized_grayscale_sha1",
             "channel_id": int(self.channel_id),
             "bucket_start_ms": int(bucket_start_ms),
@@ -2188,9 +2444,19 @@ class LuxriotCaptureSession:
             "selection_source": selection_source,
             "apex_available": bool(apex_available),
         }
+        provenance["selection_mode"] = selection_mode
+        provenance["activity_peak"] = round(float(activity_peak), 6)
+        if activity_x is not None:
+            provenance["activity_x"] = round(float(activity_x), 3)
+        provenance["baseline"] = dict(baseline)
+        if bias != "auto":
+            provenance["selector_bias"] = bias
+        selected_sharpness_value = self.manager._finite_float(selected.get("cv_sharpness_score"))
+        if selected_sharpness_value is not None:
+            provenance["selected_sharpness"] = round(float(selected_sharpness_value), 6)
         if selected_score is not None:
             provenance["selection_score"] = round(float(selected_score), 6)
-            provenance["score_source"] = "mean_absolute_grayscale_frame_delta"
+            provenance["score_source"] = score_source or "mean_absolute_grayscale_frame_delta"
         if fallback_reason:
             provenance["fallback_reason"] = fallback_reason
 
@@ -2210,6 +2476,14 @@ class LuxriotCaptureSession:
                 # An unencodable apex must not kill the capture loop; the frame
                 # keeps its provenance and flows on without a preview.
                 pass
+        if companion is not None:
+            companion_payload = self._encode_burst_companion(companion)
+            if companion_payload:
+                frame["burst_companion"] = companion_payload
+                provenance["companion"] = {
+                    key: companion_payload[key]
+                    for key in ("timestamp_ms", "source_frame_index", "frame_hash", "sharpness", "activity")
+                }
         frame["capture_selection"] = dict(provenance)
         frame["capture_source_frame_count"] = len(candidates)
         frame["capture_selected_source_frame_index"] = int(selected_index)
@@ -2229,8 +2503,21 @@ class LuxriotCaptureSession:
             self.capture_apex_selection_sources[selection_source] = (
                 self.capture_apex_selection_sources.get(selection_source, 0) + 1
             )
+            self.capture_apex_mode_counts[selection_mode] = (
+                self.capture_apex_mode_counts.get(selection_mode, 0) + 1
+            )
+            if frame.get("burst_companion"):
+                self.capture_apex_companion_count += 1
             self.capture_apex_last_selection = dict(provenance)
+            baseline_snapshot = self._capture_baseline_snapshot_locked()
             self._enforce_buffer_locked()
+
+        note_baseline = getattr(self.manager, "note_capture_baseline", None)
+        if callable(note_baseline):
+            try:
+                note_baseline(self.channel_id, baseline_snapshot)
+            except Exception:
+                pass
 
         self._add_selected_probe_frame(
             selected.get("image"),
@@ -2306,6 +2593,7 @@ class LuxriotCaptureSession:
                 self._capture_cv_previous_gray,
                 current_gray,
             )
+            cv_sharpness_score = self._capture_cv_sharpness_score(current_gray)
             self._capture_cv_previous_gray = current_gray
             bucket_start_ms = (int(timestamp_ms) // 1000) * 1000
             candidate: Dict[str, Any] = {
@@ -2317,6 +2605,8 @@ class LuxriotCaptureSession:
             }
             if cv_attention_score is not None:
                 candidate["cv_attention_score"] = round(float(cv_attention_score), 6)
+            if cv_sharpness_score is not None:
+                candidate["cv_sharpness_score"] = round(float(cv_sharpness_score), 6)
             if (
                 self._capture_apex_bucket_start_ms is not None
                 and int(self._capture_apex_bucket_start_ms) != bucket_start_ms
@@ -2579,6 +2869,10 @@ class LuxriotCaptureSession:
             capture_apex_probe_skipped_count = self.capture_apex_probe_skipped_count
             capture_apex_selection_sources = dict(self.capture_apex_selection_sources)
             capture_apex_last_selection = dict(self.capture_apex_last_selection)
+            capture_apex_mode_counts = dict(self.capture_apex_mode_counts)
+            capture_apex_companion_count = self.capture_apex_companion_count
+            capture_activity_baseline = self._capture_baseline_snapshot_locked()
+            capture_selector_bias = str(self.capture_selector_bias or "auto")
         return {
             "running": not self.stop_event.is_set() and self.thread.is_alive(),
             "channel_id": self.channel_id,
@@ -2596,6 +2890,10 @@ class LuxriotCaptureSession:
             "capture_apex_probe_skipped_count": capture_apex_probe_skipped_count,
             "capture_apex_selection_sources": capture_apex_selection_sources,
             "capture_apex_last_selection": capture_apex_last_selection,
+            "capture_apex_mode_counts": capture_apex_mode_counts,
+            "capture_apex_companion_count": capture_apex_companion_count,
+            "capture_activity_baseline": capture_activity_baseline,
+            "capture_selector_bias": capture_selector_bias,
             "summary_queue_depth": summary_queue_depth,
             "summary_queue_frame_count": summary_queue_frame_count,
             "summary_queue_max_batches": self.summary_queue_max_batches,
@@ -2957,6 +3255,10 @@ class LuxriotManager:
         self.default_json_alert_prompt = self._normalize_json_alert_prompt(
             getattr(config, "LUXRIOT_ALERTS_JSON_PROMPT", DEFAULT_ALERTS_JSON_PROMPT)
         )
+        self.default_capture_selector_bias = (
+            self._normalize_selector_bias(getattr(config, "LUXRIOT_CAPTURE_SELECTOR_BIAS", "auto"))
+            or "auto"
+        )
         self.state_transitions_enabled = bool(
             getattr(config, "LUXRIOT_STATE_TRANSITIONS_ENABLED", True)
         )
@@ -3002,6 +3304,8 @@ class LuxriotManager:
         self.road_scene_auto_samples: Dict[int, List[Any]] = {}
         self.road_scene_calibrations: Dict[int, Dict[str, Any]] = {}
         self.road_episode_aggregators: Dict[int, Any] = {}
+        # Measured per-channel motion homeostasis (capture decider baseline).
+        self.capture_activity_baselines: Dict[int, Dict[str, Any]] = {}
         try:
             self.lm_input_warning_chars = int(getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000))
         except (TypeError, ValueError):
@@ -4607,6 +4911,47 @@ class LuxriotManager:
             if scene_out:
                 out["road_cv_scene"] = scene_out
 
+        attention = value.get("capture_attention")
+        if isinstance(attention, Mapping):
+            attention_out: Dict[str, Any] = {}
+            policy = str(attention.get("policy") or "").strip()[:60]
+            if policy:
+                attention_out["policy"] = policy
+            attention_baseline = attention.get("baseline")
+            if isinstance(attention_baseline, Mapping):
+                baseline_out: Dict[str, Any] = {}
+                baseline_level = cls._finite_float(attention_baseline.get("level"))
+                if baseline_level is not None:
+                    baseline_out["level"] = round(float(baseline_level), 6)
+                if "warmup" in attention_baseline:
+                    baseline_out["warmup"] = bool(attention_baseline.get("warmup"))
+                if baseline_out:
+                    attention_out["baseline"] = baseline_out
+            second_items: List[Dict[str, Any]] = []
+            raw_seconds = attention.get("seconds")
+            if isinstance(raw_seconds, Sequence) and not isinstance(raw_seconds, (str, bytes, bytearray)):
+                for raw in raw_seconds[:6]:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    snapshot = _parse_optional_int(raw.get("snapshot"))
+                    mode = str(raw.get("mode") or "").strip().lower()[:20]
+                    if snapshot is None or snapshot < 1 or mode not in {"burst", "normal"}:
+                        continue
+                    second_item: Dict[str, Any] = {"snapshot": int(snapshot), "mode": mode}
+                    second_activity = cls._finite_float(raw.get("activity_x"))
+                    if second_activity is not None:
+                        second_item["activity_x"] = round(float(second_activity), 2)
+                    blur = str(raw.get("blur") or "").strip().lower()[:40]
+                    if blur:
+                        second_item["blur"] = blur
+                    if raw.get("sharper_companion"):
+                        second_item["sharper_companion"] = True
+                    second_items.append(second_item)
+            if second_items:
+                attention_out["seconds"] = second_items
+            if attention_out.get("seconds"):
+                out["capture_attention"] = attention_out
+
         health = value.get("health")
         if isinstance(health, Mapping):
             health_out: Dict[str, Any] = {}
@@ -4639,6 +4984,7 @@ class LuxriotManager:
                 "road_cv_frame_scores",
                 "road_episodes",
                 "road_cv_scene",
+                "capture_attention",
             )
         )
         if not has_signal_payload:
@@ -5841,6 +6187,7 @@ class LuxriotManager:
             },
             "bookmark_enabled": bool(self.default_bookmark_enabled),
             "bookmark_cooldown_sec": float(self.default_bookmark_cooldown_sec),
+            "capture_selector_bias": str(self.default_capture_selector_bias or "auto"),
             "json_alert_prompt": str(self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT),
             "channel_overrides": {
                 str(channel_id): dict(settings)
@@ -5858,6 +6205,11 @@ class LuxriotManager:
             "road_scene_calibrations": {
                 str(channel_id): dict(state)
                 for channel_id, state in self.road_scene_calibrations.items()
+                if isinstance(state, Mapping)
+            },
+            "capture_baselines": {
+                str(channel_id): dict(state)
+                for channel_id, state in self.capture_activity_baselines.items()
                 if isinstance(state, Mapping)
             },
             "prompt_settings": prompt_payload,
@@ -6035,12 +6387,29 @@ class LuxriotManager:
                     },
                 }
                 loaded_road_scene_calibrations[int(channel_id)] = normalized_state
+        loaded_capture_baselines: Dict[int, Dict[str, Any]] = {}
+        capture_baselines_raw = payload.get("capture_baselines") if isinstance(payload, Mapping) else None
+        if isinstance(capture_baselines_raw, Mapping):
+            for channel_key, state_value in capture_baselines_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or channel_id <= 0 or not isinstance(state_value, Mapping):
+                    continue
+                level = self._coerce_float(state_value.get("level"))
+                if level is None or level < 0:
+                    continue
+                loaded_capture_baselines[int(channel_id)] = {
+                    "level": float(level),
+                    "dev": max(0.0, float(self._coerce_float(state_value.get("dev")) or 0.0)),
+                    "buckets": max(0, int(_parse_optional_int(state_value.get("buckets")) or 0)),
+                    "updated_at": float(self._coerce_float(state_value.get("updated_at")) or time.time()),
+                }
         loaded_stream_system_prompt: Optional[str] = None
         loaded_alert_policy_prompt: Optional[str] = None
         loaded_rollup_prompts: Dict[str, str] = {}
         loaded_channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
         loaded_default_bookmark_enabled: Optional[bool] = None
         loaded_default_bookmark_cooldown_sec: Optional[float] = None
+        loaded_default_capture_selector_bias: Optional[str] = None
         loaded_default_json_alert_prompt: Optional[str] = None
         loaded_prompt_default_fields: Set[str] = set()
         if isinstance(prompt_settings_raw, Mapping):
@@ -6060,6 +6429,12 @@ class LuxriotManager:
                 raw_cooldown = self._coerce_float(prompt_settings_raw.get("bookmark_cooldown_sec"))
                 loaded_default_bookmark_cooldown_sec = max(0.0, raw_cooldown if raw_cooldown is not None else 0.0)
                 loaded_prompt_default_fields.add("bookmark_cooldown_sec")
+            if "capture_selector_bias" in prompt_settings_raw:
+                loaded_default_capture_selector_bias = self._normalize_selector_bias(
+                    prompt_settings_raw.get("capture_selector_bias")
+                )
+                if loaded_default_capture_selector_bias is not None:
+                    loaded_prompt_default_fields.add("capture_selector_bias")
             if "json_alert_prompt" in prompt_settings_raw:
                 loaded_default_json_alert_prompt = self._normalize_json_alert_prompt(
                     prompt_settings_raw.get("json_alert_prompt")
@@ -6108,6 +6483,12 @@ class LuxriotManager:
                         channel_model_hint = str(channel_payload.get("model_hint") or "").strip()
                         if channel_model_hint:
                             parsed_channel_payload["model_hint"] = channel_model_hint
+                    if "capture_selector_bias" in channel_payload:
+                        channel_selector_bias = self._normalize_selector_bias(
+                            channel_payload.get("capture_selector_bias")
+                        )
+                        if channel_selector_bias is not None:
+                            parsed_channel_payload["capture_selector_bias"] = channel_selector_bias
                     if "json_alert_prompt" in channel_payload:
                         parsed_channel_payload["json_alert_prompt"] = self._normalize_json_alert_prompt(
                             channel_payload.get("json_alert_prompt")
@@ -6135,6 +6516,7 @@ class LuxriotManager:
             self.summary_runs = loaded_runs
             self.channel_routine_context = loaded_routines
             self.road_scene_calibrations = loaded_road_scene_calibrations
+            self.capture_activity_baselines = loaded_capture_baselines
             self.active_summary_runs = {}
             self.channel_prompt_overrides = loaded_channel_prompt_overrides
             self._rebuild_channel_status_digest_locked()
@@ -6146,6 +6528,8 @@ class LuxriotManager:
                 self.default_bookmark_enabled = loaded_default_bookmark_enabled
             if loaded_default_bookmark_cooldown_sec is not None:
                 self.default_bookmark_cooldown_sec = loaded_default_bookmark_cooldown_sec
+            if loaded_default_capture_selector_bias is not None:
+                self.default_capture_selector_bias = loaded_default_capture_selector_bias
             if loaded_default_json_alert_prompt is not None:
                 self.default_json_alert_prompt = loaded_default_json_alert_prompt or self.default_json_alert_prompt
             for level, prompt_text in loaded_rollup_prompts.items():
@@ -6163,6 +6547,51 @@ class LuxriotManager:
     def persist_summary_state(self) -> bool:
         with self.cache_lock:
             return self._persist_summary_state_locked()
+
+    def get_persisted_capture_baseline(self, channel_id: int) -> Optional[Dict[str, Any]]:
+        with self.cache_lock:
+            state = self.capture_activity_baselines.get(int(channel_id))
+            return dict(state) if isinstance(state, Mapping) else None
+
+    def note_capture_baseline(self, channel_id: int, snapshot: Mapping[str, Any]) -> None:
+        """Record the channel's measured motion baseline for persistence/prompting."""
+
+        level = self._coerce_float(snapshot.get("level"))
+        if level is None or level < 0:
+            return
+        record = {
+            "level": float(level),
+            "dev": max(0.0, float(self._coerce_float(snapshot.get("dev")) or 0.0)),
+            "buckets": max(0, int(_parse_optional_int(snapshot.get("buckets")) or 0)),
+            "updated_at": time.time(),
+        }
+        with self.cache_lock:
+            self.capture_activity_baselines[int(channel_id)] = record
+
+    @staticmethod
+    def _activity_level_label(level: float) -> str:
+        if level < 0.01:
+            return "low"
+        if level < 0.05:
+            return "moderate"
+        return "high"
+
+    def _render_capture_homeostasis_prompt(self, channel_id: int) -> str:
+        with self.cache_lock:
+            state = self.capture_activity_baselines.get(int(channel_id))
+            baseline = dict(state) if isinstance(state, Mapping) else None
+        if not baseline:
+            return ""
+        buckets = max(0, int(_parse_optional_int(baseline.get("buckets")) or 0))
+        if buckets < _CAPTURE_BASELINE_WARMUP_BUCKETS:
+            return ""
+        level = float(self._coerce_float(baseline.get("level")) or 0.0)
+        minutes = max(1, int(round(buckets / 60.0)))
+        return (
+            "Measured motion homeostasis (server-computed, trusted): typical per-second motion on this "
+            f"channel is {self._activity_level_label(level)} (activity level {level:.4f}, ~{minutes} min of history). "
+            "VECTOR_SIGNALS_JSON.capture_attention reports how current snapshots compare to this norm."
+        )
 
     def _load_desired_live_sessions(self) -> Dict[int, Dict[str, Any]]:
         state_store = getattr(self, "runtime_state_store", None)
@@ -7020,6 +7449,60 @@ class LuxriotManager:
             bundle["road_cv_scene"] = road_scene
         return self._compact_vector_signal(bundle)
 
+    def _capture_attention_signal(self, frames: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """Summarize capture-decider modes for the exact snapshot numbering the model sees."""
+
+        seconds: List[Dict[str, Any]] = []
+        baseline_info: Optional[Dict[str, Any]] = None
+        policy = ""
+        for index, frame in enumerate(frames, start=1):
+            if not isinstance(frame, Mapping):
+                continue
+            selection = frame.get("capture_selection")
+            if not isinstance(selection, Mapping):
+                continue
+            policy = policy or str(selection.get("policy") or "")
+            baseline_raw = selection.get("baseline")
+            if baseline_info is None and isinstance(baseline_raw, Mapping):
+                baseline_info = {
+                    "level": self._coerce_float(baseline_raw.get("level")),
+                    "warmup": bool(baseline_raw.get("warmup")),
+                }
+            mode = str(selection.get("selection_mode") or "").strip().lower()
+            activity_x = self._coerce_float(selection.get("activity_x"))
+            if mode == "burst":
+                pass
+            elif mode == "normal" and activity_x is not None and float(activity_x) >= 3.0:
+                pass
+            else:
+                continue
+            entry: Dict[str, Any] = {"snapshot": int(index), "mode": mode}
+            if activity_x is not None:
+                entry["activity_x"] = round(float(activity_x), 2)
+            if mode == "burst":
+                entry["blur"] = "expected_motion"
+                if isinstance(selection.get("companion"), Mapping) or frame.get("burst_companion"):
+                    entry["sharper_companion"] = True
+            seconds.append(entry)
+        if not seconds:
+            return {}
+        # Token discipline: bursts first, then the strongest normals, max six.
+        seconds.sort(
+            key=lambda item: (
+                0 if item.get("mode") == "burst" else 1,
+                -float(item.get("activity_x") or 0.0),
+            )
+        )
+        seconds = seconds[:6]
+        seconds.sort(key=lambda item: int(item.get("snapshot") or 0))
+        signal: Dict[str, Any] = {
+            "policy": policy or CAPTURE_APEX_POLICY,
+            "seconds": seconds,
+        }
+        if baseline_info is not None:
+            signal["baseline"] = baseline_info
+        return signal
+
     def _render_vector_signal_prompt(self, vector_signal: object) -> str:
         compact = self._compact_vector_signal(vector_signal)
         if not compact:
@@ -7040,10 +7523,19 @@ class LuxriotManager:
         base = self._strip_suffix_prompt(str(base_prompt or ""), rendered_json_prompt).strip()
         alert_policy = self._get_rendered_alert_policy_prompt(channel_id)
         routine = self._get_channel_routine_prompt(channel_id)
+        homeostasis = self._render_capture_homeostasis_prompt(channel_id)
         vector_prompt = self._render_vector_signal_prompt(vector_signal)
         parts = [
             part
-            for part in (base, alert_policy, routine, vector_prompt, LIVE_OBSERVATION_STATE_PROMPT, rendered_json_prompt)
+            for part in (
+                base,
+                alert_policy,
+                routine,
+                homeostasis,
+                vector_prompt,
+                LIVE_OBSERVATION_STATE_PROMPT,
+                rendered_json_prompt,
+            )
             if str(part or "").strip()
         ]
         return "\n\n".join(str(part).strip() for part in parts)
@@ -7067,6 +7559,32 @@ class LuxriotManager:
             if isinstance(overrides, Mapping) and "alert_policy_prompt" in overrides:
                 return str(overrides.get("alert_policy_prompt") or "")
         return str(self.alert_policy_prompt or "")
+
+    @staticmethod
+    def _normalize_selector_bias(value: object, *, strict: bool = False) -> Optional[str]:
+        bias = str(value or "").strip().lower()
+        if not bias:
+            return None
+        if bias not in CAPTURE_SELECTOR_BIASES:
+            if strict:
+                raise ValueError(
+                    "capture_selector_bias must be one of: " + ", ".join(CAPTURE_SELECTOR_BIASES)
+                )
+            return None
+        return bias
+
+    def _get_capture_selector_bias_locked(self, channel_id: Optional[int] = None) -> str:
+        if channel_id is not None:
+            overrides = self.channel_prompt_overrides.get(int(channel_id))
+            if isinstance(overrides, Mapping) and "capture_selector_bias" in overrides:
+                bias = self._normalize_selector_bias(overrides.get("capture_selector_bias"))
+                if bias:
+                    return bias
+        return self._normalize_selector_bias(self.default_capture_selector_bias) or "auto"
+
+    def get_capture_selector_bias(self, channel_id: Optional[int] = None) -> str:
+        with self.cache_lock:
+            return self._get_capture_selector_bias_locked(channel_id)
 
     def _get_channel_bookmark_settings_locked(self, channel_id: Optional[int] = None) -> Dict[str, Any]:
         enabled = bool(self.default_bookmark_enabled)
@@ -7166,6 +7684,7 @@ class LuxriotManager:
                     "L3": self._default_rollup_prompt_for_level_locked("L3"),
                 },
                 "capture_interval_sec": self._default_capture_interval_sec(),
+                "capture_selector_bias": self._normalize_selector_bias(self.default_capture_selector_bias) or "auto",
                 "bookmark_enabled": bool(defaults_bookmark.get("bookmark_enabled")),
                 "bookmark_cooldown_sec": float(defaults_bookmark.get("bookmark_cooldown_sec") or 0.0),
                 "json_alert_prompt": str(defaults_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
@@ -7182,6 +7701,7 @@ class LuxriotManager:
                 "L3": self._get_rollup_system_prompt_locked("L3", channel_id),
             }
             effective_capture_interval_sec = self._get_capture_interval_sec_locked(channel_id)
+            effective_capture_selector_bias = self._get_capture_selector_bias_locked(channel_id)
             effective_bookmark = self._get_channel_bookmark_settings_locked(channel_id)
             active_memory = ""
             if channel_id is not None:
@@ -7206,6 +7726,7 @@ class LuxriotManager:
                     "stream_system_prompt",
                     "alert_policy_prompt",
                     "capture_interval_sec",
+                    "capture_selector_bias",
                     "bookmark_enabled",
                     "bookmark_cooldown_sec",
                     "json_alert_prompt",
@@ -7240,6 +7761,7 @@ class LuxriotManager:
             "stream_system_prompt": setting_source("stream_system_prompt"),
             "alert_policy_prompt": setting_source("alert_policy_prompt"),
             "capture_interval_sec": setting_source("capture_interval_sec"),
+            "capture_selector_bias": setting_source("capture_selector_bias"),
             "bookmark_enabled": setting_source("bookmark_enabled"),
             "bookmark_cooldown_sec": setting_source("bookmark_cooldown_sec"),
             "json_alert_prompt": setting_source("json_alert_prompt"),
@@ -7303,6 +7825,7 @@ class LuxriotManager:
             "alert_policy_prompt": effective_alert_policy_prompt,
             "rollup_prompts": effective_rollup_prompts,
             "capture_interval_sec": effective_capture_interval_sec,
+            "capture_selector_bias": effective_capture_selector_bias,
             "bookmark_enabled": bool(effective_bookmark.get("bookmark_enabled")),
             "bookmark_cooldown_sec": float(effective_bookmark.get("bookmark_cooldown_sec") or 0.0),
             "json_alert_prompt": str(effective_bookmark.get("json_alert_prompt") or DEFAULT_ALERTS_JSON_PROMPT),
@@ -7324,10 +7847,14 @@ class LuxriotManager:
         json_alert_prompt: Optional[str] = None,
         bookmark_enabled: Optional[bool] = None,
         bookmark_cooldown_sec: Optional[float] = None,
+        capture_selector_bias: Optional[str] = None,
         clear_override_fields: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         changed = False
         target_channel_id = int(channel_id) if channel_id is not None else None
+        normalized_selector_bias: Optional[str] = None
+        if capture_selector_bias is not None:
+            normalized_selector_bias = self._normalize_selector_bias(capture_selector_bias, strict=True)
         clear_fields: Set[str] = set()
         if clear_override_fields is not None:
             if isinstance(clear_override_fields, (str, bytes)):
@@ -7336,6 +7863,7 @@ class LuxriotManager:
                 "stream_system_prompt",
                 "alert_policy_prompt",
                 "capture_interval_sec",
+                "capture_selector_bias",
                 "bookmark_enabled",
                 "bookmark_cooldown_sec",
                 "json_alert_prompt",
@@ -7364,6 +7892,8 @@ class LuxriotManager:
             updated_fields.add("bookmark_enabled")
         if bookmark_cooldown_sec is not None:
             updated_fields.add("bookmark_cooldown_sec")
+        if normalized_selector_bias is not None:
+            updated_fields.add("capture_selector_bias")
         if isinstance(rollup_prompts, Mapping):
             for raw_level in rollup_prompts:
                 level = self._normalize_rollup_level(raw_level)
@@ -7383,6 +7913,7 @@ class LuxriotManager:
                 "default_json_alert_prompt": self.default_json_alert_prompt,
                 "default_bookmark_enabled": self.default_bookmark_enabled,
                 "default_bookmark_cooldown_sec": self.default_bookmark_cooldown_sec,
+                "default_capture_selector_bias": self.default_capture_selector_bias,
                 "rollup_llm_system_prompts": copy.deepcopy(self.rollup_llm_system_prompts),
                 "channel_override_present": bool(
                     target_channel_id is not None
@@ -7419,6 +7950,10 @@ class LuxriotManager:
                     next_cooldown = max(0.0, float(bookmark_cooldown_sec))
                     if next_cooldown != float(self.default_bookmark_cooldown_sec):
                         self.default_bookmark_cooldown_sec = next_cooldown
+                        changed = True
+                if normalized_selector_bias is not None:
+                    if normalized_selector_bias != str(self.default_capture_selector_bias or "auto"):
+                        self.default_capture_selector_bias = normalized_selector_bias
                         changed = True
             else:
                 current_overrides_raw = self.channel_prompt_overrides.get(target_channel_id)
@@ -7482,6 +8017,13 @@ class LuxriotManager:
                     ):
                         channel_overrides["bookmark_cooldown_sec"] = next_cooldown
                         changed = True
+                if normalized_selector_bias is not None:
+                    if (
+                        "capture_selector_bias" not in channel_overrides
+                        or normalized_selector_bias != str(channel_overrides.get("capture_selector_bias") or "")
+                    ):
+                        channel_overrides["capture_selector_bias"] = normalized_selector_bias
+                        changed = True
             if isinstance(rollup_prompts, Mapping):
                 for raw_level, raw_prompt in rollup_prompts.items():
                     level = self._normalize_rollup_level(raw_level)
@@ -7512,6 +8054,9 @@ class LuxriotManager:
                     self.default_bookmark_enabled = bool(previous_state["default_bookmark_enabled"])
                     self.default_bookmark_cooldown_sec = float(
                         previous_state["default_bookmark_cooldown_sec"] or 0.0
+                    )
+                    self.default_capture_selector_bias = str(
+                        previous_state["default_capture_selector_bias"] or "auto"
                     )
                     self.rollup_llm_system_prompts = copy.deepcopy(
                         previous_state["rollup_llm_system_prompts"]
@@ -8745,6 +9290,59 @@ class LuxriotManager:
             if fallback_reason:
                 item["fallback_reason"] = fallback_reason
             out.append(item)
+
+        # Burst evidence rides along regardless of even sampling: the motion
+        # peak (if it was skipped) and its sharper companion frame.
+        sampled_indices = {index for _role, index in anchors}
+        extras = 0
+        for index, frame in enumerate(frames):
+            if extras >= 4:
+                break
+            companion = frame.get("burst_companion")
+            if not isinstance(companion, Mapping):
+                continue
+            frame_ts = cls._frame_timestamp_ms(frame, batch_end_ms)
+            if index not in sampled_indices:
+                apex_thumbnail = str(frame.get("thumbnail") or "").strip()
+                if apex_thumbnail:
+                    apex_item: Dict[str, Any] = {
+                        "anchor_role": "burst_apex",
+                        "frame_index": int(index),
+                        "timestamp_ms": frame_ts,
+                        "thumbnail": apex_thumbnail,
+                    }
+                    apex_hash = str(frame.get("frame_hash") or "").strip()[:40]
+                    if apex_hash:
+                        apex_item["frame_hash"] = apex_hash
+                    apex_source_index = _parse_optional_int(frame.get("source_frame_index"))
+                    if apex_source_index is not None:
+                        apex_item["source_frame_index"] = int(apex_source_index)
+                    out.append(apex_item)
+                    sampled_indices.add(index)
+                    extras += 1
+            companion_thumbnail = str(companion.get("thumbnail") or "").strip()
+            if companion_thumbnail and extras < 4:
+                companion_item: Dict[str, Any] = {
+                    "anchor_role": "burst_companion",
+                    "frame_index": int(index),
+                    "timestamp_ms": int(
+                        _parse_optional_int(companion.get("timestamp_ms")) or frame_ts
+                    ),
+                    "thumbnail": companion_thumbnail,
+                    "companion_of_timestamp_ms": frame_ts,
+                }
+                companion_hash = str(companion.get("frame_hash") or "").strip()[:40]
+                if companion_hash:
+                    companion_item["frame_hash"] = companion_hash
+                companion_source_index = _parse_optional_int(companion.get("source_frame_index"))
+                if companion_source_index is not None:
+                    companion_item["source_frame_index"] = int(companion_source_index)
+                for score_key in ("sharpness", "activity"):
+                    score = cls._finite_float(companion.get(score_key))
+                    if score is not None:
+                        companion_item[score_key] = round(float(score), 6)
+                out.append(companion_item)
+                extras += 1
         return out
 
     def _archive_summary_entry(self, entry: Mapping[str, Any]) -> Dict[str, Any]:
@@ -8799,6 +9397,9 @@ class LuxriotManager:
             )
         except Exception:
             total_payload_chars = text_chars + image_url_chars
+        # Rough context estimate for small-context VLMs (Qwen3-VL class):
+        # ~4 chars per text token, ~300 visual tokens per <=640px image.
+        estimated_tokens = int(round(text_chars / 4.0)) + int(image_parts) * 300
         return {
             "message_count": len(messages),
             "text_chars": int(text_chars),
@@ -8806,12 +9407,21 @@ class LuxriotManager:
             "high_detail_images": int(high_detail_images),
             "image_url_chars": int(image_url_chars),
             "total_payload_chars": int(total_payload_chars),
+            "estimated_context_tokens": int(estimated_tokens),
         }
+
+    def _summary_context_tokens_warn(self) -> int:
+        try:
+            threshold = int(getattr(self.config, "LM_VIDEO_CONTEXT_TOKENS_WARN", 7000))
+        except (TypeError, ValueError):
+            threshold = 7000
+        return max(1000, threshold)
 
     def _summary_input_warnings(self, stats: Mapping[str, Any]) -> List[str]:
         warnings: List[str] = []
         text_chars = _parse_optional_int(stats.get("text_chars")) or 0
         image_url_chars = _parse_optional_int(stats.get("image_url_chars")) or 0
+        estimated_tokens = _parse_optional_int(stats.get("estimated_context_tokens")) or 0
         if text_chars >= self.lm_input_warning_chars:
             warnings.append(
                 f"text_input_chars {text_chars} >= warning {self.lm_input_warning_chars}"
@@ -8819,6 +9429,12 @@ class LuxriotManager:
         if image_url_chars >= self.lm_image_payload_warning_chars:
             warnings.append(
                 f"image_payload_chars {image_url_chars} >= warning {self.lm_image_payload_warning_chars}"
+            )
+        tokens_warn = self._summary_context_tokens_warn()
+        if estimated_tokens >= tokens_warn:
+            warnings.append(
+                f"estimated_context_tokens {estimated_tokens} >= warning {tokens_warn}; "
+                "the VLM context may truncate this batch"
             )
         return warnings
 
@@ -8857,6 +9473,16 @@ class LuxriotManager:
             cast(Sequence[Mapping[str, Any]], source_frame_items),
             raw_vector_signal,
         )
+        if self.vector_signals_enabled:
+            capture_attention = self._capture_attention_signal(frame_items)
+            if capture_attention:
+                enriched_signal = dict(vector_signal) if vector_signal else {
+                    "version": 1,
+                    "channel_id": int(channel_id),
+                    "semantics": "vector_homeostasis_attention_signal_not_visual_proof",
+                }
+                enriched_signal["capture_attention"] = capture_attention
+                vector_signal = self._compact_vector_signal(enriched_signal)
         provenance_source_frame_count = int(
             _parse_optional_int(frame_selection.get("source_frame_count"))
             or len(source_frame_items)

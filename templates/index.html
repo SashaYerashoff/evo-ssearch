@@ -225,10 +225,16 @@
                             </div>
                             <div id="luxriotStatus" class="luxriot-status">Not connected</div>
                         </div>
-                        <div class="luxriot-row">
+                        <div class="luxriot-row video-channel-row">
                             <label for="luxriotChannelSelect">Channel:</label>
                             <select id="luxriotChannelSelect" class="luxriot-mini-input"></select>
                             <button id="luxriotRefreshChannels" class="feature-btn">Reload</button>
+                        </div>
+                        <div class="luxriot-sidebar-preview" aria-label="Selected channel model view">
+                            <div class="luxriot-viewport" id="luxriotViewport">
+                                <img id="luxriotPreview" src="" alt="Luxriot live preview" />
+                                <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
+                            </div>
                         </div>
                         <div class="luxriot-row luxriot-live-controls-row">
                             <span class="luxriot-pill">Batch:
@@ -243,7 +249,7 @@
                             </span>
                             <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
                         </div>
-                        <div class="luxriot-row">
+                        <div class="luxriot-row video-model-row">
                             <label for="luxriotLiveModel">Live model:</label>
                             <select id="luxriotLiveModel" class="luxriot-mini-input">
                                 <option value="">Loading models...</option>
@@ -253,15 +259,28 @@
                         <div class="luxriot-actions">
                             <button id="luxriotToggleCapture" class="feature-btn primary">Start summaries</button>
                             <button id="luxriotFlushCapture" class="feature-btn">Flush now</button>
-                            <button class="feature-btn" data-road-scene-grounding>Ground road mask</button>
                             <button id="luxriotPromptSettingsBtn" class="feature-btn">System prompt settings</button>
                         </div>
-                        <div class="video-summary-controls">
-                            <div class="video-summary-controls-head">
-                                <div class="video-summary-controls-title">Summary Lens</div>
-                                <div class="video-summary-controls-sub">Choose what lands in the live text feed.</div>
+                        <div class="luxriot-hidden-prompts">
+                            <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
+                            <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
+                            <textarea id="luxriotAlertPolicyPrompt" class="luxriot-prompt" placeholder="Channel-specific alert criteria">{{ luxriot_alert_policy_prompt }}</textarea>
+                            <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{{ luxriot_rollup_prompt_l1 }}</textarea>
+                            <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{{ luxriot_rollup_prompt_l2 }}</textarea>
+                            <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{{ luxriot_rollup_prompt_l3 }}</textarea>
+                            <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{{ luxriot_json_alert_prompt }}</textarea>
+                        </div>
+                    </div>
+                </aside>
+
+                <section class="studio-workspace video-workspace">
+                    <div class="luxriot-card luxriot-summaries-card studio-panel studio-panel--workspace">
+                        <div class="studio-panel-head video-feed-head">
+                            <div>
+                                <div class="studio-panel-title">VLM Feed</div>
+                                <div class="studio-panel-sub">Live summaries and drilled rollups for the selected channel context.</div>
                             </div>
-                            <div class="luxriot-summary-toolbar">
+                            <div class="luxriot-summary-toolbar" aria-label="VLM feed filters">
                                 <div class="luxriot-summary-filters">
                                     <div class="luxriot-summary-filter">
                                         <label for="luxriotSummaryChannelSelect">Channel</label>
@@ -295,87 +314,6 @@
                                     <button id="luxriotSummaryCollapseAllBtn" class="feature-btn">⇵ Collapse all</button>
                                     <button id="luxriotSummaryBackBtn" class="feature-btn" disabled>↩ Back</button>
                                 </div>
-                            </div>
-                        </div>
-                        <div class="luxriot-hidden-prompts">
-                            <textarea id="luxriotPrompt" class="luxriot-prompt" placeholder="Describe ongoing activity, anomalies, people, vehicles..."></textarea>
-                            <textarea id="luxriotSystemPrompt" class="luxriot-prompt" placeholder="System prompt for live summaries">{{ luxriot_system_prompt_default }}</textarea>
-                            <textarea id="luxriotAlertPolicyPrompt" class="luxriot-prompt" placeholder="Channel-specific alert criteria">{{ luxriot_alert_policy_prompt }}</textarea>
-                            <textarea id="luxriotRollupPromptL1" class="luxriot-prompt" placeholder="System prompt for L1 rollups">{{ luxriot_rollup_prompt_l1 }}</textarea>
-                            <textarea id="luxriotRollupPromptL2" class="luxriot-prompt" placeholder="System prompt for L2 rollups">{{ luxriot_rollup_prompt_l2 }}</textarea>
-                            <textarea id="luxriotRollupPromptL3" class="luxriot-prompt" placeholder="System prompt for L3 rollups">{{ luxriot_rollup_prompt_l3 }}</textarea>
-                            <textarea id="luxriotJsonAlertPrompt" class="luxriot-prompt" placeholder="JSON alert schema prompt">{{ luxriot_json_alert_prompt }}</textarea>
-                        </div>
-                    </div>
-                </aside>
-
-                <section class="studio-workspace video-workspace">
-                    <div class="luxriot-card video-live-card studio-panel">
-                        <div class="luxriot-live-layout">
-                            <div class="luxriot-viewport" id="luxriotViewport">
-                                <img id="luxriotPreview" src="" alt="Luxriot live preview" />
-                                <div class="luxriot-overlay" id="luxriotOverlay">Preview not started</div>
-                            </div>
-                            <aside class="luxriot-stream-context" aria-label="Selected stream status">
-                                <div class="luxriot-stream-context-head">
-                                    <div class="luxriot-stream-context-title-wrap">
-                                        <div class="luxriot-stream-context-kicker">Selected Stream</div>
-                                        <div id="luxriotStreamName" class="luxriot-stream-context-title">No channel selected</div>
-                                    </div>
-                                    <span id="luxriotStreamState" class="luxriot-stream-state idle">idle</span>
-                                </div>
-                                <div class="luxriot-stream-context-grid">
-                                    <div class="luxriot-stream-context-metric">
-                                        <span>Channel</span>
-                                        <strong id="luxriotStreamChannel">-</strong>
-                                    </div>
-                                    <div class="luxriot-stream-context-metric">
-                                        <span>Preview</span>
-                                        <strong id="luxriotStreamResolution">waiting</strong>
-                                    </div>
-                                    <div class="luxriot-stream-context-metric">
-                                        <span>Cadence</span>
-                                        <strong id="luxriotStreamCadence">-</strong>
-                                    </div>
-                                    <div class="luxriot-stream-context-metric">
-                                        <span>Batch</span>
-                                        <strong id="luxriotStreamBatch">-</strong>
-                                    </div>
-                                </div>
-                                <div class="luxriot-stream-context-list">
-                                    <div><span>Live model</span><strong id="luxriotStreamModel">-</strong></div>
-                                    <div><span>Summary queue</span><strong id="luxriotStreamQueue">idle</strong></div>
-                                    <div id="luxriotStreamProbesRow"><span>Diagnostic capture</span><strong id="luxriotStreamProbes">idle</strong></div>
-                                    <div><span>Last preview</span><strong id="luxriotStreamLastFrame">never</strong></div>
-                                </div>
-                                <div class="luxriot-stream-context-actions">
-                                    <button id="luxriotContextToggleCapture" class="feature-btn primary">Start summaries</button>
-                                    <button id="luxriotContextFlushCapture" class="feature-btn">Flush</button>
-                                    <button id="roadSceneGroundingBtn" class="feature-btn" data-road-scene-grounding>Ground road mask</button>
-                                </div>
-                                <div id="luxriotStreamDetail" class="luxriot-stream-context-detail">Runtime state will update when the preview and stream status refresh.</div>
-                                <div id="roadSceneGroundingPanel" class="road-scene-grounding-panel" hidden>
-                                    <div class="road-scene-grounding-head">
-                                        <div>
-                                            <div class="road-scene-grounding-kicker">Road CV grounding</div>
-                                            <div id="roadSceneGroundingTitle" class="road-scene-grounding-title">No preview yet</div>
-                                        </div>
-                                        <span id="roadSceneGroundingConfidence" class="road-scene-confidence">idle</span>
-                                    </div>
-                                    <div class="road-scene-grounding-frame">
-                                        <img id="roadSceneGroundingImage" alt="Road motion mask overlay" />
-                                    </div>
-                                    <div id="roadSceneGroundingMeta" class="road-scene-grounding-meta">Generate a bounded preview to inspect the inferred motion zone.</div>
-                                </div>
-                            </aside>
-                        </div>
-                    </div>
-
-                    <div class="luxriot-card luxriot-summaries-card studio-panel studio-panel--workspace">
-                        <div class="studio-panel-head">
-                            <div>
-                                <div class="studio-panel-title">VLM Feed</div>
-                                <div class="studio-panel-sub">Live summaries and drilled rollups for the selected channel context.</div>
                             </div>
                         </div>
                         <div id="luxriotSummaryMeta" class="luxriot-summary-meta">No summaries yet.</div>
@@ -464,6 +402,26 @@
                                 <button id="luxriotStopAllVideo" class="feature-btn">Stop video</button>
                                 <button id="luxriotStopAllAnalytics" class="feature-btn">Pause CLIP probes</button>
                             </div>
+                        </div>
+                        <div class="luxriot-selected-runtime" aria-label="Selected stream status">
+                            <div class="luxriot-stream-context-head">
+                                <div class="luxriot-stream-context-title-wrap">
+                                    <div class="luxriot-stream-context-kicker">Selected channel</div>
+                                    <div id="luxriotStreamName" class="luxriot-stream-context-title">No channel selected</div>
+                                </div>
+                                <span id="luxriotStreamState" class="luxriot-stream-state idle">idle</span>
+                            </div>
+                            <div class="luxriot-selected-runtime-facts">
+                                <span>Channel <strong id="luxriotStreamChannel">-</strong></span>
+                                <span>Preview <strong id="luxriotStreamResolution">waiting</strong></span>
+                                <span>Cadence <strong id="luxriotStreamCadence">-</strong></span>
+                                <span>Batch <strong id="luxriotStreamBatch">-</strong></span>
+                                <span>Model <strong id="luxriotStreamModel">-</strong></span>
+                                <span>Queue <strong id="luxriotStreamQueue">idle</strong></span>
+                                <span id="luxriotStreamProbesRow" class="runtime-fact-secondary">Probes <strong id="luxriotStreamProbes">idle</strong></span>
+                                <span class="runtime-fact-secondary">Preview age <strong id="luxriotStreamLastFrame">never</strong></span>
+                            </div>
+                            <div id="luxriotStreamDetail" class="luxriot-stream-context-detail">Runtime state will update when the preview and stream status refresh.</div>
                         </div>
                         <div id="luxriotStreams" class="luxriot-stream-list">
                             <div class="loading">No active channels.</div>
@@ -850,6 +808,14 @@
                     <label class="small-label-group">
                         Dedup cooldown (sec):
                         <input type="number" id="luxriotBookmarkCooldown" class="settings-input luxriot-mini-input" min="0" step="1" />
+                    </label>
+                    <label class="small-label-group" title="How the per-second CV apex decider picks the frame sent to VLM/CLIP/archive. Auto follows the channel's measured motion norm; Action always keeps the motion peak; Clarity always keeps the sharpest frame.">
+                        Frame selector:
+                        <select id="luxriotSelectorBias" class="settings-input luxriot-mini-input">
+                            <option value="auto">Auto (adaptive)</option>
+                            <option value="action">Action priority</option>
+                            <option value="clarity">Clarity priority</option>
+                        </select>
                     </label>
                 </div>
                 <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>

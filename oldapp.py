@@ -2526,6 +2526,43 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
                     },
                 }
             )
+    # At most one extra frame per batch: the sharper companion of the strongest
+    # burst second, so the model gets identity detail next to the motion peak.
+    companion_thumbnail = None
+    companion_snapshot_no = None
+    best_burst_x = -1.0
+    for idx, frame in enumerate(frames):
+        companion = frame.get('burst_companion') if isinstance(frame, dict) else None
+        if not isinstance(companion, dict) or not str(companion.get('thumbnail') or '').strip():
+            continue
+        selection = frame.get('capture_selection') if isinstance(frame.get('capture_selection'), dict) else {}
+        try:
+            burst_x = float(selection.get('activity_x') or 0.0)
+        except (TypeError, ValueError):
+            burst_x = 0.0
+        if burst_x > best_burst_x:
+            best_burst_x = burst_x
+            companion_thumbnail = str(companion.get('thumbnail'))
+            companion_snapshot_no = idx + 1
+    if companion_thumbnail and companion_snapshot_no is not None:
+        user_content.append(
+            {
+                'type': 'text',
+                'text': (
+                    f"Snapshot {len(frames) + 1} - sharper companion of burst Snapshot {companion_snapshot_no} "
+                    "(same second; use it for identity/detail, the burst snapshot for the action itself)"
+                ),
+            }
+        )
+        user_content.append(
+            {
+                'type': 'image_url',
+                'image_url': {
+                    'url': f"data:image/jpeg;base64,{companion_thumbnail}",
+                    'detail': 'high',
+                },
+            }
+        )
     system_msg = system_prompt.strip() or LUXRIOT_SYSTEM_PROMPT_DEFAULT
     return [
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
@@ -9376,9 +9413,18 @@ def _luxriot_media_open_upstream(
     channel_id: int,
     stream: str,
     time_ms: Optional[int],
+    duration_sec: Optional[int],
     range_header: Optional[str],
 ):
     timeout, _, _ = _luxriot_media_limits(media_kind)
+    if media_kind == "archive" and duration_sec:
+        # Evo may assemble an HTML5-compatible archive fragment before sending
+        # its first byte. A live-stream read timeout is too short for a bounded
+        # multi-second review clip, even though the eventual media is healthy.
+        timeout = (
+            timeout[0],
+            max(timeout[1], min(60.0, float(duration_sec) + 8.0)),
+        )
     headers = {
         "Accept": "video/mp4,video/webm,video/ogg,video/mp2t,multipart/x-mixed-replace,application/octet-stream,*/*",
         "Accept-Encoding": "identity",
@@ -9423,12 +9469,13 @@ def _luxriot_media_open_upstream(
         params = {
             "time": resolved_time_ms,
             "streamType": stream,
-            "duration": 1,
+            "duration": max(1, int(duration_sec or 1)),
             "html5compatible": "true",
         }
         media_meta = {
             "archive_requested_time_ms": requested_time_ms,
             "archive_resolved_time_ms": resolved_time_ms,
+            "archive_duration_seconds": max(1, int(duration_sec or 1)),
             "archive_frame_alignment": alignment,
             "html5_compatible": "requested",
         }
@@ -9601,6 +9648,7 @@ def _luxriot_media_response_headers(
         meta_headers = {
             "X-EVA-Archive-Requested-Time-Ms": media_meta.get("archive_requested_time_ms"),
             "X-EVA-Archive-Resolved-Time-Ms": media_meta.get("archive_resolved_time_ms"),
+            "X-EVA-Archive-Duration-Seconds": media_meta.get("archive_duration_seconds"),
             "X-EVA-Archive-Frame-Alignment": media_meta.get("archive_frame_alignment"),
             "X-EVA-HTML5-Compatible": media_meta.get("html5_compatible"),
         }
@@ -9638,6 +9686,7 @@ def luxriot_media(media_kind: str, channel_id: int):
             channel_id=channel_id,
         )
     time_ms: Optional[int] = None
+    duration_sec: Optional[int] = None
     if normalized_kind == "archive":
         try:
             time_ms = int(request.args.get("time_ms") or request.args.get("time") or 0)
@@ -9648,6 +9697,19 @@ def luxriot_media(media_kind: str, channel_id: int):
                 status=400,
                 error_code="archive_time_required",
                 message="A positive archive time_ms is required.",
+                media_kind=normalized_kind,
+                channel_id=channel_id,
+            )
+        try:
+            duration_sec = int(request.args.get("duration_sec") or request.args.get("duration") or 1)
+        except (TypeError, ValueError):
+            duration_sec = 0
+        _, archive_max_seconds, _ = _luxriot_media_limits("archive")
+        if duration_sec <= 0 or duration_sec > int(archive_max_seconds):
+            return _luxriot_media_error_response(
+                status=400,
+                error_code="invalid_archive_duration",
+                message=f"Archive duration must be between 1 and {int(archive_max_seconds)} seconds.",
                 media_kind=normalized_kind,
                 channel_id=channel_id,
             )
@@ -9670,6 +9732,7 @@ def luxriot_media(media_kind: str, channel_id: int):
             channel_id=channel_id,
             stream=stream,
             time_ms=time_ms,
+            duration_sec=duration_sec,
             range_header=range_header,
         )
         iterator, first_chunk = _luxriot_media_first_chunk(upstream)
@@ -10361,13 +10424,18 @@ def luxriot_prompt_settings():
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('bookmark_cooldown_sec'), default=0.0))
     elif 'cooldown_sec' in data:
         bookmark_cooldown_sec = max(0.0, _to_float(data.get('cooldown_sec'), default=0.0))
+    capture_selector_bias: Optional[str] = None
+    if 'capture_selector_bias' in data:
+        capture_selector_bias = str(data.get('capture_selector_bias') or '').strip()
+        if not capture_selector_bias:
+            return jsonify({'error': 'capture_selector_bias must be auto, action, or clarity'}), 400
     clear_override_fields: Optional[List[str]] = None
     if 'clear_override_fields' in data:
         raw_clear_fields = data.get('clear_override_fields')
         if not isinstance(raw_clear_fields, list):
             return jsonify({'error': 'clear_override_fields must be a list of setting names'}), 400
         clear_override_fields = [str(field or '').strip() for field in raw_clear_fields]
-        if len(clear_override_fields) > 9:
+        if len(clear_override_fields) > 10:
             return jsonify({'error': 'clear_override_fields contains too many entries'}), 400
     protected_bookmark_fields = {
         'bookmark_enabled',
@@ -10415,6 +10483,7 @@ def luxriot_prompt_settings():
             json_alert_prompt=json_alert_prompt,
             bookmark_enabled=bookmark_enabled,
             bookmark_cooldown_sec=bookmark_cooldown_sec,
+            capture_selector_bias=capture_selector_bias,
             clear_override_fields=clear_override_fields,
         )
         audit_error = _write_completion_audit_or_error(
@@ -10430,6 +10499,7 @@ def luxriot_prompt_settings():
                 "json_alert_prompt_updated": json_alert_prompt is not None,
                 "bookmark_enabled_updated": bookmark_enabled is not None,
                 "bookmark_cooldown_updated": bookmark_cooldown_sec is not None,
+                "capture_selector_bias_updated": capture_selector_bias is not None,
                 "cleared_override_fields": sorted(clear_override_fields or []),
                 "rollup_levels": sorted(rollup_prompt_updates.keys())
                 if isinstance(rollup_prompt_updates, Mapping)

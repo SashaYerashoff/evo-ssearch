@@ -6806,16 +6806,21 @@ textarea::placeholder {
 
 @media (max-width: 1180px) {
     .header {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr) auto;
         justify-items: stretch;
     }
 
     .header-center {
         order: 3;
+        grid-column: 1 / -1;
     }
 
     .header-actions {
-        justify-content: space-between;
+        justify-content: flex-end;
+    }
+
+    .brand-sub {
+        display: none;
     }
 
     .archive-box {
@@ -7493,6 +7498,10 @@ textarea::placeholder {
     overflow: hidden;
 }
 
+.archive-review-frame .feature-btn[hidden] {
+    display: none !important;
+}
+
 .archive-review-frame img {
     width: 100%;
     height: 100%;
@@ -7703,14 +7712,12 @@ textarea::placeholder {
 }
 
 .video-box {
-    grid-template-columns: minmax(260px, 300px) minmax(0, 1fr) clamp(430px, 30vw, 560px);
+    grid-template-columns: minmax(320px, 360px) minmax(0, 1fr) clamp(360px, 23vw, 430px);
     overflow: hidden;
 }
 
 .video-workspace {
-    display: grid;
-    grid-template-rows: minmax(260px, 0.84fr) minmax(360px, 1.16fr);
-    gap: clamp(14px, 1.2vw, 18px);
+    display: block;
     min-height: 0;
     overflow: hidden;
 }
@@ -7733,9 +7740,63 @@ textarea::placeholder {
 .video-command-panel {
     display: flex;
     flex-direction: column;
-    gap: 0.95rem;
+    gap: 10px;
     overflow: auto;
-    padding-right: 0.25rem;
+    padding: 14px;
+}
+
+.video-command-panel .studio-panel-head {
+    display: grid;
+    gap: 7px;
+    margin-bottom: 0;
+    padding-bottom: 10px;
+}
+
+.video-command-panel .studio-panel-sub,
+.video-command-panel .video-control-note {
+    display: none;
+}
+
+.video-command-panel .luxriot-status {
+    max-width: 100%;
+    font-size: 0.65rem;
+    line-height: 1.35;
+}
+
+.video-channel-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+}
+
+.video-channel-row > label {
+    display: none;
+}
+
+.video-channel-row .luxriot-mini-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.video-model-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+}
+
+.video-model-row .luxriot-mini-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.video-command-panel > .luxriot-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, max-content));
+    gap: 8px;
+}
+
+.video-command-panel > .luxriot-actions #luxriotPromptSettingsBtn {
+    grid-column: 1 / -1;
 }
 
 .video-live-card {
@@ -7745,14 +7806,45 @@ textarea::placeholder {
 
 .luxriot-summaries-card {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
     row-gap: 0.75rem;
+    height: 100%;
+    padding: 14px;
 }
 
 .video-analysis-shell,
 .luxriot-stream-card {
     display: grid;
     grid-template-rows: auto minmax(0, 1fr);
+}
+
+.luxriot-stream-card {
+    grid-template-rows: auto auto minmax(0, 1fr);
+    padding: 14px;
+}
+
+.luxriot-sidebar-preview {
+    min-width: 0;
+}
+
+.luxriot-sidebar-preview .luxriot-viewport {
+    width: 100%;
+    min-height: 0;
+    aspect-ratio: 16 / 9;
+    border-radius: 12px;
+}
+
+.luxriot-sidebar-preview .luxriot-viewport img {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    object-fit: contain;
+}
+
+.luxriot-sidebar-preview .feature-btn {
+    min-height: 28px;
+    padding: 0 9px;
+    font-size: 0.64rem;
 }
 
 .luxriot-live-layout {
@@ -8143,6 +8235,136 @@ textarea::placeholder {
     margin-bottom: 0;
 }
 
+.luxriot-summaries-card .video-feed-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+}
+
+.video-feed-head .studio-panel-sub {
+    display: none;
+}
+
+.video-feed-head .luxriot-summary-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 10px 14px;
+    min-width: 0;
+}
+
+.video-feed-head .luxriot-summary-filters {
+    display: grid;
+    grid-template-columns: minmax(150px, 1.25fr) minmax(125px, 0.9fr) minmax(100px, 0.7fr);
+    align-items: end;
+    gap: 8px;
+    min-width: 0;
+}
+
+.video-feed-head .luxriot-summary-filter {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+}
+
+.video-feed-head .luxriot-summary-filter label {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.video-feed-head .luxriot-summary-toolbar .luxriot-mini-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.video-feed-head .luxriot-summary-actions-row {
+    justify-content: flex-end;
+    width: auto;
+}
+
+.video-feed-head .luxriot-summary-actions-row .feature-btn {
+    min-height: 34px;
+    padding-inline: 10px;
+}
+
+.luxriot-selected-runtime {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid rgba(37, 51, 66, 0.82);
+    border-radius: 12px;
+    background: rgba(7, 12, 17, 0.62);
+}
+
+.luxriot-selected-runtime-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.luxriot-selected-runtime-facts > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    padding: 5px 7px;
+    border: 1px solid rgba(37, 51, 66, 0.72);
+    border-radius: 8px;
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.61rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.luxriot-selected-runtime-facts strong {
+    max-width: 150px;
+    overflow: hidden;
+    color: var(--text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.luxriot-selected-runtime .luxriot-stream-context-detail {
+    display: -webkit-box;
+    margin: 0;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    font-size: 0.72rem;
+    line-height: 1.35;
+}
+
+.luxriot-selected-runtime .runtime-fact-secondary {
+    display: none;
+}
+
+.luxriot-stream-card > .studio-panel-head {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+}
+
+.luxriot-stream-card > .studio-panel-head .studio-panel-sub {
+    display: none;
+}
+
+.luxriot-stream-card > .studio-panel-head .luxriot-actions {
+    flex-wrap: nowrap;
+    gap: 6px;
+}
+
+.luxriot-stream-card > .studio-panel-head .feature-btn {
+    min-height: 32px;
+    padding-inline: 9px;
+    font-size: 0.65rem;
+}
+
 .luxriot-summary-meta {
     min-height: 0;
     margin-top: -0.1rem;
@@ -8189,6 +8411,89 @@ textarea::placeholder {
 .monitor-box {
     grid-template-columns: minmax(250px, 300px) minmax(0, 1fr) minmax(320px, 380px);
     overflow: hidden;
+}
+
+/* Compact density for the non-video workspaces. */
+.archive-results-panel,
+.archive-inspector-panel,
+.monitor-command-panel,
+.monitor-board-panel,
+.monitor-selection-panel,
+.bench-card,
+.agent-sessions,
+.agent-chat-area,
+.agent-context {
+    padding: 14px;
+}
+
+.archive-search-shell {
+    gap: 10px;
+}
+
+.archive-search-shell .archive-section,
+.archive-search-shell .archive-section-compact {
+    padding: 12px;
+}
+
+.archive-rail .section-help {
+    display: none;
+}
+
+.archive-detections-actions,
+.archive-panel-actions {
+    margin-top: 10px;
+    gap: 6px;
+}
+
+.archive-detections-meta {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+}
+
+.monitor-rail {
+    gap: 12px;
+}
+
+.monitor-command-panel .studio-panel-head,
+.monitor-board-panel .studio-panel-head,
+.monitor-selection-panel .studio-panel-head {
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+}
+
+.monitor-selection-panel {
+    gap: 12px;
+}
+
+.monitor-probe-summary {
+    gap: 10px;
+}
+
+.monitor-probe-stats {
+    gap: 7px;
+}
+
+.monitor-probe-stat {
+    padding: 9px 11px;
+    border-radius: 10px;
+}
+
+.agent-sessions-header,
+.agent-chat-topbar,
+.agent-ctx-section {
+    padding: 8px 14px;
+}
+
+.agent-chat-topbar {
+    min-height: 46px;
+    gap: 12px;
+}
+
+.agent-messages {
+    padding: 16px 18px;
+    gap: 16px;
 }
 
 .monitor-command-actions {
@@ -9015,25 +9320,48 @@ textarea::placeholder {
     }
 
     .video-box {
-        grid-template-columns: minmax(240px, 286px) minmax(0, 1fr) minmax(400px, 440px);
+        grid-template-columns: minmax(290px, 330px) minmax(0, 1fr) minmax(340px, 390px);
+    }
+
+    .video-feed-head .luxriot-summary-toolbar {
+        grid-template-columns: 1fr;
+    }
+
+    .video-feed-head .luxriot-summary-actions-row {
+        justify-content: flex-start;
+    }
+
+    .video-command-panel #luxriotBatchInfo {
+        display: none;
+    }
+
+    .luxriot-sidebar-preview .luxriot-viewport {
+        height: 112px;
+        aspect-ratio: auto;
+    }
+
+    .archive-results-head .archive-results-sub,
+    .archive-inspector .studio-panel-sub,
+    .monitor-command-panel .studio-panel-sub,
+    .monitor-board-panel .studio-panel-sub,
+    .monitor-selection-panel .studio-panel-sub,
+    .agent-sessions-sub,
+    .agent-chat-sub {
+        display: none;
     }
 }
 
 @media (max-width: 1440px) {
-    .video-box,
-    .monitor-box,
-    .agent-box {
-        grid-template-columns: minmax(230px, 276px) minmax(0, 1fr);
+    .video-box {
+        grid-template-columns: minmax(300px, 320px) minmax(0, 1fr) minmax(320px, 350px);
     }
 
-    .video-inspector,
-    .monitor-inspector,
-    .agent-inspector {
-        display: none;
+    .monitor-box {
+        grid-template-columns: minmax(240px, 270px) minmax(0, 1fr) minmax(300px, 330px);
     }
 
     .agent-box {
-        grid-template-columns: minmax(220px, 250px) minmax(0, 1fr);
+        grid-template-columns: minmax(220px, 250px) minmax(0, 1fr) minmax(280px, 310px);
     }
 
     .app-settings-modal-content {
@@ -9077,6 +9405,14 @@ textarea::placeholder {
 
     .luxriot-stream-context {
         max-height: none;
+    }
+
+    .video-feed-head .luxriot-summary-toolbar {
+        grid-template-columns: 1fr;
+    }
+
+    .video-feed-head .luxriot-summary-actions-row {
+        justify-content: flex-start;
     }
 }
 
@@ -9201,6 +9537,39 @@ textarea::placeholder {
 
     .app-settings-modal-content .range-value {
         text-align: left;
+    }
+
+    .video-command-panel {
+        flex: 0 0 auto;
+        height: auto;
+        min-height: max-content;
+        overflow: visible;
+    }
+
+    .video-box {
+        grid-auto-rows: max-content;
+        overflow: visible;
+    }
+
+    .video-rail {
+        height: auto;
+        min-height: max-content;
+        overflow: visible;
+    }
+
+    .luxriot-sidebar-preview .luxriot-viewport {
+        height: clamp(180px, 34vw, 300px);
+    }
+
+    .video-workspace,
+    .luxriot-summaries-card {
+        height: max(560px, 72dvh);
+        min-height: max(560px, 72dvh);
+    }
+
+    .luxriot-summaries-card .luxriot-summaries {
+        overflow: auto;
+        padding-right: 0.1rem;
     }
 }
 body.auth-required {
@@ -10015,4 +10384,86 @@ body::-webkit-scrollbar-thumb:hover,
 .agent-msg-body .markdown-table-wrap::-webkit-scrollbar-thumb:hover {
     background: var(--eva-scrollbar-thumb-hover);
     background-clip: content-box;
+}
+
+/* Narrow Video workspace: stack complete panes and let the document own scrolling. */
+@media (max-width: 920px) {
+    body,
+    .search-panel,
+    .video-box,
+    .video-rail,
+    .video-workspace {
+        overflow: visible;
+    }
+
+    .search-panel,
+    .video-box {
+        height: auto;
+        min-height: 0;
+    }
+
+    .video-box {
+        grid-auto-rows: max-content;
+    }
+}
+
+/* Narrow Archive/Monitoring/Agent workspaces: no clipped grid rows or nested page traps. */
+@media (max-width: 920px) {
+    .archive-box,
+    .monitor-box,
+    .agent-box,
+    .archive-rail,
+    .archive-workspace,
+    .monitor-rail,
+    .monitor-workspace,
+    .agent-rail,
+    .agent-workspace {
+        overflow: visible;
+    }
+
+    .archive-box,
+    .monitor-box,
+    .agent-box {
+        height: auto;
+        min-height: 0;
+        grid-auto-rows: max-content;
+    }
+
+    .archive-rail,
+    .monitor-rail,
+    .agent-rail {
+        height: auto;
+        min-height: max-content;
+    }
+
+    .archive-search-shell {
+        height: auto;
+        max-height: none;
+        overflow: visible;
+        padding-right: 0;
+    }
+
+    .archive-workspace,
+    .archive-results-panel {
+        height: max(560px, 70dvh);
+        min-height: max(560px, 70dvh);
+    }
+
+    .monitor-workspace,
+    .monitor-board-panel {
+        height: max(600px, 74dvh);
+        min-height: max(600px, 74dvh);
+    }
+
+    .agent-workspace,
+    .agent-chat-area {
+        height: max(620px, 76dvh);
+        min-height: max(620px, 76dvh);
+    }
+
+    .results-grid,
+    #probeCards,
+    .agent-messages {
+        overflow: auto;
+    }
 }
