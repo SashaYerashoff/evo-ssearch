@@ -4670,6 +4670,238 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertIn("l1-ch7-w900-1781699400", manager.rollup_summary_cache)
 
+    def test_rollup_retention_can_outlive_hot_l0_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+                config_overrides={
+                    "LUXRIOT_SUMMARY_RETENTION_DAYS": 7,
+                    "LUXRIOT_ROLLUP_RETENTION_DAYS": 90,
+                },
+            )
+            old_window = time.time() - 14 * 86400.0
+            manager._put_cached_rollup_summary(
+                manager._canonical_rollup_id("L2", 7, old_window, 3600),
+                operator_rollup_response("Two-week-old behavior remains queryable."),
+                channel_id=7,
+                level="L2",
+                source_level="L1",
+                window_start=old_window,
+                window_end=old_window + 3600.0,
+                window_sec=3600,
+                source_signature="two-week-source",
+                summary_kind="llm",
+                generation_status="ready",
+                format_version=2,
+            )
+
+            rows = manager._list_cached_rollups(
+                7,
+                old_window - 1.0,
+                old_window + 3601.0,
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertIn("Two-week-old behavior", rows[0]["summary"])
+
+    def test_durable_rollup_backfill_restores_l2_from_archived_l0_text(self):
+        calls = []
+
+        def lm_callback(_messages, _model, **kwargs):
+            calls.append(kwargs.get("workload_class"))
+            return operator_rollup_response(
+                "Across the hour, routine desk work was briefly interrupted by one departure."
+            )
+
+        lm_callback.eva_workload_class = True
+
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lm_callback,
+                runtime_state_store=state_store,
+                config_overrides={
+                    "LUXRIOT_SUMMARY_RETENTION_DAYS": 7,
+                    "LUXRIOT_ROLLUP_RETENTION_DAYS": 90,
+                },
+            )
+            manager.rollup_llm_levels = {"L2", "L3"}
+            manager.rollup_backfill_spacing_sec = 0.01
+            base = float(int((time.time() - 7200.0) // 3600) * 3600)
+
+            def bucket_loader(channel_id, start_ts, end_ts, bucket_sec):
+                self.assertEqual(channel_id, 7)
+                self.assertEqual(bucket_sec, 900)
+                return [
+                    {
+                        "window_start": base + offset,
+                        "window_end": base + offset + 900.0,
+                        "batch_count": 2,
+                    }
+                    for offset in (0.0, 900.0, 1800.0, 2700.0)
+                ]
+
+            def history_loader(channel_id, start_ts, end_ts):
+                self.assertEqual(channel_id, 7)
+                logs = [
+                    {
+                        "channel_id": 7,
+                        "run_id": "archive-run",
+                        "summary": f"Archived observation {index}: routine desk activity.",
+                        "frame_count": 12,
+                        "created_at": base + index * 900.0 + 30.0,
+                        "batch_start_ms": int((base + index * 900.0 + 10.0) * 1000),
+                        "batch_end_ms": int((base + index * 900.0 + 40.0) * 1000),
+                    }
+                    for index in range(4)
+                ]
+                return logs, len(logs)
+
+            manager.set_summary_archive_readers(history_loader, bucket_loader)
+            plan = manager.plan_rollup_backfill(
+                channel_ids=[7],
+                start_ts=base,
+                end_ts=base + 3600.0,
+                levels=["L2"],
+            )
+            self.assertEqual(plan["totals"]["missing_semantic"], 1)
+            self.assertEqual(plan["restoration_scope"]["queueable_windows"], 1)
+            self.assertEqual(plan["restoration_scope"]["not_restorable_no_archived_source"], 0)
+            self.assertIn("Only queueable_windows", plan["restoration_scope"]["queue_contract"])
+            started = manager.start_rollup_backfill(
+                channel_ids=[7],
+                start_ts=base,
+                end_ts=base + 3600.0,
+                levels=["L2"],
+            )
+            job_id = started["job_id"]
+            deadline = time.monotonic() + 3.0
+            status = manager.rollup_backfill_status()
+            while status["status"] not in {"completed", "completed_with_gaps", "failed"} and time.monotonic() < deadline:
+                time.sleep(0.02)
+                status = manager.rollup_backfill_status()
+
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["job_id"], job_id)
+            self.assertEqual(status["progress"]["restored"], 1)
+            self.assertEqual(status["progress_percent"], 100.0)
+            rollup_id = manager._canonical_rollup_id("L2", 7, base, 3600)
+            self.assertTrue(manager._rollup_semantic_ready(state_store.load_rollup(rollup_id)))
+            self.assertEqual(calls, ["background"])
+
+    def test_rollup_backfill_reports_source_gap_without_retry_loop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+                config_overrides={"LUXRIOT_ROLLUP_RETENTION_DAYS": 90},
+            )
+            manager.rollup_llm_levels = {"L2"}
+            manager.rollup_backfill_spacing_sec = 0.01
+            base = float(int((time.time() - 7200.0) // 3600) * 3600)
+            manager.set_summary_archive_readers(
+                lambda _channel, _start, _end: ([], 0),
+                lambda _channel, _start, _end, _bucket: [
+                    {"window_start": base, "window_end": base + 900.0}
+                ],
+            )
+
+            manager.start_rollup_backfill(
+                channel_ids=[7],
+                start_ts=base,
+                end_ts=base + 3600.0,
+                levels=["L2"],
+            )
+            deadline = time.monotonic() + 2.0
+            status = manager.rollup_backfill_status()
+            while status["status"] not in {"completed_with_gaps", "failed"} and time.monotonic() < deadline:
+                time.sleep(0.02)
+                status = manager.rollup_backfill_status()
+
+            self.assertEqual(status["status"], "completed_with_gaps")
+            self.assertEqual(status["progress"]["source_missing"], 1)
+            self.assertEqual(status["progress"]["retries"], 0)
+
+    def test_rollup_backfill_resumes_durable_cursor_after_process_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            base = float(int((time.time() - 7200.0) // 3600) * 3600)
+            state_store.save_state(
+                LuxriotManager.ROLLUP_BACKFILL_STATE_KEY,
+                {
+                    "version": 1,
+                    "job_id": "rollup-backfill-resume",
+                    "request_key": "resume-key",
+                    "status": "running",
+                    "created_at": time.time() - 60.0,
+                    "updated_at": time.time() - 30.0,
+                    "started_at": time.time() - 60.0,
+                    "completed_at": None,
+                    "from_ts": base,
+                    "to_ts": base + 3600.0,
+                    "channel_ids": [7],
+                    "levels": ["L2"],
+                    "plan": {"totals": {"missing_semantic": 1}},
+                    "cursor": {
+                        "level_index": 0,
+                        "channel_index": 0,
+                        "after_window_start": None,
+                        "attempt": 0,
+                    },
+                    "progress": {
+                        "processed": 0,
+                        "restored": 0,
+                        "already_ready": 0,
+                        "source_missing": 0,
+                        "failed": 0,
+                        "retries": 0,
+                    },
+                },
+            )
+
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _model: operator_rollup_response(
+                    "Restarted worker restored the hour narrative."
+                ),
+                runtime_state_store=state_store,
+                config_overrides={"LUXRIOT_ROLLUP_RETENTION_DAYS": 90},
+            )
+            manager.rollup_llm_levels = {"L2"}
+            manager.rollup_backfill_spacing_sec = 0.01
+            manager.set_summary_archive_readers(
+                lambda _channel, _start, _end: (
+                    [
+                        {
+                            "channel_id": 7,
+                            "run_id": "archive-run",
+                            "summary": "Archived routine observation.",
+                            "frame_count": 12,
+                            "created_at": base + 30.0,
+                            "batch_start_ms": int((base + 10.0) * 1000),
+                            "batch_end_ms": int((base + 40.0) * 1000),
+                        }
+                    ],
+                    1,
+                ),
+                lambda _channel, _start, _end, _bucket: [
+                    {"window_start": base, "window_end": base + 900.0}
+                ],
+            )
+            deadline = time.monotonic() + 3.0
+            status = manager.rollup_backfill_status()
+            while status["status"] not in {"completed", "failed"} and time.monotonic() < deadline:
+                time.sleep(0.02)
+                status = manager.rollup_backfill_status()
+
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["job_id"], "rollup-backfill-resume")
+            self.assertEqual(status["progress"]["restored"], 1)
+
     def test_rollup_operator_summary_and_memory_are_stored_separately(self):
         with tempfile.TemporaryDirectory() as temp:
             def lm_callback(_messages, _model):

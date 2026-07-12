@@ -102,7 +102,8 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | Retention for hot L0 history and independently queryable PostgreSQL L1–L3 rows |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` (`7`) | Retention for hot L0 runtime history; older L0 text may remain reconstructable from archive rows |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_RETENTION_DAYS` (`archive row retention`, normally `90`) | Retention for independently queryable PostgreSQL L1–L3 rows |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT` | Per-channel history cap |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_STATE_HOT_LIMIT` (`2160`) | Bounded hot L0 rows per channel (about 6 h at 12 frames × 1 fps plus margin); older evidence stays in archive and closed context survives as L1–L3 |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH` (`4`) | Frames archived per batch for search |
@@ -115,6 +116,9 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`15`) | Minimum spacing between channel/level rollup jobs; deterministic channel phases spread fleet load without crowding live descriptions |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS` (`2`) | Maximum newest missing windows synthesized by one scheduled level job while cached windows are skipped |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS` (`2`) | Maximum time, in target-level windows, that a saturated L0 queue may defer rollups before one job is admitted anyway; `0` disables deferral |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC` (`10`) | Minimum pause between post-upgrade historical restoration windows; live backlog still pauses the worker completely |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS` (`3`) | Bounded semantic retries per historical window before recording a failed gap and continuing |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC` (`45`) | Initial per-window ETA estimate until the durable worker measures the deployed LM |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |

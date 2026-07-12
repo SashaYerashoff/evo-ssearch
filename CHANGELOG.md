@@ -22,7 +22,10 @@ Scaffold for release notes; final prose to be assembled from commits
   `duration_sec`.
 - **Agent:** persisted research continuation ledger, composite channel
   inventory, shared LM admission queue, context/token budget observability
-  (`estimated_context_tokens`).
+  (`estimated_context_tokens`); an approval-gated post-upgrade command can now
+  audit and durably restore missing L2/L3 semantic history from archived L0
+  text, with restart-safe progress, source-gap accounting, live-load priority,
+  and ETA reporting.
 - **UI:** vertical workspace layout rework, burst attention badges,
   review-modal filmstrip roles.
 - **Stability:** capture thumbnail/frozen-signal contract restoration,

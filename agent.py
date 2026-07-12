@@ -1359,6 +1359,71 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "restore_video_summary_history",
+            "description": (
+                "Preview a durable background job that restores missing semantic video-summary history "
+                "from archived L0 batch text, then place it in the low-priority worker after UI approval. "
+                "Use for post-upgrade requests such as 'restore missing summaries for all channels for two weeks'. "
+                "Levels are fixed-duration semantic windows: L1=15 minutes, L2=60 minutes, L3=6 hours. "
+                "Default recovery levels are L2 then L3, which rebuild the temporal lens quickly; include L1 only "
+                "when the operator explicitly requests exhaustive 15-minute semantic backfill. The job is idempotent, "
+                "survives restarts, yields to live VLM backlog, and reports ETA/progress/source gaps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Channels to restore. Omit for all authorized channels.",
+                    },
+                    "relative_range": {
+                        "type": "string",
+                        "description": "Relative period such as 'last two weeks' or 'last 14 days'.",
+                    },
+                    "from_ts": {
+                        "type": "number",
+                        "description": "Optional absolute lower Unix timestamp in seconds.",
+                    },
+                    "to_ts": {
+                        "type": "number",
+                        "description": "Optional absolute upper Unix timestamp in seconds.",
+                    },
+                    "levels": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["L1", "L2", "L3"]},
+                        "description": (
+                            "Levels to restore: L1=15 minutes, L2=60 minutes, L3=6 hours. "
+                            "Default: L2,L3. Add L1 only for exhaustive 15-minute history."
+                        ),
+                    },
+                    "preview": {
+                        "type": "boolean",
+                        "description": "Must be true in chat. Returns an auditable UI Apply action.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_video_summary_restore_status",
+            "description": (
+                "Get durable progress, ETA, current window, completed/restored/failed counts, and final report "
+                "for the post-upgrade video-summary restoration worker."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "count_video_summary_events",
             "description": (
                 "Count appearance/disappearance style events from VLM video-summary text for one channel/time window. "
@@ -1916,6 +1981,8 @@ class AgentTools:
             "get_prompt_settings":  self._get_prompt_settings,
             "update_prompt_settings": self._update_prompt_settings,
             "get_video_summaries":  self._get_video_summaries,
+            "restore_video_summary_history": self._restore_video_summary_history,
+            "get_video_summary_restore_status": self._get_video_summary_restore_status,
             "list_attention_bursts": self._list_attention_bursts,
             "count_video_summary_events": self._count_video_summary_events,
             "track_visual_state_transitions": self._track_visual_state_transitions,
@@ -4665,6 +4732,62 @@ class AgentTools:
             "entries": entries,
         }
 
+    def _restore_video_summary_history(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "plan_rollup_backfill"):
+            raise ToolError("Video-summary restoration worker is unavailable.")
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(
+            args,
+            default_since_hours=14.0 * 24.0,
+        )
+        raw_channels = args.get("channel_ids")
+        channel_ids = [
+            int(channel_id)
+            for channel_id in (raw_channels if isinstance(raw_channels, list) else [])
+            if _opt_int(channel_id) is not None and int(channel_id) > 0
+        ]
+        raw_levels = args.get("levels")
+        levels = [
+            str(level or "").strip().upper()
+            for level in (raw_levels if isinstance(raw_levels, list) else ["L2", "L3"])
+            if str(level or "").strip().upper() in {"L1", "L2", "L3"}
+        ]
+        preview = bool(args.get("preview", True))
+        try:
+            if preview:
+                result = self._lxm.plan_rollup_backfill(
+                    channel_ids=channel_ids or None,
+                    start_ts=from_ts,
+                    end_ts=to_ts,
+                    levels=levels,
+                )
+            else:
+                result = self._lxm.start_rollup_backfill(
+                    channel_ids=channel_ids or None,
+                    start_ts=from_ts,
+                    end_ts=to_ts,
+                    levels=levels,
+                )
+        except Exception as exc:
+            raise ToolError(f"Could not prepare video-summary restoration: {exc}") from exc
+        payload = dict(result)
+        payload["time_window"] = time_meta
+        payload["preview"] = preview
+        if preview:
+            payload["operator_action"] = (
+                "Review the source coverage and ETA, then use the UI Apply action once. "
+                "After Apply the durable worker resumes across restarts without another command."
+            )
+        return payload
+
+    def _get_video_summary_restore_status(self, _args: Dict[str, Any]) -> Dict[str, Any]:
+        status_fn = getattr(self._lxm, "rollup_backfill_status", None)
+        if not callable(status_fn):
+            raise ToolError("Video-summary restoration worker is unavailable.")
+        try:
+            return dict(status_fn())
+        except Exception as exc:
+            raise ToolError(f"Could not read video-summary restoration status: {exc}") from exc
+
     # ── count_video_summary_events ──────────────────────────────────────────
 
     def _count_video_summary_events(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -6659,6 +6782,7 @@ def build_system_prompt(
         f"- Do not call vlm_summary or vlm_alert rows probe detections. When answering from archive tools, name the source class and separate probe hits, video-description frames, and VLM alert frames.\n"
         f"- When answering from video summaries, state the returned coverage window from get_video_summaries.coverage before conclusions when the operator asked about a period. Never imply that missing summary windows were reviewed. If coverage.status is partial/no_data/truncated, say which part was actually reviewed and which part remains unchecked.\n"
         f"- Treat time_window.duration_sec and coverage.available.requested_span_sec as authoritative server arithmetic. Do not recalculate or relabel their duration; 259200 seconds is 72 hours / 3 days. If returned absolute dates conflict with the operator's relative phrase, stop and normalize the relative phrase again.\n"
+        f"- For a post-upgrade request to restore missing summary history, call restore_video_summary_history once with preview=true. The fixed levels are L1=15 minutes, L2=60 minutes, and L3=6 hours. Default to L2,L3 so the temporal lens returns first; add L1 only when the operator explicitly requests exhaustive 15-minute semantic history. A preview is a PLAN, not a completed restoration: say 'planned levels' and 'queueable', never 'levels restored'. In the preview, queueable_windows is the ONLY work that can be restored and the ONLY basis for ETA. Never describe not_restorable_no_archived_source or calendar gaps as queued/missing work: label them exactly 'source coverage gaps (not queued)'. Report archive source coverage, the exact queue size, ETA range, and that live descriptions take priority. Tell the operator to use the UI Apply action; after Apply, never recreate or fan out the queue in chat. Use get_video_summary_restore_status for later progress.\n"
         f"- If the operator asks to confirm video-summary findings with images/snaps, use get_video_summaries with include_evidence_frames=true or call get_detections with source=vlm_summary/source=vlm_alert, the same channel, and the same since_ms/until_ms. Do not use semantic search as the first proof step for exact time evidence.\n"
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
@@ -6761,6 +6885,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "calibrate_probe_from_archive",
         "prepare_probe_calibration_batch",
         "list_video_summary_channels",
+        "restore_video_summary_history",
     }
     if operator_relative_range and tool_name in summary_tools:
         prepared["relative_range"] = operator_relative_range
@@ -11159,6 +11284,91 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 for row in processed_items[:8]
                 if isinstance(row, dict)
             ],
+        }
+
+    if tool_name == "restore_video_summary_history":
+        per_channel = result.get("per_channel") if isinstance(result.get("per_channel"), list) else []
+        totals = result.get("totals") or (result.get("plan") or {}).get("totals") or {}
+        scope = result.get("restoration_scope")
+        if not isinstance(scope, dict):
+            scope = {
+                "queueable_windows": totals.get("missing_semantic"),
+                "already_semantic_windows": totals.get("already_ready"),
+                "archived_source_windows": totals.get("source_windows"),
+                "not_restorable_no_archived_source": totals.get("source_missing_windows"),
+                "calendar_windows": totals.get("calendar_windows"),
+                "queue_contract": (
+                    "Only queueable_windows are submitted to the worker and included in ETA; "
+                    "no-source gaps are not queued work."
+                ),
+            }
+        compact_channels = []
+        for row in per_channel[:50]:
+            if not isinstance(row, dict):
+                continue
+            levels = {}
+            for level, level_row in (row.get("levels") or {}).items():
+                if not isinstance(level_row, dict):
+                    continue
+                levels[level] = {
+                    "queueable_windows": level_row.get("missing_semantic"),
+                    "already_semantic_windows": level_row.get("already_ready"),
+                    "archived_source_windows": level_row.get("source_windows"),
+                    "not_restorable_no_archived_source": level_row.get("source_missing_windows"),
+                }
+            compact_channels.append({"channel_id": row.get("channel_id"), "levels": levels})
+        compact = {
+            "status": result.get("status"),
+            "preview": result.get("preview"),
+            "job_id": result.get("job_id"),
+            "request_key": result.get("request_key"),
+            "time_window": result.get("time_window"),
+            "channel_count": result.get("channel_count"),
+            "channel_ids": result.get("channel_ids"),
+            "levels": result.get("levels"),
+            "archive_source": result.get("archive_source"),
+            "restoration_scope": scope,
+            "estimated_hours": result.get("estimated_hours") or (result.get("plan") or {}).get("estimated_hours"),
+            "estimated_hours_range": result.get("estimated_hours_range") or (result.get("plan") or {}).get("estimated_hours_range"),
+            "load_policy": result.get("load_policy"),
+            "operator_action": result.get("operator_action"),
+            "progress": result.get("progress"),
+            "progress_percent": result.get("progress_percent"),
+            "remaining": result.get("remaining"),
+            "eta_hours": result.get("eta_hours"),
+            "current_item": result.get("current_item"),
+            "last_error": result.get("last_error"),
+            "per_channel": compact_channels,
+        }
+        return _attach_action_plan_hint(compact, result)
+
+    if tool_name == "get_video_summary_restore_status":
+        return {
+            key: result.get(key)
+            for key in (
+                "status",
+                "job_id",
+                "created_at",
+                "started_at",
+                "completed_at",
+                "from_ts",
+                "to_ts",
+                "channel_ids",
+                "levels",
+                "plan",
+                "progress",
+                "progress_percent",
+                "remaining",
+                "eta_seconds",
+                "eta_hours",
+                "average_window_sec",
+                "current_item",
+                "last_outcome",
+                "last_error",
+                "worker_alive",
+                "durable",
+            )
+            if result.get(key) is not None
         }
 
     if tool_name == "list_probes":

@@ -1005,6 +1005,67 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             259_200,
         )
 
+    def test_summary_restore_defaults_to_durable_l2_l3_preview_for_two_weeks(self):
+        manager = _SummaryManager()
+        captured = {}
+
+        def plan_rollup_backfill(**kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "preview",
+                "channel_ids": [7, 8],
+                "channel_count": 2,
+                "levels": list(kwargs["levels"]),
+                "totals": {
+                    "source_windows": 30,
+                    "already_ready": 4,
+                    "missing_semantic": 26,
+                },
+                "estimated_hours": 1.25,
+                "estimated_hours_range": [0.75, 2.25],
+                "load_policy": "single background worker",
+            }
+
+        manager.plan_rollup_backfill = plan_rollup_backfill
+        fixed_now = 1_783_900_000.0
+        with patch("agent.time.time", return_value=fixed_now):
+            result = _tools(manager).execute(
+                "restore_video_summary_history",
+                {
+                    "channel_ids": [7, 8],
+                    "relative_range": "last two weeks",
+                    "preview": True,
+                },
+            )
+
+        self.assertEqual(captured["levels"], ["L2", "L3"])
+        self.assertEqual(captured["start_ts"], fixed_now - 14 * 86400)
+        self.assertEqual(captured["end_ts"], fixed_now)
+        self.assertEqual(result["time_window"]["duration_sec"], 14 * 86400)
+        self.assertTrue(result["preview"])
+        self.assertIn("without another command", result["operator_action"])
+
+        compact = _compact_tool_result_for_model("restore_video_summary_history", result)
+        self.assertEqual(compact["restoration_scope"]["queueable_windows"], 26)
+        self.assertIn("not queued work", compact["restoration_scope"]["queue_contract"])
+
+    def test_summary_restore_status_reads_durable_worker_state(self):
+        manager = _SummaryManager()
+        manager.rollup_backfill_status = lambda: {
+            "status": "running",
+            "job_id": "rollup-backfill-1",
+            "progress_percent": 42.5,
+            "eta_hours": 3.2,
+            "durable": True,
+        }
+
+        result = _tools(manager).execute("get_video_summary_restore_status", {})
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["job_id"], "rollup-backfill-1")
+        self.assertEqual(result["eta_hours"], 3.2)
+        self.assertTrue(result["durable"])
+
     def test_normalize_time_window_accepts_date_without_clock_as_calendar_day(self):
         tools = _tools()
         result = tools.execute(

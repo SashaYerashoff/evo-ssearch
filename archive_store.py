@@ -628,7 +628,7 @@ class PostgresDetectionsStore(_TenantRepository):
         PostgreSQL avoids sending the same summary payload and large thumbnail
         columns repeatedly to the operator history reader.
         """
-        limit = max(1, min(240, int(limit or 120)))
+        limit = max(1, min(1000, int(limit or 120)))
         offset = max(0, int(offset or 0))
         where_sql, params = self._build_where(
             channel_id=channel_id,
@@ -732,6 +732,76 @@ class PostgresDetectionsStore(_TenantRepository):
                 }
             )
         return logs, total
+
+    def list_vlm_summary_buckets(
+        self,
+        *,
+        channel_id: int,
+        since_ms: int,
+        until_ms: int,
+        bucket_sec: int = 900,
+    ) -> List[Dict[str, Any]]:
+        """List archive-backed L0 text coverage grouped into rollup windows."""
+
+        normalized_bucket_sec = max(300, min(86400, int(bucket_sec)))
+        bucket_ms = normalized_bucket_sec * 1000
+        where_sql, params = self._build_where(
+            channel_id=channel_id,
+            source="vlm_summary",
+            since_ms=int(since_ms),
+            until_ms=int(until_ms),
+        )
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    rows = connection.execute(
+                        f"""
+                        WITH candidates AS (
+                            SELECT DISTINCT ON (
+                                COALESCE(NULLIF(payload_json->>'run_id', ''), 'manual'),
+                                COALESCE(NULLIF(payload_json->>'batch_start_ms', '')::bigint, event_timestamp_ms),
+                                COALESCE(NULLIF(payload_json->>'batch_end_ms', '')::bigint, event_timestamp_ms)
+                            )
+                                COALESCE(NULLIF(payload_json->>'batch_start_ms', '')::bigint, event_timestamp_ms) AS batch_start_ms,
+                                COALESCE(NULLIF(payload_json->>'batch_end_ms', '')::bigint, event_timestamp_ms) AS batch_end_ms,
+                                payload_json
+                            FROM archive.detections
+                            {where_sql}
+                              AND COALESCE(payload_json->>'summary', '') <> ''
+                            ORDER BY
+                                COALESCE(NULLIF(payload_json->>'run_id', ''), 'manual'),
+                                COALESCE(NULLIF(payload_json->>'batch_start_ms', '')::bigint, event_timestamp_ms),
+                                COALESCE(NULLIF(payload_json->>'batch_end_ms', '')::bigint, event_timestamp_ms),
+                                event_timestamp_ms DESC,
+                                id DESC
+                        )
+                        SELECT
+                            (FLOOR(batch_start_ms::numeric / %s) * %s)::bigint AS bucket_start_ms,
+                            COUNT(*)::bigint AS batch_count,
+                            MIN(batch_start_ms)::bigint AS first_batch_start_ms,
+                            MAX(batch_end_ms)::bigint AS last_batch_end_ms,
+                            SUM(COALESCE(NULLIF(payload_json->>'frame_count', '')::integer, 0))::bigint AS frame_count
+                        FROM candidates
+                        GROUP BY bucket_start_ms
+                        ORDER BY bucket_start_ms ASC
+                        """,
+                        tuple(params + [bucket_ms, bucket_ms]),
+                    ).fetchall()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _archive_not_ready(exc) from exc
+            raise
+        return [
+            {
+                "window_start": float(int(row[0])) / 1000.0,
+                "window_end": float(int(row[0]) + bucket_ms) / 1000.0,
+                "batch_count": int(row[1] or 0),
+                "first_batch_start_ms": int(row[2] or 0),
+                "last_batch_end_ms": int(row[3] or 0),
+                "frame_count": int(row[4] or 0),
+            }
+            for row in rows
+        ]
 
     def list_vector_candidates(
         self,

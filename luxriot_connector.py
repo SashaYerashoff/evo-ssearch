@@ -231,6 +231,8 @@ class ProbeStoreLike(Protocol):
 AlertParserFn = Callable[[str, int, Optional[int]], List[Dict[str, Any]]]
 SummaryDispatcherFn = Callable[[Mapping[str, Any], str], Mapping[str, Any]]
 SummaryArchiveFn = Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]]
+SummaryArchiveHistoryLoaderFn = Callable[[int, float, float], Tuple[List[Dict[str, Any]], int]]
+SummaryArchiveBucketLoaderFn = Callable[[int, float, float, int], List[Dict[str, Any]]]
 
 
 class AlertDeliveryResult(int):
@@ -3181,6 +3183,7 @@ class LuxriotCaptureSession:
 
 
 class LuxriotManager:
+    ROLLUP_BACKFILL_STATE_KEY = "luxriot_rollup_backfill:active"
     """Coordinator for Luxriot snapshots, summaries, and channel helpers."""
 
     DESIRED_LIVE_SESSIONS_KEY = "luxriot_live_sessions:v1"
@@ -3364,6 +3367,8 @@ class LuxriotManager:
         self.runtime_state_store = runtime_state_store
         self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
         self.summary_archive_callback: Optional[SummaryArchiveFn] = summary_archive_callback
+        self.summary_archive_history_loader: Optional[SummaryArchiveHistoryLoaderFn] = None
+        self.summary_archive_bucket_loader: Optional[SummaryArchiveBucketLoaderFn] = None
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
         self.alert_policy_prompt = str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "") or "")
 
@@ -3410,6 +3415,17 @@ class LuxriotManager:
         except Exception:
             summary_retention_days = 7.0
         self.summary_retention_days = max(0.0, summary_retention_days)
+        try:
+            rollup_retention_days = float(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_RETENTION_DAYS",
+                    self.summary_retention_days,
+                )
+            )
+        except Exception:
+            rollup_retention_days = self.summary_retention_days
+        self.rollup_retention_days = max(0.0, rollup_retention_days)
         self.summary_history: Dict[int, List[Dict[str, Any]]] = {}
         self.channel_status_digest: Dict[int, Dict[str, Any]] = {}
         self.summary_runs: Dict[int, List[Dict[str, Any]]] = {}
@@ -3577,6 +3593,27 @@ class LuxriotManager:
             0.0,
             min(10.0, scheduler_max_deferral_windows),
         )
+        try:
+            backfill_spacing = float(
+                getattr(config, "LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC", 10.0)
+            )
+        except Exception:
+            backfill_spacing = 10.0
+        self.rollup_backfill_spacing_sec = max(1.0, min(300.0, backfill_spacing))
+        try:
+            backfill_max_attempts = int(
+                getattr(config, "LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS", 3)
+            )
+        except Exception:
+            backfill_max_attempts = 3
+        self.rollup_backfill_max_attempts = max(1, min(10, backfill_max_attempts))
+        try:
+            backfill_estimate_sec = float(
+                getattr(config, "LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC", 45.0)
+            )
+        except Exception:
+            backfill_estimate_sec = 45.0
+        self.rollup_backfill_estimate_sec = max(1.0, min(900.0, backfill_estimate_sec))
         self._rollup_scheduler_due: Dict[Tuple[int, str], float] = {}
         self._rollup_scheduler_deferred_since: Dict[Tuple[int, str], float] = {}
         self._rollup_scheduler_stop = threading.Event()
@@ -3692,6 +3729,18 @@ class LuxriotManager:
         self._load_summary_state_from_disk()
         self._summary_state_revision_issued = int(self.summary_state_revision)
         self._load_rollup_cache_from_disk()
+        self._rollup_backfill_condition = threading.Condition(threading.RLock())
+        self._rollup_backfill_stop = threading.Event()
+        self._rollup_backfill_candidate_cache: Dict[Tuple[str, int, str], List[float]] = {}
+        self._rollup_backfill_state = self._load_rollup_backfill_state()
+        self._rollup_backfill_thread: Optional[threading.Thread] = None
+        if runtime_state_store is not None:
+            self._rollup_backfill_thread = threading.Thread(
+                target=self._rollup_backfill_loop,
+                daemon=True,
+                name="eva-rollup-backfill",
+            )
+            self._rollup_backfill_thread.start()
         if self.rollup_scheduler_enabled:
             self._start_rollup_scheduler()
 
@@ -3905,6 +3954,609 @@ class LuxriotManager:
                     }
                 )
             self._rollup_scheduler_stop.wait(self.rollup_scheduler_spacing_sec)
+
+    def set_summary_archive_readers(
+        self,
+        history_loader: Optional[SummaryArchiveHistoryLoaderFn],
+        bucket_loader: Optional[SummaryArchiveBucketLoaderFn],
+    ) -> None:
+        self.summary_archive_history_loader = history_loader
+        self.summary_archive_bucket_loader = bucket_loader
+        with self._rollup_backfill_condition:
+            self._rollup_backfill_condition.notify_all()
+
+    def _load_rollup_backfill_state(self) -> Dict[str, Any]:
+        store = getattr(self, "runtime_state_store", None)
+        if store is None:
+            return {}
+        try:
+            payload = store.load_state(self.ROLLUP_BACKFILL_STATE_KEY)
+        except Exception:
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        state = dict(payload)
+        if str(state.get("status") or "") in {"running", "waiting_live", "retrying"}:
+            state["status"] = "queued"
+            state["resume_reason"] = "process_restart"
+        return state
+
+    def _persist_rollup_backfill_state_locked(self) -> None:
+        store = getattr(self, "runtime_state_store", None)
+        if store is None or not self._rollup_backfill_state:
+            return
+        self._rollup_backfill_state["updated_at"] = time.time()
+        store.save_state(
+            self.ROLLUP_BACKFILL_STATE_KEY,
+            dict(self._rollup_backfill_state),
+        )
+
+    @staticmethod
+    def _backfill_terminal_status(status: object) -> bool:
+        return str(status or "").strip().lower() in {
+            "completed",
+            "completed_with_gaps",
+            "cancelled",
+            "failed",
+        }
+
+    def _backfill_channel_ids(self, channel_ids: Optional[Sequence[int]]) -> List[int]:
+        parsed = sorted(
+            {
+                int(channel_id)
+                for channel_id in (channel_ids or [])
+                if _parse_optional_int(channel_id) is not None and int(channel_id) > 0
+            }
+        )
+        if parsed:
+            return parsed
+        try:
+            inventory = self.get_channels(force=False)
+        except Exception:
+            inventory = []
+        parsed = sorted(
+            {
+                int(channel_id)
+                for channel_id in (
+                    _parse_optional_int(row.get("id"))
+                    for row in inventory
+                    if isinstance(row, Mapping)
+                )
+                if channel_id is not None and channel_id > 0
+            }
+        )
+        return parsed or self._rollup_scheduler_channels()
+
+    def _backfill_candidate_starts(
+        self,
+        job_id: str,
+        channel_id: int,
+        level: str,
+        start_ts: float,
+        end_ts: float,
+    ) -> List[float]:
+        normalized_level = self._normalize_rollup_level(level)
+        cache_key = (str(job_id), int(channel_id), normalized_level)
+        cached = self._rollup_backfill_candidate_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        loader = self.summary_archive_bucket_loader
+        if not callable(loader):
+            return []
+        l1_window = int(self.rollup_windows["L1"])
+        rows = loader(int(channel_id), float(start_ts), float(end_ts), l1_window)
+        l1_starts = sorted(
+            {
+                float(self._bucket_start(float(row.get("window_start")), l1_window))
+                for row in rows
+                if isinstance(row, Mapping)
+                and self._coerce_float(row.get("window_start")) is not None
+            }
+        )
+        window_sec = int(self.rollup_windows[normalized_level])
+        closed_end = min(float(end_ts), time.time())
+        starts = sorted(
+            {
+                float(self._bucket_start(start, window_sec))
+                for start in l1_starts
+                if float(self._bucket_start(start, window_sec)) + window_sec <= closed_end
+                and float(self._bucket_start(start, window_sec)) + window_sec > float(start_ts)
+            }
+        )
+        self._rollup_backfill_candidate_cache[cache_key] = starts
+        return list(starts)
+
+    def _rollup_semantic_ready(self, row: Optional[Mapping[str, Any]]) -> bool:
+        if not isinstance(row, Mapping):
+            return False
+        kind = str(row.get("summary_kind") or "").strip().lower()
+        format_version = int(_parse_optional_int(row.get("format_version")) or 1)
+        summary = str(row.get("summary") or "").strip()
+        return bool(
+            kind in {"llm", "llm_cached"}
+            and format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+            and summary
+            and not self._rollup_operator_semantic_guard_issues(summary)
+        )
+
+    def _backfill_ready_ids(
+        self,
+        channel_id: int,
+        start_ts: float,
+        end_ts: float,
+    ) -> Set[str]:
+        return {
+            str(row.get("rollup_id") or "").strip()
+            for row in self._list_cached_rollups(channel_id, start_ts, end_ts)
+            if self._rollup_semantic_ready(row)
+            and str(row.get("rollup_id") or "").strip()
+        }
+
+    @staticmethod
+    def _closed_window_count(start_ts: float, end_ts: float, window_sec: int) -> int:
+        first = int(math.floor(float(start_ts) / window_sec) * window_sec)
+        closed_end = int(math.floor(min(float(end_ts), time.time()) / window_sec) * window_sec)
+        if closed_end <= first:
+            return 0
+        return max(0, int((closed_end - first) // window_sec))
+
+    def plan_rollup_backfill(
+        self,
+        *,
+        channel_ids: Optional[Sequence[int]],
+        start_ts: float,
+        end_ts: float,
+        levels: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        if not callable(self.summary_archive_bucket_loader):
+            raise RuntimeError("archive-backed summary coverage reader is unavailable")
+        normalized_channels = self._backfill_channel_ids(channel_ids)
+        if not normalized_channels:
+            raise ValueError("no channels are available for summary restoration")
+        normalized_levels = [
+            level
+            for level in ("L1", "L2", "L3")
+            if level in {
+                self._normalize_rollup_level(item)
+                for item in (levels or ("L2", "L3"))
+            }
+        ]
+        if not normalized_levels:
+            raise ValueError("levels must contain L1, L2, or L3")
+        start = max(0.0, min(float(start_ts), float(end_ts)))
+        end = max(float(start_ts), float(end_ts))
+        audit_id = f"audit-{uuid4().hex[:12]}"
+        totals = {
+            "calendar_windows": 0,
+            "source_windows": 0,
+            "source_missing_windows": 0,
+            "already_ready": 0,
+            "missing_semantic": 0,
+        }
+        per_channel: List[Dict[str, Any]] = []
+        for channel_id in normalized_channels:
+            ready_ids = self._backfill_ready_ids(channel_id, start, end)
+            level_rows: Dict[str, Dict[str, int]] = {}
+            for level in normalized_levels:
+                window_sec = int(self.rollup_windows[level])
+                candidates = self._backfill_candidate_starts(
+                    audit_id,
+                    channel_id,
+                    level,
+                    start,
+                    end,
+                )
+                ready = sum(
+                    1
+                    for window_start in candidates
+                    if self._canonical_rollup_id(level, channel_id, window_start, window_sec)
+                    in ready_ids
+                )
+                calendar = self._closed_window_count(start, end, window_sec)
+                source_count = len(candidates)
+                missing = max(0, source_count - ready)
+                level_rows[level] = {
+                    "calendar_windows": calendar,
+                    "source_windows": source_count,
+                    "source_missing_windows": max(0, calendar - source_count),
+                    "already_ready": ready,
+                    "missing_semantic": missing,
+                }
+                for key in totals:
+                    totals[key] += int(level_rows[level][key])
+            per_channel.append({"channel_id": channel_id, "levels": level_rows})
+        channels_with_source = sum(
+            1
+            for row in per_channel
+            if any(
+                int(level_row.get("source_windows") or 0) > 0
+                for level_row in (row.get("levels") or {}).values()
+                if isinstance(level_row, Mapping)
+            )
+        )
+        queueable_channels = sum(
+            1
+            for row in per_channel
+            if any(
+                int(level_row.get("missing_semantic") or 0) > 0
+                for level_row in (row.get("levels") or {}).values()
+                if isinstance(level_row, Mapping)
+            )
+        )
+        with self._rollup_backfill_condition:
+            current_avg = self._coerce_float(
+                self._rollup_backfill_state.get("average_window_sec")
+            )
+        estimate_per_window = max(
+            1.0,
+            current_avg or self.rollup_backfill_estimate_sec,
+        ) + self.rollup_backfill_spacing_sec
+        estimated_sec = float(totals["missing_semantic"]) * estimate_per_window
+        request_payload = {
+            "channel_ids": normalized_channels,
+            "from_bucket": int(start),
+            "to_bucket": int(end),
+            "levels": normalized_levels,
+        }
+        request_key = hashlib.sha256(
+            json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        self._rollup_backfill_candidate_cache = {
+            key: value
+            for key, value in self._rollup_backfill_candidate_cache.items()
+            if key[0] != audit_id
+        }
+        return {
+            "status": "preview",
+            "request_key": request_key,
+            "channel_ids": normalized_channels,
+            "channel_count": len(normalized_channels),
+            "levels": normalized_levels,
+            "from_ts": start,
+            "to_ts": end,
+            "archive_source": "vlm_summary batch text",
+            "totals": totals,
+            "restoration_scope": {
+                "queueable_windows": int(totals["missing_semantic"]),
+                "already_semantic_windows": int(totals["already_ready"]),
+                "archived_source_windows": int(totals["source_windows"]),
+                "not_restorable_no_archived_source": int(totals["source_missing_windows"]),
+                "calendar_windows": int(totals["calendar_windows"]),
+                "channels_with_source": channels_with_source,
+                "channels_without_source": max(0, len(normalized_channels) - channels_with_source),
+                "queueable_channels": queueable_channels,
+                "queue_contract": (
+                    "Only queueable_windows are submitted to the worker and included in ETA. "
+                    "not_restorable_no_archived_source is a coverage gap, not queued work."
+                ),
+            },
+            "per_channel": per_channel,
+            "estimated_window_sec": round(estimate_per_window, 2),
+            "estimated_seconds": round(estimated_sec, 1),
+            "estimated_hours": round(estimated_sec / 3600.0, 2),
+            "estimated_hours_range": [
+                round(estimated_sec * 0.6 / 3600.0, 2),
+                round(estimated_sec * 1.8 / 3600.0, 2),
+            ],
+            "load_policy": "single background worker; live backlog wins; LM workload=background",
+            "idempotent": True,
+        }
+
+    def start_rollup_backfill(
+        self,
+        *,
+        channel_ids: Optional[Sequence[int]],
+        start_ts: float,
+        end_ts: float,
+        levels: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        plan = self.plan_rollup_backfill(
+            channel_ids=channel_ids,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            levels=levels,
+        )
+        with self._rollup_backfill_condition:
+            current = dict(self._rollup_backfill_state)
+            if current and not self._backfill_terminal_status(current.get("status")):
+                result = self.rollup_backfill_status()
+                result["idempotent_existing_job"] = True
+                return result
+            if (
+                current
+                and current.get("request_key") == plan.get("request_key")
+                and str(current.get("status") or "") in {"completed", "completed_with_gaps"}
+            ):
+                result = self.rollup_backfill_status()
+                result["idempotent_existing_job"] = True
+                return result
+            now = time.time()
+            self._rollup_backfill_state = {
+                "version": 1,
+                "job_id": f"rollup-backfill-{uuid4().hex[:12]}",
+                "request_key": plan["request_key"],
+                "status": "queued",
+                "created_at": now,
+                "updated_at": now,
+                "started_at": None,
+                "completed_at": None,
+                "from_ts": plan["from_ts"],
+                "to_ts": plan["to_ts"],
+                "channel_ids": list(plan["channel_ids"]),
+                "levels": list(plan["levels"]),
+                "plan": {
+                    "totals": dict(plan["totals"]),
+                    "estimated_seconds": plan["estimated_seconds"],
+                    "estimated_hours": plan["estimated_hours"],
+                    "estimated_hours_range": list(plan["estimated_hours_range"]),
+                },
+                "cursor": {
+                    "level_index": 0,
+                    "channel_index": 0,
+                    "after_window_start": None,
+                    "attempt": 0,
+                },
+                "progress": {
+                    "processed": 0,
+                    "restored": 0,
+                    "already_ready": 0,
+                    "source_missing": 0,
+                    "failed": 0,
+                    "retries": 0,
+                },
+                "average_window_sec": None,
+                "last_error": None,
+                "current_item": None,
+            }
+            self._rollup_backfill_candidate_cache.clear()
+            self._persist_rollup_backfill_state_locked()
+            self._rollup_backfill_condition.notify_all()
+        return self.rollup_backfill_status()
+
+    def rollup_backfill_status(self) -> Dict[str, Any]:
+        with self._rollup_backfill_condition:
+            state = copy.deepcopy(self._rollup_backfill_state)
+        if not state:
+            return {
+                "status": "not_started",
+                "worker_alive": bool(
+                    self._rollup_backfill_thread
+                    and self._rollup_backfill_thread.is_alive()
+                ),
+            }
+        plan = state.get("plan") if isinstance(state.get("plan"), Mapping) else {}
+        totals = plan.get("totals") if isinstance(plan.get("totals"), Mapping) else {}
+        progress = state.get("progress") if isinstance(state.get("progress"), Mapping) else {}
+        target = int(totals.get("missing_semantic") or 0)
+        processed = int(progress.get("processed") or 0)
+        remaining = max(0, target - processed)
+        average = self._coerce_float(state.get("average_window_sec")) or self.rollup_backfill_estimate_sec
+        eta_sec = remaining * (average + self.rollup_backfill_spacing_sec)
+        completed = str(state.get("status") or "") in {"completed", "completed_with_gaps"}
+        if completed:
+            remaining = 0
+        state["remaining"] = remaining
+        state["progress_percent"] = round(
+            100.0 if completed or target <= 0 else min(100.0, processed * 100.0 / target),
+            2,
+        )
+        state["eta_seconds"] = round(eta_sec, 1)
+        state["eta_hours"] = round(eta_sec / 3600.0, 2)
+        state["worker_alive"] = bool(
+            self._rollup_backfill_thread
+            and self._rollup_backfill_thread.is_alive()
+        )
+        state["durable"] = getattr(self, "runtime_state_store", None) is not None
+        return state
+
+    def _next_rollup_backfill_item_locked(self) -> Optional[Dict[str, Any]]:
+        state = self._rollup_backfill_state
+        levels = [str(level) for level in state.get("levels") or []]
+        channels = [int(channel_id) for channel_id in state.get("channel_ids") or []]
+        cursor = state.setdefault("cursor", {})
+        while int(cursor.get("level_index") or 0) < len(levels):
+            level_index = int(cursor.get("level_index") or 0)
+            channel_index = int(cursor.get("channel_index") or 0)
+            if channel_index >= len(channels):
+                cursor["level_index"] = level_index + 1
+                cursor["channel_index"] = 0
+                cursor["after_window_start"] = None
+                cursor["attempt"] = 0
+                self._persist_rollup_backfill_state_locked()
+                continue
+            level = levels[level_index]
+            channel_id = channels[channel_index]
+            starts = self._backfill_candidate_starts(
+                str(state.get("job_id") or ""),
+                channel_id,
+                level,
+                float(state.get("from_ts") or 0.0),
+                float(state.get("to_ts") or time.time()),
+            )
+            after = self._coerce_float(cursor.get("after_window_start"))
+            window_sec = int(self.rollup_windows[level])
+            for window_start in starts:
+                if after is not None and window_start <= after:
+                    continue
+                rollup_id = self._canonical_rollup_id(level, channel_id, window_start, window_sec)
+                if self._rollup_semantic_ready(self._get_cached_rollup_record(rollup_id)):
+                    cursor["after_window_start"] = window_start
+                    progress = state.setdefault("progress", {})
+                    progress["already_ready"] = int(progress.get("already_ready") or 0) + 1
+                    continue
+                return {
+                    "channel_id": channel_id,
+                    "level": level,
+                    "window_start": window_start,
+                    "window_end": window_start + window_sec,
+                    "rollup_id": rollup_id,
+                }
+            cursor["channel_index"] = channel_index + 1
+            cursor["after_window_start"] = None
+            cursor["attempt"] = 0
+            self._persist_rollup_backfill_state_locked()
+        return None
+
+    def _restore_rollup_window(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        channel_id = int(item["channel_id"])
+        level = self._normalize_rollup_level(item.get("level"))
+        window_start = float(item["window_start"])
+        window_end = float(item["window_end"])
+        rollup_id = str(item["rollup_id"])
+        cached = self._get_cached_rollup_record(rollup_id)
+        if self._rollup_semantic_ready(cached):
+            return {"status": "already_ready", "rollup_id": rollup_id}
+        if level == "L1":
+            loader = self.summary_archive_history_loader
+            if not callable(loader):
+                raise RuntimeError("archive-backed summary history reader is unavailable")
+            logs, total = loader(channel_id, window_start, window_end - 0.001)
+            if not logs:
+                return {"status": "source_missing", "rollup_id": rollup_id, "source_count": int(total)}
+            source_nodes = self._l0_nodes_from_logs(channel_id, logs)
+            source_level = "L0"
+        else:
+            source_level = "L1" if level == "L2" else "L2"
+            source_nodes = [
+                row
+                for row in self._list_cached_rollups(channel_id, window_start, window_end - 0.001)
+                if self._normalize_rollup_level(row.get("level")) == source_level
+                and self._rollup_semantic_ready(row)
+            ]
+            if not source_nodes and level == "L2":
+                loader = self.summary_archive_history_loader
+                if callable(loader):
+                    logs, _total = loader(channel_id, window_start, window_end - 0.001)
+                    source_nodes = self._l0_nodes_from_logs(channel_id, logs)
+                    source_level = "L0"
+            if not source_nodes:
+                return {"status": "source_missing", "rollup_id": rollup_id, "source_count": 0}
+        rows = self._build_rollup_level(
+            channel_id=channel_id,
+            level=level,
+            source_level=source_level,
+            window_sec=int(self.rollup_windows[level]),
+            source_nodes=source_nodes,
+            synthesize=True,
+            max_new=1,
+            workload_class="background",
+        )
+        restored = next(
+            (
+                row
+                for row in rows
+                if str(row.get("rollup_id") or "") == rollup_id
+            ),
+            None,
+        )
+        if self._rollup_semantic_ready(restored):
+            return {
+                "status": "restored",
+                "rollup_id": rollup_id,
+                "source_count": len(source_nodes),
+            }
+        error = str((restored or {}).get("generation_error") or "semantic generation did not complete")
+        raise RuntimeError(error)
+
+    def _rollup_backfill_loop(self) -> None:
+        while not self._rollup_backfill_stop.is_set():
+            with self._rollup_backfill_condition:
+                status = str(self._rollup_backfill_state.get("status") or "")
+                if not self._rollup_backfill_state or self._backfill_terminal_status(status):
+                    self._rollup_backfill_condition.wait(timeout=10.0)
+                    continue
+                if not callable(self.summary_archive_bucket_loader) or not callable(self.summary_archive_history_loader):
+                    self._rollup_backfill_state["status"] = "waiting_source_reader"
+                    try:
+                        self._persist_rollup_backfill_state_locked()
+                    except Exception:
+                        pass
+                    self._rollup_backfill_condition.wait(timeout=10.0)
+                    continue
+                if self._rollup_backfill_state.get("started_at") is None:
+                    self._rollup_backfill_state["started_at"] = time.time()
+                self._rollup_backfill_state["status"] = "running"
+                try:
+                    item = self._next_rollup_backfill_item_locked()
+                except Exception as exc:
+                    self._rollup_backfill_state["status"] = "failed"
+                    self._rollup_backfill_state["last_error"] = _safe_error_text(exc, 240) or exc.__class__.__name__
+                    self._rollup_backfill_state["completed_at"] = time.time()
+                    try:
+                        self._persist_rollup_backfill_state_locked()
+                    except Exception:
+                        pass
+                    continue
+                if item is None:
+                    progress = self._rollup_backfill_state.get("progress") or {}
+                    final_status = "completed_with_gaps" if int(progress.get("failed") or 0) or int(progress.get("source_missing") or 0) else "completed"
+                    self._rollup_backfill_state["status"] = final_status
+                    self._rollup_backfill_state["completed_at"] = time.time()
+                    self._rollup_backfill_state["current_item"] = None
+                    self._persist_rollup_backfill_state_locked()
+                    continue
+                if self._l0_backpressure_active():
+                    self._rollup_backfill_state["status"] = "waiting_live"
+                    self._rollup_backfill_state["current_item"] = item
+                    self._persist_rollup_backfill_state_locked()
+                    self._rollup_backfill_condition.wait(timeout=max(10.0, self.rollup_backfill_spacing_sec))
+                    continue
+                self._rollup_backfill_state["current_item"] = item
+                self._persist_rollup_backfill_state_locked()
+            started = time.monotonic()
+            try:
+                outcome = self._restore_rollup_window(item)
+                error: Optional[str] = None
+            except Exception as exc:
+                outcome = {"status": "failed", "rollup_id": item.get("rollup_id")}
+                error = _safe_error_text(exc, 240) or exc.__class__.__name__
+            elapsed = max(0.0, time.monotonic() - started)
+            wait_sec = self.rollup_backfill_spacing_sec
+            with self._rollup_backfill_condition:
+                state = self._rollup_backfill_state
+                cursor = state.setdefault("cursor", {})
+                progress = state.setdefault("progress", {})
+                outcome_status = str(outcome.get("status") or "failed")
+                if outcome_status == "failed":
+                    attempt = int(cursor.get("attempt") or 0) + 1
+                    cursor["attempt"] = attempt
+                    progress["retries"] = int(progress.get("retries") or 0) + 1
+                    state["last_error"] = error
+                    if attempt < self.rollup_backfill_max_attempts:
+                        state["status"] = "retrying"
+                        wait_sec = max(wait_sec, min(300.0, 15.0 * (2 ** (attempt - 1))))
+                    else:
+                        progress["failed"] = int(progress.get("failed") or 0) + 1
+                        progress["processed"] = int(progress.get("processed") or 0) + 1
+                        cursor["after_window_start"] = float(item["window_start"])
+                        cursor["attempt"] = 0
+                        state["status"] = "running"
+                else:
+                    progress["processed"] = int(progress.get("processed") or 0) + 1
+                    if outcome_status == "restored":
+                        progress["restored"] = int(progress.get("restored") or 0) + 1
+                    elif outcome_status == "already_ready":
+                        progress["already_ready"] = int(progress.get("already_ready") or 0) + 1
+                    elif outcome_status == "source_missing":
+                        progress["source_missing"] = int(progress.get("source_missing") or 0) + 1
+                    cursor["after_window_start"] = float(item["window_start"])
+                    cursor["attempt"] = 0
+                    state["status"] = "running"
+                    state["last_error"] = None
+                    previous_avg = self._coerce_float(state.get("average_window_sec"))
+                    state["average_window_sec"] = round(
+                        elapsed if previous_avg is None else previous_avg * 0.8 + elapsed * 0.2,
+                        3,
+                    )
+                state["last_outcome"] = dict(outcome)
+                state["current_item"] = None
+                try:
+                    self._persist_rollup_backfill_state_locked()
+                except Exception as exc:
+                    state["status"] = "failed"
+                    state["last_error"] = _safe_error_text(exc, 240) or exc.__class__.__name__
+                    state["completed_at"] = time.time()
+                self._rollup_backfill_condition.wait(timeout=wait_sec)
 
     def _session_side_effect_lock_for(self, channel_id: int) -> Any:
         channel_key = int(channel_id)
@@ -6677,6 +7329,11 @@ class LuxriotManager:
             return None
         return time.time() - self.summary_retention_days * 86400.0
 
+    def _rollup_retention_cutoff(self) -> Optional[float]:
+        if self.rollup_retention_days <= 0:
+            return None
+        return time.time() - self.rollup_retention_days * 86400.0
+
     def _filter_summary_history_retention(
         self,
         logs: Sequence[Mapping[str, Any]],
@@ -9214,7 +9871,7 @@ class LuxriotManager:
         self,
         entries: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
-        cutoff = self._summary_retention_cutoff()
+        cutoff = self._rollup_retention_cutoff()
         out: List[Dict[str, Any]] = []
         for entry in entries:
             normalized = self._normalize_cached_rollup_entry(entry)
@@ -9227,7 +9884,7 @@ class LuxriotManager:
         return out
 
     def _prune_rollup_cache_retention_locked(self) -> None:
-        cutoff = self._summary_retention_cutoff()
+        cutoff = self._rollup_retention_cutoff()
         if cutoff is None:
             return
         for key, entry in list(self.rollup_summary_cache.items()):
@@ -9349,7 +10006,7 @@ class LuxriotManager:
         normalized = self._normalize_cached_rollup_entry(durable)
         if normalized is None:
             return None
-        cutoff = self._summary_retention_cutoff()
+        cutoff = self._rollup_retention_cutoff()
         created = self._coerce_float(normalized.get("created_at"))
         if cutoff is not None and created is not None and created < cutoff:
             return None
@@ -9371,7 +10028,7 @@ class LuxriotManager:
         try:
             saver(payload)
             now = time.time()
-            cutoff = self._summary_retention_cutoff()
+            cutoff = self._rollup_retention_cutoff()
             pruner = getattr(state_store, "prune_rollups", None)
             pruned = 0
             if (
@@ -9470,7 +10127,7 @@ class LuxriotManager:
         entries.extend(hot_entries)
         out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
-        cutoff = self._summary_retention_cutoff()
+        cutoff = self._rollup_retention_cutoff()
         for entry in entries:
             normalized = self._normalize_cached_rollup_entry(entry)
             if normalized is None:
@@ -9828,6 +10485,7 @@ class LuxriotManager:
         node: Mapping[str, Any],
         children: Sequence[Mapping[str, Any]],
         fallback_summary: str,
+        workload_class: str = "rollup",
     ) -> Tuple[str, Dict[str, Any], Optional[str]]:
         try:
             messages = self._build_rollup_messages(
@@ -9844,7 +10502,7 @@ class LuxriotManager:
                     self.lm_callback(
                         messages,
                         model_hint,
-                        workload_class="rollup",
+                        workload_class=workload_class,
                     )
                 ).strip()
             else:
@@ -9902,7 +10560,7 @@ class LuxriotManager:
                     self.lm_callback(
                         corrective_messages,
                         model_hint,
-                        workload_class="rollup",
+                        workload_class=workload_class,
                     )
                 ).strip()
             else:
@@ -9974,6 +10632,7 @@ class LuxriotManager:
         source_level: str,
         node_children_pairs: Sequence[Tuple[Dict[str, Any], Sequence[Mapping[str, Any]]]],
         max_new: Optional[int] = None,
+        workload_class: str = "rollup",
     ) -> None:
         if level not in self.rollup_llm_levels or not node_children_pairs:
             return
@@ -10061,6 +10720,7 @@ class LuxriotManager:
                 node=node,
                 children=children,
                 fallback_summary=fallback,
+                workload_class=workload_class,
             )
             if summary and summary != fallback and generation_error is None:
                 self._put_cached_rollup_summary(
@@ -10219,6 +10879,7 @@ class LuxriotManager:
         *,
         synthesize: bool = True,
         max_new: Optional[int] = None,
+        workload_class: str = "rollup",
     ) -> List[Dict[str, Any]]:
         if not source_nodes:
             return []
@@ -10314,6 +10975,7 @@ class LuxriotManager:
                 source_level=source_level,
                 node_children_pairs=llm_pairs,
                 max_new=max_new,
+                workload_class=workload_class,
             )
         return out
 
@@ -12399,6 +13061,7 @@ class LuxriotManager:
             "capture_thread_total": len(video_streams) + len(analytics_items),
             "shared_analytics_count": sum(1 for item in analytics_streams if bool(item.get("shared_capture"))),
             "rollup_scheduler": rollup_scheduler_status,
+            "rollup_backfill": self.rollup_backfill_status(),
         }
 
     def system_status_digest(

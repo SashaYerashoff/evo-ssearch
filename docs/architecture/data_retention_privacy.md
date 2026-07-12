@@ -30,6 +30,7 @@ confirm this characterization for the jurisdiction.
 | Thumbnails | `EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS` | 14 |
 | Row cap | `EVOSSEARCH_ARCHIVE_MAX_RECORDS` | 5,000,000 (raise for multi-week) |
 | Summary history | `EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS` | 7 |
+| Semantic L1–L3 history | `EVOSSEARCH_LUXRIOT_ROLLUP_RETENTION_DAYS` | archive row retention (normally 90) |
 
 Retention is enforced by a scheduled prune. **Data minimization:** keep windows
 no longer than the pilot/operational need; default to the shortest window that

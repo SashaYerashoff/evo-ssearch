@@ -6804,6 +6804,40 @@ def _store_vlm_summary_archive_frames(entry: Mapping[str, Any]) -> Dict[str, Any
 luxriot_manager.set_summary_archive_callback(_store_vlm_summary_archive_frames)
 
 
+def _load_vlm_summary_archive_logs(
+    channel_id: int,
+    start_ts: float,
+    end_ts: float,
+) -> Tuple[List[Dict[str, Any]], int]:
+    return detections_store.list_vlm_summary_batches(
+        channel_id=int(channel_id),
+        since_ms=int(float(start_ts) * 1000.0),
+        until_ms=int(float(end_ts) * 1000.0),
+        limit=1000,
+        offset=0,
+    )
+
+
+def _list_vlm_summary_archive_buckets(
+    channel_id: int,
+    start_ts: float,
+    end_ts: float,
+    bucket_sec: int,
+) -> List[Dict[str, Any]]:
+    return detections_store.list_vlm_summary_buckets(
+        channel_id=int(channel_id),
+        since_ms=int(float(start_ts) * 1000.0),
+        until_ms=int(float(end_ts) * 1000.0),
+        bucket_sec=int(bucket_sec),
+    )
+
+
+luxriot_manager.set_summary_archive_readers(
+    _load_vlm_summary_archive_logs,
+    _list_vlm_summary_archive_buckets,
+)
+
+
 def _build_image_messages(image_path: str, prompt: str) -> List[Dict[str, Any]]:
     user_prompt = (prompt or '').strip() or "Describe the main content of this image clearly and concisely."
     user_content = [

@@ -47,6 +47,7 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "delete_probes",
         "update_probe",
         "update_prompt_settings",
+        "restore_video_summary_history",
     }
 )
 _HIDDEN_UNTIL_APPROVALS = frozenset({"create_bookmark"})
@@ -97,6 +98,8 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "track_visual_state_transitions": Permission.DETECTIONS_VIEW,
     "create_bookmark": Permission.BOOKMARKS_CREATE,
     "generate_report": Permission.REPORTS_VIEW,
+    "restore_video_summary_history": Permission.CAPTURE_MANAGE,
+    "get_video_summary_restore_status": Permission.STREAMS_VIEW,
 }
 
 _WRITE_TOOLS = _PREVIEW_ONLY_TOOLS | _HIDDEN_UNTIL_APPROVALS
@@ -245,6 +248,7 @@ class EvaAgentToolAdapter:
             "track_visual_state_transitions": 90.0,
             "list_video_summary_channels": 90.0,
             "generate_report": 90.0,
+            "restore_video_summary_history": 180.0,
         }.get(name, 45.0)
 
     def close(self) -> None:
@@ -519,6 +523,8 @@ class EvaAgentToolAdapter:
             if name == "prepare_probe_calibration_batch":
                 self._filter_probe_batch_items_for_scope(prepared, scoped_channels)
         elif name == "generate_report" and scoped_channels is not None:
+            prepared.setdefault("channel_ids", sorted(scoped_channels))
+        elif name == "restore_video_summary_history" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif (
             name in _SINGLE_CHANNEL_FOR_SCOPED_ACTORS

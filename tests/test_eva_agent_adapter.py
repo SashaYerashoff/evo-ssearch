@@ -116,6 +116,24 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         )
         self.assertNotIn("users:manage", self.legacy.seen_trusted)
 
+    def test_summary_restore_is_preview_only_and_scoped_to_authorized_channels(self):
+        schemas = {
+            item["function"]["name"]: item
+            for item in self.adapter.available_tool_schemas(self.context)
+        }
+        preview = schemas["restore_video_summary_history"]["function"]["parameters"]["properties"]["preview"]
+        self.assertEqual(preview["enum"], [True])
+
+        result = self.adapter.execute(
+            "restore_video_summary_history",
+            {"relative_range": "last two weeks", "preview": True},
+            self.context,
+        )
+
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+        self.assertTrue(result["arguments"]["preview"])
+
     def test_trusted_permissions_are_cleared_after_tool_exception(self):
         self.legacy.fail_name = "lookup_help"
 

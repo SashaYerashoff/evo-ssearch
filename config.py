@@ -621,6 +621,16 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_SUMMARY_RETENTION_DAYS = 7.0
     LUXRIOT_SUMMARY_RETENTION_DAYS = max(0.0, LUXRIOT_SUMMARY_RETENTION_DAYS)
+    try:
+        LUXRIOT_ROLLUP_RETENTION_DAYS = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_RETENTION_DAYS',
+                str(ARCHIVE_ROW_RETENTION_DAYS),
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_RETENTION_DAYS = float(ARCHIVE_ROW_RETENTION_DAYS)
+    LUXRIOT_ROLLUP_RETENTION_DAYS = max(0.0, LUXRIOT_ROLLUP_RETENTION_DAYS)
     _SUMMARY_DEFAULT_BATCH = LUXRIOT_BATCH_SIZES[0] if LUXRIOT_BATCH_SIZES else 12
     _SUMMARY_DEFAULT_LIMIT = int(
         max(
@@ -829,6 +839,36 @@ class Config:
     LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS = max(
         0.0,
         min(10.0, LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC', '10')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = 10.0
+    LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = max(
+        1.0,
+        min(300.0, LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS', '3')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = 3
+    LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = max(
+        1,
+        min(10, LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC', '45')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = 45.0
+    LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = max(
+        1.0,
+        min(900.0, LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC),
     )
     try:
         LUXRIOT_ROLLUP_L1_WINDOW_SEC = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_WINDOW_SEC', '900'))
