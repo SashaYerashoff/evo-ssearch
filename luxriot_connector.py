@@ -2636,7 +2636,7 @@ class LuxriotCaptureSession:
             self._finalize_capture_apex_bucket(completed_bucket)
         if summarize and float(self.interval) >= 1.0:
             # Snapshot/1-fps capture has no intra-second choice to defer.  Commit
-            # immediately so Georgia cadence and batch timing stay unchanged.
+            # immediately so the configured cadence and batch timing stay unchanged.
             self._flush_capture_apex_bucket()
         if summarize:
             self._summarize_if_ready()

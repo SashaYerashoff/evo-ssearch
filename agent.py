@@ -67,7 +67,7 @@ AGENT_MAX_TOOL_CALLS_PER_TURN  = 64
 AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN = 8
 AGENT_VIDEO_SUMMARY_DEFAULT_LEVEL_LIMIT = 500
 AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
-AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "Asia/Tbilisi").strip() or "Asia/Tbilisi"
+AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "UTC").strip() or "UTC"
 TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
 
 
@@ -619,8 +619,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "timezone": {
                         "type": "string",
                         "description": (
-                            "IANA timezone. Defaults to the deployment site timezone "
-                            f"({AGENT_SITE_TIMEZONE}; configure EVOSSEARCH_SITE_TIMEZONE)."
+                            "Optional IANA timezone supplied by the operator. "
+                            f"Defaults to the neutral reference timezone ({AGENT_SITE_TIMEZONE})."
                         ),
                     },
                 },
@@ -6542,7 +6542,7 @@ def build_system_prompt(
         f"attention signal, tune probes when explicitly requested, adjust prompt settings, describe frames, "
         f"create bookmarks, and compile reports.\n"
         f"Be concise and operator-focused. Never fabricate detection data.\n\n"
-        f"Current site time ({AGENT_SITE_TIMEZONE}): {now_str}\n\n"
+        f"Current reference time ({AGENT_SITE_TIMEZONE}): {now_str}\n\n"
         f"Video-description runtime:\n{video_stream_block}\n\n"
         f"Configured semantic probes ({len(probes)} total; secondary/internal unless explicitly requested):\n{probe_block}\n\n"
         f"Available channels: {channels_str}\n\n"
@@ -6576,7 +6576,7 @@ def build_system_prompt(
         f"- Never claim that Luxriot is disconnected or that a channel does not exist unless list_channels or another Luxriot tool in this turn confirmed that failure.\n"
         f"- You can access EVA AI's first-party operator/admin documentation through lookup_help. If asked whether documentation, guides, manuals, operator guide, or admin guide are reachable, call lookup_help and answer from those results. Never answer that you cannot access the operator/admin docs, external files, or browse the internet when lookup_help is the correct first-party documentation path.\n"
         f"- For UI / how-to / 'where is the button' / documentation / scenario-meaning questions, including questions about L0/L1/L2/L3 prompts or settings, call lookup_help first and answer from the returned passages, citing the doc and section. For broad requests to summarize the guides or documentation, call lookup_help with top_k=8. Do not mix help-doc passages with incident evidence. If best_match_restricted is true (or the only relevant match is in restricted_matches), tell the operator it is an admin/engineer action and name the required permission instead of inventing steps — even if weaker allowed results exist. If lookup_help returns nothing relevant, say it is not documented rather than inventing UI paths.\n"
-        f"- When translating or summarizing documentation from lookup_help, say that it is an adapted summary/translation of the cited sections, not a verbatim manual translation. Cite the source sections inline. Keep source terms precise: source=probe means CLIP probe hits, not sensors; missing image_url means no frame was returned in that result set, not proof that visual evidence does not exist. For Georgian or other languages you are not certain about, label the output as a machine translation draft that should be checked by a native speaker before client-facing use.\n"
+        f"- When translating or summarizing documentation from lookup_help, say that it is an adapted summary/translation of the cited sections, not a verbatim manual translation. Cite the source sections inline. Keep source terms precise: source=probe means CLIP probe hits, not sensors; missing image_url means no frame was returned in that result set, not proof that visual evidence does not exist. For languages you are not certain about, label the output as a machine translation draft that should be checked by a native speaker before client-facing use.\n"
         f"- Probe-threshold semantics are strict: raising pos_floor or raising margin makes a probe stricter; lowering pos_floor or lowering margin makes it more permissive. Never describe lowering margin as tightening, filtering more, or reducing noise.\n"
         f"- Detection hit counts over 24h are historical archive summaries. After a probe threshold change, do not claim that the 24h hit count already improved, dropped, or 'took effect' unless you explicitly measured a fresh post-change window.\n"
         f"- If the operator asks for probe status immediately after an update, report the saved settings and explain that effect on live volume still requires post-change observation unless a fresh post-change query was run.\n"

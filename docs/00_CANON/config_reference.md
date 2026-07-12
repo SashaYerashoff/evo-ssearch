@@ -50,7 +50,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_GUNICORN_THREADS` (`8`) | HTTP request threads inside the single required worker. Eight leaves capacity for bounded live-media responses plus Agent/status traffic |
 | `EVOSSEARCH_SETTINGS_LOCAL_ONLY` (`true`) | Restrict settings writes |
 | `EVOSSEARCH_CONFIG_ENV_FILE` | Absolute path declaration for Settings precedence/provenance, normally identical to systemd `EnvironmentFile`. It does not load or retarget the Settings editor by itself |
-| `EVOSSEARCH_SITE_TIMEZONE` (`Asia/Tbilisi`) | Agent calendar normalization and operator-facing period timestamps; read directly by `agent.py` |
+| `EVOSSEARCH_SITE_TIMEZONE` (`UTC`) | Optional neutral fallback for agent calendar normalization. Omit it unless the deployment explicitly configures a timezone; operator-facing UI uses the browser timezone without displaying a location label. |
 
 ## Auth
 

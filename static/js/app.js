@@ -318,12 +318,12 @@
         snapshotMaxEdge: {luxriot_snapshot_max_edge},
         batchSize: {luxriot_batch_default}
     };
-    const luxriotConfiguredSiteTimezone = {site_timezone_json};
-    let luxriotSiteTimezone = luxriotConfiguredSiteTimezone;
+    let luxriotDisplayTimezone = 'UTC';
     try {
-        new Intl.DateTimeFormat('en', { timeZone: luxriotSiteTimezone }).format(new Date());
+        luxriotDisplayTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        new Intl.DateTimeFormat('en', { timeZone: luxriotDisplayTimezone }).format(new Date());
     } catch (_) {
-        luxriotSiteTimezone = 'UTC';
+        luxriotDisplayTimezone = 'UTC';
     }
     let luxriotActiveChannel = luxriotDefaults.channelId;
     let luxriotPreviewTimer = null;
@@ -2390,13 +2390,13 @@
         return 'live';
     }
 
-    function summarySiteDateParts(epochSec = null) {
+    function summaryLocalDateParts(epochSec = null) {
         const hasEpoch = epochSec !== null && epochSec !== '' && Number.isFinite(Number(epochSec));
         const date = hasEpoch
             ? new Date(Number(epochSec) * 1000)
             : new Date();
         const parts = new Intl.DateTimeFormat('en-CA', {
-            timeZone: luxriotSiteTimezone,
+            timeZone: luxriotDisplayTimezone,
             year: 'numeric',
             month: '2-digit',
             day: '2-digit',
@@ -2408,7 +2408,7 @@
         return { year: values.year, month: values.month, day: values.day };
     }
 
-    function shiftSummarySiteDate(parts, dayDelta) {
+    function shiftSummaryLocalDate(parts, dayDelta) {
         const shifted = new Date(Date.UTC(
             Number(parts.year),
             Number(parts.month) - 1,
@@ -2421,7 +2421,7 @@
         };
     }
 
-    function summarySiteLocalToEpoch(parts) {
+    function summaryLocalToEpoch(parts) {
         const desiredMs = Date.UTC(
             Number(parts.year),
             Number(parts.month) - 1,
@@ -2432,7 +2432,7 @@
         );
         let guessMs = desiredMs;
         const formatter = new Intl.DateTimeFormat('en-CA', {
-            timeZone: luxriotSiteTimezone,
+            timeZone: luxriotDisplayTimezone,
             hourCycle: 'h23',
             year: 'numeric',
             month: '2-digit',
@@ -2461,13 +2461,13 @@
         return guessMs / 1000;
     }
 
-    function summarySiteDayBounds(dayDelta = 0) {
-        const today = summarySiteDateParts();
-        const startParts = shiftSummarySiteDate(today, dayDelta);
-        const endParts = shiftSummarySiteDate(startParts, 1);
+    function summaryLocalDayBounds(dayDelta = 0) {
+        const today = summaryLocalDateParts();
+        const startParts = shiftSummaryLocalDate(today, dayDelta);
+        const endParts = shiftSummaryLocalDate(startParts, 1);
         return {
-            fromTs: summarySiteLocalToEpoch(startParts),
-            toTs: summarySiteLocalToEpoch(endParts) - 0.001,
+            fromTs: summaryLocalToEpoch(startParts),
+            toTs: summaryLocalToEpoch(endParts) - 0.001,
         };
     }
 
@@ -2477,11 +2477,11 @@
         const toTs = now;
         if (normalized === 'live' || normalized === 'all') return { fromTs: null, toTs: null };
         if (normalized === 'today') {
-            const bounds = summarySiteDayBounds(0);
+            const bounds = summaryLocalDayBounds(0);
             return { fromTs: bounds.fromTs, toTs: now };
         }
-        if (normalized === 'yesterday') return summarySiteDayBounds(-1);
-        if (normalized === 'day_before_yesterday') return summarySiteDayBounds(-2);
+        if (normalized === 'yesterday') return summaryLocalDayBounds(-1);
+        if (normalized === 'day_before_yesterday') return summaryLocalDayBounds(-2);
         if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
         if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
         if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
@@ -2508,12 +2508,12 @@
         return 'custom';
     }
 
-    function formatSummarySiteTimestamp(ts, options = {}) {
+    function formatSummaryLocalTimestamp(ts, options = {}) {
         if (ts === null || ts === '' || typeof ts === 'undefined') return 'n/a';
         const sec = Number(ts);
         if (!Number.isFinite(sec)) return 'n/a';
         return new Intl.DateTimeFormat(undefined, {
-            timeZone: luxriotSiteTimezone,
+            timeZone: luxriotDisplayTimezone,
             year: 'numeric',
             month: 'short',
             day: 'numeric',
@@ -2534,12 +2534,12 @@
         const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
         const bounds = getSummaryEffectiveBounds();
         if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
-            return `${formatSummarySiteTimestamp(bounds.fromTs, { dateOnly: true })} · ${luxriotSiteTimezone}`;
+            return formatSummaryLocalTimestamp(bounds.fromTs, { dateOnly: true });
         }
         if (Number.isFinite(bounds.fromTs) && Number.isFinite(bounds.toTs)) {
-            return `${formatSummarySiteTimestamp(bounds.fromTs)} – ${formatSummarySiteTimestamp(bounds.toTs)} · ${luxriotSiteTimezone}`;
+            return `${formatSummaryLocalTimestamp(bounds.fromTs)} – ${formatSummaryLocalTimestamp(bounds.toTs)}`;
         }
-        return `All retained history · ${luxriotSiteTimezone}`;
+        return 'All retained history';
     }
 
     function syncSummaryRangeUI() {
@@ -2567,7 +2567,7 @@
         if (!text) return null;
         const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
         if (!match) return null;
-        return summarySiteLocalToEpoch({
+        return summaryLocalToEpoch({
             year: Number(match[1]),
             month: Number(match[2]),
             day: Number(match[3]),
@@ -2582,7 +2582,7 @@
         if (!Number.isFinite(sec)) return '';
         const values = {};
         new Intl.DateTimeFormat('en-CA', {
-            timeZone: luxriotSiteTimezone,
+            timeZone: luxriotDisplayTimezone,
             hourCycle: 'h23',
             year: 'numeric',
             month: '2-digit',
@@ -2678,11 +2678,11 @@
         let fromTs;
         let toTs;
         if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
-            const currentDate = summarySiteDateParts(bounds.fromTs + 1);
-            const nextDate = shiftSummarySiteDate(currentDate, delta);
-            const afterNext = shiftSummarySiteDate(nextDate, 1);
-            fromTs = summarySiteLocalToEpoch(nextDate);
-            toTs = summarySiteLocalToEpoch(afterNext) - 0.001;
+            const currentDate = summaryLocalDateParts(bounds.fromTs + 1);
+            const nextDate = shiftSummaryLocalDate(currentDate, delta);
+            const afterNext = shiftSummaryLocalDate(nextDate, 1);
+            fromTs = summaryLocalToEpoch(nextDate);
+            toTs = summaryLocalToEpoch(afterNext) - 0.001;
         } else {
             const durationSec = Math.max(60, bounds.toTs - bounds.fromTs);
             fromTs = bounds.fromTs + delta * durationSec;
@@ -4399,7 +4399,7 @@
                 const createdMs = Number.isFinite(createdAtSec) && createdAtSec > 0 ? Math.round(createdAtSec * 1000) : 0;
                 const batchStartMs = Number(log.batch_start_ms || log.window_start_ms || 0);
                 const batchEndMs = Number(log.batch_end_ms || log.window_end_ms || 0);
-                const tsLabel = createdMs ? formatSummarySiteTimestamp(createdAtSec) : 'n/a';
+                const tsLabel = createdMs ? formatSummaryLocalTimestamp(createdAtSec) : 'n/a';
                 const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
                 const modelLabel = String(log.model || '').trim();
                 const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
@@ -4409,7 +4409,7 @@
                     : 'Unknown channel';
                 if (log.coverage_gap) {
                     const gapWindow = Number.isFinite(batchStartMs) && batchStartMs > 0 && Number.isFinite(batchEndMs) && batchEndMs > batchStartMs
-                        ? `${formatSummarySiteTimestamp(batchStartMs / 1000)}–${formatSummarySiteTimestamp(batchEndMs / 1000)}`
+                        ? `${formatSummaryLocalTimestamp(batchStartMs / 1000)}–${formatSummaryLocalTimestamp(batchEndMs / 1000)}`
                         : tsLabel;
                     const gapReason = String(log.gap_reason || 'dropped batch').replace(/_/g, ' ');
                     return `
@@ -4476,8 +4476,8 @@
     function formatRollupRange(windowStart, windowEnd) {
         const start = Number(windowStart);
         const end = Number(windowEnd);
-        const startLabel = Number.isFinite(start) ? formatSummarySiteTimestamp(start) : 'n/a';
-        const endLabel = Number.isFinite(end) ? formatSummarySiteTimestamp(end) : 'n/a';
+        const startLabel = Number.isFinite(start) ? formatSummaryLocalTimestamp(start) : 'n/a';
+        const endLabel = Number.isFinite(end) ? formatSummaryLocalTimestamp(end) : 'n/a';
         return `${startLabel} -> ${endLabel}`;
     }
 
@@ -9435,7 +9435,7 @@
             luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
             if (luxriotSummaryRangePreset === 'custom') {
                 if (!Number.isFinite(luxriotSummaryFromTs) || !Number.isFinite(luxriotSummaryToTs)) {
-                    const initial = summarySiteDayBounds(-1);
+                    const initial = summaryLocalDayBounds(-1);
                     luxriotSummaryFromTs = initial.fromTs;
                     luxriotSummaryToTs = initial.toTs;
                     if (luxriotSummaryFromInput) luxriotSummaryFromInput.value = formatSummaryDatetimeInput(initial.fromTs);

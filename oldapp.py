@@ -1921,10 +1921,6 @@ def serve_app_js():
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
-    js = js.replace(
-        '{site_timezone_json}',
-        json.dumps(os.getenv('EVOSSEARCH_SITE_TIMEZONE', 'Asia/Tbilisi').strip() or 'Asia/Tbilisi'),
-    )
     js = js.replace('{auth_enabled_json}', json.dumps(bool(config.AUTH_ENABLED)))
     js = js.replace(
         '{auth_csrf_cookie_json}',

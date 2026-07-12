@@ -64,8 +64,8 @@ RC устраняет подтверждённые correctness-дефекты и
 - Channel title resolver использует Unicode NFKC + `casefold`; грузинские и
   кириллические названия не отбрасываются ASCII-регуляркой. Numeric ID остаётся
   наиболее надёжным операторским ключом.
-- `EVOSSEARCH_SITE_TIMEZONE` задаёт calendar semantics Agent; default для этой
-  раскатки — `Asia/Tbilisi`. Если модель передала только одну границу уже frozen
+- `EVOSSEARCH_SITE_TIMEZONE` при необходимости явно задаёт calendar semantics
+  Agent; нейтральный default — `UTC`. Если модель передала только одну границу уже frozen
   окна, server дополняет вторую границу, а не заменяет период случайным default.
 - `get_video_summaries` выбирает evidence по периоду: начало/событийные или
   deviation/state/vector окна/конец. Архивные результаты сохраняют `coverage` и

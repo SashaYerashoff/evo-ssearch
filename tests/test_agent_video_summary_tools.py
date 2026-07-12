@@ -879,8 +879,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["since_ms"], 1781389800000)
         self.assertEqual(result["until_ms"], 1781415000000)
 
-    def test_site_timezone_is_default_and_formats_operator_timestamps_consistently(self):
-        with patch("agent.AGENT_SITE_TIMEZONE", "Asia/Tbilisi"):
+    def test_configured_timezone_is_default_and_formats_operator_timestamps_consistently(self):
+        with patch("agent.AGENT_SITE_TIMEZONE", "Etc/GMT-4"):
             result = _tools().execute(
                 "normalize_time_window",
                 {
@@ -890,7 +890,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(result["timezone"], "Asia/Tbilisi")
+            self.assertEqual(result["timezone"], "Etc/GMT-4")
             self.assertEqual(result["from_local"], "2026-06-14T01:30:00+04:00")
             self.assertEqual(_format_epoch_minute(result["from_ts"]), "2026-06-14 01:30")
             self.assertEqual(_format_epoch_minute(result["to_ts"]), "2026-06-14 08:30")

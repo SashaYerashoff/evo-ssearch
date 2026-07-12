@@ -633,7 +633,7 @@ def test_video_history_controls_separate_period_resolution_and_live_following():
     for token in (
         "function resolveAutoSummaryLevel",
         "function shiftSelectedSummaryPeriod",
-        "function summarySiteLocalToEpoch",
+        "function summaryLocalToEpoch",
         "rangePreset === 'live' ? 'live'",
         "fetch(`/luxriot/history?${params.toString()}`",
         "function refreshLuxriotArchivedSummaries",
@@ -646,6 +646,9 @@ def test_video_history_controls_separate_period_resolution_and_live_following():
     assert ".luxriot-feed-loading-spinner" in CSS
     assert 'grid-template-areas:\n        "filters"\n        "period"\n        "custom"\n        "actions"' in CSS
     assert ".video-feed-head .luxriot-summary-actions-row" in CSS
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in JS
+    assert "All retained history ·" not in JS
+    assert "site_timezone_json" not in JS
 
 
 def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():

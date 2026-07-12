@@ -402,7 +402,6 @@ def prepare_env_values(
             "EVOSSEARCH_HOST": "127.0.0.1",
             "EVOSSEARCH_PORT": "5000",
             "EVOSSEARCH_AUTH_COOKIE_SECURE": "true",
-            "EVOSSEARCH_SITE_TIMEZONE": "Asia/Tbilisi",
             "EVOSSEARCH_AUTH_TENANT_ID": tenant_id,
             "EVOSSEARCH_ARCHIVE_TENANT_ID": tenant_id,
             "EVOSSEARCH_LM_PROFILES": "agent,vlm",
