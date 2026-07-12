@@ -524,6 +524,25 @@ def test_archive_media_loops_the_complete_description_batch():
     assert "Loading the next recorded archive segment" not in JS
 
 
+def test_burst_attention_is_visible_in_summary_and_archive_ui():
+    for token in (
+        "function summaryBurstAttention",
+        "function renderSummaryBurstAttentionChip",
+        "capture_attention",
+        "⚡ burst ×",
+        "Motion far above this channel's measured norm; snapshot numbers:",
+        "function archiveFrameRoleLabel",
+        "burst apex",
+        "sharper companion (burst)",
+        "archive-review-strip-attention",
+        "Burst attention frame",
+    ):
+        assert token in JS
+    assert ".summary-attention-chip" in CSS
+    assert ".result-badge.attention" in CSS
+    assert ".archive-review-strip-frame .archive-review-strip-attention" in CSS
+
+
 def test_rollup_aggregation_progress_is_targeted_generation_safe_and_cleared():
     rollups = JS.split("async function refreshLuxriotRollups", 1)[1].split(
         "async function refreshLuxriotSummaryView", 1

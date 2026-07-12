@@ -1097,6 +1097,12 @@
         background: rgba(138, 98, 50, 0.22);
         color: #ffd39e;
     }
+
+    .result-badge.attention {
+        border-color: rgba(240, 160, 48, 0.62);
+        background: rgba(240, 160, 48, 0.18);
+        color: #ffd27a;
+    }
     
     .similarity {
         color: #bbb;
@@ -2364,6 +2370,19 @@
         color: #ff8f9d;
         border-color: rgba(255, 76, 101, 0.6);
         background: rgba(162, 35, 55, 0.2);
+    }
+
+    .summary-attention-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.18rem 0.48rem;
+        border: 1px solid rgba(240, 160, 48, 0.58);
+        border-radius: 999px;
+        background: rgba(240, 160, 48, 0.16);
+        color: #ffd27a;
+        font-size: 0.68rem;
+        line-height: 1;
+        white-space: nowrap;
     }
 
     .luxriot-bookmark-btn,
@@ -7626,6 +7645,18 @@ textarea::placeholder {
     line-height: 1.1;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.archive-review-strip-frame .archive-review-strip-attention {
+    left: auto;
+    right: 4px;
+    top: 4px;
+    bottom: auto;
+    padding: 3px 5px;
+    color: #ffd27a;
+    border: 1px solid rgba(240, 160, 48, 0.62);
+    background: rgba(25, 16, 4, 0.86);
+    font-size: 0.66rem;
 }
 
 .archive-review-filmstrip-status {

@@ -3846,6 +3846,38 @@
         return `<span class="summary-alert-badges" title="${escapeHtml(title)}"><span class="summary-alert-level">${escapeHtml(level || 'L0')}</span>${parts.join('')}</span>`;
     }
 
+    function summaryBurstAttention(row) {
+        const attention = row?.vector_signal?.capture_attention;
+        const seconds = attention && typeof attention === 'object' && Array.isArray(attention.seconds)
+            ? attention.seconds
+            : [];
+        const bursts = seconds.filter((item) => (
+            item && typeof item === 'object' && String(item.mode || '').trim().toLowerCase() === 'burst'
+        ));
+        if (!bursts.length) return null;
+        const activityValues = bursts
+            .map((item) => Number(item.activity_x))
+            .filter((value) => Number.isFinite(value) && value >= 0);
+        const snapshots = bursts
+            .map((item) => String(item.snapshot ?? '').trim())
+            .filter(Boolean);
+        return {
+            count: bursts.length,
+            maxActivity: activityValues.length ? Math.max(...activityValues) : null,
+            snapshots,
+        };
+    }
+
+    function renderSummaryBurstAttentionChip(row) {
+        const burst = summaryBurstAttention(row);
+        if (!burst) return '';
+        const maxLabel = Number.isFinite(burst.maxActivity) ? ` (max ${burst.maxActivity.toFixed(1)}×)` : '';
+        const label = `⚡ burst ×${burst.count}${maxLabel}`;
+        const snapshotLabel = burst.snapshots.length ? burst.snapshots.join(', ') : 'n/a';
+        const title = `Motion far above this channel's measured norm; snapshot numbers: ${snapshotLabel}`;
+        return `<span class="summary-attention-chip" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
+    }
+
     function withSummaryUpdatedMeta(text) {
         const base = String(text || '').trim();
         const stamp = new Date().toLocaleTimeString();
@@ -3929,13 +3961,14 @@
                 const canBookmark = userHasPermission('bookmarks:create');
                 const collapsed = isSummaryCollapsed(channelId, logKey);
                 const alertBadges = renderSummaryAlertBadges(log, 'L0');
+                const attentionBadge = renderSummaryBurstAttentionChip(log);
                 const bookmarkButton = canBookmark
                     ? `<button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${hasSummaryText ? '' : 'disabled'}>Bookmark</button>`
                     : '';
                 return `
                     <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
                         <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}</div>
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}${attentionBadge}</div>
                             <div class="luxriot-summary-actions">
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
                                     ${collapsed ? 'Expand' : 'Collapse'}
@@ -6526,6 +6559,18 @@
         return lines.join('');
     }
 
+    function archiveFrameRoleLabel(roleValue) {
+        const role = String(roleValue || '').trim().toLowerCase();
+        if (role === 'burst_apex') return 'burst apex';
+        if (role === 'burst_companion') return 'sharper companion (burst)';
+        return role ? role.replace(/_/g, ' ') : '';
+    }
+
+    function isBurstArchiveFrameRole(roleValue) {
+        const role = String(roleValue || '').trim().toLowerCase();
+        return role === 'burst_apex' || role === 'burst_companion';
+    }
+
     function buildResultBadges(result) {
         if (!result || typeof result !== 'object') return '';
         const badges = [];
@@ -6543,6 +6588,12 @@
             } else {
                 badges.push({ label: 'Archive frame', classes: '' });
             }
+        }
+
+        const payload = archiveResultPayload(result);
+        const anchorRole = String(payload.anchor_role || payload.anchor_source_role || '').trim();
+        if (isBurstArchiveFrameRole(anchorRole)) {
+            badges.push({ label: `⚡ ${archiveFrameRoleLabel(anchorRole)}`, classes: 'attention' });
         }
 
         const modeRaw = String(result.search_mode || '').trim().toLowerCase();
@@ -7297,7 +7348,8 @@
         const role = String(payload.anchor_role || payload.anchor_source_role || '').trim();
         const frameIndex = Number(payload.frame_index ?? payload.anchor_frame_index);
         const parts = [];
-        if (role) parts.push(role.replace(/_/g, ' '));
+        const roleLabel = archiveFrameRoleLabel(role);
+        if (roleLabel) parts.push(roleLabel);
         if (Number.isFinite(frameIndex)) parts.push(`frame ${frameIndex}`);
         return parts.length ? parts.join(' · ') : 'Frame';
     }
@@ -12005,10 +12057,16 @@
             const frameNo = archiveReviewFrameNumber(frame);
             const label = frameNo !== null ? `Frame ${frameNo}` : `Frame ${idx + 1}`;
             const roleText = archiveFrameRoleText(frame).replace(/\s+/g, ' ');
+            const framePayload = archiveResultPayload(frame);
+            const frameRole = String(framePayload.anchor_role || framePayload.anchor_source_role || '').trim();
+            const attentionMarker = isBurstArchiveFrameRole(frameRole)
+                ? '<span class="archive-review-strip-attention" aria-label="Burst attention frame">⚡</span>'
+                : '';
             const activeClass = idx === activeIndex ? ' is-active' : '';
             return `
                 <button class="archive-review-strip-frame${activeClass}" type="button" data-archive-review-frame-index="${idx}" title="${escapeHtml(roleText)}">
                     <img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(label)}" loading="lazy">
+                    ${attentionMarker}
                     <span>${escapeHtml(label)}</span>
                 </button>
             `;
