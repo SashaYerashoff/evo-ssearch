@@ -35,7 +35,23 @@ from urllib.parse import urlsplit
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
-EXPECTED_VERSION = "β 0.8.3"
+
+
+def _expected_version() -> str:
+    """The bundled VERSION file is authoritative; the constant is a fallback.
+
+    The installer ships inside the source tree it installs, so a hard-coded
+    version string silently rots on every release bump.
+    """
+
+    try:
+        text = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        text = ""
+    return text or "β 0.8.4"
+
+
+EXPECTED_VERSION = _expected_version()
 EXPECTED_SCHEMA = "20260614_0006"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")

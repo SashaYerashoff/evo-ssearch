@@ -55,7 +55,9 @@ def make_source(root: Path) -> Path:
     ):
         (source / relative).mkdir(parents=True, exist_ok=True)
     files = {
-        "VERSION": "β 0.8.3\n",
+        # Stay in lockstep with the real tree: the installer's expected
+        # version now derives from the repo VERSION file.
+        "VERSION": (ROOT / "VERSION").read_text(encoding="utf-8"),
         "run_prod.sh": "#!/bin/sh\n",
         "wsgi.py": "app = None\n",
         "requirements.txt": "example==1\n",
