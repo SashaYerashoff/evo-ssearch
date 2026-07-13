@@ -456,7 +456,8 @@ systemctl_write start "${SERVICE_NAME}.service"
 READY_JSON=""
 for _attempt in {1..18}; do
   if READY_JSON="$(curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null)"; then
-    if printf '%s' "${READY_JSON}" | grep -Fq "${EXPECTED_VERSION}"; then
+    if printf '%s' "${READY_JSON}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' \
+       && printf '%s' "${READY_JSON}" | grep -Fq "${EXPECTED_VERSION}"; then
       break
     fi
   fi

@@ -45,6 +45,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertLess(confirmation, install)
         self.assertLess(install, restart_prompt)
         self.assertIn("is up and running", SCRIPT)
+        self.assertIn('"status"[[:space:]]*:[[:space:]]*"ready"', SCRIPT)
 
     def test_builder_places_entrypoint_at_bundle_root(self):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
