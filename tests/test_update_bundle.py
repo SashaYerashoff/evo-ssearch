@@ -62,6 +62,12 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
         self.assertIn('"${BASE_URL}/ready?load=1"', SCRIPT)
 
+    def test_agent_context_mismatch_stops_before_update(self):
+        context_check = SCRIPT.index("agent inference server exposes context")
+        confirmation = SCRIPT.index("Type UPDATE")
+        self.assertLess(context_check, confirmation)
+        self.assertIn("raise and restart it before updating", SCRIPT)
+
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')
         confirmation = SCRIPT.index("Type UPDATE")

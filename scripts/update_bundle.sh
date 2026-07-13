@@ -318,9 +318,7 @@ CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}
 AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL)"
 [[ -n "${AGENT_LM_BASE_URL}" ]] || AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_BASE_URL)"
 if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
-  printf 'WARN: .env pins agent context to %s; this hotfix defaults to %s.\n' \
-    "${CONFIGURED_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}" >&2
-  printf '      The env file is preserved; raise EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS before the final client test.\n' >&2
+  stop ".env pins agent context to ${CONFIGURED_AGENT_CONTEXT}; raise EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS to ${EXPECTED_AGENT_CONTEXT} before updating"
 fi
 if [[ -n "${AGENT_LM_BASE_URL}" ]]; then
   AGENT_MODELS_BODY="$(mktemp)"
@@ -340,9 +338,7 @@ except Exception:
 PY
 )"
     if [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( SERVED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
-      printf 'WARN: agent inference server exposes context %s, below required %s.\n' \
-        "${SERVED_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}" >&2
-      printf '      Raise llama.cpp/vLLM context and restart that inference service before acceptance testing.\n' >&2
+      stop "agent inference server exposes context ${SERVED_AGENT_CONTEXT}, below required ${EXPECTED_AGENT_CONTEXT}; raise and restart it before updating"
     elif [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]]; then
       ok "agent inference context is ${SERVED_AGENT_CONTEXT} (required: ${EXPECTED_AGENT_CONTEXT})"
     else
