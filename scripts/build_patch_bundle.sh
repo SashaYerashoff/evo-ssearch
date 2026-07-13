@@ -160,6 +160,11 @@ for script_name in install_patch.sh verify_patch.sh rollback.sh set_site_ips.sh 
   fi
 done
 
+if [[ -f "${REPO_ROOT}/scripts/update_bundle.sh" ]]; then
+  cp "${REPO_ROOT}/scripts/update_bundle.sh" "${BUNDLE_DIR}/update.sh"
+  chmod 0755 "${BUNDLE_DIR}/update.sh"
+fi
+
 if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
   mkdir -p "${BUNDLE_DIR}/wheelhouse"
   if [[ -n "${WHEELHOUSE_DIR}" ]]; then
