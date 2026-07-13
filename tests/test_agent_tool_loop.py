@@ -15,6 +15,7 @@ from agent import (
     _context_budget_snapshot,
     _filter_streamed_tool_markup,
     _parse_text_tool_calls,
+    _select_relevant_tool_schemas,
     _seed_turn_tool_context,
     _apply_turn_tool_context,
     _AgentLMClient,
@@ -144,6 +145,61 @@ class _FakeApprovalTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_tool_schemas_are_routed_by_operator_intent(self):
+        def names(query, *, inventory_complete=False):
+            context = _seed_turn_tool_context(query)
+            if inventory_complete:
+                context["video_inventory_completed"] = True
+            return {
+                row["function"]["name"]
+                for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+            }
+
+        self.assertEqual(names("Hello, introduce yourself"), set())
+        self.assertEqual(
+            names("Show current active streams, models, queues and dropped frames"),
+            {"list_video_summary_channels"},
+        )
+        self.assertEqual(
+            names("Show recent VLM alerts and notable video-summary events for the last hour"),
+            {"normalize_time_window", "list_video_summary_channels"},
+        )
+        detailed = names(
+            "Show recent VLM alerts and notable video-summary events for the last hour",
+            inventory_complete=True,
+        )
+        self.assertIn("get_video_summaries", detailed)
+        self.assertIn("describe_frame", detailed)
+        self.assertNotIn("create_probe", detailed)
+        self.assertNotIn("update_prompt_settings", detailed)
+        self.assertEqual(
+            names("How do I open the archive review?"),
+            {"lookup_help"},
+        )
+        probe_tools = names("Create a CLIP probe on channel #112 for a visible lighter flame")
+        self.assertIn("create_probe", probe_tools)
+        self.assertIn("calibrate_probe_from_archive", probe_tools)
+        self.assertNotIn("get_video_summaries", probe_tools)
+
+    def test_plain_chat_omits_empty_tools_payload(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+        client.admission_controller = Admission()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "hello"}}]
+        }
+        with patch.object(agent.requests, "post", return_value=response) as post:
+            client.call_with_tools([{"role": "user", "content": "hello"}], tools=[])
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
     def test_agent_disables_model_thinking_for_tool_and_final_calls(self):
         client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
 
@@ -220,6 +276,12 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual("".join(_filter_streamed_tool_markup(chunks)), "Answer before  after")
 
     def test_vlm_alert_request_routes_to_prompt_policy_without_disabling_explicit_probes(self):
+        self.assertFalse(
+            _seed_turn_tool_context("Show the latest VLM alert for channel #112")["vlm_alert_policy_request"]
+        )
+        self.assertFalse(
+            _seed_turn_tool_context("Покажи последние VLM-алерты канала #112")["vlm_alert_policy_request"]
+        )
         context = _seed_turn_tool_context(
             "set a new alert for the vlm channel #112 - if person fires a lighter"
         )
@@ -267,6 +329,87 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertGreater(with_tools["tool_schema_estimated_tokens"], 0)
         self.assertEqual(status["compacted_tool_messages"], 1)
         self.assertLess(len(compacted[1]["content"]), len(messages[1]["content"]))
+
+    def test_video_summary_model_compaction_keeps_signal_without_verbose_contract(self):
+        raw = {
+            "channel_id": 112,
+            "depth": "L0",
+            "count": 25,
+            "total_in_window": 154,
+            "semantic_available_count": 154,
+            "semantic_status": "ready",
+            "truncated": True,
+            "coverage": {
+                "status": "truncated",
+                "truncated": True,
+                "selection_strategy": "period_sample_alert_priority",
+                "note": "n" * 2000,
+                "available": {
+                    "entry_count": 154,
+                    "status": "covered",
+                    "first_time": "2026-07-13 09:27",
+                    "last_time": "2026-07-13 10:27",
+                    "large_internal_gaps": [{"detail": "x" * 2000}],
+                },
+                "returned": {"entry_count": 25, "status": "partial"},
+            },
+            "source_coverage": {"status": "covered", "available": {"entry_count": 154}},
+            "evidence_frames": [
+                {"id": 296781, "channel_id": 112, "source": "vlm_summary", "image_url": "/detections/thumbnail/296781"}
+            ],
+            "entries": [
+                {
+                    "time": f"10:{index:02d}",
+                    "summary": "semantic narrative " + ("x" * 1500),
+                    "alert_events": [{"title": "event"}] * 10,
+                }
+                for index in range(25)
+            ],
+        }
+
+        compact = _compact_tool_result_for_model("get_video_summaries", raw)
+
+        self.assertEqual(len(compact["entries"]), 5)
+        self.assertEqual(len(compact["entries"][0]["summary"]), 700)
+        self.assertEqual(len(compact["entries"][0]["alert_events"]), 4)
+        self.assertEqual(compact["evidence_frames"][0]["image_url"], "/detections/thumbnail/296781")
+        self.assertNotIn("large_internal_gaps", json.dumps(compact["coverage"]))
+        self.assertLess(len(json.dumps(compact)), 9_000)
+
+    def test_incomplete_final_response_uses_completed_tool_ledger(self):
+        class IncompleteLM(_FakeLMClient):
+            def stream_text(self, messages, cancel_event=None):
+                self.final_messages = list(messages)
+                yield "Let me fetch the remaining frames."
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = IncompleteLM(tool_rounds=1, tool_name="get_video_summaries")
+        runner._tools = _FakeTools(result={
+            "channel_id": 112,
+            "depth": "L0",
+            "count": 25,
+            "total_in_window": 154,
+            "semantic_status": "ready",
+            "coverage": {"status": "truncated", "truncated": True},
+            "evidence_frames": [{"id": 296781, "image_url": "/detections/thumbnail/296781"}],
+            "evidence_frame_totals": {"vlm_summary": 154},
+            "entries": [],
+        })
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat("session-1", "Show VLM alerts for channel #112")
+            if item.startswith("data: ")
+        ]
+
+        self.assertTrue(any(item.get("type") == "completion_recovery" for item in events))
+        final_text = "".join(item.get("content", "") for item in events if item.get("type") == "text")
+        self.assertIn("CH 112", final_text)
+        self.assertNotIn("Let me fetch", final_text)
 
     def test_archive_tool_compaction_preserves_source_semantics(self):
         compact = _compact_tool_result_for_model(
@@ -340,7 +483,7 @@ class AgentToolLoopTests(unittest.TestCase):
             request_id="request-1",
         )
 
-        list(runner.stream_chat("session-1", "test", tool_context=context))
+        list(runner.stream_chat("session-1", "list channels", tool_context=context))
 
         self.assertEqual(
             runner._lm_client.tools[0]["function"]["name"],

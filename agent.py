@@ -83,19 +83,19 @@ def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int
     return value
 
 
-AGENT_CONTEXT_LIMIT_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", 32_768, minimum=8_192)
+AGENT_CONTEXT_LIMIT_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", 65_536, minimum=8_192)
 AGENT_MAX_OUTPUT_TOKENS = _int_env("EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS", 2_048, minimum=256, maximum=8_192)
 AGENT_CONTEXT_CHARS_PER_TOKEN = _int_env("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", 3, minimum=1, maximum=12)
 AGENT_CONTEXT_HISTORY_BUDGET_TOKENS = min(
-    _int_env("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", 8_000, minimum=1_000),
+    _int_env("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", 16_000, minimum=1_000),
     max(1_000, AGENT_CONTEXT_LIMIT_TOKENS // 3),
 )
 AGENT_CONTEXT_WARNING_TOKENS = min(
-    _int_env("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", 24_000, minimum=4_000),
+    _int_env("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", 52_000, minimum=4_000),
     max(4_000, AGENT_CONTEXT_LIMIT_TOKENS - AGENT_MAX_OUTPUT_TOKENS - 4_096),
 )
 AGENT_CONTEXT_HARD_TOKENS = min(
-    _int_env("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", 28_000, minimum=8_000),
+    _int_env("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", 60_000, minimum=8_000),
     max(8_000, AGENT_CONTEXT_LIMIT_TOKENS - AGENT_MAX_OUTPUT_TOKENS - 1_024),
 )
 if AGENT_CONTEXT_HARD_TOKENS <= AGENT_CONTEXT_WARNING_TOKENS:
@@ -1857,12 +1857,13 @@ class _AgentLMClient:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "tools": effective_tools,
-            "tool_choice": "auto",
             "max_tokens": min(1_024, AGENT_MAX_OUTPUT_TOKENS),
             "chat_template_kwargs": dict(AGENT_CHAT_TEMPLATE_KWARGS),
             "stream": False,
         }
+        if effective_tools:
+            payload["tools"] = effective_tools
+            payload["tool_choice"] = "auto"
         with self.admission_controller.admission(
             self.admission_resource,
             workload="agent",
@@ -7271,12 +7272,156 @@ def _operator_requests_vlm_alert_policy(text: Any) -> bool:
     )
     alert_change = bool(
         re.search(
-            r"\b(?:set|add|create|new|watch|alert|notify)\b|"
-            r"алерт|уведом|добав|созда|следи|отслежива",
+            r"\b(?:set|add|create|new|watch|notify)\b|\balert\s+(?:me|us)\b|"
+            r"добав|созда|следи|отслежива|уведомля|настрой.*алерт|нов(?:ый|ое|ую).{0,20}алерт",
             value,
         )
     )
     return bool(vlm_channel and alert_change and not explicitly_probe)
+
+
+_TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
+    "help": frozenset({"lookup_help"}),
+    "channel_inventory": frozenset({"list_channels", "list_video_summary_channels"}),
+    "runtime": frozenset({"list_video_summary_channels"}),
+    "prompt_policy": frozenset({"get_prompt_settings", "update_prompt_settings"}),
+    "video_research": frozenset({
+        "normalize_time_window",
+        "list_video_summary_channels",
+        "get_video_summaries",
+        "get_detections",
+        "describe_frame",
+        "list_attention_bursts",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+        "generate_report",
+    }),
+    "archive_research": frozenset({
+        "normalize_time_window",
+        "list_channels",
+        "search_archive",
+        "get_detections",
+        "get_detection_summary",
+        "build_research_batch",
+        "describe_frame",
+        "get_visual_window_signals",
+    }),
+    "probe_management": frozenset({
+        "list_channels",
+        "list_probes",
+        "calibrate_probe_from_archive",
+        "prepare_probe_calibration_batch",
+        "create_probe",
+        "update_probe",
+        "delete_probes",
+        "get_detections",
+        "get_detection_summary",
+        "search_archive",
+        "describe_frame",
+    }),
+    "bookmark": frozenset({
+        "search_archive",
+        "get_detections",
+        "describe_frame",
+        "create_bookmark",
+    }),
+    "summary_restore": frozenset({
+        "normalize_time_window",
+        "list_video_summary_channels",
+        "restore_video_summary_history",
+        "get_video_summary_restore_status",
+    }),
+}
+
+
+def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[str]:
+    """Return bounded operational intents used to expose only relevant tools."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    intents: List[str] = []
+
+    def add(name: str) -> None:
+        if name not in intents:
+            intents.append(name)
+
+    if context.get("vlm_alert_policy_request"):
+        add("prompt_policy")
+        return intents
+    if context.get("runtime_status_only"):
+        add("runtime")
+        return intents
+
+    if re.search(
+        r"\b(?:help|documentation|docs?|manual|guide|how\s+(?:do|can)\s+i|where\s+is|what\s+does)\b"
+        r"|помощ|документ|инструкц|руководств|как\s+(?:мне\s+)?(?:сделать|настроить|открыть)|где\s+(?:кнопк|наход)",
+        text,
+    ):
+        add("help")
+        return intents
+    if re.search(r"\b(?:restore|backfill|rebuild)\b.*\b(?:summary|summaries|history|rollup)\b|восстанов|бэкфилл|достро.*суммар", text):
+        add("summary_restore")
+        return intents
+    if re.search(r"\bbookmark(?:s)?\b|закладк", text):
+        add("bookmark")
+        return intents
+    if re.search(r"\b(?:probe|clip|p/n/m|threshold)\b|проб[аыуе]?|клип|порог", text):
+        add("probe_management")
+        return intents
+    if re.search(
+        r"\b(?:prompt|system prompt|alert policy|sampling settings?)\b|промпт|политик[аи]\s+алерт|настройк[аи]\s+описан",
+        text,
+    ):
+        add("prompt_policy")
+        return intents
+    if re.search(
+        r"\b(?:archive|detection|find similar|similar image|search (?:for )?(?:a )?frame|describe (?:this )?frame|image search)\b"
+        r"|архив|детекц|похож|найд[иите].*(?:кадр|картин)|опиши.*кадр",
+        text,
+    ):
+        add("archive_research")
+    if (
+        context.get("focus_video_summaries")
+        or re.search(
+            r"\b(?:vlm|video|camera|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incident|event|events)\b"
+            r"|видео|камер|алерт|суммар|описан|событи|инцидент|что\s+произош|отч[её]т|покрыти|замолчал",
+            text,
+        )
+    ):
+        add("video_research")
+    if re.search(r"\b(?:list|show|available)\b.*\bchannels?\b|список\s+канал|покажи.*канал", text):
+        add("channel_inventory")
+
+    # Plain conversation and unrelated questions need no tools. This is
+    # intentional: an empty tool list is much safer than a 40k schema dump.
+    return intents
+
+
+def _select_relevant_tool_schemas(
+    schemas: Sequence[Mapping[str, Any]],
+    context: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    intents = [str(item) for item in (context.get("tool_intents") or [])]
+    allowed_names: set[str] = set()
+    for intent in intents:
+        allowed_names.update(_TOOL_INTENT_GROUPS.get(intent, ()))
+
+    # A broad video request without a named channel must inventory scope first.
+    # Once the inventory result is remembered, detail tools become available in
+    # the same turn.
+    if (
+        "video_research" in intents
+        and context.get("channel_id") is None
+        and not context.get("video_inventory_completed")
+        and not context.get("research_continuation")
+    ):
+        allowed_names.intersection_update({"normalize_time_window", "list_video_summary_channels"})
+
+    return [
+        copy.deepcopy(dict(schema))
+        for schema in schemas
+        if isinstance(schema, Mapping)
+        and str((schema.get("function") or {}).get("name") or "") in allowed_names
+    ]
 
 
 def _extract_vlm_alert_criterion(text: Any) -> Optional[str]:
@@ -7314,6 +7459,7 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
             or russian_runtime_status
         ),
     }
+    context["tool_intents"] = _classify_tool_intents(user_text, context)
     user_text_value = str(user_text or "").strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
@@ -7508,6 +7654,7 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         return
 
     if tool_name == "list_video_summary_channels":
+        context["video_inventory_completed"] = True
         time_window = result.get("time_window")
         if isinstance(time_window, Mapping) and time_window.get("from_ts") is not None and time_window.get("to_ts") is not None:
             context["time_window"] = {
@@ -8089,6 +8236,93 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
     return message
 
 
+def _final_response_is_incomplete(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if len(text) > 360:
+        return False
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return bool(
+        re.match(
+            r"^(?:let me|i(?:'ll| will)|next,? i(?:'ll| will)|сейчас я|давай я|позволь(?:те)? мне)\b",
+            normalized,
+        )
+        and re.search(
+            r"\b(?:fetch|check|inspect|retrieve|query|call|use|look|review|собер|провер|запрош|получ|посмотр|вызов)\w*\b",
+            normalized,
+        )
+    )
+
+
+def _format_completion_fallback(ledger: Mapping[str, Any]) -> str:
+    """Produce an evidence-only answer when the local model returns no conclusion."""
+
+    query = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query, flags=re.IGNORECASE))
+    coverage_rows = [row for row in (ledger.get("coverage") or []) if isinstance(row, Mapping)]
+    evidence_rows = [row for row in (ledger.get("evidence") or []) if isinstance(row, Mapping)]
+    error_rows = [row for row in (ledger.get("errors") or []) if isinstance(row, Mapping)]
+
+    lines = [
+        "Модель не сформировала надёжный финальный текст; ниже сохранённый результат выполненных проверок."
+        if russian
+        else "The model did not produce a reliable final narrative; these are the completed tool results."
+    ]
+    for row in coverage_rows[:8]:
+        channel_id = row.get("channel_id")
+        if row.get("tool") == "list_video_summary_channels":
+            if russian:
+                lines.append(
+                    f"- Инвентаризация: активно {row.get('active') or 0}, неактивно {row.get('inactive') or 0}, "
+                    f"ошибок {row.get('errors') or 0}, не проверено {row.get('unchecked') or 0}."
+                )
+            else:
+                lines.append(
+                    f"- Inventory: {row.get('active') or 0} active, {row.get('inactive') or 0} inactive, "
+                    f"{row.get('errors') or 0} errors, {row.get('unchecked') or 0} unchecked."
+                )
+            continue
+        if channel_id is not None:
+            if russian:
+                lines.append(
+                    f"- CH {channel_id} {row.get('depth') or ''}: возвращено {row.get('entries') or 0} из "
+                    f"{row.get('total_in_window') or 0}; coverage={row.get('status') or 'unknown'}, "
+                    f"truncated={'yes' if row.get('truncated') else 'no'}."
+                )
+            else:
+                lines.append(
+                    f"- CH {channel_id} {row.get('depth') or ''}: returned {row.get('entries') or 0} of "
+                    f"{row.get('total_in_window') or 0}; coverage={row.get('status') or 'unknown'}, "
+                    f"truncated={'yes' if row.get('truncated') else 'no'}."
+                )
+    for row in evidence_rows[:8]:
+        if row.get("channel_id") is None:
+            continue
+        if russian:
+            lines.append(
+                f"- Кадры CH {row.get('channel_id')}: {row.get('returned_frames') or row.get('count') or 0} "
+                f"возвращено, URL изображений {row.get('image_url_count') or 0}."
+            )
+        else:
+            lines.append(
+                f"- Frames CH {row.get('channel_id')}: {row.get('returned_frames') or row.get('count') or 0} "
+                f"returned, {row.get('image_url_count') or 0} image URLs."
+            )
+    for row in error_rows[:4]:
+        lines.append(
+            ("- Ошибка tool: " if russian else "- Tool error: ")
+            + str(row.get("error") or "unknown")[:220]
+        )
+    if len(lines) == 1:
+        lines.append(
+            "- Проверки завершились без пригодного для отчёта результата. Сузь канал или временное окно и повтори запрос."
+            if russian
+            else "- The checks returned no reportable result. Narrow the channel or time window and retry."
+        )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Agent runner (tool loop + SSE)
 # ---------------------------------------------------------------------------
@@ -8415,30 +8649,15 @@ class AgentRunner:
         )
         history_slice_start = 1 + len(trusted_research_messages)
         history_slice_end = history_slice_start + len(history_prefix)
-        available_tool_schemas = (
+        permitted_tool_schemas = (
             self._secure_tools.available_tool_schemas(tool_context)
             if tool_context is not None and self._secure_tools is not None
             else _TOOL_SCHEMAS
         )
-        if turn_tool_context.get("vlm_alert_policy_request"):
-            allowed_prompt_tools = {"get_prompt_settings", "update_prompt_settings"}
-            available_tool_schemas = [
-                schema
-                for schema in available_tool_schemas
-                if isinstance(schema, Mapping)
-                and str((schema.get("function") or {}).get("name") or "") in allowed_prompt_tools
-            ]
-        elif turn_tool_context.get("runtime_status_only"):
-            # A current-runtime inventory question has one authoritative tool.
-            # Removing unrelated schemas saves roughly 10k prompt tokens on the
-            # local 9B model and prevents accidental archive fan-out.
-            available_tool_schemas = [
-                schema
-                for schema in available_tool_schemas
-                if isinstance(schema, Mapping)
-                and str((schema.get("function") or {}).get("name") or "")
-                == "list_video_summary_channels"
-            ]
+        available_tool_schemas = _select_relevant_tool_schemas(
+            permitted_tool_schemas,
+            turn_tool_context,
+        )
         initial_budget = _context_budget_snapshot(
             in_flight,
             tool_schemas=available_tool_schemas,
@@ -8484,6 +8703,12 @@ class AgentRunner:
         context_warning_sent = False
         context_hard_stop_sent = False
         while True:
+            # Tool availability may expand after a trusted inventory result in
+            # the same turn, but it never escapes the operator intent group.
+            available_tool_schemas = _select_relevant_tool_schemas(
+                permitted_tool_schemas,
+                turn_tool_context,
+            )
             if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
                 in_flight.append(
                     {
@@ -8801,13 +9026,19 @@ class AgentRunner:
                     continue
                 chunk = str(stream_value)
                 full_text_parts.append(chunk)
-                yield _sse({"type": "text", "content": chunk})
         except Exception as exc:
             yield _sse({"type": "error", "message": f"Streaming error: {exc}"})
             yield _sse({"type": "done", "session_id": session_id})
             return
 
         final_text = "".join(full_text_parts)
+        if _final_response_is_incomplete(final_text):
+            final_text = _format_completion_fallback(turn_signal_ledger)
+            yield _sse({
+                "type": "completion_recovery",
+                "message": "The local model returned an incomplete final response; using completed tool results.",
+            })
+        yield _sse({"type": "text", "content": final_text})
 
         # ── persist assistant turn ─────────────────────────────────────────
         # Persist intermediate tool-call/result pairs
@@ -11269,6 +11500,67 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _compact_time_window_for_model(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        key: value.get(key)
+        for key in (
+            "timezone",
+            "relative_range",
+            "from_ts",
+            "to_ts",
+            "since_ms",
+            "until_ms",
+            "from_time",
+            "to_time",
+            "duration_sec",
+            "window_source",
+        )
+        if value.get(key) is not None
+    }
+
+
+def _compact_coverage_for_model(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    compact: Dict[str, Any] = {
+        key: value.get(key)
+        for key in (
+            "status",
+            "truncated",
+            "must_state_coverage",
+            "selection_strategy",
+        )
+        if value.get(key) is not None
+    }
+    for section_name in ("available", "returned"):
+        section = value.get(section_name)
+        if not isinstance(section, Mapping):
+            continue
+        compact[section_name] = {
+            key: section.get(key)
+            for key in (
+                "label",
+                "entry_count",
+                "status",
+                "first_ts",
+                "last_ts",
+                "first_time",
+                "last_time",
+                "coverage_ratio",
+                "leading_gap_sec",
+                "trailing_gap_sec",
+                "internal_gap_count",
+            )
+            if section.get(key) is not None
+        }
+    note = str(value.get("operator_note") or value.get("note") or "").strip()
+    if note:
+        compact["note"] = note[:320]
+    return compact
+
+
 def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
@@ -11502,7 +11794,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         runtime_streams = result.get("active_runtime_streams") if isinstance(result.get("active_runtime_streams"), list) else []
         return {
             "depth": result.get("depth"),
-            "time_window": result.get("time_window"),
+            "time_window": _compact_time_window_for_model(result.get("time_window")),
             "channel_inventory_status": result.get("channel_inventory_status"),
             "channel_inventory_error": result.get("channel_inventory_error"),
             "channel_inventory_cache": result.get("channel_inventory_cache"),
@@ -11529,7 +11821,6 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "deferred_channel_ids": result.get("deferred_channel_ids"),
             "per_turn_channel_limit": result.get("per_turn_channel_limit"),
             "requires_confirmation": result.get("requires_confirmation"),
-            "full_research_note": result.get("full_research_note"),
             "configured_vlm_profile": result.get("configured_vlm_profile"),
             "configured_vlm_model": result.get("configured_vlm_model"),
             "active_runtime_streams": [
@@ -11552,7 +11843,6 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "failed_batches": row.get("failed_batches"),
                     "dropped_frames": row.get("dropped_frames"),
                     "dropped_batches": row.get("dropped_batches"),
-                    "last_success_at": row.get("last_success_at"),
                     "last_error": row.get("last_error"),
                 }
                 for row in runtime_streams[:AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN]
@@ -11600,9 +11890,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "latest_time": row.get("latest_time"),
                     "alert_total": row.get("alert_total"),
                     "alert_counts": row.get("alert_counts"),
-                    "alert_parser_breakdown": row.get("alert_parser_breakdown"),
-                    "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
-                    "recent_alerts": list(row.get("recent_alerts") or [])[:3],
+                    "recent_alerts": list(row.get("recent_alerts") or [])[:2],
                     "state_transition_total": row.get("state_transition_total"),
                     "running": row.get("running"),
                     "desired": row.get("desired"),
@@ -11610,14 +11898,9 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "live_signal_status": row.get("live_signal_status"),
                     "video_lm": row.get("video_lm"),
                     "active_capture_source": row.get("active_capture_source"),
-                    "recent_frame_count": row.get("recent_frame_count"),
                     "stale_signal": row.get("stale_signal"),
                     "last_capture_age_sec": row.get("last_capture_age_sec"),
-                    "max_frame_age_sec": row.get("max_frame_age_sec"),
                     "frozen_signal": row.get("frozen_signal"),
-                    "frozen_signal_age_sec": row.get("frozen_signal_age_sec"),
-                    "frozen_frame_count": row.get("frozen_frame_count"),
-                    "run_count": row.get("run_count"),
                     "coverage_status": row.get("coverage_status"),
                     "coverage_ratio": row.get("coverage_ratio"),
                     "coverage_gap_count": row.get("coverage_gap_count"),
@@ -11642,9 +11925,9 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "level_limit_applied": result.get("level_limit_applied"),
             "backend_truncated": result.get("backend_truncated"),
             "source_counts": result.get("source_counts"),
-            "time_window": result.get("time_window"),
-            "coverage": result.get("coverage"),
-            "source_coverage": result.get("source_coverage"),
+            "time_window": _compact_time_window_for_model(result.get("time_window")),
+            "coverage": _compact_coverage_for_model(result.get("coverage")),
+            "source_coverage": _compact_coverage_for_model(result.get("source_coverage")),
             "count": result.get("count"),
             "total_in_window": result.get("total_in_window"),
             "semantic_available_count": result.get("semantic_available_count"),
@@ -11656,9 +11939,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "running": result.get("running"),
             "evidence_frame_query": result.get("evidence_frame_query"),
             "evidence_selection_strategy": result.get("evidence_selection_strategy"),
-            "evidence_priority_windows": result.get("evidence_priority_windows"),
-            "evidence_frame_queries": result.get("evidence_frame_queries"),
-            "evidence_frame_attempted_sources": result.get("evidence_frame_attempted_sources"),
+            "evidence_priority_windows": list(result.get("evidence_priority_windows") or [])[:6],
             "attempted_sources": result.get("attempted_sources"),
             "evidence_frame_totals": result.get("evidence_frame_totals"),
             "totals": result.get("totals"),
@@ -11687,14 +11968,14 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "alert_parser_breakdown": row.get("alert_parser_breakdown"),
                     "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
                     "state_transition_total": row.get("state_transition_total"),
-                    "alert_events": row.get("alert_events"),
-                    "state_observations": row.get("state_observations"),
-                    "state_transition_events": row.get("state_transition_events"),
+                    "alert_events": list(row.get("alert_events") or [])[:4],
+                    "state_observations": list(row.get("state_observations") or [])[:4],
+                    "state_transition_events": list(row.get("state_transition_events") or [])[:4],
                     "unconfirmed_prose_signal_count": row.get("unconfirmed_prose_signal_count"),
                     "unconfirmed_prose_note": row.get("unconfirmed_prose_note"),
-                    "summary": str(row.get("summary") or "")[:1200],
+                    "summary": str(row.get("summary") or "")[:700],
                 }
-                for row in entries[:6]
+                for row in entries[:5]
                 if isinstance(row, dict)
             ],
         }

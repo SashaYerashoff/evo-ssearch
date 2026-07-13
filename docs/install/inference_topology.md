@@ -27,7 +27,13 @@ EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL=<agent-host>/v1
 EVOSSEARCH_LM_PROFILE_AGENT_MODEL=<agent-model>
 EVOSSEARCH_LM_PROFILE_VLM_BASE_URL=<vlm-host>/v1
 EVOSSEARCH_LM_PROFILE_VLM_MODEL=qwen/qwen3-vl-4b
+EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=65536
 ```
+
+The agent inference server must expose at least the same 65,536-token context.
+For llama.cpp use `-c 65536`; for vLLM set the equivalent max model length and
+confirm `/v1/models` reports `meta.n_ctx` or `max_model_len` at or above 65536.
+Changing only the EVA environment does not enlarge the model server context.
 
 ## Multiple VLM hosts (balancer)
 

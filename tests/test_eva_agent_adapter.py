@@ -35,6 +35,7 @@ class _LegacyTools:
         self._trusted = None
         self.seen_trusted = None
         self.fail_name = None
+        self.results = {}
 
     def _set_trusted_permissions(self, permissions):
         self._trusted = frozenset(str(item) for item in (permissions or ()))
@@ -47,6 +48,8 @@ class _LegacyTools:
         self.seen_trusted = self._trusted
         if name == self.fail_name:
             raise RuntimeError("boom")
+        if name in self.results:
+            return self.results[name]
         if name == "list_channels":
             return {
                 "count": 2,
@@ -115,6 +118,41 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             frozenset({Permission.AGENT_USE.value, Permission.DETECTIONS_VIEW.value}),
         )
         self.assertNotIn("users:manage", self.legacy.seen_trusted)
+
+    def test_video_summary_security_boundary_preserves_entries_and_image_urls(self):
+        self.legacy.results["get_video_summaries"] = {
+            "channel_id": 7,
+            "count": 25,
+            "coverage": {
+                "status": "truncated",
+                "windows": [
+                    {"index": index, "status": "covered", "metadata": {"source": "L0"}}
+                    for index in range(300)
+                ],
+            },
+            "entries": [
+                {"time": f"10:{index:02d}", "summary": f"summary {index}"}
+                for index in range(25)
+            ],
+            "evidence_frames": [
+                {
+                    "id": 501,
+                    "detection_id": 501,
+                    "channel_id": 7,
+                    "image_url": "/detections/thumbnail/501",
+                }
+            ],
+        }
+
+        result = self.adapter.execute(
+            "get_video_summaries",
+            {"channel_id": 7, "limit": 25, "include_evidence_frames": True},
+            self.context,
+        )
+
+        self.assertEqual(len(result["entries"]), 25)
+        self.assertEqual(result["evidence_frames"][0]["image_url"], "/detections/thumbnail/501")
+        self.assertNotIn("_truncated", result)
 
     def test_summary_restore_is_preview_only_and_scoped_to_authorized_channels(self):
         schemas = {

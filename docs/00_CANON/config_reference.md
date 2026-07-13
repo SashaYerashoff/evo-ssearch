@@ -149,12 +149,12 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS` (`32768`) | Actual context served by the agent model; lower budgets are clamped below it |
+| `EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS` (`65536`) | Actual context served by the agent model; the inference server must expose the same or a larger context |
 | `EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS` (`2048`) | Reserved maximum final-answer budget |
 | `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`3`) | Conservative JSON/tool-result token estimator divisor |
-| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`8000`) | Old chat history budget before trimming |
-| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`24000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
-| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`28000`) | Stops further tool use and compacts tool payloads before the final model call |
+| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`16000`) | Old chat history budget before trimming |
+| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`52000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
+| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and compacts tool payloads before the final model call |
 
 ## Inference queue (disabled by default)
 

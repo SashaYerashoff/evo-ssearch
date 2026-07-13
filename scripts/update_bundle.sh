@@ -294,6 +294,49 @@ target_python() {
   fi
 }
 
+EXPECTED_AGENT_CONTEXT=65536
+CONFIGURED_AGENT_CONTEXT="$(read_env_value EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS)"
+CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}"
+AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL)"
+[[ -n "${AGENT_LM_BASE_URL}" ]] || AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_BASE_URL)"
+if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
+  printf 'WARN: .env pins agent context to %s; this hotfix defaults to %s.\n' \
+    "${CONFIGURED_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}" >&2
+  printf '      The env file is preserved; raise EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS before the final client test.\n' >&2
+fi
+if [[ -n "${AGENT_LM_BASE_URL}" ]]; then
+  AGENT_MODELS_BODY="$(mktemp)"
+  if curl -fsS --max-time 5 "${AGENT_LM_BASE_URL%/}/models" > "${AGENT_MODELS_BODY}" 2>/dev/null; then
+    SERVED_AGENT_CONTEXT="$(target_python - "${AGENT_MODELS_BODY}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    row = (payload.get("data") or [{}])[0]
+    value = row.get("max_model_len") or (row.get("meta") or {}).get("n_ctx")
+    print(int(value) if value is not None else "UNKNOWN")
+except Exception:
+    print("UNKNOWN")
+PY
+)"
+    if [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( SERVED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
+      printf 'WARN: agent inference server exposes context %s, below required %s.\n' \
+        "${SERVED_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}" >&2
+      printf '      Raise llama.cpp/vLLM context and restart that inference service before acceptance testing.\n' >&2
+    elif [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]]; then
+      ok "agent inference context is ${SERVED_AGENT_CONTEXT} (required: ${EXPECTED_AGENT_CONTEXT})"
+    else
+      printf 'WARN: agent inference server did not report n_ctx/max_model_len; verify it is at least %s.\n' \
+        "${EXPECTED_AGENT_CONTEXT}" >&2
+    fi
+  else
+    printf 'WARN: could not read agent inference context from %s/models.\n' "${AGENT_LM_BASE_URL%/}" >&2
+  fi
+  rm -f "${AGENT_MODELS_BODY}"
+fi
+
 CV_OVERLAY_REQUIRED=false
 if target_python - <<'PY' >/dev/null 2>&1
 import cv2

@@ -181,7 +181,7 @@ class EvaAgentToolAdapter:
                     "window_seconds",
                 ),
                 max_output_bytes=96_000,
-                max_output_items=500,
+                max_output_items=self._max_output_items(name),
                 max_output_string_chars=24_000,
                 timeout_seconds=self._timeout_seconds(name),
                 rate_limit=RateLimit(
@@ -217,6 +217,18 @@ class EvaAgentToolAdapter:
             "calibrate_probe_from_archive": 120,
             "prepare_probe_calibration_batch": 120,
         }.get(name)
+
+    @staticmethod
+    def _max_output_items(name: str) -> int:
+        # Video-summary responses contain bounded semantic entries, evidence
+        # rows, and nested coverage contracts. The generic 500-item ceiling can
+        # be exhausted by coverage metadata before it reaches entries/image_url,
+        # producing false empty summaries and blank UI previews. Bytes and row
+        # limits remain independently bounded.
+        return {
+            "get_video_summaries": 4_000,
+            "list_video_summary_channels": 2_000,
+        }.get(name, 500)
 
     @staticmethod
     def _default_rows(name: str) -> int | None:
