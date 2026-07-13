@@ -7,6 +7,8 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/dist}"
 BUNDLE_NAME="${BUNDLE_NAME:-eva-ai-patch-$(date +%Y%m%d-%H%M%S)}"
 INCLUDE_WHEELHOUSE=false
 WHEELHOUSE_DIR=""
+FFMPEG_ARCHIVE=""
+OPENCV_WHEEL=""
 PYTHON_BIN="${PYTHON:-python3}"
 
 log() {
@@ -30,6 +32,8 @@ Options:
   --name NAME           Bundle directory/archive name.
   --with-wheelhouse     Download Python wheels into bundle/wheelhouse.
   --wheelhouse-dir DIR  Copy an existing wheelhouse directory into the bundle.
+  --ffmpeg-archive FILE Include a BtbN linux64 FFmpeg .tar.xz payload.
+  --opencv-wheel FILE   Include an x86_64 opencv-python-headless wheel.
   --python-bin PATH     Python used for pip download. Default: $PYTHON or python3.
   -h, --help            Show this help.
 
@@ -59,6 +63,14 @@ while [[ $# -gt 0 ]]; do
       INCLUDE_WHEELHOUSE=true
       shift 2
       ;;
+    --ffmpeg-archive)
+      FFMPEG_ARCHIVE="$2"
+      shift 2
+      ;;
+    --opencv-wheel)
+      OPENCV_WHEEL="$2"
+      shift 2
+      ;;
     --python-bin)
       PYTHON_BIN="$2"
       shift 2
@@ -85,6 +97,18 @@ need_cmd() {
 need_cmd tar
 need_cmd date
 need_cmd mktemp
+
+if [[ -n "${FFMPEG_ARCHIVE}" || -n "${OPENCV_WHEEL}" ]]; then
+  [[ -f "${FFMPEG_ARCHIVE}" ]] || {
+    fail "FFmpeg archive not found: ${FFMPEG_ARCHIVE:-<not supplied>}"
+    exit 1
+  }
+  [[ -f "${OPENCV_WHEEL}" ]] || {
+    fail "OpenCV wheel not found: ${OPENCV_WHEEL:-<not supplied>}"
+    exit 1
+  }
+  need_cmd sha256sum
+fi
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -153,7 +177,7 @@ else
   tar "${COMMON_EXCLUDES[@]}" -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${SNAPSHOT_DIR}"
 fi
 
-for script_name in install_patch.sh verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh; do
+for script_name in install_patch.sh install_media_runtime.sh restore_code_snapshot.py verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh; do
   if [[ -f "${REPO_ROOT}/scripts/${script_name}" ]]; then
     cp "${REPO_ROOT}/scripts/${script_name}" "${BUNDLE_DIR}/scripts/${script_name}"
     chmod 0755 "${BUNDLE_DIR}/scripts/${script_name}"
@@ -210,6 +234,38 @@ if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
   ok "wheelhouse included"
 fi
 
+if [[ -n "${FFMPEG_ARCHIVE}" ]]; then
+  log "Including self-contained FFmpeg/ffprobe and OpenCV rescue payload"
+  MEDIA_DIR="${BUNDLE_DIR}/runtime"
+  FFMPEG_EXTRACT_DIR="${TMP_DIR}/ffmpeg-extract"
+  mkdir -p "${MEDIA_DIR}/ffmpeg/bin" "${MEDIA_DIR}/opencv" "${FFMPEG_EXTRACT_DIR}"
+  FFMPEG_ROOT="$(tar -tJf "${FFMPEG_ARCHIVE}" | sed -n '1{s:/*$::;p;}')"
+  [[ -n "${FFMPEG_ROOT}" ]] || {
+    fail "FFmpeg archive is empty: ${FFMPEG_ARCHIVE}"
+    exit 1
+  }
+  tar -xJf "${FFMPEG_ARCHIVE}" -C "${FFMPEG_EXTRACT_DIR}" \
+    "${FFMPEG_ROOT}/bin/ffmpeg" \
+    "${FFMPEG_ROOT}/bin/ffprobe" \
+    "${FFMPEG_ROOT}/LICENSE.txt"
+  install -m 0755 "${FFMPEG_EXTRACT_DIR}/${FFMPEG_ROOT}/bin/ffmpeg" "${MEDIA_DIR}/ffmpeg/bin/ffmpeg"
+  install -m 0755 "${FFMPEG_EXTRACT_DIR}/${FFMPEG_ROOT}/bin/ffprobe" "${MEDIA_DIR}/ffmpeg/bin/ffprobe"
+  install -m 0644 "${FFMPEG_EXTRACT_DIR}/${FFMPEG_ROOT}/LICENSE.txt" "${MEDIA_DIR}/ffmpeg/LICENSE.txt"
+  install -m 0644 "${OPENCV_WHEEL}" "${MEDIA_DIR}/opencv/$(basename "${OPENCV_WHEEL}")"
+  {
+    printf 'platform=linux-x86_64\n'
+    printf 'ffmpeg_source_archive=%s\n' "$(basename "${FFMPEG_ARCHIVE}")"
+    printf 'ffmpeg_source_sha256=%s\n' "$(sha256sum "${FFMPEG_ARCHIVE}" | awk '{print $1}')"
+    printf 'opencv_wheel=%s\n' "$(basename "${OPENCV_WHEEL}")"
+    printf 'opencv_wheel_sha256=%s\n' "$(sha256sum "${OPENCV_WHEEL}" | awk '{print $1}')"
+  } > "${MEDIA_DIR}/manifest.txt"
+  (
+    cd "${MEDIA_DIR}"
+    find ffmpeg opencv -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+  )
+  ok "media runtime included"
+fi
+
 {
   printf 'bundle_name=%s\n' "${BUNDLE_NAME}"
   printf 'created_at=%s\n' "$(date -Is)"
@@ -221,6 +277,12 @@ fi
     printf 'wheelhouse=included\n'
   else
     printf 'wheelhouse=not_included\n'
+  fi
+  if [[ -n "${FFMPEG_ARCHIVE}" ]]; then
+    printf 'media_runtime=included\n'
+    printf 'media_runtime_platform=linux-x86_64\n'
+  else
+    printf 'media_runtime=not_included\n'
   fi
   if [[ -n "${GIT_STATUS}" ]]; then
     printf 'working_tree_status=dirty\n'

@@ -71,7 +71,7 @@ as_root() {
   fi
 }
 
-for command_name in cmp curl grep sed systemctl tar; do
+for command_name in cmp curl grep sed sha256sum systemctl tar; do
   command -v "${command_name}" >/dev/null 2>&1 || stop "required command is missing: ${command_name}"
 done
 
@@ -231,9 +231,27 @@ printf 'Health URL:  %s\n' "${BASE_URL}"
 MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MANIFEST_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 BUNDLE_COMMIT="$(sed -n 's/^git_commit=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+MEDIA_RUNTIME="$(sed -n 's/^media_runtime=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+MEDIA_PLATFORM="$(sed -n 's/^media_runtime_platform=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 [[ "${MANIFEST_VERSION}" == "${EXPECTED_VERSION}" ]] || stop "manifest version is not ${EXPECTED_VERSION}"
 [[ "${MANIFEST_STATUS}" == "clean" ]] || stop "bundle was built from a dirty working tree"
 [[ "${BUNDLE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || stop "manifest git_commit is missing or invalid"
+[[ "${MEDIA_RUNTIME}" == "included" ]] || stop "offline FFmpeg/OpenCV runtime is missing from this bundle"
+[[ "${MEDIA_PLATFORM}" == "linux-x86_64" && "$(uname -m)" == "x86_64" ]] \
+  || stop "media runtime requires Linux x86_64"
+[[ -x "${BUNDLE_DIR}/runtime/ffmpeg/bin/ffmpeg" ]] || stop "bundled ffmpeg is missing"
+[[ -x "${BUNDLE_DIR}/runtime/ffmpeg/bin/ffprobe" ]] || stop "bundled ffprobe is missing"
+(
+  cd "${BUNDLE_DIR}/runtime"
+  sha256sum -c SHA256SUMS >/dev/null
+) || stop "media runtime checksum verification failed"
+"${BUNDLE_DIR}/runtime/ffmpeg/bin/ffmpeg" -v error \
+  -f lavfi -i color=c=black:s=16x16:d=0.05 -frames:v 1 \
+  -f image2pipe -vcodec mjpeg - >/dev/null \
+  || stop "bundled ffmpeg failed the decode smoke test"
+"${BUNDLE_DIR}/runtime/ffmpeg/bin/ffprobe" -version >/dev/null \
+  || stop "bundled ffprobe failed to start"
+ok "offline FFmpeg/ffprobe payload is intact and executable"
 
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
 case "${DEPLOYED_VERSION}" in
@@ -275,6 +293,42 @@ target_python() {
     "${APP_DIR}/.venv/bin/python" "$@"
   fi
 }
+
+CV_OVERLAY_REQUIRED=false
+if target_python - <<'PY' >/dev/null 2>&1
+import cv2
+import numpy as np
+image = np.zeros((8, 8, 3), dtype=np.uint8)
+assert cv2.cvtColor(image, cv2.COLOR_BGR2RGB).shape == (8, 8, 3)
+PY
+then
+  ok "existing OpenCV runtime is healthy"
+else
+  CV_OVERLAY_REQUIRED=true
+  ok "existing OpenCV is unavailable; the bundled rescue wheel will be used"
+fi
+
+mapfile -t OPENCV_WHEELS < <(find "${BUNDLE_DIR}/runtime/opencv" -maxdepth 1 -type f -name 'opencv_python_headless-*.whl' -print)
+[[ "${#OPENCV_WHEELS[@]}" -eq 1 ]] || stop "expected exactly one bundled OpenCV wheel"
+CV_PAYLOAD_TEST_DIR="$(mktemp -d)"
+if ! target_python -m zipfile -e "${OPENCV_WHEELS[0]}" "${CV_PAYLOAD_TEST_DIR}"; then
+  rm -rf "${CV_PAYLOAD_TEST_DIR}"
+  stop "bundled OpenCV wheel could not be unpacked"
+fi
+if ! target_python - "${CV_PAYLOAD_TEST_DIR}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import cv2
+import numpy as np
+image = np.zeros((8, 8, 3), dtype=np.uint8)
+assert cv2.cvtColor(image, cv2.COLOR_BGR2RGB).shape == (8, 8, 3)
+PY
+then
+  rm -rf "${CV_PAYLOAD_TEST_DIR}"
+  stop "bundled OpenCV wheel is incompatible with the target Python/OS"
+fi
+rm -rf "${CV_PAYLOAD_TEST_DIR}"
+ok "bundled OpenCV rescue payload is compatible"
 
 SCHEMA_VERSION="$(target_python - "${ENV_FILE}" <<'PY'
 import os
@@ -351,12 +405,85 @@ if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
   ok "sudo access confirmed"
 fi
 
+read_latest_backup() {
+  if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
+    as_root cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || true
+  else
+    cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || true
+  fi
+}
+
+backup_has_snapshot() {
+  local backup_dir="$1"
+  if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
+    as_root test -f "${backup_dir}/code.tgz"
+  else
+    test -f "${backup_dir}/code.tgz"
+  fi
+}
+
+LATEST_BEFORE_UPDATE="$(read_latest_backup)"
+ROLLBACK_ARMED=false
+ROLLBACK_RUNNING=false
+
+automatic_rollback() {
+  local exit_status=$?
+  trap - EXIT
+  if [[ "${ROLLBACK_ARMED}" != true || "${ROLLBACK_RUNNING}" == true ]]; then
+    exit "${exit_status}"
+  fi
+  ROLLBACK_RUNNING=true
+  printf '\n== Update failed; restoring %s automatically\n' "${DEPLOYED_VERSION:-previous EVA AI version}" >&2
+  local latest_backup
+  latest_backup="$(read_latest_backup)"
+  if [[ -z "${latest_backup}" || "${latest_backup}" == "${LATEST_BEFORE_UPDATE}" ]] \
+    || ! backup_has_snapshot "${latest_backup}"; then
+    printf 'WARN: no new complete code snapshot was recorded; restarting the unchanged service.\n' >&2
+    systemctl_write start "${SERVICE_NAME}.service" || true
+    exit "${exit_status}"
+  fi
+  local rollback_command=(
+    "${BUNDLE_DIR}/scripts/rollback.sh"
+    --backup-dir "${latest_backup}"
+    --backup-root "${BACKUP_ROOT}"
+    --app-dir "${APP_DIR}"
+    --env-file "${ENV_FILE}"
+    --service "${SERVICE_NAME}"
+    --base-url "${BASE_URL}"
+    --no-verify
+  )
+  if [[ "${MODE}" == "user" ]]; then
+    rollback_command+=(--user)
+    "${rollback_command[@]}" || {
+      printf 'FAIL: automatic rollback failed; backup: %s\n' "${latest_backup}" >&2
+      exit "${exit_status}"
+    }
+  else
+    as_root "${rollback_command[@]}" || {
+      printf 'FAIL: automatic rollback failed; backup: %s\n' "${latest_backup}" >&2
+      exit "${exit_status}"
+    }
+  fi
+  printf 'OK: previous code and configuration restored; database and runtime data were untouched.\n' >&2
+  local rollback_deadline=$((SECONDS + 240))
+  while (( SECONDS < rollback_deadline )); do
+    if curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null | grep -Fq "${DEPLOYED_VERSION}"; then
+      printf 'OK: %s is back up at %s\n' "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
+      break
+    fi
+    sleep 5
+  done
+  exit "${exit_status}"
+}
+trap automatic_rollback EXIT
+
 printf '\nType UPDATE to install %s (database and runtime data stay unchanged): ' "${EXPECTED_VERSION}"
 read -r CONFIRMATION
 [[ "${CONFIRMATION}" == "UPDATE" ]] || stop "confirmation not received; nothing was changed"
 
 say "Stopping ${SERVICE_NAME}.service"
 systemctl_write stop "${SERVICE_NAME}.service"
+ROLLBACK_ARMED=true
 
 say "Backing up and installing code"
 if [[ "${MODE}" == "user" ]]; then
@@ -416,6 +543,22 @@ else
     --skip-pg-dump --no-start --no-verify
 fi
 
+MEDIA_INSTALL=(
+  "${BUNDLE_DIR}/scripts/install_media_runtime.sh"
+  --bundle-dir "${BUNDLE_DIR}"
+  --app-dir "${APP_DIR}"
+  --python "${APP_DIR}/.venv/bin/python"
+  --owner "${SERVICE_USER}:${SERVICE_GROUP}"
+)
+if [[ "${CV_OVERLAY_REQUIRED}" == true ]]; then
+  MEDIA_INSTALL+=(--with-opencv-overlay)
+fi
+if [[ "${MODE}" == "user" ]]; then
+  "${MEDIA_INSTALL[@]}"
+else
+  as_root "${MEDIA_INSTALL[@]}"
+fi
+
 target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" <<'PY'
 import os
 import re
@@ -462,6 +605,7 @@ read -r RESTART_ANSWER
 case "${RESTART_ANSWER}" in
   ""|y|Y|yes|YES) ;;
   *)
+    ROLLBACK_ARMED=false
     printf '\nUpdate installed. Service remains stopped.\n'
     if [[ "${MODE}" == "user" ]]; then
       printf 'Start it with: systemctl --user start %s.service\n' "${SERVICE_NAME}"
@@ -492,6 +636,7 @@ SERVICE_STATE="$(systemctl_read is-active "${SERVICE_NAME}.service" 2>/dev/null 
 [[ -n "${READY_JSON}" ]] || stop "service started but /ready did not report ${EXPECTED_VERSION}; backup root: ${BACKUP_ROOT}"
 curl -skfS --max-time 5 "${BASE_URL}/health" >/dev/null \
   || stop "service is active but /health failed; backup root: ${BACKUP_ROOT}"
+ROLLBACK_ARMED=false
 
 printf '\n============================================================\n'
 printf 'OK: EVA AI %s is up and running\n' "${EXPECTED_VERSION}"

@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import subprocess
 import tempfile
 import re
@@ -50,6 +51,18 @@ except Exception:  # pragma: no cover - road CV is optional in minimal installs
 
 LOGGER = logging.getLogger(__name__)
 ROLLUP_OPERATOR_FORMAT_VERSION = 2
+
+
+def _ffmpeg_binary() -> str:
+    """Prefer the verified offline runtime shipped beside the application."""
+
+    configured = str(os.getenv("EVOSSEARCH_FFMPEG_BIN") or "").strip()
+    if configured:
+        return configured
+    bundled = Path(__file__).resolve().parent / ".eva-runtime" / "bin" / "ffmpeg"
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return str(bundled)
+    return shutil.which("ffmpeg") or "ffmpeg"
 
 
 class SummaryBatchSuperseded(RuntimeError):
@@ -1822,7 +1835,7 @@ class LuxriotCaptureSession:
                 stderr_path = Path(temp_dir) / "ffmpeg.stderr"
                 dense_max_edge = max(160, min(1280, int(self.max_edge or 800)))
                 cmd = [
-                    "ffmpeg",
+                    _ffmpeg_binary(),
                     "-hide_banner",
                     "-loglevel",
                     "error",

@@ -12,6 +12,7 @@ import pickle
 import re
 import secrets
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -24,6 +25,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote, urlencode
 from threading import Lock
+
+_EVA_RUNTIME_PYTHON = Path(__file__).resolve().parent / ".eva-runtime" / "python"
+if _EVA_RUNTIME_PYTHON.is_dir():
+    sys.path.insert(0, str(_EVA_RUNTIME_PYTHON))
 
 import numpy as np
 import torch

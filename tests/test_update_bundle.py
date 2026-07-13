@@ -1,4 +1,6 @@
 import subprocess
+import tarfile
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -7,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = ROOT / "scripts" / "update_bundle.sh"
 SCRIPT = SCRIPT_PATH.read_text(encoding="utf-8")
 BUILD_SCRIPT = (ROOT / "scripts" / "build_patch_bundle.sh").read_text(encoding="utf-8")
+ROLLBACK_SCRIPT = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
 
 
 class UpdateBundleTests(unittest.TestCase):
@@ -66,6 +69,55 @@ class UpdateBundleTests(unittest.TestCase):
     def test_builder_places_entrypoint_at_bundle_root(self):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
+
+    def test_media_runtime_is_required_and_checked_before_confirmation(self):
+        media_check = SCRIPT.index('MEDIA_RUNTIME="')
+        checksum = SCRIPT.index("sha256sum -c SHA256SUMS")
+        confirmation = SCRIPT.index("Type UPDATE")
+        self.assertLess(media_check, confirmation)
+        self.assertLess(checksum, confirmation)
+        self.assertIn("bundled ffmpeg failed the decode smoke test", SCRIPT)
+        self.assertIn("bundled OpenCV wheel is incompatible", SCRIPT)
+        self.assertIn("--ffmpeg-archive FILE", BUILD_SCRIPT)
+        self.assertIn("--opencv-wheel FILE", BUILD_SCRIPT)
+
+    def test_post_stop_failure_arms_automatic_rollback(self):
+        stop_service = SCRIPT.index('systemctl_write stop "${SERVICE_NAME}.service"')
+        armed = SCRIPT.index("ROLLBACK_ARMED=true")
+        install = SCRIPT.index('"${BUNDLE_DIR}/scripts/install_patch.sh"')
+        self.assertLess(stop_service, armed)
+        self.assertLess(armed, install)
+        self.assertIn("trap automatic_rollback EXIT", SCRIPT)
+        self.assertIn("--no-verify", SCRIPT)
+        self.assertIn("database and runtime data were untouched", SCRIPT)
+
+    def test_manual_rollback_supports_user_systemd_and_exact_restore(self):
+        self.assertIn("systemctl --user", ROLLBACK_SCRIPT)
+        self.assertIn("restore_code_snapshot.py", ROLLBACK_SCRIPT)
+
+    def test_restore_helper_deletes_new_code_but_keeps_runtime_data(self):
+        helper = ROOT / "scripts" / "restore_code_snapshot.py"
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            app = root / "app"
+            snapshot_root = root / "snapshot" / "app"
+            app.mkdir()
+            snapshot_root.mkdir(parents=True)
+            (snapshot_root / "old.py").write_text("old\n", encoding="utf-8")
+            archive = root / "code.tgz"
+            with tarfile.open(archive, "w:gz") as handle:
+                handle.add(snapshot_root, arcname="app")
+            (app / "old.py").write_text("changed\n", encoding="utf-8")
+            (app / "new.py").write_text("new\n", encoding="utf-8")
+            (app / "video").mkdir()
+            (app / "video" / "evidence.mp4").write_bytes(b"evidence")
+            subprocess.run(
+                ["python3", str(helper), "--archive", str(archive), "--app-dir", str(app)],
+                check=True,
+            )
+            self.assertEqual((app / "old.py").read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((app / "new.py").exists())
+            self.assertEqual((app / "video" / "evidence.mp4").read_bytes(), b"evidence")
 
 
 if __name__ == "__main__":
