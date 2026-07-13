@@ -56,6 +56,13 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
 
+    def test_system_update_authenticates_before_confirmation_and_stop(self):
+        sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')
+        confirmation = SCRIPT.index("Type UPDATE")
+        service_stop = SCRIPT.index('systemctl_write stop "${SERVICE_NAME}.service"')
+        self.assertLess(sudo_check, confirmation)
+        self.assertLess(confirmation, service_stop)
+
     def test_builder_places_entrypoint_at_bundle_root(self):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)

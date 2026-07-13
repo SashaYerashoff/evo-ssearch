@@ -345,6 +345,12 @@ else
   fi
 fi
 
+if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
+  say "Checking sudo access before service stop"
+  sudo -v || stop "sudo authentication failed; service was not stopped"
+  ok "sudo access confirmed"
+fi
+
 printf '\nType UPDATE to install %s (database and runtime data stay unchanged): ' "${EXPECTED_VERSION}"
 read -r CONFIRMATION
 [[ "${CONFIRMATION}" == "UPDATE" ]] || stop "confirmation not received; nothing was changed"
