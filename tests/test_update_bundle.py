@@ -52,6 +52,10 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn(".eva-bundle-commit", SCRIPT)
         self.assertIn("this exact ${EXPECTED_VERSION} bundle is already installed", SCRIPT)
 
+    def test_post_restart_wait_allows_slow_model_restore(self):
+        self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
+        self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
+
     def test_builder_places_entrypoint_at_bundle_root(self):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
