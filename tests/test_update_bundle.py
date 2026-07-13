@@ -60,6 +60,7 @@ class UpdateBundleTests(unittest.TestCase):
     def test_post_restart_wait_allows_slow_model_restore(self):
         self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
+        self.assertIn('"${BASE_URL}/ready?load=1"', SCRIPT)
 
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')

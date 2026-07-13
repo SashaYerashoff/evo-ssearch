@@ -528,7 +528,7 @@ automatic_rollback() {
   printf 'OK: previous code and configuration restored; database and runtime data were untouched.\n' >&2
   local rollback_deadline=$((SECONDS + 240))
   while (( SECONDS < rollback_deadline )); do
-    if curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null \
+    if curl -skfS --max-time 5 "${BASE_URL}/ready?load=1" 2>/dev/null \
       | ready_json_matches_version "${DEPLOYED_VERSION}"; then
       printf 'OK: %s is back up at %s\n' "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
       break
@@ -683,7 +683,7 @@ systemctl_write start "${SERVICE_NAME}.service"
 READY_JSON=""
 READY_DEADLINE=$((SECONDS + 240))
 while (( SECONDS < READY_DEADLINE )); do
-  if READY_JSON="$(curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null)"; then
+  if READY_JSON="$(curl -skfS --max-time 5 "${BASE_URL}/ready?load=1" 2>/dev/null)"; then
     if printf '%s' "${READY_JSON}" | ready_json_matches_version "${EXPECTED_VERSION}"; then
       break
     fi
