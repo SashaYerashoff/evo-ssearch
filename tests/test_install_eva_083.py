@@ -177,6 +177,28 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         second = installer.render_env_update(first, second_updates)
         self.assertEqual(second, first)
 
+    def test_adopt_updates_only_managed_release_version(self):
+        existing = dict(COMPLETE_ENV)
+        existing.update({
+            "EVOSSEARCH_APP_VERSION": "β 0.8.1",
+            "EVOSSEARCH_HOST": "10.20.30.40",
+        })
+        raw = env_text(existing, prefix="# preserve site settings")
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+        rendered = installer.render_env_update(raw, updates)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(updates, {"EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION})
+        self.assertEqual(values["EVOSSEARCH_APP_VERSION"], installer.EXPECTED_VERSION)
+        self.assertIn(f"EVOSSEARCH_APP_VERSION='{installer.EXPECTED_VERSION}'", rendered)
+        self.assertIn('EVOSSEARCH_HOST="10.20.30.40"', rendered)
+
     def test_noninteractive_configuration_accepts_environment_without_echoing_secrets(self):
         resolution = installer.EnvResolution(None, Path("/tmp/eva-ai.env"), "", {})
 
@@ -359,6 +381,34 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             mutate_host.assert_not_called()
             self.assertFalse((root / "backups").exists())
 
+    def test_apply_staging_failure_restores_preexisting_env_without_backup_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            original = env_text()
+            env_file.write_text(original, encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            options.dry_run = False
+            options.unit_file.write_text("[Service]\nUser=site-eva\n", encoding="utf-8")
+            prepared = installer.prepare_install(options, environ={})
+            prepared.values["NEW_SITE_KEY"] = "staged"
+            prepared.updates["NEW_SITE_KEY"] = "staged"
+
+            with (
+                patch.object(installer.os, "geteuid", return_value=0),
+                patch.object(
+                    installer.CommandRunner,
+                    "run",
+                    side_effect=installer.InstallerError("preflight failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(installer.InstallerError, "preflight failed"):
+                    installer.apply_install(prepared)
+
+            self.assertEqual(env_file.read_text(encoding="utf-8"), original)
+            self.assertFalse(list(root.glob("eva-ai.env.preinstall-*.bak")))
+
     def test_no_migrate_requires_no_privileged_dsn(self):
         migration_dsn, source, error = installer.prepare_migration_dsn(
             {"EVA_DATABASE_DSN": COMPLETE_ENV["EVA_DATABASE_DSN"]},
@@ -428,6 +478,23 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             self.assertIn("Alembic current -> upgrade head -> current", plan)
             self.assertIn("verify_patch.sh", plan)
             self.assertIn("rollback.sh", plan)
+
+    def test_adopt_plan_preserves_existing_systemd_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            existing_unit = "[Service]\nUser=site-eva\nProtectSystem=full\n"
+            options.unit_file.write_text(existing_unit, encoding="utf-8")
+
+            prepared = installer.prepare_install(options, environ={})
+            plan = "\n".join(action.description for action in prepared.actions)
+
+            self.assertIn("preserve existing systemd unit", plan)
+            self.assertIn("preserve the account selected by the existing systemd unit", plan)
+            self.assertEqual(options.unit_file.read_text(encoding="utf-8"), existing_unit)
 
     def test_fresh_install_without_wheelhouse_is_blocked_offline(self):
         with tempfile.TemporaryDirectory() as tmp:

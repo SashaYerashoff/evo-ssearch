@@ -14,6 +14,7 @@
 set -Eeuo pipefail
 
 EXPECTED_SCHEMA="20260614_0006"
+EXPECTED_VERSION="β 0.8.4"
 APP_DIR="/opt/eva-ai/evo-ssearch"
 ENV_FILE="/etc/eva-ai/eva-ai.env"
 SERVICE_NAME="eva-ai"
@@ -63,19 +64,73 @@ say "EVA AI 0.8.4 guided upgrade"
 if [ "$(id -u)" -ne 0 ]; then
   stop_and_call "запусти через sudo: sudo ./scripts/field_upgrade_084.sh"
 fi
+for required_command in cmp curl find grep sed systemctl tee; do
+  if ! command -v "${required_command}" >/dev/null 2>&1; then
+    stop_and_call "required command is missing: ${required_command}"
+  fi
+done
 
 # 1. We must be inside an unpacked offline bundle, not a random checkout.
 if [ ! -f "${BUNDLE_DIR}/manifest.txt" ]; then
   stop_and_call "manifest.txt не найден рядом с repo/ — это не распакованный bundle"
 fi
-BUNDLE_VERSION="$(tr -d '\n' < "${REPO_DIR}/VERSION" 2>/dev/null || true)"
-ok "bundle version: ${BUNDLE_VERSION:-unknown}"
+BUNDLE_VERSION="$(tr -d '\r\n' < "${REPO_DIR}/VERSION" 2>/dev/null || true)"
+MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+MANIFEST_TREE_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+if [ "${BUNDLE_VERSION}" != "${EXPECTED_VERSION}" ]; then
+  stop_and_call "bundle VERSION='${BUNDLE_VERSION:-missing}', expected '${EXPECTED_VERSION}'"
+fi
+if [ "${MANIFEST_VERSION}" != "${EXPECTED_VERSION}" ]; then
+  stop_and_call "manifest version='${MANIFEST_VERSION:-missing}', expected '${EXPECTED_VERSION}'"
+fi
+if [ "${MANIFEST_TREE_STATUS}" != "clean" ]; then
+  stop_and_call "bundle was built from a ${MANIFEST_TREE_STATUS:-unknown} working tree; release bundle must be clean"
+fi
+ok "bundle version: ${BUNDLE_VERSION}"
 
 if [ ! -f "${ENV_FILE}" ]; then
   stop_and_call "env-файл не найден: ${ENV_FILE}"
 fi
 if [ ! -x "${APP_DIR}/.venv/bin/python" ]; then
   stop_and_call "нет исполняемого ${APP_DIR}/.venv/bin/python — adopt-апгрейд невозможен без venv"
+fi
+DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
+case "${DEPLOYED_VERSION}" in
+  "β 0.8.0"|"β 0.8.1")
+    ok "supported deployed version: ${DEPLOYED_VERSION}"
+    ;;
+  "${EXPECTED_VERSION}")
+    stop_and_call "${EXPECTED_VERSION} is already installed; do not rerun the field upgrade"
+    ;;
+  *)
+    stop_and_call "unsupported deployed VERSION='${DEPLOYED_VERSION:-missing}'; expected β 0.8.0 or β 0.8.1"
+    ;;
+esac
+
+# 0.8.1 -> 0.8.4 is dependency-neutral.  Without a usable wheelhouse, prove
+# that the deployed dependency declarations are byte-identical before reusing
+# its venv (an empty wheelhouse directory does not bypass this gate).
+WHEELHOUSE_ARTIFACT="$(find "${BUNDLE_DIR}/wheelhouse" -maxdepth 1 -type f \
+  \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) -print -quit 2>/dev/null || true)"
+if [ -z "${WHEELHOUSE_ARTIFACT}" ]; then
+  for requirements_file in requirements.txt requirements-db.txt; do
+    if [ ! -f "${APP_DIR}/${requirements_file}" ] \
+       || ! cmp -s "${APP_DIR}/${requirements_file}" "${REPO_DIR}/${requirements_file}"; then
+      stop_and_call "${requirements_file} differs from deployed tree; a reviewed wheelhouse is required"
+    fi
+  done
+  if "${APP_DIR}/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    if ! "${APP_DIR}/.venv/bin/python" -m pip check >/dev/null 2>&1; then
+      stop_and_call "existing venv failed 'pip check'; repair it or bring a reviewed wheelhouse"
+    fi
+  elif command -v uv >/dev/null 2>&1; then
+    if ! uv pip check --python "${APP_DIR}/.venv/bin/python" >/dev/null 2>&1; then
+      stop_and_call "existing venv failed 'uv pip check'; repair it or bring a reviewed wheelhouse"
+    fi
+  else
+    stop_and_call "cannot verify existing venv: neither python -m pip nor uv is available"
+  fi
+  ok "requirements unchanged and existing venv passes pip check"
 fi
 
 EVIDENCE_DIR="/var/tmp/eva-upgrade-084-$(date +%Y%m%d-%H%M%S)"
@@ -94,15 +149,33 @@ ok "pre_service_state=$(cat "${EVIDENCE_DIR}/pre_service_state.txt" 2>/dev/null 
 say "Проверка версии схемы БД (только чтение)"
 SCHEMA_VERSION="$("${APP_DIR}/.venv/bin/python" - "$ENV_FILE" <<'PYEOF' 2>>"${EVIDENCE_DIR}/schema_check.log"
 import re
+import os
 import sys
 
 env_path = sys.argv[1]
-dsn = ""
+values = {}
 with open(env_path, "r", encoding="utf-8") as handle:
     for line in handle:
-        match = re.match(r"^EVA_DATABASE_DSN=(.*)$", line.strip())
+        match = re.match(
+            r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$",
+            line.strip(),
+        )
         if match:
-            dsn = match.group(1).strip().strip('"').strip("'")
+            values[match.group(1)] = match.group(2).strip().strip('"').strip("'")
+for _iteration in range(8):
+    changed = False
+    for key, value in tuple(values.items()):
+        expanded = re.sub(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+            lambda match: values.get(match.group(1), os.environ.get(match.group(1), match.group(0))),
+            value,
+        )
+        if expanded != value:
+            values[key] = expanded
+            changed = True
+    if not changed:
+        break
+dsn = values.get("EVA_DATABASE_DSN") or values.get("EVOSSEARCH_DATABASE_DSN") or ""
 if not dsn:
     print("NO_DSN")
     sys.exit(0)
@@ -142,7 +215,7 @@ set +e
   --app-dir "${APP_DIR}" \
   --env-file "${ENV_FILE}" \
   --service-name "${SERVICE_NAME}" \
-  | tee "${EVIDENCE_DIR}/dry_run.txt"
+  2>&1 | tee "${EVIDENCE_DIR}/dry_run.txt"
 DRY_STATUS=${PIPESTATUS[0]}
 set -e
 if [ "${DRY_STATUS}" -ne 0 ]; then
@@ -169,12 +242,15 @@ set +e
   --app-dir "${APP_DIR}" \
   --env-file "${ENV_FILE}" \
   --service-name "${SERVICE_NAME}" \
-  | tee "${EVIDENCE_DIR}/apply.txt"
+  2>&1 | tee "${EVIDENCE_DIR}/apply.txt"
 APPLY_STATUS=${PIPESTATUS[0]}
 set -e
 
 # 7. Record the rollback command regardless of outcome.
-grep -E "rollback" "${EVIDENCE_DIR}/apply.txt" > "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" 2>/dev/null || true
+grep -Ei "^(ROLLBACK HANDOFF: |rollback_command=)" "${EVIDENCE_DIR}/apply.txt" \
+  | tail -n 1 \
+  | sed -E 's/^ROLLBACK HANDOFF: //; s/^rollback_command=//' \
+  > "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" 2>/dev/null || true
 if [ -s "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" ]; then
   ok "команда отката сохранена: ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt"
 fi
@@ -182,21 +258,25 @@ fi
 if [ "${APPLY_STATUS}" -ne 0 ]; then
   stop_and_call "apply завершился с ошибкой; журнал: ${EVIDENCE_DIR}/apply.txt"
 fi
+if [ ! -s "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" ]; then
+  stop_and_call "apply завершён, но rollback-команда не записана; журнал: ${EVIDENCE_DIR}/apply.txt"
+fi
 
 # 8. Post-upgrade verification.
 say "Проверка после апгрейда"
 sleep 5
 systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/post_service_state.txt" 2>&1 || true
-POST_STATE="$(cat "${EVIDENCE_DIR}/post_service_state.txt" 2>/dev/null || echo unknown)"
 HEALTH_OK=false
 for _attempt in 1 2 3 4 5 6 7 8 9; do
-  if curl -sS -m 10 "${BASE_URL}/health" > "${EVIDENCE_DIR}/post_health.json" 2>/dev/null \
-     && curl -sS -m 10 "${BASE_URL}/ready" > "${EVIDENCE_DIR}/post_ready.json" 2>/dev/null; then
+  if curl -fsS -m 10 "${BASE_URL}/health" > "${EVIDENCE_DIR}/post_health.json" 2>/dev/null \
+     && curl -fsS -m 10 "${BASE_URL}/ready" > "${EVIDENCE_DIR}/post_ready.json" 2>/dev/null; then
     HEALTH_OK=true
     break
   fi
   sleep 10
 done
+systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/post_service_state.txt" 2>&1 || true
+POST_STATE="$(cat "${EVIDENCE_DIR}/post_service_state.txt" 2>/dev/null || echo unknown)"
 
 if [ "${POST_STATE}" != "active" ] || [ "${HEALTH_OK}" != "true" ]; then
   fail "сервис не подтвердил здоровье (state=${POST_STATE})"

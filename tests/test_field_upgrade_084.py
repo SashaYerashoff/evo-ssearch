@@ -48,10 +48,35 @@ class FieldUpgradeGuideTests(unittest.TestCase):
         self.assertIn("ROLLBACK_COMMAND.txt", SCRIPT)
         self.assertIn("client_diagnostics.sh", SCRIPT)
         self.assertIn("EVIDENCE_DIR", SCRIPT)
+        self.assertIn('2>&1 | tee "${EVIDENCE_DIR}/apply.txt"', SCRIPT)
+        self.assertIn("ROLLBACK HANDOFF:", SCRIPT)
         # The runtime DSN is parsed for the read-only schema check but must
         # never be printed back to the terminal or the evidence files.
         self.assertNotIn("print(dsn", SCRIPT)
         self.assertNotIn("echo ${dsn", SCRIPT.lower())
+
+    def test_exact_bundle_and_dependency_neutral_adopt_are_gated(self):
+        self.assertIn('EXPECTED_VERSION="β 0.8.4"', SCRIPT)
+        self.assertIn('MANIFEST_VERSION=', SCRIPT)
+        self.assertIn('MANIFEST_TREE_STATUS=', SCRIPT)
+        self.assertIn('release bundle must be clean', SCRIPT)
+        self.assertIn('DEPLOYED_VERSION=', SCRIPT)
+        self.assertIn('is already installed; do not rerun', SCRIPT)
+        self.assertIn('expected β 0.8.0 or β 0.8.1', SCRIPT)
+        self.assertIn('cmp -s "${APP_DIR}/${requirements_file}"', SCRIPT)
+        self.assertIn('-m pip check', SCRIPT)
+        self.assertIn('uv pip check --python', SCRIPT)
+        self.assertIn('neither python -m pip nor uv is available', SCRIPT)
+
+    def test_post_upgrade_http_check_rejects_error_statuses(self):
+        self.assertIn('curl -fsS -m 10 "${BASE_URL}/health"', SCRIPT)
+        self.assertIn('curl -fsS -m 10 "${BASE_URL}/ready"', SCRIPT)
+        last_state_refresh = SCRIPT.rindex('systemctl is-active "${SERVICE_NAME}"')
+        health_loop = SCRIPT.index('for _attempt in 1 2 3 4 5 6 7 8 9')
+        self.assertGreater(last_state_refresh, health_loop)
+
+    def test_verification_commands_are_required_before_apply(self):
+        self.assertIn('for required_command in cmp curl find grep sed systemctl tee', SCRIPT)
 
 
 if __name__ == "__main__":

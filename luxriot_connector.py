@@ -3571,10 +3571,10 @@ class LuxriotManager:
         self.rollup_scheduler_initial_delay_sec = max(1.0, min(600.0, scheduler_initial_delay))
         try:
             scheduler_spacing = float(
-                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC", 15.0)
+                getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC", 5.0)
             )
         except Exception:
-            scheduler_spacing = 15.0
+            scheduler_spacing = 5.0
         self.rollup_scheduler_spacing_sec = max(1.0, min(300.0, scheduler_spacing))
         try:
             scheduler_backfill_windows = int(
@@ -3694,6 +3694,7 @@ class LuxriotManager:
             ).strip()
             or None
         )
+        self._rollup_scheduler_status["model_hint"] = self.rollup_llm_model_hint
         default_rollup_system_prompt = (
             "You are a CCTV operations analyst. Summarize lower-level notes into operator-facing window reports. "
             "Use structured Markdown sections, keep concrete timestamps/events, and avoid repetitive rollup wording."
@@ -3783,8 +3784,18 @@ class LuxriotManager:
         offset = int(digest[:12], 16) % max(1, int(spread_sec))
         return float(now) + self.rollup_scheduler_initial_delay_sec + float(offset)
 
-    def _l0_backpressure_active(self, channel_id: Optional[int] = None) -> bool:
-        """Return true only for a saturated queued backlog, not normal inference."""
+    def _l0_backpressure_active(
+        self,
+        channel_id: Optional[int] = None,
+        *,
+        model_hint: Optional[str] = None,
+    ) -> bool:
+        """Return true when a saturated L0 queue shares this LM resource.
+
+        Live VLM work must win when rollups use the same endpoint.  A saturated
+        vision server must not, however, idle a separate text/agent GPU.  Test
+        callbacks and unknown resources stay conservative and still defer.
+        """
 
         with self.cache_lock:
             if channel_id is None:
@@ -3792,6 +3803,13 @@ class LuxriotManager:
             else:
                 session = self.sessions.get(int(channel_id))
                 sessions = [session] if session is not None else []
+        resource_resolver = getattr(self.lm_callback, "eva_resource_key", None)
+        target_resource = ""
+        if callable(resource_resolver) and str(model_hint or "").strip():
+            try:
+                target_resource = str(resource_resolver(model_hint) or "").strip()
+            except Exception:
+                target_resource = ""
         for session in sessions:
             try:
                 status = session.status()
@@ -3800,6 +3818,15 @@ class LuxriotManager:
             queue_depth = int(_parse_optional_int(status.get("summary_queue_depth")) or 0)
             queue_limit = int(_parse_optional_int(status.get("summary_queue_max_batches")) or 0)
             if queue_limit > 0 and queue_depth >= queue_limit:
+                if target_resource and callable(resource_resolver):
+                    try:
+                        live_resource = str(
+                            resource_resolver(status.get("model")) or ""
+                        ).strip()
+                    except Exception:
+                        live_resource = ""
+                    if live_resource and live_resource != target_resource:
+                        continue
                 return True
         return False
 
@@ -3866,7 +3893,16 @@ class LuxriotManager:
                 self._rollup_scheduler_stop.wait(min(10.0, wait_sec))
                 continue
             scheduler_key = (channel_id, level)
-            l0_backpressure = self._l0_backpressure_active(channel_id)
+            # Rollups share the same LM admission resource with every live L0
+            # stream.  A saturated queue on channel A must therefore defer a
+            # scheduled rollup for channel B as well; checking only the rollup
+            # channel let inactive/history channels consume capacity while a
+            # live channel was already dropping/coalescing observations.
+            with self.cache_lock:
+                rollup_model_hint = self._get_rollup_model_hint_locked(channel_id)
+            l0_backpressure = self._l0_backpressure_active(
+                model_hint=rollup_model_hint,
+            )
             deferral_exhausted = bool(
                 l0_backpressure
                 and self._rollup_deferral_exhausted(
@@ -3929,6 +3965,14 @@ class LuxriotManager:
                     error,
                 )
             completed_at = time.time()
+            job_duration_sec = max(0.0, completed_at - started_at)
+            # Spacing is a minimum start-to-start interval, not idle time added
+            # after inference. At 50 channels the fixed post-job 15 s delay
+            # alone exceeded a day for the required L1-L3 cadence.
+            post_wait_sec = max(
+                0.0,
+                self.rollup_scheduler_spacing_sec - job_duration_sec,
+            )
             next_due = float(due_at) + float(self.rollup_windows[level])
             while next_due <= completed_at:
                 next_due += float(self.rollup_windows[level])
@@ -3940,7 +3984,8 @@ class LuxriotManager:
                         "active_channel_id": None,
                         "active_level": None,
                         "last_completed_at": completed_at,
-                        "last_duration_sec": round(max(0.0, completed_at - started_at), 3),
+                        "last_duration_sec": round(job_duration_sec, 3),
+                        "last_post_wait_sec": round(post_wait_sec, 3),
                         "last_channel_id": int(channel_id),
                         "last_level": level,
                         "last_generated_windows": int(generated_windows),
@@ -3953,7 +3998,8 @@ class LuxriotManager:
                         ) + (0 if error else 1),
                     }
                 )
-            self._rollup_scheduler_stop.wait(self.rollup_scheduler_spacing_sec)
+            if post_wait_sec > 0:
+                self._rollup_scheduler_stop.wait(post_wait_sec)
 
     def set_summary_archive_readers(
         self,
@@ -4073,9 +4119,13 @@ class LuxriotManager:
         format_version = int(_parse_optional_int(row.get("format_version")) or 1)
         summary = str(row.get("summary") or "").strip()
         return bool(
-            kind in {"llm", "llm_cached"}
-            and format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+            kind in {"llm", "llm_cached", "legacy_cached"}
+            and (
+                format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+                or kind == "legacy_cached"
+            )
             and summary
+            and not self._is_legacy_fallback_rollup(summary)
             and not self._rollup_operator_semantic_guard_issues(summary)
         )
 
@@ -4262,14 +4312,32 @@ class LuxriotManager:
                 result = self.rollup_backfill_status()
                 result["idempotent_existing_job"] = True
                 return result
-            if (
-                current
-                and current.get("request_key") == plan.get("request_key")
-                and str(current.get("status") or "") in {"completed", "completed_with_gaps"}
-            ):
-                result = self.rollup_backfill_status()
-                result["idempotent_existing_job"] = True
-                return result
+            if current and current.get("request_key") == plan.get("request_key"):
+                current_status = str(current.get("status") or "")
+                current_progress = (
+                    current.get("progress")
+                    if isinstance(current.get("progress"), Mapping)
+                    else {}
+                )
+                retryable_failures = int(
+                    _parse_optional_int(current_progress.get("failed")) or 0
+                )
+                missing_semantic = int(
+                    _parse_optional_int(plan.get("totals", {}).get("missing_semantic"))
+                    or 0
+                )
+                # A successful identical request is idempotent.  A completed
+                # job with source gaps is also terminal: no archived source
+                # exists to retry.  Transient LM failures are different—the
+                # planner still sees those windows as missing, so a repeated
+                # operator command must be allowed to create a fresh job.
+                if current_status == "completed" or (
+                    current_status == "completed_with_gaps"
+                    and (retryable_failures <= 0 or missing_semantic <= 0)
+                ):
+                    result = self.rollup_backfill_status()
+                    result["idempotent_existing_job"] = True
+                    return result
             now = time.time()
             self._rollup_backfill_state = {
                 "version": 1,
@@ -4495,7 +4563,11 @@ class LuxriotManager:
                     self._rollup_backfill_state["current_item"] = None
                     self._persist_rollup_backfill_state_locked()
                     continue
-                if self._l0_backpressure_active():
+                with self.cache_lock:
+                    rollup_model_hint = self._get_rollup_model_hint_locked(
+                        _parse_optional_int(item.get("channel_id"))
+                    )
+                if self._l0_backpressure_active(model_hint=rollup_model_hint):
                     self._rollup_backfill_state["status"] = "waiting_live"
                     self._rollup_backfill_state["current_item"] = item
                     self._persist_rollup_backfill_state_locked()
@@ -9100,6 +9172,14 @@ class LuxriotManager:
         return self._default_rollup_prompt_for_level_locked(normalized_level)
 
     def _get_rollup_model_hint_locked(self, channel_id: Optional[int] = None) -> Optional[str]:
+        # L1-L3 are text-only reasoning workloads.  A dedicated rollup model
+        # (the agent profile by default) must win over the channel's live VLM
+        # hint; otherwise a channel configured for an 8k vision model also
+        # routes long historical aggregation there and deterministically
+        # overflows its context window.
+        fallback_hint = str(self.rollup_llm_model_hint or "").strip()
+        if fallback_hint:
+            return fallback_hint
         if channel_id is not None:
             overrides = self.channel_prompt_overrides.get(int(channel_id))
             if isinstance(overrides, Mapping):
@@ -9113,8 +9193,7 @@ class LuxriotManager:
                 model_hint = str(run.get("model") or "").strip()
                 if model_hint:
                     return model_hint
-        fallback_hint = str(self.rollup_llm_model_hint or "").strip()
-        return fallback_hint or None
+        return None
 
     def get_stream_system_prompt(self, channel_id: Optional[int] = None) -> str:
         with self.cache_lock:
@@ -9804,12 +9883,51 @@ class LuxriotManager:
         summary_kind = str(entry.get("summary_kind") or "").strip()
         if not summary_kind:
             summary_kind = "llm_cached" if format_version >= ROLLUP_OPERATOR_FORMAT_VERSION else "legacy_cached"
+        elif (
+            format_version < ROLLUP_OPERATOR_FORMAT_VERSION
+            and summary_kind.lower() in {"llm", "llm_cached"}
+        ):
+            # 0.8.0/0.8.1 already persisted genuine LM-generated rollups, but
+            # predates the v2 operator-section contract.  Preserve that work as
+            # an explicitly labelled legacy semantic instead of silently
+            # scheduling the same historical window for regeneration.
+            summary_kind = "legacy_cached"
         if self._is_legacy_fallback_rollup(summary):
             summary_kind = "degraded"
         generation_status = str(entry.get("generation_status") or "").strip()
-        if not generation_status:
+        if (
+            format_version < ROLLUP_OPERATOR_FORMAT_VERSION
+            and summary_kind.lower() == "degraded"
+            and generation_status.lower() == "semantic_guard_rejected"
+            and not self._is_legacy_fallback_rollup(summary)
+        ):
+            # A 0.8.4 process may already have opened an old cache once and
+            # relabelled a v1 semantic because of a narrow modern guard.  This
+            # remains recoverable without an LM call: restore the legacy class
+            # and apply the deterministic overclaim sanitizer below.
+            summary_kind = "legacy_cached"
+        if summary_kind == "legacy_cached" and generation_status.lower() in {
+            "",
+            "ready",
+            "cached",
+            "stale",
+            "semantic_guard_rejected",
+        }:
+            generation_status = "legacy_ready"
+        elif not generation_status:
             generation_status = "cached" if summary_kind in {"llm", "llm_cached"} else "stale"
-        if self._rollup_operator_semantic_guard_issues(summary):
+        semantic_issues = self._rollup_operator_semantic_guard_issues(summary)
+        legacy_sanitized = False
+        if semantic_issues and summary_kind == "legacy_cached":
+            sanitized = self._sanitize_rollup_operator_overclaims(summary)
+            if sanitized and not self._rollup_operator_semantic_guard_issues(sanitized):
+                summary = sanitized
+                generation_status = "legacy_sanitized"
+                legacy_sanitized = True
+            else:
+                summary_kind = "degraded"
+                generation_status = "semantic_guard_rejected"
+        elif semantic_issues:
             summary_kind = "degraded"
             generation_status = "semantic_guard_rejected"
         memory_raw = entry.get("memory_update")
@@ -9865,6 +9983,8 @@ class LuxriotManager:
             normalized["state_transition_total"] = state_transition_total
         if vector_signal_total > 0:
             normalized["vector_signal_total"] = vector_signal_total
+        if legacy_sanitized:
+            normalized["legacy_sanitized"] = True
         return normalized
 
     def _filter_rollup_cache_retention(
@@ -9962,6 +10082,19 @@ class LuxriotManager:
         with self.cache_lock:
             self.rollup_summary_cache.clear()
             retained_entries = self._filter_rollup_cache_retention(normalized_entries)
+            legacy_entries = [
+                entry
+                for entry in retained_entries
+                if str(entry.get("summary_kind") or "").strip().lower()
+                == "legacy_cached"
+            ]
+            legacy_by_level: Dict[str, int] = {}
+            for entry in legacy_entries:
+                legacy_level = self._normalize_rollup_level(entry.get("level")) or "UNKNOWN"
+                legacy_by_level[legacy_level] = legacy_by_level.get(legacy_level, 0) + 1
+            self._rollup_scheduler_status["rollup_cache_entries_loaded"] = len(retained_entries)
+            self._rollup_scheduler_status["legacy_rollups_adopted"] = len(legacy_entries)
+            self._rollup_scheduler_status["legacy_rollups_adopted_by_level"] = legacy_by_level
             for entry in retained_entries[-self.rollup_summary_cache_limit :]:
                 self.rollup_summary_cache[str(entry["rollup_id"])] = entry
         bulk_saver = getattr(state_store, "save_rollups", None)
@@ -10188,14 +10321,7 @@ class LuxriotManager:
                     current_kind = str(current.get("summary_kind") or "").strip().lower()
                     generated_signature = str(row_dict.get("source_signature") or "").strip()
                     current_signature = str(current.get("source_signature") or "").strip()
-                    current_semantic_valid = bool(
-                        current_kind in {"llm", "llm_cached"}
-                        and int(_parse_optional_int(current.get("format_version")) or 1)
-                        >= ROLLUP_OPERATOR_FORMAT_VERSION
-                        and not self._rollup_operator_semantic_guard_issues(
-                            current.get("summary")
-                        )
-                    )
+                    current_semantic_valid = self._rollup_semantic_ready(current)
                     if (
                         current_semantic_valid
                         and generated_kind not in {"llm", "llm_cached"}
@@ -10214,13 +10340,23 @@ class LuxriotManager:
                             not generated_signature
                             or generated_signature != current_signature
                         ):
-                            # Closed-window source can expand during bounded
-                            # backfill. Keep the last useful narrative visible
-                            # while the scheduler refreshes it, but mark that it
-                            # does not yet include the new source signature.
-                            merged["summary_kind"] = "llm_cached"
-                            merged["generation_status"] = "refresh_pending"
-                            merged["semantic_refresh_pending"] = True
+                            if current_kind == "legacy_cached":
+                                # Imported 0.8.1 history is an immutable account
+                                # of what that release actually produced.  Keep
+                                # it visible and truthful instead of silently
+                                # replacing it when modern source signatures
+                                # differ after normalization changes.
+                                merged["summary_kind"] = "legacy_cached"
+                                merged["generation_status"] = "legacy_ready"
+                                merged["legacy_source_changed"] = True
+                            else:
+                                # Closed-window source can expand during bounded
+                                # backfill. Keep the last useful narrative visible
+                                # while the scheduler refreshes it, but mark that it
+                                # does not yet include the new source signature.
+                                merged["summary_kind"] = "llm_cached"
+                                merged["generation_status"] = "refresh_pending"
+                                merged["semantic_refresh_pending"] = True
                     merged["rollup_id"] = row_id
                     merged_by_id[row_id] = merged
                 else:
@@ -10592,13 +10728,17 @@ class LuxriotManager:
             return fallback_summary, {}, "empty_operator_summary"
         except Exception as exc:
             error_code = type(exc).__name__
+            error_detail = _safe_error_text(exc, 240)
             LOGGER.warning(
-                "Rollup synthesis failed channel_id=%s level=%s error=%s",
+                "Rollup synthesis failed channel_id=%s level=%s error=%s detail=%s",
                 channel_id,
                 level,
                 error_code,
+                error_detail or "unavailable",
             )
-            return fallback_summary, {}, error_code
+            return fallback_summary, {}, (
+                f"{error_code}: {error_detail}" if error_detail else error_code
+            )
 
     def _compose_pending_rollup_summary(
         self,
@@ -10679,6 +10819,8 @@ class LuxriotManager:
                 cached_summary = str(cached.get("summary") or "").strip()
                 cached_signature = str(cached.get("source_signature") or "").strip()
                 cached_format_version = _parse_optional_int(cached.get("format_version")) or 1
+                cached_kind = str(cached.get("summary_kind") or "").strip().lower()
+                cached_legacy = cached_kind == "legacy_cached"
                 cached_semantic_issues = self._rollup_operator_semantic_guard_issues(
                     cached_summary
                 )
@@ -10688,18 +10830,26 @@ class LuxriotManager:
                     )
                 if (
                     cached_summary
-                    and cached_signature
-                    and cached_signature == source_signature
-                    and cached_format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+                    and self._rollup_semantic_ready(cached)
+                    and (
+                        cached_legacy
+                        or (
+                            cached_signature
+                            and cached_signature == source_signature
+                            and cached_format_version >= ROLLUP_OPERATOR_FORMAT_VERSION
+                        )
+                    )
                     and not cached_semantic_issues
                 ):
                     node["summary"] = cached_summary
                     node["operator_summary"] = cached_summary
                     cached_memory = cached.get("memory_update")
                     node["memory_update"] = dict(cached_memory) if isinstance(cached_memory, Mapping) else {}
-                    node["summary_kind"] = "llm_cached"
-                    node["generation_status"] = "cached"
+                    node["summary_kind"] = "legacy_cached" if cached_legacy else "llm_cached"
+                    node["generation_status"] = "legacy_ready" if cached_legacy else "cached"
                     node["format_version"] = cached_format_version
+                    if cached_legacy and cached_signature != source_signature:
+                        node["legacy_source_changed"] = True
                     self._update_channel_routine_context(
                         channel_id=channel_id,
                         rollup_id=rollup_id,

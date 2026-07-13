@@ -134,6 +134,14 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         self.assertEqual(result["arguments"]["channel_ids"], ["7"])
         self.assertTrue(result["arguments"]["preview"])
 
+        self.assertNotIn("get_video_summary_restore_status", schemas)
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "get_video_summary_restore_status",
+                {},
+                self.context,
+            )
+
     def test_trusted_permissions_are_cleared_after_tool_exception(self):
         self.legacy.fail_name = "lookup_help"
 

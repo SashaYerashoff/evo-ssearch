@@ -4688,12 +4688,15 @@
             const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
             const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
             const alertBadges = renderSummaryAlertBadges(row, rowLevel);
-            const semanticReady = summaryKind === 'llm' || summaryKind === 'llm_cached';
+            const semanticReady = ['llm', 'llm_cached', 'legacy_cached'].includes(summaryKind);
+            const legacySemantic = summaryKind === 'legacy_cached';
             const pending = summaryKind === 'pending_context' || generationStatus === 'pending';
             const queued = summaryKind === 'queued' || generationStatus === 'queued' || generationStatus === 'deferred';
             const semanticRefreshPending = generationStatus === 'refresh_pending' || row?.semantic_refresh_pending === true;
             const statusLabel = semanticReady
-                ? (semanticRefreshPending
+                ? (legacySemantic
+                    ? 'semantic · legacy'
+                    : semanticRefreshPending
                     ? 'semantic · refreshing'
                     : (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic'))
                 : pending
@@ -4704,6 +4707,8 @@
             const statusClass = semanticReady ? 'ready' : pending ? 'pending' : queued ? 'queued' : 'degraded';
             const statusTitle = semanticRefreshPending
                 ? 'Showing the last completed semantic narrative while newly retained source observations are folded into this closed window.'
+                : legacySemantic
+                ? 'Imported from the pre-0.8.4 semantic history without regenerating the original operator narrative.'
                 : statusClass === 'degraded'
                 ? 'The semantic pass did not complete; source observations remain available and the window can be retried.'
                 : statusClass === 'queued'
@@ -4854,7 +4859,7 @@
             const retryCount = luxriotSummaryRollupRows
                 .filter((row) => {
                     const kind = String(row?.summary_kind || '').trim().toLowerCase();
-                    return kind && !['llm', 'llm_cached', 'pending_context', 'queued'].includes(kind);
+                    return kind && !['llm', 'llm_cached', 'legacy_cached', 'pending_context', 'queued'].includes(kind);
                 })
                 .length;
             const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
@@ -14522,7 +14527,7 @@
             textEl.className = 'agent-msg-text';
             const traceEl = document.createElement('details');
             traceEl.className = 'agent-tool-trace';
-            traceEl.open = true;
+            traceEl.open = false;
             traceEl.hidden = true;
             const traceSummary = document.createElement('summary');
             traceSummary.className = 'agent-tool-trace-summary';
@@ -14536,7 +14541,7 @@
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            const bubble = { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '' };
+            const bubble = { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '', currentToolName: '' };
             setStreamingStatus(bubble, 'Thinking through the request...', 'thinking');
             scrollToBottom(true);
             return bubble;
@@ -14561,8 +14566,15 @@
                 ? buildAgentProbeApprovalCard(name, result)
                 : buildActionCard(name, result);
             if (!card) return;
-            const standaloneApproval = card.dataset && card.dataset.agentStandaloneApproval === 'true';
+            const standaloneApproval = Boolean(
+                (card.dataset && card.dataset.agentStandaloneApproval === 'true')
+                || card.querySelector('.agent-approval-footer')
+            );
             if (standaloneApproval && bubble.bodyEl) {
+                card.dataset.agentStandaloneApproval = 'true';
+                if (card.classList.contains('agent-action-card')) {
+                    card.classList.add('agent-approval-card', 'agent-approval-card-legacy');
+                }
                 const before = bubble.traceEl && bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
                 bubble.bodyEl.insertBefore(card, before);
             } else if (bubble.actionsEl) {
@@ -14615,13 +14627,17 @@
                 if (!(node instanceof HTMLElement)) return false;
                 return node.dataset.agentStandaloneApproval === 'true'
                     || node.classList.contains('agent-approval-card')
+                    || Boolean(node.querySelector('.agent-approval-footer'))
                     || isLegacyProbeApprovalCard(node);
             });
             if (!candidates.length) return;
             const before = bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
             candidates.forEach((node) => {
                 node.dataset.agentStandaloneApproval = 'true';
-                if (isLegacyProbeApprovalCard(node)) {
+                if (
+                    isLegacyProbeApprovalCard(node)
+                    || (node.classList.contains('agent-action-card') && node.querySelector('.agent-approval-footer'))
+                ) {
                     node.classList.add('agent-approval-card', 'agent-approval-card-legacy');
                 }
                 bubble.bodyEl.insertBefore(node, before);
@@ -15610,7 +15626,16 @@
                 } else {
                     const empty = document.createElement('div');
                     empty.className = 'agent-card-muted-note';
-                    empty.textContent = 'No summaries in this time range.';
+                    const sourceWindows = Number(result && result.total_in_window) || 0;
+                    const semanticStatus = String((result && result.semantic_status) || '').toLowerCase();
+                    const semanticPending = Number(result && result.semantic_pending_count) || 0;
+                    if (sourceWindows > 0 && (semanticStatus === 'pending' || semanticPending > 0)) {
+                        empty.textContent = `${sourceWindows} source windows retained; semantic summaries are being generated.`;
+                    } else if (sourceWindows > 0) {
+                        empty.textContent = `${sourceWindows} source windows retained; no completed semantic narrative yet. Drill into L0 observations.`;
+                    } else {
+                        empty.textContent = 'No video-description data in this time range.';
+                    }
                     body.appendChild(empty);
                 }
                 card.appendChild(body);
@@ -15979,10 +16004,14 @@
                     if (evt.content) appendTokenToBubble(bubble, evt.content);
                     break;
                 case 'tool_call':
-                    if (evt.name) setStreamingStatus(bubble, `Running ${evt.name}...`, 'working');
+                    if (evt.name) {
+                        bubble.currentToolName = String(evt.name);
+                        setStreamingStatus(bubble, `Running ${evt.name}...`, 'working');
+                    }
                     break;
                 case 'tool_result':
                     appendActionCard(bubble, evt.name, evt.result);
+                    if (bubble.currentToolName === String(evt.name || '')) bubble.currentToolName = '';
                     if (
                         ((evt.name === 'update_probe') || (evt.name === 'create_probe') || (evt.name === 'delete_probes'))
                         && evt.result && evt.result.status === 'applied'
@@ -15997,7 +16026,11 @@
                     appendErrorToMessages(evt.message || 'Unknown error');
                     break;
                 case 'heartbeat':
-                    setStreamingStatus(bubble, 'Still working...', 'thinking');
+                    setStreamingStatus(
+                        bubble,
+                        bubble.currentToolName ? `Running ${bubble.currentToolName}...` : 'Still working...',
+                        bubble.currentToolName ? 'working' : 'thinking'
+                    );
                     break;
                 case 'tool_start':
                 case 'done':
@@ -16015,7 +16048,7 @@
                 const hasText = String(bubble.text || '').trim().length > 0;
                 const hasActions = Number(bubble.actionCount || 0) > 0;
                 bubble.traceEl.hidden = !hasActions;
-                bubble.traceEl.open = hasActions && !hasText;
+                bubble.traceEl.open = false;
             }
             promoteStandaloneAgentApprovalCards(bubble);
             syncAgentEvidenceIdCard(bubble);

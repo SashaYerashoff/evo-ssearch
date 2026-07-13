@@ -262,6 +262,12 @@ class EvaAgentToolAdapter:
             definition.name
             for definition in self.gateway.available_tools(context)
         } - _HIDDEN_UNTIL_APPROVALS
+        if "*" not in context.allowed_channel_ids:
+            # The durable backfill worker is deployment-global and its status
+            # contains channel IDs plus aggregate progress across the job. Do
+            # not expose a misleading partially-filtered global status to a
+            # channel-scoped actor.
+            allowed_names.discard("get_video_summary_restore_status")
         return [
             self._model_schema(name)
             for name in self._schemas
@@ -514,6 +520,11 @@ class EvaAgentToolAdapter:
         if name == "delete_probes":
             self._resolve_delete_probe_channels(prepared, context)
         scoped_channels = self._scoped_channels(context)
+        if name == "get_video_summary_restore_status" and scoped_channels is not None:
+            raise ChannelAccessDeniedError(
+                "video-summary restoration status is deployment-wide; ask an all-channel administrator",
+                details={"scope": "deployment"},
+            )
         if name == "survey_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif name == "list_video_summary_channels" and scoped_channels is not None:

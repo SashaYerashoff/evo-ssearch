@@ -120,6 +120,44 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer vlm-secret")
         self.assertEqual(captured["timeout"], 321)
         self.assertEqual(captured["workload"], "rollup")
+        self.assertEqual(
+            captured["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_interactive_agent_keeps_model_thinking_mode(self):
+        profile = {
+            "id": "agent",
+            "kind": "agent",
+            "base_url": "http://agent.local/v1",
+            "model": "qwen3.5-9b-mtp",
+            "api_key": "",
+            "timeout": 120,
+        }
+        captured = {}
+
+        def fake_post(_url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "research this"}],
+                profile_id="agent",
+                profile_kind="agent",
+                workload_class="agent",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertNotIn("chat_template_kwargs", captured["json"])
 
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {

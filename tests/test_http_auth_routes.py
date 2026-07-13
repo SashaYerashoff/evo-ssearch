@@ -1458,7 +1458,9 @@ class HttpAuthRouteTests(unittest.TestCase):
             if "lm-match.example" in url:
                 return Response({"data": [{"id": "model-a", "max_model_len": 32768}]})
             if "lm-mismatch.example" in url:
-                return Response({"data": [{"id": "actually-served"}]})
+                return Response({
+                    "data": [{"id": "actually-served", "meta": {"n_ctx": 16384}}]
+                })
             raise oldapp.requests.Timeout("credential-bearing endpoint unavailable")
 
         with oldapp._lm_served_models_cache_lock:
@@ -1479,6 +1481,7 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(rows["match"]["served_context_length"], 32768)
         self.assertIs(rows["mismatch"]["model_match"], False)
         self.assertEqual(rows["mismatch"]["served_models"], ["actually-served"])
+        self.assertEqual(rows["mismatch"]["served_context_length"], 16384)
         self.assertEqual(rows["unreachable"]["model_match"], "unknown")
         self.assertEqual(rows["unreachable"]["served_models"], [])
         serialized = str(response.get_json())

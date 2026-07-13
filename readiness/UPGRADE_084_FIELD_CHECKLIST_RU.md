@@ -37,17 +37,82 @@ systemd, рестарт), power-loss recovery. `--apply` на дев-машин�
    на объекте реально `123`/`changeme` — preflight выдаст FAIL
    `contains an obvious placeholder value`. Это не баг: смени пароль Evo на
    объекте до апгрейда, значение в диагностике не печатается.
-3. **`pg_dump` должен быть на app-хосте** (`apt install postgresql-client`
-   заранее, оффлайн-хосту — deb на ту же флешку). Без него preflight FAIL.
+3. **`pg_dump` нужен для маршрута с миграцией**, но не блокирует
+   штатный code-only `field_upgrade_084.sh --no-migrate`: этот маршрут
+   вообще не изменяет БД. Если схема не `20260614_0006`, проводник
+   остановится; тогда разработчику нужны `postgresql-client` и
+   отдельный migration/backup DSN.
 4. **Приведённый migration DSN** — отдельная привилегированная роль PostgreSQL.
    Передавать транзиентно: `EVA_INSTALL_MIGRATION_DSN` через
    `sudo --preserve-env=...` (в env-файл не пишется). `EVA_DATABASE_DSN`
    инсталлер для DDL не использует и не возьмёт.
 5. **Adopt-режим определяется по исполняемому `target/.venv/bin/python`.**
    Если venv на хосте переносили/ломали — инсталлер честно потребует
-   wheelhouse как для fresh. Проверь `test -x /opt/eva-ai/evo-ssearch/.venv/bin/python`.
+   wheelhouse как для fresh. Проводник также сам сравнит
+   `requirements.txt`/`requirements-db.txt` с полевым деревом и запустит
+   `.venv/bin/python -m pip check` (либо `uv pip check`, если venv собран без
+   модуля pip); без wheelhouse любое расхождение — `STOP`.
 6. Версионный гейт инсталлера теперь читает `VERSION` из bundle
-   (β 0.8.4) — отдельно ничего править не нужно.
+   и сверяет его с `manifest.txt`; оба должны быть ровно `β 0.8.4`.
+   `working_tree_status` в manifest должен быть `clean`; черновой bundle из
+   dirty-дерева в поле будет отвергнут.
+   Если в старом env явно записан `EVOSSEARCH_APP_VERSION`, инсталлер заменит
+   только этот release-managed ключ; IP, DSN, модели и прочие
+   site-настройки не перетираются.
+7. **Существующий systemd unit в adopt-режиме не переписывается.** Его
+   `User`/`Group`, hardening, drop-ins и зависимости остаются полевыми. Новый
+   unit из шаблона создаётся только на fresh-хосте.
+8. **Повторный запуск после успеха запрещён.** Проводник принимает
+   только исходные `β 0.8.0`/`β 0.8.1` и откажется запускаться на
+   уже установленной `β 0.8.4`, чтобы не заменить точку отката бэкапом
+   уже обновлённой версии.
+9. **Сохранённые L1–L3 из 0.8.1 не перегенерировать.** На первом старте
+   0.8.4 читает прежний `luxriot_rollup_cache`, помечает настоящие
+   LM-generated записи как `legacy_cached` и раскладывает их в отдельные
+   durable rows `luxriot_rollup:*`. Они сразу доступны UI и агенту; scheduler
+   и restore-worker считают их готовыми и не вызывают модель повторно.
+   Механическая строка вида `L1 rollup from L0: ...` семантикой не считается.
+   В `/luxriot/streams` после старта проверить
+   `rollup_scheduler.rollup_cache_entries_loaded`,
+   `legacy_rollups_adopted` и `legacy_rollups_adopted_by_level`.
+   Важно: старый cache был ограничен retention/размером (обычно 7 дней и
+   800 записей), поэтому импорт сохраняет всё реально записанное 0.8.1, но
+   не может восстановить никогда не созданные окна. Для таких окон источником
+   остаются архивные L0 `vlm_summary`; их генерация должна быть отдельным,
+   подтверждённым оператором restore, а не частью апгрейда.
+
+   До остановки 0.8.1 зафиксировать, сколько настоящих LM-rollup текстов
+   физически лежит в старом общем cache (видимая в UI динамическая карточка
+   сама по себе этого не гарантирует):
+
+   ```bash
+   sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d eva <<'SQL'
+   WITH entries AS (
+     SELECT jsonb_array_elements(
+       COALESCE(payload_json -> 'entries', '[]'::jsonb)
+     ) AS item
+     FROM archive.runtime_state
+     WHERE state_key = 'luxriot_rollup_cache'
+   )
+   SELECT
+     COALESCE(item ->> 'level', '?') AS level,
+     count(*) AS cached_rows,
+     count(*) FILTER (
+       WHERE lower(COALESCE(item ->> 'summary_kind', 'llm_cached'))
+             IN ('llm', 'llm_cached')
+         AND COALESCE(item ->> 'summary', '') NOT LIKE 'L1 rollup from L0:%'
+     ) AS semantic_rows,
+     to_timestamp(min((item ->> 'window_start')::double precision)) AS oldest,
+     to_timestamp(max((item ->> 'window_start')::double precision)) AS newest
+   FROM entries
+   GROUP BY 1
+   ORDER BY 1;
+   SQL
+   ```
+
+   Сохранить вывод в evidence. После первого старта сумма
+   `legacy_rollups_adopted_by_level` должна соответствовать найденным
+   семантическим строкам, оставшимся внутри новой rollup-retention.
 
 ## Маршрут инженера (основной — скрипт-проводник)
 
@@ -66,7 +131,9 @@ systemd, рестарт), power-loss recovery. `--apply` на дев-машин�
 scripts/build_patch_bundle.sh --name eva-ai-0.8.4-offline
 (cd dist && sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256)
 
-# 1. На хосте: распаковать и запустить проводник
+# 1. На хосте: ещё раз проверить файл после USB-копирования,
+#    затем распаковать и запустить проводник
+sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256
 tar xzf eva-ai-0.8.4-offline.tar.gz && cd eva-ai-0.8.4-offline/repo
 sudo ./scripts/field_upgrade_084.sh
 
@@ -103,3 +170,20 @@ sudo ./scripts/field_upgrade_084.sh
    `capture_cv_sharp_active` появляется в selection_sources.
 5. Агент: «когда были всплески активности выше нормы на канале N за час?» —
    ответ ссылается на burst-окна, не на прозу.
+
+## Проверка после reboot (до отъезда)
+
+```bash
+sudo systemctl is-enabled eva-ai
+sudo systemctl reboot
+# после возврата SSH/TeamViewer:
+systemctl is-active eva-ai
+curl -fsS http://127.0.0.1:5000/health
+curl -fsS http://127.0.0.1:5000/ready
+systemctl --failed --no-pager
+```
+
+Имена inference-сервисов зависят от объекта; их `is-enabled`/`is-active`
+проверяются по installation record. Сам апгрейд не переустанавливает
+vLLM/llama.cpp, модели и CUDA runtime: он сохраняет уже развёрнутую
+inference-топологию и её env endpoints.

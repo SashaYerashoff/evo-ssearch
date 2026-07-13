@@ -36,6 +36,13 @@ Scaffold for release notes; final prose to be assembled from commits
   explicit per-window retry remains available. The background scheduler now
   distinguishes ordinary inference from a saturated L0 backlog, has a bounded
   deferral ceiling, and backfills newest missing closed windows after downtime.
+  Genuine 0.8.0/0.8.1 LM rollups are adopted as labelled legacy semantics and
+  promoted to durable rows without model regeneration; deterministic fallback
+  cards remain excluded from semantic history. Scheduled L1–L3 text rollups
+  use the dedicated agent profile with model thinking disabled for the
+  background transform only; interactive agent reasoning remains enabled.
+  Rollup backpressure is LM-resource-aware, and scheduler spacing is measured
+  start-to-start so a 50-channel cadence is not defeated by mandatory idle time.
 - **Install:** offline dry-run-first installer orchestrator; version gate
   reads the bundled VERSION file; adopt upgrade rehearsed against a field
   tree copy (code-only, schema stays at head, no wheelhouse needed); guided

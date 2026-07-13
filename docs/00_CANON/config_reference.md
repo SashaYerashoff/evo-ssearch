@@ -113,13 +113,14 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC` (`21600`) | L3 aggregation window and proactive cadence (6 h) |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED` (`true`) | Build closed L1–L3 windows in the background instead of waiting for the first operator view |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC` (`30`) | Startup grace before staggered rollup work begins |
-| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`15`) | Minimum spacing between channel/level rollup jobs; deterministic channel phases spread fleet load without crowding live descriptions |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum start-to-start spacing between channel/level rollup jobs (inference time counts toward it); deterministic channel phases spread fleet load and LM admission keeps interactive work ahead of rollups |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS` (`2`) | Maximum newest missing windows synthesized by one scheduled level job while cached windows are skipped |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS` (`2`) | Maximum time, in target-level windows, that a saturated L0 queue may defer rollups before one job is admitted anyway; `0` disables deferral |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC` (`10`) | Minimum pause between post-upgrade historical restoration windows; live backlog still pauses the worker completely |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS` (`3`) | Bounded semantic retries per historical window before recording a failed gap and continuing |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC` (`45`) | Initial per-window ETA estimate until the durable worker measures the deployed LM |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL` (`agent` profile when configured) | Text-only L1–L3 model/profile selector; intentionally independent of each live channel's VLM selector |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |
 | `EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT` (`empty`) | Optional default operator alert criteria appended separately from role/summary prompt |
@@ -147,10 +148,12 @@ preview does not open a second recorder stream; `Full live` is an explicit opt-i
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`4`) | Conservative token estimator divisor |
-| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`12000`) | Old chat history budget before trimming |
-| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`45000`) | Adds an internal compact-answer warning before the next model call |
-| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and asks the agent to answer with gathered evidence |
+| `EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS` (`32768`) | Actual context served by the agent model; lower budgets are clamped below it |
+| `EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS` (`2048`) | Reserved maximum final-answer budget |
+| `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`3`) | Conservative JSON/tool-result token estimator divisor |
+| `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`8000`) | Old chat history budget before trimming |
+| `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`24000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
+| `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`28000`) | Stops further tool use and compacts tool payloads before the final model call |
 
 ## Inference queue (disabled by default)
 

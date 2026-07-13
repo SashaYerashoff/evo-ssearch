@@ -53,6 +53,10 @@ class _SummaryManager:
                     "running": True,
                     "model": "vlm-a1",
                     "pending_frames": 3,
+                    "summary_queue_depth": 2,
+                    "summary_queue_frame_count": 16,
+                    "summary_inflight": True,
+                    "summary_worker_alive": True,
                     "dropped_frames": 1,
                     "queue_dropped_batches": 0,
                     "recent_frame_count": 2,
@@ -663,11 +667,31 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             },
             context,
         )
+        report_args = _apply_turn_tool_context(
+            "generate_report",
+            {
+                "channel_id": 112,
+                "from_ts": 1,
+                "to_ts": 2,
+            },
+            context,
+        )
 
         self.assertNotIn("date", normalize_args)
         self.assertNotIn("start_time", normalize_args)
         self.assertIn("last 3 days", normalize_args["relative_range"])
         self.assertIn("last 3 days", summary_args["relative_range"])
+        self.assertIn("last 3 days", report_args["relative_range"])
+
+        ru_context = _seed_turn_tool_context(
+            "Сделай отчёт по каналу 112 за последние 3 дня."
+        )
+        ru_report_args = _apply_turn_tool_context(
+            "generate_report",
+            {"channel_id": 112, "from_ts": 1, "to_ts": 2},
+            ru_context,
+        )
+        self.assertIn("последние 3 дня", ru_report_args["relative_range"])
 
     def test_operator_explicit_calendar_range_is_not_replaced_by_relative_words(self):
         context = _seed_turn_tool_context(
@@ -675,6 +699,19 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         )
 
         self.assertNotIn("operator_relative_range", context)
+
+    def test_russian_runtime_status_uses_current_runtime_fast_path(self):
+        context = _seed_turn_tool_context(
+            "Покажи активные стримы, модели, очереди, потери и последние ошибки."
+        )
+
+        self.assertTrue(context["runtime_status_only"])
+        prepared = _apply_turn_tool_context(
+            "list_video_summary_channels",
+            {"since_hours": 6},
+            context,
+        )
+        self.assertTrue(prepared["runtime_only"])
 
     def test_turn_context_does_not_override_explicit_source_or_time(self):
         context = _seed_turn_tool_context("Check video descriptions and confirm with images.")
@@ -2400,6 +2437,84 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertTrue(compact["candidate_channels"][0]["frozen_signal"])
         self.assertEqual(compact["runtime_problem_channels"][0]["live_signal_status"], "frozen")
         self.assertTrue(any(row["live_signal_status"] == "stale" for row in compact["runtime_problem_channels"]))
+        active_runtime = compact["active_runtime_streams"][0]
+        self.assertEqual(active_runtime["channel_id"], 7)
+        self.assertEqual(active_runtime["buffered_frames"], 3)
+        self.assertEqual(active_runtime["summary_queue_depth"], 2)
+        self.assertEqual(active_runtime["summary_queue_frames"], 16)
+        runtime_only = _tools().execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "runtime_only": True},
+        )
+        self.assertTrue(runtime_only["runtime_only"])
+        self.assertEqual(runtime_only["active_count"], 1)
+        self.assertEqual(runtime_only["inactive_count"], 0)
+        self.assertEqual(runtime_only["candidate_channels"], [])
+
+        manager = _SummaryManager()
+        manager.session_status = lambda *args, **kwargs: self.fail(
+            "runtime-only status must not scan historical summaries"
+        )
+        scoped_runtime = _tools(manager).execute(
+            "list_video_summary_channels",
+            {
+                "channel_ids": [7],
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "runtime_only": True,
+            },
+        )
+        self.assertEqual(scoped_runtime["running_video_channels"], [7])
+        self.assertEqual(scoped_runtime["desired_video_channels"], [7])
+        self.assertEqual(
+            [row["channel_id"] for row in scoped_runtime["active_runtime_streams"]],
+            [7],
+        )
+        self.assertNotIn(8, scoped_runtime["scope"]["active_channel_ids"])
+
+        runtime_context = _seed_turn_tool_context(
+            "List active streams, models, queues, dropped frames, and last errors"
+        )
+        prepared = _apply_turn_tool_context(
+            "list_video_summary_channels", {"since_hours": 6}, runtime_context
+        )
+        self.assertTrue(prepared["runtime_only"])
+
+    def test_get_video_summaries_distinguishes_pending_semantics_from_no_source_data(self):
+        manager = _SummaryManager()
+
+        def pending_rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            return {
+                "running": True,
+                "levels": {
+                    "L0": [],
+                    "L1": [
+                        {
+                            "level": "L1",
+                            "window_start": 100.0,
+                            "window_end": 200.0,
+                            "summary": "Aggregation in progress.",
+                            "summary_kind": "pending_context",
+                            "generation_status": "pending",
+                        }
+                    ],
+                    "L2": [],
+                    "L3": [],
+                },
+            }
+
+        manager.summary_rollups = pending_rollups
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {"channel_id": 7, "depth": "L1", "from_ts": 100.0, "to_ts": 200.0},
+        )
+
+        self.assertEqual(result["total_in_window"], 1)
+        self.assertEqual(result["semantic_available_count"], 0)
+        self.assertEqual(result["semantic_pending_count"], 1)
+        self.assertEqual(result["semantic_status"], "pending")
+        self.assertEqual(result["source_coverage"]["status"], "covered")
+        self.assertEqual(result["count"], 1)
 
     def test_list_video_summary_channels_uses_batch_bounds_for_activity_window(self):
         manager = _SummaryManager()

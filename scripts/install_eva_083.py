@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dry-run-first, offline EVA AI 0.8.3 installer.
+"""Dry-run-first, offline EVA AI installer.
 
 The installer deliberately orchestrates the existing field-proven mechanisms:
 ``preflight_patch.sh`` for the baseline, ``install_patch.sh`` for backup and
@@ -63,6 +63,7 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "API_KEY", "DSN", "DATABASE_URL")
 _VLM_ENDPOINT_RE = re.compile(r"^EVOSSEARCH_LM_PROFILE_(?!AGENT(?:_|$)).+_BASE_URL$")
 _ENV_REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_INSTALLER_MANAGED_ENV_KEYS = frozenset({"EVOSSEARCH_APP_VERSION"})
 
 
 class InstallerError(RuntimeError):
@@ -305,6 +306,12 @@ def _quote_env_value(value: str) -> str:
 def render_env_update(raw: str, updates: Mapping[str, str]) -> str:
     content = str(raw or "")
     existing_keys = set(parse_env_text(content))
+    for key in sorted(_INSTALLER_MANAGED_ENV_KEYS.intersection(updates)):
+        replacement = f"{key}={_quote_env_value(str(updates[key]))}"
+        pattern = re.compile(
+            rf"(?m)^[ \t]*(?:export[ \t]+)?{re.escape(key)}[ \t]*=.*$"
+        )
+        content = pattern.sub(replacement, content)
     pending_updates = {
         key: value for key, value in updates.items()
         if key not in existing_keys
@@ -414,6 +421,15 @@ def prepare_env_values(
         })
     for key, value in defaults.items():
         add_missing(key, value)
+
+    # The release identity belongs to the installed code, not to site
+    # configuration.  It is the sole reviewed key that an adopt upgrade may
+    # replace; all operational settings remain preserve/append-only.
+    if "EVOSSEARCH_APP_VERSION" in resolution.existing:
+        current_version = str(values.get("EVOSSEARCH_APP_VERSION") or "").strip()
+        if current_version != EXPECTED_VERSION:
+            values["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
+            updates["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
 
     for spec in _PROMPTS:
         if spec.key == "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL" and _has_agent_endpoint(values):
@@ -764,6 +780,11 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
             else f"create {prepared.env.target} with mode 0600"
         )
     )
+    unit_action = (
+        f"preserve existing systemd unit {options.unit_file} unchanged"
+        if options.unit_file.is_file()
+        else f"render new {options.unit_file} from installer template and daemon-reload"
+    )
     actions = [
         PlanAction(
             "lock",
@@ -772,7 +793,11 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         PlanAction("configuration", env_action),
         PlanAction(
             "host",
-            f"ensure service account {options.service_user}:{options.service_group} and target directories",
+            (
+                "preserve the account selected by the existing systemd unit and ensure target directories"
+                if options.unit_file.is_file()
+                else f"ensure service account {options.service_user}:{options.service_group} and target directories"
+            ),
         ),
         PlanAction(
             "dependencies",
@@ -780,7 +805,7 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         ),
         PlanAction(
             "systemd",
-            f"render {options.unit_file} from installer template and daemon-reload",
+            unit_action,
         ),
         PlanAction(
             "preflight",
@@ -996,10 +1021,13 @@ def apply_install(prepared: PreparedInstall) -> Path:
     env_preexisted = prepared.env.target.exists()
     unit_preexisted = options.unit_file.exists()
     env_preinstall_backup: Path | None = None
-    unit_preinstall_backup: Path | None = None
 
     try:
-        _ensure_service_account(options, runner)
+        # A code-only adopt upgrade must not silently replace the site's
+        # reviewed service identity or hardening.  Existing units are preserved;
+        # the installer account/template are only for a fresh service.
+        if not unit_preexisted:
+            _ensure_service_account(options, runner)
         options.app_dir.mkdir(parents=True, exist_ok=True)
         options.backup_root.mkdir(parents=True, exist_ok=True)
         if not app_preexisted:
@@ -1024,13 +1052,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
             runner.run((options.python_bin, "-m", "venv", options.app_dir / ".venv"))
             _chown_tree(options.app_dir / ".venv", options.service_user, options.service_group)
 
-        template = options.unit_template.read_text(encoding="utf-8")
         prepared.options.env_file = prepared.env.target
-        unit_content = render_unit(template, options)
-        if not options.unit_file.is_file() or options.unit_file.read_text(encoding="utf-8") != unit_content:
-            unit_preinstall_backup = _backup_file(options.unit_file)
+        if not unit_preexisted:
+            template = options.unit_template.read_text(encoding="utf-8")
+            unit_content = render_unit(template, options)
             _atomic_write(options.unit_file, unit_content, 0o644)
-        runner.run(("systemctl", "daemon-reload"))
+            runner.run(("systemctl", "daemon-reload"))
 
         preflight = options.source_dir / "scripts" / "preflight_patch.sh"
         runner.run((
@@ -1066,13 +1093,6 @@ def apply_install(prepared: PreparedInstall) -> Path:
         if env_preexisted and env_preinstall_backup is not None:
             shutil.copy2(env_preinstall_backup, backup_dir / "eva-ai.env")
             env_preinstall_backup.unlink(missing_ok=True)
-        if unit_preexisted and unit_preinstall_backup is not None:
-            shutil.copy2(unit_preinstall_backup, backup_dir / options.unit_file.name)
-            (backup_dir / "systemd_unit_path.txt").write_text(
-                str(options.unit_file) + "\n",
-                encoding="utf-8",
-            )
-            unit_preinstall_backup.unlink(missing_ok=True)
         state = (
             f"created_at={datetime.now(timezone.utc).isoformat()}\n"
             f"installation_mode={'upgrade' if app_preexisted else 'fresh'}\n"
@@ -1125,6 +1145,26 @@ def apply_install(prepared: PreparedInstall) -> Path:
                     backup_dir = _latest_backup(options.backup_root)
                 except InstallerError:
                     backup_dir = None
+        # If install_patch never established a rollback snapshot, undo the
+        # small amount of staging performed by this orchestrator itself.  If
+        # it did establish one but then failed, make sure that snapshot holds
+        # the *pre-orchestrator* env rather than the appended staging copy.
+        if env_preinstall_backup is not None and env_preinstall_backup.is_file():
+            if backup_dir is not None:
+                shutil.copy2(env_preinstall_backup, backup_dir / "eva-ai.env")
+            elif env_preexisted:
+                shutil.copy2(env_preinstall_backup, prepared.env.target)
+            env_preinstall_backup.unlink(missing_ok=True)
+        elif backup_dir is None and not env_preexisted:
+            prepared.env.target.unlink(missing_ok=True)
+        if backup_dir is None and not unit_preexisted:
+            options.unit_file.unlink(missing_ok=True)
+            subprocess.run(
+                ("systemctl", "daemon-reload"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
         if backup_dir is not None:
             print(
                 "ROLLBACK HANDOFF: sudo "
@@ -1140,7 +1180,7 @@ def apply_install(prepared: PreparedInstall) -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Dry-run-first, offline EVA AI 0.8.3 installer.",
+        description="Dry-run-first, offline EVA AI installer.",
     )
     parser.add_argument("--source-dir", type=Path, default=REPO_ROOT)
     parser.add_argument("--bundle-dir", type=Path)

@@ -7,17 +7,17 @@ fact changes, change it here first.
 Markers: `[FIELD]` = client-specific, filled only in the internal field-rollout
 doc, never in shareable docs. `[VERIFY]` = confirm before relying on it.
 
-Last reviewed: 2026-07-02 (β 0.8.3)
+Last reviewed: 2026-07-13 (β 0.8.4)
 
 ## Product & version
 
 | Fact | Value |
 |---|---|
 | Product | Luxriot EVA AI |
-| Current version | `β 0.8.3` |
+| Current version | `β 0.8.4` |
 | Release class | Production-pilot beta (supervised, closed network) |
 | Version source of truth | `VERSION` file; `EVOSSEARCH_APP_VERSION` overrides only if set |
-| Previous baseline | `β 0.8.2.1` |
+| Previous baseline | `β 0.8.3` |
 
 ## Database
 
@@ -26,7 +26,7 @@ Last reviewed: 2026-07-02 (β 0.8.3)
 | Control plane | PostgreSQL (required in secure deployment) |
 | Alembic schema head | `20260614_0006` |
 | Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260614_0006` |
-| Migration needed for 0.8.2.1 → 0.8.3 | **No** (code-only patch) |
+| Migration needed for 0.8.3 → 0.8.4 | **No** (code-only patch) |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |
 | Runtime DB roles | Separate DSNs for API, audit, worker, migration |

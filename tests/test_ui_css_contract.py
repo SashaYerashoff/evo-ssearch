@@ -271,6 +271,7 @@ def test_agent_probe_approval_is_standalone_not_research_trace():
     assert "function isLegacyProbeApprovalCard" in JS
     assert "card.dataset.agentStandaloneApproval = 'true'" in JS
     assert "card.dataset && card.dataset.agentStandaloneApproval === 'true'" in JS
+    assert "card.querySelector('.agent-approval-footer')" in JS
     assert "const card = isStandaloneProbeApprovalResult(name, result)" in JS
     assert "bubble.bodyEl.insertBefore(card, before)" in JS
     assert "bubble.actionsEl.appendChild(card)" in JS
@@ -291,6 +292,29 @@ def test_agent_probe_approval_is_standalone_not_research_trace():
     assert ".agent-approval-fields" in CSS
     assert ".agent-approval-card + .agent-tool-trace" in CSS
     assert ".agent-approval-card-legacy" in CSS
+
+
+def test_agent_research_trace_stays_collapsed_and_keeps_current_tool_visible():
+    streaming = JS.split("function startStreamingBubble", 1)[1].split(
+        "function appendTokenToBubble", 1
+    )[0]
+    finish = JS.split("function finishStreamingBubble", 1)[1].split(
+        "function appendAgentNotice", 1
+    )[0]
+    events = JS.split("function handleAgentEvent", 1)[1].split(
+        "function finishStreamingBubble", 1
+    )[0]
+    assert "traceEl.open = false" in streaming
+    assert "bubble.traceEl.open = false" in finish
+    assert "bubble.currentToolName = String(evt.name)" in events
+    assert "`Running ${bubble.currentToolName}...`" in events
+
+
+def test_video_rollups_label_imported_legacy_semantics_as_ready():
+    assert "['llm', 'llm_cached', 'legacy_cached'].includes(summaryKind)" in JS
+    assert "semantic · legacy" in JS
+    assert "Imported from the pre-0.8.4 semantic history" in JS
+    assert "'llm', 'llm_cached', 'legacy_cached', 'pending_context'" in JS
 
 
 def test_vlm_machine_json_label_is_semantic_not_generic_only():
@@ -360,6 +384,9 @@ def test_agent_cards_surface_coverage_and_incomplete_scope():
     search_card = JS.split("if (toolName === 'search_archive')", 1)[1].split("toolName === 'get_detections'", 1)[0]
     assert "alwaysCoverage: true" in search_card
     assert "alwaysTruncation: true" in search_card
+    assert "source windows retained; semantic summaries are being generated" in JS
+    assert "source windows retained; no completed semantic narrative yet" in JS
+    assert "No video-description data in this time range" in JS
 
 
 def test_agent_sidebar_polls_analytics_runtime_and_lm_admission_only_when_active():

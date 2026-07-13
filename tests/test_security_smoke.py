@@ -65,6 +65,17 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertIn("error", payload)
 
+    def test_every_response_has_safe_browser_headers(self) -> None:
+        response = self.client.get("/health")
+
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(
+            response.headers["Permissions-Policy"],
+            "camera=(), microphone=(), geolocation=()",
+        )
+
     def test_settings_masks_luxriot_password(self) -> None:
         headers = {}
         if config.ADMIN_TOKEN:

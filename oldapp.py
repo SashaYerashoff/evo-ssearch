@@ -1201,6 +1201,16 @@ def _attach_request_security_headers(response):
     response.headers["X-Request-ID"] = str(
         getattr(g, "request_id", "") or uuid.uuid4()
     )
+    # Safe browser baseline for every response, including login/error pages.
+    # A CSP is intentionally not imposed here yet because the legacy UI still
+    # contains inline assets; these headers do not alter its runtime contract.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=()",
+    )
     return response
 
 
@@ -2912,6 +2922,17 @@ def _probe_served_lm_models(
                         if context_length is not None:
                             contexts[model_id] = context_length
                             break
+                    else:
+                        # llama.cpp reports its loaded context under
+                        # data[].meta.n_ctx rather than the common vLLM keys.
+                        meta = item.get("meta")
+                        context_length = (
+                            _reported_lm_context_length(meta.get("n_ctx"))
+                            if isinstance(meta, Mapping)
+                            else None
+                        )
+                        if context_length is not None:
+                            contexts[model_id] = context_length
                 if served_models:
                     result = {
                         "known": True,
@@ -3033,6 +3054,13 @@ def _call_lm_chat(
     default_workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
     requested_workload = str(workload_class or "").strip().lower()
     workload = requested_workload if requested_workload in {"agent", "interactive", "alert", "describe", "video", "vlm", "heartbeat", "rollup", "background"} else default_workload
+    if workload in {"rollup", "background"}:
+        # MTP/reasoning models can spend the entire completion budget on an
+        # internal chain of thought and never emit the operator narrative.
+        # Rollups are scheduled text transforms, not interactive agent turns,
+        # so request a direct answer for this workload only.  llama.cpp passes
+        # this OpenAI-compatible extension through to the Qwen chat template.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     def _response_error_detail(resp: Any) -> str:
         try:
@@ -3122,8 +3150,19 @@ def _call_video_understanding(
     )
 
 
+def _video_understanding_resource_key(model_override: Optional[str] = None) -> str:
+    """Resolve a public model/profile selector to its credential-free endpoint."""
+
+    profile = _resolve_lm_profile(
+        model_override=str(model_override or "").strip() or None,
+        kind="vlm",
+    )
+    return normalize_lm_resource(str(profile.get("base_url") or ""), "")
+
+
 _call_video_understanding.eva_generation_preflight = True  # type: ignore[attr-defined]
 _call_video_understanding.eva_workload_class = True  # type: ignore[attr-defined]
+_call_video_understanding.eva_resource_key = _video_understanding_resource_key  # type: ignore[attr-defined]
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -12450,16 +12489,22 @@ def _runtime_env_map() -> Dict[str, str]:
         ),
         "EVOSSEARCH_LM_VIDEO_TEMPERATURE": str(config.LM_VIDEO_TEMPERATURE),
         "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN": os.getenv(
-            "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4"
+            "EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "3"
+        ),
+        "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", "32768"
+        ),
+        "EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS": os.getenv(
+            "EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS", "2048"
         ),
         "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS": os.getenv(
-            "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000"
+            "EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "8000"
         ),
         "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS": os.getenv(
-            "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000"
+            "EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "24000"
         ),
         "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS": os.getenv(
-            "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000"
+            "EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "28000"
         ),
         "EVOSSEARCH_OFFLINE_VIDEO_ENABLED": _bool_to_env(getattr(config, "OFFLINE_VIDEO_ENABLED", False)),
         "EVOSSEARCH_PROBE_SNAP_ENABLED": _bool_to_env(getattr(config, "PROBE_SNAP_ENABLED", False)),
@@ -13412,10 +13457,12 @@ EVOSSEARCH_LM_VIDEO_MAX_TOKENS={config.LM_VIDEO_MAX_TOKENS}
 EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS={getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000)}
 EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS={getattr(config, "LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS", 2500000)}
 EVOSSEARCH_LM_VIDEO_TEMPERATURE={config.LM_VIDEO_TEMPERATURE}
-EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN={os.getenv("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "4")}
-EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "12000")}
-EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "45000")}
-EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "60000")}
+EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", "32768")}
+EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS={os.getenv("EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS", "2048")}
+EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN={os.getenv("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", "3")}
+EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS", "8000")}
+EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS", "24000")}
+EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS={os.getenv("EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS", "28000")}
 EVOSSEARCH_OFFLINE_VIDEO_ENABLED={str(getattr(config, "OFFLINE_VIDEO_ENABLED", False)).lower()}
 EVOSSEARCH_PROBE_SNAP_ENABLED={str(getattr(config, "PROBE_SNAP_ENABLED", False)).lower()}
 EVOSSEARCH_INDEXED_FOLDER_ENABLED={str(getattr(config, "INDEXED_FOLDER_ENABLED", False)).lower()}

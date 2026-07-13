@@ -108,6 +108,11 @@ class DurableRollupMemoryStateStore(MemoryRuntimeStateStore):
     def save_rollup(self, payload):
         self.rollups[str(payload["rollup_id"])] = dict(payload)
 
+    def save_rollups(self, payloads):
+        for payload in payloads:
+            self.save_rollup(payload)
+        return len(payloads)
+
     def load_rollup(self, rollup_id):
         payload = self.rollups.get(str(rollup_id))
         return dict(payload) if payload else None
@@ -591,6 +596,57 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 }
             )
             self.assertTrue(manager._l0_backpressure_active(7))
+
+    def test_global_l0_backpressure_detects_another_saturated_live_channel(self):
+        class StatusSession:
+            def __init__(self, status):
+                self._status = status
+
+            def status(self):
+                return dict(self._status)
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.sessions[7] = StatusSession(
+                {
+                    "summary_queue_depth": 0,
+                    "summary_queue_max_batches": 2,
+                }
+            )
+            manager.sessions[8] = StatusSession(
+                {
+                    "summary_queue_depth": 2,
+                    "summary_queue_max_batches": 2,
+                }
+            )
+
+            self.assertFalse(manager._l0_backpressure_active(7))
+            self.assertTrue(manager._l0_backpressure_active())
+
+    def test_l0_backpressure_only_blocks_rollups_on_the_same_lm_resource(self):
+        class StatusSession:
+            def status(self):
+                return {
+                    "model": "vlm",
+                    "summary_queue_depth": 2,
+                    "summary_queue_max_batches": 2,
+                }
+
+        def lm_callback(_messages, _model):
+            return operator_rollup_response("Routine window.")
+
+        lm_callback.eva_resource_key = lambda selector: (
+            "http://agent.local/v1"
+            if str(selector or "").strip() == "agent"
+            else "http://vlm.local/v1"
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.sessions[7] = StatusSession()
+
+            self.assertTrue(manager._l0_backpressure_active(model_hint="vlm"))
+            self.assertFalse(manager._l0_backpressure_active(model_hint="agent"))
 
     def test_rollup_backpressure_deferral_has_a_hard_window_ceiling(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4438,6 +4494,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertGreaterEqual(stats["source_lines_selected"], 2)
             self.assertGreater(stats["text_chars"], 0)
 
+    def test_rollup_model_uses_dedicated_text_profile_before_channel_vlm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_ROLLUP_LLM_MODEL": "agent"},
+            )
+            manager.channel_prompt_overrides[7] = {"model_hint": "vlm"}
+            manager.summary_runs[7] = [{"model": "qwen/qwen3-vl-4b"}]
+
+            with manager.cache_lock:
+                selected = manager._get_rollup_model_hint_locked(7)
+
+            self.assertEqual(selected, "agent")
+
     def test_summary_rollups_readonly_mode_does_not_synthesize_with_llm(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []
@@ -4598,6 +4668,159 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(result["levels"]["L1"]), 1)
             self.assertIn("briefly left", result["levels"]["L1"][0]["summary"])
             self.assertEqual(result["levels"]["L1"][0]["generation_status"], "ready")
+
+    def test_081_semantic_cache_is_adopted_without_regeneration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            base = float(int((time.time() - 3600.0) // 900) * 900)
+            legacy_summary = (
+                "### Window Snapshot\n"
+                "A person worked at the desk, left briefly, and returned.\n\n"
+                "### Routine Baseline\nDesk work remained the routine.\n\n"
+                "### Preserved Deviations\nOne short absence was observed.\n\n"
+                "### Alert Ledger\nNo structured alert was recorded.\n\n"
+                "### Operator Notes\nThe observed sequence completed within the window."
+            )
+            rollup_id = f"l1-ch7-w900-{int(base)}"
+            state_store.payloads["luxriot_rollup_cache"] = {
+                "version": 1,
+                "entries": [
+                    {
+                        "rollup_id": rollup_id,
+                        "channel_id": 7,
+                        "level": "L1",
+                        "source_level": "L0",
+                        "window_start": base,
+                        "window_end": base + 900.0,
+                        "window_sec": 900,
+                        "source_ids": ["l0-old-a"],
+                        "source_signature": "0.8.1-source",
+                        "summary": legacy_summary,
+                        "summary_kind": "llm",
+                        "created_at": base + 900.0,
+                    }
+                ],
+            }
+            lm_calls = []
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _model: lm_calls.append(True) or "unexpected",
+                runtime_state_store=state_store,
+                config_overrides={"LUXRIOT_ROLLUP_RETENTION_DAYS": 90},
+            )
+            manager.set_summary_archive_readers(
+                lambda _channel, _start, _end: ([], 0),
+                lambda _channel, _start, _end, _bucket: [
+                    {"window_start": base, "window_end": base + 900.0}
+                ],
+            )
+
+            adopted = state_store.load_rollup(rollup_id)
+            plan = manager.plan_rollup_backfill(
+                channel_ids=[7],
+                start_ts=base,
+                end_ts=base + 900.0,
+                levels=["L1"],
+            )
+            restored = manager._restore_rollup_window(
+                {
+                    "channel_id": 7,
+                    "level": "L1",
+                    "window_start": base,
+                    "window_end": base + 900.0,
+                    "rollup_id": rollup_id,
+                }
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "new-runtime-run",
+                    "summary": "A newly loaded L0 observation for the imported window.",
+                    "frame_count": 12,
+                    "created_at": base + 60.0,
+                    "batch_start_ms": int((base + 30.0) * 1000),
+                    "batch_end_ms": int((base + 90.0) * 1000),
+                },
+            )
+            rendered = manager.summary_rollups(
+                7,
+                run_selector="all",
+                start_ts=base,
+                end_ts=base + 899.0,
+                target_level="L1",
+                synthesize=True,
+            )
+
+            self.assertIsNotNone(adopted)
+            self.assertEqual(adopted["summary_kind"], "legacy_cached")
+            self.assertEqual(adopted["generation_status"], "legacy_ready")
+            self.assertTrue(manager._rollup_semantic_ready(adopted))
+            self.assertEqual(manager._rollup_scheduler_status["rollup_cache_entries_loaded"], 1)
+            self.assertEqual(manager._rollup_scheduler_status["legacy_rollups_adopted"], 1)
+            self.assertEqual(
+                manager._rollup_scheduler_status["legacy_rollups_adopted_by_level"],
+                {"L1": 1},
+            )
+            self.assertEqual(plan["totals"]["already_ready"], 1)
+            self.assertEqual(plan["totals"]["missing_semantic"], 0)
+            self.assertEqual(restored["status"], "already_ready")
+            self.assertEqual(rendered["levels"]["L1"][0]["summary_kind"], "legacy_cached")
+            self.assertIn("worked at the desk", rendered["levels"]["L1"][0]["summary"])
+            self.assertEqual(lm_calls, [])
+
+    def test_081_mechanical_fallback_is_not_adopted_as_semantic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            normalized = manager._normalize_cached_rollup_entry(
+                {
+                    "rollup_id": "l1-ch7-w900-1781700000",
+                    "channel_id": 7,
+                    "level": "L1",
+                    "source_level": "L0",
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "window_sec": 900,
+                    "summary": "L1 rollup from L0: repeated batch text",
+                    "summary_kind": "degraded",
+                    "generation_status": "semantic_guard_rejected",
+                    "format_version": 1,
+                }
+            )
+
+            self.assertIsNotNone(normalized)
+            self.assertEqual(normalized["summary_kind"], "degraded")
+            self.assertFalse(manager._rollup_semantic_ready(normalized))
+
+    def test_081_semantic_overclaim_is_sanitized_without_lm_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            normalized = manager._normalize_cached_rollup_entry(
+                {
+                    "rollup_id": "l1-ch7-w900-1781700000",
+                    "channel_id": 7,
+                    "level": "L1",
+                    "source_level": "L0",
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "window_sec": 900,
+                    "summary": (
+                        "### Window Snapshot\nRoutine sampled window.\n\n"
+                        "### Operator Notes\nNo blind spots or missing coverage were found."
+                    ),
+                    "summary_kind": "degraded",
+                    "generation_status": "semantic_guard_rejected",
+                    "format_version": 1,
+                }
+            )
+
+            self.assertIsNotNone(normalized)
+            self.assertEqual(normalized["summary_kind"], "legacy_cached")
+            self.assertEqual(normalized["generation_status"], "legacy_sanitized")
+            self.assertTrue(normalized["legacy_sanitized"])
+            self.assertNotIn("No blind spots", normalized["summary"])
+            self.assertIn("sampled frames are partial evidence", normalized["summary"])
+            self.assertTrue(manager._rollup_semantic_ready(normalized))
 
     def test_readonly_rollup_keeps_last_semantic_narrative_while_refresh_is_pending(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4825,6 +5048,54 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(status["status"], "completed_with_gaps")
             self.assertEqual(status["progress"]["source_missing"], 1)
             self.assertEqual(status["progress"]["retries"], 0)
+
+    def test_completed_backfill_with_transient_failures_can_be_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=DurableRollupMemoryStateStore(),
+            )
+            previous_job_id = "rollup-backfill-previous"
+            request_key = "same-request"
+            with manager._rollup_backfill_condition:
+                manager._rollup_backfill_state = {
+                    "version": 1,
+                    "job_id": previous_job_id,
+                    "request_key": request_key,
+                    "status": "completed_with_gaps",
+                    "progress": {
+                        "processed": 1,
+                        "restored": 0,
+                        "already_ready": 0,
+                        "source_missing": 0,
+                        "failed": 1,
+                        "retries": 3,
+                    },
+                    "plan": {"totals": {"missing_semantic": 1}},
+                }
+            plan = {
+                "request_key": request_key,
+                "channel_ids": [7],
+                "levels": ["L2"],
+                "from_ts": 1_000.0,
+                "to_ts": 4_600.0,
+                "totals": {"missing_semantic": 1},
+                "estimated_seconds": 45.0,
+                "estimated_hours": 0.01,
+                "estimated_hours_range": [0.01, 0.02],
+            }
+
+            with patch.object(manager, "plan_rollup_backfill", return_value=plan):
+                result = manager.start_rollup_backfill(
+                    channel_ids=[7],
+                    start_ts=1_000.0,
+                    end_ts=4_600.0,
+                    levels=["L2"],
+                )
+
+            self.assertNotEqual(result["job_id"], previous_job_id)
+            self.assertFalse(result.get("idempotent_existing_job", False))
+            self.assertEqual(result["progress"]["failed"], 0)
 
     def test_rollup_backfill_resumes_durable_cursor_after_process_restart(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -9,6 +9,12 @@ from agent import (
     _LMResponse,
     _ToolCall,
     _compact_tool_result_for_model,
+    _compact_tool_messages_for_context_budget,
+    _context_budget_snapshot,
+    _filter_streamed_tool_markup,
+    _parse_text_tool_calls,
+    _seed_turn_tool_context,
+    _apply_turn_tool_context,
 )
 from agent_security import ToolExecutionContext
 
@@ -135,6 +141,86 @@ class _FakeApprovalTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_recovers_allowed_xml_tool_call_and_strips_protocol_markup(self):
+        content = """I will prepare the preview.\n<tool_call>
+<function=update_prompt_settings>
+<parameter=channel_id>112</parameter>
+<parameter=changes>{"alert_policy_prompt":"Alert when a visible lighter flame appears in a person's hand."}</parameter>
+<parameter=preview>True</parameter>
+</function>
+</tool_call>"""
+        cleaned, calls, saw_markup = _parse_text_tool_calls(
+            content,
+            allowed_names={"get_prompt_settings", "update_prompt_settings"},
+        )
+
+        self.assertTrue(saw_markup)
+        self.assertEqual(cleaned, "I will prepare the preview.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "update_prompt_settings")
+        self.assertEqual(calls[0].args["channel_id"], 112)
+        self.assertTrue(calls[0].args["preview"])
+
+        cleaned, calls, _ = _parse_text_tool_calls(
+            content.replace("update_prompt_settings", "create_probe"),
+            allowed_names={"get_prompt_settings", "update_prompt_settings"},
+        )
+        self.assertEqual(calls, [])
+        self.assertNotIn("<tool_call>", cleaned or "")
+
+    def test_stream_filter_removes_split_tool_protocol(self):
+        chunks = ["Answer before <tool_", "call><function=create_probe>", "secret", "</tool_call> after"]
+        self.assertEqual("".join(_filter_streamed_tool_markup(chunks)), "Answer before  after")
+
+    def test_vlm_alert_request_routes_to_prompt_policy_without_disabling_explicit_probes(self):
+        context = _seed_turn_tool_context(
+            "set a new alert for the vlm channel #112 - if person fires a lighter"
+        )
+        self.assertTrue(context["vlm_alert_policy_request"])
+        self.assertEqual(context["channel_id"], 112)
+        context["prompt_settings_current"] = {"alert_policy_prompt": "Existing criterion."}
+        prepared = _apply_turn_tool_context(
+            "update_prompt_settings",
+            {"changes": {
+                "alert_policy_prompt": "model wording",
+                "rollup_prompts": {"L1": "must not leak"},
+                "bookmark_enabled": True,
+                "migrate_legacy_alert_policy": True,
+            }},
+            context,
+        )
+        self.assertEqual(prepared["channel_id"], 112)
+        self.assertTrue(prepared["preview"])
+        self.assertEqual(
+            prepared["changes"]["alert_policy_prompt"],
+            "Existing criterion.\nAlert when a person ignites a lighter and a visible small flame appears in or near the person's hand.",
+        )
+        self.assertEqual(set(prepared["changes"]), {"alert_policy_prompt"})
+        explicit_probe = _seed_turn_tool_context(
+            "create a CLIP probe on VLM channel #112 for a visible lighter flame"
+        )
+        self.assertFalse(explicit_probe["vlm_alert_policy_request"])
+
+    def test_context_budget_counts_tool_schemas_and_emergency_compacts_results(self):
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "tool", "name": "get_video_summaries", "tool_call_id": "c1", "content": json.dumps({
+                "channel_id": 7,
+                "depth": "L1",
+                "count": 10,
+                "entries": [{"time": str(index), "summary": "x" * 3000} for index in range(10)],
+            })},
+        ]
+        schemas = [{"type": "function", "function": {"name": "wide", "description": "y" * 3000}}]
+        with_tools = _context_budget_snapshot(messages, tool_schemas=schemas)
+        without_tools = _context_budget_snapshot(messages)
+        compacted, status = _compact_tool_messages_for_context_budget(messages, token_budget=1000)
+
+        self.assertGreater(with_tools["estimated_tokens"], without_tools["estimated_tokens"])
+        self.assertGreater(with_tools["tool_schema_estimated_tokens"], 0)
+        self.assertEqual(status["compacted_tool_messages"], 1)
+        self.assertLess(len(compacted[1]["content"]), len(messages[1]["content"]))
+
     def test_archive_tool_compaction_preserves_source_semantics(self):
         compact = _compact_tool_result_for_model(
             "search_archive",

@@ -1,5 +1,5 @@
 [Unit]
-Description=EVA AI 0.8.3 control plane
+Description=EVA AI control plane
 After=network-online.target
 Wants=network-online.target
 
