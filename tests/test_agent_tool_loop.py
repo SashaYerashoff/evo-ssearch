@@ -1,6 +1,8 @@
 import json
 import time
 import unittest
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
 import agent
 from agent import (
@@ -15,6 +17,7 @@ from agent import (
     _parse_text_tool_calls,
     _seed_turn_tool_context,
     _apply_turn_tool_context,
+    _AgentLMClient,
 )
 from agent_security import ToolExecutionContext
 
@@ -141,6 +144,50 @@ class _FakeApprovalTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_agent_disables_model_thinking_for_tool_and_final_calls(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+            def status(self):
+                return {"resources": []}
+
+        client.admission_controller = Admission()
+        tool_response = Mock()
+        tool_response.raise_for_status.return_value = None
+        tool_response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}]
+        }
+        with patch.object(agent.requests, "post", return_value=tool_response) as post:
+            client.call_with_tools([{"role": "user", "content": "inspect"}], tools=[])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+        class StreamResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self):
+                yield b'data: {"choices":[{"delta":{"content":"done"}}]}'
+                yield b'data: [DONE]'
+
+        with patch.object(agent.requests, "post", return_value=StreamResponse()) as post:
+            self.assertEqual("".join(client.stream_text([{"role": "user", "content": "finish"}])), "done")
+        self.assertEqual(
+            post.call_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
     def test_recovers_allowed_xml_tool_call_and_strips_protocol_markup(self):
         content = """I will prepare the preview.\n<tool_call>
 <function=update_prompt_settings>

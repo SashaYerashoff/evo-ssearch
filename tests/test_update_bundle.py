@@ -47,6 +47,11 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("is up and running", SCRIPT)
         self.assertIn('"status"[[:space:]]*:[[:space:]]*"ready"', SCRIPT)
 
+    def test_same_version_hotfix_is_idempotent_by_bundle_commit(self):
+        self.assertIn("same-version hotfix", SCRIPT)
+        self.assertIn(".eva-bundle-commit", SCRIPT)
+        self.assertIn("this exact ${EXPECTED_VERSION} bundle is already installed", SCRIPT)
+
     def test_builder_places_entrypoint_at_bundle_root(self):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)

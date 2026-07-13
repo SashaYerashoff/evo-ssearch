@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import requests
 import pytest
@@ -9,6 +10,7 @@ import oldapp
 
 
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2"
+APP_JS = (Path(__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(encoding="utf-8")
 
 
 class FakeUpstream:
@@ -87,6 +89,7 @@ def _install_client(monkeypatch, client):
 def test_media_limits_are_backed_by_deployment_config(monkeypatch):
     monkeypatch.setattr(oldapp.config, "LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC", 1.25)
     monkeypatch.setattr(oldapp.config, "LUXRIOT_MEDIA_READ_TIMEOUT_SEC", 2.5)
+    monkeypatch.setattr(oldapp.config, "LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC", 90.0)
     monkeypatch.setattr(oldapp.config, "LUXRIOT_LIVE_MEDIA_MAX_SECONDS", 12.0)
     monkeypatch.setattr(oldapp.config, "LUXRIOT_LIVE_MEDIA_MAX_BYTES", 4096)
     monkeypatch.setattr(oldapp.config, "LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS", 24.0)
@@ -343,7 +346,33 @@ def test_archive_media_broker_forwards_single_range_and_response_range_headers(
     }
     assert kwargs["headers"]["Range"] == "bytes=0-23"
     assert kwargs["headers"]["Streaming-Web-Ver"] == "1.3.0"
-    assert kwargs["timeout"][1] >= 23.0
+    assert kwargs["timeout"][1] == 90.0
+
+
+def test_archive_media_prepare_timeout_is_clamped_for_slow_evo(monkeypatch):
+    monkeypatch.setattr(oldapp.config, "LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC", 999.0)
+    frame_time = FakeUpstream(text="1700000000000")
+    media = FakeUpstream([MP4_BYTES], headers={"Content-Type": "video/mp4"})
+    fake = FakeLuxriotClient([frame_time, media])
+    _install_client(monkeypatch, fake)
+
+    upstream = oldapp._luxriot_media_open_upstream(
+        media_kind="archive",
+        channel_id=9,
+        stream="mainStream",
+        time_ms=1700000000000,
+        duration_sec=15,
+        range_header=None,
+    )
+
+    assert upstream is media
+    assert fake.calls[0][2]["timeout"][1] == 180.0
+    assert fake.calls[1][2]["timeout"][1] == 180.0
+
+
+def test_archive_ui_waits_beyond_default_broker_prepare_timeout():
+    assert "Math.min(120000, durationSec * 4000 + 30000)" in APP_JS
+    assert "Math.min(60000, durationSec * 3000 + 15000)" not in APP_JS
 
 
 def test_archive_media_broker_falls_back_when_html5_query_is_rejected(

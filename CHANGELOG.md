@@ -39,8 +39,10 @@ Scaffold for release notes; final prose to be assembled from commits
   Genuine 0.8.0/0.8.1 LM rollups are adopted as labelled legacy semantics and
   promoted to durable rows without model regeneration; deterministic fallback
   cards remain excluded from semantic history. Scheduled L1–L3 text rollups
-  use the dedicated agent profile with model thinking disabled for the
-  background transform only; interactive agent reasoning remains enabled.
+  use the dedicated agent profile with model thinking disabled. Interactive
+  agent tool decisions and final answers also request direct/non-thinking
+  output so Qwen3.5 cannot spend the completion budget before finishing the
+  operator-visible tool loop.
   Rollup backpressure is LM-resource-aware, and scheduler spacing is measured
   start-to-start so a 50-channel cadence is not defeated by mandatory idle time.
 - **Install:** offline dry-run-first installer orchestrator; version gate

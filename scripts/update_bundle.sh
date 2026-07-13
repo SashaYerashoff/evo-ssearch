@@ -230,13 +230,21 @@ printf 'Health URL:  %s\n' "${BASE_URL}"
 [[ "$(tr -d '\r\n' < "${SOURCE_DIR}/VERSION")" == "${EXPECTED_VERSION}" ]] || stop "bundle VERSION is not ${EXPECTED_VERSION}"
 MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MANIFEST_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+BUNDLE_COMMIT="$(sed -n 's/^git_commit=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 [[ "${MANIFEST_VERSION}" == "${EXPECTED_VERSION}" ]] || stop "manifest version is not ${EXPECTED_VERSION}"
 [[ "${MANIFEST_STATUS}" == "clean" ]] || stop "bundle was built from a dirty working tree"
+[[ "${BUNDLE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || stop "manifest git_commit is missing or invalid"
 
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
 case "${DEPLOYED_VERSION}" in
   "β 0.8.0"|"β 0.8.1") ok "supported installed version: ${DEPLOYED_VERSION}" ;;
-  "${EXPECTED_VERSION}") stop "${EXPECTED_VERSION} is already installed" ;;
+  "${EXPECTED_VERSION}")
+    INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit" 2>/dev/null || true)"
+    if [[ "${INSTALLED_BUNDLE_COMMIT}" == "${BUNDLE_COMMIT}" ]]; then
+      stop "this exact ${EXPECTED_VERSION} bundle is already installed (${BUNDLE_COMMIT:0:7})"
+    fi
+    ok "same-version hotfix: ${INSTALLED_BUNDLE_COMMIT:0:7} -> ${BUNDLE_COMMIT:0:7}"
+    ;;
   *) stop "unsupported installed version: ${DEPLOYED_VERSION:-missing}" ;;
 esac
 
@@ -398,7 +406,7 @@ else
     --skip-pg-dump --no-start --no-verify
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" <<'PY'
 import os
 import re
 import stat
@@ -408,6 +416,8 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 version = sys.argv[2]
+marker_path = Path(sys.argv[3])
+bundle_commit = sys.argv[4]
 original = path.read_text(encoding="utf-8")
 replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
 updated, count = re.subn(
@@ -433,6 +443,7 @@ finally:
         os.unlink(temp_name)
     except FileNotFoundError:
         pass
+marker_path.write_text(bundle_commit + "\n", encoding="utf-8")
 PY
 ok "code installed; database and runtime data were not changed"
 

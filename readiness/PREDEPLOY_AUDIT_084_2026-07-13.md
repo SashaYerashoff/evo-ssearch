@@ -42,8 +42,9 @@ hardware or runtime state.
   semantics and promoted to independently queryable durable rows without model
   regeneration. Mechanical fallback cards are not promoted as semantics.
 - Text-only L1-L3 work is routed to the dedicated agent profile. Background
-  rollups request direct/non-thinking output while interactive agent reasoning
-  remains enabled. Scheduler spacing is start-to-start with a five-second
+  rollups and the interactive agent request direct/non-thinking output; this
+  preserves completion budget for tool calls and final operator answers.
+  Scheduler spacing is start-to-start with a five-second
   default, avoiding a mathematically impossible 50-channel idle budget.
 - A completed backfill with transient LM failures can be explicitly retried;
   true source gaps remain terminal/idempotent.

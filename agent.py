@@ -69,6 +69,7 @@ AGENT_VIDEO_SUMMARY_DEFAULT_LEVEL_LIMIT = 500
 AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
 AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "UTC").strip() or "UTC"
 TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
+AGENT_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int] = None) -> int:
@@ -1859,6 +1860,7 @@ class _AgentLMClient:
             "tools": effective_tools,
             "tool_choice": "auto",
             "max_tokens": min(1_024, AGENT_MAX_OUTPUT_TOKENS),
+            "chat_template_kwargs": dict(AGENT_CHAT_TEMPLATE_KWARGS),
             "stream": False,
         }
         with self.admission_controller.admission(
@@ -1937,6 +1939,7 @@ class _AgentLMClient:
             "model": self.model,
             "messages": messages,
             "max_tokens": AGENT_MAX_OUTPUT_TOKENS,
+            "chat_template_kwargs": dict(AGENT_CHAT_TEMPLATE_KWARGS),
             "stream": True,
         }
         def raw_chunks() -> Iterator[str]:

@@ -9651,9 +9651,12 @@ def _luxriot_media_open_upstream(
         # Evo may assemble an HTML5-compatible archive fragment before sending
         # its first byte. A live-stream read timeout is too short for a bounded
         # multi-second review clip, even though the eventual media is healthy.
+        archive_prepare_timeout = _luxriot_media_config_float(
+            "LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC", 90.0, 15.0, 180.0
+        )
         timeout = (
             timeout[0],
-            max(timeout[1], min(60.0, float(duration_sec) + 8.0)),
+            max(timeout[1], archive_prepare_timeout, float(duration_sec) + 8.0),
         )
     headers = {
         "Accept": "video/mp4,video/webm,video/ogg,video/mp2t,multipart/x-mixed-replace,application/octet-stream,*/*",

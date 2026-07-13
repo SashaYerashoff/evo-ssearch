@@ -83,6 +83,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_FROZEN_FRAME_MIN_COUNT` (`3`) | Minimum identical captured frames before frozen-source detection can trigger |
 | `EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC` (`3.0`) | Same-origin media broker connect timeout; clamped to 0.25–30 s |
 | `EVOSSEARCH_LUXRIOT_MEDIA_READ_TIMEOUT_SEC` (`8.0`) | Same-origin media broker upstream read timeout; clamped to 0.5–60 s |
+| `EVOSSEARCH_LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC` (`90.0`) | First-byte timeout while Evo assembles a browser-compatible archive fragment; clamped to 15–180 s |
 | `EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS` (`120.0`) | Maximum lifetime of one bounded live broker response; UI renews it proactively at 75%; clamped to 1–120 s |
 | `EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_BYTES` (`268435456`) | Maximum streamed bytes in one live broker response (256 MiB default and cap; data is relayed rather than retained) |
 | `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS` (`45.0`) | Maximum lifetime of one bounded archive broker response; clamped to 1–300 s |

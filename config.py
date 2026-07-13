@@ -538,6 +538,16 @@ class Config:
         LUXRIOT_MEDIA_READ_TIMEOUT_SEC = 8.0
     LUXRIOT_MEDIA_READ_TIMEOUT_SEC = max(0.5, min(60.0, LUXRIOT_MEDIA_READ_TIMEOUT_SEC))
     try:
+        LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC', '90.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = 90.0
+    LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = max(
+        15.0,
+        min(180.0, LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC),
+    )
+    try:
         LUXRIOT_LIVE_MEDIA_MAX_SECONDS = float(
             os.getenv('EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS', '120.0')
         )

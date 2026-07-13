@@ -7713,7 +7713,11 @@
             durationSec,
         });
         setArchiveMediaState('loading', `Preparing ${durationSec}s batch loop…`);
-        const negotiationTimeoutMs = Math.max(30000, Math.min(60000, durationSec * 3000 + 15000));
+        // Evo can spend close to a minute assembling an otherwise healthy
+        // browser-compatible archive fragment before sending its first byte.
+        // Keep the UI deadline above the broker's default 90 s preparation
+        // allowance so a valid WebM/MP4 response is not aborted at the edge.
+        const negotiationTimeoutMs = Math.max(60000, Math.min(120000, durationSec * 4000 + 30000));
         void fetchLuxriotMediaBlob(mediaUrl, controller, negotiationTimeoutMs)
             .then((negotiated) => {
                 if (!isCurrentArchiveMediaRequest(requestContext)) return;
