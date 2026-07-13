@@ -35,6 +35,8 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("--skip-pg-dump", SCRIPT)
         self.assertNotIn("--run-migrations", SCRIPT)
         self.assertIn("default_transaction_read_only=on", SCRIPT)
+        self.assertIn('${HOME}/.local/state/eva-ai/0.8.4-backups', SCRIPT)
+        self.assertIn('if [[ "${MODE}" == "user" ]]', SCRIPT)
 
     def test_human_confirmation_and_restart_are_separate(self):
         confirmation = SCRIPT.index("Type UPDATE")

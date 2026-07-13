@@ -11,7 +11,7 @@ APP_DIR=""
 ENV_FILE=""
 SERVICE_NAME=""
 BASE_URL=""
-BACKUP_ROOT="/var/tmp/eva-ai-0.8.4-backups"
+BACKUP_ROOT=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/manifest.txt" && -d "${SCRIPT_DIR}/repo" ]]; then
@@ -134,6 +134,14 @@ else
   SERVICE_GROUP="$(${SYSTEMCTL[@]} show "${SERVICE_NAME}.service" -p Group --value 2>/dev/null || true)"
   SERVICE_USER="${SERVICE_USER:-eva}"
   SERVICE_GROUP="${SERVICE_GROUP:-${SERVICE_USER}}"
+fi
+
+if [[ -z "${BACKUP_ROOT}" ]]; then
+  if [[ "${MODE}" == "user" ]]; then
+    BACKUP_ROOT="${HOME}/.local/state/eva-ai/0.8.4-backups"
+  else
+    BACKUP_ROOT="/var/tmp/eva-ai-0.8.4-backups"
+  fi
 fi
 
 systemctl_read() {
@@ -333,15 +341,62 @@ say "Stopping ${SERVICE_NAME}.service"
 systemctl_write stop "${SERVICE_NAME}.service"
 
 say "Backing up and installing code"
-as_root "${BUNDLE_DIR}/scripts/install_patch.sh" \
-  --bundle-dir "${BUNDLE_DIR}" \
-  --source-dir "${SOURCE_DIR}" \
-  --app-dir "${APP_DIR}" \
-  --env-file "${ENV_FILE}" \
-  --service "${SERVICE_NAME}" \
-  --base-url "${BASE_URL}" \
-  --backup-root "${BACKUP_ROOT}" \
-  --skip-pg-dump --no-start --no-verify
+if [[ "${MODE}" == "user" ]]; then
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  BACKUP_DIR="${BACKUP_ROOT}/patch-${timestamp}"
+  mkdir -p "${BACKUP_DIR}"
+  cp -a "${ENV_FILE}" "${BACKUP_DIR}/eva-ai.env"
+  APP_PARENT="$(dirname "${APP_DIR}")"
+  APP_BASE="$(basename "${APP_DIR}")"
+  tar \
+    --exclude="${APP_BASE}/.git" \
+    --exclude="${APP_BASE}/.local" \
+    --exclude="${APP_BASE}/.venv" \
+    --exclude="${APP_BASE}/dist" \
+    --exclude="${APP_BASE}/__pycache__" \
+    --exclude="${APP_BASE}/.pytest_cache" \
+    --exclude="${APP_BASE}/node_modules" \
+    --exclude="${APP_BASE}/detections_archive" \
+    --exclude="${APP_BASE}/video" \
+    --exclude="${APP_BASE}/models" \
+    --exclude="${APP_BASE}/*.mp4" \
+    --exclude="${APP_BASE}/*.avi" \
+    --exclude="${APP_BASE}/*.mov" \
+    --exclude="${APP_BASE}/*.mkv" \
+    --exclude="${APP_BASE}/probes_store.json" \
+    --exclude="${APP_BASE}/luxriot_summary_state.json" \
+    --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
+    -czf "${BACKUP_DIR}/code.tgz" \
+    -C "${APP_PARENT}" "${APP_BASE}"
+  printf '%s\n' "${BACKUP_DIR}" > "${BACKUP_ROOT}/LATEST"
+
+  COPY_EXCLUDES=(
+    --exclude=.git --exclude=.local --exclude=.venv
+    --exclude=__pycache__ --exclude='*.pyc' --exclude=.pytest_cache
+    --exclude=dist --exclude=node_modules --exclude=detections_archive
+    --exclude=video --exclude=models --exclude='*.mp4' --exclude='*.avi'
+    --exclude='*.mov' --exclude='*.mkv' --exclude=probes_store.json
+    --exclude=luxriot_summary_state.json --exclude=luxriot_rollups_cache.json
+    --exclude=.env --exclude='.env.*' --exclude='*.sqlite3' --exclude='*.db'
+    --exclude='*.log'
+  )
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "${COPY_EXCLUDES[@]}" "${SOURCE_DIR}/" "${APP_DIR}/"
+  else
+    tar "${COPY_EXCLUDES[@]}" -cf - -C "${SOURCE_DIR}" . | tar -xf - -C "${APP_DIR}"
+  fi
+  ok "local code backup: ${BACKUP_DIR}"
+else
+  as_root "${BUNDLE_DIR}/scripts/install_patch.sh" \
+    --bundle-dir "${BUNDLE_DIR}" \
+    --source-dir "${SOURCE_DIR}" \
+    --app-dir "${APP_DIR}" \
+    --env-file "${ENV_FILE}" \
+    --service "${SERVICE_NAME}" \
+    --base-url "${BASE_URL}" \
+    --backup-root "${BACKUP_ROOT}" \
+    --skip-pg-dump --no-start --no-verify
+fi
 
 target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" <<'PY'
 import os
@@ -419,5 +474,10 @@ printf '\n============================================================\n'
 printf 'OK: EVA AI %s is up and running\n' "${EXPECTED_VERSION}"
 printf 'URL: %s\n' "${BASE_URL}"
 printf 'Service: %s.service (%s systemd)\n' "${SERVICE_NAME}" "${MODE}"
-printf 'Backup: %s\n' "$(as_root cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || printf '%s' "${BACKUP_ROOT}")"
+if [[ "${MODE}" == "user" ]]; then
+  LATEST_BACKUP="$(cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || printf '%s' "${BACKUP_ROOT}")"
+else
+  LATEST_BACKUP="$(as_root cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || printf '%s' "${BACKUP_ROOT}")"
+fi
+printf 'Backup: %s\n' "${LATEST_BACKUP}"
 printf '============================================================\n'
