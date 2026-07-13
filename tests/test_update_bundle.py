@@ -27,6 +27,8 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('MODE="system"', SCRIPT)
         self.assertIn("find_user_service", SCRIPT)
         self.assertIn("find_system_service", SCRIPT)
+        self.assertIn("user-systemd dev mode skips", SCRIPT)
+        self.assertIn("Production installer dry-run", SCRIPT)
 
     def test_adopt_update_never_migrates_or_dumps_database(self):
         self.assertIn("--no-migrate", SCRIPT)

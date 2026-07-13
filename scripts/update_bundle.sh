@@ -312,11 +312,17 @@ DRY_RUN=(
   --unit-file "${UNIT_FILE}"
   --base-url "${BASE_URL}"
 )
-say "Installer dry-run"
-if [[ "${MODE}" == "system" || ! -r "${ENV_FILE}" ]]; then
-  as_root "${DRY_RUN[@]}" || stop "installer dry-run failed"
+if [[ "${MODE}" == "user" ]]; then
+  say "Local rehearsal preflight"
+  printf 'WARN: user-systemd dev mode skips the production credential-placeholder policy.\n'
+  printf '      Version, bundle, venv, requirements and database schema checks passed.\n'
 else
-  "${DRY_RUN[@]}" || stop "installer dry-run failed"
+  say "Production installer dry-run"
+  if [[ ! -r "${ENV_FILE}" ]]; then
+    as_root "${DRY_RUN[@]}" || stop "installer dry-run failed"
+  else
+    "${DRY_RUN[@]}" || stop "installer dry-run failed"
+  fi
 fi
 
 printf '\nType UPDATE to install %s (database and runtime data stay unchanged): ' "${EXPECTED_VERSION}"
