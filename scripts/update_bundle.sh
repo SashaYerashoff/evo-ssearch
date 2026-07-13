@@ -239,11 +239,15 @@ DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
 case "${DEPLOYED_VERSION}" in
   "β 0.8.0"|"β 0.8.1") ok "supported installed version: ${DEPLOYED_VERSION}" ;;
   "${EXPECTED_VERSION}")
-    INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit" 2>/dev/null || true)"
+    INSTALLED_BUNDLE_COMMIT=""
+    if [[ -f "${APP_DIR}/.eva-bundle-commit" ]]; then
+      INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit")"
+    fi
     if [[ "${INSTALLED_BUNDLE_COMMIT}" == "${BUNDLE_COMMIT}" ]]; then
       stop "this exact ${EXPECTED_VERSION} bundle is already installed (${BUNDLE_COMMIT:0:7})"
     fi
-    ok "same-version hotfix: ${INSTALLED_BUNDLE_COMMIT:0:7} -> ${BUNDLE_COMMIT:0:7}"
+    INSTALLED_BUNDLE_LABEL="${INSTALLED_BUNDLE_COMMIT:0:7}"
+    ok "same-version hotfix: ${INSTALLED_BUNDLE_LABEL:-unmarked} -> ${BUNDLE_COMMIT:0:7}"
     ;;
   *) stop "unsupported installed version: ${DEPLOYED_VERSION:-missing}" ;;
 esac
