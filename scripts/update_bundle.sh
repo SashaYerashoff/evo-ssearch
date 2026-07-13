@@ -294,6 +294,24 @@ target_python() {
   fi
 }
 
+ready_json_matches_version() {
+  local expected_version="$1"
+  target_python -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if payload.get("status") == "ready" and payload.get("version") == sys.argv[1]
+    else 1
+)
+' "${expected_version}"
+}
+
 EXPECTED_AGENT_CONTEXT=65536
 CONFIGURED_AGENT_CONTEXT="$(read_env_value EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS)"
 CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}"
@@ -510,7 +528,8 @@ automatic_rollback() {
   printf 'OK: previous code and configuration restored; database and runtime data were untouched.\n' >&2
   local rollback_deadline=$((SECONDS + 240))
   while (( SECONDS < rollback_deadline )); do
-    if curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null | grep -Fq "${DEPLOYED_VERSION}"; then
+    if curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null \
+      | ready_json_matches_version "${DEPLOYED_VERSION}"; then
       printf 'OK: %s is back up at %s\n' "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
       break
     fi
@@ -665,8 +684,7 @@ READY_JSON=""
 READY_DEADLINE=$((SECONDS + 240))
 while (( SECONDS < READY_DEADLINE )); do
   if READY_JSON="$(curl -skfS --max-time 5 "${BASE_URL}/ready" 2>/dev/null)"; then
-    if printf '%s' "${READY_JSON}" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' \
-       && printf '%s' "${READY_JSON}" | grep -Fq "${EXPECTED_VERSION}"; then
+    if printf '%s' "${READY_JSON}" | ready_json_matches_version "${EXPECTED_VERSION}"; then
       break
     fi
   fi

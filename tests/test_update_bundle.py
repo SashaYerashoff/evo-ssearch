@@ -48,7 +48,9 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertLess(confirmation, install)
         self.assertLess(install, restart_prompt)
         self.assertIn("is up and running", SCRIPT)
-        self.assertIn('"status"[[:space:]]*:[[:space:]]*"ready"', SCRIPT)
+        self.assertIn("ready_json_matches_version", SCRIPT)
+        self.assertIn('payload.get("version") == sys.argv[1]', SCRIPT)
+        self.assertNotIn('grep -Fq "${EXPECTED_VERSION}"', SCRIPT)
 
     def test_same_version_hotfix_is_idempotent_by_bundle_commit(self):
         self.assertIn("same-version hotfix", SCRIPT)
