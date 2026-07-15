@@ -10,6 +10,7 @@ SCRIPT_PATH = ROOT / "scripts" / "update_bundle.sh"
 SCRIPT = SCRIPT_PATH.read_text(encoding="utf-8")
 BUILD_SCRIPT = (ROOT / "scripts" / "build_patch_bundle.sh").read_text(encoding="utf-8")
 ROLLBACK_SCRIPT = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
+INSTALL_SCRIPT = (ROOT / "scripts" / "install_patch.sh").read_text(encoding="utf-8")
 
 
 class UpdateBundleTests(unittest.TestCase):
@@ -113,10 +114,24 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("trap automatic_rollback EXIT", SCRIPT)
         self.assertIn("--no-verify", SCRIPT)
         self.assertIn("database and runtime data were untouched", SCRIPT)
+        self.assertIn("ready_json_reports_version", SCRIPT)
+        self.assertIn("/ready remains degraded", SCRIPT)
+        self.assertIn("SECONDS + 60", SCRIPT)
 
     def test_manual_rollback_supports_user_systemd_and_exact_restore(self):
         self.assertIn("systemctl --user", ROLLBACK_SCRIPT)
         self.assertIn("restore_code_snapshot.py", ROLLBACK_SCRIPT)
+        for excluded in (".git", ".local", ".venv*", ".env", "dist", "*.sqlite3", "*.db", "*.log"):
+            self.assertIn(f'--exclude="${{APP_BASE}}/{excluded}"', ROLLBACK_SCRIPT)
+
+    def test_all_code_snapshots_exclude_runtime_private_and_large_trees(self):
+        for source in (SCRIPT, INSTALL_SCRIPT, ROLLBACK_SCRIPT):
+            for excluded in (
+                ".git", "*/.git", ".local", "*/.local", ".venv*", "*/.venv*",
+                ".env", ".env.*", "dist", "*/dist", "node_modules", "*/node_modules",
+                "*.sqlite3", "*.db", "*.log",
+            ):
+                self.assertIn(f'--exclude="${{APP_BASE}}/{excluded}"', source)
 
     def test_restore_helper_deletes_new_code_but_keeps_runtime_data(self):
         helper = ROOT / "scripts" / "restore_code_snapshot.py"
@@ -127,6 +142,7 @@ class UpdateBundleTests(unittest.TestCase):
             app.mkdir()
             snapshot_root.mkdir(parents=True)
             (snapshot_root / "old.py").write_text("old\n", encoding="utf-8")
+            (snapshot_root / ".venv.broken-old").symlink_to("/mnt/retired/eva-venv")
             archive = root / "code.tgz"
             with tarfile.open(archive, "w:gz") as handle:
                 handle.add(snapshot_root, arcname="app")
@@ -134,6 +150,7 @@ class UpdateBundleTests(unittest.TestCase):
             (app / "new.py").write_text("new\n", encoding="utf-8")
             (app / "video").mkdir()
             (app / "video" / "evidence.mp4").write_bytes(b"evidence")
+            (app / ".venv.broken-current").symlink_to("/mnt/current/eva-venv")
             subprocess.run(
                 ["python3", str(helper), "--archive", str(archive), "--app-dir", str(app)],
                 check=True,
@@ -141,6 +158,8 @@ class UpdateBundleTests(unittest.TestCase):
             self.assertEqual((app / "old.py").read_text(encoding="utf-8"), "old\n")
             self.assertFalse((app / "new.py").exists())
             self.assertEqual((app / "video" / "evidence.mp4").read_bytes(), b"evidence")
+            self.assertEqual((app / ".venv.broken-current").readlink(), Path("/mnt/current/eva-venv"))
+            self.assertFalse((app / ".venv.broken-old").is_symlink())
 
 
 if __name__ == "__main__":

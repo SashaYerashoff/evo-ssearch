@@ -105,6 +105,13 @@ background rollups, agent context/tool routing, and offline deployment.
   `.eva-bundle-commit`; another `0.8.4` commit is treated as a hotfix.
 - The updater backs up code and env, never migrates the database, preserves
   runtime data, and automatically restores code/env after a post-stop failure.
+- Code and emergency rollback snapshots exclude nested Git, venv, env, build,
+  model, media, database, log, and runtime-data trees. Restore also ignores
+  those entries in older snapshots, including retired absolute `.venv*`
+  symlinks, instead of copying them over adopted runtime state.
+- Automatic rollback distinguishes a fully ready restored release from a
+  restored release whose external required dependency remains unavailable; it
+  reports the degraded dependency state without a second four-minute wait.
 - Success requires active service, `/health`, and `/ready?load=1` reporting
   `status=ready` and `β 0.8.4`.
 - Linux x86_64 FFmpeg/ffprobe and an OpenCV rescue wheel are included and
@@ -159,6 +166,12 @@ Use `readiness/MANUAL_TEST_PLAN_0.8.4_OFFICE_DEMO_RU.md`. The required focus is:
   three known failures require a configured PostgreSQL archive/probe store and
   demonstrate that those tests are not yet hermetic without deployment env.
 - Archive UI/media focused suite after timeout-contract repair: 65/65.
+- A same-version live failure rehearsal correctly entered automatic rollback
+  when the configured Luxriot endpoint was unreachable. It restored the prior
+  bundle marker and active service without touching database/runtime data. The
+  rehearsal exposed an over-broad emergency snapshot and a retired absolute
+  venv symlink in the older backup; both rollback paths are now bounded and
+  regression-tested.
 - Previous `0.8.4` deterministic predeploy gate: 626 passed, 18 skipped, 134
   subtests passed.
 - Agent/updater hotfix targeted suite before this documentation pass: 141/141.

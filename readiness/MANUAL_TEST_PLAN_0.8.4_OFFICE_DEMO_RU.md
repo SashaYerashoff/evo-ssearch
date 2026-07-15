@@ -140,6 +140,18 @@ schema gates до человеческого confirmation. Source-worktree `.env
 
 После успеха перезагрузить страницу/Luxriot web tile с очисткой cache.
 
+Если updater сделал automatic rollback, сохранить весь terminal output. Строка
+`previous code and configuration restored` означает, что code/env возвращены.
+Если затем написано `/ready remains degraded`, старый сервис отвечает и сообщает
+правильную версию, но один из обязательных runtime dependencies всё ещё
+недоступен. Это всё равно STOP для офисного обновления: записать содержимое
+`required` из `/ready`, не повторять update и не трогать базу.
+
+Rollback snapshot должен быть code-only: `.git`, `.local`, `.venv*`, `.env*`,
+`dist`, `node_modules`, models/media, DB и logs в него не входят. Если создание
+backup неожиданно длится дольше нескольких минут или свободное место быстро
+падает, прервать процедуру до повторного запуска и связаться с разработчиком.
+
 ## 4. Шкала качества ответа
 
 Каждый агентный сценарий оценивается по шести измерениям, 0–3 балла.

@@ -312,6 +312,20 @@ raise SystemExit(
 ' "${expected_version}"
 }
 
+ready_json_reports_version() {
+  local expected_version="$1"
+  target_python -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if payload.get("version") == sys.argv[1] else 1)
+' "${expected_version}"
+}
+
 EXPECTED_AGENT_CONTEXT=65536
 CONFIGURED_AGENT_CONTEXT="$(read_env_value EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS)"
 CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}"
@@ -544,15 +558,23 @@ automatic_rollback() {
     }
   fi
   printf 'OK: previous code and configuration restored; database and runtime data were untouched.\n' >&2
-  local rollback_deadline=$((SECONDS + 240))
+  local rollback_deadline=$((SECONDS + 60))
+  local rollback_response=""
   while (( SECONDS < rollback_deadline )); do
-    if curl -skfS --max-time 5 "${BASE_URL}/ready?load=1" 2>/dev/null \
-      | ready_json_matches_version "${DEPLOYED_VERSION}"; then
-      printf 'OK: %s is back up at %s\n' "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
-      break
+    if rollback_response="$(curl -skS --max-time 5 "${BASE_URL}/ready?load=1" 2>/dev/null)" \
+      && printf '%s' "${rollback_response}" | ready_json_reports_version "${DEPLOYED_VERSION}"; then
+      if printf '%s' "${rollback_response}" | ready_json_matches_version "${DEPLOYED_VERSION}"; then
+        printf 'OK: %s is back up at %s\n' "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
+      else
+        printf 'WARN: restored %s is running at %s but /ready remains degraded; inspect required dependencies.\n' \
+          "${DEPLOYED_VERSION}" "${BASE_URL}" >&2
+      fi
+      exit "${exit_status}"
     fi
     sleep 5
   done
+  printf 'WARN: previous code was restored, but %s did not report version %s within 60 seconds.\n' \
+    "${BASE_URL}" "${DEPLOYED_VERSION}" >&2
   exit "${exit_status}"
 }
 trap automatic_rollback EXIT
@@ -575,12 +597,19 @@ if [[ "${MODE}" == "user" ]]; then
   APP_BASE="$(basename "${APP_DIR}")"
   tar \
     --exclude="${APP_BASE}/.git" \
+    --exclude="${APP_BASE}/*/.git" \
     --exclude="${APP_BASE}/.local" \
-    --exclude="${APP_BASE}/.venv" \
+    --exclude="${APP_BASE}/*/.local" \
+    --exclude="${APP_BASE}/.venv*" \
+    --exclude="${APP_BASE}/*/.venv*" \
+    --exclude="${APP_BASE}/.env" \
+    --exclude="${APP_BASE}/.env.*" \
     --exclude="${APP_BASE}/dist" \
+    --exclude="${APP_BASE}/*/dist" \
     --exclude="${APP_BASE}/__pycache__" \
     --exclude="${APP_BASE}/.pytest_cache" \
     --exclude="${APP_BASE}/node_modules" \
+    --exclude="${APP_BASE}/*/node_modules" \
     --exclude="${APP_BASE}/detections_archive" \
     --exclude="${APP_BASE}/video" \
     --exclude="${APP_BASE}/models" \
@@ -591,6 +620,9 @@ if [[ "${MODE}" == "user" ]]; then
     --exclude="${APP_BASE}/probes_store.json" \
     --exclude="${APP_BASE}/luxriot_summary_state.json" \
     --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
+    --exclude="${APP_BASE}/*.sqlite3" \
+    --exclude="${APP_BASE}/*.db" \
+    --exclude="${APP_BASE}/*.log" \
     -czf "${BACKUP_DIR}/code.tgz" \
     -C "${APP_PARENT}" "${APP_BASE}"
   printf '%s\n' "${BACKUP_DIR}" > "${BACKUP_ROOT}/LATEST"

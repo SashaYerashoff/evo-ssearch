@@ -54,7 +54,10 @@ Scaffold for release notes; final prose to be assembled from commits
 - **Compatible adopt upgrades:** deployed versions are no longer allowlisted;
   any non-empty post-schema build can proceed when exact requirements, healthy
   venv, and read-only schema-head gates pass. Exact bundle reruns remain blocked
-  by commit marker.
+  by commit marker. Code/rollback snapshots now exclude nested private/runtime
+  trees, legacy absolute venv links are safely ignored during restore, and an
+  automatically restored service reports external readiness degradation without
+  another four-minute wait.
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
   See `readiness/RELEASE_NOTES_0.8.4.md`.
 

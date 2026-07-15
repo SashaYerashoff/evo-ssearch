@@ -25,10 +25,27 @@ def preserved(relative: Path) -> bool:
     parts = relative.parts
     if not parts:
         return False
-    if parts[0] in PRESERVED_ROOTS or "__pycache__" in parts:
+    if (
+        parts[0] in PRESERVED_ROOTS
+        or parts[0].startswith(".venv")
+        or parts[0] == ".env"
+        or parts[0].startswith(".env.")
+        or "__pycache__" in parts
+    ):
         return True
     name = parts[-1]
     return name in PRESERVED_NAMES or any(fnmatch.fnmatch(name, pattern) for pattern in PRESERVED_PATTERNS)
+
+
+def restorable_members(members: list[tarfile.TarInfo]) -> list[tarfile.TarInfo]:
+    """Drop adopted runtime/config entries before the safe tar filter sees them."""
+    selected: list[tarfile.TarInfo] = []
+    for member in members:
+        parts = Path(member.name).parts
+        relative = Path(*parts[1:]) if len(parts) > 1 else Path()
+        if not preserved(relative):
+            selected.append(member)
+    return selected
 
 
 def remove(path: Path) -> None:
@@ -72,15 +89,16 @@ def main() -> int:
             raise SystemExit("snapshot has an unexpected top-level path")
         if any(member.name.startswith("/") or ".." in Path(member.name).parts for member in members):
             raise SystemExit("snapshot contains an unsafe path")
+        members = restorable_members(members)
         with tempfile.TemporaryDirectory(prefix="eva-rollback-") as temp_name:
             temp_root = Path(temp_name)
-            handle.extractall(temp_root, filter="data")
+            handle.extractall(temp_root, members=members, filter="data")
             snapshot_app = temp_root / app_name
             app_dir.mkdir(parents=True, exist_ok=True)
             clean_new_code(app_dir, snapshot_app)
 
     with tarfile.open(archive, "r:gz") as handle:
-        handle.extractall(app_parent, filter="data")
+        handle.extractall(app_parent, members=members, filter="data")
     return 0
 
 

@@ -216,10 +216,20 @@ fi
 APP_PARENT="$(dirname "${APP_DIR}")"
 APP_BASE="$(basename "${APP_DIR}")"
 tar \
-  --exclude="${APP_BASE}/.venv" \
+  --exclude="${APP_BASE}/.git" \
+  --exclude="${APP_BASE}/*/.git" \
+  --exclude="${APP_BASE}/.local" \
+  --exclude="${APP_BASE}/*/.local" \
+  --exclude="${APP_BASE}/.venv*" \
+  --exclude="${APP_BASE}/*/.venv*" \
+  --exclude="${APP_BASE}/.env" \
+  --exclude="${APP_BASE}/.env.*" \
+  --exclude="${APP_BASE}/dist" \
+  --exclude="${APP_BASE}/*/dist" \
   --exclude="${APP_BASE}/__pycache__" \
   --exclude="${APP_BASE}/.pytest_cache" \
   --exclude="${APP_BASE}/node_modules" \
+  --exclude="${APP_BASE}/*/node_modules" \
   --exclude="${APP_BASE}/detections_archive" \
   --exclude="${APP_BASE}/video" \
   --exclude="${APP_BASE}/models" \
@@ -230,6 +240,9 @@ tar \
   --exclude="${APP_BASE}/probes_store.json" \
   --exclude="${APP_BASE}/luxriot_summary_state.json" \
   --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
+  --exclude="${APP_BASE}/*.sqlite3" \
+  --exclude="${APP_BASE}/*.db" \
+  --exclude="${APP_BASE}/*.log" \
   -czf "${BACKUP_DIR}/code.tgz" \
   -C "${APP_PARENT}" "${APP_BASE}"
 ok "backed up current code"
