@@ -60,6 +60,9 @@ Scaffold for release notes; final prose to be assembled from commits
   another four-minute wait. System-mode media preflight cleans privileged
   OpenCV staging safely; the agent-context probe uses profile authentication
   and requires an explicit decision when the served context is unknown.
+  Adopt-upgrade config discovery now follows the active systemd
+  `EnvironmentFiles` contract and cross-checks selected agent/Luxriot endpoints
+  against `/ready`, instead of preferring a possibly stale application `.env`.
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
   See `readiness/RELEASE_NOTES_0.8.4.md`.
 

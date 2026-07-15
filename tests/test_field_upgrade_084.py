@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+import re
 from pathlib import Path
 
 
@@ -35,7 +36,21 @@ class FieldUpgradeGuideTests(unittest.TestCase):
         self.assertNotIn("EVA_MIGRATION_DATABASE_DSN", SCRIPT)
         self.assertIn('EXPECTED_SCHEMA="20260614_0006"', SCRIPT)
         self.assertIn("alembic_version", SCRIPT)
-        self.assertIn("не совпадает с ожидаемой", SCRIPT)
+        self.assertIn("does not match ${EXPECTED_SCHEMA}", SCRIPT)
+
+    def test_runtime_terminal_and_ui_sources_have_no_cyrillic_copy(self):
+        roots = [ROOT / "scripts", ROOT / "static", ROOT / "templates", ROOT / "react-ui"]
+        suffixes = {".sh", ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"}
+        cyrillic = re.compile(r"[\u0400-\u04ff]")
+        offenders = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if path.is_file() and path.suffix in suffixes:
+                    if cyrillic.search(path.read_text(encoding="utf-8", errors="ignore")):
+                        offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(offenders, [])
 
     def test_dry_run_and_confirmation_precede_apply(self):
         dry_run_at = SCRIPT.index("--dry-run --non-interactive --no-migrate")

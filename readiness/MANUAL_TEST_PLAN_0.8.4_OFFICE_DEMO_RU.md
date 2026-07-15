@@ -100,24 +100,28 @@ sudo sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:s
   | grep -E '^(EVA_DATABASE_DSN|EVOSSEARCH_DATABASE_DSN)$'
 ```
 
-Если команда ничего не вернула, updater правильно остановится на `NO_DSN`.
-Нужно найти фактический EnvironmentFile/service configuration вместе с
-разработчиком; нельзя копировать dev DSN или угадывать credentials на месте.
+Если команда ничего не вернула, updater сверит schema/role через `/ready`
+работающего runtime. При `postgresql.ok=true`, `runtime_role_ok=true` и revision
+`20260614_0006` этого достаточно для code-only adopt upgrade: база всё равно не
+изменяется. Если ни direct DSN query, ни active runtime gate не подтверждают
+schema, это STOP; нельзя копировать dev DSN или угадывать credentials на месте.
 
 ### 3.3 Обновление
 
 Запускать из распакованного bundle без `sudo`:
 
 ```bash
-sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256
-tar -xzf eva-ai-0.8.4-offline.tar.gz
-cd eva-ai-0.8.4-offline
+sha256sum -c eva-ai-0.8.4-r3-offline.tar.gz.sha256
+tar -xzf eva-ai-0.8.4-r3-offline.tar.gz
+cd eva-ai-0.8.4-r3-offline
 ./update.sh
 ```
 
 Ожидается:
 
 - `adopt-upgrade candidate: β 0.8.3 -> β 0.8.4`;
+- `Config source: systemd EnvironmentFiles` для production system service;
+- selected config совпадает с active runtime endpoints;
 - requirements unchanged;
 - schema already `20260614_0006`, database will not be changed;
 - backup path до копирования code;

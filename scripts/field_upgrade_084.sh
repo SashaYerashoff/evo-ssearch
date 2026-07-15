@@ -50,8 +50,8 @@ fail() { printf 'STOP: %s\n' "$*" >&2; }
 
 stop_and_call() {
   fail "$1"
-  printf '\nДальше НЕ продолжай. Позвони разработчику и продиктуй строку выше.\n' >&2
-  printf 'Диагностика для отправки: bash scripts/client_diagnostics.sh > diag.txt\n' >&2
+  printf '\nDo NOT continue. Call the responsible developer and read the STOP line above.\n' >&2
+  printf 'Diagnostics to send: bash scripts/client_diagnostics.sh > diag.txt\n' >&2
   exit 1
 }
 
@@ -62,7 +62,7 @@ BUNDLE_DIR="$(cd "${REPO_DIR}/.." && pwd)"
 say "EVA AI 0.8.4 guided upgrade"
 
 if [ "$(id -u)" -ne 0 ]; then
-  stop_and_call "запусти через sudo: sudo ./scripts/field_upgrade_084.sh"
+  stop_and_call "run with sudo: sudo ./scripts/field_upgrade_084.sh"
 fi
 for required_command in cmp curl find grep sed systemctl tee; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -72,7 +72,7 @@ done
 
 # 1. We must be inside an unpacked offline bundle, not a random checkout.
 if [ ! -f "${BUNDLE_DIR}/manifest.txt" ]; then
-  stop_and_call "manifest.txt не найден рядом с repo/ — это не распакованный bundle"
+  stop_and_call "manifest.txt was not found next to repo/; this is not an unpacked bundle"
 fi
 BUNDLE_VERSION="$(tr -d '\r\n' < "${REPO_DIR}/VERSION" 2>/dev/null || true)"
 MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
@@ -93,10 +93,10 @@ fi
 ok "bundle version: ${BUNDLE_VERSION}"
 
 if [ ! -f "${ENV_FILE}" ]; then
-  stop_and_call "env-файл не найден: ${ENV_FILE}"
+  stop_and_call "environment file not found: ${ENV_FILE}"
 fi
 if [ ! -x "${APP_DIR}/.venv/bin/python" ]; then
-  stop_and_call "нет исполняемого ${APP_DIR}/.venv/bin/python — adopt-апгрейд невозможен без venv"
+  stop_and_call "${APP_DIR}/.venv/bin/python is not executable; adopt upgrade requires the existing venv"
 fi
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
 if [ -z "${DEPLOYED_VERSION}" ]; then
@@ -146,14 +146,14 @@ chmod 700 "${EVIDENCE_DIR}"
 ok "evidence dir: ${EVIDENCE_DIR}"
 
 # 2. Pre-upgrade snapshot (best-effort, read-only).
-say "Снимок состояния до апгрейда"
+say "Pre-upgrade state snapshot"
 systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/pre_service_state.txt" 2>&1 || true
 curl -sS -m 10 "${BASE_URL}/health" > "${EVIDENCE_DIR}/pre_health.json" 2>&1 || true
 curl -sS -m 10 "${BASE_URL}/ready" > "${EVIDENCE_DIR}/pre_ready.json" 2>&1 || true
 ok "pre_service_state=$(cat "${EVIDENCE_DIR}/pre_service_state.txt" 2>/dev/null || echo unknown)"
 
 # 3. Read-only schema check with the runtime (non-DDL) login.
-say "Проверка версии схемы БД (только чтение)"
+say "Read-only database schema check"
 SCHEMA_VERSION="$("${APP_DIR}/.venv/bin/python" - "$ENV_FILE" <<'PYEOF' 2>>"${EVIDENCE_DIR}/schema_check.log"
 import re
 import os
@@ -199,21 +199,21 @@ PYEOF
 
 case "${SCHEMA_VERSION}" in
   "${EXPECTED_SCHEMA}")
-    ok "схема БД уже на ожидаемой голове ${EXPECTED_SCHEMA}; база данных изменяться НЕ будет (--no-migrate)"
+    ok "database schema is already ${EXPECTED_SCHEMA}; the database will NOT be changed (--no-migrate)"
     ;;
   NO_DSN)
-    stop_and_call "в env нет EVA_DATABASE_DSN — проверить версию схемы невозможно"
+    stop_and_call "EVA_DATABASE_DSN is absent from the environment file; schema cannot be verified"
     ;;
   ERROR:*)
-    stop_and_call "не удалось прочитать версию схемы (${SCHEMA_VERSION}); лог: ${EVIDENCE_DIR}/schema_check.log"
+    stop_and_call "schema could not be read (${SCHEMA_VERSION}); log: ${EVIDENCE_DIR}/schema_check.log"
     ;;
   *)
-    stop_and_call "схема БД '${SCHEMA_VERSION}' не совпадает с ожидаемой ${EXPECTED_SCHEMA}; миграцию выполняет ТОЛЬКО разработчик"
+    stop_and_call "database schema '${SCHEMA_VERSION}' does not match ${EXPECTED_SCHEMA}; ONLY the responsible developer may migrate it"
     ;;
 esac
 
 # 4. Installer dry-run must be fully green before anything changes.
-say "Пробный прогон инсталлера (dry-run, без изменений)"
+say "Installer dry-run (no changes)"
 set +e
 "${REPO_DIR}/scripts/install_eva_083.py" \
   --dry-run --non-interactive --no-migrate \
@@ -226,21 +226,21 @@ set +e
 DRY_STATUS=${PIPESTATUS[0]}
 set -e
 if [ "${DRY_STATUS}" -ne 0 ]; then
-  stop_and_call "dry-run заблокирован (см. строки FAIL выше и ${EVIDENCE_DIR}/dry_run.txt)"
+  stop_and_call "dry-run was blocked; see the FAIL lines above and ${EVIDENCE_DIR}/dry_run.txt"
 fi
-ok "dry-run чистый"
+ok "dry-run passed"
 
 # 5. One explicit confirmation, typed by a human.
-say "Подтверждение"
-printf 'Сервис %s будет остановлен и обновлён до %s. База данных не изменяется.\n' "${SERVICE_NAME}" "${BUNDLE_VERSION}"
-printf 'Набери слово UPGRADE и нажми Enter: '
+say "Confirmation"
+printf 'Service %s will be stopped and upgraded to %s. The database will not be changed.\n' "${SERVICE_NAME}" "${BUNDLE_VERSION}"
+printf 'Type UPGRADE and press Enter: '
 read -r CONFIRMATION
 if [ "${CONFIRMATION}" != "UPGRADE" ]; then
-  stop_and_call "подтверждение не получено — ничего не изменено"
+  stop_and_call "confirmation was not received; nothing was changed"
 fi
 
 # 6. Apply the reviewed plan.
-say "Применение (журнал: ${EVIDENCE_DIR}/apply.txt)"
+say "Applying update (log: ${EVIDENCE_DIR}/apply.txt)"
 set +e
 "${REPO_DIR}/scripts/install_eva_083.py" \
   --apply --non-interactive --no-migrate \
@@ -259,18 +259,18 @@ grep -Ei "^(ROLLBACK HANDOFF: |rollback_command=)" "${EVIDENCE_DIR}/apply.txt" \
   | sed -E 's/^ROLLBACK HANDOFF: //; s/^rollback_command=//' \
   > "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" 2>/dev/null || true
 if [ -s "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" ]; then
-  ok "команда отката сохранена: ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt"
+  ok "rollback command saved: ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt"
 fi
 
 if [ "${APPLY_STATUS}" -ne 0 ]; then
-  stop_and_call "apply завершился с ошибкой; журнал: ${EVIDENCE_DIR}/apply.txt"
+  stop_and_call "apply failed; log: ${EVIDENCE_DIR}/apply.txt"
 fi
 if [ ! -s "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" ]; then
-  stop_and_call "apply завершён, но rollback-команда не записана; журнал: ${EVIDENCE_DIR}/apply.txt"
+  stop_and_call "apply completed but no rollback command was recorded; log: ${EVIDENCE_DIR}/apply.txt"
 fi
 
 # 8. Post-upgrade verification.
-say "Проверка после апгрейда"
+say "Post-upgrade verification"
 sleep 5
 systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/post_service_state.txt" 2>&1 || true
 HEALTH_OK=false
@@ -303,22 +303,22 @@ systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/post_service_state.txt"
 POST_STATE="$(cat "${EVIDENCE_DIR}/post_service_state.txt" 2>/dev/null || echo unknown)"
 
 if [ "${POST_STATE}" != "active" ] || [ "${HEALTH_OK}" != "true" ]; then
-  fail "сервис не подтвердил здоровье (state=${POST_STATE})"
-  printf 'Откат: выполни команду из %s\n' "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" >&2
+  fail "service did not confirm readiness (state=${POST_STATE})"
+  printf 'Rollback: run the command stored in %s\n' "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" >&2
   exit 1
 fi
-ok "service=active, /health отвечает, /ready status=ready и version=${EXPECTED_VERSION}"
+ok "service=active, /health responds, /ready status=ready and version=${EXPECTED_VERSION}"
 printf '%s\n' "${MANIFEST_COMMIT}" > "${APP_DIR}/.eva-bundle-commit"
 ok "installed bundle marker: ${MANIFEST_COMMIT:0:7}"
 
-say "ГОТОВО"
+say "COMPLETE"
 cat <<DONE
-1. Открой UI и вкладку Video: каналы с включёнными summaries должны сами
-   подняться в течение ~2 минут (persisted desired state). Если канал не
-   поднялся — Channel Runtime покажет ошибку restore.
-2. Пройди smoke из readiness/UPGRADE_084_FIELD_CHECKLIST_RU.md (10 минут).
-3. Все журналы этого запуска: ${EVIDENCE_DIR}
-4. Если что-то не так: команда отката лежит в
-   ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt, диагностика -
-   bash scripts/client_diagnostics.sh > diag.txt (отправь файл).
+1. Open the UI and the Video tab. Channels with enabled summaries should
+   restore automatically within about two minutes. Channel Runtime shows any
+   restore failure.
+2. Run the smoke test in readiness/EVA_AI_0.8.4_R3_FIELD_UPDATE_EN.md.
+3. All logs from this run: ${EVIDENCE_DIR}
+4. If anything is wrong, the rollback command is stored in
+   ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt. Collect diagnostics with:
+   bash scripts/client_diagnostics.sh > diag.txt
 DONE

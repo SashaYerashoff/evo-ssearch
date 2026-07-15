@@ -91,6 +91,16 @@ background rollups, agent context/tool routing, and offline deployment.
 - The context probe sends the configured agent-profile API key when present. If
   `/models` is unreachable or does not expose a context value, installation
   requires a separate `FORCE-UNKNOWN-CONTEXT` decision before service stop.
+- System deployments discover the active configuration from the service's
+  `EnvironmentFiles` property before standard-path or application `.env`
+  fallbacks. The selected agent and Luxriot endpoints are cross-checked against
+  the running `/ready` identity, and the baseline service must be ready before
+  it is stopped. A runtime schema report can safely supply the read-only schema
+  gate when a deployment injects its DSN outside the selected file.
+- Field hotfix artifacts use a unique revisioned filename instead of replacing
+  another archive with the same name, preventing stale Google Drive/browser
+  cache entries and mixed extracted directories from passing the wrong
+  operator instructions.
 
 ## Offline Update
 
@@ -178,10 +188,11 @@ Use `readiness/MANUAL_TEST_PLAN_0.8.4_OFFICE_DEMO_RU.md`. The required focus is:
 - Previous `0.8.4` deterministic predeploy gate: 626 passed, 18 skipped, 134
   subtests passed.
 - Agent/updater hotfix targeted suite before this documentation pass: 141/141.
-- Final installer/agent/media regression selection: 229/229.
+- Final installer/agent/media regression selection after systemd discovery and
+  English-only runtime/UI enforcement: 234/234.
 - A real code-only snapshot of the current dev tree was 113 MB with no Git,
   local state, venv, env, dist, or node_modules members; the pre-fix emergency
   snapshot had grown to 3.9 GB before being interrupted.
-- The final clean candidate was rebuilt with bundled FFmpeg/OpenCV and repeated
-  the exact office `0.8.3` preflight through human confirmation. Its manifest
-  commit and SHA-256 are recorded in the operator handoff before deployment.
+- The revisioned `r3` candidate is built clean with bundled FFmpeg/OpenCV. Its
+  manifest commit and SHA-256 are recorded in the operator handoff before
+  deployment.

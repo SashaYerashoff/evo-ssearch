@@ -34,6 +34,24 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("user-systemd dev mode skips", SCRIPT)
         self.assertIn("Production installer dry-run", SCRIPT)
 
+    def test_config_is_discovered_from_active_systemd_unit_before_path_fallbacks(self):
+        discovery = SCRIPT.index("discover_systemd_env_file()")
+        environment_files = SCRIPT.index("-p EnvironmentFiles --value")
+        system_fallback = SCRIPT.index('path_is_file "/etc/eva-ai/eva-ai.env"')
+        app_fallback = SCRIPT.index('path_is_file "${APP_DIR}/.env"')
+        self.assertLess(discovery, environment_files)
+        self.assertLess(environment_files, system_fallback)
+        self.assertLess(system_fallback, app_fallback)
+        self.assertIn('ENV_FILE_SOURCE="systemd EnvironmentFiles"', SCRIPT)
+        self.assertIn("Config source:", SCRIPT)
+
+    def test_selected_config_is_cross_checked_with_active_runtime(self):
+        self.assertIn('"${BASE_URL}/ready"', SCRIPT)
+        self.assertIn("active runtime identity loaded from /ready", SCRIPT)
+        self.assertIn("selected config does not match the active runtime agent profile", SCRIPT)
+        self.assertIn("selected config does not match the active Luxriot endpoint", SCRIPT)
+        self.assertIn("active service reports ${ACTIVE_RUNTIME_VERSION}", SCRIPT)
+
     def test_adopt_update_never_migrates_or_dumps_database(self):
         self.assertIn("--no-migrate", SCRIPT)
         self.assertIn("--skip-pg-dump", SCRIPT)
@@ -68,6 +86,7 @@ class UpdateBundleTests(unittest.TestCase):
         confirmation_at = SCRIPT.index("Type UPDATE")
         self.assertLess(requirements_at, confirmation_at)
         self.assertLess(schema_at, confirmation_at)
+        self.assertIn("active runtime /ready (no DSN stored in selected file)", SCRIPT)
 
     def test_post_restart_wait_allows_slow_model_restore(self):
         self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
@@ -91,6 +110,7 @@ class UpdateBundleTests(unittest.TestCase):
         confirmation = SCRIPT.index("Type UPDATE")
         self.assertLess(unknown_prompt, confirmation)
         self.assertIn("unknown agent context declined; nothing was changed", SCRIPT)
+        self.assertIn("Agent context: UNVERIFIED", SCRIPT)
 
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')

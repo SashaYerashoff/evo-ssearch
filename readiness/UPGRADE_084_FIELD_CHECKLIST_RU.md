@@ -134,13 +134,13 @@ rollback-команда. Он использует те же schema/dependency g
 
 ```bash
 # 0. Дома: собрать и проверить bundle
-scripts/build_patch_bundle.sh --name eva-ai-0.8.4-offline
-(cd dist && sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256)
+scripts/build_patch_bundle.sh --name eva-ai-0.8.4-r3-offline
+(cd dist && sha256sum -c eva-ai-0.8.4-r3-offline.tar.gz.sha256)
 
 # 1. На хосте: ещё раз проверить файл после USB-копирования,
 #    затем распаковать и запустить основной updater БЕЗ sudo
-sha256sum -c eva-ai-0.8.4-offline.tar.gz.sha256
-tar xzf eva-ai-0.8.4-offline.tar.gz && cd eva-ai-0.8.4-offline
+sha256sum -c eva-ai-0.8.4-r3-offline.tar.gz.sha256
+tar xzf eva-ai-0.8.4-r3-offline.tar.gz && cd eva-ai-0.8.4-r3-offline
 ./update.sh
 
 # 2. Скрипт сам остановится на любой проблеме и скажет, что диктовать по

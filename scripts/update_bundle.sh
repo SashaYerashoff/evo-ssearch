@@ -9,6 +9,7 @@ EXPECTED_SCHEMA="20260614_0006"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
+ENV_FILE_SOURCE=""
 SERVICE_NAME=""
 BASE_URL=""
 BACKUP_ROOT=""
@@ -50,7 +51,7 @@ while [[ $# -gt 0 ]]; do
     --system) MODE="system"; shift ;;
     --service) SERVICE_NAME="${2%.service}"; shift 2 ;;
     --app-dir) APP_DIR="$2"; shift 2 ;;
-    --env-file) ENV_FILE="$2"; shift 2 ;;
+    --env-file) ENV_FILE="$2"; ENV_FILE_SOURCE="command line"; shift 2 ;;
     --base-url) BASE_URL="${2%/}"; shift 2 ;;
     --backup-root) BACKUP_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -160,15 +161,54 @@ systemctl_write() {
   fi
 }
 
+path_is_file() {
+  local path="$1"
+  if [[ -f "${path}" ]]; then
+    return 0
+  fi
+  if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
+    as_root test -f "${path}"
+  else
+    return 1
+  fi
+}
+
+discover_systemd_env_file() {
+  local raw candidate
+  raw="$(systemctl_read show "${SERVICE_NAME}.service" -p EnvironmentFiles --value 2>/dev/null || true)"
+  while IFS= read -r candidate; do
+    candidate="${candidate#-}"
+    candidate="${candidate#${candidate%%[![:space:]]*}}"
+    candidate="${candidate%${candidate##*[![:space:]]}}"
+    [[ -n "${candidate}" ]] || continue
+    if path_is_file "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done < <(
+    printf '%s\n' "${raw}" \
+      | sed -E 's/[[:space:]]+\(ignore_errors=(yes|no)\)/\n/g'
+  )
+  return 1
+}
+
 if [[ -z "${APP_DIR}" ]]; then
   APP_DIR="$(systemctl_read show "${SERVICE_NAME}.service" -p WorkingDirectory --value 2>/dev/null || true)"
   [[ -n "${APP_DIR}" ]] || APP_DIR="/opt/eva-ai/evo-ssearch"
 fi
 if [[ -z "${ENV_FILE}" ]]; then
-  if [[ -f "${APP_DIR}/.env" ]]; then
+  if discovered_env_file="$(discover_systemd_env_file)"; then
+    ENV_FILE="${discovered_env_file}"
+    ENV_FILE_SOURCE="systemd EnvironmentFiles"
+  elif path_is_file "/etc/eva-ai/eva-ai.env"; then
+    ENV_FILE="/etc/eva-ai/eva-ai.env"
+    ENV_FILE_SOURCE="standard system config"
+  elif path_is_file "${APP_DIR}/.env"; then
     ENV_FILE="${APP_DIR}/.env"
+    ENV_FILE_SOURCE="application fallback"
   else
     ENV_FILE="/etc/eva-ai/eva-ai.env"
+    ENV_FILE_SOURCE="unresolved fallback"
   fi
 fi
 UNIT_FILE="$(systemctl_read show "${SERVICE_NAME}.service" -p FragmentPath --value 2>/dev/null || true)"
@@ -182,7 +222,7 @@ fi
 
 read_env_value() {
   local key="$1"
-  local reader=(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "${ENV_FILE}")
+  local reader=(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" "${ENV_FILE}")
   local value
   if [[ -r "${ENV_FILE}" ]]; then
     value="$("${reader[@]}" | tail -n 1)"
@@ -221,10 +261,11 @@ printf 'Mode:       %s systemd\n' "${MODE}"
 printf 'Service:    %s.service\n' "${SERVICE_NAME}"
 printf 'Application: %s\n' "${APP_DIR}"
 printf 'Config:      %s\n' "${ENV_FILE}"
+printf 'Config source: %s\n' "${ENV_FILE_SOURCE:-preselected}"
 printf 'Health URL:  %s\n' "${BASE_URL}"
 
 [[ -d "${APP_DIR}" ]] || stop "application directory not found: ${APP_DIR}"
-[[ -f "${ENV_FILE}" ]] || stop "environment file not found: ${ENV_FILE}"
+path_is_file "${ENV_FILE}" || stop "environment file not found: ${ENV_FILE}"
 [[ -x "${APP_DIR}/.venv/bin/python" ]] || stop "existing .venv is missing; adopt upgrade is not possible"
 [[ -f "${SOURCE_DIR}/VERSION" ]] || stop "bundle VERSION is missing"
 [[ "$(tr -d '\r\n' < "${SOURCE_DIR}/VERSION")" == "${EXPECTED_VERSION}" ]] || stop "bundle VERSION is not ${EXPECTED_VERSION}"
@@ -335,6 +376,46 @@ raise SystemExit(0 if payload.get("version") == sys.argv[1] else 1)
 ' "${expected_version}"
 }
 
+ACTIVE_READY_BODY="$(mktemp)"
+if ! curl -skfS --max-time 8 "${BASE_URL}/ready" > "${ACTIVE_READY_BODY}" 2>/dev/null; then
+  rm -f "${ACTIVE_READY_BODY}"
+  stop "installed EVA /ready is unavailable; restore the existing service before upgrading"
+fi
+mapfile -t ACTIVE_RUNTIME_FACTS < <(target_python - "${ACTIVE_READY_BODY}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+checks = payload.get("checks") or {}
+postgres = checks.get("postgresql") or {}
+database = checks.get("database") or {}
+profiles = (checks.get("lm_profiles") or {}).get("profiles") or []
+agent = next((row for row in profiles if row.get("kind") == "agent" or row.get("id") == "agent"), {})
+luxriot = checks.get("luxriot") or {}
+db_gate_ok = bool(postgres.get("ok") and database.get("ok") and postgres.get("runtime_role_ok", True))
+print(str(payload.get("status") or ""))
+print(str(payload.get("version") or ""))
+print(str(postgres.get("current_revision") or ""))
+print("true" if db_gate_ok else "false")
+print(str(agent.get("base_url") or ""))
+print(str(luxriot.get("base_url") or ""))
+PY
+)
+rm -f "${ACTIVE_READY_BODY}"
+ACTIVE_RUNTIME_STATUS="${ACTIVE_RUNTIME_FACTS[0]:-}"
+ACTIVE_RUNTIME_VERSION="${ACTIVE_RUNTIME_FACTS[1]:-}"
+ACTIVE_RUNTIME_SCHEMA="${ACTIVE_RUNTIME_FACTS[2]:-}"
+ACTIVE_RUNTIME_DB_OK="${ACTIVE_RUNTIME_FACTS[3]:-false}"
+ACTIVE_RUNTIME_AGENT_BASE_URL="${ACTIVE_RUNTIME_FACTS[4]:-}"
+ACTIVE_RUNTIME_LUXRIOT_BASE_URL="${ACTIVE_RUNTIME_FACTS[5]:-}"
+ok "active runtime identity loaded from /ready (${ACTIVE_RUNTIME_VERSION:-unknown version})"
+[[ "${ACTIVE_RUNTIME_STATUS}" == "ready" ]] \
+  || stop "installed EVA reports ${ACTIVE_RUNTIME_STATUS:-unknown} before upgrade; restore readiness first"
+if [[ -n "${ACTIVE_RUNTIME_VERSION}" && "${ACTIVE_RUNTIME_VERSION}" != "${DEPLOYED_VERSION}" ]]; then
+  stop "active service reports ${ACTIVE_RUNTIME_VERSION}, but ${APP_DIR}/VERSION is ${DEPLOYED_VERSION}"
+fi
+
 EXPECTED_AGENT_CONTEXT=65536
 CONFIGURED_AGENT_CONTEXT="$(read_env_value EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS)"
 CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}"
@@ -342,10 +423,21 @@ SERVED_AGENT_CONTEXT="UNKNOWN"
 TEMPORARY_AGENT_CONTEXT=""
 CONTEXT_FORCE_REQUIRED=false
 CONTEXT_UNKNOWN_REQUIRED=false
+CONTEXT_UNKNOWN_ACCEPTED=false
 AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL)"
 [[ -n "${AGENT_LM_BASE_URL}" ]] || AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_BASE_URL)"
 AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_API_KEY)"
 [[ -n "${AGENT_LM_API_KEY}" ]] || AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_API_KEY)"
+LUXRIOT_BASE_URL="$(read_env_value EVOSSEARCH_LUXRIOT_BASE_URL)"
+if [[ -n "${ACTIVE_RUNTIME_AGENT_BASE_URL}" && -n "${AGENT_LM_BASE_URL}" \
+  && "${ACTIVE_RUNTIME_AGENT_BASE_URL%/}" != "${AGENT_LM_BASE_URL%/}" ]]; then
+  stop "selected config does not match the active runtime agent profile (${AGENT_LM_BASE_URL%/} != ${ACTIVE_RUNTIME_AGENT_BASE_URL%/})"
+fi
+if [[ -n "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL}" && -n "${LUXRIOT_BASE_URL}" \
+  && "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL%/}" != "${LUXRIOT_BASE_URL%/}" ]]; then
+  stop "selected config does not match the active Luxriot endpoint"
+fi
+ok "selected config matches the active runtime endpoints"
 if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
   CONTEXT_FORCE_REQUIRED=true
   TEMPORARY_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT}"
@@ -466,9 +558,15 @@ except Exception as exc:
 print(row[0] if row else "EMPTY")
 PY
 )"
+SCHEMA_SOURCE="direct read-only DSN query"
+if [[ "${SCHEMA_VERSION}" == "NO_DSN" && "${ACTIVE_RUNTIME_DB_OK}" == "true" \
+  && "${ACTIVE_RUNTIME_SCHEMA}" == "${EXPECTED_SCHEMA}" ]]; then
+  SCHEMA_VERSION="${ACTIVE_RUNTIME_SCHEMA}"
+  SCHEMA_SOURCE="active runtime /ready (no DSN stored in selected file)"
+fi
 [[ "${SCHEMA_VERSION}" == "${EXPECTED_SCHEMA}" ]] \
   || stop "database schema is ${SCHEMA_VERSION}; expected ${EXPECTED_SCHEMA}. No migration was attempted."
-ok "database schema is already ${EXPECTED_SCHEMA}; database will not be changed"
+ok "database schema is already ${EXPECTED_SCHEMA} via ${SCHEMA_SOURCE}; database will not be changed"
 
 DRY_RUN=(
   "${SOURCE_DIR}/scripts/install_eva_083.py"
@@ -507,6 +605,7 @@ if [[ "${CONTEXT_UNKNOWN_REQUIRED}" == true ]]; then
   read -r CONTEXT_UNKNOWN_DECISION
   [[ "${CONTEXT_UNKNOWN_DECISION}" == "FORCE-UNKNOWN-CONTEXT" ]] \
     || stop "unknown agent context declined; nothing was changed"
+  CONTEXT_UNKNOWN_ACCEPTED=true
   ok "operator explicitly accepted an unverified agent context"
 fi
 
@@ -800,8 +899,11 @@ if [[ -n "${TEMPORARY_AGENT_CONTEXT}" ]]; then
     "${TEMPORARY_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}"
   printf 'Next: raise LM Studio context, then set EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=%s and restart EVA.\n' \
     "${EXPECTED_AGENT_CONTEXT}"
+elif [[ "${CONTEXT_UNKNOWN_ACCEPTED}" == true ]]; then
+  printf 'Agent context: UNVERIFIED (operator accepted FORCE-UNKNOWN-CONTEXT)\n'
+  printf 'WARN: EVA is up, but agent LM availability/context still requires manual verification.\n'
 else
-  printf 'Agent context: %s tokens\n' "${EXPECTED_AGENT_CONTEXT}"
+  printf 'Agent context: %s tokens\n' "${SERVED_AGENT_CONTEXT}"
 fi
 if [[ "${MODE}" == "user" ]]; then
   LATEST_BACKUP="$(cat "${BACKUP_ROOT}/LATEST" 2>/dev/null || printf '%s' "${BACKUP_ROOT}")"
