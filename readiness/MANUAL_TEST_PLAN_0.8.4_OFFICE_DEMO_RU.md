@@ -138,6 +138,12 @@ schema gates до человеческого confirmation. Source-worktree `.env
 При `FORCE-CONTEXT` весь тест маркируется `degraded-context=<число>`. Любой
 другой ответ прекращает update до остановки сервиса.
 
+Если updater не может получить context из agent LM даже с настроенным profile
+API key, он просит отдельный `FORCE-UNKNOWN-CONTEXT`. Предпочтительно остановить
+update, поднять/исправить LM Studio и перезапустить preflight. Продолжать с
+`FORCE-UNKNOWN-CONTEXT` можно только если Иван независимо проверил context в
+LM Studio; это решение и фактическое число записываются в отчёт.
+
 После успеха перезагрузить страницу/Luxriot web tile с очисткой cache.
 
 Если updater сделал automatic rollback, сохранить весь terminal output. Строка

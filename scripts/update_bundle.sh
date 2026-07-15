@@ -294,6 +294,15 @@ target_python() {
   fi
 }
 
+remove_temp_path() {
+  local path="$1"
+  if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
+    as_root rm -rf -- "${path}"
+  else
+    rm -rf -- "${path}"
+  fi
+}
+
 ready_json_matches_version() {
   local expected_version="$1"
   target_python -c '
@@ -332,15 +341,23 @@ CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}
 SERVED_AGENT_CONTEXT="UNKNOWN"
 TEMPORARY_AGENT_CONTEXT=""
 CONTEXT_FORCE_REQUIRED=false
+CONTEXT_UNKNOWN_REQUIRED=false
 AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL)"
 [[ -n "${AGENT_LM_BASE_URL}" ]] || AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_BASE_URL)"
+AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_API_KEY)"
+[[ -n "${AGENT_LM_API_KEY}" ]] || AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_API_KEY)"
 if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
   CONTEXT_FORCE_REQUIRED=true
   TEMPORARY_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT}"
 fi
 if [[ -n "${AGENT_LM_BASE_URL}" ]]; then
   AGENT_MODELS_BODY="$(mktemp)"
-  if curl -fsS --max-time 5 "${AGENT_LM_BASE_URL%/}/models" > "${AGENT_MODELS_BODY}" 2>/dev/null; then
+  AGENT_MODELS_CURL=(curl -fsS --max-time 5)
+  if [[ -n "${AGENT_LM_API_KEY}" ]]; then
+    AGENT_MODELS_CURL+=(-H "Authorization: Bearer ${AGENT_LM_API_KEY}")
+  fi
+  AGENT_MODELS_CURL+=("${AGENT_LM_BASE_URL%/}/models")
+  if "${AGENT_MODELS_CURL[@]}" > "${AGENT_MODELS_BODY}" 2>/dev/null; then
     SERVED_AGENT_CONTEXT="$(target_python - "${AGENT_MODELS_BODY}" <<'PY'
 import json
 import sys
@@ -364,10 +381,12 @@ PY
     elif [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]]; then
       ok "agent inference context is ${SERVED_AGENT_CONTEXT} (required: ${EXPECTED_AGENT_CONTEXT})"
     else
+      CONTEXT_UNKNOWN_REQUIRED=true
       printf 'WARN: agent inference server did not report n_ctx/max_model_len; verify it is at least %s.\n' \
         "${EXPECTED_AGENT_CONTEXT}" >&2
     fi
   else
+    CONTEXT_UNKNOWN_REQUIRED=true
     printf 'WARN: could not read agent inference context from %s/models.\n' "${AGENT_LM_BASE_URL%/}" >&2
   fi
   rm -f "${AGENT_MODELS_BODY}"
@@ -391,7 +410,7 @@ mapfile -t OPENCV_WHEELS < <(find "${BUNDLE_DIR}/runtime/opencv" -maxdepth 1 -ty
 [[ "${#OPENCV_WHEELS[@]}" -eq 1 ]] || stop "expected exactly one bundled OpenCV wheel"
 CV_PAYLOAD_TEST_DIR="$(mktemp -d)"
 if ! target_python -m zipfile -e "${OPENCV_WHEELS[0]}" "${CV_PAYLOAD_TEST_DIR}"; then
-  rm -rf "${CV_PAYLOAD_TEST_DIR}"
+  remove_temp_path "${CV_PAYLOAD_TEST_DIR}"
   stop "bundled OpenCV wheel could not be unpacked"
 fi
 if ! target_python - "${CV_PAYLOAD_TEST_DIR}" <<'PY'
@@ -403,10 +422,10 @@ image = np.zeros((8, 8, 3), dtype=np.uint8)
 assert cv2.cvtColor(image, cv2.COLOR_BGR2RGB).shape == (8, 8, 3)
 PY
 then
-  rm -rf "${CV_PAYLOAD_TEST_DIR}"
+  remove_temp_path "${CV_PAYLOAD_TEST_DIR}"
   stop "bundled OpenCV wheel is incompatible with the target Python/OS"
 fi
-rm -rf "${CV_PAYLOAD_TEST_DIR}"
+remove_temp_path "${CV_PAYLOAD_TEST_DIR}"
 ok "bundled OpenCV rescue payload is compatible"
 
 SCHEMA_VERSION="$(target_python - "${ENV_FILE}" <<'PY'
@@ -476,6 +495,19 @@ else
   else
     "${DRY_RUN[@]}" || stop "installer dry-run failed"
   fi
+fi
+
+if [[ "${CONTEXT_UNKNOWN_REQUIRED}" == true ]]; then
+  say "Agent context verification decision"
+  printf 'WARN: the updater could not verify the context served by the agent LM.\n' >&2
+  printf 'Configured in EVA: %s tokens\n' "${CONFIGURED_AGENT_CONTEXT}" >&2
+  printf 'Required for this release: %s tokens\n' "${EXPECTED_AGENT_CONTEXT}" >&2
+  printf 'Start/fix the agent LM and rerun when possible. To accept the unknown context explicitly,\n' >&2
+  printf 'type FORCE-UNKNOWN-CONTEXT; anything else aborts before service stop: '
+  read -r CONTEXT_UNKNOWN_DECISION
+  [[ "${CONTEXT_UNKNOWN_DECISION}" == "FORCE-UNKNOWN-CONTEXT" ]] \
+    || stop "unknown agent context declined; nothing was changed"
+  ok "operator explicitly accepted an unverified agent context"
 fi
 
 if [[ "${CONTEXT_FORCE_REQUIRED}" == true ]]; then

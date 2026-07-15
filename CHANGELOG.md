@@ -57,7 +57,9 @@ Scaffold for release notes; final prose to be assembled from commits
   by commit marker. Code/rollback snapshots now exclude nested private/runtime
   trees, legacy absolute venv links are safely ignored during restore, and an
   automatically restored service reports external readiness degradation without
-  another four-minute wait.
+  another four-minute wait. System-mode media preflight cleans privileged
+  OpenCV staging safely; the agent-context probe uses profile authentication
+  and requires an explicit decision when the served context is unknown.
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
   See `readiness/RELEASE_NOTES_0.8.4.md`.
 

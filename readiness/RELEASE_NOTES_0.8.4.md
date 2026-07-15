@@ -88,6 +88,9 @@ background rollups, agent context/tool routing, and offline deployment.
 - The updater reads the context reported by the agent endpoint. An operator can
   explicitly `FORCE-CONTEXT` when LM Studio is shorter; EVA is then temporarily
   capped to the actual compatible value and the result is marked degraded.
+- The context probe sends the configured agent-profile API key when present. If
+  `/models` is unreachable or does not expose a context value, installation
+  requires a separate `FORCE-UNKNOWN-CONTEXT` decision before service stop.
 
 ## Offline Update
 

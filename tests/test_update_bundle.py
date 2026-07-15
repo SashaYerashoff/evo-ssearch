@@ -83,6 +83,15 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("TEMPORARY FORCED CAP", SCRIPT)
         self.assertIn("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}", SCRIPT)
 
+    def test_agent_context_probe_uses_profile_auth_and_unknown_requires_confirmation(self):
+        self.assertIn("EVOSSEARCH_LM_PROFILE_AGENT_API_KEY", SCRIPT)
+        self.assertIn("EVOSSEARCH_LM_API_KEY", SCRIPT)
+        self.assertIn('Authorization: Bearer ${AGENT_LM_API_KEY}', SCRIPT)
+        unknown_prompt = SCRIPT.index("FORCE-UNKNOWN-CONTEXT")
+        confirmation = SCRIPT.index("Type UPDATE")
+        self.assertLess(unknown_prompt, confirmation)
+        self.assertIn("unknown agent context declined; nothing was changed", SCRIPT)
+
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')
         confirmation = SCRIPT.index("Type UPDATE")
@@ -104,6 +113,15 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("bundled OpenCV wheel is incompatible", SCRIPT)
         self.assertIn("--ffmpeg-archive FILE", BUILD_SCRIPT)
         self.assertIn("--opencv-wheel FILE", BUILD_SCRIPT)
+
+    def test_system_opencv_preflight_removes_root_owned_temp_payload_as_root(self):
+        helper = SCRIPT.index("remove_temp_path()")
+        payload = SCRIPT.index('CV_PAYLOAD_TEST_DIR="$(mktemp -d)"')
+        confirmation = SCRIPT.index("Type UPDATE")
+        self.assertLess(helper, payload)
+        self.assertLess(payload, confirmation)
+        self.assertIn('as_root rm -rf -- "${path}"', SCRIPT)
+        self.assertEqual(SCRIPT.count('remove_temp_path "${CV_PAYLOAD_TEST_DIR}"'), 3)
 
     def test_post_stop_failure_arms_automatic_rollback(self):
         stop_service = SCRIPT.index('systemctl_write stop "${SERVICE_NAME}.service"')
