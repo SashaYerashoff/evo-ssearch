@@ -57,6 +57,17 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn(".eva-bundle-commit", SCRIPT)
         self.assertIn("this exact ${EXPECTED_VERSION} bundle is already installed", SCRIPT)
 
+    def test_adopt_compatibility_is_schema_and_dependency_gated_not_version_allowlisted(self):
+        self.assertIn("adopt-upgrade candidate", SCRIPT)
+        self.assertIn("Compatibility is determined by the exact requirements and read-only schema gates", SCRIPT)
+        self.assertNotIn('"β 0.8.0"|"β 0.8.1"', SCRIPT)
+        self.assertNotIn("unsupported installed version", SCRIPT)
+        requirements_at = SCRIPT.index("for requirements_file in requirements.txt requirements-db.txt")
+        schema_at = SCRIPT.index('SCHEMA_VERSION="$(target_python')
+        confirmation_at = SCRIPT.index("Type UPDATE")
+        self.assertLess(requirements_at, confirmation_at)
+        self.assertLess(schema_at, confirmation_at)
+
     def test_post_restart_wait_allows_slow_model_restore(self):
         self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)

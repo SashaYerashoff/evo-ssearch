@@ -51,7 +51,12 @@ Scaffold for release notes; final prose to be assembled from commits
   field upgrade script (`scripts/field_upgrade_084.sh`) with a read-only
   schema gate, dry-run-then-confirm flow, and recorded rollback command
   (`readiness/UPGRADE_084_FIELD_CHECKLIST_RU.md`).
+- **Compatible adopt upgrades:** deployed versions are no longer allowlisted;
+  any non-empty post-schema build can proceed when exact requirements, healthy
+  venv, and read-only schema-head gates pass. Exact bundle reruns remain blocked
+  by commit marker.
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
+  See `readiness/RELEASE_NOTES_0.8.4.md`.
 
 ## β 0.8.3 — 2026-07-02 (road-event and live-signal stabilization)
 

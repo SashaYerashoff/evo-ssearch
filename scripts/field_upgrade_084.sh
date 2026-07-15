@@ -77,6 +77,7 @@ fi
 BUNDLE_VERSION="$(tr -d '\r\n' < "${REPO_DIR}/VERSION" 2>/dev/null || true)"
 MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MANIFEST_TREE_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+MANIFEST_COMMIT="$(sed -n 's/^git_commit=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 if [ "${BUNDLE_VERSION}" != "${EXPECTED_VERSION}" ]; then
   stop_and_call "bundle VERSION='${BUNDLE_VERSION:-missing}', expected '${EXPECTED_VERSION}'"
 fi
@@ -85,6 +86,9 @@ if [ "${MANIFEST_VERSION}" != "${EXPECTED_VERSION}" ]; then
 fi
 if [ "${MANIFEST_TREE_STATUS}" != "clean" ]; then
   stop_and_call "bundle was built from a ${MANIFEST_TREE_STATUS:-unknown} working tree; release bundle must be clean"
+fi
+if ! [[ "${MANIFEST_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+  stop_and_call "manifest git_commit is missing or invalid"
 fi
 ok "bundle version: ${BUNDLE_VERSION}"
 
@@ -95,21 +99,24 @@ if [ ! -x "${APP_DIR}/.venv/bin/python" ]; then
   stop_and_call "нет исполняемого ${APP_DIR}/.venv/bin/python — adopt-апгрейд невозможен без venv"
 fi
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
-case "${DEPLOYED_VERSION}" in
-  "β 0.8.0"|"β 0.8.1")
-    ok "supported deployed version: ${DEPLOYED_VERSION}"
-    ;;
-  "${EXPECTED_VERSION}")
-    stop_and_call "${EXPECTED_VERSION} is already installed; do not rerun the field upgrade"
-    ;;
-  *)
-    stop_and_call "unsupported deployed VERSION='${DEPLOYED_VERSION:-missing}'; expected β 0.8.0 or β 0.8.1"
-    ;;
-esac
+if [ -z "${DEPLOYED_VERSION}" ]; then
+  stop_and_call "deployed VERSION is missing; rollback verification would be ambiguous"
+fi
+INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit" 2>/dev/null || true)"
+if [ "${INSTALLED_BUNDLE_COMMIT}" = "${MANIFEST_COMMIT}" ]; then
+  stop_and_call "this exact ${EXPECTED_VERSION} bundle is already installed (${MANIFEST_COMMIT:0:7})"
+fi
+if [ "${DEPLOYED_VERSION}" = "${EXPECTED_VERSION}" ]; then
+  ok "same-version hotfix candidate: ${INSTALLED_BUNDLE_COMMIT:0:7} -> ${MANIFEST_COMMIT:0:7}"
+else
+  ok "adopt-upgrade candidate: ${DEPLOYED_VERSION} -> ${EXPECTED_VERSION}"
+  printf 'Compatibility will be decided by exact requirements and schema gates.\n'
+fi
 
-# 0.8.1 -> 0.8.4 is dependency-neutral.  Without a usable wheelhouse, prove
-# that the deployed dependency declarations are byte-identical before reusing
-# its venv (an empty wheelhouse directory does not bypass this gate).
+# A post-schema -> 0.8.4 adopt upgrade is dependency-neutral only when the
+# declarations prove it. Without a usable wheelhouse, require byte-identical
+# dependency declarations before reusing the existing venv (an empty
+# wheelhouse directory does not bypass this gate).
 WHEELHOUSE_ARTIFACT="$(find "${BUNDLE_DIR}/wheelhouse" -maxdepth 1 -type f \
   \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) -print -quit 2>/dev/null || true)"
 if [ -z "${WHEELHOUSE_ARTIFACT}" ]; then
@@ -269,9 +276,26 @@ systemctl is-active "${SERVICE_NAME}" > "${EVIDENCE_DIR}/post_service_state.txt"
 HEALTH_OK=false
 for _attempt in 1 2 3 4 5 6 7 8 9; do
   if curl -fsS -m 10 "${BASE_URL}/health" > "${EVIDENCE_DIR}/post_health.json" 2>/dev/null \
-     && curl -fsS -m 10 "${BASE_URL}/ready" > "${EVIDENCE_DIR}/post_ready.json" 2>/dev/null; then
-    HEALTH_OK=true
-    break
+     && curl -fsS -m 10 "${BASE_URL}/ready?load=1" > "${EVIDENCE_DIR}/post_ready.json" 2>/dev/null; then
+    if "${APP_DIR}/.venv/bin/python" - "${EXPECTED_VERSION}" "${EVIDENCE_DIR}/post_ready.json" <<'PYEOF'
+import json
+import sys
+
+try:
+    with open(sys.argv[2], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if payload.get("status") == "ready" and payload.get("version") == sys.argv[1]
+    else 1
+)
+PYEOF
+    then
+      HEALTH_OK=true
+      break
+    fi
   fi
   sleep 10
 done
@@ -283,7 +307,9 @@ if [ "${POST_STATE}" != "active" ] || [ "${HEALTH_OK}" != "true" ]; then
   printf 'Откат: выполни команду из %s\n' "${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt" >&2
   exit 1
 fi
-ok "service=active, /health и /ready отвечают"
+ok "service=active, /health отвечает, /ready status=ready и version=${EXPECTED_VERSION}"
+printf '%s\n' "${MANIFEST_COMMIT}" > "${APP_DIR}/.eva-bundle-commit"
+ok "installed bundle marker: ${MANIFEST_COMMIT:0:7}"
 
 say "ГОТОВО"
 cat <<DONE

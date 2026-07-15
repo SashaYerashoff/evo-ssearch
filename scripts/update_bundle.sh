@@ -254,21 +254,21 @@ MEDIA_PLATFORM="$(sed -n 's/^media_runtime_platform=//p' "${BUNDLE_DIR}/manifest
 ok "offline FFmpeg/ffprobe payload is intact and executable"
 
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
-case "${DEPLOYED_VERSION}" in
-  "β 0.8.0"|"β 0.8.1") ok "supported installed version: ${DEPLOYED_VERSION}" ;;
-  "${EXPECTED_VERSION}")
-    INSTALLED_BUNDLE_COMMIT=""
-    if [[ -f "${APP_DIR}/.eva-bundle-commit" ]]; then
-      INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit")"
-    fi
-    if [[ "${INSTALLED_BUNDLE_COMMIT}" == "${BUNDLE_COMMIT}" ]]; then
-      stop "this exact ${EXPECTED_VERSION} bundle is already installed (${BUNDLE_COMMIT:0:7})"
-    fi
-    INSTALLED_BUNDLE_LABEL="${INSTALLED_BUNDLE_COMMIT:0:7}"
-    ok "same-version hotfix: ${INSTALLED_BUNDLE_LABEL:-unmarked} -> ${BUNDLE_COMMIT:0:7}"
-    ;;
-  *) stop "unsupported installed version: ${DEPLOYED_VERSION:-missing}" ;;
-esac
+[[ -n "${DEPLOYED_VERSION}" ]] || stop "installed VERSION is missing; cannot create a verifiable rollback handoff"
+INSTALLED_BUNDLE_COMMIT=""
+if [[ -f "${APP_DIR}/.eva-bundle-commit" ]]; then
+  INSTALLED_BUNDLE_COMMIT="$(tr -d '\r\n' < "${APP_DIR}/.eva-bundle-commit")"
+fi
+if [[ "${INSTALLED_BUNDLE_COMMIT}" == "${BUNDLE_COMMIT}" ]]; then
+  stop "this exact ${EXPECTED_VERSION} bundle is already installed (${BUNDLE_COMMIT:0:7})"
+fi
+if [[ "${DEPLOYED_VERSION}" == "${EXPECTED_VERSION}" ]]; then
+  INSTALLED_BUNDLE_LABEL="${INSTALLED_BUNDLE_COMMIT:0:7}"
+  ok "same-version hotfix: ${INSTALLED_BUNDLE_LABEL:-unmarked} -> ${BUNDLE_COMMIT:0:7}"
+else
+  ok "adopt-upgrade candidate: ${DEPLOYED_VERSION} -> ${EXPECTED_VERSION}"
+  printf '      Compatibility is determined by the exact requirements and read-only schema gates below.\n'
+fi
 
 for requirements_file in requirements.txt requirements-db.txt; do
   [[ -f "${APP_DIR}/${requirements_file}" ]] || stop "installed ${requirements_file} is missing"
