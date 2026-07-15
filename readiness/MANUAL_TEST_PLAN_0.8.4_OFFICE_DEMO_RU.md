@@ -111,9 +111,9 @@ schema, это STOP; нельзя копировать dev DSN или угады
 Запускать из распакованного bundle без `sudo`:
 
 ```bash
-sha256sum -c eva-ai-0.8.4-r3-offline.tar.gz.sha256
-tar -xzf eva-ai-0.8.4-r3-offline.tar.gz
-cd eva-ai-0.8.4-r3-offline
+sha256sum -c eva-ai-0.8.4-r4-offline.tar.gz.sha256
+tar -xzf eva-ai-0.8.4-r4-offline.tar.gz
+cd eva-ai-0.8.4-r4-offline
 ./update.sh
 ```
 

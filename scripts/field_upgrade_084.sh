@@ -316,7 +316,7 @@ cat <<DONE
 1. Open the UI and the Video tab. Channels with enabled summaries should
    restore automatically within about two minutes. Channel Runtime shows any
    restore failure.
-2. Run the smoke test in readiness/EVA_AI_0.8.4_R3_FIELD_UPDATE_EN.md.
+2. Run the smoke test in readiness/EVA_AI_0.8.4_R4_FIELD_UPDATE_EN.md.
 3. All logs from this run: ${EVIDENCE_DIR}
 4. If anything is wrong, the rollback command is stored in
    ${EVIDENCE_DIR}/ROLLBACK_COMMAND.txt. Collect diagnostics with:

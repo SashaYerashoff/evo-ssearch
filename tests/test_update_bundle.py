@@ -51,6 +51,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("selected config does not match the active runtime agent profile", SCRIPT)
         self.assertIn("selected config does not match the active Luxriot endpoint", SCRIPT)
         self.assertIn("active service reports ${ACTIVE_RUNTIME_VERSION}", SCRIPT)
+        self.assertIn("--verified-adopt-existing-config", SCRIPT)
 
     def test_adopt_update_never_migrates_or_dumps_database(self):
         self.assertIn("--no-migrate", SCRIPT)

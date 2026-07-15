@@ -571,6 +571,7 @@ ok "database schema is already ${EXPECTED_SCHEMA} via ${SCHEMA_SOURCE}; database
 DRY_RUN=(
   "${SOURCE_DIR}/scripts/install_eva_083.py"
   --dry-run --non-interactive --no-migrate --no-start --no-verify
+  --verified-adopt-existing-config
   --source-dir "${SOURCE_DIR}"
   --bundle-dir "${BUNDLE_DIR}"
   --app-dir "${APP_DIR}"

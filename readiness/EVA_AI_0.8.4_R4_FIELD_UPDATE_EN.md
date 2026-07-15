@@ -1,4 +1,4 @@
-# EVA AI β 0.8.4-r3 offline field update
+# EVA AI β 0.8.4-r4 offline field update
 
 Use this guide for an existing EVA AI installation whose database is already at
 schema `20260614_0006`. The update is code-only: it does not migrate or replace
@@ -9,8 +9,8 @@ existing Python environment.
 
 Copy both files. Do not rename either one:
 
-- `eva-ai-0.8.4-r3-offline.tar.gz`
-- `eva-ai-0.8.4-r3-offline.tar.gz.sha256`
+- `eva-ai-0.8.4-r4-offline.tar.gz`
+- `eva-ai-0.8.4-r4-offline.tar.gz.sha256`
 
 Do not reuse an older archive named only `eva-ai-0.8.4-offline.tar.gz`.
 
@@ -34,13 +34,13 @@ Open a terminal as the normal site user, not as root. Replace `/media/USB` with
 the actual USB mount path:
 
 ```bash
-mkdir -p ~/eva-ai-update-r3
-cp /media/USB/eva-ai-0.8.4-r3-offline.tar.gz ~/eva-ai-update-r3/
-cp /media/USB/eva-ai-0.8.4-r3-offline.tar.gz.sha256 ~/eva-ai-update-r3/
-cd ~/eva-ai-update-r3
-sha256sum -c eva-ai-0.8.4-r3-offline.tar.gz.sha256
-tar -xzf eva-ai-0.8.4-r3-offline.tar.gz
-cd eva-ai-0.8.4-r3-offline
+mkdir -p ~/eva-ai-update-r4
+cp /media/USB/eva-ai-0.8.4-r4-offline.tar.gz ~/eva-ai-update-r4/
+cp /media/USB/eva-ai-0.8.4-r4-offline.tar.gz.sha256 ~/eva-ai-update-r4/
+cd ~/eva-ai-update-r4
+sha256sum -c eva-ai-0.8.4-r4-offline.tar.gz.sha256
+tar -xzf eva-ai-0.8.4-r4-offline.tar.gz
+cd eva-ai-0.8.4-r4-offline
 ./update.sh
 ```
 

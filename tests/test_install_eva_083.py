@@ -462,6 +462,63 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             )
             self.assertNotIn("changeme", stdout.getvalue().lower())
 
+    def test_verified_code_only_adopt_warns_but_does_not_block_existing_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            placeholder_env = dict(COMPLETE_ENV)
+            placeholder_env["EVOSSEARCH_LUXRIOT_PASSWORD"] = "changeme"
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(placeholder_env), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            (options.app_dir / "VERSION").write_text("β 0.8.3\n", encoding="utf-8")
+            options.adopt_existing_config = True
+
+            prepared = installer.prepare_install(options, environ={})
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+            warnings = [finding.message for finding in prepared.findings if finding.level == "WARN"]
+
+            self.assertNotIn(
+                "EVOSSEARCH_LUXRIOT_PASSWORD contains an obvious placeholder value",
+                failures,
+            )
+            self.assertIn(
+                "EVOSSEARCH_LUXRIOT_PASSWORD looks like a placeholder but is preserved by verified code-only adopt",
+                warnings,
+            )
+
+    def test_verified_adopt_does_not_weaken_fresh_install_or_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            placeholder_env = dict(COMPLETE_ENV)
+            placeholder_env["EVOSSEARCH_LUXRIOT_PASSWORD"] = "changeme"
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(placeholder_env), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            options.adopt_existing_config = True
+
+            prepared = installer.prepare_install(options, environ={})
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+            self.assertIn(
+                "EVOSSEARCH_LUXRIOT_PASSWORD contains an obvious placeholder value",
+                failures,
+            )
+
+            (options.app_dir / "VERSION").write_text("β 0.8.3\n", encoding="utf-8")
+            options.migrate = True
+            prepared = installer.prepare_install(
+                options,
+                environ={
+                    "EVA_INSTALL_MIGRATION_DSN": "postgresql://migrator:secret@db.internal/eva",
+                },
+            )
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+            self.assertIn(
+                "EVOSSEARCH_LUXRIOT_PASSWORD contains an obvious placeholder value",
+                failures,
+            )
+
     def test_plan_reuses_existing_patch_migration_verify_and_rollback_mechanisms(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

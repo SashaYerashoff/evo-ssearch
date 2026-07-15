@@ -63,6 +63,9 @@ Scaffold for release notes; final prose to be assembled from commits
   Adopt-upgrade config discovery now follows the active systemd
   `EnvironmentFiles` contract and cross-checks selected agent/Luxriot endpoints
   against `/ready`, instead of preferring a possibly stale application `.env`.
+  A verified code-only adopt preserves an already-running configuration and
+  reports placeholder-like existing values as warnings; fresh installs and
+  migrations keep the strict placeholder failure policy.
 - Schema head: `20260614_0006` (unchanged from 0.8.3 unless noted before tag).
   See `readiness/RELEASE_NOTES_0.8.4.md`.
 

@@ -126,6 +126,7 @@ class InstallerOptions:
     migrate: bool
     start: bool
     verify: bool
+    adopt_existing_config: bool = False
 
 
 @dataclass
@@ -684,10 +685,23 @@ def collect_preflight(
             and key.endswith("_MODEL")
         )
     )
+    verified_adopt = bool(
+        options.adopt_existing_config
+        and not options.migrate
+        and resolution.source is not None
+        and resolution.source.resolve(strict=False) == resolution.target.resolve(strict=False)
+        and (options.app_dir / "VERSION").is_file()
+    )
     for key in sorted(placeholder_keys):
         value = str(values.get(key) or "").strip()
         if value and _looks_like_placeholder(key, value):
-            add("FAIL", f"{key} contains an obvious placeholder value")
+            if verified_adopt:
+                add(
+                    "WARN",
+                    f"{key} looks like a placeholder but is preserved by verified code-only adopt",
+                )
+            else:
+                add("FAIL", f"{key} contains an obvious placeholder value")
 
     if options.migrate and migration_dsn:
         if not _valid_postgres_dsn(migration_dsn):
@@ -1208,6 +1222,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly skip Alembic migration (not recommended).",
     )
+    parser.add_argument(
+        "--verified-adopt-existing-config",
+        action="store_true",
+        help=(
+            "Preserve an existing running deployment's config and downgrade only "
+            "placeholder-like values to warnings. Requires an in-place env, installed "
+            "VERSION, and --no-migrate; intended for a live-verified orchestrator."
+        ),
+    )
     parser.add_argument("--no-start", action="store_true", help="Install but leave the service stopped.")
     parser.add_argument("--no-verify", action="store_true", help="Skip post-start /health and /ready checks.")
     return parser
@@ -1238,6 +1261,7 @@ def _options(args: argparse.Namespace) -> InstallerOptions:
         migrate=not bool(args.no_migrate),
         start=not bool(args.no_start),
         verify=not bool(args.no_verify) and not bool(args.no_start),
+        adopt_existing_config=bool(args.verified_adopt_existing_config),
     )
 
 

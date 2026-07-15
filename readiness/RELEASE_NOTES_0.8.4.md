@@ -97,6 +97,11 @@ background rollups, agent context/tool routing, and offline deployment.
   the running `/ready` identity, and the baseline service must be ready before
   it is stopped. A runtime schema report can safely supply the read-only schema
   gate when a deployment injects its DSN outside the selected file.
+- After that live identity/readiness verification, the code-only orchestrator
+  may adopt an in-place existing config whose value merely resembles a
+  placeholder; it emits a warning and preserves the value. Fresh installs,
+  migrations, missing installed VERSION, and non-in-place configs retain the
+  strict placeholder failure.
 - Field hotfix artifacts use a unique revisioned filename instead of replacing
   another archive with the same name, preventing stale Google Drive/browser
   cache entries and mixed extracted directories from passing the wrong
@@ -188,11 +193,11 @@ Use `readiness/MANUAL_TEST_PLAN_0.8.4_OFFICE_DEMO_RU.md`. The required focus is:
 - Previous `0.8.4` deterministic predeploy gate: 626 passed, 18 skipped, 134
   subtests passed.
 - Agent/updater hotfix targeted suite before this documentation pass: 141/141.
-- Final installer/agent/media regression selection after systemd discovery and
-  English-only runtime/UI enforcement: 234/234.
+- Final installer/agent/media regression selection after systemd discovery,
+  verified-config adoption, and English-only runtime/UI enforcement: 236/236.
 - A real code-only snapshot of the current dev tree was 113 MB with no Git,
   local state, venv, env, dist, or node_modules members; the pre-fix emergency
   snapshot had grown to 3.9 GB before being interrupted.
-- The revisioned `r3` candidate is built clean with bundled FFmpeg/OpenCV. Its
+- The revisioned `r4` candidate is built clean with bundled FFmpeg/OpenCV. Its
   manifest commit and SHA-256 are recorded in the operator handoff before
   deployment.
