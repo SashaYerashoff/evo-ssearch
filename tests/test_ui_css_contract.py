@@ -545,7 +545,7 @@ def test_archive_media_loops_the_complete_description_batch():
     assert "Math.ceil(batchSpanMs / 1000) + 1" in JS
     assert "Math.min(15, Math.ceil(batchSpanMs / 1000) + 1)" in JS
     assert "params.set('duration_sec'" in JS
-    assert "durationSec * 3000 + 15000" in JS
+    assert "Math.min(120000, durationSec * 4000 + 30000)" in JS
     assert "function fetchLuxriotMediaBlob" in JS
     assert "URL.createObjectURL(negotiated.blob)" in JS
     assert "URL.revokeObjectURL(archiveMediaObjectUrl)" in JS
