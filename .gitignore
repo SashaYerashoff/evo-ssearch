@@ -55,6 +55,8 @@ Thumbs.db
 # Project specific
 *.log
 *.tmp
+.eva-bundle-commit
+.eva-runtime/
 .clip_index/
 probes_store.json
 luxriot_rollups_cache.json
