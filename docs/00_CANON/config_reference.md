@@ -99,6 +99,20 @@ flow with a secret-safe direct-Digest fallback. When summaries are running, the 
 defaults to the shared `/luxriot/attention_stream/<channel>` model view so operator
 preview does not open a second recorder stream; `Full live` is an explicit opt-in.
 
+## Direct local V4L2 video sources (optional)
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LOCAL_VIDEO_SOURCES_JSON` (`[]`) | JSON array of local USB/V4L2 cameras. Each row accepts `id`, `title`, `device`, `input_format`, `width`, `height`, `fps`, and `preview_fps` |
+
+Example: `[{"id":900001,"title":"Direct USB webcam","device":"/dev/video0","input_format":"mjpeg","width":1280,"height":720,"fps":15,"preview_fps":8}]`.
+The channel ID must not collide with an Evo channel. The service account must be
+able to read the configured `/dev/videoN` device (normally through the `video`
+group), and FFmpeg must be available from the bundled runtime or
+`EVOSSEARCH_FFMPEG_BIN`. Local channels support live preview, snapshots, EVA/VLM
+capture, probes, summaries, and locally retained alert evidence. They do not
+provide recorder archive playback or an Evo bookmark destination.
+
 ## Video-description / summaries
 
 | Var (default) | Notes |

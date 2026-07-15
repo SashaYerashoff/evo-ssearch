@@ -9671,7 +9671,9 @@ def _luxriot_media_open_upstream(
         headers["Streaming-Web-Ver"] = "1.3.0"
     if range_header:
         headers["Range"] = range_header
-    client = luxriot_manager.build_client()
+    if media_kind == "archive" and luxriot_manager.is_local_channel(channel_id):
+        raise _LuxriotArchiveGapError("Local video sources do not provide recorded archive media.")
+    client = luxriot_manager.build_capture_client(channel_id)
     media_meta: Dict[str, Any] = {}
     if media_kind == "archive":
         path = f"/archive/{int(channel_id)}/stream"
@@ -9858,7 +9860,9 @@ def _luxriot_media_response_headers(
         "X-Content-Type-Options": "nosniff",
         "X-EVA-Media-State": "playing",
         "X-EVA-Media-Kind": negotiated_kind,
-        "X-EVA-Media-Source": f"luxriot-{media_kind}",
+        "X-EVA-Media-Source": _luxriot_media_safe_header(
+            getattr(upstream, "_eva_media_source", ""), 40
+        ) or f"luxriot-{media_kind}",
         "X-EVA-Media-Bounded": "1",
     }
     if media_kind == "live":

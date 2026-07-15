@@ -20,6 +20,7 @@ from uuid import uuid4
 import requests
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 from requests.auth import HTTPDigestAuth
+from local_video_source import LocalVideoSourceRegistry
 try:
     from road_events import (
         AutoSceneCardConfig,
@@ -1094,7 +1095,7 @@ class LuxriotCaptureSession:
             self.interval = max(1, int(getattr(manager.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5)))
         self.max_edge = int(getattr(manager.config, "LUXRIOT_SNAPSHOT_MAX_EDGE", 800))
         self.max_buffer = int(getattr(manager.config, "LUXRIOT_MAX_BUFFER_FRAMES", 180))
-        self.client = manager.build_client()
+        self.client = manager.build_capture_client(channel_id)
 
         self.frames: List[Dict[str, Any]] = []
         self.recent_frames: List[Dict[str, Any]] = []
@@ -3384,6 +3385,9 @@ class LuxriotManager:
         self.summary_archive_bucket_loader: Optional[SummaryArchiveBucketLoaderFn] = None
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
         self.alert_policy_prompt = str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "") or "")
+        self.local_video_registry = LocalVideoSourceRegistry(
+            getattr(config, "LOCAL_VIDEO_SOURCES", ()) or ()
+        )
 
         self.sessions: Dict[int, LuxriotCaptureSession] = {}
         self.probe_sessions: Dict[int, LuxriotCaptureSession] = {}
@@ -11823,6 +11827,13 @@ class LuxriotManager:
             password=self.config.LUXRIOT_PASSWORD,
         )
 
+    def is_local_channel(self, channel_id: int) -> bool:
+        return self.local_video_registry.has_channel(channel_id)
+
+    def build_capture_client(self, channel_id: int) -> Any:
+        local_client = self.local_video_registry.client_for(channel_id)
+        return local_client if local_client is not None else self.build_client()
+
     def should_dispatch_probe_frame(self, channel_id: int, *, capture_kind: str = "video") -> bool:
         """Return whether a selected apex needs CLIP buffering for this channel."""
 
@@ -11839,11 +11850,14 @@ class LuxriotManager:
             if not force and self.channels_cache and now - self.channels_cache[0] < 30:
                 return [dict(channel) for channel in self.channels_cache[1]]
             self.channels_cache_last_attempt_at = now
+        local_channels = self.local_video_registry.channels()
         client = self.build_client()
+        upstream_error: Optional[str] = None
         try:
             channels = client.get_channels()
         except Exception as exc:
             safe_error = _safe_error_text(exc, 500) or exc.__class__.__name__
+            upstream_error = safe_error
             with self.cache_lock:
                 self.channels_cache_stale = self.channels_cache is not None
                 self.channels_cache_last_error = safe_error
@@ -11862,16 +11876,33 @@ class LuxriotManager:
                     safe_error,
                 )
                 return cached
-            raise
+            if not local_channels:
+                raise
+            LOGGER.warning(
+                "Luxriot channel inventory refresh failed; exposing configured local video sources: %s",
+                safe_error,
+            )
+            channels = []
+        known_ids = {
+            int(channel.get("id"))
+            for channel in channels
+            if isinstance(channel, Mapping) and _parse_optional_int(channel.get("id")) is not None
+        }
+        channels = [dict(channel) for channel in channels]
+        channels.extend(
+            channel for channel in local_channels if int(channel["id"]) not in known_ids
+        )
         refreshed_at = time.time()
         with self.cache_lock:
             self.channels_cache = (refreshed_at, [dict(channel) for channel in channels])
-            self.channels_cache_stale = False
-            self.channels_cache_last_error = None
-            self.channels_cache_last_success_at = refreshed_at
+            self.channels_cache_stale = upstream_error is not None
+            self.channels_cache_last_error = upstream_error
+            if upstream_error is None:
+                self.channels_cache_last_success_at = refreshed_at
             stream_meta = dict(getattr(client, "channel_inventory_meta", None) or {})
             if stream_meta.get("error"):
                 stream_meta["error"] = _safe_error_text(stream_meta.get("error"), 500)
+            stream_meta["local_channel_count"] = len(local_channels)
             self.channels_cache_stream_meta = stream_meta
         return [dict(channel) for channel in channels]
 
@@ -11894,7 +11925,7 @@ class LuxriotManager:
             }
 
     def get_snapshot_base64(self, channel_id: int, stream_type: str = "mainStream") -> Tuple[str, Dict[str, Any]]:
-        client = self.build_client()
+        client = self.build_capture_client(channel_id)
         snapshot = client.get_snapshot(channel_id, stream=stream_type)
         captured_at_ms = int(time.time() * 1000)
         encoded = self.jpeg_encoder(snapshot, max_edge=self.config.LUXRIOT_SNAPSHOT_MAX_EDGE, quality=85)
@@ -11912,7 +11943,7 @@ class LuxriotManager:
         roi_norm: Optional[Tuple[float, float, float, float]] = None,
         quality: int = 92,
     ) -> Tuple[str, Dict[str, Any]]:
-        client = self.build_client()
+        client = self.build_capture_client(channel_id)
         snapshot = client.get_snapshot(channel_id, stream=stream_type)
         captured_at_ms = int(time.time() * 1000)
         original_width = int(snapshot.width)
@@ -11959,6 +11990,8 @@ class LuxriotManager:
         state: str = "new",
         timestamp_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
+        if self.is_local_channel(channel_id):
+            raise RuntimeError("Local video sources do not provide an Evo bookmark destination.")
         client = self.build_client()
         sev_map = getattr(self.config, "LUXRIOT_SEVERITY_MAP", {}) or {}
         severity = str(severity).lower()
@@ -12312,6 +12345,9 @@ class LuxriotManager:
                     max_ts_ms=max_ts_ms,
                 ),
             }
+            if self.is_local_channel(channel_id):
+                alert_events.append({**alert, "delivery_status": "local_source_no_recorder"})
+                continue
             if not bool(settings.get("bookmark_enabled")):
                 alert_events.append({**alert, "delivery_status": "bookmark_disabled"})
                 continue

@@ -47,6 +47,9 @@ background rollups, agent context/tool routing, and offline deployment.
   upstream timeouts, lease renewal, and stall recovery.
 - `Model view` reuses the EVA attention stream instead of opening a second
   recorder session.
+- Optional local V4L2/USB cameras appear as independent live channels and feed
+  preview, snapshots, probes, and VLM summaries through bundled FFmpeg without
+  Evo. They intentionally have no recorder archive or Evo bookmark target.
 - Archive review opens on the stored evidence frame and filmstrip; video is an
   explicit operator action.
 - Browser playback timeout/gap keeps the stored evidence visible and reports

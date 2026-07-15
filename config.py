@@ -7,6 +7,8 @@ import re
 import hashlib
 from pathlib import Path
 
+from local_video_source import parse_local_video_sources
+
 # Keep only names, never values.  After python-dotenv runs, ``os.environ`` no
 # longer reveals whether a setting came from systemd/process environment or the
 # project file.  Settings diagnostics use this frozen set to explain precedence
@@ -476,6 +478,9 @@ class Config:
     LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://luxriot-host:8080').strip().rstrip('/')
     LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
     LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '').strip()
+    LOCAL_VIDEO_SOURCES = parse_local_video_sources(
+        os.getenv('EVOSSEARCH_LOCAL_VIDEO_SOURCES_JSON', '')
+    )
     try:
         LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
     except (TypeError, ValueError):

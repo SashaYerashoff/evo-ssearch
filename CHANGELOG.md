@@ -19,7 +19,9 @@ Scaffold for release notes; final prose to be assembled from commits
   renewal and stall watchdogs; shared EVA attention preview (`Model view`) with
   60 s freshness window and auto-recovery; archive review modal is
   evidence-first with opt-in playback; archive segments support bounded
-  `duration_sec`.
+  `duration_sec`. Optional local V4L2/USB sources can be added as independent
+  live channels, using the bundled FFmpeg runtime directly without Evo; their
+  lack of recorder archive and bookmark delivery is reported explicitly.
 - **Agent:** persisted research continuation ledger, composite channel
   inventory, shared LM admission queue, context/token budget observability
   (`estimated_context_tokens`); an approval-gated post-upgrade command can now
