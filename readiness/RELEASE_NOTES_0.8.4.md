@@ -149,9 +149,18 @@ Use `readiness/MANUAL_TEST_PLAN_0.8.4_OFFICE_DEMO_RU.md`. The required focus is:
 
 ## Verification
 
-- Installer/guided-upgrade targeted suite after compatibility changes: 50/50.
+- Installer/agent targeted suite after compatibility changes: 171/171.
+- Exact office `0.8.3 / 9e39392` fixture with a working deployment env passed
+  bundle media, requirements, venv, 65k agent-context, and live read-only schema
+  gates through the final human confirmation. The same fixture with the source
+  office `.env` stopped safely at `NO_DSN`, revealing that the source-worktree
+  env is not sufficient evidence of the deployed service configuration.
+- Clean-worktree full pytest snapshot: 657 passed, 23 skipped, 133 subtests;
+  three known failures require a configured PostgreSQL archive/probe store and
+  demonstrate that those tests are not yet hermetic without deployment env.
+- Archive UI/media focused suite after timeout-contract repair: 65/65.
 - Previous `0.8.4` deterministic predeploy gate: 626 passed, 18 skipped, 134
   subtests passed.
 - Agent/updater hotfix targeted suite before this documentation pass: 141/141.
-- Final bundle must be rebuilt and rehearsed after the compatibility commit;
-  record its manifest commit and SHA-256 before office deployment.
+- Final bundle must be rebuilt after the last documentation/test commit; record
+  its manifest commit and SHA-256 before office deployment.

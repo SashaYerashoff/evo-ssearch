@@ -92,6 +92,18 @@ curl -fsS http://127.0.0.1:5000/ready > pre-ready.json
 - agent LM model и reported context;
 - включены ли bookmarks.
 
+Не печатая значения, убедиться, что deployed env содержит runtime DB DSN:
+
+```bash
+ENV_FILE=/etc/eva-ai/eva-ai.env
+sudo sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' "$ENV_FILE" \
+  | grep -E '^(EVA_DATABASE_DSN|EVOSSEARCH_DATABASE_DSN)$'
+```
+
+Если команда ничего не вернула, updater правильно остановится на `NO_DSN`.
+Нужно найти фактический EnvironmentFile/service configuration вместе с
+разработчиком; нельзя копировать dev DSN или угадывать credentials на месте.
+
 ### 3.3 Обновление
 
 Запускать из распакованного bundle без `sudo`:
@@ -110,6 +122,12 @@ cd eva-ai-0.8.4-offline
 - schema already `20260614_0006`, database will not be changed;
 - backup path до копирования code;
 - финальный `OK: EVA AI β 0.8.4 is up and running`.
+
+Compatibility rehearsal 2026-07-15 на одноразовой копии точного офисного
+commit `9e39392` прошла media, requirements, venv, context и live read-only
+schema gates до человеческого confirmation. Source-worktree `.env` офисной
+ветки DSN не содержит; это не доказывает состояние deployed service env и
+является обязательной preflight-проверкой для Ивана.
 
 Если context ниже 65 536, записать три строки updater:
 
