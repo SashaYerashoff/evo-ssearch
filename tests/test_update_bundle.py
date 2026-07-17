@@ -62,11 +62,12 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('if [[ "${MODE}" == "user" ]]', SCRIPT)
 
     def test_human_confirmation_and_restart_are_separate(self):
-        confirmation = SCRIPT.index("Type UPDATE")
+        confirmation = SCRIPT.index("Install %s now?")
         install = SCRIPT.index('"${BUNDLE_DIR}/scripts/install_patch.sh"')
         restart_prompt = SCRIPT.index("Restart %s.service now?")
         self.assertLess(confirmation, install)
         self.assertLess(install, restart_prompt)
+        self.assertIn("[y/N]", SCRIPT)
         self.assertIn("is up and running", SCRIPT)
         self.assertIn("ready_json_matches_version", SCRIPT)
         self.assertIn('payload.get("version") == sys.argv[1]', SCRIPT)
@@ -84,7 +85,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertNotIn("unsupported installed version", SCRIPT)
         requirements_at = SCRIPT.index("for requirements_file in requirements.txt requirements-db.txt")
         schema_at = SCRIPT.index('SCHEMA_VERSION="$(target_python')
-        confirmation_at = SCRIPT.index("Type UPDATE")
+        confirmation_at = SCRIPT.index("Install %s now?")
         self.assertLess(requirements_at, confirmation_at)
         self.assertLess(schema_at, confirmation_at)
         self.assertIn("active runtime /ready (no DSN stored in selected file)", SCRIPT)
@@ -96,9 +97,9 @@ class UpdateBundleTests(unittest.TestCase):
 
     def test_agent_context_mismatch_requires_explicit_safe_force_before_update(self):
         context_check = SCRIPT.index("Agent context compatibility decision")
-        confirmation = SCRIPT.index("Type UPDATE")
+        confirmation = SCRIPT.index("Install %s now?")
         self.assertLess(context_check, confirmation)
-        self.assertIn("FORCE-CONTEXT", SCRIPT)
+        self.assertIn("Continue with the temporary context cap? [y/N]", SCRIPT)
         self.assertIn("short-context update declined; nothing was changed", SCRIPT)
         self.assertIn("TEMPORARY FORCED CAP", SCRIPT)
         self.assertIn("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}", SCRIPT)
@@ -107,15 +108,27 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("EVOSSEARCH_LM_PROFILE_AGENT_API_KEY", SCRIPT)
         self.assertIn("EVOSSEARCH_LM_API_KEY", SCRIPT)
         self.assertIn('Authorization: Bearer ${AGENT_LM_API_KEY}', SCRIPT)
-        unknown_prompt = SCRIPT.index("FORCE-UNKNOWN-CONTEXT")
-        confirmation = SCRIPT.index("Type UPDATE")
+        unknown_prompt = SCRIPT.index("Continue with the operator-verified Agent configuration? [y/N]")
+        confirmation = SCRIPT.index("Install %s now?")
         self.assertLess(unknown_prompt, confirmation)
         self.assertIn("unknown agent context declined; nothing was changed", SCRIPT)
         self.assertIn("Agent context: UNVERIFIED", SCRIPT)
 
+    def test_missing_agent_model_is_adopted_without_operator_shell_edits(self):
+        self.assertIn('DEFAULT_AGENT_MODEL="qwen3.5-9b-mtp"', SCRIPT)
+        self.assertIn('read_env_file_value "${APP_DIR}/.env" EVOSSEARCH_LM_PROFILE_AGENT_MODEL', SCRIPT)
+        self.assertIn('AGENT_MODEL_SOURCE="existing application .env"', SCRIPT)
+        self.assertIn('AGENT_MODEL_SOURCE="active EVA runtime"', SCRIPT)
+        self.assertIn('AGENT_MODEL_SOURCE="only model served by Agent inference"', SCRIPT)
+        self.assertIn('AGENT_MODEL_SOURCE="EVA AI 0.8.4 release default"', SCRIPT)
+        self.assertIn('env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=${AGENT_MODEL_TO_PERSIST}"', SCRIPT)
+        self.assertIn('adopted_agent_model = sys.argv[6].strip()', SCRIPT)
+        self.assertIn('EVOSSEARCH_LM_PROFILE_AGENT_MODEL={adopted_agent_model}', SCRIPT)
+        self.assertIn("Agent model adopted from", SCRIPT)
+
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')
-        confirmation = SCRIPT.index("Type UPDATE")
+        confirmation = SCRIPT.index("Install %s now?")
         service_stop = SCRIPT.index('systemctl_write stop "${SERVICE_NAME}.service"')
         self.assertLess(sudo_check, confirmation)
         self.assertLess(confirmation, service_stop)
@@ -127,7 +140,7 @@ class UpdateBundleTests(unittest.TestCase):
     def test_media_runtime_is_required_and_checked_before_confirmation(self):
         media_check = SCRIPT.index('MEDIA_RUNTIME="')
         checksum = SCRIPT.index("sha256sum -c SHA256SUMS")
-        confirmation = SCRIPT.index("Type UPDATE")
+        confirmation = SCRIPT.index("Install %s now?")
         self.assertLess(media_check, confirmation)
         self.assertLess(checksum, confirmation)
         self.assertIn("bundled ffmpeg failed the decode smoke test", SCRIPT)
@@ -138,7 +151,7 @@ class UpdateBundleTests(unittest.TestCase):
     def test_system_opencv_preflight_removes_root_owned_temp_payload_as_root(self):
         helper = SCRIPT.index("remove_temp_path()")
         payload = SCRIPT.index('CV_PAYLOAD_TEST_DIR="$(mktemp -d)"')
-        confirmation = SCRIPT.index("Type UPDATE")
+        confirmation = SCRIPT.index("Install %s now?")
         self.assertLess(helper, payload)
         self.assertLess(payload, confirmation)
         self.assertIn('as_root rm -rf -- "${path}"', SCRIPT)

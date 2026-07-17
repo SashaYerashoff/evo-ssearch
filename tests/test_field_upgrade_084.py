@@ -47,6 +47,8 @@ class FieldUpgradeGuideTests(unittest.TestCase):
             if not root.exists():
                 continue
             for path in root.rglob("*"):
+                if "node_modules" in path.parts:
+                    continue
                 if path.is_file() and path.suffix in suffixes:
                     if cyrillic.search(path.read_text(encoding="utf-8", errors="ignore")):
                         offenders.append(str(path.relative_to(ROOT)))

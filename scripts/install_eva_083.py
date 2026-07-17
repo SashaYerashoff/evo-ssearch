@@ -340,18 +340,30 @@ def _prompt(spec: PromptSpec, *, input_fn: Callable[[str], str]) -> str:
     return value
 
 
+def _selected_agent_profile_key(values: Mapping[str, str], suffix: str) -> str:
+    profile_id = str(values.get("EVOSSEARCH_LM_AGENT_PROFILE_ID") or "").strip()
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", profile_id).strip("_").upper()
+    if not normalized:
+        return ""
+    return f"EVOSSEARCH_LM_PROFILE_{normalized}_{suffix}"
+
+
 def _has_agent_endpoint(values: Mapping[str, str]) -> bool:
-    return bool(
-        str(values.get("EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL") or "").strip()
-        or str(values.get("EVOSSEARCH_LM_BASE_URL") or "").strip()
+    candidates = (
+        "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL",
+        "EVOSSEARCH_LM_BASE_URL",
+        _selected_agent_profile_key(values, "BASE_URL"),
     )
+    return any(str(values.get(key) or "").strip() for key in candidates if key)
 
 
 def _has_agent_model(values: Mapping[str, str]) -> bool:
-    return bool(
-        str(values.get("EVOSSEARCH_LM_PROFILE_AGENT_MODEL") or "").strip()
-        or str(values.get("EVOSSEARCH_LM_MODEL") or "").strip()
+    candidates = (
+        "EVOSSEARCH_LM_PROFILE_AGENT_MODEL",
+        "EVOSSEARCH_LM_MODEL",
+        _selected_agent_profile_key(values, "MODEL"),
     )
+    return any(str(values.get(key) or "").strip() for key in candidates if key)
 
 
 def _has_vlm_endpoint(values: Mapping[str, str]) -> bool:

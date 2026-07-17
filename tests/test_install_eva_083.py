@@ -308,6 +308,26 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertNotIn("EVOSSEARCH_LM_PROFILE_VLM_MODEL", updates)
         self.assertNotIn("EVOSSEARCH_LM_VLM_PROFILE_ID", updates)
 
+    def test_selected_nonstandard_agent_profile_satisfies_agent_contract(self):
+        existing = dict(COMPLETE_ENV)
+        existing.pop("EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL")
+        existing.pop("EVOSSEARCH_LM_PROFILE_AGENT_MODEL")
+        existing["EVOSSEARCH_LM_PROFILES"] = "chat,vlm"
+        existing["EVOSSEARCH_LM_AGENT_PROFILE_ID"] = "chat"
+        existing["EVOSSEARCH_LM_PROFILE_CHAT_BASE_URL"] = "http://lm.internal:1234/v1"
+        existing["EVOSSEARCH_LM_PROFILE_CHAT_MODEL"] = "qwen3.5-9b-mtp"
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), "", existing)
+
+        _values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertNotIn("EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL", updates)
+        self.assertNotIn("EVOSSEARCH_LM_PROFILE_AGENT_MODEL", updates)
+
     def test_migrate_requires_distinct_privileged_dsn_and_never_falls_back_to_runtime(self):
         values = {"EVA_DATABASE_DSN": COMPLETE_ENV["EVA_DATABASE_DSN"]}
         updates = {}

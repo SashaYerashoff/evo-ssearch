@@ -6,6 +6,7 @@ umask 077
 
 EXPECTED_VERSION="β 0.8.4"
 EXPECTED_SCHEMA="20260614_0006"
+DEFAULT_AGENT_MODEL="qwen3.5-9b-mtp"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
@@ -72,7 +73,7 @@ as_root() {
   fi
 }
 
-for command_name in cmp curl grep sed sha256sum systemctl tar; do
+for command_name in cmp curl env grep sed sha256sum systemctl tar; do
   command -v "${command_name}" >/dev/null 2>&1 || stop "required command is missing: ${command_name}"
 done
 
@@ -220,19 +221,26 @@ if [[ -z "${UNIT_FILE}" ]]; then
   fi
 fi
 
-read_env_value() {
-  local key="$1"
-  local reader=(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" "${ENV_FILE}")
+read_env_file_value() {
+  local file="$1"
+  local key="$2"
+  local reader=(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" "${file}")
   local value
-  if [[ -r "${ENV_FILE}" ]]; then
+  if [[ -r "${file}" ]]; then
     value="$("${reader[@]}" | tail -n 1)"
-  else
+  elif path_is_file "${file}"; then
     value="$(as_root "${reader[@]}" | tail -n 1)"
+  else
+    value=""
   fi
   value="${value%$'\r'}"
   value="${value%\"}"; value="${value#\"}"
   value="${value%\'}"; value="${value#\'}"
   printf '%s' "${value}"
+}
+
+read_env_value() {
+  read_env_file_value "${ENV_FILE}" "$1"
 }
 
 if [[ -z "${BASE_URL}" ]]; then
@@ -400,6 +408,7 @@ print(str(postgres.get("current_revision") or ""))
 print("true" if db_gate_ok else "false")
 print(str(agent.get("base_url") or ""))
 print(str(luxriot.get("base_url") or ""))
+print(str(agent.get("model") or agent.get("configured_model") or ""))
 PY
 )
 rm -f "${ACTIVE_READY_BODY}"
@@ -409,6 +418,7 @@ ACTIVE_RUNTIME_SCHEMA="${ACTIVE_RUNTIME_FACTS[2]:-}"
 ACTIVE_RUNTIME_DB_OK="${ACTIVE_RUNTIME_FACTS[3]:-false}"
 ACTIVE_RUNTIME_AGENT_BASE_URL="${ACTIVE_RUNTIME_FACTS[4]:-}"
 ACTIVE_RUNTIME_LUXRIOT_BASE_URL="${ACTIVE_RUNTIME_FACTS[5]:-}"
+ACTIVE_RUNTIME_AGENT_MODEL="${ACTIVE_RUNTIME_FACTS[6]:-}"
 ok "active runtime identity loaded from /ready (${ACTIVE_RUNTIME_VERSION:-unknown version})"
 [[ "${ACTIVE_RUNTIME_STATUS}" == "ready" ]] \
   || stop "installed EVA reports ${ACTIVE_RUNTIME_STATUS:-unknown} before upgrade; restore readiness first"
@@ -419,6 +429,17 @@ fi
 EXPECTED_AGENT_CONTEXT=65536
 CONFIGURED_AGENT_CONTEXT="$(read_env_value EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS)"
 CONFIGURED_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT:-${EXPECTED_AGENT_CONTEXT}}"
+CONFIGURED_AGENT_MODEL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_MODEL)"
+[[ -n "${CONFIGURED_AGENT_MODEL}" ]] || CONFIGURED_AGENT_MODEL="$(read_env_value EVOSSEARCH_LM_MODEL)"
+LEGACY_AGENT_MODEL=""
+if [[ "${APP_DIR}/.env" != "${ENV_FILE}" ]] && path_is_file "${APP_DIR}/.env"; then
+  LEGACY_AGENT_MODEL="$(read_env_file_value "${APP_DIR}/.env" EVOSSEARCH_LM_PROFILE_AGENT_MODEL)"
+  [[ -n "${LEGACY_AGENT_MODEL}" ]] \
+    || LEGACY_AGENT_MODEL="$(read_env_file_value "${APP_DIR}/.env" EVOSSEARCH_LM_MODEL)"
+fi
+AGENT_MODEL_TO_PERSIST=""
+AGENT_MODEL_SOURCE=""
+SERVED_AGENT_MODELS=()
 SERVED_AGENT_CONTEXT="UNKNOWN"
 TEMPORARY_AGENT_CONTEXT=""
 CONTEXT_FORCE_REQUIRED=false
@@ -450,20 +471,31 @@ if [[ -n "${AGENT_LM_BASE_URL}" ]]; then
   fi
   AGENT_MODELS_CURL+=("${AGENT_LM_BASE_URL%/}/models")
   if "${AGENT_MODELS_CURL[@]}" > "${AGENT_MODELS_BODY}" 2>/dev/null; then
-    SERVED_AGENT_CONTEXT="$(target_python - "${AGENT_MODELS_BODY}" <<'PY'
+    mapfile -t AGENT_SERVER_FACTS < <(target_python - "${AGENT_MODELS_BODY}" <<'PY'
 import json
 import sys
 
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    row = (payload.get("data") or [{}])[0]
+    rows = [row for row in (payload.get("data") or []) if isinstance(row, dict)]
+    row = rows[0] if rows else {}
     value = row.get("max_model_len") or (row.get("meta") or {}).get("n_ctx")
     print(int(value) if value is not None else "UNKNOWN")
+    seen = set()
+    for item in rows:
+        model_id = str(item.get("id") or item.get("model") or "").strip()
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            print(model_id)
 except Exception:
     print("UNKNOWN")
 PY
-)"
+)
+    SERVED_AGENT_CONTEXT="${AGENT_SERVER_FACTS[0]:-UNKNOWN}"
+    if (( ${#AGENT_SERVER_FACTS[@]} > 1 )); then
+      SERVED_AGENT_MODELS=("${AGENT_SERVER_FACTS[@]:1}")
+    fi
     if [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( SERVED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
       CONTEXT_FORCE_REQUIRED=true
       if [[ -z "${TEMPORARY_AGENT_CONTEXT}" ]] \
@@ -482,6 +514,35 @@ PY
     printf 'WARN: could not read agent inference context from %s/models.\n' "${AGENT_LM_BASE_URL%/}" >&2
   fi
   rm -f "${AGENT_MODELS_BODY}"
+fi
+
+if [[ -z "${CONFIGURED_AGENT_MODEL}" ]]; then
+  if [[ -n "${LEGACY_AGENT_MODEL}" ]]; then
+    AGENT_MODEL_TO_PERSIST="${LEGACY_AGENT_MODEL}"
+    AGENT_MODEL_SOURCE="existing application .env"
+  elif [[ -n "${ACTIVE_RUNTIME_AGENT_MODEL}" ]]; then
+    AGENT_MODEL_TO_PERSIST="${ACTIVE_RUNTIME_AGENT_MODEL}"
+    AGENT_MODEL_SOURCE="active EVA runtime"
+  else
+    for served_model in "${SERVED_AGENT_MODELS[@]}"; do
+      if [[ "${served_model}" == "${DEFAULT_AGENT_MODEL}" ]]; then
+        AGENT_MODEL_TO_PERSIST="${served_model}"
+        AGENT_MODEL_SOURCE="Agent inference server"
+        break
+      fi
+    done
+    if [[ -z "${AGENT_MODEL_TO_PERSIST}" && "${#SERVED_AGENT_MODELS[@]}" -eq 1 ]]; then
+      AGENT_MODEL_TO_PERSIST="${SERVED_AGENT_MODELS[0]}"
+      AGENT_MODEL_SOURCE="only model served by Agent inference"
+    fi
+  fi
+  if [[ -z "${AGENT_MODEL_TO_PERSIST}" ]]; then
+    AGENT_MODEL_TO_PERSIST="${DEFAULT_AGENT_MODEL}"
+    AGENT_MODEL_SOURCE="EVA AI 0.8.4 release default"
+    printf 'WARN: Agent model was not explicit and could not be discovered; adopting release default %s.\n' \
+      "${AGENT_MODEL_TO_PERSIST}" >&2
+  fi
+  ok "Agent model adopted from ${AGENT_MODEL_SOURCE}: ${AGENT_MODEL_TO_PERSIST}"
 fi
 
 CV_OVERLAY_REQUIRED=false
@@ -583,6 +644,11 @@ DRY_RUN=(
   --unit-file "${UNIT_FILE}"
   --base-url "${BASE_URL}"
 )
+DRY_RUN_COMMAND=()
+if [[ -n "${AGENT_MODEL_TO_PERSIST}" ]]; then
+  DRY_RUN_COMMAND=(env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=${AGENT_MODEL_TO_PERSIST}")
+fi
+DRY_RUN_COMMAND+=("${DRY_RUN[@]}")
 if [[ "${MODE}" == "user" ]]; then
   say "Local rehearsal preflight"
   printf 'WARN: user-systemd dev mode skips the production credential-placeholder policy.\n'
@@ -590,9 +656,9 @@ if [[ "${MODE}" == "user" ]]; then
 else
   say "Production installer dry-run"
   if [[ ! -r "${ENV_FILE}" ]]; then
-    as_root "${DRY_RUN[@]}" || stop "installer dry-run failed"
+    as_root "${DRY_RUN_COMMAND[@]}" || stop "installer dry-run failed"
   else
-    "${DRY_RUN[@]}" || stop "installer dry-run failed"
+    "${DRY_RUN_COMMAND[@]}" || stop "installer dry-run failed"
   fi
 fi
 
@@ -601,10 +667,9 @@ if [[ "${CONTEXT_UNKNOWN_REQUIRED}" == true ]]; then
   printf 'WARN: the updater could not verify the context served by the agent LM.\n' >&2
   printf 'Configured in EVA: %s tokens\n' "${CONFIGURED_AGENT_CONTEXT}" >&2
   printf 'Required for this release: %s tokens\n' "${EXPECTED_AGENT_CONTEXT}" >&2
-  printf 'Start/fix the agent LM and rerun when possible. To accept the unknown context explicitly,\n' >&2
-  printf 'type FORCE-UNKNOWN-CONTEXT; anything else aborts before service stop: '
+  printf 'Continue with the operator-verified Agent configuration? [y/N]: '
   read -r CONTEXT_UNKNOWN_DECISION
-  [[ "${CONTEXT_UNKNOWN_DECISION}" == "FORCE-UNKNOWN-CONTEXT" ]] \
+  [[ "${CONTEXT_UNKNOWN_DECISION}" =~ ^([yY]|[yY][eE][sS])$ ]] \
     || stop "unknown agent context declined; nothing was changed"
   CONTEXT_UNKNOWN_ACCEPTED=true
   ok "operator explicitly accepted an unverified agent context"
@@ -617,9 +682,9 @@ if [[ "${CONTEXT_FORCE_REQUIRED}" == true ]]; then
   printf 'Reported by agent LM: %s tokens\n' "${SERVED_AGENT_CONTEXT}" >&2
   printf 'Safe temporary EVA cap: %s tokens\n' "${TEMPORARY_AGENT_CONTEXT}" >&2
   printf 'The agent will have less room for history and multi-step research until LM Studio is reconfigured.\n' >&2
-  printf 'Type FORCE-CONTEXT to continue with the temporary cap; anything else aborts before service stop: '
+  printf 'Continue with the temporary context cap? [y/N]: '
   read -r CONTEXT_DECISION
-  [[ "${CONTEXT_DECISION}" == "FORCE-CONTEXT" ]] \
+  [[ "${CONTEXT_DECISION}" =~ ^([yY]|[yY][eE][sS])$ ]] \
     || stop "short-context update declined; nothing was changed"
   ok "operator accepted temporary ${TEMPORARY_AGENT_CONTEXT}-token agent context"
 fi
@@ -711,9 +776,10 @@ automatic_rollback() {
 }
 trap automatic_rollback EXIT
 
-printf '\nType UPDATE to install %s (database and runtime data stay unchanged): ' "${EXPECTED_VERSION}"
+printf '\nInstall %s now? Database and runtime data stay unchanged. [y/N]: ' "${EXPECTED_VERSION}"
 read -r CONFIRMATION
-[[ "${CONFIRMATION}" == "UPDATE" ]] || stop "confirmation not received; nothing was changed"
+[[ "${CONFIRMATION}" =~ ^([yY]|[yY][eE][sS])$ ]] \
+  || stop "confirmation not received; nothing was changed"
 
 say "Stopping ${SERVICE_NAME}.service"
 systemctl_write stop "${SERVICE_NAME}.service"
@@ -803,7 +869,7 @@ else
   as_root "${MEDIA_INSTALL[@]}"
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" "${AGENT_MODEL_TO_PERSIST}" <<'PY'
 import os
 import re
 import stat
@@ -816,6 +882,7 @@ version = sys.argv[2]
 marker_path = Path(sys.argv[3])
 bundle_commit = sys.argv[4]
 temporary_agent_context = sys.argv[5].strip()
+adopted_agent_model = sys.argv[6].strip()
 original = path.read_text(encoding="utf-8")
 replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
 updated, count = re.subn(
@@ -834,6 +901,17 @@ if temporary_agent_context:
     )
     if count == 0:
         updated = updated.rstrip("\n") + "\n" + context_replacement + "\n"
+if adopted_agent_model:
+    if any(char in adopted_agent_model for char in "\r\n\x00"):
+        raise SystemExit("unsafe Agent model value")
+    model_replacement = f"EVOSSEARCH_LM_PROFILE_AGENT_MODEL={adopted_agent_model}"
+    updated, count = re.subn(
+        r"(?m)^[ \t]*EVOSSEARCH_LM_PROFILE_AGENT_MODEL[ \t]*=.*$",
+        model_replacement,
+        updated,
+    )
+    if count == 0:
+        updated = updated.rstrip("\n") + "\n" + model_replacement + "\n"
 st = path.stat()
 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -901,7 +979,7 @@ if [[ -n "${TEMPORARY_AGENT_CONTEXT}" ]]; then
   printf 'Next: raise LM Studio context, then set EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=%s and restart EVA.\n' \
     "${EXPECTED_AGENT_CONTEXT}"
 elif [[ "${CONTEXT_UNKNOWN_ACCEPTED}" == true ]]; then
-  printf 'Agent context: UNVERIFIED (operator accepted FORCE-UNKNOWN-CONTEXT)\n'
+  printf 'Agent context: UNVERIFIED (operator accepted the warning)\n'
   printf 'WARN: EVA is up, but agent LM availability/context still requires manual verification.\n'
 else
   printf 'Agent context: %s tokens\n' "${SERVED_AGENT_CONTEXT}"
