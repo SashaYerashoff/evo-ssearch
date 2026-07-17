@@ -23,6 +23,7 @@ Start here — the docs are the source of truth, not this README:
   [observability](docs/admin/observability.md) ·
   [backup & recovery](docs/admin/backup_recovery.md)
 - **Install:** [deployment guide](docs/install/deployment_guide.md) ·
+  [Git install/update](docs/install/git_install_084.md) ·
   [inference topology](docs/install/inference_topology.md)
 - **Architecture:** [system](docs/architecture/system_architecture.md) ·
   [cognitive](docs/architecture/cognitive_architecture.md) ·

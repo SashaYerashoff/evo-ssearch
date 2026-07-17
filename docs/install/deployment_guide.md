@@ -4,6 +4,11 @@ Third-party-shareable install guide for an EVA AI pilot on Ubuntu LTS. **Contain
 no client data** — all site specifics are placeholders. The filled, internal
 version lives in `install/field_rollout_demo.md` (not shared).
 
+For the reviewed β 0.8.4 source branch, exact clone, dry-run, apply, rollback,
+and verification commands are in the
+[Git Installation and Update Guide](git_install_084.md). Do not run `git pull`
+inside a live production checkout.
+
 Invariants: [facts](../00_CANON/facts.md). All variables:
 [config_reference](../00_CANON/config_reference.md). Production browser/internal
 URL rules: [production_settings](production_settings.md). Placeholders: `<...>`.
