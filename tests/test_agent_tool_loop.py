@@ -181,6 +181,43 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("calibrate_probe_from_archive", probe_tools)
         self.assertNotIn("get_video_summaries", probe_tools)
 
+    def test_activated_runbook_tools_pass_the_intent_gate(self):
+        query = "проверь канал 115, был ли почтальон вчера вечером?"
+        context = _seed_turn_tool_context(query)
+        # Without the runbook the RU phrasing matches no intent group.
+        bare = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        self.assertEqual(bare, [])
+
+        slugs = agent._extract_requested_skill_slugs(query)
+        self.assertIn("video_event_check", slugs)
+        skill_tools = agent._skill_tool_names(slugs)
+        self.assertIn("get_video_summaries", skill_tools)
+        self.assertIn("describe_frame", skill_tools)
+
+        context["skill_tool_names"] = sorted(skill_tools)
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        }
+        self.assertTrue(skill_tools.issubset(exposed))
+
+    def test_skill_tool_names_ignores_unknown_and_stays_in_schema_envelope(self):
+        self.assertEqual(agent._skill_tool_names([]), set())
+        self.assertEqual(agent._skill_tool_names(["no_such_runbook"]), set())
+        # Names never leave the provided (permission-filtered) schema list.
+        context = _seed_turn_tool_context("привет! как дела?")
+        context["skill_tool_names"] = ["get_video_summaries", "not_a_real_tool"]
+        permitted = [
+            row
+            for row in agent._TOOL_SCHEMAS
+            if row["function"]["name"] == "lookup_help"
+        ]
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(permitted, context)
+        }
+        self.assertEqual(exposed, set())
+
     def test_plain_chat_omits_empty_tools_payload(self):
         client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
 

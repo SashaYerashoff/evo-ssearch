@@ -6681,6 +6681,36 @@ def _extract_requested_skill_slugs(message: Any) -> List[str]:
     return list(dict.fromkeys(hits))
 
 
+def _skill_tool_names(skill_slugs: Sequence[str]) -> set[str]:
+    """Tool names mentioned in the activated runbooks' SKILL.md content.
+
+    An activated runbook must be executable, so the tools it names are added
+    to the turn's exposed schemas. Names are matched against the registered
+    tool set, so operator-authored runbooks cannot introduce unknown tools.
+    """
+    slugs = {str(slug or "").strip() for slug in skill_slugs}
+    slugs.discard("")
+    if not slugs:
+        return set()
+    known = {
+        str((schema.get("function") or {}).get("name") or "").strip()
+        for schema in _TOOL_SCHEMAS
+        if isinstance(schema, Mapping) and isinstance(schema.get("function"), Mapping)
+    }
+    known.discard("")
+    names: set[str] = set()
+    for doc in _load_runtime_skill_docs():
+        if str(doc.get("slug") or "").strip() not in slugs:
+            continue
+        content = str(doc.get("content") or "")
+        for tool_name in known:
+            if tool_name in names:
+                continue
+            if re.search(rf"\b{re.escape(tool_name)}\b", content):
+                names.add(tool_name)
+    return names
+
+
 def _extract_text_from_message_content(message: Any) -> str:
     if isinstance(message, str):
         return message
@@ -7404,6 +7434,11 @@ def _select_relevant_tool_schemas(
     allowed_names: set[str] = set()
     for intent in intents:
         allowed_names.update(_TOOL_INTENT_GROUPS.get(intent, ()))
+    # An activated runbook must be executable: expose the tools it names.
+    # This only widens within `schemas`, which are already permission-filtered.
+    allowed_names.update(
+        str(item) for item in (context.get("skill_tool_names") or ())
+    )
 
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
@@ -8621,6 +8656,9 @@ class AgentRunner:
 
         # Replace the stored user content with the full (possibly image-bearing) one
         turn_tool_context = _seed_turn_tool_context(user_text)
+        requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
+        if requested_skill_tool_names:
+            turn_tool_context["skill_tool_names"] = sorted(requested_skill_tool_names)
         trusted_research_messages: List[Dict[str, Any]] = []
         if active_research_state is not None:
             trusted_research_messages.append(

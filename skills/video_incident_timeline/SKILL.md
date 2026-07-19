@@ -14,7 +14,7 @@ Trigger phrases:
 Goal: produce a chronological operator report for notable events on one channel or a small named channel set.
 
 Default order:
-1. Normalize the period.
+1. Normalize the period with `normalize_time_window`.
 2. Resolve channels. If none are named and many channels are active, use `list_video_summary_channels` and ask for confirmation before full research.
 3. Start with `get_video_summaries depth="L2"` for the broad map.
 4. Use `depth="L1"` for windows with alerts, deviations, or user-relevant scene changes.

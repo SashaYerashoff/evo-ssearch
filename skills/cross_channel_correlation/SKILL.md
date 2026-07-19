@@ -16,8 +16,8 @@ Trigger phrases:
 Goal: compare candidate events across channels and propose possible links with explicit uncertainty.
 
 Default order:
-1. Normalize the period and resolve all mentioned channels.
-2. Build per-channel event candidates using VLM summaries first and VLM archive frames second.
+1. Normalize the period with `normalize_time_window` and resolve all mentioned channels.
+2. Build per-channel event candidates using VLM summaries first (`get_video_summaries`) and VLM archive frames second (`get_detections` with `source="vlm_summary"`/`source="vlm_alert"`).
 3. Use `get_visual_window_signals` only as a weak ranking cue when searching for candidate appearances across channels.
 4. Compare candidate events by time proximity, direction of movement, object/person description, color, make/model when visible, and repeated distinctive features.
 5. Before saying a link is visually confirmed, call `describe_frame` on the relevant returned `detection_id` or frame image for each side of the link.

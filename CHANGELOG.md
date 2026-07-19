@@ -22,7 +22,12 @@ Scaffold for release notes; final prose to be assembled from commits
   `duration_sec`. Optional local V4L2/USB sources can be added as independent
   live channels, using the bundled FFmpeg runtime directly without Evo; their
   lack of recorder archive and bookmark delivery is reported explicitly.
-- **Agent:** persisted research continuation ledger, composite channel
+- **Agent:** activated runbooks (skills) now force-expose the tools they name
+  through the intent gate — previously RU phrasings of a runbook's own trigger
+  phrases could inject the runbook while exposing zero tools; runbook SKILL.md
+  steps now name their tools explicitly (`multi_channel_event_sweep`,
+  `cross_channel_correlation`, `video_incident_timeline`). Persisted research
+  continuation ledger, composite channel
   inventory, shared LM admission queue, context/token budget observability
   (`estimated_context_tokens`); an approval-gated post-upgrade command can now
   audit and durably restore missing L2/L3 semantic history from archived L0
