@@ -448,6 +448,7 @@
     const LM_AUTO_MODEL_LABEL = 'Auto balance';
     let lmModelCatalog = {
         models: [],
+        profiles: [],
         defaultModel: '',
         autoModelSelector: LM_AUTO_MODEL_SELECTOR,
         autoModelLabel: LM_AUTO_MODEL_LABEL,
@@ -474,6 +475,24 @@
         return out;
     }
 
+    function lmProfileForSelector(value) {
+        const normalized = normalizeModelId(value);
+        if (!normalized) return null;
+        const profiles = Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [];
+        return profiles.find((profile) => {
+            const selector = normalizeModelId(profile && (profile.selector || profile.id));
+            return selector && selector === normalized;
+        }) || null;
+    }
+
+    function lmModelOptionLabel(modelId) {
+        const profile = lmProfileForSelector(modelId);
+        if (!profile) return modelId;
+        const resolved = normalizeModelId(profile.model);
+        if (!resolved || resolved === modelId) return modelId;
+        return `${modelId} (${resolved})`;
+    }
+
     function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '', optionsConfig = {}) {
         if (!(selectEl instanceof HTMLSelectElement)) return;
         const includeAuto = Boolean(optionsConfig.includeAuto);
@@ -492,7 +511,9 @@
         }
         selectEl.innerHTML = options
             .map((modelId) => {
-                const label = includeAuto && modelId === autoSelector ? autoLabel : modelId;
+                const label = includeAuto && modelId === autoSelector
+                    ? autoLabel
+                    : lmModelOptionLabel(modelId);
                 return `<option value="${escapeHtml(modelId)}">${escapeHtml(label)}</option>`;
             })
             .join('');
@@ -552,6 +573,9 @@
                 }
                 lmModelCatalog = {
                     models: uniqueModelIds(data.models || []),
+                    profiles: Array.isArray(data.profiles)
+                        ? data.profiles.filter((profile) => profile && typeof profile === 'object')
+                        : [],
                     defaultModel: normalizeModelId(data.default_model),
                     agentDefaultModel: normalizeModelId(data.agent_default_model),
                     offlineDefaultModel: normalizeModelId(data.offline_default_model),
@@ -571,6 +595,7 @@
                         luxriotLiveModelInput ? luxriotLiveModelInput.value : '',
                         videoModelInput ? videoModelInput.value : '',
                     ),
+                    profiles: Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [],
                     defaultModel: normalizeModelId(lmModelCatalog.defaultModel || ''),
                     agentDefaultModel: normalizeModelId(lmModelCatalog.agentDefaultModel || ''),
                     offlineDefaultModel: normalizeModelId(lmModelCatalog.offlineDefaultModel || ''),
@@ -678,6 +703,12 @@
             authCurrentUser = data.user || null;
             setAuthGateVisible(false);
             syncUiAccess();
+            void loadLmModelCatalog().then((catalog) => {
+                if (catalog && catalog.source === 'fallback') {
+                    return loadLmModelCatalog(true);
+                }
+                return catalog;
+            }).catch(() => {});
             if (authTokenBtn && authCurrentUser) {
                 authTokenBtn.title = `${authCurrentUser.displayName || authCurrentUser.username} · Sign out`;
                 authTokenBtn.style.opacity = '1';
@@ -14311,19 +14342,39 @@
             } catch(_) { return ''; }
         }
 
+        function agentModelDescription(data, fallbackModel = '') {
+            const resolved = normalizeModelId(data && data.resolved_model);
+            const selector = normalizeModelId(data && data.model) || normalizeModelId(fallbackModel);
+            const profileId = normalizeModelId(data && data.profile_id);
+            const model = resolved || selector || 'default';
+            if (profileId && selector === profileId && resolved && resolved !== profileId) {
+                return `${model} (profile ${profileId})`;
+            }
+            return model;
+        }
+
+        function agentApplyConfigToInput(data) {
+            const input = elAgentModelInput();
+            if (!input) return;
+            setModelSelectOptions(input, data.model || data.default_model || '');
+            const defaultDescription = normalizeModelId(data.default_resolved_model)
+                || normalizeModelId(data.default_model)
+                || 'n/a';
+            input.title = data.source === 'runtime_override'
+                ? `Runtime override active. Default: ${defaultDescription}`
+                : `Using default model: ${defaultDescription}`;
+        }
+
         async function agentLoadConfig() {
             try {
-                await loadLmModelCatalog();
+                const catalog = await loadLmModelCatalog();
+                if (catalog && catalog.source === 'fallback') {
+                    await loadLmModelCatalog(true);
+                }
                 const r = await fetch('/agent/config');
                 if (!r.ok) return;
                 const data = await r.json();
-                const input = elAgentModelInput();
-                if (input) {
-                    setModelSelectOptions(input, data.model || data.default_model || '');
-                    input.title = data.source === 'runtime_override'
-                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
-                        : `Using default model: ${data.default_model || 'n/a'}`;
-                }
+                agentApplyConfigToInput(data);
             } catch(e) {
                 console.warn('agent: failed to load config', e);
             }
@@ -14346,13 +14397,8 @@
                 if (!r.ok || data.error) {
                     throw new Error(data.error || 'Failed to save agent model');
                 }
-                if (input) {
-                    setModelSelectOptions(input, data.model || model || data.default_model || '');
-                    input.title = data.source === 'runtime_override'
-                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
-                        : `Using default model: ${data.default_model || 'n/a'}`;
-                }
-                appendAgentNotice(`Agent model set to ${data.model || model || 'default'}`, 'success');
+                agentApplyConfigToInput(data);
+                appendAgentNotice(`Agent model set to ${agentModelDescription(data, model)}`, 'success');
             } catch (e) {
                 appendErrorToMessages(`Failed to set agent model: ${e.message}`);
             } finally {
