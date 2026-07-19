@@ -432,7 +432,13 @@ if [[ "${ACTIVE_RUNTIME_STATUS}" != "ready" ]]; then
   printf '      The update continues; post-update verification will accept the same pre-existing degraded dependencies.\n' >&2
 fi
 if [[ -n "${ACTIVE_RUNTIME_VERSION}" && "${ACTIVE_RUNTIME_VERSION}" != "${DEPLOYED_VERSION}" ]]; then
-  stop "active service reports ${ACTIVE_RUNTIME_VERSION}, but ${APP_DIR}/VERSION is ${DEPLOYED_VERSION}"
+  ENV_VERSION_OVERRIDE="$(read_env_value EVOSSEARCH_APP_VERSION)"
+  if [[ -n "${ENV_VERSION_OVERRIDE}" && "${ENV_VERSION_OVERRIDE}" == "${ACTIVE_RUNTIME_VERSION}" ]]; then
+    ok "runtime reports ${ACTIVE_RUNTIME_VERSION} via the EVOSSEARCH_APP_VERSION override; code tree is ${DEPLOYED_VERSION}"
+  else
+    printf 'WARN: active service reports %s while %s/VERSION is %s; continuing (field builds may brand the runtime version differently).\n' \
+      "${ACTIVE_RUNTIME_VERSION}" "${APP_DIR}" "${DEPLOYED_VERSION}" >&2
+  fi
 fi
 
 EXPECTED_AGENT_CONTEXT=65536

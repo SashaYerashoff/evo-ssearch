@@ -51,7 +51,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("selected config does not match the active runtime agent profile", SCRIPT)
         self.assertIn("selected config does not match the active Luxriot endpoint", SCRIPT)
         self.assertIn("never rewrites model or server endpoints", SCRIPT)
-        self.assertIn("active service reports ${ACTIVE_RUNTIME_VERSION}", SCRIPT)
+        self.assertIn("WARN: active service reports %s while %s/VERSION is %s", SCRIPT)
         self.assertIn("--verified-adopt-existing-config", SCRIPT)
 
     def test_adopt_update_never_migrates_or_dumps_database(self):
@@ -140,6 +140,11 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertNotIn("restore readiness first", SCRIPT)
         self.assertIn("POST_UPDATE_DEGRADED=true", SCRIPT)
         self.assertIn("matching the pre-update state", SCRIPT)
+
+    def test_branded_runtime_version_mismatch_warns_instead_of_stopping(self):
+        self.assertNotIn('stop "active service reports', SCRIPT)
+        self.assertIn("via the EVOSSEARCH_APP_VERSION override", SCRIPT)
+        self.assertIn("field builds may brand the runtime version differently", SCRIPT)
 
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')

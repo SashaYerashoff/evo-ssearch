@@ -496,20 +496,32 @@
     function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '', optionsConfig = {}) {
         if (!(selectEl instanceof HTMLSelectElement)) return;
         const includeAuto = Boolean(optionsConfig.includeAuto);
+        const keepUnavailableSelection = Boolean(optionsConfig.keepUnavailableSelection);
         const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
         const autoLabel = normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL);
         const selected = normalizeModelId(selectedValue);
         const fallback = normalizeModelId(fallbackValue || lmModelCatalog.defaultModel);
+        const profiles = Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [];
+        // Offer only what is actually reachable right now: selectors of live
+        // profiles plus the models their servers report. Configured-but-down
+        // entries and stale localStorage values never become options.
+        const availableProfileSelectors = profiles
+            .filter((profile) => profile && profile.available && profile.enabled !== false)
+            .map((profile) => normalizeModelId(profile.selector || profile.id))
+            .filter(Boolean);
+        const servedModels = uniqueModelIds(lmModelCatalog.models || []);
         const options = includeAuto
-            ? uniqueModelIds(autoSelector, lmModelCatalog.models || [], selected, fallback)
-            : uniqueModelIds(lmModelCatalog.models || [], selected, fallback);
-        const nextValue = selected || (includeAuto ? autoSelector : '') || fallback || options[0] || '';
-        if (!options.length) {
+            ? uniqueModelIds(autoSelector, availableProfileSelectors, servedModels)
+            : uniqueModelIds(availableProfileSelectors, servedModels);
+        const unavailableSelected = Boolean(selected)
+            && !options.includes(selected)
+            && keepUnavailableSelection;
+        if (!options.length && !unavailableSelected) {
             selectEl.innerHTML = '<option value="">No models available</option>';
             selectEl.value = '';
             return;
         }
-        selectEl.innerHTML = options
+        let html = options
             .map((modelId) => {
                 const label = includeAuto && modelId === autoSelector
                     ? autoLabel
@@ -517,10 +529,18 @@
                 return `<option value="${escapeHtml(modelId)}">${escapeHtml(label)}</option>`;
             })
             .join('');
-        if (options.includes(nextValue)) {
-            selectEl.value = nextValue;
+        if (unavailableSelected) {
+            html += `<option value="${escapeHtml(selected)}">${escapeHtml(`${lmModelOptionLabel(selected)} (unavailable)`)}</option>`;
+        }
+        selectEl.innerHTML = html;
+        if (selected && (options.includes(selected) || unavailableSelected)) {
+            selectEl.value = selected;
+        } else if (includeAuto && options.includes(autoSelector)) {
+            selectEl.value = autoSelector;
+        } else if (fallback && options.includes(fallback)) {
+            selectEl.value = fallback;
         } else {
-            selectEl.value = options[0];
+            selectEl.value = options[0] || '';
         }
     }
 
@@ -14356,7 +14376,9 @@
         function agentApplyConfigToInput(data) {
             const input = elAgentModelInput();
             if (!input) return;
-            setModelSelectOptions(input, data.model || data.default_model || '');
+            setModelSelectOptions(input, data.model || data.default_model || '', '', {
+                keepUnavailableSelection: true,
+            });
             const defaultDescription = normalizeModelId(data.default_resolved_model)
                 || normalizeModelId(data.default_model)
                 || 'n/a';

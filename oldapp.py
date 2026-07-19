@@ -5450,7 +5450,8 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
         fallback_models.append(agent_selector)
 
     payload: Dict[str, Any] = {
-        "models": fallback_models,
+        "models": [],
+        "configured_models": fallback_models,
         "default_model": default_model,
         "default_profile_id": str(default_profile.get("id") or "").strip(),
         "agent_default_model": agent_default_model,
@@ -5474,9 +5475,6 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
     fetched_any = False
     try:
         model_ids: List[str] = []
-        for candidate in fallback_models:
-            if candidate and candidate not in model_ids:
-                model_ids.append(candidate)
         available_by_profile: Dict[str, List[str]] = {}
         for profile in profiles:
             profile_id = str(profile.get("id") or "").strip()
@@ -5515,16 +5513,16 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
                     fetched_any = True
             except Exception as exc:
                 profile_errors[profile_id] = str(exc)
-        if available_by_profile:
-            by_id = {
-                str(profile.get("id") or ""): dict(profile)
-                for profile in payload["profiles"]
-                if isinstance(profile, Mapping)
-            }
-            for profile_id, models in available_by_profile.items():
-                if profile_id in by_id:
-                    by_id[profile_id]["available_models"] = models
-            payload["profiles"] = list(by_id.values())
+        annotated_profiles = []
+        for profile in payload["profiles"]:
+            if not isinstance(profile, Mapping):
+                continue
+            row = dict(profile)
+            profile_id = str(row.get("id") or "")
+            row["available_models"] = available_by_profile.get(profile_id, [])
+            row["available"] = bool(row["available_models"])
+            annotated_profiles.append(row)
+        payload["profiles"] = annotated_profiles
         payload.update({
             "models": model_ids,
             "source": "lm_profiles" if fetched_any else "fallback",
