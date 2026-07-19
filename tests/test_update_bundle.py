@@ -141,6 +141,16 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("POST_UPDATE_DEGRADED=true", SCRIPT)
         self.assertIn("matching the pre-update state", SCRIPT)
 
+    def test_dependency_import_preflight_gates_before_install_but_excludes_opencv(self):
+        preflight = SCRIPT.index("Python dependency preflight (read-only)")
+        confirmation = SCRIPT.index("Install %s now?")
+        self.assertLess(preflight, confirmation)
+        for module_name in ('"torch"', '"transformers"', '"clip"', '"faiss"', '"psycopg"', '"gunicorn"'):
+            self.assertIn(module_name, SCRIPT)
+        self.assertNotIn('"cv2"', SCRIPT)
+        self.assertIn("cannot import modules required by", SCRIPT)
+        self.assertIn("the bundled rescue wheel will be used", SCRIPT)
+
     def test_branded_runtime_version_mismatch_warns_instead_of_stopping(self):
         self.assertNotIn('stop "active service reports', SCRIPT)
         self.assertIn("via the EVOSSEARCH_APP_VERSION override", SCRIPT)

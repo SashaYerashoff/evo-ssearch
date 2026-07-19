@@ -618,6 +618,31 @@ else
 fi
 ok "model/server preflight finished; no configuration was or will be modified"
 
+say "Python dependency preflight (read-only)"
+printf 'Checking that the existing .venv can import every %s runtime dependency.\n' "${EXPECTED_VERSION}"
+printf 'OpenCV is deliberately excluded: the bundle deploys it into .eva-runtime/python when missing.\n'
+MISSING_IMPORTS="$(target_python - <<'PY'
+import importlib
+
+modules = [
+    "flask", "flask_cors", "dotenv", "numpy", "torch", "torchvision",
+    "PIL", "transformers", "clip", "faiss", "requests", "psutil",
+    "psycopg", "gunicorn",
+]
+missing = []
+for name in modules:
+    try:
+        importlib.import_module(name)
+    except Exception:
+        missing.append(name)
+print(",".join(missing))
+PY
+)"
+if [[ -n "${MISSING_IMPORTS}" ]]; then
+  stop "existing .venv cannot import modules required by ${EXPECTED_VERSION}: ${MISSING_IMPORTS}. The requirements files match, but these packages are not actually installed, and this adopt bundle carries no wheelhouse. Install them into the venv (or build a --with-wheelhouse bundle) before updating; nothing was changed."
+fi
+ok "existing .venv imports every ${EXPECTED_VERSION} runtime dependency (OpenCV comes from the bundle when needed)"
+
 CV_OVERLAY_REQUIRED=false
 if target_python - <<'PY' >/dev/null 2>&1
 import cv2
