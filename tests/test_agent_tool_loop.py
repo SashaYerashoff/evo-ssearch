@@ -218,6 +218,37 @@ class AgentToolLoopTests(unittest.TestCase):
         }
         self.assertEqual(exposed, set())
 
+    def test_write_tool_compaction_returns_stable_preview_envelope(self):
+        raw = {
+            "status": "preview",
+            "action": "create",
+            "exists": False,
+            "proposed": {"name": "visible fire or smoke", "channel_id": 7},
+            "conflicts": [{"id": f"p{i}", "name": f"probe {i}"} for i in range(12)],
+            "approval": {
+                "plan_id": "plan-123",
+                "action": "create_probe",
+                "expires_at": "2026-07-19T20:00:00+00:00",
+                "required_permission": "probes:manage",
+            },
+        }
+        compact = _compact_tool_result_for_model("create_probe", raw)
+        self.assertEqual(compact["status"], "preview")
+        self.assertEqual(compact["channel_id"], 7)
+        self.assertEqual(len(compact["conflicts"]), 8)
+        self.assertNotIn("approval", compact)
+        self.assertEqual(compact["action_plan"]["plan_id"], "plan-123")
+        self.assertEqual(compact["action_plan"]["status"], "awaiting_ui_apply")
+
+        deleted = _compact_tool_result_for_model(
+            "delete_probes",
+            {"status": "applied", "delete_all": False, "deleted": 2,
+             "targets": [{"id": "p1"}, {"id": "p2"}]},
+        )
+        self.assertEqual(deleted["deleted"], 2)
+        self.assertEqual(len(deleted["targets"]), 2)
+        self.assertNotIn("action_plan", deleted)
+
     def test_plain_chat_omits_empty_tools_payload(self):
         client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
 
