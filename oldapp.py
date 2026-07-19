@@ -10910,6 +10910,14 @@ def luxriot_summary_rollups():
     target_level = (request.args.get('target_level') or '').strip().upper() or None
     synthesize = str(request.args.get('synthesize') or '').strip().lower() in {'1', 'true', 'yes'}
     try:
+        # An explicit operator request (synthesize=1 with a target level, e.g.
+        # the "Generate" button) overrides the passive rollup-LLM level config:
+        # the config gates background synthesis cost, not on-demand commands.
+        force_levels = (
+            {target_level}
+            if synthesize and target_level in {"L1", "L2", "L3"}
+            else None
+        )
         rollups = luxriot_manager.summary_rollups(
             channel_id=channel_id,
             run_selector=run_selector,
@@ -10918,6 +10926,7 @@ def luxriot_summary_rollups():
             level_limit=level_limit,
             target_level=target_level,
             synthesize=synthesize,
+            force_synthesis_levels=force_levels,
         )
         levels = rollups.get('levels') if isinstance(rollups, Mapping) else None
         if target_level and isinstance(levels, Mapping):

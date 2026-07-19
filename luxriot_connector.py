@@ -10790,8 +10790,9 @@ class LuxriotManager:
         node_children_pairs: Sequence[Tuple[Dict[str, Any], Sequence[Mapping[str, Any]]]],
         max_new: Optional[int] = None,
         workload_class: str = "rollup",
+        force_synthesis: bool = False,
     ) -> None:
-        if level not in self.rollup_llm_levels or not node_children_pairs:
+        if (level not in self.rollup_llm_levels and not force_synthesis) or not node_children_pairs:
             return
         remaining_budget = max(
             1,
@@ -11047,6 +11048,7 @@ class LuxriotManager:
         synthesize: bool = True,
         max_new: Optional[int] = None,
         workload_class: str = "rollup",
+        force_synthesis: bool = False,
     ) -> List[Dict[str, Any]]:
         if not source_nodes:
             return []
@@ -11133,9 +11135,9 @@ class LuxriotManager:
             )
             if alert_events:
                 out[-1]["alert_events"] = alert_events
-            if synthesize and level in self.rollup_llm_levels:
+            if synthesize and (level in self.rollup_llm_levels or force_synthesis):
                 llm_pairs.append((out[-1], children))
-        if synthesize and level in self.rollup_llm_levels and llm_pairs:
+        if synthesize and (level in self.rollup_llm_levels or force_synthesis) and llm_pairs:
             self._apply_rollup_llm_summaries(
                 channel_id=channel_id,
                 level=level,
@@ -11143,6 +11145,7 @@ class LuxriotManager:
                 node_children_pairs=llm_pairs,
                 max_new=max_new,
                 workload_class=workload_class,
+                force_synthesis=force_synthesis,
             )
         return out
 
@@ -12891,6 +12894,7 @@ class LuxriotManager:
         target_level: Optional[str] = None,
         synthesize_levels: Optional[Set[str]] = None,
         max_new_per_level: Optional[int] = None,
+        force_synthesis_levels: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         aggregation_started = time.monotonic()
         raw_target_level = str(target_level or "").strip().upper()
@@ -12902,11 +12906,19 @@ class LuxriotManager:
             for level in (synthesize_levels or set())
             if self._normalize_rollup_level(level) in {"L1", "L2", "L3"}
         }
+        forced_synthesis_levels = {
+            self._normalize_rollup_level(level)
+            for level in (force_synthesis_levels or set())
+            if self._normalize_rollup_level(level) in {"L1", "L2", "L3"}
+        }
 
         def should_synthesize(level: str) -> bool:
             if not synthesize:
                 return False
             return not requested_synthesis_levels or level in requested_synthesis_levels
+
+        def synthesis_forced(level: str) -> bool:
+            return synthesize and level in forced_synthesis_levels
 
         target_rank = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(
             requested_target or "L3",
@@ -12955,8 +12967,9 @@ class LuxriotManager:
                 source_level="L0",
                 window_sec=self.rollup_windows["L1"],
                 source_nodes=l0_nodes,
-                synthesize=should_synthesize("L1"),
+                synthesize=should_synthesize("L1") or synthesis_forced("L1"),
                 max_new=max_new_per_level,
+                force_synthesis=synthesis_forced("L1"),
             )
             l1_nodes = self._merge_rollup_rows(l1_nodes, stored_by_level["L1"])
         if target_rank >= 2:
@@ -12966,8 +12979,9 @@ class LuxriotManager:
                 source_level="L1",
                 window_sec=self.rollup_windows["L2"],
                 source_nodes=l1_nodes,
-                synthesize=should_synthesize("L2"),
+                synthesize=should_synthesize("L2") or synthesis_forced("L2"),
                 max_new=max_new_per_level,
+                force_synthesis=synthesis_forced("L2"),
             )
             l2_nodes = self._merge_rollup_rows(l2_nodes, stored_by_level["L2"])
         if target_rank >= 3:
@@ -12977,8 +12991,9 @@ class LuxriotManager:
                 source_level="L2",
                 window_sec=self.rollup_windows["L3"],
                 source_nodes=l2_nodes,
-                synthesize=should_synthesize("L3"),
+                synthesize=should_synthesize("L3") or synthesis_forced("L3"),
                 max_new=max_new_per_level,
+                force_synthesis=synthesis_forced("L3"),
             )
             l3_nodes = self._merge_rollup_rows(l3_nodes, stored_by_level["L3"])
 

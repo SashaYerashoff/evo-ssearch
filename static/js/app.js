@@ -12953,6 +12953,57 @@
         if (archiveReviewFilmstrip) archiveReviewFilmstrip.innerHTML = '';
     }
 
+    async function archiveReviewHydrateBaseResult(context) {
+        // Rows rebuilt from a stored agent session carry only the compact
+        // model envelope (no payload.summary / batch bounds). Re-fetch the
+        // full detection so the summary and filmstrip work after reload.
+        const result = context && context.baseResult;
+        if (!result || !isVideoArchiveResult(result)) return;
+        const payload = archiveResultPayload(result);
+        if (payload.summary || Number.isFinite(Number(payload.batch_start_ms))) return;
+        const detectionId = result.detection_id ?? result.id;
+        const channelId = Number(result.channel_id);
+        const timestampMs = Number(result.timestamp_ms ?? payload.frame_timestamp_ms);
+        if (detectionId == null || !Number.isFinite(channelId) || !Number.isFinite(timestampMs)) return;
+        const params = new URLSearchParams({
+            channel_id: String(Math.trunc(channelId)),
+            since_ms: String(Math.trunc(timestampMs) - 1500),
+            until_ms: String(Math.trunc(timestampMs) + 1500),
+            limit: '50',
+            offset: '0',
+        });
+        const source = String(result.source || '').trim();
+        if (source) params.set('source', source);
+        try {
+            const response = await fetch(`/detections/list?${params.toString()}`);
+            const data = await parseApiJson(response, 'Failed to load archive detection');
+            const rows = normalizeDetectionResults(Array.isArray(data.detections) ? data.detections : []);
+            const match = rows.find((row) => String(row.detection_id ?? row.id ?? '') === String(detectionId));
+            if (!match) return;
+            const fullPayload = archiveResultPayload(match);
+            if (fullPayload && Object.keys(fullPayload).length) {
+                result.payload = fullPayload;
+                if (!result.summary && fullPayload.summary) result.summary = fullPayload.summary;
+            }
+            for (const key of ('thumbnail' in match ? ['thumbnail'] : [])) {
+                if (!result[key]) result[key] = match[key];
+            }
+            if (context === archiveReviewContext && archiveReviewSummary) {
+                const summary = archiveSummaryText(result);
+                const truncated = archiveResultPayload(result).summary_truncated;
+                archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
+            }
+        } catch (_) {
+            // Hydration is best-effort; the modal still shows the compact row.
+        }
+    }
+
+    async function archiveReviewPrepare(context) {
+        await archiveReviewHydrateBaseResult(context);
+        if (context !== archiveReviewContext) return;
+        await archiveReviewLoadBatchFrames(context);
+    }
+
     function openArchiveReviewModal(index, result) {
         if (!archiveReviewModal || !result) return;
         cancelArchiveReviewRequest();
@@ -12988,7 +13039,7 @@
         }
         archiveReviewRenderActiveFrame();
         archiveReviewModal.style.display = 'block';
-        void archiveReviewLoadBatchFrames(archiveReviewContext);
+        void archiveReviewPrepare(archiveReviewContext);
     }
 
     async function copyArchiveReviewSummary() {
