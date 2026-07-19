@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # One-command EVA AI 0.8.4 adopt upgrade from an unpacked offline bundle.
+#
+# Model/server policy: the preflight only *describes* the configured LM
+# topology (remote vLLM for VLM streams, local LM Studio/llama.cpp for the
+# agent). Configuration that cannot be verified produces warnings, never a
+# stop, and the updater never writes model or server settings.
 
 set -Eeuo pipefail
 umask 077
 
 EXPECTED_VERSION="β 0.8.4"
 EXPECTED_SCHEMA="20260614_0006"
-DEFAULT_AGENT_MODEL="qwen3.5-9b-mtp"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
@@ -420,8 +424,13 @@ ACTIVE_RUNTIME_AGENT_BASE_URL="${ACTIVE_RUNTIME_FACTS[4]:-}"
 ACTIVE_RUNTIME_LUXRIOT_BASE_URL="${ACTIVE_RUNTIME_FACTS[5]:-}"
 ACTIVE_RUNTIME_AGENT_MODEL="${ACTIVE_RUNTIME_FACTS[6]:-}"
 ok "active runtime identity loaded from /ready (${ACTIVE_RUNTIME_VERSION:-unknown version})"
-[[ "${ACTIVE_RUNTIME_STATUS}" == "ready" ]] \
-  || stop "installed EVA reports ${ACTIVE_RUNTIME_STATUS:-unknown} before upgrade; restore readiness first"
+PREUPGRADE_DEGRADED=false
+if [[ "${ACTIVE_RUNTIME_STATUS}" != "ready" ]]; then
+  PREUPGRADE_DEGRADED=true
+  printf 'WARN: installed EVA reports %s before upgrade (a dependency such as a remote VLM server may be offline).\n' \
+    "${ACTIVE_RUNTIME_STATUS:-unknown}" >&2
+  printf '      The update continues; post-update verification will accept the same pre-existing degraded dependencies.\n' >&2
+fi
 if [[ -n "${ACTIVE_RUNTIME_VERSION}" && "${ACTIVE_RUNTIME_VERSION}" != "${DEPLOYED_VERSION}" ]]; then
   stop "active service reports ${ACTIVE_RUNTIME_VERSION}, but ${APP_DIR}/VERSION is ${DEPLOYED_VERSION}"
 fi
@@ -437,8 +446,6 @@ if [[ "${APP_DIR}/.env" != "${ENV_FILE}" ]] && path_is_file "${APP_DIR}/.env"; t
   [[ -n "${LEGACY_AGENT_MODEL}" ]] \
     || LEGACY_AGENT_MODEL="$(read_env_file_value "${APP_DIR}/.env" EVOSSEARCH_LM_MODEL)"
 fi
-AGENT_MODEL_TO_PERSIST=""
-AGENT_MODEL_SOURCE=""
 SERVED_AGENT_MODELS=()
 SERVED_AGENT_CONTEXT="UNKNOWN"
 TEMPORARY_AGENT_CONTEXT=""
@@ -450,15 +457,22 @@ AGENT_LM_BASE_URL="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL)"
 AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_PROFILE_AGENT_API_KEY)"
 [[ -n "${AGENT_LM_API_KEY}" ]] || AGENT_LM_API_KEY="$(read_env_value EVOSSEARCH_LM_API_KEY)"
 LUXRIOT_BASE_URL="$(read_env_value EVOSSEARCH_LUXRIOT_BASE_URL)"
+ENDPOINTS_UNDERSTOOD=true
 if [[ -n "${ACTIVE_RUNTIME_AGENT_BASE_URL}" && -n "${AGENT_LM_BASE_URL}" \
   && "${ACTIVE_RUNTIME_AGENT_BASE_URL%/}" != "${AGENT_LM_BASE_URL%/}" ]]; then
-  stop "selected config does not match the active runtime agent profile (${AGENT_LM_BASE_URL%/} != ${ACTIVE_RUNTIME_AGENT_BASE_URL%/})"
+  ENDPOINTS_UNDERSTOOD=false
+  printf 'WARN: selected config does not match the active runtime agent profile (%s != %s).\n' \
+    "${AGENT_LM_BASE_URL%/}" "${ACTIVE_RUNTIME_AGENT_BASE_URL%/}" >&2
+  printf '      Continuing; this updater never rewrites model or server endpoints, so the running configuration stays authoritative.\n' >&2
 fi
 if [[ -n "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL}" && -n "${LUXRIOT_BASE_URL}" \
   && "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL%/}" != "${LUXRIOT_BASE_URL%/}" ]]; then
-  stop "selected config does not match the active Luxriot endpoint"
+  ENDPOINTS_UNDERSTOOD=false
+  printf 'WARN: selected config does not match the active Luxriot endpoint; continuing without changing it.\n' >&2
 fi
-ok "selected config matches the active runtime endpoints"
+if [[ "${ENDPOINTS_UNDERSTOOD}" == true ]]; then
+  ok "selected config matches the active runtime endpoints"
+fi
 if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
   CONTEXT_FORCE_REQUIRED=true
   TEMPORARY_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT}"
@@ -516,34 +530,87 @@ PY
   rm -f "${AGENT_MODELS_BODY}"
 fi
 
+say "Model/server configuration preflight (read-only)"
+printf 'This updater never writes model or server settings; every finding below is informational.\n'
 if [[ -z "${CONFIGURED_AGENT_MODEL}" ]]; then
   if [[ -n "${LEGACY_AGENT_MODEL}" ]]; then
-    AGENT_MODEL_TO_PERSIST="${LEGACY_AGENT_MODEL}"
-    AGENT_MODEL_SOURCE="existing application .env"
-  elif [[ -n "${ACTIVE_RUNTIME_AGENT_MODEL}" ]]; then
-    AGENT_MODEL_TO_PERSIST="${ACTIVE_RUNTIME_AGENT_MODEL}"
-    AGENT_MODEL_SOURCE="active EVA runtime"
+    printf 'WARN: Agent model is set only in the legacy %s/.env (%s), not in %s; EVA keeps using its configured defaults.\n' \
+      "${APP_DIR}" "${LEGACY_AGENT_MODEL}" "${ENV_FILE}" >&2
   else
-    for served_model in "${SERVED_AGENT_MODELS[@]}"; do
-      if [[ "${served_model}" == "${DEFAULT_AGENT_MODEL}" ]]; then
-        AGENT_MODEL_TO_PERSIST="${served_model}"
-        AGENT_MODEL_SOURCE="Agent inference server"
-        break
-      fi
-    done
-    if [[ -z "${AGENT_MODEL_TO_PERSIST}" && "${#SERVED_AGENT_MODELS[@]}" -eq 1 ]]; then
-      AGENT_MODEL_TO_PERSIST="${SERVED_AGENT_MODELS[0]}"
-      AGENT_MODEL_SOURCE="only model served by Agent inference"
-    fi
+    printf 'WARN: no explicit Agent model in %s; EVA keeps using its configured profile defaults.\n' "${ENV_FILE}" >&2
   fi
-  if [[ -z "${AGENT_MODEL_TO_PERSIST}" ]]; then
-    AGENT_MODEL_TO_PERSIST="${DEFAULT_AGENT_MODEL}"
-    AGENT_MODEL_SOURCE="EVA AI 0.8.4 release default"
-    printf 'WARN: Agent model was not explicit and could not be discovered; adopting release default %s.\n' \
-      "${AGENT_MODEL_TO_PERSIST}" >&2
-  fi
-  ok "Agent model adopted from ${AGENT_MODEL_SOURCE}: ${AGENT_MODEL_TO_PERSIST}"
+else
+  ok "Agent model stays as configured: ${CONFIGURED_AGENT_MODEL}"
 fi
+describe_lm_profile() {
+  local profile_id="$1"
+  local env_id base_url model kind role models_body served_models
+  env_id="$(printf '%s' "${profile_id}" | sed -E 's/[^A-Za-z0-9]+/_/g; s/^_+//; s/_+$//' | tr '[:lower:]' '[:upper:]')"
+  base_url="$(read_env_value "EVOSSEARCH_LM_PROFILE_${env_id}_BASE_URL")"
+  [[ -n "${base_url}" ]] || base_url="$(read_env_value EVOSSEARCH_LM_BASE_URL)"
+  model="$(read_env_value "EVOSSEARCH_LM_PROFILE_${env_id}_MODEL")"
+  [[ -n "${model}" ]] || model="$(read_env_value EVOSSEARCH_LM_MODEL)"
+  kind="$(read_env_value "EVOSSEARCH_LM_PROFILE_${env_id}_KIND")"
+  case "${kind}" in
+    vlm|vision|video) role="VLM stream inference (typically a dedicated vLLM server)" ;;
+    agent) role="Agent reasoning (typically LM Studio or llama.cpp beside EVA)" ;;
+    *) role="general" ;;
+  esac
+  printf 'Profile %-12s kind=%-8s base=%s model=%s\n' "${profile_id}" "${kind:-general}" \
+    "${base_url:-unset}" "${model:-unset}"
+  printf '  Role: %s\n' "${role}"
+  if [[ -z "${base_url}" ]]; then
+    printf 'WARN: profile %s has no base URL configured; skipping the reachability probe.\n' "${profile_id}" >&2
+    return 0
+  fi
+  models_body="$(mktemp)"
+  if curl -fsS --max-time 5 "${base_url%/}/models" > "${models_body}" 2>/dev/null; then
+    served_models="$(target_python - "${models_body}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    rows = [row for row in (payload.get("data") or []) if isinstance(row, dict)]
+    ids = []
+    for row in rows:
+        model_id = str(row.get("id") or row.get("model") or "").strip()
+        if model_id and model_id not in ids:
+            ids.append(model_id)
+    print(", ".join(ids))
+except Exception:
+    print("")
+PY
+)"
+    if [[ -n "${served_models}" ]]; then
+      printf '  Serving: %s\n' "${served_models}"
+      if [[ -n "${model}" ]] && ! printf '%s' "${served_models}" | grep -Fq "${model}"; then
+        printf 'WARN: profile %s is configured for model "%s" but the server at %s currently serves: %s.\n' \
+          "${profile_id}" "${model}" "${base_url%/}" "${served_models}" >&2
+        printf '      Continuing; verify the intended model is loaded after the update.\n' >&2
+      fi
+    else
+      printf 'WARN: profile %s endpoint answered but reported no served models; continuing.\n' "${profile_id}" >&2
+    fi
+  else
+    printf 'WARN: could not reach %s for profile %s; continuing — the endpoint configuration will not be changed.\n' \
+      "${base_url%/}/models" "${profile_id}" >&2
+  fi
+  rm -f "${models_body}"
+}
+CONFIGURED_LM_PROFILE_IDS="$(read_env_value EVOSSEARCH_LM_PROFILES)"
+if [[ -n "${CONFIGURED_LM_PROFILE_IDS}" ]]; then
+  IFS=',' read -ra LM_PROFILE_ID_LIST <<< "${CONFIGURED_LM_PROFILE_IDS}"
+  for lm_profile_id in "${LM_PROFILE_ID_LIST[@]}"; do
+    lm_profile_id="$(printf '%s' "${lm_profile_id}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [[ -n "${lm_profile_id}" ]] || continue
+    describe_lm_profile "${lm_profile_id}"
+  done
+else
+  printf 'WARN: EVOSSEARCH_LM_PROFILES is not set in %s; EVA runs on the single default LM profile.\n' "${ENV_FILE}" >&2
+fi
+ok "model/server preflight finished; no configuration was or will be modified"
 
 CV_OVERLAY_REQUIRED=false
 if target_python - <<'PY' >/dev/null 2>&1
@@ -644,11 +711,7 @@ DRY_RUN=(
   --unit-file "${UNIT_FILE}"
   --base-url "${BASE_URL}"
 )
-DRY_RUN_COMMAND=()
-if [[ -n "${AGENT_MODEL_TO_PERSIST}" ]]; then
-  DRY_RUN_COMMAND=(env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=${AGENT_MODEL_TO_PERSIST}")
-fi
-DRY_RUN_COMMAND+=("${DRY_RUN[@]}")
+DRY_RUN_COMMAND=("${DRY_RUN[@]}")
 if [[ "${MODE}" == "user" ]]; then
   say "Local rehearsal preflight"
   printf 'WARN: user-systemd dev mode skips the production credential-placeholder policy.\n'
@@ -869,7 +932,7 @@ else
   as_root "${MEDIA_INSTALL[@]}"
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" "${AGENT_MODEL_TO_PERSIST}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" <<'PY'
 import os
 import re
 import stat
@@ -882,7 +945,6 @@ version = sys.argv[2]
 marker_path = Path(sys.argv[3])
 bundle_commit = sys.argv[4]
 temporary_agent_context = sys.argv[5].strip()
-adopted_agent_model = sys.argv[6].strip()
 original = path.read_text(encoding="utf-8")
 replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
 updated, count = re.subn(
@@ -901,17 +963,6 @@ if temporary_agent_context:
     )
     if count == 0:
         updated = updated.rstrip("\n") + "\n" + context_replacement + "\n"
-if adopted_agent_model:
-    if any(char in adopted_agent_model for char in "\r\n\x00"):
-        raise SystemExit("unsafe Agent model value")
-    model_replacement = f"EVOSSEARCH_LM_PROFILE_AGENT_MODEL={adopted_agent_model}"
-    updated, count = re.subn(
-        r"(?m)^[ \t]*EVOSSEARCH_LM_PROFILE_AGENT_MODEL[ \t]*=.*$",
-        model_replacement,
-        updated,
-    )
-    if count == 0:
-        updated = updated.rstrip("\n") + "\n" + model_replacement + "\n"
 st = path.stat()
 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -951,10 +1002,16 @@ esac
 say "Starting and checking EVA AI"
 systemctl_write start "${SERVICE_NAME}.service"
 READY_JSON=""
+POST_UPDATE_DEGRADED=false
 READY_DEADLINE=$((SECONDS + 240))
 while (( SECONDS < READY_DEADLINE )); do
   if READY_JSON="$(curl -skfS --max-time 5 "${BASE_URL}/ready?load=1" 2>/dev/null)"; then
     if printf '%s' "${READY_JSON}" | ready_json_matches_version "${EXPECTED_VERSION}"; then
+      break
+    fi
+    if [[ "${PREUPGRADE_DEGRADED}" == true ]] \
+      && printf '%s' "${READY_JSON}" | ready_json_reports_version "${EXPECTED_VERSION}"; then
+      POST_UPDATE_DEGRADED=true
       break
     fi
   fi
@@ -971,6 +1028,10 @@ ROLLBACK_ARMED=false
 
 printf '\n============================================================\n'
 printf 'OK: EVA AI %s is up and running\n' "${EXPECTED_VERSION}"
+if [[ "${POST_UPDATE_DEGRADED}" == true ]]; then
+  printf 'WARN: /ready is degraded, matching the pre-update state (an external dependency such as the VLM server is still unavailable).\n'
+  printf '      Model and server settings were not changed by this update.\n'
+fi
 printf 'URL: %s\n' "${BASE_URL}"
 printf 'Service: %s.service (%s systemd)\n' "${SERVICE_NAME}" "${MODE}"
 if [[ -n "${TEMPORARY_AGENT_CONTEXT}" ]]; then

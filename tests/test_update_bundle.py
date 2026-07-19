@@ -50,6 +50,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("active runtime identity loaded from /ready", SCRIPT)
         self.assertIn("selected config does not match the active runtime agent profile", SCRIPT)
         self.assertIn("selected config does not match the active Luxriot endpoint", SCRIPT)
+        self.assertIn("never rewrites model or server endpoints", SCRIPT)
         self.assertIn("active service reports ${ACTIVE_RUNTIME_VERSION}", SCRIPT)
         self.assertIn("--verified-adopt-existing-config", SCRIPT)
 
@@ -114,17 +115,31 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("unknown agent context declined; nothing was changed", SCRIPT)
         self.assertIn("Agent context: UNVERIFIED", SCRIPT)
 
-    def test_missing_agent_model_is_adopted_without_operator_shell_edits(self):
-        self.assertIn('DEFAULT_AGENT_MODEL="qwen3.5-9b-mtp"', SCRIPT)
-        self.assertIn('read_env_file_value "${APP_DIR}/.env" EVOSSEARCH_LM_PROFILE_AGENT_MODEL', SCRIPT)
-        self.assertIn('AGENT_MODEL_SOURCE="existing application .env"', SCRIPT)
-        self.assertIn('AGENT_MODEL_SOURCE="active EVA runtime"', SCRIPT)
-        self.assertIn('AGENT_MODEL_SOURCE="only model served by Agent inference"', SCRIPT)
-        self.assertIn('AGENT_MODEL_SOURCE="EVA AI 0.8.4 release default"', SCRIPT)
-        self.assertIn('env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=${AGENT_MODEL_TO_PERSIST}"', SCRIPT)
-        self.assertIn('adopted_agent_model = sys.argv[6].strip()', SCRIPT)
-        self.assertIn('EVOSSEARCH_LM_PROFILE_AGENT_MODEL={adopted_agent_model}', SCRIPT)
-        self.assertIn("Agent model adopted from", SCRIPT)
+    def test_update_never_writes_model_or_server_settings(self):
+        self.assertNotIn("DEFAULT_AGENT_MODEL", SCRIPT)
+        self.assertNotIn("AGENT_MODEL_TO_PERSIST", SCRIPT)
+        self.assertNotIn("adopted_agent_model", SCRIPT)
+        self.assertNotIn("EVOSSEARCH_LM_PROFILE_AGENT_MODEL={", SCRIPT)
+        self.assertNotIn('env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=', SCRIPT)
+        self.assertIn("no configuration was or will be modified", SCRIPT)
+
+    def test_model_preflight_describes_topology_and_warns_instead_of_stopping(self):
+        preflight = SCRIPT.index("Model/server configuration preflight (read-only)")
+        confirmation = SCRIPT.index("Install %s now?")
+        self.assertLess(preflight, confirmation)
+        self.assertIn("describe_lm_profile", SCRIPT)
+        self.assertIn("EVOSSEARCH_LM_PROFILES", SCRIPT)
+        self.assertIn("dedicated vLLM server", SCRIPT)
+        self.assertIn("LM Studio or llama.cpp beside EVA", SCRIPT)
+        self.assertIn("but the server at %s currently serves", SCRIPT)
+        self.assertIn("could not reach %s for profile %s; continuing", SCRIPT)
+        self.assertIn("EVA keeps using its configured profile defaults", SCRIPT)
+
+    def test_degraded_runtime_warns_and_is_accepted_after_update(self):
+        self.assertIn("PREUPGRADE_DEGRADED=true", SCRIPT)
+        self.assertNotIn("restore readiness first", SCRIPT)
+        self.assertIn("POST_UPDATE_DEGRADED=true", SCRIPT)
+        self.assertIn("matching the pre-update state", SCRIPT)
 
     def test_system_update_authenticates_before_confirmation_and_stop(self):
         sudo_check = SCRIPT.index('sudo -v || stop "sudo authentication failed; service was not stopped"')
