@@ -2194,13 +2194,20 @@ class AgentTools:
             coverage_raw = results.get("coverage")
             coverage = dict(coverage_raw) if isinstance(coverage_raw, Mapping) else None
             results = results.get("results") if isinstance(results.get("results"), list) else []
+        # `coverage` is ordered before the (potentially large) `results` list
+        # on purpose: the security-layer output sanitizer enforces a shared
+        # item budget across the whole dict and stops once it is spent, so a
+        # coverage-honesty field placed after a big list can be silently
+        # dropped by row count alone, before size is the issue. See
+        # agent_security/eva_adapter.py's _max_output_items for the same
+        # class of bug and docs/tuktuk/grammar_review_questions.md.
         return {
             "scope": scope,
             "source": source,
             "source_label": _archive_source_label(source),
             "count": len(results),
-            "results": _strip_thumbnails([_annotate_archive_row(result) for result in results]),
             "coverage": coverage,
+            "results": _strip_thumbnails([_annotate_archive_row(result) for result in results]),
         }
 
     # ── get_visual_window_signals ─────────────────────────────────────────────

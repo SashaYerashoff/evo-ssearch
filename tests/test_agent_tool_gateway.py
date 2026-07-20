@@ -19,6 +19,8 @@ from agent_security import (
     ToolRegistry,
     ToolRisk,
 )
+from agent_security.eva_adapter import EvaAgentToolAdapter
+from agent_security.output import sanitize_output
 
 
 class _Clock:
@@ -521,6 +523,157 @@ class ToolGatewayTests(unittest.TestCase):
 
         self.assertEqual(self.calls, [])
         self.assertEqual(gateway.audit_events[0].phase, "allow")
+
+
+def _uncompacted_search_archive_row(index: int) -> dict:
+    """Mirror a real, un-compacted vlm_summary archive row (as produced by
+    agent._annotate_archive_row / oldapp._build_detection_search_result),
+    including a full payload with nested per-frame arrays. Compaction for
+    the model (_compact_search_result_for_model) trims this down, but the
+    security sanitizer runs on the *raw* result before compaction."""
+    return {
+        "path": None,
+        "filename": f"probe · 2026-07-19 20:3{index}:00",
+        "similarity": 0.15 + index * 0.001,
+        "score": 0.15 + index * 0.001,
+        "timestamp_ms": 1_784_493_000_000 + index * 60_000,
+        "source": "vlm_summary",
+        "source_label": "Video-description frame",
+        "archive_item_type": "video_description_frame",
+        "probe_id": None,
+        "probe_name": "VLM summary frame",
+        "channel_id": 112,
+        "severity": None,
+        "pos_score": 0.15,
+        "neg_score": 0.02,
+        "margin": 0.13,
+        "origin": "vlm_summary",
+        "shard_key": "112",
+        "search_mode": "clip",
+        "dino_fallback": True,
+        "detection_id": 3000 + index,
+        "id": 3000 + index,
+        "image_url": f"/detections/thumbnail/{3000 + index}",
+        "payload": {
+            "run_id": f"run-{index}",
+            "batch_start_ms": 1_784_493_000_000,
+            "batch_end_ms": 1_784_493_026_000,
+            "frame_index": index,
+            "frame_timestamp_ms": 1_784_493_000_000 + index * 2_000,
+            "anchor_role": "primary",
+            "alert_total": 0,
+            "alert_counts": {},
+            "summary_excerpt": "A person is seated at a desk " * 6,
+            "state_observations": [
+                {"key": f"obs_{i}", "value": f"val_{i}", "frame": i}
+                for i in range(12)
+            ],
+            "state_transition_events": [
+                {"from": "idle", "to": "typing", "frame": i} for i in range(6)
+            ],
+            "state_transition_total": 6,
+            "vector_signal": [0.01 * i for i in range(16)],
+        },
+    }
+
+
+class SearchArchiveCoverageBudgetTests(unittest.TestCase):
+    """Regression coverage for the search_archive coverage-honesty bug:
+    agent_security.output.sanitize_output enforces a shared item budget
+    across an entire tool result, walking dict keys in insertion order. A
+    12-row uncompacted search_archive result (full vlm_summary payload per
+    row) burns through the generic 500-item default before the sanitizer
+    reaches a trailing `coverage` key, silently dropping it and setting a
+    spurious `_truncated` flag on searches that were not actually
+    truncated — breaking the coverage-honesty gate
+    (docs/tuktuk/grammar_pin.md) for both the operator UI and the model.
+    See docs/tuktuk/grammar_review_questions.md (Resolved,
+    "search_archive coverage truncation")."""
+
+    def _build_result(self, n_rows: int = 12, *, coverage_last: bool = False) -> dict:
+        coverage = {
+            "candidate_limit": 20000,
+            "scanned_candidates": 1906,
+            "total_candidates": 1906,
+            "truncated": False,
+            "result_limit": n_rows,
+            "source": "vlm_summary",
+            "channel_id": 112,
+            "must_state_coverage": False,
+            "note": "Search ranked the full candidate set for the requested filters.",
+        }
+        rows = [_uncompacted_search_archive_row(i) for i in range(n_rows)]
+        head = {
+            "scope": "detections",
+            "source": "vlm_summary",
+            "source_label": "Video-description frame",
+            "count": n_rows,
+        }
+        # coverage_last=True reproduces agent.py's pre-fix key order
+        # (results before coverage); the default reproduces the fix.
+        return (
+            {**head, "results": rows, "coverage": coverage}
+            if coverage_last
+            else {**head, "coverage": coverage, "results": rows}
+        )
+
+    def test_adapter_budget_is_raised_for_search_archive(self) -> None:
+        self.assertEqual(EvaAgentToolAdapter._max_output_items("search_archive"), 4_000)
+
+    def test_old_order_and_default_budget_dropped_coverage(self) -> None:
+        # Proves the failure mode this fix addresses: with coverage placed
+        # after results (the pre-fix order) at the old shared generic
+        # budget, a full page of real-shaped rows exhausts the item budget
+        # before the sanitizer reaches the trailing coverage key.
+        policy = ToolPolicy(required_permission="detections.read", max_output_items=500)
+        sanitized = sanitize_output(self._build_result(coverage_last=True), policy)
+        self.assertNotIn("coverage", sanitized)
+        self.assertTrue(sanitized.get("_truncated"))
+
+    def test_raised_budget_preserves_coverage_honesty(self) -> None:
+        policy = ToolPolicy(
+            required_permission="detections.read",
+            max_output_items=EvaAgentToolAdapter._max_output_items("search_archive"),
+        )
+        sanitized = sanitize_output(self._build_result(), policy)
+        self.assertIn("coverage", sanitized)
+        self.assertEqual(sanitized["coverage"]["total_candidates"], 1906)
+        self.assertFalse(sanitized["coverage"]["truncated"])
+        self.assertNotIn("_truncated", sanitized)
+        self.assertEqual(len(sanitized["results"]), 12)
+
+    def test_search_archive_orders_coverage_before_results(self) -> None:
+        # Even at the raised budget, coverage must be ordered before the
+        # bulky results list: sanitize_output stops on a shared item
+        # counter, so if a future row grows large enough to exhaust even
+        # the raised budget, trailing keys are still the ones silently
+        # dropped. Exercises the real agent.py AgentTools._search_archive,
+        # not a test fixture, so a future reordering trips this test.
+        from agent import AgentTools
+
+        def fake_search_detections_fn(*, include_coverage=False, **_kwargs):
+            if include_coverage:
+                return {
+                    "results": [_uncompacted_search_archive_row(0)],
+                    "coverage": {"truncated": False, "scanned_candidates": 1},
+                }
+            return [_uncompacted_search_archive_row(0)]
+
+        tools = AgentTools(
+            detections_store=None,
+            probes_store=None,
+            luxriot_manager=None,
+            embed_text_fn=lambda _text: [0.0],
+            embed_image_fn=lambda _img: [0.0],
+            call_lm_fn=lambda _messages: "",
+            encode_jpeg_fn=lambda *_a, **_k: "",
+            search_indexed_folder_fn=lambda **_kwargs: [],
+            search_detections_fn=fake_search_detections_fn,
+        )
+        result = tools._search_archive({"query": "person at desk", "scope": "detections"})
+        keys = list(result.keys())
+        self.assertIn("coverage", keys)
+        self.assertLess(keys.index("coverage"), keys.index("results"))
 
 
 if __name__ == "__main__":

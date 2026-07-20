@@ -225,9 +225,23 @@ class EvaAgentToolAdapter:
         # be exhausted by coverage metadata before it reaches entries/image_url,
         # producing false empty summaries and blank UI previews. Bytes and row
         # limits remain independently bounded.
+        #
+        # search_archive has the identical shape: up to 48 uncompacted
+        # detection rows (each carrying its full vlm_summary/vlm_alert
+        # payload — state_observations/state_transition_events can be
+        # sizeable) followed by a trailing `coverage` object. The sanitizer
+        # walks keys in order and stops counting once the budget is spent,
+        # so a full page of rows silently ate `coverage` before the
+        # sanitizer ever reached it — both the operator UI and the model
+        # then saw "coverage: not reported" and a spurious `_truncated`
+        # flag on searches that were not actually truncated. This is a
+        # coverage-honesty gate (docs/tuktuk/grammar_pin.md); see
+        # docs/tuktuk/grammar_review_questions.md (Resolved,
+        # "search_archive coverage truncation").
         return {
             "get_video_summaries": 4_000,
             "list_video_summary_channels": 2_000,
+            "search_archive": 4_000,
         }.get(name, 500)
 
     @staticmethod

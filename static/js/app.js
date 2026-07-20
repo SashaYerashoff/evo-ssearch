@@ -14577,11 +14577,33 @@
             const el = elMessages();
             if (!el) return;
             el.innerHTML = '';
+            let bubble = null;
             for (const msg of messages) {
                 if (msg.role === 'user') {
+                    bubble = null;
                     appendUserBubble(msg.content, msg.created_at);
                 } else if (msg.role === 'assistant') {
-                    appendAssistantBubble(msg.content, msg.created_at);
+                    // Tool-call turns are stored as empty assistant messages;
+                    // reuse the open bubble so trace cards and the final answer
+                    // land in one bubble, matching the live stream layout.
+                    const text = String(msg.content || '').trim();
+                    if (!bubble) {
+                        bubble = appendAssistantBubble(msg.content, msg.created_at);
+                    } else if (text && !bubble.text) {
+                        bubble.textEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+                        bubble.text = text;
+                        syncAgentEvidenceIdCard(bubble);
+                    } else if (text) {
+                        bubble = appendAssistantBubble(msg.content, msg.created_at);
+                    }
+                } else if (msg.role === 'tool') {
+                    let result = msg.tool_result;
+                    if (typeof result === 'string') {
+                        try { result = JSON.parse(result); } catch (_) { result = null; }
+                    }
+                    if (result == null || typeof result !== 'object') continue;
+                    if (!bubble) bubble = appendAssistantBubble('', msg.created_at);
+                    appendActionCard(bubble, msg.tool_name || 'tool', result);
                 }
             }
             scrollToBottom(true);

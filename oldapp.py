@@ -5344,7 +5344,26 @@ def _get_agent_runner() -> Any:
                 return {"results": results, "coverage": coverage}
             return cast(List[Dict[str, Any]], payload)
 
+        def _agent_messages_contain_images(messages: List[Dict[str, Any]]) -> bool:
+            for message in messages:
+                content = message.get("content") if isinstance(message, Mapping) else None
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, Mapping) and str(part.get("type") or "") == "image_url":
+                        return True
+            return False
+
         def _agent_tool_lm_chat(messages: List[Dict[str, Any]]) -> str:
+            # The agent profile is a text model (e.g. qwen3.5-9b-mtp beside
+            # EVA); frame descriptions carry images and must go to the VLM
+            # profile, which serves the vision model (vLLM in the field).
+            if _agent_messages_contain_images(messages):
+                return _call_lm_chat(
+                    messages,
+                    profile_kind="vlm",
+                    workload_class="describe",
+                )
             return _call_lm_chat(
                 messages,
                 model_override=_agent_runtime_model_override,
