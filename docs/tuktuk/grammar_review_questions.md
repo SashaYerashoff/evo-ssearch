@@ -51,13 +51,44 @@ grammar and need Sasha-level review before the grammar or implementation moves.
   `list_video_summary_channels` in `eva_adapter.py`'s `_max_output_items`
   (see the comment there) -- `search_archive` was the one archive/detection
   tool with the coverage-tail shape that hadn't been covered by that bump.
-  Fix: (1) `search_archive` added to `_max_output_items` at 4,000, matching
-  the existing `get_video_summaries` precedent; (2) defense in depth,
-  `_search_archive`'s return dict now orders `coverage` before `results` so
-  a future oversized row set clips results, not the honesty-critical field.
-  `get_detections`/`build_research_batch` were checked and already order
-  metadata before their row arrays -- not affected. No tool schema, compact
-  envelope, or intent-group change. Regression tests:
-  `tests/test_agent_tool_gateway.py::SearchArchiveCoverageBudgetTests` (4
-  cases: raised budget, pre-fix-order failure repro, key-order assertion
-  against the real `AgentTools._search_archive`, adapter budget value).
+  Fix, part 1 (items): `search_archive` added to `_max_output_items` at
+  4,000, matching the existing `get_video_summaries` precedent; defense in
+  depth, `_search_archive`'s return dict now orders `coverage` before
+  `results` so a future oversized row set clips results, not the
+  honesty-critical field.
+
+  Fix, part 2 (bytes -- found while verifying part 1 against live repro
+  data): the item-count fix alone was not sufficient. `sanitize_output`
+  has a SECOND, independent cap -- `_bound_serialized` -- that replaces
+  the *entire* result with a useless `{"_truncated": true, "preview":
+  "<64KB of raw JSON>"}` envelope once serialized size exceeds
+  `max_output_bytes`, regardless of key order or the item budget. This
+  was a flat, hardcoded 96,000 bytes for every tool with no per-tool
+  override (unlike items/rows/timeout, which already had one). Measured
+  against live tbilisi-repro data: a `search_archive` page at its own
+  default (12 rows) serializes to ~141KB; `get_detections` at ITS default
+  page (20 rows) measures ~221KB, scaling to ~1MB at its max_rows=100.
+  Both routinely exceeded 96,000 bytes in ordinary operation -- not an
+  edge case. `get_detections` is one of the most frequently called tools,
+  so this was silently wiping a large fraction of ordinary calls to
+  `{}`-shaped nulls, independent of the search_archive-specific
+  coverage/results ordering issue. Added `_max_output_bytes` to
+  `EvaAgentToolAdapter`, mirroring the existing `_max_output_items`
+  pattern, wired into the `ToolPolicy` construction in place of the flat
+  constant. `search_archive` and `get_detections` both raised to
+  2,000,000 bytes (comfortable headroom over their measured max_rows
+  worst case); both also added to `_max_output_items` at 4,000.
+  `get_video_summaries`/`list_video_summary_channels` were measured too
+  (54KB/15KB at typical depth) and are not currently affected --
+  untouched. `build_research_batch` returned no rows for the args tried;
+  no live evidence of it being broken, left untouched pending a concrete
+  symptom. No tool schema, compact envelope, or intent-group change.
+
+  Regression tests: `tests/test_agent_tool_gateway.py::
+  SearchArchiveCoverageBudgetTests` (4 cases: raised item budget,
+  pre-fix-order failure repro, key-order assertion against the real
+  `AgentTools._search_archive`, adapter item-budget value) and
+  `::OutputByteBudgetTests` (4 cases: realistic-size fixture would have
+  been wiped at the old byte default even with the item fix applied,
+  raised byte budget preserves a realistic page, `get_detections` gets
+  both raised budgets, unlisted tools keep the conservative defaults).

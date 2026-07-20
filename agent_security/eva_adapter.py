@@ -180,7 +180,7 @@ class EvaAgentToolAdapter:
                     "time_window_seconds",
                     "window_seconds",
                 ),
-                max_output_bytes=96_000,
+                max_output_bytes=self._max_output_bytes(name),
                 max_output_items=self._max_output_items(name),
                 max_output_string_chars=24_000,
                 timeout_seconds=self._timeout_seconds(name),
@@ -226,10 +226,11 @@ class EvaAgentToolAdapter:
         # producing false empty summaries and blank UI previews. Bytes and row
         # limits remain independently bounded.
         #
-        # search_archive has the identical shape: up to 48 uncompacted
-        # detection rows (each carrying its full vlm_summary/vlm_alert
-        # payload — state_observations/state_transition_events can be
-        # sizeable) followed by a trailing `coverage` object. The sanitizer
+        # search_archive and get_detections have the identical shape: up to
+        # 48-100 uncompacted detection rows (each carrying its full
+        # vlm_summary/vlm_alert payload — state_observations/
+        # state_transition_events/vector_signal can be sizeable) followed by
+        # (for search_archive) a trailing `coverage` object. The sanitizer
         # walks keys in order and stops counting once the budget is spent,
         # so a full page of rows silently ate `coverage` before the
         # sanitizer ever reached it — both the operator UI and the model
@@ -242,7 +243,30 @@ class EvaAgentToolAdapter:
             "get_video_summaries": 4_000,
             "list_video_summary_channels": 2_000,
             "search_archive": 4_000,
+            "get_detections": 4_000,
         }.get(name, 500)
+
+    @staticmethod
+    def _max_output_bytes(name: str) -> int:
+        # Independent of _max_output_items: sanitize_output's final byte
+        # check (_bound_serialized) replaces the *entire* result with a
+        # useless {"_truncated": true, "preview": "<64KB of raw JSON>"}
+        # envelope once the serialized size exceeds this cap — wiping out
+        # coverage/count/scope alongside the rows, regardless of key order.
+        # Real archive rows run large (~9-11KB each with full vlm_summary
+        # payload/state arrays): search_archive at its default page (12
+        # rows) measured ~141KB, and get_detections at its own default
+        # (20 rows) measured ~221KB — both routinely exceeding the generic
+        # 96,000-byte default in normal operation, not just at max_rows.
+        # get_detections is one of the most frequently called tools, so
+        # this was silently returning an empty preview envelope on a large
+        # fraction of ordinary calls. See
+        # docs/tuktuk/grammar_review_questions.md (Resolved,
+        # "search_archive coverage truncation").
+        return {
+            "search_archive": 2_000_000,
+            "get_detections": 2_000_000,
+        }.get(name, 96_000)
 
     @staticmethod
     def _default_rows(name: str) -> int | None:

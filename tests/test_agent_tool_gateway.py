@@ -525,12 +525,27 @@ class ToolGatewayTests(unittest.TestCase):
         self.assertEqual(gateway.audit_events[0].phase, "allow")
 
 
-def _uncompacted_search_archive_row(index: int) -> dict:
+def _uncompacted_search_archive_row(index: int, *, realistic_size: bool = False) -> dict:
     """Mirror a real, un-compacted vlm_summary archive row (as produced by
     agent._annotate_archive_row / oldapp._build_detection_search_result),
     including a full payload with nested per-frame arrays. Compaction for
     the model (_compact_search_result_for_model) trims this down, but the
-    security sanitizer runs on the *raw* result before compaction."""
+    security sanitizer runs on the *raw* result before compaction.
+
+    realistic_size=True pads summary/state text to match measured live
+    repro rows (~10.5KB/row with real VLM-written prose), for tests that
+    exercise the byte budget specifically rather than the item-count one.
+    """
+    # Real captured VLM summaries run several sentences per section
+    # (scene description, activity description, "worth to remember");
+    # a single repeated short phrase understates real row size by ~5-10x.
+    summary_text = (
+        "### Scene description A person is seated at a desk in a dimly lit "
+        "room, facing a large monitor displaying lines of code. ### Activity "
+        "description The person remains seated and focused on the monitor "
+        "throughout the batch, with only minor shifts in posture. "
+        * (30 if realistic_size else 1)
+    )
     return {
         "path": None,
         "filename": f"probe · 2026-07-19 20:3{index}:00",
@@ -563,7 +578,7 @@ def _uncompacted_search_archive_row(index: int) -> dict:
             "anchor_role": "primary",
             "alert_total": 0,
             "alert_counts": {},
-            "summary_excerpt": "A person is seated at a desk " * 6,
+            "summary_excerpt": summary_text,
             "state_observations": [
                 {"key": f"obs_{i}", "value": f"val_{i}", "frame": i}
                 for i in range(12)
@@ -674,6 +689,73 @@ class SearchArchiveCoverageBudgetTests(unittest.TestCase):
         keys = list(result.keys())
         self.assertIn("coverage", keys)
         self.assertLess(keys.index("coverage"), keys.index("results"))
+
+
+class OutputByteBudgetTests(unittest.TestCase):
+    """Regression coverage for the second half of the coverage-truncation
+    bug: sanitize_output's byte cap (_bound_serialized) replaces the
+    *entire* result with a useless {"_truncated": true, "preview": "..."}
+    envelope once serialized size exceeds max_output_bytes — independent
+    of, and not helped by, the item-count budget or key ordering. A real
+    12-row search_archive page (measured against live repro data with
+    real VLM-written summaries) serializes to ~141KB; a real 20-row
+    get_detections page measures ~221KB. Both routinely exceeded the old
+    flat 96,000-byte default used for every tool. See
+    docs/tuktuk/grammar_review_questions.md (Resolved,
+    "search_archive coverage truncation")."""
+
+    def _search_archive_result(self, n_rows: int = 12) -> dict:
+        return {
+            "scope": "detections",
+            "source": "vlm_summary",
+            "source_label": "Video-description frame",
+            "count": n_rows,
+            "coverage": {"truncated": False, "scanned_candidates": 1906},
+            "results": [
+                _uncompacted_search_archive_row(i, realistic_size=True)
+                for i in range(n_rows)
+            ],
+        }
+
+    def test_default_byte_budget_would_have_wiped_a_realistic_page(self) -> None:
+        # Reproduces the exact live combination: the item budget is
+        # already raised (so it does not trim rows first and mask the
+        # byte cap), but max_output_bytes is still the generic default —
+        # matching the state search_archive was deployed in before this
+        # fix, where the item-count fix alone was not enough.
+        result = self._search_archive_result(12)
+        raw_bytes = len(json.dumps(result, default=str).encode("utf-8"))
+        self.assertGreater(raw_bytes, 96_000, "fixture should mirror the measured live payload size")
+        policy = ToolPolicy(
+            required_permission="detections.read",
+            max_output_bytes=96_000,
+            max_output_items=EvaAgentToolAdapter._max_output_items("search_archive"),
+        )
+        sanitized = sanitize_output(result, policy)
+        self.assertEqual(sanitized.get("_truncated"), True)
+        self.assertNotIn("results", sanitized)
+        self.assertNotIn("coverage", sanitized)
+
+    def test_raised_byte_budget_preserves_a_realistic_page(self) -> None:
+        result = self._search_archive_result(12)
+        policy = ToolPolicy(
+            required_permission="detections.read",
+            max_output_bytes=EvaAgentToolAdapter._max_output_bytes("search_archive"),
+            max_output_items=EvaAgentToolAdapter._max_output_items("search_archive"),
+        )
+        sanitized = sanitize_output(result, policy)
+        self.assertNotIn("_truncated", sanitized)
+        self.assertIn("coverage", sanitized)
+        self.assertEqual(sanitized["coverage"]["scanned_candidates"], 1906)
+        self.assertEqual(len(sanitized["results"]), 12)
+
+    def test_get_detections_gets_a_raised_byte_and_item_budget(self) -> None:
+        self.assertEqual(EvaAgentToolAdapter._max_output_bytes("get_detections"), 2_000_000)
+        self.assertEqual(EvaAgentToolAdapter._max_output_items("get_detections"), 4_000)
+
+    def test_unlisted_tools_keep_the_conservative_default(self) -> None:
+        self.assertEqual(EvaAgentToolAdapter._max_output_bytes("some_other_tool"), 96_000)
+        self.assertEqual(EvaAgentToolAdapter._max_output_items("some_other_tool"), 500)
 
 
 if __name__ == "__main__":
