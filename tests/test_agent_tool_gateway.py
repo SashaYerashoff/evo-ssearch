@@ -633,7 +633,7 @@ class SearchArchiveCoverageBudgetTests(unittest.TestCase):
         )
 
     def test_adapter_budget_is_raised_for_search_archive(self) -> None:
-        self.assertEqual(EvaAgentToolAdapter._max_output_items("search_archive"), 4_000)
+        self.assertEqual(EvaAgentToolAdapter._max_output_items("search_archive"), 50_000)
 
     def test_old_order_and_default_budget_dropped_coverage(self) -> None:
         # Proves the failure mode this fix addresses: with coverage placed
@@ -751,7 +751,7 @@ class OutputByteBudgetTests(unittest.TestCase):
 
     def test_get_detections_gets_a_raised_byte_and_item_budget(self) -> None:
         self.assertEqual(EvaAgentToolAdapter._max_output_bytes("get_detections"), 2_000_000)
-        self.assertEqual(EvaAgentToolAdapter._max_output_items("get_detections"), 4_000)
+        self.assertEqual(EvaAgentToolAdapter._max_output_items("get_detections"), 50_000)
 
     def test_unlisted_tools_keep_the_conservative_default(self) -> None:
         self.assertEqual(EvaAgentToolAdapter._max_output_bytes("some_other_tool"), 96_000)

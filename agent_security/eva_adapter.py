@@ -239,11 +239,22 @@ class EvaAgentToolAdapter:
         # coverage-honesty gate (docs/tuktuk/grammar_pin.md); see
         # docs/tuktuk/grammar_review_questions.md (Resolved,
         # "search_archive coverage truncation").
+        #
+        # Final search_archive/get_detections item counts, measured against live
+        # tbilisi-repro data at each tool's own max_rows ceiling
+        # (EvaAgentToolAdapter._max_rows): a full-size vlm_summary row with
+        # real (not placeholder) VLM-written text and state arrays consumes
+        # roughly 170-180 sanitizer "items" on its own -- 5x the ~35/row
+        # this budget was sized for from a synthetic test fixture at first.
+        # search_archive tops out at 48 rows (needs ~8,200 items; 20,000
+        # measured lossless). get_detections tops out at 100 rows (needs
+        # ~18,000 items; measured lossless only above 30,000). Both set to
+        # 50,000 for shared headroom against future payload growth.
         return {
             "get_video_summaries": 4_000,
             "list_video_summary_channels": 2_000,
-            "search_archive": 4_000,
-            "get_detections": 4_000,
+            "search_archive": 50_000,
+            "get_detections": 50_000,
         }.get(name, 500)
 
     @staticmethod

@@ -92,3 +92,17 @@ grammar and need Sasha-level review before the grammar or implementation moves.
   been wiped at the old byte default even with the item fix applied,
   raised byte budget preserves a realistic page, `get_detections` gets
   both raised budgets, unlisted tools keep the conservative defaults).
+
+  Fix, part 3 (items again -- found while verifying part 2 end-to-end in
+  the live UI): 4,000 items was itself sized from a synthetic test
+  fixture and was still too low. Measured against each tool's own
+  documented row ceiling with real (not placeholder) VLM-written text: a
+  full-size row consumes roughly 170-180 sanitizer items, not the ~35/row
+  the first estimate assumed. `search_archive` needs ~8,200 items at its
+  48-row ceiling; `get_detections` needs ~18,000 at its 100-row ceiling.
+  Both raised to 50,000 items for headroom. Verified end-to-end in the
+  live UI after this pass: a real 24-result archive search now shows
+  "Coverage: Search ranked the full candidate set... scanned 4018 of
+  4018 candidates" with no results silently dropped, and describe_frame
+  (separately routed to the VLM profile, see the sibling commit) returns
+  a real visual description instead of an LM 500 error.
