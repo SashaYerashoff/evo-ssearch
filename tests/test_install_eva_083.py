@@ -123,6 +123,13 @@ def make_options(
 
 
 class OfflineInstallerUnitTests(unittest.TestCase):
+    def test_release_identity_and_schema_match_the_current_tree(self):
+        self.assertEqual(
+            installer.EXPECTED_VERSION,
+            (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        )
+        self.assertEqual(installer.EXPECTED_SCHEMA, "20260726_0009")
+
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

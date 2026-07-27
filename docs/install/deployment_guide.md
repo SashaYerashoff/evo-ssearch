@@ -4,10 +4,12 @@ Third-party-shareable install guide for an EVA AI pilot on Ubuntu LTS. **Contain
 no client data** — all site specifics are placeholders. The filled, internal
 version lives in `install/field_rollout_demo.md` (not shared).
 
-For the reviewed β 0.8.4 source branch, exact clone, dry-run, apply, rollback,
-and verification commands are in the
-[Git Installation and Update Guide](git_install_084.md). Do not run `git pull`
-inside a live production checkout.
+For the reviewed β 0.8.5 source branch, release-specific migration and
+verification constraints are in the
+[β 0.8.5 release notes](../../readiness/RELEASE_NOTES_0.8.5.md). The older
+[0.8.4 Git guide](git_install_084.md) is historical and must not be reused as a
+0.8.5 upgrade recipe because 0.8.5 adds database migrations. Do not run
+`git pull` inside a live production checkout.
 
 Invariants: [facts](../00_CANON/facts.md). All variables:
 [config_reference](../00_CANON/config_reference.md). Production browser/internal
@@ -38,7 +40,7 @@ pip install --upgrade pip && pip install -r requirements.txt
 # create roles/schemas, then migrate to head
 set -a; . /etc/eva-ai/eva-ai.env; set +a
 alembic upgrade head
-alembic current   # expect: 20260614_0006
+alembic current   # expect: 20260726_0009
 ```
 
 Use `scripts/bootstrap_db_roles.py` for the separated runtime roles `[VERIFY]`.
@@ -114,6 +116,8 @@ Single worker is **required** (in-process schedulers). See
 - **Code-only patch** (e.g. β 0.8.1 → 0.8.2): apply files, restart. No migration.
 - **DB-touching patch:** run `alembic upgrade head` explicitly; the installer must
   refuse unsafe startup if DB revision < code-expected revision.
+- **β 0.8.4 → β 0.8.5:** back up PostgreSQL and apply Alembic revisions
+  `20260725_0007` through `20260726_0009`; this is not a code-only update.
 - Always reversible via `scripts/rollback.sh`.
 - For closed-network field patches via USB, follow the offline patch SOP
   (internal field-rollout doc).

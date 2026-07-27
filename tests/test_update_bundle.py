@@ -59,8 +59,13 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("--skip-pg-dump", SCRIPT)
         self.assertNotIn("--run-migrations", SCRIPT)
         self.assertIn("default_transaction_read_only=on", SCRIPT)
-        self.assertIn('${HOME}/.local/state/eva-ai/0.8.4-backups', SCRIPT)
+        self.assertIn('${HOME}/.local/state/eva-ai/0.8.5-backups', SCRIPT)
         self.assertIn('if [[ "${MODE}" == "user" ]]', SCRIPT)
+
+    def test_release_identity_and_schema_gate_match_the_current_tree(self):
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertIn(f'EXPECTED_VERSION="{version}"', SCRIPT)
+        self.assertIn('EXPECTED_SCHEMA="20260726_0009"', SCRIPT)
 
     def test_human_confirmation_and_restart_are_separate(self):
         confirmation = SCRIPT.index("Install %s now?")

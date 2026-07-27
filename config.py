@@ -140,7 +140,7 @@ def _get_lm_profiles(
     return profiles
 
 
-def _get_app_version(default: str = "β 0.8.1") -> str:
+def _get_app_version(default: str = "β 0.8.5") -> str:
     env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
     if env_value:
         return env_value

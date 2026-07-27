@@ -7,17 +7,17 @@ fact changes, change it here first.
 Markers: `[FIELD]` = client-specific, filled only in the internal field-rollout
 doc, never in shareable docs. `[VERIFY]` = confirm before relying on it.
 
-Last reviewed: 2026-07-13 (β 0.8.4)
+Last reviewed: 2026-07-27 (β 0.8.5)
 
 ## Product & version
 
 | Fact | Value |
 |---|---|
 | Product | Luxriot EVA AI |
-| Current version | `β 0.8.4` |
+| Current version | `β 0.8.5` |
 | Release class | Production-pilot beta (supervised, closed network) |
 | Version source of truth | `VERSION` file; `EVOSSEARCH_APP_VERSION` overrides only if set |
-| Previous baseline | `β 0.8.3` |
+| Previous baseline | `β 0.8.4` |
 
 ## Database
 

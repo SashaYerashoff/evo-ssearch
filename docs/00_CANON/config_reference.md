@@ -9,7 +9,7 @@ the human reference. Secrets
 Defaults shown are the code defaults, not the pilot values. Pilot/field values
 live in the internal field-rollout doc with `[FIELD]` markers.
 
-Last reviewed: 2026-07-11 (β 0.8.3 stabilization RC)
+Last reviewed: 2026-07-27 (β 0.8.5 release preparation)
 
 ## Secure-pilot required set
 

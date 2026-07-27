@@ -48,11 +48,11 @@ def _expected_version() -> str:
         text = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
         text = ""
-    return text or "β 0.8.4"
+    return text or "β 0.8.5"
 
 
 EXPECTED_VERSION = _expected_version()
-EXPECTED_SCHEMA = "20260614_0006"
+EXPECTED_SCHEMA = "20260726_0009"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
