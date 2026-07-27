@@ -46,10 +46,12 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 1. Pull snapshot at `SNAPSHOT_INTERVAL`; CLIP-embed it (feeds the probe buffer).
 2. When the batch fills (default 12 frames), build a summary batch.
 3. Dispatch to the VLM (synchronous by default; durable queue available but off).
-4. VLM returns a description + optional `ALERTS_JSON`.
-5. Accept: parse alerts → optional Luxriot bookmark (gated, instrumented); sample
-   frames into the archive (CLIP-indexed); record into per-channel history
-   (frame-time anchored; debounced persist; merge does not re-parse full history).
+4. VLM returns a description plus one `BATCH_STATE_JSON` block containing the
+   cover, episode state, memory pass, observations, and zero or more alerts.
+5. Accept: validate the unified batch state and snapshot references → optional
+   Luxriot bookmarks (gated, instrumented); retain the cover and evidence frames
+   under one stable batch id in the CLIP-indexed archive; record compact state
+   into per-channel history (frame-time anchored; debounced persist).
 
 **Aggregation**
 - L0 history → L1/L2/L3 rollups (deterministic + optional LLM synthesis).

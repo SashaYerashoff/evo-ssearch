@@ -125,19 +125,20 @@ provide recorder archive playback or an Evo bookmark destination.
 | `EVOSSEARCH_LUXRIOT_SUMMARY_QUEUE_MAX_BATCHES` (`2`) | Per-channel VLM summary backlog cap; live capture keeps refreshing while older queued batches may be dropped under load |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L1_WINDOW_SEC` (`900`) | L1 aggregation window and proactive cadence (15 min) |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L2_WINDOW_SEC` (`3600`) | L2 aggregation window and proactive cadence (60 min) |
-| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC` (`21600`) | L3 aggregation window and proactive cadence (6 h) |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC` (`28800`) | L3 aggregation window and proactive cadence (8 h) |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED` (`true`) | Build closed L1–L3 windows in the background instead of waiting for the first operator view |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC` (`30`) | Startup grace before staggered rollup work begins |
-| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum start-to-start spacing between channel/level rollup jobs (inference time counts toward it); deterministic channel phases spread fleet load and LM admission keeps interactive work ahead of rollups |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum start-to-start spacing between channel/level rollup jobs (inference time counts toward it); after the fast startup pass, recurring jobs align to canonical L1/L2/L3 window boundaries and deterministic channel phases spread fleet load |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS` (`2`) | Maximum newest missing windows synthesized by one scheduled level job while cached windows are skipped |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS` (`2`) | Maximum time, in target-level windows, that a saturated L0 queue may defer rollups before one job is admitted anyway; `0` disables deferral |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC` (`180`) | Absolute ceiling on that L0 deferral. This keeps L1 semantic windows from starving on a continuously busy shared model; `0` leaves only the window-based ceiling |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC` (`10`) | Minimum pause between post-upgrade historical restoration windows; live backlog still pauses the worker completely |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS` (`3`) | Bounded semantic retries per historical window before recording a failed gap and continuing |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC` (`45`) | Initial per-window ETA estimate until the durable worker measures the deployed LM |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL` (`agent` profile when configured) | Text-only L1–L3 model/profile selector; intentionally independent of each live channel's VLM selector |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
-| `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates |
+| `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates; the legacy-named alerts field now stores the unified `BATCH_STATE_JSON` contract |
 | `EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT` (`empty`) | Optional default operator alert criteria appended separately from role/summary prompt |
 | `EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED` (`true`) | Backend diff of L0 current-observed-state rows across batches |
 | `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES` (`2`) | Confirmation hysteresis before appearance/disappearance is emitted |
@@ -211,6 +212,7 @@ provide recorder archive playback or an Evo bookmark destination.
 | `EVOSSEARCH_LUXRIOT_CAPTURE_BURST_ZSCORE` (`6.0`) | Robust z-score over the channel's own measured activity baseline that marks a second as `burst` (motion peak wins outright, blur expected) |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR` (`0.004`) | Mean-abs grayscale delta below this is sensor noise, not motion; such seconds are `quiet` and ship the sharpest frame |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_BIAS` (`auto`) | Site default for the decider: `auto` (adaptive per-channel baseline), `action` (always motion peak), `clarity` (always sharpest). Per-channel override lives in channel prompt settings |
+| `EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_ENABLED` (`true`) | Site default for adaptive CV frame selection. Operators with prompt-management access can override it per channel in Live Stream Control; disabled channels use a deterministic temporal midpoint and pause homeostasis updates |
 
 The decider classifies every capture second as `quiet`/`normal`/`burst` relative to
 the channel's persisted motion baseline (homeostasis). `normal` seconds ship the
@@ -218,6 +220,30 @@ sharpest frame of the action band; `burst` seconds ship the motion peak and may
 attach one sharper companion frame of the same second (archived as
 `burst_companion`, offered to the VLM as one extra labeled snapshot). Burst/normal
 markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
+
+## Adaptive live attention
+
+| Var (default) | Notes |
+|---|---|
+| `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES` (`16`) | Hard upper bound for saved snapshots in one L0 VLM batch |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_WINDOW_SEC` (`60`) | Hard source/wall-clock deadline for a non-empty L0 batch |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_QUIET_CADENCE_SEC` (`5`) | Saved-snapshot cadence admitted to the VLM batch during quiet intervals |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC` (`2`) | Saved-snapshot cadence admitted during normal activity |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_BURST_CADENCE_SEC` (`1`) | Saved-snapshot cadence admitted during bursts |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED` (`false`) | Enable homeostatic CV/embedding attention telemetry and adaptive L0 frame admission |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED` (`false`) | Experimental sparse coordinator-owned VLM dispatch; normally off because L0 delivery is owned by the bounded per-channel batch accumulator |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS` (`false`) | Produce one sparse CLIP embedding per configured snapshot cadence for every live video channel |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED` (`false`) | Require PostgreSQL attention telemetry (`20260726_0008`) |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_RING_SECONDS` (`90`) | Bounded in-memory evidence ring; stores selected embedding frames, never dense CV frames |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE` (`6`) | Global VLM token-bucket refill rate across channels |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_OUTSTANDING` (`1`) | Global queued/in-flight VLM episode limit |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC` (`3`) | Burst post-roll collected before episode dispatch |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES` (`8`) | Maximum saved embedding frames in one episode |
+| `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED` (`false`) | Admit bounded, temporary attention-only probes from direct VLM alerts |
+| `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC` (`300`) | TTL for alert-derived probes |
+
+See `docs/architecture/adaptive_attention_runtime.md` for retention, evidence
+links, P/N/M semantics, and the deployed office profile.
 
 ## Road CV primitives (experimental)
 

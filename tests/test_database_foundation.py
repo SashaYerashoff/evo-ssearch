@@ -16,6 +16,7 @@ from eva_db import (
     redact_dsn,
 )
 from eva_db.pool import _unsafe_runtime_role_reason
+from archive_store import PostgresDetectionsStore
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,15 @@ ARCHIVE_RUNTIME_MIGRATION = ROOT / "migrations" / "versions" / (
 )
 IAM_ALL_CHANNEL_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260614_0006_iam_all_channel_access.py"
+)
+ALERT_FEEDBACK_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260725_0007_alert_feedback.py"
+)
+ATTENTION_STORAGE_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260726_0008_attention_storage.py"
+)
+VLM_BATCH_IDENTITY_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260726_0009_vlm_batch_identity.py"
 )
 
 
@@ -191,6 +201,42 @@ class RuntimeRoleSafetyTests(unittest.TestCase):
         )
 
 
+class ArchiveChannelFilterTests(unittest.TestCase):
+    def test_multi_channel_scope_builds_parameterized_in_clause(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+
+        where_sql, params = store._build_where(channel_ids=[9, 7, 9])
+
+        self.assertIn("channel_id IN (%s,%s)", where_sql)
+        self.assertEqual(params, [store.tenant_id, 7, 9])
+
+    def test_explicit_empty_channel_scope_matches_no_rows(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+
+        where_sql, params = store._build_where(channel_ids=[])
+
+        self.assertIn("1 = 0", where_sql)
+        self.assertEqual(params, [store.tenant_id])
+
+    def test_batch_identity_scope_is_parameterized(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+
+        where_sql, params = store._build_where(
+            channel_id=7,
+            source="vlm_summary",
+            batch_id="vlm-7c6512",
+        )
+
+        self.assertIn("payload_json->>'batch_id' = %s", where_sql)
+        self.assertEqual(
+            params,
+            [store.tenant_id, 7, "vlm_summary", "vlm-7c6512"],
+        )
+
+
 class MigrationContentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -322,7 +368,7 @@ class MigrationContentTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260614_0006"',
             iam_all_channel_source,
         )
         self.assertIn(
@@ -330,6 +376,66 @@ class MigrationContentTests(unittest.TestCase):
             iam_all_channel_source,
         )
         self.assertIn("all_channel_access", iam_all_channel_source)
+        alert_feedback_source = ALERT_FEEDBACK_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'revision: str = "20260725_0007"',
+            alert_feedback_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260614_0006"',
+            alert_feedback_source,
+        )
+        self.assertIn(
+            "CREATE TABLE archive.alert_feedback",
+            alert_feedback_source,
+        )
+        self.assertIn(
+            "archive_alert_feedback_tenant_isolation",
+            alert_feedback_source,
+        )
+        self.assertIn("'benign_activity'", alert_feedback_source)
+        self.assertIn("'poor_visual_quality'", alert_feedback_source)
+        attention_storage_source = ATTENTION_STORAGE_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('revision: str = "20260726_0008"', attention_storage_source)
+        self.assertIn(
+            'down_revision: str | None = "20260725_0007"',
+            attention_storage_source,
+        )
+        self.assertIn(
+            "CREATE TABLE archive.attention_embedding_snapshots",
+            attention_storage_source,
+        )
+        self.assertIn(
+            "CREATE TABLE archive.attention_intervals",
+            attention_storage_source,
+        )
+        vlm_batch_identity_source = VLM_BATCH_IDENTITY_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            vlm_batch_identity_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260726_0008"',
+            vlm_batch_identity_source,
+        )
+        self.assertIn(
+            "ix_archive_detections_vlm_batch",
+            vlm_batch_identity_source,
+        )
+        self.assertIn(
+            "payload_json->>'batch_id'",
+            vlm_batch_identity_source,
+        )
+        self.assertIn(
+            "CREATE TABLE archive.attention_probe_scores",
+            attention_storage_source,
+        )
         self.assertIn("ix_archive_detections_source_channel_ts", archive_runtime_source)
         self.assertIn("ENABLE ROW LEVEL SECURITY", archive_runtime_source)
         self.assertIn("current_setting('eva.tenant_id', true)", archive_runtime_source)

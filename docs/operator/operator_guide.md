@@ -37,7 +37,7 @@ This is where the system's always-on description of each channel lives.
   are read from the PostgreSQL archive in pages; `Load earlier` retrieves the
   next page without restarting analysis.
 - **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = per-batch
-  observations) and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries).
+  observations) and the rollups (L1/L2/L3 = 15 min / 1 h / 8 h summaries).
   `Auto` chooses a practical resolution for the selected period. Collapsed
   summary rows show **alert badges** when something was flagged.
 - Rollup status is explicit: **semantic** is a completed operator narrative,
@@ -53,8 +53,9 @@ This is where the system's always-on description of each channel lives.
 
 Prompt/settings note: **Alert Criteria** is the plain-language "watch for /
 alert on" policy. The L0 stream prompt is for description style/role. The
-`ALERTS_JSON` template is a machine-readable contract and should not be edited
-unless an engineer is intentionally changing parser/schema behavior.
+legacy-named JSON template is the unified machine-readable `BATCH_STATE_JSON`
+contract and should not be edited unless an engineer is intentionally changing
+parser/schema behavior.
 
 What to do here: confirm your demo channels are running, skim recent L1/L2 for
 context, check coverage/health, and note any alert badges before you ask the

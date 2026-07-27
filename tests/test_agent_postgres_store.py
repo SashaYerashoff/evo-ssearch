@@ -1,8 +1,11 @@
 import copy
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
+import uuid
 
-from agent_postgres_store import PostgresAgentStore
+from agent_postgres_store import PostgresAgentStore, record_agent_tool_run_audit
+from agent_security.audit import ToolAuditEvent
 
 
 TENANT_ID = "59da6ca3-51b7-4d91-9190-aae06b76d846"
@@ -103,6 +106,100 @@ class PostgresAgentResearchStateTests(unittest.TestCase):
             self.store.save_research_state(SESSION_ID, oversized, **self.owner)
 
         self.assertEqual(self.pool.connection.calls, [])
+
+
+class _ToolRunConnection:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, query, params=()):
+        normalized = " ".join(str(query).split())
+        self.calls.append((normalized, params))
+        if normalized.startswith("UPDATE agent.tool_runs"):
+            return _Cursor(("run-1",))
+        return _Cursor(None)
+
+
+class _ToolRunPool:
+    def __init__(self):
+        self.connection = _ToolRunConnection()
+        self.contexts = []
+
+    @contextmanager
+    def transaction(self, context=None, *, readonly=False):
+        self.contexts.append(context)
+        yield self.connection
+
+
+class AgentToolRunAuditTests(unittest.TestCase):
+    def _event(self, phase, **overrides):
+        values = {
+            "timestamp": datetime(2026, 7, 26, 7, 30, tzinfo=timezone.utc),
+            "phase": phase,
+            "operation": "execute",
+            "tool_name": "list_video_summary_channels",
+            "actor_id": ACTOR_ID,
+            "tenant_id": TENANT_ID,
+            "request_id": "request-42",
+            "session_id": SESSION_ID,
+            "actor_roles": ("operator",),
+            "risk": "read",
+            "required_permission": "streams:view",
+            "arguments_hash": "ab" * 32,
+            "duration_ms": 12.6,
+        }
+        values.update(overrides)
+        return ToolAuditEvent(**values)
+
+    def test_allow_and_result_are_projected_to_one_queryable_tool_run(self):
+        pool = _ToolRunPool()
+
+        record_agent_tool_run_audit(pool, self._event("allow"), uuid.uuid4())
+        record_agent_tool_run_audit(pool, self._event("result"), uuid.uuid4())
+
+        insert = next(
+            call for call in pool.connection.calls
+            if call[0].startswith("INSERT INTO agent.tool_runs")
+        )
+        update = next(
+            call for call in pool.connection.calls
+            if call[0].startswith("UPDATE agent.tool_runs")
+        )
+        self.assertEqual(insert[1][2], SESSION_ID)
+        self.assertEqual(insert[1][5], "list_video_summary_channels")
+        self.assertEqual(insert[1][8], "allow")
+        self.assertEqual(insert[1][14], False)
+        self.assertEqual(update[1][0], 13)
+        self.assertEqual(update[1][1], "success")
+        self.assertEqual(update[1][6], SESSION_ID)
+        self.assertEqual(len(pool.contexts), 2)
+        self.assertEqual(pool.contexts[0].agent_session_id, SESSION_ID)
+
+    def test_denial_is_recorded_as_a_finished_denied_run(self):
+        pool = _ToolRunPool()
+
+        record_agent_tool_run_audit(
+            pool,
+            self._event("deny", code="permission_denied"),
+            uuid.uuid4(),
+        )
+
+        insert = pool.connection.calls[0]
+        self.assertEqual(insert[1][8], "deny")
+        self.assertEqual(insert[1][10], "permission_denied")
+        self.assertEqual(insert[1][14], True)
+
+    def test_events_without_agent_session_remain_in_audit_only(self):
+        pool = _ToolRunPool()
+
+        record_agent_tool_run_audit(
+            pool,
+            self._event("allow", session_id=None),
+            uuid.uuid4(),
+        )
+
+        self.assertEqual(pool.connection.calls, [])
+        self.assertEqual(pool.contexts, [])
 
 
 if __name__ == "__main__":

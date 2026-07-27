@@ -19,6 +19,14 @@ from eva_db import PsycopgPool, TransactionContext
 
 NIL_UUID = uuid.UUID(int=0)
 ARCHIVE_RUNTIME_REVISION = "20260612_0005"
+ALERT_FEEDBACK_REVISION = "20260725_0007"
+ALERT_FEEDBACK_REASON_LABELS: Dict[str, str] = {
+    "no_relevant_event": "No relevant event",
+    "benign_activity": "Benign activity",
+    "wrong_object_or_actor": "Wrong object or actor",
+    "duplicate_or_stale": "Duplicate or stale alert",
+    "poor_visual_quality": "Poor visual quality",
+}
 PROBE_SOURCE_ALIASES = frozenset({"probe", "probes_run", "probes_query", "probe_daemon"})
 ARCHIVE_SOURCE_ALIASES = {
     "probe": "probe",
@@ -51,6 +59,12 @@ def _is_missing_archive_relation(exc: Exception) -> bool:
 def _archive_not_ready(exc: Exception) -> ArchiveStoreNotReady:
     return ArchiveStoreNotReady(
         f"Archive storage is not migrated yet. Apply database migration {ARCHIVE_RUNTIME_REVISION}."
+    )
+
+
+def _feedback_not_ready(exc: Exception) -> ArchiveStoreNotReady:
+    return ArchiveStoreNotReady(
+        f"Alert feedback storage is not migrated yet. Apply database migration {ALERT_FEEDBACK_REVISION}."
     )
 
 
@@ -175,8 +189,11 @@ class _TenantRepository:
         self.lock = threading.RLock()
         self._last_state_hashes: Dict[str, str] = {}
 
-    def _context(self) -> TransactionContext:
-        return TransactionContext(tenant_id=self.tenant_id, actor_id=NIL_UUID)
+    def _context(self, actor_id: str | uuid.UUID | None = None) -> TransactionContext:
+        return TransactionContext(
+            tenant_id=self.tenant_id,
+            actor_id=actor_id if actor_id is not None else NIL_UUID,
+        )
 
 
 class PostgresDetectionsStore(_TenantRepository):
@@ -579,15 +596,19 @@ class PostgresDetectionsStore(_TenantRepository):
         offset: int = 0,
         source: Optional[str] = None,
         include_thumbnail: bool = True,
+        channel_ids: Optional[Sequence[int]] = None,
+        batch_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         limit = max(1, min(500, int(limit or 50)))
         offset = max(0, int(offset or 0))
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            channel_ids=channel_ids,
             source=source,
             since_ms=since_ms,
             until_ms=until_ms,
+            batch_id=batch_id,
         )
         try:
             with self.lock:
@@ -625,8 +646,10 @@ class PostgresDetectionsStore(_TenantRepository):
         """Return one compact text row per archived VLM batch.
 
         Each archived batch has several evidence-frame rows. Grouping them in
-        PostgreSQL avoids sending the same summary payload and large thumbnail
-        columns repeatedly to the operator history reader.
+        PostgreSQL avoids sending the same summary payload and large inline
+        thumbnail columns repeatedly to the operator history reader. The
+        returned thumbnail id points to one frame that was actually submitted
+        to the VLM; burst/selector evidence is preferred when available.
         """
         limit = max(1, min(1000, int(limit or 120)))
         offset = max(0, int(offset or 0))
@@ -646,6 +669,9 @@ class PostgresDetectionsStore(_TenantRepository):
                                 id,
                                 event_timestamp_ms,
                                 payload_json,
+                                thumbnail_b64 IS NOT NULL AS has_thumbnail,
+                                COALESCE(NULLIF(payload_json->>'anchor_role', ''), 'sample') AS anchor_role,
+                                COALESCE(NULLIF(payload_json->>'frame_index', '')::integer, 0) AS frame_index,
                                 COALESCE(NULLIF(payload_json->>'run_id', ''), 'manual') AS run_id,
                                 COALESCE(
                                     NULLIF(payload_json->>'batch_start_ms', '')::bigint,
@@ -658,18 +684,42 @@ class PostgresDetectionsStore(_TenantRepository):
                             FROM archive.detections
                             {where_sql}
                         ), batches AS (
-                            SELECT DISTINCT ON (run_id, batch_start_ms, batch_end_ms)
+                            SELECT DISTINCT ON (
+                                COALESCE(
+                                    NULLIF(payload_json->>'batch_id', ''),
+                                    run_id || ':' || batch_start_ms::text || ':' || batch_end_ms::text
+                                )
+                            )
                                 id,
                                 event_timestamp_ms,
                                 payload_json,
+                                has_thumbnail,
+                                anchor_role,
+                                frame_index,
                                 run_id,
                                 batch_start_ms,
                                 batch_end_ms
                             FROM candidates
                             ORDER BY
-                                run_id,
-                                batch_start_ms,
-                                batch_end_ms,
+                                COALESCE(
+                                    NULLIF(payload_json->>'batch_id', ''),
+                                    run_id || ':' || batch_start_ms::text || ':' || batch_end_ms::text
+                                ),
+                                has_thumbnail DESC,
+                                CASE
+                                    WHEN lower(COALESCE(payload_json->>'is_cover', 'false'))
+                                         IN ('true', '1', 'yes', 'on') THEN 0
+                                    ELSE 1
+                                END,
+                                CASE anchor_role
+                                    WHEN 'burst_companion' THEN 0
+                                    WHEN 'burst_apex' THEN 1
+                                    WHEN 'sample' THEN 2
+                                    WHEN 'only' THEN 3
+                                    WHEN 'last' THEN 4
+                                    WHEN 'first' THEN 5
+                                    ELSE 6
+                                END,
                                 event_timestamp_ms DESC,
                                 id DESC
                         )
@@ -679,6 +729,9 @@ class PostgresDetectionsStore(_TenantRepository):
                             payload_json,
                             batch_start_ms,
                             batch_end_ms,
+                            has_thumbnail,
+                            anchor_role,
+                            frame_index,
                             COUNT(*) OVER () AS total_batches
                         FROM batches
                         ORDER BY batch_end_ms DESC, id DESC
@@ -691,7 +744,7 @@ class PostgresDetectionsStore(_TenantRepository):
                 raise _archive_not_ready(exc) from exc
             raise
 
-        total = int(rows[0][5] or 0) if rows else 0
+        total = int(rows[0][8] or 0) if rows else 0
         logs: List[Dict[str, Any]] = []
         for row in rows:
             payload = _decode_json_value(row[2])
@@ -728,6 +781,25 @@ class PostgresDetectionsStore(_TenantRepository):
                     "alert_total": int(payload.get("alert_total") or 0),
                     "bookmarks_sent": int(payload.get("bookmarks_sent") or 0),
                     "vector_signal": compact_vector_signal,
+                    "thumbnail_detection_id": int(row[0]) if bool(row[5]) else None,
+                    "thumbnail_role": str(row[6] or "sample"),
+                    "thumbnail_frame_index": int(row[7] or 0),
+                    "thumbnail_selection_source": str(
+                        payload.get("cover_source")
+                        or payload.get("selection_source")
+                        or ""
+                    ).strip(),
+                    "thumbnail_is_cover": bool(payload.get("is_cover")),
+                    "thumbnail_snapshot_index": int(
+                        payload.get("snapshot_index")
+                        or int(row[7] or 0) + 1
+                    ),
+                    "cover_kind": str(payload.get("cover_kind") or "").strip(),
+                    "cover_reason": str(payload.get("cover_reason") or "").strip(),
+                    "cover_confidence": str(
+                        payload.get("cover_confidence") or ""
+                    ).strip(),
+                    "batch_id": str(payload.get("batch_id") or "").strip(),
                     "archive_backed": True,
                 }
             )
@@ -814,11 +886,13 @@ class PostgresDetectionsStore(_TenantRepository):
         include_vectors: bool = False,
         include_thumbnail: bool = True,
         source: Optional[str] = None,
+        channel_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(100000, int(limit or 20000)))
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            channel_ids=channel_ids,
             source=source,
             since_ms=since_ms,
             until_ms=until_ms,
@@ -851,10 +925,12 @@ class PostgresDetectionsStore(_TenantRepository):
         until_ms: Optional[int] = None,
         only_with_clip: bool = True,
         source: Optional[str] = None,
+        channel_ids: Optional[Sequence[int]] = None,
     ) -> int:
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            channel_ids=channel_ids,
             source=source,
             since_ms=since_ms,
             until_ms=until_ms,
@@ -899,6 +975,428 @@ class PostgresDetectionsStore(_TenantRepository):
                 raise _archive_not_ready(exc) from exc
             raise
         return [self._row_to_dict(row, include_vectors=include_vectors) for row in rows]
+
+    @staticmethod
+    def _feedback_row_to_dict(row: Sequence[Any]) -> Dict[str, Any]:
+        return {
+            "id": int(row[0]),
+            "detection_id": int(row[1]),
+            "channel_id": int(row[2]),
+            "alert_timestamp_ms": int(row[3]),
+            "actor_id": str(row[4]),
+            "reason_code": str(row[5]),
+            "reason_label": ALERT_FEEDBACK_REASON_LABELS.get(
+                str(row[5]),
+                str(row[5]).replace("_", " ").title(),
+            ),
+            "note": str(row[6] or ""),
+            "alert_title": str(row[7]),
+            "alert_snapshot": _decode_json_value(row[8]) or {},
+            "submitted_at_ms": int(row[9] or 0),
+            "updated_at_ms": int(row[10] or 0),
+        }
+
+    def upsert_alert_feedback(
+        self,
+        *,
+        detection_id: int,
+        reason_code: str,
+        note: str = "",
+        actor_id: str | uuid.UUID | None = None,
+    ) -> Dict[str, Any]:
+        detection_id = int(detection_id)
+        if detection_id <= 0:
+            raise ValueError("detection_id must be positive")
+        reason = str(reason_code or "").strip().lower()
+        if reason not in ALERT_FEEDBACK_REASON_LABELS:
+            raise ValueError(
+                "reason_code must be one of: "
+                + ", ".join(ALERT_FEEDBACK_REASON_LABELS)
+            )
+        clean_note = str(note or "").strip()
+        if len(clean_note) > 1000:
+            raise ValueError("note must be at most 1000 characters")
+        clean_actor = actor_id if actor_id is not None else NIL_UUID
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(clean_actor)) as connection:
+                    row = connection.execute(
+                        """
+                        WITH alert AS (
+                            SELECT
+                                id,
+                                channel_id,
+                                event_timestamp_ms,
+                                left(
+                                    COALESCE(
+                                        NULLIF(payload_json #>> '{alert_event,title}', ''),
+                                        NULLIF(probe_name, ''),
+                                        'VLM alert'
+                                    ),
+                                    160
+                                ) AS alert_title,
+                                jsonb_strip_nulls(
+                                    jsonb_build_object(
+                                        'source', source,
+                                        'severity', severity,
+                                        'probe_id', probe_id,
+                                        'run_id', payload_json->>'run_id',
+                                        'batch_start_ms', payload_json->'batch_start_ms',
+                                        'batch_end_ms', payload_json->'batch_end_ms',
+                                        'anchor_frame_index', payload_json->'anchor_frame_index',
+                                        'anchor_frame_timestamp_ms', payload_json->'anchor_frame_timestamp_ms',
+                                        'alert_event', payload_json->'alert_event',
+                                        'summary', left(COALESCE(payload_json->>'summary', ''), 1000)
+                                    )
+                                ) AS alert_snapshot
+                            FROM archive.detections
+                            WHERE tenant_id = %s
+                              AND id = %s
+                              AND source = 'vlm_alert'
+                        )
+                        INSERT INTO archive.alert_feedback (
+                            tenant_id,
+                            detection_id,
+                            channel_id,
+                            alert_timestamp_ms,
+                            actor_id,
+                            reason_code,
+                            note,
+                            alert_title,
+                            alert_snapshot
+                        )
+                        SELECT
+                            %s,
+                            alert.id,
+                            alert.channel_id,
+                            alert.event_timestamp_ms,
+                            %s,
+                            %s,
+                            NULLIF(%s, ''),
+                            alert.alert_title,
+                            alert.alert_snapshot
+                        FROM alert
+                        ON CONFLICT (tenant_id, detection_id, actor_id)
+                        DO UPDATE SET
+                            reason_code = EXCLUDED.reason_code,
+                            note = EXCLUDED.note,
+                            alert_title = EXCLUDED.alert_title,
+                            alert_snapshot = EXCLUDED.alert_snapshot,
+                            updated_at = clock_timestamp()
+                        RETURNING
+                            id,
+                            detection_id,
+                            channel_id,
+                            alert_timestamp_ms,
+                            actor_id,
+                            reason_code,
+                            note,
+                            alert_title,
+                            alert_snapshot,
+                            (extract(epoch FROM submitted_at) * 1000)::bigint,
+                            (extract(epoch FROM updated_at) * 1000)::bigint
+                        """,
+                        (
+                            self.tenant_id,
+                            detection_id,
+                            self.tenant_id,
+                            str(uuid.UUID(str(clean_actor))),
+                            reason,
+                            clean_note,
+                        ),
+                    ).fetchone()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _feedback_not_ready(exc) from exc
+            raise
+        if not row:
+            raise LookupError("VLM alert detection was not found")
+        return self._feedback_row_to_dict(row)
+
+    def get_alert_feedback(
+        self,
+        *,
+        detection_id: int,
+        actor_id: str | uuid.UUID | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        params: List[Any] = [self.tenant_id, int(detection_id)]
+        actor_sql = ""
+        if actor_id is not None:
+            actor_sql = "AND actor_id = %s"
+            params.append(str(uuid.UUID(str(actor_id))))
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(actor_id), readonly=True) as connection:
+                    row = connection.execute(
+                        f"""
+                        SELECT
+                            id,
+                            detection_id,
+                            channel_id,
+                            alert_timestamp_ms,
+                            actor_id,
+                            reason_code,
+                            note,
+                            alert_title,
+                            alert_snapshot,
+                            (extract(epoch FROM submitted_at) * 1000)::bigint,
+                            (extract(epoch FROM updated_at) * 1000)::bigint
+                        FROM archive.alert_feedback
+                        WHERE tenant_id = %s
+                          AND detection_id = %s
+                          {actor_sql}
+                        ORDER BY updated_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        tuple(params),
+                    ).fetchone()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _feedback_not_ready(exc) from exc
+            raise
+        return self._feedback_row_to_dict(row) if row else None
+
+    @staticmethod
+    def _feedback_where(
+        *,
+        tenant_id: str,
+        channel_id: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
+        since_ms: Optional[int] = None,
+        until_ms: Optional[int] = None,
+        reason_code: Optional[str] = None,
+    ) -> Tuple[str, List[Any]]:
+        where = ["tenant_id = %s"]
+        params: List[Any] = [tenant_id]
+        if channel_id is not None:
+            where.append("channel_id = %s")
+            params.append(int(channel_id))
+        elif channel_ids is not None:
+            clean_channels = sorted({int(item) for item in channel_ids if int(item) > 0})
+            if clean_channels:
+                where.append(
+                    f"channel_id IN ({','.join('%s' for _ in clean_channels)})"
+                )
+                params.extend(clean_channels)
+            else:
+                where.append("1 = 0")
+        if since_ms is not None:
+            where.append("alert_timestamp_ms >= %s")
+            params.append(int(since_ms))
+        if until_ms is not None:
+            where.append("alert_timestamp_ms <= %s")
+            params.append(int(until_ms))
+        if reason_code:
+            normalized_reason = str(reason_code).strip().lower()
+            if normalized_reason not in ALERT_FEEDBACK_REASON_LABELS:
+                raise ValueError(
+                    "reason_code must be one of: "
+                    + ", ".join(ALERT_FEEDBACK_REASON_LABELS)
+                )
+            where.append("reason_code = %s")
+            params.append(normalized_reason)
+        return "WHERE " + " AND ".join(where), params
+
+    def list_alert_feedback(
+        self,
+        *,
+        channel_id: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
+        since_ms: Optional[int] = None,
+        until_ms: Optional[int] = None,
+        reason_code: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        limit = max(1, min(500, int(limit or 100)))
+        offset = max(0, int(offset or 0))
+        where_sql, params = self._feedback_where(
+            tenant_id=self.tenant_id,
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            reason_code=reason_code,
+        )
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    total_row = connection.execute(
+                        f"SELECT COUNT(*) FROM archive.alert_feedback {where_sql}",
+                        tuple(params),
+                    ).fetchone()
+                    rows = connection.execute(
+                        f"""
+                        SELECT
+                            id,
+                            detection_id,
+                            channel_id,
+                            alert_timestamp_ms,
+                            actor_id,
+                            reason_code,
+                            note,
+                            alert_title,
+                            alert_snapshot,
+                            (extract(epoch FROM submitted_at) * 1000)::bigint,
+                            (extract(epoch FROM updated_at) * 1000)::bigint
+                        FROM archive.alert_feedback
+                        {where_sql}
+                        ORDER BY alert_timestamp_ms DESC, id DESC
+                        LIMIT %s OFFSET %s
+                        """,
+                        tuple(params + [limit, offset]),
+                    ).fetchall()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _feedback_not_ready(exc) from exc
+            raise
+        total = int(total_row[0] or 0) if total_row else 0
+        return [self._feedback_row_to_dict(row) for row in rows], total
+
+    def generate_false_positive_report(
+        self,
+        *,
+        channel_id: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
+        since_ms: Optional[int] = None,
+        until_ms: Optional[int] = None,
+        reason_code: Optional[str] = None,
+        item_limit: int = 100,
+    ) -> Dict[str, Any]:
+        where_sql, params = self._feedback_where(
+            tenant_id=self.tenant_id,
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            reason_code=reason_code,
+        )
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    summary_row = connection.execute(
+                        f"""
+                        SELECT
+                            COUNT(*),
+                            COUNT(DISTINCT detection_id),
+                            COUNT(DISTINCT actor_id),
+                            COUNT(DISTINCT channel_id),
+                            MIN(alert_timestamp_ms),
+                            MAX(alert_timestamp_ms),
+                            MIN((extract(epoch FROM submitted_at) * 1000)::bigint),
+                            MAX((extract(epoch FROM updated_at) * 1000)::bigint)
+                        FROM archive.alert_feedback
+                        {where_sql}
+                        """,
+                        tuple(params),
+                    ).fetchone()
+                    reason_rows = connection.execute(
+                        f"""
+                        SELECT reason_code, COUNT(*)
+                        FROM archive.alert_feedback
+                        {where_sql}
+                        GROUP BY reason_code
+                        ORDER BY COUNT(*) DESC, reason_code ASC
+                        """,
+                        tuple(params),
+                    ).fetchall()
+                    channel_rows = connection.execute(
+                        f"""
+                        SELECT channel_id, COUNT(*)
+                        FROM archive.alert_feedback
+                        {where_sql}
+                        GROUP BY channel_id
+                        ORDER BY COUNT(*) DESC, channel_id ASC
+                        """,
+                        tuple(params),
+                    ).fetchall()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _feedback_not_ready(exc) from exc
+            raise
+
+        feedback, total = self.list_alert_feedback(
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            reason_code=reason_code,
+            limit=item_limit,
+            offset=0,
+        )
+        summary = {
+            "annotation_count": int(summary_row[0] or 0) if summary_row else 0,
+            "distinct_alert_count": int(summary_row[1] or 0) if summary_row else 0,
+            "reviewer_count": int(summary_row[2] or 0) if summary_row else 0,
+            "channel_count": int(summary_row[3] or 0) if summary_row else 0,
+        }
+        reason_counts = [
+            {
+                "reason_code": str(row[0]),
+                "reason_label": ALERT_FEEDBACK_REASON_LABELS.get(
+                    str(row[0]),
+                    str(row[0]).replace("_", " ").title(),
+                ),
+                "count": int(row[1] or 0),
+            }
+            for row in reason_rows
+        ]
+        channel_counts = [
+            {"channel_id": int(row[0]), "count": int(row[1] or 0)}
+            for row in channel_rows
+        ]
+        lines = [
+            "# False-positive operator feedback report",
+            "",
+            (
+                f"- Period: {since_ms if since_ms is not None else 'unbounded'}"
+                f" to {until_ms if until_ms is not None else 'now'} (Unix ms)"
+            ),
+            f"- Operator annotations: {summary['annotation_count']}",
+            f"- Distinct alerts: {summary['distinct_alert_count']}",
+            f"- Channels: {summary['channel_count']}",
+            f"- Reviewers: {summary['reviewer_count']}",
+            "",
+            "## Reasons",
+            "",
+        ]
+        if reason_counts:
+            lines.extend(
+                f"- {row['reason_label']}: {row['count']}"
+                for row in reason_counts
+            )
+        else:
+            lines.append("- No operator false-positive annotations in this period.")
+        lines.extend(
+            [
+                "",
+                "> These counts are operator annotations, not independent ground truth.",
+            ]
+        )
+        return {
+            "report_type": "false_positives",
+            "period": {
+                "since_ms": since_ms,
+                "until_ms": until_ms,
+                "first_alert_timestamp_ms": int(summary_row[4] or 0) if summary_row else 0,
+                "last_alert_timestamp_ms": int(summary_row[5] or 0) if summary_row else 0,
+                "first_submitted_at_ms": int(summary_row[6] or 0) if summary_row else 0,
+                "last_updated_at_ms": int(summary_row[7] or 0) if summary_row else 0,
+            },
+            "coverage": {
+                "status": "covered" if total else "no_annotations",
+                "annotation_count": total,
+                "returned_count": len(feedback),
+                "truncated": len(feedback) < total,
+                "scope": "operator_false_positive_annotations",
+                "ground_truth_status": "operator_annotation_only",
+            },
+            "summary": summary,
+            "reason_counts": reason_counts,
+            "channel_counts": channel_counts,
+            "feedback": feedback,
+            "report": "\n".join(lines),
+        }
 
     def channel_ids_for_image_path(self, image_path: str) -> frozenset[int]:
         normalized = str(image_path or "").strip()
@@ -1038,10 +1536,12 @@ class PostgresDetectionsStore(_TenantRepository):
         limit: int = 100,
         source: Optional[str] = None,
         until_ms: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(500, int(limit or 100)))
         where_sql, params = self._build_where(
             channel_id=channel_id,
+            channel_ids=channel_ids,
             source=source,
             since_ms=since_ms,
             until_ms=until_ms,
@@ -1149,21 +1649,39 @@ class PostgresDetectionsStore(_TenantRepository):
         self,
         probe_id: Optional[str] = None,
         channel_id: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
         source: Optional[str] = None,
         since_ms: Optional[int] = None,
         until_ms: Optional[int] = None,
         only_with_clip: bool = False,
         only_with_dino: bool = False,
         ids: Optional[Sequence[int]] = None,
+        batch_id: Optional[str] = None,
     ) -> Tuple[str, List[Any]]:
         where: List[str] = ["tenant_id = %s"]
         params: List[Any] = [self.tenant_id]
         if probe_id:
             where.append("probe_id = %s")
             params.append(str(probe_id))
-        if channel_id is not None:
-            where.append("channel_id = %s")
-            params.append(int(channel_id))
+        normalized_channel_ids = {
+            int(item)
+            for item in (channel_ids or [])
+            if item is not None and int(item) > 0
+        }
+        if channel_id is not None and int(channel_id) > 0:
+            normalized_channel_ids.add(int(channel_id))
+        if normalized_channel_ids:
+            ordered_channel_ids = sorted(normalized_channel_ids)
+            if len(ordered_channel_ids) == 1:
+                where.append("channel_id = %s")
+                params.append(ordered_channel_ids[0])
+            else:
+                where.append(
+                    f"channel_id IN ({','.join('%s' for _ in ordered_channel_ids)})"
+                )
+                params.extend(ordered_channel_ids)
+        elif channel_ids is not None:
+            where.append("1 = 0")
         if source:
             normalized_source = ARCHIVE_SOURCE_ALIASES.get(str(source).strip().lower(), str(source).strip().lower())
             if normalized_source == "probe":
@@ -1179,6 +1697,10 @@ class PostgresDetectionsStore(_TenantRepository):
         if until_ms is not None:
             where.append("event_timestamp_ms <= %s")
             params.append(int(until_ms))
+        normalized_batch_id = str(batch_id or "").strip()
+        if normalized_batch_id:
+            where.append("payload_json->>'batch_id' = %s")
+            params.append(normalized_batch_id)
         if only_with_clip:
             where.append("clip_vec IS NOT NULL")
         if only_with_dino:
@@ -1318,6 +1840,28 @@ class PostgresProbesStore(_TenantRepository):
                     (self.tenant_id, normalized),
                 )
         return int(cursor.rowcount or 0) > 0
+
+    def delete_probes(self, probe_ids: Sequence[str]) -> int:
+        normalized = sorted(
+            {
+                str(probe_id or "").strip()
+                for probe_id in probe_ids
+                if str(probe_id or "").strip()
+            }
+        )
+        if not normalized:
+            return 0
+        with self.lock:
+            with self.pool.transaction(self._context()) as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM archive.probes
+                    WHERE tenant_id = %s
+                      AND probe_id = ANY(%s)
+                    """,
+                    (self.tenant_id, normalized),
+                )
+        return int(cursor.rowcount or 0)
 
 
 class PostgresRuntimeStateStore(_TenantRepository):

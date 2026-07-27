@@ -120,12 +120,30 @@ def test_modal_consistency_contract_has_bounded_scroll_bodies():
     assert ".archive-review-shell" in section
     assert "max-block-size: calc(100dvh - 32px);" in section
     assert ".prompt-modal-scrollarea" in section
-    assert "grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 0.55fr);" in section
+    assert "grid-template-rows: auto minmax(240px, 1fr) auto auto auto auto minmax(180px, 0.55fr);" in section
     assert "position: relative;" in section
     assert "inset: auto;" in section
     assert "width: min(96vw, 1120px);" in section
     assert "height: min(calc(100dvh - 32px), 960px);" in section
     assert "border-radius: 22px;" in section
+
+
+def test_archive_review_modal_pins_hidden_feedback_and_summary_to_distinct_grid_rows():
+    section = CSS.split("Unified modal behavior", 1)[1].split("Unified scrollbar contract", 1)[0]
+    for area in ('"head"', '"frame"', '"meta"', '"filmstrip"', '"actions"', '"feedback"', '"summary"'):
+        assert area in section
+    for selector, area in (
+        (".archive-review-head", "head"),
+        (".archive-review-frame", "frame"),
+        (".archive-review-meta-row", "meta"),
+        (".archive-review-filmstrip", "filmstrip"),
+        (".archive-review-actions", "actions"),
+        (".archive-review-feedback", "feedback"),
+        (".archive-review-summary-panel", "summary"),
+    ):
+        assert f"{selector} {{\n    grid-area: {area};" in CSS
+    assert "minmax(240px, 1fr)" in section
+    assert "minmax(180px, 0.55fr)" in section
 
 
 def test_archive_review_modal_uses_shared_surface_not_hud_chrome():
@@ -701,3 +719,33 @@ def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():
     assert ".luxriot-rollup-status.pending" in CSS
     assert ".luxriot-rollup-status.queued" in CSS
     assert ".luxriot-rollup-status.degraded" in CSS
+
+
+def test_archive_channel_filter_is_an_explicit_multi_select():
+    for token in (
+        'id="archiveChannelFilter"',
+        'data-archive-channel-all',
+        'id="archiveChannelOptions"',
+    ):
+        assert token in TEMPLATE
+    for token in (
+        "function selectedArchiveChannelIds",
+        "function appendArchiveChannelParams",
+        "payload.channel_ids = channelIds",
+        "formData.append(key, String(item))",
+    ):
+        assert token in JS
+    assert ".archive-channel-picker" in CSS
+    assert ".archive-channel-option" in CSS
+
+
+def test_probe_board_groups_cards_by_channel():
+    for token in (
+        "const probesByChannel = new Map()",
+        'class="probe-channel-group"',
+        'class="probe-channel-card-grid"',
+        "probe-channel-group-count",
+    ):
+        assert token in JS
+    assert ".probe-channel-group" in CSS
+    assert ".probe-channel-card-grid" in CSS

@@ -83,6 +83,12 @@ def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int
     return value
 
 
+AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS = _int_env(
+    "EVOSSEARCH_AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS",
+    10,
+    minimum=5,
+    maximum=16,
+)
 AGENT_CONTEXT_LIMIT_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", 65_536, minimum=8_192)
 AGENT_MAX_OUTPUT_TOKENS = _int_env("EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS", 2_048, minimum=256, maximum=8_192)
 AGENT_CONTEXT_CHARS_PER_TOKEN = _int_env("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", 3, minimum=1, maximum=12)
@@ -1380,7 +1386,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "Preview a durable background job that restores missing semantic video-summary history "
                 "from archived L0 batch text, then place it in the low-priority worker after UI approval. "
                 "Use for post-upgrade requests such as 'restore missing summaries for all channels for two weeks'. "
-                "Levels are fixed-duration semantic windows: L1=15 minutes, L2=60 minutes, L3=6 hours. "
+                "Levels are fixed-duration semantic windows: L1=15 minutes, L2=60 minutes, L3=8 hours. "
                 "Default recovery levels are L2 then L3, which rebuild the temporal lens quickly; include L1 only "
                 "when the operator explicitly requests exhaustive 15-minute semantic backfill. The job is idempotent, "
                 "survives restarts, yields to live VLM backlog, and reports ETA/progress/source gaps."
@@ -1409,7 +1415,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                         "type": "array",
                         "items": {"type": "string", "enum": ["L1", "L2", "L3"]},
                         "description": (
-                            "Levels to restore: L1=15 minutes, L2=60 minutes, L3=6 hours. "
+                            "Levels to restore: L1=15 minutes, L2=60 minutes, L3=8 hours. "
                             "Default: L2,L3. Add L1 only for exhaustive 15-minute history."
                         ),
                     },
@@ -1629,15 +1635,19 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "description": (
                 "Compile an operator report for a time period. Defaults to live video-description "
                 "coverage, VLM alerts, stream health, quiet channels, and evidence frames. "
-                "Use report_type='probes' only when the operator explicitly asks for probe statistics."
+                "Use report_type='probes' only when the operator explicitly asks for probe statistics, "
+                "or report_type='false_positives' for operator false-positive annotations."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "report_type": {
                         "type": "string",
-                        "enum": ["video_descriptions", "probes"],
-                        "description": "Default: video_descriptions. Use probes only for explicit probe reports.",
+                        "enum": ["video_descriptions", "probes", "false_positives"],
+                        "description": (
+                            "Default: video_descriptions. Use probes only for explicit probe reports, "
+                            "and false_positives only for operator-review feedback."
+                        ),
                     },
                     "since_hours": {
                         "type": "number",
@@ -1807,6 +1817,49 @@ def _filter_streamed_tool_markup(chunks: Iterable[str]) -> Iterator[str]:
         yield buffer
 
 
+def _coalesce_system_messages(messages: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Return chat history with one leading system message.
+
+    Some OpenAI-compatible chat templates (including Ternary Bonsai's) reject
+    system messages anywhere except the first position. EVA intentionally adds
+    trusted research notes, context-budget instructions, and the turn signal
+    ledger as the turn progresses, so collect those instructions at the front
+    immediately before each model request. This also keeps assistant/tool pairs
+    adjacent, which the tool-call protocol requires.
+    """
+
+    system_parts: List[str] = []
+    non_system_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        copied = dict(message)
+        if str(copied.get("role") or "").strip().casefold() != "system":
+            non_system_messages.append(copied)
+            continue
+
+        content = copied.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, Sequence) and not isinstance(content, (bytes, bytearray)):
+            text = "\n".join(
+                str(part.get("text") or "").strip()
+                for part in content
+                if isinstance(part, Mapping)
+                and str(part.get("type") or "").strip().casefold() == "text"
+                and str(part.get("text") or "").strip()
+            )
+        else:
+            text = str(content or "").strip()
+        if text:
+            system_parts.append(text)
+
+    if not system_parts:
+        return non_system_messages
+    return [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        *non_system_messages,
+    ]
+
+
 class _AgentLMClient:
     """
     Minimal OpenAI-compatible client for the tool-calling loop.
@@ -1856,7 +1909,7 @@ class _AgentLMClient:
         }
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _coalesce_system_messages(messages),
             "max_tokens": min(1_024, AGENT_MAX_OUTPUT_TOKENS),
             "chat_template_kwargs": dict(AGENT_CHAT_TEMPLATE_KWARGS),
             "stream": False,
@@ -1938,7 +1991,7 @@ class _AgentLMClient:
         """Streaming call without tools. Yields text delta chunks."""
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _coalesce_system_messages(messages),
             "max_tokens": AGENT_MAX_OUTPUT_TOKENS,
             "chat_template_kwargs": dict(AGENT_CHAT_TEMPLATE_KWARGS),
             "stream": True,
@@ -3601,6 +3654,12 @@ class AgentTools:
                     overlapping_runs += 1
             run_count = max(overlapping_runs, len(log_run_ids), 1 if logs else 0)
             coverage_status = "partial" if coverage_gap_count else "covered"
+            alert_episode_summary = _aggregate_vlm_alert_episodes(
+                recent_alerts_from_logs,
+                raw_alert_count=alert_total,
+                severity_counts=alert_counts,
+                delivery_breakdown=delivery_breakdown,
+            )
             channel_rows.append(
                 {
                     "channel_id": channel_id,
@@ -3617,6 +3676,7 @@ class AgentTools:
                     "alert_counts": alert_counts,
                     "alert_parser_breakdown": parser_breakdown,
                     "alert_delivery_breakdown": delivery_breakdown,
+                    "alert_episode_summary": alert_episode_summary,
                     "recent_alerts": recent_alerts[:10],
                     "vector_signal_total": vector_signal_total or int(_opt_int(status_digest.get("vector_signal_total")) or 0),
                     "recent_vector_signals": list(status_digest.get("recent_vector_signals") or [])[:5],
@@ -4957,6 +5017,32 @@ class AgentTools:
         truncated = len(display_nodes) > len(returned_nodes)
         provenance_totals = _summary_provenance_totals(filtered_nodes)
         returned_provenance_totals = _summary_provenance_totals(returned_nodes)
+        structured_alerts: List[Dict[str, Any]] = []
+        raw_alert_total = 0
+        alert_severity_totals: Dict[str, int] = {}
+        for node in filtered_nodes:
+            raw_alert_total += int(_opt_int(node.get("alert_total")) or 0)
+            for severity, count in _compact_int_breakdown(node.get("alert_counts")).items():
+                alert_severity_totals[severity] = alert_severity_totals.get(severity, 0) + int(count)
+            _node_start, node_end = _summary_node_bounds(node)
+            fallback_timestamp_ms = (
+                int(float(node_end) * 1000.0)
+                if node_end is not None
+                else None
+            )
+            for event in _compact_vlm_alert_events_for_model(
+                node.get("alert_events"),
+                limit=1000,
+            ):
+                if event.get("timestamp_ms") is None and fallback_timestamp_ms is not None:
+                    event["timestamp_ms"] = fallback_timestamp_ms
+                structured_alerts.append(event)
+        alert_episode_summary = _aggregate_vlm_alert_episodes(
+            structured_alerts,
+            raw_alert_count=raw_alert_total,
+            severity_counts=alert_severity_totals,
+            delivery_breakdown=provenance_totals.get("alert_delivery_breakdown"),
+        )
         source_coverage = _video_summary_coverage_contract(
             available_nodes=filtered_nodes,
             returned_nodes=filtered_nodes,
@@ -5054,6 +5140,7 @@ class AgentTools:
             "selection_strategy": selection_strategy,
             "provenance_totals": provenance_totals,
             "returned_provenance_totals": returned_provenance_totals,
+            "alert_episode_summary": alert_episode_summary,
             "selected_run": rollups.get("selected_run"),
             "run_filter_id": rollups.get("run_filter_id"),
             "running": bool(rollups.get("running")),
@@ -5502,6 +5589,13 @@ class AgentTools:
                 requested_type = "video_descriptions"
         if requested_type in {"probe", "probes", "detections", "detection"}:
             return self._generate_probe_report(args)
+        if requested_type in {
+            "false_positive",
+            "false_positives",
+            "operator_feedback",
+            "alert_feedback",
+        }:
+            return self._generate_false_positive_report(args)
         return self._generate_video_description_report(args)
 
     def _report_time_window_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -5839,6 +5933,61 @@ class AgentTools:
                 f"{len(probes_data)} probe(s) in the selected period."
             ),
         }
+
+    def _generate_false_positive_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._ds, "generate_false_positive_report"):
+            raise ToolError("Operator feedback storage is not available.")
+        report_args = self._report_time_window_args(args)
+        from_ts, to_ts, time_meta = self._resolve_summary_time_window(
+            report_args,
+            default_since_hours=24.0,
+        )
+        channel_id = self._resolve_channel_id(args, required=False)
+        raw_channel_ids = (
+            args.get("channel_ids")
+            if isinstance(args.get("channel_ids"), list)
+            else []
+        )
+        channel_ids = sorted(
+            {
+                int(channel)
+                for channel in raw_channel_ids
+                if _opt_int(channel) is not None and int(channel) > 0
+            }
+        )
+        store_args: Dict[str, Any] = {
+            "since_ms": int(from_ts * 1000.0),
+            "until_ms": int(to_ts * 1000.0),
+            "item_limit": max(1, min(50, int(args.get("top_events") or 12))),
+        }
+        if channel_id is not None:
+            store_args["channel_id"] = int(channel_id)
+        elif channel_ids:
+            store_args["channel_ids"] = channel_ids
+        reason_code = str(args.get("reason_code") or "").strip().lower()
+        if reason_code:
+            store_args["reason_code"] = reason_code
+        try:
+            report = self._ds.generate_false_positive_report(**store_args)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        if not isinstance(report, dict):
+            raise ToolError("Operator feedback report returned an invalid result.")
+        report["period"] = {
+            **dict(report.get("period") or {}),
+            **time_meta,
+        }
+        coverage = dict(report.get("coverage") or {})
+        coverage.setdefault(
+            "note",
+            (
+                "This report covers operator false-positive annotations only; "
+                "unreviewed alerts are not classified."
+            ),
+        )
+        coverage["ground_truth_status"] = "operator_annotation_only"
+        report["coverage"] = coverage
+        return report
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -6986,13 +7135,6 @@ def _format_agent_video_streams(
         for stream in status.get("video_streams") or []
         if isinstance(stream, Mapping) and allowed(stream.get("channel_id"))
     ]
-    digest_by_channel = {
-        int(row.get("channel_id")): row
-        for row in status.get("channel_status_digest") or []
-        if isinstance(row, Mapping)
-        and _opt_int(row.get("channel_id")) is not None
-        and allowed(row.get("channel_id"))
-    }
     desired_missing = [
         row
         for row in status.get("desired_video_missing") or []
@@ -7031,42 +7173,13 @@ def _format_agent_video_streams(
         buffered_frames = stream.get("pending_frames", 0)
         summary_queue_depth = stream.get("summary_queue_depth", 0)
         summary_queue_frames = stream.get("summary_queue_frame_count", 0)
-        dropped = stream.get("dropped_frames", 0)
-        queue_dropped = stream.get("queue_dropped_batches", 0)
-        logs = stream.get("log_count", 0)
-        alert_total = stream.get("last_alert_total")
-        alert_counts = stream.get("last_alert_counts")
-        alert_text = ""
-        digest = digest_by_channel.get(int(channel_id)) if _opt_int(channel_id) is not None else {}
-        recent_alerts = digest.get("recent_alerts") if isinstance(digest, Mapping) else None
-        vector_total = _opt_int(digest.get("vector_signal_total")) if isinstance(digest, Mapping) else None
-        if isinstance(alert_counts, Mapping) and alert_counts:
-            alert_text = ", alerts=" + ", ".join(
-                f"{key}:{value}" for key, value in alert_counts.items()
-            )
-        elif isinstance(digest, Mapping) and isinstance(digest.get("alert_counts_by_severity"), Mapping) and digest.get("alert_counts_by_severity"):
-            alert_text = ", alerts=" + ", ".join(
-                f"{key}:{value}" for key, value in digest.get("alert_counts_by_severity", {}).items()
-            )
-        elif alert_total not in (None, "", 0, "0"):
-            alert_text = f", alerts={alert_total}"
-        recent_text = ""
-        if isinstance(recent_alerts, list) and recent_alerts:
-            titles = [
-                str(item.get("title") or "").strip()
-                for item in recent_alerts[:3]
-                if isinstance(item, Mapping) and str(item.get("title") or "").strip()
-            ]
-            if titles:
-                recent_text = ", recent_alerts=" + "; ".join(titles)[:160]
-        vector_text = f", vector_signals={vector_total}" if vector_total else ""
         error_text = f", last_error={last_error[:120]!r}" if last_error else ""
         lines.append(
             f"  - CH {channel_id}: {state}, video_lm={model_selector}, model_selector={model_selector}, "
             f"configured_vlm={configured_model}, buffered_frames={buffered_frames}, "
             f"summary_queue_batches={summary_queue_depth}, summary_queue_frames={summary_queue_frames}, "
-            f"dropped_frames={dropped}, dropped_batches={queue_dropped}, "
-            f"summaries={logs}{alert_text}{recent_text}{vector_text}{error_text}"
+            f"volatile period counters omitted; call list_video_summary_channels"
+            f"{error_text}"
         )
     if len(streams) > len(lines):
         lines.append(f"  - ... {len(streams) - len(lines)} more video stream(s) not expanded here")
@@ -7188,8 +7301,14 @@ def build_system_prompt(
     )
 
     return (
-        f"You are the AI operations assistant for Luxriot EVA AI — a CCTV intelligent "
-        f"monitoring platform. Your primary operational center is live video descriptions: "
+        f"You are EVA's interactive intellectual core within an intelligent security system "
+        f"that may operate from a home installation to city-scale infrastructure. You connect "
+        f"the operator with accumulated visual memory and controlled actions; you do not imitate "
+        f"a human guard or invent deployment rules. EVA's visual-semantic core turns sampled "
+        f"perception into BATCH_STATE_JSON memory, episode continuity, covers, and alert actions. "
+        f"You reconstruct, inspect, report, and regulate that memory through tools. Neither core "
+        f"may substitute prior context, attention signals, or operator expectations for observed evidence. "
+        f"Your primary operational center is live video descriptions: "
         f"VLM summaries, VLM alerts, coverage windows, stream health, and archived evidence frames. "
         f"You also have tools to search the archive, inspect probe hits, use CLIP P/N/M as a semantic "
         f"attention signal, tune probes when explicitly requested, adjust prompt settings, describe frames, "
@@ -7222,10 +7341,10 @@ def build_system_prompt(
         f"- For prompt-setting modifications: call update_prompt_settings with preview=true only. "
         f"Show the diff and tell the operator to use the UI Apply button if they want to commit it. "
         f"Do not call preview=false in chat.\n"
-        f"- Prompt field mapping: L0/live feed role/summary behavior = stream_system_prompt. Channel-specific alert/watch criteria = alert_policy_prompt. L1/L2/L3 rollups = rollup_prompts.L1/L2/L3. json_alert_prompt is only the structured alert-output template.\n"
+        f"- Prompt field mapping: L0/live feed role/summary behavior = stream_system_prompt. Channel-specific alert/watch criteria = alert_policy_prompt. L1/L2/L3 rollups = rollup_prompts.L1/L2/L3. json_alert_prompt is the compatibility field name for the unified BATCH_STATE_JSON output contract; do not create a separate cover or alert JSON contract.\n"
         f"- When the operator says 'watch this channel for...', 'pay attention to...', or asks to add alert conditions, update alert_policy_prompt with preview=true. Do not hide operator alert criteria inside stream_system_prompt.\n"
         f"- If get_prompt_settings returns prompt_health.needs_migration=true, offer update_prompt_settings with changes.migrate_legacy_alert_policy=true and preview=true before editing further. This moves legacy prose-alert/watch text out of stream_system_prompt into alert_policy_prompt.\n"
-        f"- Do not rewrite json_alert_prompt unless the operator explicitly asks to change the structured alert/parsing template.\n"
+        f"- Do not rewrite json_alert_prompt unless the operator explicitly asks to change the unified structured batch-state/parsing template.\n"
         f"- Never narrate execution without evidence: do not write 'executing', 'result returned', 'root cause identified', 'failed approval', or similar action-status claims unless a tool result in this turn or a trusted action receipt in history explicitly says so.\n"
         f"- Never claim that a prompt change, probe change, bookmark rule, or channel-specific setting was applied unless the corresponding tool returned status=applied in this turn or a trusted action receipt in history says status=applied.\n"
         f"- Never claim that Luxriot is disconnected or that a channel does not exist unless list_channels or another Luxriot tool in this turn confirmed that failure.\n"
@@ -7247,6 +7366,7 @@ def build_system_prompt(
         f"- Do not answer a broad period investigation from only the newest summary entry or newest archive hits. First establish period coverage/alert/probe health, then inspect L2/L1 summaries across the requested window, choose 2-3 candidate windows spanning the period or carrying alerts/deviations, and only then drill into frames/L0 for evidence. If only the latest slice is available, report that as a coverage limitation.\n"
         f"- When probes are relevant to a period investigation, use list_probes or generate_report with report_type='probes' as a secondary signal. Prefer representative_events across the period over latest_ts/top newest hits when explaining probe evidence.\n"
         f"- Rank video-summary signals by provenance. Routine memory/baseline is prior context, not current evidence. Vector signals/CLIP P/N/M/road-CV cues are attention or homeostasis signals: stronger than routine memory for choosing where to inspect, but not visual proof. L0 prose is a current VLM description but can be contaminated by prior memory. Structured L0 alert_events/state_observations are stronger than prose. Backend state_transition_events are confirmed cross-batch state changes from structured L0 observations, but still require frame evidence for final visual confirmation. Archive frame plus describe_frame is the strongest visual proof available in chat.\n"
+        f"- BATCH_STATE_JSON is the authoritative structured L0 update for cover selection, scene status, event continuity, observed states, memory pass, and alert candidates. A cover is a navigation thumbnail, not proof. In archive investigations distinguish the semantic search MATCH frame, model-selected COVER, alert ANCHOR, and neighboring context frames.\n"
         f"- If L0 prose mentions an event or entity but structured alert_events/state_observations do not confirm it, do not drop it and do not call it false. Mark it as unconfirmed prose-only evidence: possible memory contamination, structured-output miss, or real event needing frame review. For important safety/security findings, drill into VLM summary/alert frames and describe_frame before concluding.\n"
         f"- Treat parser/delivery diagnostics as pipeline health, not incident counts: json/prose/parser counts explain extraction quality; delivery_status sent/cooldown_skipped/bookmark_disabled/failed explains Luxriot bookmark side effects.\n"
         f"- For count/state-change questions that can be checked visually, such as 'how many times did X appear/disappear', 'when did the door open/close', or 'did the object leave/return', prefer track_visual_state_transitions after normalize_time_window. Provide positive_state_query and a visible-background negative_state_query; avoid literal negation like 'no X'/'without X' because CLIP does not reliably understand negation. Use L2/L1 summaries as a map and use count_video_summary_events only as summary-text fallback when archived CLIP frames are unavailable. Report that CLIP P/N/M state transitions are candidates and cite boundary frame evidence before strong conclusions.\n"
@@ -7254,8 +7374,9 @@ def build_system_prompt(
         f"- Archive source semantics: source=probe rows are real probe hits/detections; source=vlm_summary rows are sampled frames saved from video-description batches; source=vlm_alert rows are frames anchored to VLM alerts from video descriptions.\n"
         f"- Do not call vlm_summary or vlm_alert rows probe detections. When answering from archive tools, name the source class and separate probe hits, video-description frames, and VLM alert frames.\n"
         f"- When answering from video summaries, state the returned coverage window from get_video_summaries.coverage before conclusions when the operator asked about a period. Never imply that missing summary windows were reviewed. If coverage.status is partial/no_data/truncated, say which part was actually reviewed and which part remains unchecked.\n"
+        f"- VLM alert_total/raw_alert_count counts batch emissions, not distinct real-world incidents. Report raw emissions separately from alert_episode_summary.candidate_episode_count, preserve delivery/deduplication counts, and describe candidate episodes as temporal/semantic grouping rather than ground truth.\n"
         f"- Treat time_window.duration_sec and coverage.available.requested_span_sec as authoritative server arithmetic. Do not recalculate or relabel their duration; 259200 seconds is 72 hours / 3 days. If returned absolute dates conflict with the operator's relative phrase, stop and normalize the relative phrase again.\n"
-        f"- For a post-upgrade request to restore missing summary history, call restore_video_summary_history once with preview=true. The fixed levels are L1=15 minutes, L2=60 minutes, and L3=6 hours. Default to L2,L3 so the temporal lens returns first; add L1 only when the operator explicitly requests exhaustive 15-minute semantic history. A preview is a PLAN, not a completed restoration: say 'planned levels' and 'queueable', never 'levels restored'. In the preview, queueable_windows is the ONLY work that can be restored and the ONLY basis for ETA. Never describe not_restorable_no_archived_source or calendar gaps as queued/missing work: label them exactly 'source coverage gaps (not queued)'. Report archive source coverage, the exact queue size, ETA range, and that live descriptions take priority. Tell the operator to use the UI Apply action; after Apply, never recreate or fan out the queue in chat. Use get_video_summary_restore_status for later progress.\n"
+        f"- For a post-upgrade request to restore missing summary history, call restore_video_summary_history once with preview=true. The fixed levels are L1=15 minutes, L2=60 minutes, and L3=8 hours. Default to L2,L3 so the temporal lens returns first; add L1 only when the operator explicitly requests exhaustive 15-minute semantic history. A preview is a PLAN, not a completed restoration: say 'planned levels' and 'queueable', never 'levels restored'. In the preview, queueable_windows is the ONLY work that can be restored and the ONLY basis for ETA. Never describe not_restorable_no_archived_source or calendar gaps as queued/missing work: label them exactly 'source coverage gaps (not queued)'. Report archive source coverage, the exact queue size, ETA range, and that live descriptions take priority. Tell the operator to use the UI Apply action; after Apply, never recreate or fan out the queue in chat. Use get_video_summary_restore_status for later progress.\n"
         f"- If the operator asks to confirm video-summary findings with images/snaps, use get_video_summaries with include_evidence_frames=true or call get_detections with source=vlm_summary/source=vlm_alert, the same channel, and the same since_ms/until_ms. Do not use semantic search as the first proof step for exact time evidence.\n"
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
@@ -7433,6 +7554,24 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     return intents
 
 
+def _repair_common_operator_typos(value: Any) -> str:
+    """Repair a tiny, conservative set of routing-critical operator typos."""
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r"\bhappend\b", "happened", text, flags=re.IGNORECASE)
+    # Keep Spanish "las" intact unless it is clearly being used before an
+    # English relative duration in an otherwise English operator message.
+    text = re.sub(
+        r"\blas(?=\s+(?:\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|"
+        r"eight|nine|ten|eleven|twelve|couple|few)\s*"
+        r"(?:weeks?|w|hours?|hrs?|h|minutes?|mins?|min|m|days?|d)\b)",
+        "last",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
 def _select_relevant_tool_schemas(
     schemas: Sequence[Mapping[str, Any]],
     context: Mapping[str, Any],
@@ -7481,8 +7620,9 @@ def _extract_vlm_alert_criterion(text: Any) -> Optional[str]:
 
 
 def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
-    normalized = _normalize_probe_match_text(user_text)
-    normalized_unicode = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    routing_text = _repair_common_operator_typos(user_text)
+    normalized = _normalize_probe_match_text(routing_text)
+    normalized_unicode = unicodedata.normalize("NFKC", routing_text).casefold()
     runtime_terms = ("active", "running", "runtime", "current", "live")
     status_terms = ("stream", "model", "queue", "dropped", "last error", "status")
     russian_runtime_status = bool(
@@ -7490,9 +7630,9 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         and re.search(r"стрим|канал|модел|очеред|потер|дроп|ошиб|статус", normalized_unicode)
     )
     context = {
-        "wants_video_evidence": _operator_wants_video_evidence(user_text),
-        "focus_video_summaries": _operator_focuses_video_summaries(user_text),
-        "vlm_alert_policy_request": _operator_requests_vlm_alert_policy(user_text),
+        "wants_video_evidence": _operator_wants_video_evidence(routing_text),
+        "focus_video_summaries": _operator_focuses_video_summaries(routing_text),
+        "vlm_alert_policy_request": _operator_requests_vlm_alert_policy(routing_text),
         "runtime_status_only": (
             (
                 any(term in normalized for term in runtime_terms)
@@ -7501,8 +7641,16 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
             or russian_runtime_status
         ),
     }
-    context["tool_intents"] = _classify_tool_intents(user_text, context)
-    user_text_value = str(user_text or "").strip()
+    context["video_overview_request"] = bool(
+        re.search(
+            r"\b(?:what happened|what went on|alerts?|notable|incidents?|events?|"
+            r"overnight|last night|summary|summaries|report)\b"
+            r"|что\s+произош|что\s+было|за\s+ночь|алерт|событи|инцидент|сводк|отч[её]т",
+            normalized_unicode,
+        )
+    )
+    context["tool_intents"] = _classify_tool_intents(routing_text, context)
+    user_text_value = routing_text.strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
     channel_match = re.search(
@@ -7515,14 +7663,213 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
     explicit_calendar_range = len(
         re.findall(r"\b\d{4}-\d{2}-\d{2}\b", user_text_value)
     ) >= 2
-    if (
-        _parse_relative_window_seconds(user_text_value) is not None
-        and not explicit_calendar_range
-    ):
+    parsed_relative_window = _parse_relative_window_seconds(user_text_value)
+    if parsed_relative_window is not None and not explicit_calendar_range:
         # Keep the operator's phrase authoritative. Small local models can turn
         # "last 3 days" into plausible-looking but stale absolute dates.
-        context["operator_relative_range"] = user_text_value
+        context["operator_relative_range"] = parsed_relative_window[1]
     return context
+
+
+def _inherit_followup_tool_context(
+    context: Dict[str, Any],
+    user_text: Any,
+    history: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Carry the last operator intent into terse continuations and time choices."""
+
+    if context.get("tool_intents"):
+        return context
+    repaired = _repair_common_operator_typos(user_text)
+    is_followup = bool(
+        operator_requests_continuation(repaired)
+        or _parse_relative_window_seconds(repaired) is not None
+        or re.fullmatch(r"\s*\d{1,2}[.)]?\s*", repaired)
+        or re.fullmatch(
+            r"\s*(?:yes|yep|ok|okay|proceed|go ahead|да|продолжай|продолжить)\s*[.!]?\s*",
+            repaired,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not is_followup:
+        return context
+
+    prior_user_messages = 0
+    for message in reversed(list(history)):
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "user":
+            continue
+        prior_user_messages += 1
+        prior = _seed_turn_tool_context(
+            _extract_text_from_message_content(message.get("content"))
+        )
+        if (
+            not context.get("operator_relative_range")
+            and prior.get("operator_relative_range")
+        ):
+            context["operator_relative_range"] = prior["operator_relative_range"]
+        if context.get("channel_id") is None and prior.get("channel_id") is not None:
+            context["channel_id"] = prior["channel_id"]
+        if prior.get("tool_intents"):
+            context["tool_intents"] = list(prior["tool_intents"])
+            for key in (
+                "focus_video_summaries",
+                "wants_video_evidence",
+                "runtime_status_only",
+                "video_overview_request",
+                "channel_id",
+            ):
+                if context.get(key) in (None, False, "") and prior.get(key) not in (None, False, ""):
+                    context[key] = copy.deepcopy(prior[key])
+            context["inherited_operator_intent"] = True
+            break
+        if prior_user_messages >= 4:
+            break
+    return context
+
+
+def _tool_schema_names(schemas: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {
+        str((schema.get("function") or {}).get("name") or "")
+        for schema in schemas
+        if isinstance(schema, Mapping)
+    }
+
+
+def _required_video_research_tool_call(
+    context: Mapping[str, Any],
+    schemas: Sequence[Mapping[str, Any]],
+) -> Optional[_ToolCall]:
+    """Return the next non-optional read needed before a video-period answer."""
+
+    if "video_research" not in (context.get("tool_intents") or ()):
+        return None
+    available = _tool_schema_names(schemas)
+    relative_range = str(context.get("operator_relative_range") or "").strip()
+    if relative_range and not isinstance(context.get("time_window"), Mapping):
+        if "normalize_time_window" in available:
+            return _ToolCall(
+                id=f"required-normalize-{uuid.uuid4().hex[:12]}",
+                name="normalize_time_window",
+                args={"relative_range": relative_range},
+            )
+
+    if (
+        context.get("channel_id") is None
+        and not context.get("video_inventory_completed")
+        and isinstance(context.get("time_window"), Mapping)
+        and "list_video_summary_channels" in available
+    ):
+        return _ToolCall(
+            id=f"required-inventory-{uuid.uuid4().hex[:12]}",
+            name="list_video_summary_channels",
+            args={},
+        )
+
+    candidates = [
+        int(item)
+        for item in (context.get("video_candidate_channel_ids") or ())
+        if _opt_int(item) is not None and int(item) > 0
+    ]
+    if (
+        not candidates
+        and context.get("video_overview_request")
+        and context.get("channel_id") is not None
+        and isinstance(context.get("time_window"), Mapping)
+    ):
+        candidates = [int(context["channel_id"])]
+    completed = {
+        int(item)
+        for item in (context.get("video_detail_completed_channel_ids") or ())
+        if _opt_int(item) is not None and int(item) > 0
+    }
+    remaining = [channel_id for channel_id in candidates if channel_id not in completed]
+    if (
+        context.get("video_inventory_completed")
+        and not context.get("video_inventory_requires_confirmation")
+        and remaining
+        and "get_video_summaries" in available
+    ):
+        time_window = context.get("time_window")
+        duration_sec = (
+            _opt_float(time_window.get("duration_sec"))
+            if isinstance(time_window, Mapping)
+            else None
+        )
+        depth = "L2" if duration_sec is not None and duration_sec >= 8 * 3600 else "L1"
+        return _ToolCall(
+            id=f"required-summary-{remaining[0]}-{uuid.uuid4().hex[:8]}",
+            name="get_video_summaries",
+            args={
+                "channel_id": remaining[0],
+                "depth": depth,
+                "limit": 20,
+            },
+        )
+    return None
+
+
+def _video_overview_research_plan_completed(context: Mapping[str, Any]) -> bool:
+    """Return true once the bounded server-owned overview plan has enough data."""
+
+    if not context.get("video_overview_request"):
+        return False
+    if (
+        context.get("operator_relative_range")
+        and not isinstance(context.get("time_window"), Mapping)
+    ):
+        return False
+    if context.get("channel_id") is None and not context.get("video_inventory_completed"):
+        return False
+    if context.get("video_inventory_requires_confirmation"):
+        return True
+    candidates = [
+        int(item)
+        for item in (context.get("video_candidate_channel_ids") or ())
+        if _opt_int(item) is not None and int(item) > 0
+    ]
+    if not candidates and context.get("channel_id") is not None:
+        candidates = [int(context["channel_id"])]
+    completed = {
+        int(item)
+        for item in (context.get("video_detail_completed_channel_ids") or ())
+        if _opt_int(item) is not None and int(item) > 0
+    }
+    if candidates:
+        return set(candidates).issubset(completed)
+    return bool(context.get("video_inventory_completed"))
+
+
+_TURN_CACHEABLE_READ_TOOLS = frozenset(
+    {
+        "lookup_help",
+        "normalize_time_window",
+        "list_channels",
+        "list_video_summary_channels",
+        "get_video_summaries",
+        "list_attention_bursts",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+        "get_detections",
+        "get_detection_summary",
+        "search_archive",
+        "get_visual_window_signals",
+        "describe_frame",
+        "list_probes",
+        "get_prompt_settings",
+        "get_video_summary_restore_status",
+    }
+)
+
+
+def _turn_tool_cache_key(tool_name: str, args: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        dict(args or {}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"{str(tool_name)}\x00{payload}"
 
 
 def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
@@ -7697,6 +8044,9 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
 
     if tool_name == "list_video_summary_channels":
         context["video_inventory_completed"] = True
+        context["video_inventory_requires_confirmation"] = bool(
+            result.get("requires_confirmation")
+        )
         time_window = result.get("time_window")
         if isinstance(time_window, Mapping) and time_window.get("from_ts") is not None and time_window.get("to_ts") is not None:
             context["time_window"] = {
@@ -7704,8 +8054,22 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "to_ts": time_window.get("to_ts"),
                 "since_ms": time_window.get("since_ms"),
                 "until_ms": time_window.get("until_ms"),
+                "from_local": time_window.get("from_local"),
+                "to_local": time_window.get("to_local"),
+                "relative_range": time_window.get("relative_range"),
+                "duration_sec": time_window.get("duration_sec"),
             }
         candidates = result.get("candidate_channels")
+        if isinstance(candidates, list):
+            context["video_candidate_channel_ids"] = [
+                int(channel_id)
+                for channel_id in (
+                    _opt_int(row.get("channel_id"))
+                    for row in candidates
+                    if isinstance(row, Mapping)
+                )
+                if channel_id is not None and channel_id > 0
+            ]
         if isinstance(candidates, list) and len(candidates) == 1 and isinstance(candidates[0], Mapping):
             channel_id = _opt_int(candidates[0].get("channel_id"))
             if channel_id is not None:
@@ -7720,6 +8084,14 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 channel_id = _opt_int(processed[0])
         if channel_id is not None:
             context["channel_id"] = channel_id
+            if tool_name == "get_video_summaries":
+                completed = {
+                    int(item)
+                    for item in (context.get("video_detail_completed_channel_ids") or ())
+                    if _opt_int(item) is not None and int(item) > 0
+                }
+                completed.add(int(channel_id))
+                context["video_detail_completed_channel_ids"] = sorted(completed)
         time_window = result.get("time_window")
         if isinstance(time_window, Mapping) and time_window.get("from_ts") is not None and time_window.get("to_ts") is not None:
             context["time_window"] = {
@@ -7727,6 +8099,10 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "to_ts": time_window.get("to_ts"),
                 "since_ms": time_window.get("since_ms"),
                 "until_ms": time_window.get("until_ms"),
+                "from_local": time_window.get("from_local"),
+                "to_local": time_window.get("to_local"),
+                "relative_range": time_window.get("relative_range"),
+                "duration_sec": time_window.get("duration_sec"),
             }
         return
 
@@ -7988,6 +8364,7 @@ def _record_turn_signal_ledger(
                         "alert_total": row.get("alert_total"),
                         "alert_parser_breakdown": row.get("alert_parser_breakdown"),
                         "alert_delivery_breakdown": row.get("alert_delivery_breakdown"),
+                        "alert_episode_summary": row.get("alert_episode_summary"),
                         "state_transition_total": row.get("state_transition_total"),
                         "coverage_status": row.get("coverage_status"),
                         "quiet": row.get("quiet"),
@@ -8031,6 +8408,7 @@ def _record_turn_signal_ledger(
                 "coverage_note": _compact_signal_value(coverage.get("operator_note") or coverage.get("note"), 220),
                 "provenance_totals": result.get("provenance_totals"),
                 "returned_provenance_totals": result.get("returned_provenance_totals"),
+                "alert_episode_summary": result.get("alert_episode_summary"),
             },
         )
         if evidence_frames or result.get("evidence_frame_totals") or result.get("totals"):
@@ -8282,19 +8660,72 @@ def _final_response_is_incomplete(value: Any) -> bool:
     text = str(value or "").strip()
     if not text:
         return True
-    if len(text) > 360:
-        return False
     normalized = unicodedata.normalize("NFKC", text).casefold()
-    return bool(
+    promised_action = bool(
         re.match(
-            r"^(?:let me|i(?:'ll| will)|next,? i(?:'ll| will)|сейчас я|давай я|позволь(?:те)? мне)\b",
+            r"^(?:let me|i(?:'ll| will)(?: now)?|next,? i(?:'ll| will)|"
+            r"сейчас я|давай я|позволь(?:те)? мне)\b",
             normalized,
         )
         and re.search(
-            r"\b(?:fetch|check|inspect|retrieve|query|call|use|look|review|собер|провер|запрош|получ|посмотр|вызов)\w*\b",
+            r"\b(?:fetch|check|inspect|retrieve|query|call|use|look|review|normalize|"
+            r"собер|провер|запрош|получ|посмотр|вызов|нормализ)\w*\b",
             normalized,
         )
     )
+    stalled_handoff = bool(
+        re.search(
+            r"\b(?:ready for (?:your )?confirmation|ready to proceed|proceeding to|"
+            r"once you (?:confirm|specify).{0,120}\bi will|"
+            r"готов(?:а|о|ы)?\s+(?:продолжить|приступить)|жду подтвержден)\b",
+            normalized,
+            flags=re.DOTALL,
+        )
+    )
+    return promised_action or stalled_handoff
+
+
+def _video_research_response_needs_recovery(
+    value: Any,
+    context: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+) -> bool:
+    """Reject factual video reports that have no completed tool evidence."""
+
+    if "video_research" not in (context.get("tool_intents") or ()):
+        return False
+    text = str(value or "").strip()
+    if not text:
+        return True
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    clarification = bool(
+        "?" in text
+        and re.search(
+            r"\b(?:which|what time|specify|clarify|do you mean|какой|уточн|"
+            r"что именно|какое время|какой период)\b",
+            normalized,
+        )
+    )
+    if clarification:
+        return False
+    completed_evidence = any(
+        isinstance(ledger.get(section), list) and bool(ledger.get(section))
+        for section in ("coverage", "evidence", "semantic_signals")
+    )
+    if completed_evidence:
+        return False
+    factual_claim = bool(
+        re.search(
+            r"\b(?:i have normalized|current status|coverage analysis|alert status|"
+            r"alerts? (?:were|was|generated|triggered)|summaries? generated|"
+            r"dropped \d+|channel health|notable events?|"
+            r"нормализовал|текущ(?:ий|ее) статус|алерт(?:ы|ов)?|событи(?:е|я)|"
+            r"сводк(?:а|и)|потерян\w* кадр)\b",
+            normalized,
+        )
+        or bool(re.search(r"\bch\s*#?\s*\d+\b", normalized))
+    )
+    return factual_claim
 
 
 def _format_completion_fallback(ledger: Mapping[str, Any]) -> str:
@@ -8662,7 +9093,11 @@ class AgentRunner:
             )
 
         # Replace the stored user content with the full (possibly image-bearing) one
-        turn_tool_context = _seed_turn_tool_context(user_text)
+        turn_tool_context = _inherit_followup_tool_context(
+            _seed_turn_tool_context(user_text),
+            user_text,
+            history_prefix,
+        )
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
         if requested_skill_tool_names:
             turn_tool_context["skill_tool_names"] = sorted(requested_skill_tool_names)
@@ -8745,6 +9180,12 @@ class AgentRunner:
 
         # ── tool loop ──────────────────────────────────────────────────────
         tool_calls_used = 0
+        turn_tool_call_limit = (
+            AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS
+            if "video_research" in (turn_tool_context.get("tool_intents") or ())
+            else AGENT_MAX_TOOL_CALLS_PER_TURN
+        )
+        turn_read_cache: Dict[str, Tuple[Any, Any]] = {}
         context_warning_sent = False
         context_hard_stop_sent = False
         while True:
@@ -8754,7 +9195,7 @@ class AgentRunner:
                 permitted_tool_schemas,
                 turn_tool_context,
             )
-            if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
+            if tool_calls_used >= turn_tool_call_limit:
                 in_flight.append(
                     {
                         "role": "system",
@@ -8772,7 +9213,7 @@ class AgentRunner:
                             f"Stopped tool use after {tool_calls_used} call(s); "
                             "preparing a partial answer."
                         ),
-                        "max_tool_calls": AGENT_MAX_TOOL_CALLS_PER_TURN,
+                        "max_tool_calls": turn_tool_call_limit,
                     }
                 )
                 break
@@ -8840,27 +9281,64 @@ class AgentRunner:
                         "warning_tokens": AGENT_CONTEXT_WARNING_TOKENS,
                     }
                 )
-            # Run the blocking LM call in a thread so we can emit heartbeats
+            # Some read steps are protocol requirements, not model choices.
+            # This prevents a small local model from narrating an intended
+            # lookup without actually executing it.
             lm_response: _LMResponse
-            lm_cancel_event = threading.Event()
-            try:
-                lm_response = yield from _run_with_heartbeats(
-                    fn=lambda: self._lm_client.call_with_tools(
-                        in_flight,
-                        tools=available_tool_schemas,
-                        cancel_event=lm_cancel_event,
-                    ),
-                    heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
-                    heartbeat_payload_fn=lambda: {
-                        "phase": "lm_tool_decision",
-                        "lm_admission": self._lm_client.admission_status(),
-                    },
-                    cancel_event=lm_cancel_event,
+            required_call = _required_video_research_tool_call(
+                turn_tool_context,
+                available_tool_schemas,
+            )
+            if (
+                required_call is None
+                and _video_overview_research_plan_completed(turn_tool_context)
+            ):
+                in_flight.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "The bounded server-owned video overview plan is complete. "
+                            "Do not call more tools in this turn. Synthesize the completed "
+                            "inventory and summary results now; state coverage and any "
+                            "unchecked scope."
+                        ),
+                    }
                 )
-            except Exception as exc:
-                yield _sse({"type": "error", "message": f"LM error: {exc}"})
-                yield _sse({"type": "done", "session_id": session_id})
-                return
+                yield _sse(
+                    {
+                        "type": "research_plan_complete",
+                        "tool_calls_used": tool_calls_used,
+                        "message": "Bounded video overview complete; preparing the answer.",
+                    }
+                )
+                break
+            if required_call is not None:
+                lm_response = _LMResponse(
+                    content="",
+                    finish_reason="tool_calls",
+                    tool_calls=[required_call],
+                )
+            else:
+                # Run the blocking LM call in a thread so we can emit heartbeats.
+                lm_cancel_event = threading.Event()
+                try:
+                    lm_response = yield from _run_with_heartbeats(
+                        fn=lambda: self._lm_client.call_with_tools(
+                            in_flight,
+                            tools=available_tool_schemas,
+                            cancel_event=lm_cancel_event,
+                        ),
+                        heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
+                        heartbeat_payload_fn=lambda: {
+                            "phase": "lm_tool_decision",
+                            "lm_admission": self._lm_client.admission_status(),
+                        },
+                        cancel_event=lm_cancel_event,
+                    )
+                except Exception as exc:
+                    yield _sse({"type": "error", "message": f"LM error: {exc}"})
+                    yield _sse({"type": "done", "session_id": session_id})
+                    return
 
             if lm_response.finish_reason != "tool_calls" or not lm_response.tool_calls:
                 # Model wants to respond with text — break out to streaming phase
@@ -8882,6 +9360,10 @@ class AgentRunner:
                     tool_call.args,
                     turn_tool_context,
                 )
+            tool_cache_keys = {
+                id(tool_call): _turn_tool_cache_key(tool_call.name, tool_call.args)
+                for tool_call in lm_response.tool_calls
+            }
 
             # Append assistant turn with tool_calls to in-flight history
             assistant_msg: Dict[str, Any] = {
@@ -8900,10 +9382,11 @@ class AgentRunner:
             new_assistant_messages.append(assistant_msg)
 
             # Execute each tool call
+            stop_tool_loop_after_batch = False
             for tc in lm_response.tool_calls:
                 yield _sse({"type": "tool_call", "name": tc.name, "args": tc.args})
                 progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-                if tool_calls_used >= AGENT_MAX_TOOL_CALLS_PER_TURN:
+                if tool_calls_used >= turn_tool_call_limit:
                     error_payload = {
                         "error": (
                             "Tool budget exhausted. Ask the operator to continue "
@@ -8924,6 +9407,71 @@ class AgentRunner:
                     new_assistant_messages.append(result_msg)
                     continue
                 tool_calls_used += 1
+                cache_key = tool_cache_keys[id(tc)]
+                cached = (
+                    turn_read_cache.get(cache_key)
+                    if tc.name in _TURN_CACHEABLE_READ_TOOLS
+                    else None
+                )
+                if cached is not None:
+                    cached_result, cached_for_model = cached
+                    duplicate_for_model = copy.deepcopy(cached_for_model)
+                    if isinstance(duplicate_for_model, dict):
+                        duplicate_for_model["duplicate_suppressed"] = True
+                        duplicate_for_model["next_step_hint"] = (
+                            "This exact read already completed in this turn. "
+                            "Stop tool use and answer from the cached result."
+                        )
+                    result_msg = {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "content": json.dumps(duplicate_for_model, default=str),
+                    }
+                    _signal_ledger_append(
+                        turn_signal_ledger,
+                        "context_budget",
+                        {
+                            "phase": "duplicate_tool_suppressed",
+                            "tool": tc.name,
+                            "tool_calls_used": tool_calls_used,
+                        },
+                        limit=4,
+                    )
+                    in_flight.append(result_msg)
+                    new_assistant_messages.append(result_msg)
+                    yield _sse(
+                        {
+                            "type": "tool_result",
+                            "name": tc.name,
+                            "result": {
+                                "duplicate_suppressed": True,
+                                "message": (
+                                    "Identical read suppressed; cached result retained."
+                                ),
+                            },
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "type": "tool_loop_guard",
+                            "reason": "duplicate_read",
+                            "tool": tc.name,
+                            "tool_calls_used": tool_calls_used,
+                        }
+                    )
+                    in_flight.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                f"Duplicate {tc.name} read was suppressed. "
+                                "Do not request it again; answer from the completed "
+                                "cached result."
+                            ),
+                        }
+                    )
+                    stop_tool_loop_after_batch = True
+                    continue
 
                 try:
                     research_event: Optional[Dict[str, Any]] = None
@@ -8973,6 +9521,11 @@ class AgentRunner:
                             "persisted": research_persisted,
                         }
                     result_for_model = _compact_tool_result_for_model(tc.name, result)
+                    if tc.name in _TURN_CACHEABLE_READ_TOOLS:
+                        turn_read_cache[cache_key] = (
+                            copy.deepcopy(result),
+                            copy.deepcopy(result_for_model),
+                        )
                     if research_event is not None and isinstance(result_for_model, dict):
                         result_for_model["research_ledger"] = dict(research_event)
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
@@ -9021,6 +9574,8 @@ class AgentRunner:
 
                 in_flight.append(result_msg)
                 new_assistant_messages.append(result_msg)
+            if stop_tool_loop_after_batch:
+                break
 
         # ── final streaming text response ──────────────────────────────────
         signal_ledger_message = _format_turn_signal_ledger_message(turn_signal_ledger)
@@ -9077,7 +9632,14 @@ class AgentRunner:
             return
 
         final_text = "".join(full_text_parts)
-        if _final_response_is_incomplete(final_text):
+        if (
+            _final_response_is_incomplete(final_text)
+            or _video_research_response_needs_recovery(
+                final_text,
+                turn_tool_context,
+                turn_signal_ledger,
+            )
+        ):
             final_text = _format_completion_fallback(turn_signal_ledger)
             yield _sse({
                 "type": "completion_recovery",
@@ -9504,6 +10066,131 @@ def _compact_vlm_alert_events_for_model(value: Any, limit: int = 6) -> List[Dict
         if len(rows) >= max(1, int(limit)):
             break
     return rows
+
+
+def _vlm_alert_family(value: Mapping[str, Any]) -> str:
+    text = unicodedata.normalize(
+        "NFKC",
+        f"{value.get('title') or ''} {value.get('description') or ''}",
+    ).casefold()
+    families = (
+        ("vehicle_drift", r"\b(?:drift|drifting|donut|tire smoke|street racing)\b|дрифт"),
+        ("vehicle_collision", r"\b(?:collision|crash|impact|vehicle accident)\b|столкнов|авари"),
+        ("traffic_signal", r"\b(?:red light|traffic light|signal violation)\b|красн\w+\s+свет"),
+        ("fire_or_smoke", r"\b(?:fire|flame|smoke|burning)\b|пожар|плам|дым"),
+        ("weapon_or_violence", r"\b(?:weapon|gun|knife|fight|assault|violence)\b|оруж|пистолет|нож|драк"),
+        ("fall_or_distress", r"\b(?:fall|fallen|collapsed|person down|distress)\b|упал|лежит|потерял созн"),
+        ("entry_or_exit", r"\b(?:enter|enters|entered|exit|exits|arriv|depart)\w*\b|вош[её]л|выш[её]л|приш[её]л|уш[её]л"),
+        ("clothing_or_body", r"\b(?:clothing|garment|underwear|shirt|striped|body|mouth|nose)\b|одежд|бель|полосат|рот|нос"),
+        ("gesture_or_pose", r"\b(?:gesture|hand movement|seated|sitting|standing|lying)\b|жест|сидит|стоит"),
+    )
+    for family, pattern in families:
+        if re.search(pattern, text):
+            return family
+    normalized = re.sub(r"[^\w\s]+", " ", text)
+    normalized = re.sub(r"\b\d+(?:[.:]\d+)?\b", " ", normalized)
+    normalized = re.sub(
+        r"\b(?:a|an|the|is|are|was|were|seen|visible|detected|possible|"
+        r"alert|event|person|subject)\b",
+        " ",
+        normalized,
+    )
+    tokens = [token for token in normalized.split() if len(token) > 2]
+    return "other:" + ("_".join(tokens[:6]) or "unspecified")
+
+
+def _aggregate_vlm_alert_episodes(
+    events: Any,
+    *,
+    raw_alert_count: Optional[int] = None,
+    severity_counts: Any = None,
+    delivery_breakdown: Any = None,
+    episode_gap_sec: float = 600.0,
+    limit: int = 12,
+) -> Dict[str, Any]:
+    """Group repetitive VLM alert emissions into model-readable candidate episodes."""
+
+    compact_events = _compact_vlm_alert_events_for_model(events, limit=100_000)
+    compact_events.sort(key=lambda row: int(_opt_int(row.get("timestamp_ms")) or 0))
+    severity_rank = {
+        "normal": 0,
+        "info": 1,
+        "low": 2,
+        "medium": 3,
+        "high": 4,
+        "critical": 5,
+    }
+    episodes: List[Dict[str, Any]] = []
+    latest_by_family: Dict[str, Dict[str, Any]] = {}
+    for event in compact_events:
+        family = _vlm_alert_family(event)
+        timestamp_ms = _opt_int(event.get("timestamp_ms"))
+        current = latest_by_family.get(family)
+        current_last_ms = _opt_int(current.get("last_timestamp_ms")) if current else None
+        same_episode = bool(
+            current is not None
+            and timestamp_ms is not None
+            and current_last_ms is not None
+            and 0 <= int(timestamp_ms) - int(current_last_ms) <= int(episode_gap_sec * 1000.0)
+        )
+        if not same_episode:
+            current = {
+                "family": family,
+                "first_timestamp_ms": timestamp_ms,
+                "last_timestamp_ms": timestamp_ms,
+                "raw_count": 0,
+                "severity": str(event.get("severity") or "normal"),
+                "delivery_breakdown": {},
+                "representative_titles": [],
+            }
+            episodes.append(current)
+            latest_by_family[family] = current
+        current["raw_count"] = int(current.get("raw_count") or 0) + 1
+        if timestamp_ms is not None:
+            if current.get("first_timestamp_ms") is None:
+                current["first_timestamp_ms"] = int(timestamp_ms)
+            current["last_timestamp_ms"] = int(timestamp_ms)
+        severity = str(event.get("severity") or "normal").strip().lower()
+        if severity_rank.get(severity, 0) > severity_rank.get(str(current.get("severity") or ""), 0):
+            current["severity"] = severity
+        delivery = str(event.get("delivery_status") or "unknown").strip().lower() or "unknown"
+        deliveries = current["delivery_breakdown"]
+        deliveries[delivery] = int(deliveries.get(delivery) or 0) + 1
+        title = str(event.get("title") or "").strip()
+        titles = current["representative_titles"]
+        if title and title not in titles and len(titles) < 3:
+            titles.append(title)
+
+    raw_total = int(
+        max(
+            len(compact_events),
+            int(_opt_int(raw_alert_count) or 0),
+        )
+    )
+    episodes.sort(
+        key=lambda row: (
+            int(_opt_int(row.get("last_timestamp_ms")) or 0),
+            int(row.get("raw_count") or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "raw_alert_count": raw_total,
+        "structured_alert_count": len(compact_events),
+        "candidate_episode_count": len(episodes),
+        "repeated_structured_alert_count": max(0, len(compact_events) - len(episodes)),
+        "unclustered_alert_count": max(0, raw_total - len(compact_events)),
+        "episode_gap_sec": float(episode_gap_sec),
+        "severity_counts": _compact_int_breakdown(severity_counts),
+        "delivery_breakdown": _compact_int_breakdown(delivery_breakdown),
+        "episodes": episodes[: max(1, int(limit))],
+        "truncated": len(episodes) > max(1, int(limit)),
+        "semantics": (
+            "candidate_episode = same semantic alert family grouped while consecutive "
+            "emissions are no more than episode_gap_sec apart; this reduces repeated "
+            "batch emissions and is not proof of distinct real-world incidents"
+        ),
+    }
 
 
 def _compact_state_observations_for_model(value: Any, limit: int = 8) -> List[Dict[str, Any]]:
@@ -11384,6 +12071,13 @@ def _strip_thumbnails_deep(obj: Any) -> Any:
 
 def _tool_result_for_ui(tool_name: str, result: Any) -> Any:
     """Return a frontend-safe tool result without large inline images when a URL exists."""
+    if (
+        tool_name in {"list_video_summary_channels", "get_video_summaries"}
+        and isinstance(result, dict)
+    ):
+        # These tools can carry hundreds of source windows and provenance
+        # fields. The UI cards use the same bounded envelope as the model.
+        return _compact_tool_result_for_model(tool_name, result)
     if tool_name != "describe_frame" or not isinstance(result, dict):
         return result
     out = dict(result)
@@ -11481,7 +12175,7 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
     layer_semantics = {
         "stream": "L0 live-description role/style; not channel-specific alert criteria.",
         "alerts": "Operator watch/alert criteria; EVA appends backend alert instructions around this layer.",
-        "json": "Machine-readable ALERTS_JSON extraction contract; do not edit for ordinary watch conditions.",
+        "json": "Unified machine-readable BATCH_STATE_JSON contract for cover, continuity, memory pass, observed states, and alerts; do not edit for ordinary watch conditions.",
         "rollups": "L1/L2/L3 compressed memory maps; context for investigation, not visual proof.",
     }
     for layer_name in ("stream", "alerts", "json"):
@@ -11740,6 +12434,57 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "pipeline_health": result.get("pipeline_health"),
             "report": result.get("report"),
         }
+        if result.get("report_type") == "false_positives":
+            reason_counts = (
+                result.get("reason_counts")
+                if isinstance(result.get("reason_counts"), list)
+                else []
+            )
+            channel_counts = (
+                result.get("channel_counts")
+                if isinstance(result.get("channel_counts"), list)
+                else []
+            )
+            feedback = (
+                result.get("feedback")
+                if isinstance(result.get("feedback"), list)
+                else []
+            )
+            compact.update(
+                {
+                    "reason_counts": [
+                        {
+                            "reason_code": row.get("reason_code"),
+                            "reason_label": row.get("reason_label"),
+                            "count": row.get("count"),
+                        }
+                        for row in reason_counts[:8]
+                        if isinstance(row, dict)
+                    ],
+                    "channel_counts": [
+                        {
+                            "channel_id": row.get("channel_id"),
+                            "count": row.get("count"),
+                        }
+                        for row in channel_counts[:16]
+                        if isinstance(row, dict)
+                    ],
+                    "feedback": [
+                        {
+                            "detection_id": row.get("detection_id"),
+                            "channel_id": row.get("channel_id"),
+                            "alert_timestamp_ms": row.get("alert_timestamp_ms"),
+                            "reason_code": row.get("reason_code"),
+                            "reason_label": row.get("reason_label"),
+                            "alert_title": row.get("alert_title"),
+                            "note": row.get("note"),
+                        }
+                        for row in feedback[:12]
+                        if isinstance(row, dict)
+                    ],
+                }
+            )
+            return compact
         if result.get("report_type") == "probes":
             compact.update({
                 "total_detections": result.get("total_detections"),
@@ -11935,6 +12680,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "latest_time": row.get("latest_time"),
                     "alert_total": row.get("alert_total"),
                     "alert_counts": row.get("alert_counts"),
+                    "alert_episode_summary": row.get("alert_episode_summary"),
                     "recent_alerts": list(row.get("recent_alerts") or [])[:2],
                     "state_transition_total": row.get("state_transition_total"),
                     "running": row.get("running"),
@@ -11990,6 +12736,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "totals": result.get("totals"),
             "provenance_totals": result.get("provenance_totals"),
             "returned_provenance_totals": result.get("returned_provenance_totals"),
+            "alert_episode_summary": result.get("alert_episode_summary"),
             "evidence_frames": [
                 _compact_detection_for_model(row)
                 for row in evidence_frames[:8]

@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## tuktuk Grammar Pin
+
+Before changing agent tools, tool result compaction, intent groups, or
+`skills/*/SKILL.md`, read `AGENTS.md` and
+`docs/tuktuk/grammar_pin.md`. The pinned tuktuk grammar is the design gate for
+EVA reflex/tool-orchestration changes.
+
+If a new tool or skill does not fit the pinned block grammar or violates the
+extractability law, raise the conflict explicitly in the work log or review
+summary and record it in `docs/tuktuk/grammar_review_questions.md`. Do not
+silently bend the grammar or implementation.
+
 ## Overview
 
 evo-ssearch is a CLIP-powered image search server with a Flask-based interface:

@@ -12,6 +12,7 @@ from agent import (
     _ToolCall,
     _compact_tool_result_for_model,
     _compact_tool_messages_for_context_budget,
+    _coalesce_system_messages,
     _context_budget_snapshot,
     _filter_streamed_tool_markup,
     _parse_text_tool_calls,
@@ -54,9 +55,16 @@ class _FakeStore:
 
 
 class _FakeLMClient:
-    def __init__(self, tool_rounds: int, tool_name: str = "list_channels") -> None:
+    def __init__(
+        self,
+        tool_rounds: int,
+        tool_name: str = "list_channels",
+        *,
+        distinct_args: bool = False,
+    ) -> None:
         self.remaining = tool_rounds
         self.tool_name = tool_name
+        self.distinct_args = distinct_args
         self.tools = None
         self.final_messages = None
         self.tool_call_messages = []
@@ -74,7 +82,7 @@ class _FakeLMClient:
                     _ToolCall(
                         id=f"call-{round_number}",
                         name=self.tool_name,
-                        args={},
+                        args={"round": round_number} if self.distinct_args else {},
                     )
                 ],
             )
@@ -145,6 +153,39 @@ class _FakeApprovalTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_system_messages_are_coalesced_at_front_for_strict_chat_templates(self):
+        messages = [
+            {"role": "system", "content": "base rules"},
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "list_channels", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "list_channels",
+                "content": "{}",
+            },
+            {"role": "system", "content": "trusted turn ledger"},
+        ]
+
+        normalized = _coalesce_system_messages(messages)
+
+        self.assertEqual(normalized[0], {
+            "role": "system",
+            "content": "base rules\n\ntrusted turn ledger",
+        })
+        self.assertEqual([item["role"] for item in normalized], [
+            "system", "user", "assistant", "tool",
+        ])
+        self.assertEqual(messages[-1]["role"], "system")
+
     def test_tool_schemas_are_routed_by_operator_intent(self):
         def names(query, *, inventory_complete=False):
             context = _seed_turn_tool_context(query)
@@ -180,6 +221,181 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("create_probe", probe_tools)
         self.assertIn("calibrate_probe_from_archive", probe_tools)
         self.assertNotIn("get_video_summaries", probe_tools)
+
+    def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
+        initial = _seed_turn_tool_context(
+            "Hi! Tell me about what happend this night"
+        )
+        self.assertIn("video_research", initial["tool_intents"])
+
+        followup = _seed_turn_tool_context("2. the las 24 hours.")
+        agent._inherit_followup_tool_context(
+            followup,
+            "2. the las 24 hours.",
+            [
+                {
+                    "role": "user",
+                    "content": "Hi! Tell me about what happend this night",
+                },
+                {"role": "assistant", "content": "Which period?"},
+            ],
+        )
+        self.assertIn("video_research", followup["tool_intents"])
+        self.assertEqual(followup["operator_relative_range"], "last 24 hours")
+        self.assertTrue(followup["inherited_operator_intent"])
+
+        continued = _seed_turn_tool_context("continue")
+        agent._inherit_followup_tool_context(
+            continued,
+            "continue",
+            [
+                {
+                    "role": "user",
+                    "content": "Hi! Tell me about what happend this night",
+                },
+                {"role": "assistant", "content": "Which period?"},
+                {"role": "user", "content": "2. the las 24 hours."},
+                {"role": "assistant", "content": "I will normalize it."},
+            ],
+        )
+        self.assertIn("video_research", continued["tool_intents"])
+        self.assertEqual(continued["operator_relative_range"], "last 24 hours")
+
+    def test_video_period_research_executes_required_reads_before_model_narrative(self):
+        class ResearchTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                window = {
+                    "from_ts": 100.0,
+                    "to_ts": 86_500.0,
+                    "since_ms": 100_000,
+                    "until_ms": 86_500_000,
+                    "duration_sec": 86_400,
+                    "relative_range": "last 24 hours",
+                }
+                if name == "normalize_time_window":
+                    return dict(window)
+                if name == "list_video_summary_channels":
+                    return {
+                        "time_window": dict(window),
+                        "requested_channel_ids": [112, 118],
+                        "checked_channel_ids": [112, 118],
+                        "candidate_channels": [
+                            {"channel_id": 112, "summary_count": 10},
+                            {"channel_id": 118, "summary_count": 20},
+                        ],
+                        "inactive_channel_ids": [],
+                        "deferred_channel_ids": [],
+                        "unchecked_channel_ids": [],
+                        "errors": [],
+                        "active_count": 2,
+                        "inactive_count": 0,
+                        "error_count": 0,
+                    }
+                if name == "get_video_summaries":
+                    return {
+                        "channel_id": args["channel_id"],
+                        "depth": args["depth"],
+                        "time_window": dict(window),
+                        "count": 1,
+                        "total_in_window": 1,
+                        "coverage": {"status": "covered"},
+                        "entries": [{"summary": "observed activity"}],
+                    }
+                raise AssertionError(name)
+
+        history = [
+            {
+                "role": "user",
+                "content": "Hi! Tell me about what happend this night",
+            },
+            {"role": "assistant", "content": "Which period?"},
+            {"role": "user", "content": "2. the las 24 hours."},
+        ]
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(history=history)
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = ResearchTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "2. the las 24 hours.",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            [
+                "normalize_time_window",
+                "list_video_summary_channels",
+                "get_video_summaries",
+                "get_video_summaries",
+            ],
+        )
+        self.assertEqual(runner._tools.call_args[0][1]["relative_range"], "last 24 hours")
+        self.assertEqual(runner._tools.call_args[2][1]["depth"], "L2")
+        self.assertEqual(runner._tools.call_args[3][1]["channel_id"], 118)
+        self.assertEqual(
+            sum(event.get("type") == "tool_call" for event in events),
+            4,
+        )
+        self.assertTrue(
+            any(event.get("type") == "research_plan_complete" for event in events)
+        )
+        self.assertEqual(runner._lm_client.tool_call_messages, [])
+
+    def test_duplicate_video_read_is_suppressed_and_stops_tool_loop(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=10,
+            tool_name="get_video_summaries",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "channel_id": 112,
+                "depth": "L1",
+                "count": 1,
+                "total_in_window": 1,
+                "coverage": {"status": "covered"},
+                "entries": [{"summary": "stable result"}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Inspect video coverage for channel #112",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 1)
+        self.assertEqual(
+            sum(event.get("type") == "tool_call" for event in events),
+            2,
+        )
+        guard = next(
+            event for event in events if event.get("type") == "tool_loop_guard"
+        )
+        self.assertEqual(guard["reason"], "duplicate_read")
+        duplicate_result = [
+            event
+            for event in events
+            if event.get("type") == "tool_result"
+        ][-1]
+        self.assertTrue(duplicate_result["result"]["duplicate_suppressed"])
 
     def test_activated_runbook_tools_pass_the_intent_gate(self):
         query = "проверь канал 115, был ли почтальон вчера вечером?"
@@ -515,7 +731,7 @@ class AgentToolLoopTests(unittest.TestCase):
     def test_tool_loop_can_exceed_eight_rounds(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
-        runner._lm_client = _FakeLMClient(tool_rounds=12)
+        runner._lm_client = _FakeLMClient(tool_rounds=12, distinct_args=True)
         runner._tools = _FakeTools()
         runner._ps = object()
         runner._ds = object()
@@ -567,7 +783,7 @@ class AgentToolLoopTests(unittest.TestCase):
     def test_tool_loop_has_high_but_finite_budget(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
-        runner._lm_client = _FakeLMClient(tool_rounds=100)
+        runner._lm_client = _FakeLMClient(tool_rounds=100, distinct_args=True)
         runner._tools = _FakeTools()
         runner._ps = object()
         runner._ds = object()
@@ -583,6 +799,64 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(runner._tools.calls, 64)
         self.assertTrue(any(item.get("type") == "tool_budget" for item in payloads))
         self.assertEqual(payloads[-1]["type"], "done")
+
+    def test_video_research_has_a_smaller_distinct_tool_budget(self):
+        class DistinctVideoLM(_FakeLMClient):
+            def __init__(self):
+                super().__init__(tool_rounds=100, tool_name="get_video_summaries")
+                self.round_number = 0
+
+            def call_with_tools(self, _messages, tools=None, cancel_event=None):
+                self.tools = tools
+                self.tool_call_messages.append(list(_messages))
+                self.round_number += 1
+                return _LMResponse(
+                    content="",
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        _ToolCall(
+                            id=f"video-{self.round_number}",
+                            name="get_video_summaries",
+                            args={"limit": self.round_number},
+                        )
+                    ],
+                )
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = DistinctVideoLM()
+        runner._tools = _FakeTools(
+            result={
+                "channel_id": 112,
+                "depth": "L1",
+                "count": 1,
+                "total_in_window": 1,
+                "coverage": {"status": "covered"},
+                "entries": [{"summary": "result"}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Inspect video coverage for channel #112",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            runner._tools.calls,
+            agent.AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+        )
+        budget = next(item for item in events if item.get("type") == "tool_budget")
+        self.assertEqual(
+            budget["max_tool_calls"],
+            agent.AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+        )
 
     def test_continue_uses_persisted_channel_ids_and_frozen_window(self):
         research_state = {

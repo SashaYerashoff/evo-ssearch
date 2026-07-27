@@ -1877,6 +1877,22 @@
         justify-content: space-between;
     }
 
+    .luxriot-selector-control {
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.65rem;
+        padding: 0.4rem 0.55rem;
+        border: 1px solid rgba(45, 212, 191, 0.18);
+        border-radius: 8px;
+        background: rgba(9, 22, 26, 0.58);
+    }
+
+    .luxriot-selector-control .inline-check {
+        margin: 0;
+        color: #c8f7ec;
+        font-size: 0.78rem;
+    }
+
     .luxriot-cadence-pill {
         gap: 0.4rem;
     }
@@ -5577,6 +5593,55 @@ textarea::placeholder {
     line-height: 1.6;
 }
 
+.luxriot-summary-content.has-thumbnail {
+    display: grid;
+    grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
+    align-items: start;
+    gap: 14px;
+}
+
+.luxriot-summary-thumbnail {
+    display: grid;
+    gap: 7px;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.7rem;
+    text-align: left;
+    cursor: pointer;
+}
+
+.luxriot-summary-thumbnail img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border: 1px solid rgba(37, 51, 66, 0.92);
+    border-radius: 9px;
+    background: #05080b;
+}
+
+.luxriot-summary-thumbnail:hover img {
+    border-color: rgba(0, 214, 143, 0.52);
+}
+
+.luxriot-summary.is-collapsed .luxriot-summary-content {
+    display: none;
+}
+
+@media (max-width: 760px) {
+    .luxriot-summary-content.has-thumbnail {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .luxriot-summary-thumbnail {
+        max-width: 260px;
+    }
+}
+
 .summary-body code {
     background: rgba(0, 214, 143, 0.08);
     border-color: rgba(0, 214, 143, 0.18);
@@ -7503,7 +7568,15 @@ textarea::placeholder {
     position: absolute;
     inset: clamp(14px, 3vh, 28px) clamp(14px, 4vw, 44px);
     display: grid;
-    grid-template-rows: auto minmax(260px, 1fr) auto auto auto minmax(180px, 0.55fr);
+    grid-template-areas:
+        "head"
+        "frame"
+        "meta"
+        "filmstrip"
+        "actions"
+        "feedback"
+        "summary";
+    grid-template-rows: auto minmax(260px, 1fr) auto auto auto auto minmax(180px, 0.55fr);
     gap: 12px;
     max-width: 1120px;
     margin: 0 auto;
@@ -7516,6 +7589,7 @@ textarea::placeholder {
 }
 
 .archive-review-head {
+    grid-area: head;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
@@ -7560,6 +7634,7 @@ textarea::placeholder {
 }
 
 .archive-review-frame {
+    grid-area: frame;
     position: relative;
     min-height: 0;
     margin: 0 18px;
@@ -7597,6 +7672,7 @@ textarea::placeholder {
 }
 
 .archive-review-meta-row {
+    grid-area: meta;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     gap: 16px;
@@ -7644,6 +7720,7 @@ textarea::placeholder {
 }
 
 .archive-review-filmstrip {
+    grid-area: filmstrip;
     display: flex;
     gap: 8px;
     min-height: 72px;
@@ -7715,6 +7792,17 @@ textarea::placeholder {
     font-size: 0.66rem;
 }
 
+.archive-review-strip-frame .archive-review-strip-marker {
+    left: 4px;
+    top: 4px;
+    bottom: auto;
+    max-width: calc(100% - 28px);
+    color: #9ff8df;
+    border: 1px solid rgba(0, 216, 166, 0.48);
+    background: rgba(3, 24, 21, 0.88);
+    font-size: 0.52rem;
+}
+
 .archive-review-filmstrip-status {
     display: grid;
     place-items: center;
@@ -7735,6 +7823,7 @@ textarea::placeholder {
 }
 
 .archive-review-actions {
+    grid-area: actions;
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
@@ -7742,7 +7831,99 @@ textarea::placeholder {
     padding: 0 18px;
 }
 
+.archive-review-actions .feature-btn.warning {
+    border-color: rgba(245, 158, 11, 0.68);
+    color: #fbbf24;
+}
+
+.archive-review-feedback {
+    grid-area: feedback;
+    margin: 0 18px;
+    padding: 14px 16px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 8px;
+    background: rgba(46, 29, 5, 0.42);
+}
+
+.archive-review-feedback[hidden] {
+    display: none;
+}
+
+.archive-review-feedback-head,
+.archive-review-feedback-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.archive-review-feedback-title {
+    color: var(--text);
+    font-size: 0.86rem;
+    font-weight: 650;
+}
+
+.archive-review-feedback-copy,
+.archive-review-feedback-status,
+.archive-review-feedback-note span {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.archive-review-feedback-status {
+    color: #fbbf24;
+}
+
+.archive-review-feedback-reasons {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.archive-review-feedback-reason {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 6px 9px;
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+.archive-review-feedback-reason:has(input:checked) {
+    border-color: rgba(245, 158, 11, 0.72);
+    background: rgba(245, 158, 11, 0.1);
+}
+
+.archive-review-feedback-note {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.archive-review-feedback-note textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: 9px 10px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 6px;
+    background: rgba(4, 11, 17, 0.84);
+    color: var(--text);
+    font: inherit;
+}
+
+.archive-review-feedback-actions {
+    justify-content: flex-end;
+}
+
 .archive-review-summary-panel {
+    grid-area: summary;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -7780,7 +7961,7 @@ textarea::placeholder {
 @media (max-width: 760px) {
     .archive-review-shell {
         inset: 10px;
-        grid-template-rows: auto minmax(220px, 0.9fr) auto auto auto minmax(180px, 0.6fr);
+        grid-template-rows: auto minmax(220px, 0.9fr) auto auto auto auto minmax(180px, 0.6fr);
     }
 
     .archive-review-head,
@@ -10023,6 +10204,156 @@ body.ui-lite [style*="backdrop-filter"] {
     backdrop-filter: none !important;
 }
 
+/* Archive channel scope: checkbox chips make multi-stream selection explicit. */
+.archive-channel-picker {
+    display: grid;
+    gap: 6px;
+    max-height: 178px;
+    padding: 7px;
+    overflow-y: auto;
+    border: 1px solid var(--field-border);
+    border-radius: 10px;
+    background: rgba(11, 16, 21, 0.96);
+    scrollbar-width: thin;
+}
+
+.archive-channel-options {
+    display: grid;
+    gap: 5px;
+}
+
+.archive-channel-option {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--text);
+    cursor: pointer;
+}
+
+.archive-channel-option:hover {
+    border-color: rgba(0, 214, 143, 0.25);
+    background: rgba(0, 214, 143, 0.06);
+}
+
+.archive-channel-option input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: var(--accent);
+}
+
+.archive-channel-option span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.archive-channel-option-all {
+    border-bottom: 1px solid rgba(37, 51, 66, 0.72);
+    border-radius: 8px 8px 2px 2px;
+    color: var(--muted);
+}
+
+/* Probe board: keep operational controls together per source channel. */
+#probeCards {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.probe-channel-group {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid rgba(37, 51, 66, 0.84);
+    border-radius: 16px;
+    background: rgba(7, 11, 15, 0.46);
+}
+
+.probe-channel-group-head {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 2px;
+}
+
+.probe-channel-group-kicker,
+.probe-channel-group-count {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.probe-channel-group-name {
+    margin-top: 3px;
+    color: var(--text);
+    font-size: 0.96rem;
+    font-weight: 650;
+}
+
+.probe-channel-group-count {
+    flex: 0 0 auto;
+    text-align: right;
+}
+
+.probe-channel-card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+    gap: 12px;
+    align-items: start;
+}
+
+.probe-temporary-group {
+    min-width: 0;
+    padding-top: 2px;
+    border-top: 1px solid rgba(37, 51, 66, 0.58);
+}
+
+.probe-temporary-group > summary {
+    padding: 9px 2px 7px;
+    cursor: pointer;
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.probe-temporary-group[open] > summary {
+    color: var(--accent);
+}
+
+.probe-temporary-group > .probe-channel-card-grid {
+    padding-top: 4px;
+}
+
+.probe-channel-group-new {
+    padding: 0;
+    border-style: dashed;
+    background: transparent;
+}
+
+@media (max-width: 720px) {
+    .probe-channel-group-head {
+        align-items: start;
+        flex-direction: column;
+    }
+
+    .probe-channel-group-count {
+        text-align: left;
+    }
+}
+
 /* Probe board card flow layout: controls participate in card grid, not overlays. */
 #probeCards {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
@@ -10358,7 +10689,15 @@ body.ui-lite [style*="backdrop-filter"] {
     margin: 0 auto;
     padding: 0;
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 0.55fr);
+    grid-template-areas:
+        "head"
+        "frame"
+        "meta"
+        "filmstrip"
+        "actions"
+        "feedback"
+        "summary";
+    grid-template-rows: auto minmax(240px, 1fr) auto auto auto auto minmax(180px, 0.55fr);
     gap: 12px;
     border: 1px solid rgba(37, 51, 66, 0.92);
     border-radius: 22px;
@@ -10411,7 +10750,7 @@ body.ui-lite [style*="backdrop-filter"] {
     .archive-review-shell {
         width: min(100%, 1120px);
         height: calc(100dvh - 20px);
-        grid-template-rows: auto minmax(0, 0.9fr) auto auto auto minmax(0, 0.7fr);
+        grid-template-rows: auto minmax(200px, 0.9fr) auto auto auto auto minmax(160px, 0.7fr);
     }
 
     .archive-review-head,

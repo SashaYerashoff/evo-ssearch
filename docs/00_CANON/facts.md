@@ -24,9 +24,9 @@ Last reviewed: 2026-07-13 (β 0.8.4)
 | Fact | Value |
 |---|---|
 | Control plane | PostgreSQL (required in secure deployment) |
-| Alembic schema head | `20260614_0006` |
-| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260614_0006` |
-| Migration needed for 0.8.3 → 0.8.4 | **No** (code-only patch) |
+| Alembic schema head | `20260726_0009` |
+| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260726_0009` |
+| Migration needed for this working tree | **Yes**: run `alembic upgrade head` |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |
 | Runtime DB roles | Separate DSNs for API, audit, worker, migration |

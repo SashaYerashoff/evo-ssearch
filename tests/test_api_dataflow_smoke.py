@@ -16,6 +16,7 @@ from oldapp import (
     _SENSITIVE_ENDPOINT_PERMISSIONS,
     _build_detection_search_result,
     _env_precedence_report,
+    _expired_stored_probe_lineage_payload,
     _store_vlm_summary_archive_frames,
     ProbesStore,
     app,
@@ -153,6 +154,97 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             )
             self.assertEqual(store.list_probes(), [])
 
+            store.upsert_probe({"id": "probe-2"})
+            store.upsert_probe({"id": "probe-3"})
+            self.assertEqual(
+                store.delete_probes(["probe-2", "probe-3", "probe-3"]),
+                2,
+            )
+            self.assertEqual(store.list_probes(), [])
+
+    def test_probe_list_hides_expired_temporary_rows_but_keeps_disabled_saved_probes(self) -> None:
+        store = type(
+            "ProbeStore",
+            (),
+            {
+                "list_probes": staticmethod(
+                    lambda: [
+                        {
+                            "id": "saved-disabled",
+                            "channel_id": 7,
+                            "enabled": False,
+                            "temporary": False,
+                        },
+                        {
+                            "id": "temporary-active",
+                            "channel_id": 7,
+                            "enabled": True,
+                            "temporary": True,
+                            "expires_at_ms": 9_999_999_999_999,
+                        },
+                        {
+                            "id": "temporary-expired",
+                            "channel_id": 7,
+                            "enabled": False,
+                            "temporary": True,
+                            "expires_at_ms": 1,
+                        },
+                    ]
+                )
+            },
+        )()
+
+        with patch("oldapp.probes_store", store):
+            response = self.client.get("/probes/list")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            [probe["id"] for probe in payload["probes"]],
+            ["saved-disabled", "temporary-active"],
+        )
+        self.assertEqual(payload["counts"]["persistent"], 1)
+        self.assertEqual(payload["counts"]["temporary_active"], 1)
+        self.assertEqual(payload["counts"]["temporary_expired_hidden"], 1)
+
+    def test_expired_probe_lineage_omits_heavy_runtime_thumbnails(self) -> None:
+        payload = _expired_stored_probe_lineage_payload(
+            {
+                "id": "temporary-expired",
+                "channel_id": 7,
+                "temporary": True,
+                "created_at_ms": 1_000,
+                "expires_at_ms": 2_000,
+                "parent_alert_id": "alert-1",
+                "last_hit": {
+                    "timestamp_ms": 1_900,
+                    "pos_score": 0.8,
+                    "thumbnail": "x" * 300_000,
+                },
+                "recent_hits": [
+                    {
+                        "timestamp_ms": 1_900,
+                        "pos_score": 0.8,
+                        "thumbnail": "y" * 300_000,
+                    }
+                ],
+            },
+            now_ms=3_000,
+        )
+
+        record = payload["record"]
+        self.assertNotIn("last_hit", record)
+        self.assertNotIn("recent_hits", record)
+        self.assertEqual(record["runtime_evidence"]["recent_hit_count"], 1)
+        self.assertEqual(
+            record["runtime_evidence"]["last_hit"]["pos_score"],
+            0.8,
+        )
+        self.assertNotIn(
+            "thumbnail",
+            record["runtime_evidence"]["last_hit"],
+        )
+
     def test_env_precedence_reports_process_difference_without_values(self) -> None:
         file_secret_hash = hashlib.sha256(b"different-secret").hexdigest()
         report = _env_precedence_report(
@@ -190,6 +282,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/agent/skills/create",
             "/detections/image",
             "/detections/thumbnail/<int:detection_id>",
+            "/detections/<int:detection_id>/feedback",
             "/detections/diagnostics",
             "/favicon.ico",
             "/health",
@@ -210,6 +303,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/lm/models",
             "/luxriot/recent_frame/<int:channel_id>",
             "/ready",
+            "/reports/false-positives",
+            "/reports/false-positives/export",
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
@@ -274,6 +369,70 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(store.records[2]["probe_id"], "vlm_alert:7")
         self.assertTrue(store.records[2]["bookmark_sent"])
         self.assertIn("run-7", store.records[0]["dedupe_key"])
+
+    def test_cv_apex_and_companion_receive_independent_clip_embeddings(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.records: List[Dict[str, Any]] = []
+
+            def add_detections(self, records: List[Dict[str, Any]]) -> int:
+                self.records.extend(records)
+                return len(records)
+
+        store = Store()
+        embedded: List[str] = []
+
+        def embed(thumbnail: Any, embedder: str) -> str:
+            self.assertEqual(embedder, "clip")
+            value = str(thumbnail)
+            embedded.append(value)
+            return f"vec:{value}"
+
+        entry = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Fast movement with a sharper comparison frame.",
+            "frame_count": 1,
+            "created_at": 100.0,
+            "batch_start_ms": 100000,
+            "batch_end_ms": 100999,
+            "archive_frames": [
+                {
+                    "anchor_role": "burst_apex",
+                    "frame_index": 0,
+                    "timestamp_ms": 100300,
+                    "thumbnail": "cv-apex",
+                    "source_frame_index": 2,
+                    "selection_source": "capture_cv_frame_delta",
+                    "selector_enabled": True,
+                },
+                {
+                    "anchor_role": "burst_companion",
+                    "frame_index": 0,
+                    "timestamp_ms": 100600,
+                    "thumbnail": "sharp-companion",
+                    "source_frame_index": 3,
+                    "companion_of_timestamp_ms": 100300,
+                },
+            ],
+        }
+
+        with (
+            patch("oldapp.detections_store", store),
+            patch("oldapp._embed_thumbnail_b64", side_effect=embed),
+            patch("oldapp._apply_archive_retention", return_value={"ok": True}),
+        ):
+            result = _store_vlm_summary_archive_frames(entry)
+
+        self.assertEqual(result["summary_frames"], 2)
+        self.assertEqual(embedded, ["cv-apex", "sharp-companion"])
+        self.assertEqual(
+            [record["clip_vec"] for record in store.records],
+            ["vec:cv-apex", "vec:sharp-companion"],
+        )
+        self.assertTrue(store.records[0]["payload"]["selector_enabled"])
+        self.assertEqual(store.records[0]["payload"]["source_frame_index"], 2)
+        self.assertEqual(store.records[1]["payload"]["source_frame_index"], 3)
 
     def test_vlm_summary_archive_frames_write_one_record_per_alert_event(self) -> None:
         class Store:
@@ -432,6 +591,24 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
 
+    def test_detections_list_passes_multiple_channel_filters(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?channel_id=7&channel_id=9&since_ms=1000"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["channel_ids"], [7, 9])
+        self.assertNotIn("channel_id", captured)
+        self.assertEqual(response.get_json()["filters"]["channel_ids"], [7, 9])
+
     def test_detections_list_can_skip_thumbnail_payload_for_history_reader(self) -> None:
         captured: Dict[str, Any] = {}
 
@@ -443,12 +620,14 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         with patch("oldapp.detections_store", Store()):
             response = self.client.get(
                 "/detections/list?source=vlm_summary&channel_id=7&since_ms=1000"
-                "&until_ms=2000&include_thumbnail=0"
+                "&until_ms=2000&include_thumbnail=0&batch_id=vlm-test-batch"
             )
 
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertFalse(captured["include_thumbnail"])
+        self.assertEqual(captured["batch_id"], "vlm-test-batch")
         self.assertFalse(response.get_json()["filters"]["include_thumbnail"])
+        self.assertEqual(response.get_json()["filters"]["batch_id"], "vlm-test-batch")
 
     def test_luxriot_history_returns_compact_postgres_batch_page(self) -> None:
         captured: Dict[str, Any] = {}

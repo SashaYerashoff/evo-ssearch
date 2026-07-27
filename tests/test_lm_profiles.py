@@ -159,6 +159,43 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertNotIn("chat_template_kwargs", captured["json"])
 
+    def test_interactive_vlm_requests_direct_answer(self):
+        profile = {
+            "id": "vlm",
+            "kind": "vlm",
+            "base_url": "http://vlm.local/v1",
+            "model": "qwen3.5-4b-mtp",
+            "api_key": "",
+            "timeout": 120,
+        }
+        captured = {}
+
+        def fake_post(_url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "describe this frame"}],
+                profile_id="vlm",
+                profile_kind="vlm",
+                workload_class="describe",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(
+            captured["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {
             "default": {

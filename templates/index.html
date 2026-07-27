@@ -66,10 +66,14 @@
                             <div class="section-help">Load archived frames from video descriptions, VLM alerts, and secondary CLIP probe hits before drilling down.</div>
                             <div class="archive-filter-grid">
                                 <div class="input-group">
-                                    <label for="archiveChannelFilter" class="input-label">Stream:</label>
-                                    <select id="archiveChannelFilter">
-                                        <option value="">All streams</option>
-                                    </select>
+                                    <span class="input-label">Streams:</span>
+                                    <div id="archiveChannelFilter" class="archive-channel-picker" role="group" aria-label="Archive streams">
+                                        <label class="archive-channel-option archive-channel-option-all">
+                                            <input type="checkbox" data-archive-channel-all checked>
+                                            <span>All streams</span>
+                                        </label>
+                                        <div id="archiveChannelOptions" class="archive-channel-options"></div>
+                                    </div>
                                 </div>
                                 <div class="input-group">
                                     <label for="archiveProbeFilter" class="input-label">Probe:</label>
@@ -249,6 +253,13 @@
                             </span>
                             <span id="luxriotBatchInfo" class="luxriot-pill">~{{ luxriot_snapshot_interval }}s · {{ luxriot_snapshot_max_edge }}px</span>
                         </div>
+                        <div class="luxriot-row luxriot-selector-control">
+                            <label class="inline-check" title="When enabled, EVA chooses each model-visible frame from the dense source using motion, sharpness, and the channel's adaptive baseline. When disabled, EVA uses the deterministic temporal midpoint.">
+                                <input type="checkbox" id="luxriotSelectorEnabled" checked>
+                                Adaptive CV frame selector
+                            </label>
+                            <span class="video-control-note">Per channel · the selected frame is used by VLM, archive, and CLIP probes.</span>
+                        </div>
                         <div id="luxriotRuntimeConfigState" class="luxriot-runtime-config-state" aria-live="polite" hidden>
                             <span id="luxriotRuntimeConfigRunning"></span>
                             <span id="luxriotRuntimeConfigPending" class="luxriot-runtime-config-pending" hidden>applies on summaries restart</span>
@@ -309,7 +320,7 @@
                                             <option value="L0">Observations</option>
                                             <option value="L1">15 minute summaries</option>
                                             <option value="L2">1 hour summaries</option>
-                                            <option value="L3">6 hour summaries</option>
+                                            <option value="L3">8 hour summaries</option>
                                         </select>
                                     </div>
                                 </div>
@@ -436,6 +447,7 @@
                                 <span>Cadence <strong id="luxriotStreamCadence">-</strong></span>
                                 <span>Batch <strong id="luxriotStreamBatch">-</strong></span>
                                 <span>Model <strong id="luxriotStreamModel">-</strong></span>
+                                <span>Frame selector <strong id="luxriotStreamSelector">-</strong></span>
                                 <span>Queue <strong id="luxriotStreamQueue">idle</strong></span>
                                 <span id="luxriotStreamProbesRow" class="runtime-fact-secondary">Probes <strong id="luxriotStreamProbes">idle</strong></span>
                                 <span class="runtime-fact-secondary">Preview age <strong id="luxriotStreamLastFrame">never</strong></span>
@@ -890,6 +902,27 @@
                 <button id="archiveReviewSimilarBtn" class="feature-btn">Find similar</button>
                 <button id="archiveReviewJumpBtn" class="feature-btn primary">Open VLM feed</button>
                 <button id="archiveReviewCopyBtn" class="feature-btn">Copy summary</button>
+                <button id="archiveReviewFeedbackBtn" class="feature-btn warning" type="button" hidden>Report false positive</button>
+            </div>
+            <div id="archiveReviewFeedbackPanel" class="archive-review-feedback" hidden>
+                <div class="archive-review-feedback-head">
+                    <div>
+                        <div class="archive-review-feedback-title">Why is this alert a false positive?</div>
+                        <div class="archive-review-feedback-copy">The annotation stays linked to this exact VLM alert and channel.</div>
+                    </div>
+                    <div id="archiveReviewFeedbackStatus" class="archive-review-feedback-status"></div>
+                </div>
+                <div id="archiveReviewFeedbackReasons" class="archive-review-feedback-reasons"></div>
+                <label class="archive-review-feedback-note">
+                    <span>Operator note (optional)</span>
+                    <textarea id="archiveReviewFeedbackNote" maxlength="1000" rows="3" placeholder="What did you see in the video?"></textarea>
+                </label>
+                <div class="archive-review-feedback-actions">
+                    <button id="archiveReviewFeedbackSaveBtn" class="feature-btn primary" type="button">Save feedback</button>
+                    <button id="archiveReviewFeedbackCancelBtn" class="feature-btn" type="button">Cancel</button>
+                    <button id="archiveReviewFeedbackExportMdBtn" class="feature-btn" type="button" hidden>Export 24h MD</button>
+                    <button id="archiveReviewFeedbackExportXmlBtn" class="feature-btn" type="button" hidden>Export 24h XML</button>
+                </div>
             </div>
             <div class="archive-review-summary-panel">
                 <div class="archive-review-summary-title">Video description for the L0 batch</div>

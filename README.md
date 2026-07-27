@@ -28,7 +28,8 @@ Start here — the docs are the source of truth, not this README:
 - **Architecture:** [system](docs/architecture/system_architecture.md) ·
   [cognitive](docs/architecture/cognitive_architecture.md) ·
   [security/threat model](docs/architecture/security_threat_model.md) ·
-  [data retention & privacy](docs/architecture/data_retention_privacy.md)
+  [data retention & privacy](docs/architecture/data_retention_privacy.md) ·
+  [tuktuk grammar pin](docs/tuktuk/grammar_pin.md)
 - **Limits & history:** [known limitations](docs/known_limitations.md) ·
   [CHANGELOG](CHANGELOG.md) · [historical snapshots](readiness/history/)
 

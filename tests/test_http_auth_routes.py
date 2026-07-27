@@ -1086,6 +1086,156 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(forbidden_scope.status_code, 403)
         self.assertEqual(allowed_scope.status_code, 200)
 
+    def test_multi_channel_detection_scope_checks_every_selected_channel(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset({Permission.DETECTIONS_VIEW.value}),
+            allowed_channel_ids=frozenset({7, 9}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        with patch(
+            "oldapp.detections_store.list_detections",
+            return_value=([], 0),
+        ) as list_detections:
+            allowed = self.client.get(
+                "/detections/list?channel_id=7&channel_id=9"
+            )
+            forbidden = self.client.get(
+                "/detections/list?channel_id=7&channel_id=8"
+            )
+
+        self.assertEqual(allowed.status_code, 200, allowed.get_json())
+        self.assertEqual(allowed.get_json()["filters"]["channel_ids"], [7, 9])
+        self.assertEqual(
+            list_detections.call_args.kwargs["channel_ids"],
+            [7, 9],
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_alert_false_positive_feedback_report_and_export_are_scoped(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.OPERATOR.value}),
+            permissions=frozenset(
+                {
+                    Permission.DETECTIONS_VIEW.value,
+                    Permission.REPORTS_VIEW.value,
+                    Permission.BOOKMARKS_CREATE.value,
+                    Permission.DATA_EXPORT.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        saved_feedback = {
+            "id": 91,
+            "detection_id": 501,
+            "channel_id": 7,
+            "alert_timestamp_ms": 150_000,
+            "actor_id": USER_ID,
+            "reason_code": "benign_activity",
+            "reason_label": "Benign activity",
+            "note": "Maintenance worker.",
+            "alert_title": "Person near door",
+            "alert_snapshot": {"source": "vlm_alert"},
+            "submitted_at_ms": 160_000,
+            "updated_at_ms": 160_000,
+        }
+        report = {
+            "report_type": "false_positives",
+            "period": {"since_ms": 100_000, "until_ms": 200_000},
+            "coverage": {
+                "status": "covered",
+                "annotation_count": 1,
+                "returned_count": 1,
+                "truncated": False,
+                "ground_truth_status": "operator_annotation_only",
+            },
+            "summary": {
+                "annotation_count": 1,
+                "distinct_alert_count": 1,
+                "reviewer_count": 1,
+                "channel_count": 1,
+            },
+            "reason_counts": [
+                {
+                    "reason_code": "benign_activity",
+                    "reason_label": "Benign activity",
+                    "count": 1,
+                }
+            ],
+            "channel_counts": [{"channel_id": 7, "count": 1}],
+            "feedback": [saved_feedback],
+            "report": "# False-positive operator feedback report",
+        }
+
+        with (
+            patch(
+                "oldapp.detections_store.fetch_detections_by_ids",
+                return_value=[
+                    {
+                        "id": 501,
+                        "channel_id": 7,
+                        "source": "vlm_alert",
+                    }
+                ],
+            ),
+            patch(
+                "oldapp.detections_store.upsert_alert_feedback",
+                return_value=saved_feedback,
+            ) as upsert_feedback,
+            patch(
+                "oldapp.detections_store.generate_false_positive_report",
+                return_value=report,
+            ) as generate_report,
+        ):
+            missing_csrf = self.client.post(
+                "/detections/501/feedback",
+                json={"reason_code": "benign_activity"},
+            )
+            saved = self.client.post(
+                "/detections/501/feedback",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "reason_code": "benign_activity",
+                    "note": "Maintenance worker.",
+                },
+            )
+            scoped_report = self.client.get(
+                "/reports/false-positives?since_ms=100000&until_ms=200000"
+            )
+            xml_export = self.client.get(
+                "/reports/false-positives/export"
+                "?format=xml&since_ms=100000&until_ms=200000"
+            )
+
+        self.assertEqual(missing_csrf.status_code, 403)
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        self.assertEqual(saved.get_json()["feedback"]["detection_id"], 501)
+        self.assertEqual(
+            upsert_feedback.call_args.kwargs["actor_id"],
+            USER_ID,
+        )
+        self.assertEqual(scoped_report.status_code, 200, scoped_report.get_json())
+        self.assertEqual(
+            generate_report.call_args_list[0].kwargs["channel_ids"],
+            [7],
+        )
+        self.assertEqual(xml_export.status_code, 200)
+        self.assertTrue(xml_export.data.startswith(b"<?xml"))
+        self.assertIn(
+            "eva-false-positive-report-",
+            xml_export.headers["Content-Disposition"],
+        )
+        self.assertTrue(
+            any(
+                event.action == "archive.alert_feedback.upsert"
+                and event.channel_id == 7
+                for event in self.audit.events
+            )
+        )
+
     def test_archive_not_ready_response_is_sanitized(self) -> None:
         self._login()
 
@@ -1147,6 +1297,7 @@ class HttpAuthRouteTests(unittest.TestCase):
                     "channel_id": 7,
                     "stream_system_prompt": "plain prompt",
                     "alert_policy_prompt": "watch for visible falls near stairs",
+                    "capture_selector_enabled": False,
                 },
             )
 
@@ -1157,6 +1308,7 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_enabled"])
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_cooldown_sec"])
+        self.assertFalse(update_settings.call_args.kwargs["capture_selector_enabled"])
 
         with patch("oldapp.luxriot_manager.update_prompt_settings") as update_settings:
             denied_bookmark_reset = self.client.post(

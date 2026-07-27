@@ -91,7 +91,7 @@ def install_channel_memory(manager: LuxriotManager, channel_id: int = 7) -> None
 
 
 class VlmAlertPromptContractTests(unittest.TestCase):
-    def test_final_live_prompt_places_prior_memory_before_alerts_json_contract(self):
+    def test_final_live_prompt_places_prior_memory_before_batch_state_contract(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             install_channel_memory(manager)
@@ -105,7 +105,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
             self.assertIn("Alert review policy", final_prompt)
             self.assertIn("Active Channel Memory", final_prompt)
-            self.assertIn("ALERTS_JSON:", final_prompt)
+            self.assertIn("BATCH_STATE_JSON:", final_prompt)
             self.assertLess(
                 final_prompt.index("Alert review policy"),
                 final_prompt.index("Active Channel Memory"),
@@ -113,13 +113,13 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             )
             self.assertLess(
                 final_prompt.index("Active Channel Memory"),
-                final_prompt.index("ALERTS_JSON:"),
-                "channel memory/prior must be before the final ALERTS_JSON output contract",
+                final_prompt.index("BATCH_STATE_JSON:"),
+                "channel memory/prior must be before the final BATCH_STATE_JSON output contract",
             )
             self.assertLess(
                 final_prompt.index("Current-batch observation contract"),
-                final_prompt.index("ALERTS_JSON:"),
-                "ALERTS_JSON must stay last after current-state instructions",
+                final_prompt.index("BATCH_STATE_JSON:"),
+                "BATCH_STATE_JSON must stay last after current-state instructions",
             )
 
     def test_vector_signal_prompt_marks_cues_as_attention_not_visual_proof(self):
@@ -152,7 +152,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             self.assertIn("not visual proof", final_prompt)
             self.assertLess(final_prompt.index("Active Channel Memory"), final_prompt.index("VECTOR_SIGNALS_JSON"))
             self.assertLess(final_prompt.index("VECTOR_SIGNALS_JSON"), final_prompt.index("Current-batch observation contract"))
-            self.assertLess(final_prompt.index("VECTOR_SIGNALS_JSON"), final_prompt.index("ALERTS_JSON:"))
+            self.assertLess(final_prompt.index("VECTOR_SIGNALS_JSON"), final_prompt.index("BATCH_STATE_JSON:"))
 
     def test_default_alert_contract_has_no_private_scene_entities(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -162,6 +162,43 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
             for forbidden in ("orlandina", "sphynx", "union jack", "british flag", "sasha"):
                 self.assertNotIn(forbidden, lowered)
+
+    def test_unified_batch_state_preserves_cover_and_evidence_references(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+            {"thumbnail": "frame-three", "captured_at": 102.0},
+        ]
+        summary = (
+            "A person enters through the gate.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,'
+            '"cover":{"snapshot_index":2,"kind":"transition","reason":"clearest gate crossing","confidence":"high"},'
+            '"scene":{"status":"matched","summary":"Gate entrance"},'
+            '"events":[{"event_id":"gate-entry","label":"person enters","state":"new",'
+            '"snapshot_indices":[1,2],"summary":"Person crosses the gate","novelty":"novel","pass_up":true}],'
+            '"observed_states":[],"routines":[],"memory_pass":["gate entry"],'
+            '"alerts":[{"title":"Gate entry","severity":"low","snapshot_indices":[2,3]}]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+        archived = LuxriotManager._summary_archive_frames(
+            frames,
+            batch_start_ms=100000,
+            batch_end_ms=102000,
+            sample_count=2,
+            batch_state=state,
+        )
+
+        self.assertEqual(state["contract_status"], "parsed")
+        self.assertEqual(state["cover"]["snapshot_index"], 2)
+        self.assertEqual(state["cover"]["source"], "model")
+        self.assertEqual(state["alerts"][0]["snapshot_indices"], [2, 3])
+        self.assertEqual(
+            [frame["snapshot_index"] for frame in archived],
+            [1, 2, 3],
+        )
+        self.assertTrue(archived[1]["is_cover"])
 
     def test_alert_policy_prompt_is_separate_from_stream_prompt(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -176,7 +213,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             self.assertEqual(settings["alert_policy_prompt"], "Pay special attention to people falling near stairs.")
             final_prompt = manager.compose_live_system_prompt(7, manager.get_effective_stream_system_prompt(7))
             self.assertIn("Pay special attention to people falling near stairs.", final_prompt)
-            self.assertIn("ALERTS_JSON:", final_prompt)
+            self.assertIn("BATCH_STATE_JSON:", final_prompt)
 
     def test_legacy_stream_alert_prompt_returns_migration_suggestion(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -225,9 +262,12 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 "Window summary.\n\n"
                 "Alerts:\n"
                 "Info: Person waves at the gate.\n\n"
-                "ALERTS_JSON:\n"
-                "{\"alerts\":[{\"title\":\"Vehicle drifting\",\"description\":\"Vehicle drifting in the lot.\","
-                "\"severity\":\"high\",\"state\":\"new\",\"channel_id\":7,\"timestamp_ms\":0}]}"
+                "BATCH_STATE_JSON:\n"
+                "{\"version\":1,\"cover\":{\"snapshot_index\":2},\"events\":[],"
+                "\"observed_states\":[],\"routines\":[],\"memory_pass\":[],"
+                "\"alerts\":[{\"title\":\"Vehicle drifting\",\"description\":\"Vehicle drifting in the lot.\","
+                "\"severity\":\"high\",\"state\":\"new\",\"channel_id\":7,\"timestamp_ms\":0,"
+                "\"snapshot_indices\":[2]}]}"
             )
 
             with patch.object(
@@ -241,6 +281,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             self.assertEqual(diagnostics["json_alert_count"], 1)
             self.assertEqual(diagnostics["prose_alert_count"], 1)
             self.assertEqual(diagnostics["parser_alert_count"], 2)
+            self.assertEqual(result.alert_events[0]["snapshot_indices"], [2])
 
 
 if __name__ == "__main__":

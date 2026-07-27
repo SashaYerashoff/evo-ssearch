@@ -4,6 +4,7 @@ from unittest.mock import patch
 from agent import (
     AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN,
     AgentTools,
+    _aggregate_vlm_alert_episodes,
     _apply_turn_tool_context,
     _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
@@ -392,6 +393,48 @@ class TurnSignalLedgerTests(unittest.TestCase):
 
 
 class AgentVideoSummaryToolTests(unittest.TestCase):
+    def test_repeated_vlm_alerts_are_grouped_as_candidate_episodes(self):
+        result = _aggregate_vlm_alert_episodes(
+            [
+                {
+                    "title": "Vehicle drifting with tire smoke",
+                    "severity": "high",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 1_000,
+                },
+                {
+                    "title": "Drifting vehicle creates tire smoke",
+                    "severity": "high",
+                    "delivery_status": "dedup_suppressed",
+                    "timestamp_ms": 31_000,
+                },
+                {
+                    "title": "Person entered the room",
+                    "severity": "low",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 40_000,
+                },
+                {
+                    "title": "Vehicle drifting again",
+                    "severity": "high",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 901_000,
+                },
+            ],
+            raw_alert_count=7,
+            severity_counts={"high": 6, "low": 1},
+            delivery_breakdown={"sent": 3, "dedup_suppressed": 4},
+            episode_gap_sec=600,
+        )
+
+        self.assertEqual(result["raw_alert_count"], 7)
+        self.assertEqual(result["structured_alert_count"], 4)
+        self.assertEqual(result["candidate_episode_count"], 3)
+        self.assertEqual(result["repeated_structured_alert_count"], 1)
+        self.assertEqual(result["unclustered_alert_count"], 3)
+        self.assertEqual(result["severity_counts"]["high"], 6)
+        self.assertIn("not proof", result["semantics"])
+
     def test_ui_detection_rows_do_not_invent_image_url_without_thumbnail(self):
         missing = {
             "id": 117031,
@@ -449,7 +492,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["prompt_health"]["suggested_alert_policy_prompt"], "Flag people fighting.")
         self.assertIn("L0 live-description role/style", compact["prompt_layers"]["stream"]["semantics"])
         self.assertIn("Operator watch/alert criteria", compact["prompt_layers"]["alerts"]["semantics"])
-        self.assertIn("Machine-readable ALERTS_JSON", compact["prompt_layers"]["json"]["semantics"])
+        self.assertIn("BATCH_STATE_JSON", compact["prompt_layers"]["json"]["semantics"])
         self.assertIn("compressed memory maps", compact["prompt_layers"]["rollups"]["semantics"])
 
     def test_system_prompt_reframes_sensitive_visible_evidence_instead_of_refusing(self):
@@ -465,7 +508,11 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
         self.assertIn("Video-description runtime:", prompt)
         self.assertIn("CH 7: running, video_lm=vlm-a1", prompt)
-        self.assertIn("recent_alerts=Doorway activity", prompt)
+        self.assertIn(
+            "volatile period counters omitted; call list_video_summary_channels",
+            prompt,
+        )
+        self.assertNotIn("recent_alerts=Doorway activity", prompt)
         self.assertIn("CH 8: desired but not running", prompt)
         self.assertIn("Configured semantic probes (1 total; secondary/internal", prompt)
         self.assertLess(prompt.index("Video-description runtime:"), prompt.index("Configured semantic probes"))
@@ -2993,6 +3040,76 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["probe_count"], 1)
         self.assertEqual(result["probes"][0]["probe_name"], "door")
         self.assertEqual(store.summary_kwargs["source"], "probe")
+
+    def test_generate_report_false_positives_uses_operator_annotations(self):
+        class FeedbackReportStore(_DetectionStore):
+            def generate_false_positive_report(self, **kwargs):
+                self.feedback_kwargs = kwargs
+                return {
+                    "report_type": "false_positives",
+                    "period": {
+                        "since_ms": kwargs["since_ms"],
+                        "until_ms": kwargs["until_ms"],
+                    },
+                    "coverage": {
+                        "status": "covered",
+                        "annotation_count": 2,
+                        "ground_truth_status": "operator_annotation_only",
+                    },
+                    "summary": {
+                        "annotation_count": 2,
+                        "distinct_alert_count": 2,
+                        "reviewer_count": 1,
+                        "channel_count": 1,
+                    },
+                    "reason_counts": [
+                        {
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "count": 2,
+                        }
+                    ],
+                    "channel_counts": [{"channel_id": 7, "count": 2}],
+                    "feedback": [
+                        {
+                            "detection_id": 501,
+                            "channel_id": 7,
+                            "alert_timestamp_ms": 150_000,
+                            "actor_id": "private-reviewer-id",
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "alert_title": "Person near door",
+                            "note": "Maintenance worker.",
+                        }
+                    ],
+                    "report": "# False-positive operator feedback report",
+                }
+
+        store = FeedbackReportStore()
+        result = _tools(detections_store=store).execute(
+            "generate_report",
+            {
+                "report_type": "false_positives",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "channel_ids": [7],
+                "top_events": 5,
+            },
+        )
+        compact = _compact_tool_result_for_model("generate_report", result)
+
+        self.assertEqual(result["report_type"], "false_positives")
+        self.assertEqual(store.feedback_kwargs["since_ms"], 100_000)
+        self.assertEqual(store.feedback_kwargs["until_ms"], 300_000)
+        self.assertEqual(store.feedback_kwargs["channel_ids"], [7])
+        self.assertEqual(store.feedback_kwargs["item_limit"], 5)
+        self.assertEqual(
+            result["coverage"]["ground_truth_status"],
+            "operator_annotation_only",
+        )
+        self.assertEqual(compact["reason_counts"][0]["count"], 2)
+        self.assertEqual(compact["feedback"][0]["detection_id"], 501)
+        self.assertNotIn("actor_id", compact["feedback"][0])
 
     def test_generate_probe_report_exposes_representative_events_to_model(self):
         class ProbeReportStore(_DetectionStore):

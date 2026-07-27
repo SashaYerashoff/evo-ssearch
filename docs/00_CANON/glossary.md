@@ -22,7 +22,7 @@ distinct. When in doubt, link here.
 - **L0 / L1 / L2 / L3** — summary levels by time window:
   - **L0** = per-batch live video-description (frame-time anchored).
   - **L1 / L2 / L3** = rollups over progressively larger windows
-    (default ~15 min / 1 h / 6 h). L1–L3 may be LLM-synthesized or deterministic.
+    (default ~15 min / 1 h / 8 h). L1–L3 may be LLM-synthesized or deterministic.
 - **Read-only rollup** — reading rollups for investigation **without** triggering
   LLM synthesis (used by agent investigation tools).
 - **Salience-weighted compression** — when a rollup exceeds its budget, alert /
@@ -30,10 +30,14 @@ distinct. When in doubt, link here.
 
 ## Alerts & bookmarks
 
-- **ALERTS_JSON** — a structured alert block the VLM appends to a video-description
-  when a security/safety trigger is visible. The structured layer behind severity
-  badges and alert counts. Always requested; independent of bookmark settings.
-- **Alert** — one parsed entry from ALERTS_JSON (title, description, severity, state, timestamp).
+- **BATCH_STATE_JSON** — the single structured current-batch contract appended by
+  the VLM. It carries the chosen cover, scene/episode continuity, observed states,
+  routine and memory-pass items, and zero or more grounded alerts. Always requested;
+  independent of bookmark settings.
+- **ALERTS_JSON** — legacy input format accepted while reading older summaries; it
+  is no longer requested from the VLM.
+- **Alert** — one parsed entry from `BATCH_STATE_JSON.alerts` (title, description,
+  severity, state, timestamp, and snapshot references).
 - **Severity** — `info | low | normal | high | critical`.
 - **Bookmark** — an event pushed **into Luxriot Evo** from an alert. Gated by
   `bookmark_enabled` and a per-channel cooldown. A bookmark can fail to deliver

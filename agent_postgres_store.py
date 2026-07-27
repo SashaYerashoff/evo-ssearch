@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import re
 import threading
 import uuid
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from eva_db import PsycopgPool, TransactionContext
+from agent_security.audit import ToolAuditEvent
 
 
 def _jsonb(value: Any) -> Any:
@@ -33,6 +36,160 @@ def _uuid_text(value: str | uuid.UUID | None, field_name: str) -> str:
         return str(uuid.UUID(str(value)))
     except Exception as exc:
         raise ValueError(f"{field_name} is required and must be a UUID") from exc
+
+
+def _arguments_digest(value: str | None) -> bytes:
+    text = str(value or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return bytes.fromhex(text)
+    return hashlib.sha256(text.encode("utf-8")).digest()
+
+
+def record_agent_tool_run_audit(
+    pool: PsycopgPool,
+    event: ToolAuditEvent,
+    audit_event_id: str | uuid.UUID,
+) -> None:
+    """Project immutable tool audit phases into the queryable agent.tool_runs table."""
+
+    if not event.session_id:
+        return
+    context = TransactionContext(
+        tenant_id=_uuid_text(event.tenant_id, "tenant_id"),
+        actor_id=_uuid_text(event.actor_id, "actor_id"),
+        request_id=event.request_id,
+        agent_session_id=_uuid_text(event.session_id, "session_id"),
+    )
+    arguments_digest = _arguments_digest(event.arguments_hash)
+    duration_ms = (
+        max(0, int(round(float(event.duration_ms))))
+        if event.duration_ms is not None
+        else None
+    )
+    phase = str(event.phase or "").strip().lower()
+    safe_metadata = {
+        "phase": phase,
+        "operation": str(event.operation or "execute")[:40],
+        "risk": str(event.risk or "")[:40] or None,
+        "code": str(event.code or "")[:120] or None,
+    }
+    audit_id = _uuid_text(audit_event_id, "audit_event_id")
+    required_permission = str(event.required_permission or "unknown")[:160]
+    request_id = str(event.request_id) if event.request_id is not None else None
+
+    def _insert(
+        connection: Any,
+        *,
+        decision: str,
+        finished: bool,
+        result_class: Optional[str],
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO agent.tool_runs (
+                id,
+                tenant_id,
+                session_id,
+                actor_user_id,
+                request_id,
+                tool_name,
+                normalized_arguments_hash,
+                required_permission,
+                permission_decision,
+                duration_ms,
+                result_class,
+                audit_event_id,
+                safe_metadata,
+                started_at,
+                finished_at
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                CASE WHEN %s THEN %s ELSE NULL END
+            )
+            """,
+            (
+                str(uuid.uuid4()),
+                context.tenant_id,
+                str(event.session_id),
+                context.actor_id,
+                request_id,
+                str(event.tool_name)[:200],
+                arguments_digest,
+                required_permission,
+                decision,
+                duration_ms if finished else None,
+                result_class,
+                audit_id,
+                _jsonb(safe_metadata),
+                event.timestamp,
+                finished,
+                event.timestamp,
+            ),
+        )
+
+    with pool.transaction(context) as connection:
+        if phase == "allow":
+            _insert(connection, decision="allow", finished=False, result_class=None)
+            return
+        if phase == "deny":
+            _insert(
+                connection,
+                decision="deny",
+                finished=True,
+                result_class=str(event.code or "denied")[:120],
+            )
+            return
+        if phase not in {"result", "error"}:
+            return
+
+        row = connection.execute(
+            """
+            UPDATE agent.tool_runs
+            SET duration_ms = %s,
+                result_class = %s,
+                audit_event_id = %s,
+                safe_metadata = safe_metadata || %s,
+                finished_at = %s
+            WHERE id = (
+                SELECT id
+                FROM agent.tool_runs
+                WHERE tenant_id = %s
+                  AND session_id = %s
+                  AND tool_name = %s
+                  AND normalized_arguments_hash = %s
+                  AND request_id IS NOT DISTINCT FROM %s
+                  AND finished_at IS NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+            )
+            RETURNING id
+            """,
+            (
+                duration_ms,
+                "success" if phase == "result" else str(event.code or "error")[:120],
+                audit_id,
+                _jsonb(safe_metadata),
+                event.timestamp,
+                context.tenant_id,
+                str(event.session_id),
+                str(event.tool_name)[:200],
+                arguments_digest,
+                request_id,
+            ),
+        ).fetchone()
+        if row is None:
+            _insert(
+                connection,
+                decision="allow",
+                finished=True,
+                result_class=(
+                    "success"
+                    if phase == "result"
+                    else str(event.code or "error")[:120]
+                ),
+            )
 
 
 class PostgresAgentStore:

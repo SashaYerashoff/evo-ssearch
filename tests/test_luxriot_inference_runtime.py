@@ -389,6 +389,28 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertEqual(selection["selected_timestamp_ms"], 2_500)
             self.assertEqual(selection["selector_bias"], "clarity")
 
+    def test_disabled_selector_uses_midpoint_and_freezes_homeostasis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager, session = self._make_session(temp)
+            manager.update_prompt_settings(channel_id=7, capture_selector_enabled=False)
+            session.capture_activity_baseline_level = 0.0125
+            session.capture_activity_baseline_dev = 0.003
+            session.capture_activity_baseline_buckets = 640
+
+            session._accept_captured_frame(_deterministic_noise_frame(1), 2_100, summarize=False)
+            session._accept_captured_frame(_deterministic_noise_frame(2), 2_500, summarize=False)
+            session._accept_captured_frame(_deterministic_noise_frame(3), 2_900, summarize=False)
+            session._flush_capture_apex_bucket()
+
+            selection = session.recent_frame_items()[-1]["capture_selection"]
+            self.assertFalse(selection["selector_enabled"])
+            self.assertEqual(selection["selection_mode"], "disabled")
+            self.assertEqual(selection["selection_source"], "selector_disabled_temporal_midpoint")
+            self.assertEqual(selection["selected_timestamp_ms"], 2_500)
+            self.assertEqual(selection["fallback_reason"], "capture_cv_selector_disabled")
+            self.assertEqual(session.capture_activity_baseline_buckets, 640)
+            self.assertEqual(session.status()["capture_selector_enabled"], False)
+
     def test_bucket_mode_is_relative_to_channel_baseline(self):
         with tempfile.TemporaryDirectory() as temp:
             _manager, session = self._make_session(temp)
@@ -516,6 +538,10 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                     "summary": "Sudden movement near the gate.",
                     "frame_count": 12,
                     "created_at": 1_781_700_000.0,
+                    "thumbnail_detection_id": 44,
+                    "thumbnail_role": "burst_apex",
+                    "thumbnail_frame_index": 2,
+                    "thumbnail_selection_source": "capture_cv_frame_delta",
                     "prompt": "large internal prompt",
                     "frame_selection": {
                         "groups": [
@@ -544,6 +570,13 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertIn("frame_selection", full_log)
             self.assertNotIn("frame_selection", feed_log)
             self.assertNotIn("prompt", feed_log)
+            self.assertEqual(feed_log["thumbnail_detection_id"], 44)
+            self.assertEqual(feed_log["thumbnail_role"], "burst_apex")
+            self.assertEqual(feed_log["thumbnail_frame_index"], 2)
+            self.assertEqual(
+                feed_log["thumbnail_selection_source"],
+                "capture_cv_frame_delta",
+            )
             self.assertEqual(
                 feed_log["vector_signal"]["capture_attention"]["seconds"][0]["mode"],
                 "burst",
@@ -653,11 +686,15 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             manager = build_manager(Path(temp))
             manager.rollup_windows["L1"] = 900
             manager.rollup_scheduler_max_deferral_windows = 2.0
+            manager.rollup_scheduler_max_deferral_sec = 180.0
             manager._rollup_scheduler_deferred_since[(7, "L1")] = 1_000.0
 
+            self.assertFalse(manager._rollup_deferral_exhausted((7, "L1"), "L1", 1_179.9))
+            self.assertTrue(manager._rollup_deferral_exhausted((7, "L1"), "L1", 1_180.0))
+
+            manager.rollup_scheduler_max_deferral_sec = 0.0
             self.assertFalse(manager._rollup_deferral_exhausted((7, "L1"), "L1", 2_799.9))
             self.assertTrue(manager._rollup_deferral_exhausted((7, "L1"), "L1", 2_800.0))
-
             manager.rollup_scheduler_max_deferral_windows = 0.0
             self.assertTrue(manager._rollup_deferral_exhausted((8, "L1"), "L1", 1_000.0))
 
@@ -674,6 +711,40 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertGreater(len(set(due)), 20)
             self.assertGreaterEqual(min(due), 1_030.0)
             self.assertLess(max(due), 1_280.0)
+
+    def test_rollup_scheduler_recurring_due_aligns_to_window_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.rollup_scheduler_spacing_sec = 5.0
+
+            due = manager._rollup_next_due(
+                7,
+                "L1",
+                started_at=10_000.0,
+                completed_at=10_050.0,
+                channel_count=3,
+            )
+
+            self.assertGreaterEqual(due, 10_800.0)
+            self.assertLess(due, 10_860.0)
+
+    def test_rollup_scheduler_catches_boundary_crossed_during_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.rollup_scheduler_spacing_sec = 5.0
+
+            due = manager._rollup_next_due(
+                7,
+                "L1",
+                started_at=10_790.0,
+                completed_at=10_850.0,
+                channel_count=3,
+            )
+
+            self.assertGreaterEqual(due, 10_850.0)
+            self.assertLess(due, 10_860.0)
 
     def test_selector_bias_is_a_channel_setting_with_reset(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -694,6 +765,32 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 manager.update_prompt_settings(channel_id=7, capture_selector_bias="fastest")
+
+    def test_selector_enabled_is_a_persisted_channel_setting_with_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=store)
+            settings = manager.update_prompt_settings(
+                channel_id=7,
+                capture_selector_enabled=False,
+            )
+            self.assertFalse(settings["capture_selector_enabled"])
+            self.assertIn("capture_selector_enabled", settings["override_fields"])
+            self.assertEqual(
+                settings["setting_sources"]["capture_selector_enabled"],
+                "channel_override",
+            )
+            self.assertFalse(manager.get_capture_selector_enabled(7))
+            self.assertTrue(manager.get_capture_selector_enabled(8))
+
+            reloaded = build_manager(Path(temp), runtime_state_store=store)
+            self.assertFalse(reloaded.get_capture_selector_enabled(7))
+            reset = reloaded.update_prompt_settings(
+                channel_id=7,
+                clear_override_fields=["capture_selector_enabled"],
+            )
+            self.assertTrue(reset["capture_selector_enabled"])
+            self.assertNotIn("capture_selector_enabled", reset["override_fields"])
 
 
 def _burst_batch_frame(
@@ -2231,6 +2328,9 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 Path(temp),
                 config_overrides={
                     "LUXRIOT_VECTOR_SIGNALS_ENABLED": False,
+                    # This test exercises two consecutive embedding snapshots;
+                    # production now honours the configured snapshot cadence.
+                    "LUXRIOT_SNAPSHOT_INTERVAL": 1,
                 },
             )
             def encode_selected(frame, **_kwargs):
@@ -3319,9 +3419,17 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertFalse(outcome["queued"])
             saved = archived[0]["archive_frames"]
-            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 3, 4])
-            self.assertEqual([frame["anchor_role"] for frame in saved], ["first", "sample", "sample", "last"])
-            self.assertEqual([frame["timestamp_ms"] for frame in saved], [100000, 101000, 103000, 104000])
+            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 2, 3, 4])
+            self.assertEqual(
+                [frame["anchor_role"] for frame in saved],
+                ["first", "sample", "sample", "sample", "last"],
+            )
+            self.assertEqual(
+                [frame["timestamp_ms"] for frame in saved],
+                [100000, 101000, 102000, 103000, 104000],
+            )
+            self.assertTrue(saved[2]["is_cover"])
+            self.assertEqual(saved[2]["cover_source"], "backend_fallback")
 
     def test_summary_alert_counts_roll_up_by_severity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3628,7 +3736,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(l0["window_end"], 130.0)
             self.assertEqual(l0["window_sec"], 30)
 
-    def test_alerts_json_prompt_is_decoupled_from_bookmark_side_effects(self):
+    def test_batch_state_prompt_is_decoupled_from_bookmark_side_effects(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -3639,7 +3747,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager.default_bookmark_enabled = False
 
             prompt = manager.get_effective_stream_system_prompt(7)
-            self.assertIn("ALERTS_JSON", prompt)
+            self.assertIn("BATCH_STATE_JSON", prompt)
 
             batch = manager.create_summary_batch(
                 channel_id=7,
@@ -3650,10 +3758,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 interval_sec=1.0,
                 frames=[{"captured_at": 100.0, "image_b64": "ZmFrZQ=="}],
             )
-            self.assertIn("ALERTS_JSON", batch["system_prompt"])
+            self.assertIn("BATCH_STATE_JSON", batch["system_prompt"])
             result = manager.process_summary_alerts(
                 7,
-                'ALERTS_JSON:\n{"alerts":[{"title":"test","severity":"normal"}]}',
+                'BATCH_STATE_JSON:\n{"version":1,"cover":{"snapshot_index":1},'
+                '"events":[],"observed_states":[],"routines":[],"memory_pass":[],'
+                '"alerts":[{"title":"test","severity":"normal","snapshot_indices":[1]}]}',
                 default_ts_ms=100_000,
             )
             self.assertEqual(result, 0)
@@ -4507,6 +4617,169 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 selected = manager._get_rollup_model_hint_locked(7)
 
             self.assertEqual(selected, "agent")
+
+    def test_l3_rollup_includes_operator_feedback_and_invalidates_cache_signature(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_ROLLUP_L3_WINDOW_SEC": 28800},
+            )
+            feedback_count = {"value": 1}
+            loader_calls = []
+
+            def feedback_loader(channel_id, start_ts, end_ts, limit):
+                loader_calls.append((channel_id, start_ts, end_ts, limit))
+                return {
+                    "summary": {
+                        "annotation_count": feedback_count["value"],
+                        "distinct_alert_count": feedback_count["value"],
+                        "reviewer_count": 1,
+                        "channel_count": 1,
+                    },
+                    "coverage": {
+                        "status": "covered",
+                        "annotation_count": feedback_count["value"],
+                        "returned_count": feedback_count["value"],
+                        "truncated": False,
+                    },
+                    "reason_counts": [
+                        {
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "count": feedback_count["value"],
+                        }
+                    ],
+                    "feedback": [
+                        {
+                            "detection_id": 501,
+                            "alert_timestamp_ms": 1_781_700_000_000,
+                            "alert_title": "Person near door",
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "note": "Maintenance worker.",
+                        }
+                    ],
+                    "period": {
+                        "last_updated_at_ms": feedback_count["value"] * 1000,
+                    },
+                }
+
+            manager.set_operator_feedback_report_loader(feedback_loader)
+            child = {
+                "rollup_id": "l2-ch7-window",
+                "channel_id": 7,
+                "level": "L2",
+                "window_start": 1_781_700_000.0,
+                "window_end": 1_781_703_600.0,
+                "item_count": 4,
+                "frame_count": 48,
+                "run_ids": ["run-7"],
+                "summary": "Routine doorway activity with one alert.",
+                "alert_counts": {"normal": 1},
+                "source_ids": ["l1-ch7-window"],
+            }
+            l1_child = {
+                "rollup_id": "l1-ch7-window",
+                "source_ids": ["l0-ch7-interesting"],
+                "item_count": 4,
+                "frame_count": 48,
+                "alert_counts": {"normal": 1},
+            }
+            l0_child = {
+                "rollup_id": "l0-ch7-interesting",
+                "window_start": 1_781_700_100.0,
+                "window_end": 1_781_700_130.0,
+                "summary": "A doorway alert fired while a maintenance worker crossed.",
+                "item_count": 1,
+                "frame_count": 12,
+                "alert_counts": {"normal": 1},
+                "vector_signal_total": 2,
+            }
+            manager._attach_l2_hierarchy_audits(
+                [child],
+                [l1_child],
+                [l0_child],
+            )
+
+            first = manager._build_rollup_level(
+                7,
+                "L3",
+                "L2",
+                28800,
+                [child],
+                synthesize=False,
+            )[0]
+            messages = manager._build_rollup_messages(
+                7,
+                "L3",
+                "L2",
+                first,
+                [child],
+            )
+            feedback_count["value"] = 2
+            second = manager._build_rollup_level(
+                7,
+                "L3",
+                "L2",
+                28800,
+                [child],
+                synthesize=False,
+            )[0]
+
+            user_text = messages[1]["content"][0]["text"]
+            self.assertEqual(first["window_sec"], 28800)
+            self.assertEqual(
+                first["operator_feedback"]["coverage"]["ground_truth_status"],
+                "operator_annotation_only",
+            )
+            self.assertIn("Operator false-positive annotations", user_text)
+            self.assertIn("Maintenance worker.", user_text)
+            self.assertIn("not independent ground truth", user_text)
+            self.assertEqual(first["hierarchy_audit"]["status"], "consistent")
+            self.assertEqual(len(first["l0_drill_samples"]), 1)
+            self.assertIn("Deterministic L1-to-L2 hierarchy audit", user_text)
+            self.assertIn("maximum 4", user_text)
+            self.assertNotEqual(
+                first["source_signature"],
+                second["source_signature"],
+            )
+            self.assertEqual(loader_calls[0][0], 7)
+            self.assertEqual(loader_calls[0][3], 16)
+
+    def test_open_rollup_window_is_pending_and_never_sent_to_llm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model):
+                calls.append(True)
+                return operator_rollup_response("This should not be generated yet.")
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            child = {
+                "rollup_id": "l0-ch7-open",
+                "window_start": 10_050.0,
+                "window_end": 10_060.0,
+                "item_count": 1,
+                "frame_count": 12,
+                "run_ids": ["run-open"],
+                "summary": "A currently open observation.",
+            }
+
+            with patch("luxriot_connector.time.time", return_value=10_100.0):
+                row = manager._build_rollup_level(
+                    7,
+                    "L1",
+                    "L0",
+                    900,
+                    [child],
+                    synthesize=True,
+                )[0]
+
+            self.assertEqual(row["summary_kind"], "pending_context")
+            self.assertEqual(row["generation_status"], "pending")
+            self.assertIn("still collecting context", row["summary"])
+            self.assertEqual(calls, [])
 
     def test_summary_rollups_readonly_mode_does_not_synthesize_with_llm(self):
         with tempfile.TemporaryDirectory() as temp:
