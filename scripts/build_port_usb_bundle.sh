@@ -32,11 +32,28 @@ mkdir -p "${STAGING_ROOT}/repository-backup"
 
 rsync -a --delete --delete-excluded \
     --exclude=.git \
-    --exclude=.venv \
+    --exclude='.env*' \
+    --exclude='.venv*' \
     --exclude=.local \
+    --exclude=.claude \
+    --exclude=.eva-bundle-commit \
+    --exclude=.eva-runtime \
+    --exclude=.clip_index \
     --exclude=.pytest_cache \
     --exclude=__pycache__ \
     --exclude=react-ui/ \
+    --exclude=node_modules/ \
+    --exclude=dist/ \
+    --exclude=detections_archive/ \
+    --exclude=inference_spool/ \
+    --exclude=video/ \
+    --exclude=probes_store.json \
+    --exclude=probe_channel_groups.json \
+    --exclude=luxriot_rollups_cache.json \
+    --exclude=luxriot_summary_state.json \
+    --exclude='*.sqlite3' \
+    --exclude='*.sqlite3-shm' \
+    --exclude='*.sqlite3-wal' \
     --exclude='*.pyc' \
     --exclude='*.dump' \
     --exclude='*.bak' \

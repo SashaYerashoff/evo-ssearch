@@ -22,6 +22,16 @@ def test_usb_builder_excludes_the_unused_react_workspace():
 
     assert "--exclude=react-ui/" in builder
     assert "--delete-excluded" in builder
+    for local_only_pattern in (
+        "--exclude='.env*'",
+        "--exclude='.venv*'",
+        "--exclude=.eva-runtime",
+        "--exclude=node_modules/",
+        "--exclude=dist/",
+        "--exclude=probes_store.json",
+        "--exclude='*.sqlite3'",
+    ):
+        assert local_only_pattern in builder
 
 
 def test_port_profile_keeps_gpu_for_vllm_and_clip_on_cpu():
