@@ -6,11 +6,30 @@ function getCookie(name: string): string {
   return m ? decodeURIComponent(m[1]) : ''
 }
 
+export const AUTH_EXPIRED_EVENT = 'eva:auth-expired'
+export const API_FORBIDDEN_EVENT = 'eva:api-forbidden'
+
+export function apiErrorMessage(status: number, payload: unknown): string {
+  if (payload && typeof payload === 'object') {
+    const body = payload as Record<string, unknown>
+    const value = body.error ?? body.message
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  if (typeof payload === 'string' && payload.trim()) return payload.trim().slice(0, 240)
+  if (status === 401) return 'Authentication required'
+  if (status === 403) return 'You do not have permission for this action'
+  return `HTTP ${status}`
+}
+
+export function shouldAttachCsrf(method: string): boolean {
+  return !['GET', 'HEAD', 'OPTIONS'].includes(String(method || 'GET').toUpperCase())
+}
+
 export class ApiError extends Error {
   status: number
   payload: any
   constructor(status: number, payload: any) {
-    super(payload?.error || `HTTP ${status}`)
+    super(apiErrorMessage(status, payload))
     this.status = status
     this.payload = payload
   }
@@ -20,7 +39,13 @@ async function parse(res: Response): Promise<any> {
   const text = await res.text()
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { data = text }
-  if (!res.ok) throw new ApiError(res.status, data)
+  if (!res.ok) {
+    if (typeof window !== 'undefined') {
+      const eventName = res.status === 401 ? AUTH_EXPIRED_EVENT : res.status === 403 ? API_FORBIDDEN_EVENT : null
+      if (eventName) window.dispatchEvent(new CustomEvent(eventName, { detail: { status: res.status, payload: data } }))
+    }
+    throw new ApiError(res.status, data)
+  }
   return data
 }
 
@@ -42,7 +67,7 @@ async function request(
   let body: BodyInit | undefined
   if (json !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json) }
   else if (form) { body = form }
-  if (method !== 'GET') {
+  if (shouldAttachCsrf(method)) {
     const csrf = getCookie('eva_csrf')
     if (csrf) headers['X-CSRF-Token'] = csrf
   }
@@ -54,5 +79,6 @@ export const api = {
   get: (path: string, query?: Record<string, unknown>) => request(path, { query }),
   postJson: (path: string, json: unknown) => request(path, { method: 'POST', json }),
   postForm: (path: string, form: FormData) => request(path, { method: 'POST', form }),
+  patch: (path: string, json: unknown) => request(path, { method: 'PATCH', json }),
   del: (path: string) => request(path, { method: 'DELETE' }),
 }

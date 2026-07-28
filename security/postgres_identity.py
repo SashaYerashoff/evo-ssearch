@@ -59,6 +59,7 @@ class IdentityRecord:
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
+    session_id: str
     identity: IdentityRecord
     csrf_digest: str
     expires_at: datetime
@@ -642,7 +643,7 @@ class PostgresIdentityRepository:
         ) as connection:
             row = connection.execute(
                 """
-                SELECT s.user_id, s.csrf_token_hash, s.expires_at
+                SELECT s.id, s.user_id, s.csrf_token_hash, s.expires_at
                 FROM iam.sessions AS s
                 JOIN iam.users AS u
                   ON u.tenant_id = s.tenant_id AND u.id = s.user_id
@@ -659,7 +660,8 @@ class PostgresIdentityRepository:
             if row is None:
                 return None
 
-            user_id = _require_uuid(row[0], "user_id")
+            session_id = _require_uuid(row[0], "session_id")
+            user_id = _require_uuid(row[1], "user_id")
             self._set_actor_id(connection, user_id)
             connection.execute(
                 """
@@ -676,9 +678,10 @@ class PostgresIdentityRepository:
             if not identity.is_active:
                 return None
             return SessionRecord(
+                session_id=str(session_id),
                 identity=identity,
-                csrf_digest=bytes(row[1]).hex(),
-                expires_at=row[2],
+                csrf_digest=bytes(row[2]).hex(),
+                expires_at=row[3],
             )
 
     def revoke_session(

@@ -1,4 +1,4 @@
-import { IconTrash, IconPlayerPlay, IconMaximize, IconRadar2 } from '@tabler/icons-react'
+import { IconTrash, IconPlayerPlay, IconPlayerStop, IconMaximize, IconRadar2 } from '@tabler/icons-react'
 import type { Probe } from '../../api/probes'
 import { hitImageSrc } from '../../api/probes'
 
@@ -27,8 +27,8 @@ export function ProbeCard({ probe, status, selected, onSelect, onRun, onDelete }
   status: ProbeStatus
   selected: boolean
   onSelect: () => void
-  onRun: () => void
-  onDelete: () => void
+  onRun?: () => void
+  onDelete?: () => void
 }) {
   const hit = lastHit(probe)
   const src = hitImageSrc(hit)
@@ -37,7 +37,10 @@ export function ProbeCard({ probe, status, selected, onSelect, onRun, onDelete }
       <div className="pc-head">
         <span className={`pc-badge ${status}`}>{status.toUpperCase()}</span>
         <div className="pc-actions">
-          <span className="pc-ico" title="Run probe" onClick={(e) => { e.stopPropagation(); onRun() }}><IconPlayerPlay size={14} /></span>
+          {onRun && <span className="pc-ico" title={status === 'running' ? 'Stop probe' : 'Start probe'}
+            onClick={(e) => { e.stopPropagation(); onRun() }}>
+            {status === 'running' ? <IconPlayerStop size={14} /> : <IconPlayerPlay size={14} />}
+          </span>}
           <span className="pc-ico" title="Inspect" onClick={(e) => { e.stopPropagation(); onSelect() }}><IconMaximize size={14} /></span>
         </div>
       </div>
@@ -49,7 +52,7 @@ export function ProbeCard({ probe, status, selected, onSelect, onRun, onDelete }
       <div className="pc-scores">P: {n3(hit?.pos_score)} · N: {n3(hit?.neg_score)} · M: {n3(hit?.margin)}</div>
       <div className="pc-foot">
         <span className="pc-gate">{gateText(probe)}</span>
-        <span className="pc-ico danger" title="Delete probe" onClick={(e) => { e.stopPropagation(); onDelete() }}><IconTrash size={14} /></span>
+        {onDelete && <span className="pc-ico danger" title="Delete probe" onClick={(e) => { e.stopPropagation(); onDelete() }}><IconTrash size={14} /></span>}
       </div>
     </button>
   )

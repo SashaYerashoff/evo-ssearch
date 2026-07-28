@@ -1,12 +1,26 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import {
-  IconFilter, IconAdjustmentsHorizontal, IconLetterT, IconPhoto, IconSearch, IconDownload, IconX, IconSparkles,
+  IconAdjustmentsHorizontal,
+  IconFilter,
+  IconLetterT,
+  IconPhoto,
+  IconSearch,
+  IconSparkles,
 } from '@tabler/icons-react'
 import type { Channel, Detection, ArchiveFilters } from '../../api/types'
 import type { AgentDrive } from '../../App'
 import { api } from '../../api/client'
-import { listArchive, searchText, normalizeDetection, detectionsFromResult } from '../../api/detections'
-import { FilterBar } from './FilterBar'
+import {
+  buildArchiveSearchPayload,
+  detectionsFromResult,
+  getArchiveProbeOptions,
+  listArchive,
+  normalizeDetection,
+  searchText,
+  type ArchiveProbeOption,
+} from '../../api/detections'
+import { FilterBar, TIMES } from './FilterBar'
+import { ToolTabs } from '../shell/ToolTabs'
 import { DetectionCard } from './DetectionCard'
 import { InspectorModal } from './InspectorModal'
 
@@ -49,31 +63,14 @@ function agentHoursFromArgs(args: any): string | null {
 
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
-const TOOL_META: Record<Tool, { title: string; icon: JSX.Element; width: number }> = {
-  filters: { title: 'Archive filters', icon: <IconFilter size={16} />, width: 384 },
-  search: { title: 'Search controls', icon: <IconAdjustmentsHorizontal size={16} />, width: 340 },
-  text: { title: 'Text query', icon: <IconLetterT size={16} />, width: 460 },
-  image: { title: 'Image query', icon: <IconPhoto size={16} />, width: 360 },
-}
-
-const SOURCES = [
-  { v: '', label: 'All evidence' }, { v: 'vlm_summary', label: 'Video descriptions' },
-  { v: 'vlm_alert', label: 'VLM alerts' }, { v: 'probe', label: 'CLIP probes' },
-]
-const TIMES = [
-  { v: '1', label: 'Last 1h' }, { v: '6', label: 'Last 6h' }, { v: '24', label: 'Last 24h' },
-  { v: '72', label: 'Last 3d' }, { v: '168', label: 'Last 7d' }, { v: '0', label: 'All time' },
-]
-
 export function ArchiveScreen({
-  channels, tool, drive, noAnim, onFilters, onToolHandled,
+  channels, drive, noAnim, onFilters, onRefreshChannels,
 }: {
   channels: Channel[]
-  tool: ArchiveTool
   drive?: AgentDrive | null
   noAnim?: boolean
   onFilters?: (f: ArchiveFilters) => void
-  onToolHandled: () => void
+  onRefreshChannels?: () => Promise<void> | void
 }) {
   const [filters, setFilters] = useState<ArchiveFilters>(DEFAULT_FILTERS)
   const [items, setItems] = useState<Detection[]>([])
@@ -82,47 +79,116 @@ export function ArchiveScreen({
   const [note, setNote] = useState('')
   const [selected, setSelected] = useState<Detection | null>(null)
   const [minMatch, setMinMatch] = useState(0)
-  const [modalTool, setModalTool] = useState<Tool | null>(null)
   const [textValue, setTextValue] = useState('')
   const [agentStep, setAgentStep] = useState<string | null>(null)
   const [agentTyping, setAgentTyping] = useState(false)
+  const [nextOffset, setNextOffset] = useState(0)
+  const [total, setTotal] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
+  const [resultMode, setResultMode] = useState<'list' | 'search'>('list')
+  const [appliedFilters, setAppliedFilters] = useState<ArchiveFilters | null>(null)
+  const [probeOptions, setProbeOptions] = useState<ArchiveProbeOption[]>([])
+  const [probesLoading, setProbesLoading] = useState(false)
+  const [filterRefresh, setFilterRefresh] = useState(0)
+  // horizontal accordion: exactly one tool block is expanded, the rest collapse to summary chips
+  const [openTool, setOpenTool] = useState<'filters' | 'text' | 'match' | 'image'>('filters')
   const typeToken = useRef(0)
+  const requestSeq = useRef(0)
+  const probeRequestSeq = useRef(0)
+  const loadingRef = useRef(false)
+  const loadMoreRef = useRef<HTMLDivElement>(null)
 
-  const patch = (p: Partial<ArchiveFilters>) => setFilters((f) => ({ ...f, ...p }))
+  const patch = useCallback((p: Partial<ArchiveFilters>) => {
+    requestSeq.current++
+    loadingRef.current = false
+    setLoading(false)
+    setNextOffset(0)
+    setFilters((f) => ({ ...f, ...p }))
+  }, [])
 
-  const runLoad = useCallback(async () => {
+  const runLoad = useCallback(async (requestedOffset = 0, append = false) => {
+    if (loadingRef.current) return
+    loadingRef.current = true
+    const seq = ++requestSeq.current
     setLoading(true); setError(null)
     try {
-      const { items, total } = await listArchive(filters, channels)
-      setItems(items); setNote(`${items.length} of ${total} frames`)
-    } catch (e: any) { setError(e?.message || 'Archive load failed'); setItems([]) }
-    finally { setLoading(false) }
+      const result = await listArchive(filters, channels, requestedOffset)
+      if (requestSeq.current !== seq) return
+      const last = result.offset + result.items.length
+      setItems((current) => {
+        if (!append) return result.items
+        const existing = new Set(current.map((item) => item.key))
+        return [...current, ...result.items.filter((item) => !existing.has(item.key))]
+      })
+      setNextOffset(last)
+      setTotal(result.total)
+      setHasMore(result.hasMore)
+      setResultMode('list')
+      setAppliedFilters({ ...filters })
+      if (!append) setSelected(null)
+      setNote(result.items.length ? `${last} loaded` : '0 loaded')
+    } catch (e: any) {
+      if (requestSeq.current !== seq) return
+      setError(e?.message || (append ? 'Could not load more archive matches' : 'Archive load failed'))
+      if (!append) {
+        setItems([])
+        setTotal(0)
+        setNextOffset(0)
+      }
+      setHasMore(false)
+    } finally {
+      if (requestSeq.current === seq) {
+        loadingRef.current = false
+        setLoading(false)
+      }
+    }
   }, [filters, channels])
 
   const runText = useCallback(async (q: string) => {
+    loadingRef.current = false
+    const seq = ++requestSeq.current
     setLoading(true); setError(null)
     try {
       const results = await searchText(q, filters, channels)
+      if (requestSeq.current !== seq) return
       setItems(results); setNote(`${results.length} matches · “${q}”`)
-    } catch (e: any) { setError(e?.message || 'Text search failed') }
-    finally { setLoading(false) }
+      setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
+      setAppliedFilters({ ...filters }); setSelected(null)
+    } catch (e: any) {
+      if (requestSeq.current === seq) setError(e?.message || 'Text search failed')
+    } finally {
+      if (requestSeq.current === seq) {
+        loadingRef.current = false
+        setLoading(false)
+      }
+    }
   }, [filters, channels])
 
   const runImageSearch = useCallback(async (blob: Blob, label: string) => {
+    loadingRef.current = false
+    const seq = ++requestSeq.current
     setLoading(true); setError(null)
     try {
       const form = new FormData()
       form.append('image', blob, 'ref.jpg')
-      form.append('limit', filters.rows || '24')
-      form.append('sort_by', filters.sortBy || 'similarity')
-      if (filters.channelId) form.append('channel_id', filters.channelId)
-      if (filters.source) form.append('source', filters.source)
+      for (const [key, value] of Object.entries(buildArchiveSearchPayload(filters))) {
+        if (value !== undefined && value !== '') form.append(key, String(value))
+      }
       const res = await api.postForm('/detections/search_image', form)
+      if (requestSeq.current !== seq) return
       const cmap = new Map(channels.map((c) => [c.id, c.title]))
       const results = (res.results || []).map((x: any) => normalizeDetection(x, cmap))
       setItems(results); setNote(`${results.length} similar · ${label}`)
-    } catch (e: any) { setError(e?.message || 'Image search failed') }
-    finally { setLoading(false) }
+      setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
+      setAppliedFilters({ ...filters }); setSelected(null)
+    } catch (e: any) {
+      if (requestSeq.current === seq) setError(e?.message || 'Image search failed')
+    } finally {
+      if (requestSeq.current === seq) {
+        loadingRef.current = false
+        setLoading(false)
+      }
+    }
   }, [filters, channels])
 
   const runSimilar = useCallback((d: Detection) => {
@@ -138,7 +204,7 @@ export function ArchiveScreen({
   const animateTyping = useCallback(async (q: string) => {
     if (noAnim) return
     const token = ++typeToken.current
-    setModalTool('text'); setAgentTyping(true); setTextValue('')
+    setAgentTyping(true); setTextValue('')
     await sleep(240)
     for (let i = 1; i <= q.length; i++) {
       if (typeToken.current !== token) return
@@ -147,8 +213,31 @@ export function ArchiveScreen({
   }, [noAnim])
 
   useEffect(() => { runLoad() }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (tool) { setModalTool(tool); onToolHandled() } }, [tool]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { onFilters?.(filters) }, [filters]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const seq = ++probeRequestSeq.current
+    if (filters.source !== 'probe') {
+      setProbeOptions([])
+      setProbesLoading(false)
+      return
+    }
+    setProbesLoading(true)
+    getArchiveProbeOptions(filters)
+      .then((options) => {
+        if (probeRequestSeq.current === seq) setProbeOptions(options)
+      })
+      .catch(() => {
+        if (probeRequestSeq.current === seq) setProbeOptions([])
+      })
+      .finally(() => {
+        if (probeRequestSeq.current === seq) setProbesLoading(false)
+      })
+  }, [filters.source, filters.channelId, filters.hours, filters.sinceMs, filters.untilMs, filterRefresh])
+
+  const refreshFilters = useCallback(async () => {
+    await onRefreshChannels?.()
+    setFilterRefresh((n) => n + 1)
+  }, [onRefreshChannels])
 
   // mirror each agent action onto the working console, and render view-tool results into the grid
   useEffect(() => {
@@ -163,6 +252,7 @@ export function ArchiveScreen({
           if (ch) patch({ channelId: String(ch.id) })
         }
         if (args?.source) patch({ source: String(args.source) })
+        if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
         const h = agentHoursFromArgs(args)
         if (h != null) patch({ hours: h, sinceMs: undefined, untilMs: undefined })
         if (args?.sort_by) patch({ sortBy: String(args.sort_by) === 'time' ? 'time' : 'similarity' })
@@ -171,17 +261,23 @@ export function ArchiveScreen({
           patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
         }
         const q = String(args?.query || args?.event_query || args?.positive_query || args?.text || '').trim()
-        if (TYPING_TOOLS.has(name) && q) animateTyping(q)
+        if (TYPING_TOOLS.has(name) && q) { setOpenTool('text'); animateTyping(q) }
+        else if (args?.channel_id != null || args?.source || h != null || args?.sort_by || args?.limit != null) setOpenTool('filters')
       }
       return
     }
     // done → route the tool's returned frames into the grid
     if (VIEW_TOOLS.has(name)) {
       typeToken.current++ // stop any in-flight typing
-      setAgentTyping(false); setModalTool(null)
+      requestSeq.current++
+      loadingRef.current = false
+      setLoading(false)
+      setAgentTyping(false)
       if (!error) {
         const found = detectionsFromResult(result, channels)
         setItems(found)
+        setNextOffset(0); setTotal(found.length); setHasMore(false); setResultMode('search')
+        setAppliedFilters({ ...filters })
         setNote(`Agent · ${found.length} frame${found.length === 1 ? '' : 's'} · ${prettyTool(name)}`)
         setError(found.length ? null : 'Agent returned no frames for this query.')
       }
@@ -192,92 +288,84 @@ export function ArchiveScreen({
   }, [drive?.seq]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const displayed = minMatch > 0 ? items.filter((d) => (d.matchPct ?? 0) >= minMatch) : items
+  const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
+  const archiveMatchCount = resultMode === 'list' ? total : items.length
 
-  function toDtLocal(ms?: string) {
-    if (!ms) return ''
-    const d = new Date(Number(ms)); const p = (n: number) => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+  useEffect(() => {
+    const sentinel = loadMoreRef.current
+    if (!sentinel || loading || !hasMore || resultMode !== 'list' || filtersDirty) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting && !loadingRef.current) {
+        void runLoad(nextOffset, true)
+      }
+    }, { rootMargin: '500px 0px' })
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [filtersDirty, hasMore, loading, nextOffset, resultMode, runLoad])
+
+  // live summaries shown on collapsed chips
+  const filtersSummary = [
+    filters.channelId ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`) : 'All streams',
+    filters.source === 'probe' && filters.probeId
+      ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
+      : null,
+    (filters.sinceMs || filters.untilMs) ? 'custom range' : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h'),
+    `${filters.rows || '24'} rows`,
+  ].filter(Boolean).join(' · ')
+  const q = textValue.trim()
+  const textSummary = q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—'
+  const matchSummary = minMatch > 0 ? `≥ ${minMatch}%` : 'off'
+
+  const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
+    filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
+    text: { Icon: IconLetterT, label: 'Text query', summary: textSummary },
+    match: { Icon: IconAdjustmentsHorizontal, label: 'Match', summary: matchSummary },
+    image: { Icon: IconPhoto, label: 'Image', summary: '—' },
   }
-  const fromDt = (v: string) => (v ? String(new Date(v).getTime()) : undefined)
 
-  function toolBody(t: Tool) {
-    if (t === 'filters') return (
-      <div className="wform" style={{ minWidth: 260 }}>
-        <div className="wfield"><label>Stream</label>
-          <select value={filters.channelId || ''} onChange={(e) => patch({ channelId: e.target.value })}>
-            <option value="">All streams</option>
-            {channels.map((c) => <option key={c.id} value={c.id}>{c.title}</option>)}
-          </select>
-        </div>
-        <div className="wgrid">
-          <div className="wfield"><label>Source</label>
-            <select value={filters.source || ''} onChange={(e) => patch({ source: e.target.value })}>
-              {SOURCES.map((s) => <option key={s.v} value={s.v}>{s.label}</option>)}
-            </select>
-          </div>
-          <div className="wfield"><label>Time range</label>
-            <select value={filters.hours || '24'} onChange={(e) => patch({ hours: e.target.value, sinceMs: undefined, untilMs: undefined })}>
-              {TIMES.map((tt) => <option key={tt.v} value={tt.v}>{tt.label}</option>)}
-            </select>
-          </div>
-        </div>
-        <div className="wfield"><label>From</label>
-          <input type="datetime-local" value={toDtLocal(filters.sinceMs)} onChange={(e) => patch({ sinceMs: fromDt(e.target.value) })} />
-        </div>
-        <div className="wfield"><label>To</label>
-          <input type="datetime-local" value={toDtLocal(filters.untilMs)} onChange={(e) => patch({ untilMs: fromDt(e.target.value) })} />
-        </div>
-        <button className="btn primary" style={{ justifyContent: 'center' }} onClick={() => { runLoad(); setModalTool(null) }}>
-          <IconDownload size={15} /> Load archive
-        </button>
+  // active tool's controls, shown to the right of the fixed tab strip
+  const expanded = () => {
+    if (openTool === 'filters') return (
+      <div className="atp-open" key="filters">
+        <FilterBar
+          filters={filters}
+          channels={channels}
+          probes={probeOptions}
+          probesLoading={probesLoading}
+          onChange={patch}
+          onLoad={() => runLoad(0)}
+          onRefresh={refreshFilters}
+          loading={loading}
+        />
       </div>
     )
-    if (t === 'search') return (
-      <div className="wform" style={{ minWidth: 250 }}>
-        <div className="wgrid">
-          <div className="wfield"><label>Sort by</label>
-            <select value={filters.sortBy || 'similarity'} onChange={(e) => patch({ sortBy: e.target.value })}>
-              <option value="similarity">Similarity</option><option value="time">Newest</option>
-            </select>
-          </div>
-          <div className="wfield"><label>Results</label>
-            <select value={filters.rows || '24'} onChange={(e) => patch({ rows: e.target.value })}>
-              {['12', '24', '36', '48'].map((r) => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </div>
-        </div>
-        <div className="wfield">
-          <label>Min match: {minMatch}%</label>
+    if (openTool === 'text') return (
+      <div className="atp-open atp-group atp-textgroup" key="text">
+        <span className="atp-glabel"><IconLetterT size={13} /> Text query</span>
+        <form className="atp-text" onSubmit={(e) => { e.preventDefault(); const v = textValue.trim(); if (v) runText(v) }}>
+          <input placeholder="describe an archived scene…" autoFocus={!agentTyping}
+            value={textValue} readOnly={agentTyping} className={agentTyping ? 'agent-caret' : ''}
+            onChange={(e) => setTextValue(e.target.value)} />
+          <button className="btn primary" disabled={agentTyping || !textValue.trim()}><IconSearch size={15} /> Search</button>
+        </form>
+      </div>
+    )
+    if (openTool === 'match') return (
+      <div className="atp-open atp-group" key="match">
+        <span className="atp-glabel"><IconAdjustmentsHorizontal size={13} /> Match threshold</span>
+        <div className="atp-min">
+          <label>Min match · {minMatch}%</label>
           <input type="range" min={0} max={100} step={1} value={minMatch} onChange={(e) => setMinMatch(Number(e.target.value))} />
         </div>
-        <div className="wnote">Hides frames below the match threshold ({displayed.length}/{items.length} shown).</div>
       </div>
     )
-    if (t === 'text') return (
-      <form className="wform" style={{ minWidth: 320 }} onSubmit={(e) => { e.preventDefault(); const v = textValue.trim(); if (v) { runText(v); setModalTool(null) } }}>
-        <div className="wnote">
-          {agentTyping ? <><IconSparkles size={13} /> Agent is typing a query…</> : 'Natural-language search over archived frames. Current filters apply.'}
-        </div>
-        <div className="wrow">
-          <input
-            name="q" placeholder="Describe archived scene…" autoFocus={!agentTyping}
-            value={textValue} readOnly={agentTyping}
-            onChange={(e) => setTextValue(e.target.value)}
-            className={agentTyping ? 'agent-caret' : ''}
-            style={{ flex: 1, background: 'var(--void-tile)', border: '1px solid var(--line-2)', borderRadius: 9, color: 'var(--text)', padding: '9px 11px', outline: 'none' }}
-          />
-          <button className="btn primary" disabled={agentTyping}><IconSearch size={15} /> Search</button>
-        </div>
-      </form>
-    )
-    // image
     return (
-      <div className="wform" style={{ minWidth: 250 }}>
-        <div className="wnote">Upload a reference image; runs visual similarity over archived frames.</div>
-        <label className="btn" style={{ justifyContent: 'center' }}>
+      <div className="atp-open atp-group" key="image">
+        <span className="atp-glabel"><IconPhoto size={13} /> Image query</span>
+        <label className="btn atp-image" title="Upload a reference image — visual similarity search">
           <IconPhoto size={15} /> Choose image
           <input type="file" accept="image/*" style={{ display: 'none' }}
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) { runImageSearch(f, f.name); setModalTool(null) } }} />
+            onChange={(e) => { const file = e.target.files?.[0]; if (file) runImageSearch(file, file.name); e.currentTarget.value = '' }} />
         </label>
       </div>
     )
@@ -291,7 +379,27 @@ export function ArchiveScreen({
           <span>Agent is <b>{agentStep || 'searching the archive'}</b> — watch the console</span>
         </div>
       )}
-      <FilterBar filters={filters} channels={channels} onChange={patch} onLoad={runLoad} loading={loading} count={note} />
+      <ToolTabs
+        tabs={(['filters', 'text', 'match', 'image'] as const).map((t) => {
+          const { Icon, label, summary } = TOOL_META[t]
+          return { id: t, icon: <Icon size={13} />, label, summary }
+        })}
+        active={openTool}
+        onSelect={(id) => setOpenTool(id as typeof openTool)}
+      >
+        {expanded()}
+      </ToolTabs>
+
+      <div className="archive-results-head" role="status" aria-live="polite">
+        <div className="archive-results-count">
+          <strong>{archiveMatchCount.toLocaleString()}</strong>
+          <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
+        </div>
+        <div className="archive-results-context">
+          {note || `${items.length} loaded`}
+          {filtersDirty ? ' · Filters changed — load to apply' : ''}
+        </div>
+      </div>
 
       {error && <div className="empty-state" style={{ color: 'var(--danger)', padding: 30 }}>{error}</div>}
       {loading && items.length === 0 && <div className="loading-state"><div className="spinner" /><div>Loading archive…</div></div>}
@@ -303,21 +411,18 @@ export function ArchiveScreen({
         </div>
       )}
 
-      {selected && <InspectorModal d={selected} onClose={() => setSelected(null)} onFindSimilar={runSimilar} />}
-
-      {modalTool && (
-        <div className={`scrim ${agentTyping ? 'driven' : ''}`} onClick={() => { if (!agentTyping) setModalTool(null) }}>
-          <div className={`modal ${agentTyping ? 'driven' : ''}`} style={{ maxWidth: TOOL_META[modalTool].width + 44 }} onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-                {TOOL_META[modalTool].icon}{TOOL_META[modalTool].title}
-              </div>
-              <button className="modal-close" onClick={() => setModalTool(null)}><IconX size={18} /></button>
-            </div>
-            <div className="modal-body">{toolBody(modalTool)}</div>
-          </div>
+      {resultMode === 'list' && !filtersDirty && (
+        <div ref={loadMoreRef} className="archive-load-more">
+          {loading && items.length > 0 && <><div className="spinner" /><span>Loading more matches…</span></>}
+          {!loading && hasMore && <span>Scroll for more</span>}
+          {!loading && !hasMore && items.length > 0 && !error && <span>All archive matches loaded</span>}
+          {!loading && error && items.length > 0 && (
+            <button type="button" className="btn" onClick={() => runLoad(nextOffset, true)}>Retry loading more</button>
+          )}
         </div>
       )}
+
+      {selected && <InspectorModal d={selected} onClose={() => setSelected(null)} onFindSimilar={runSimilar} />}
     </div>
   )
 }

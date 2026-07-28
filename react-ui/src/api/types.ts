@@ -6,6 +6,7 @@ export interface AuthUser {
   roles: string[]
   permissions: string[]
   allowedChannelIds: string[]
+  currentSessionId?: string
 }
 
 export interface Channel {
@@ -39,6 +40,7 @@ export interface Detection {
 export interface ArchiveFilters {
   channelId?: string
   source?: string
+  probeId?: string
   hours?: string
   sinceMs?: string
   untilMs?: string

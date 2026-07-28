@@ -24,6 +24,8 @@ export interface BookmarkGate {
 }
 
 export interface ImageProbe { data?: string | null; name?: string; pos_floor?: number; enabled?: boolean }
+// normalized region-of-interest rectangle (all values 0..1 of the frame)
+export interface RoiNorm { x: number; y: number; w: number; h: number }
 // pairs are stored/returned with positive/negative keys; positives[]/negatives[] are authoritative.
 export interface TextPair { positive?: string; negative?: string }
 
@@ -48,7 +50,7 @@ export interface Probe {
   bookmark_gate?: BookmarkGate
   image_probe?: ImageProbe | null
   roi_enabled?: boolean
-  roi_norm?: number[] | null
+  roi_norm?: RoiNorm | number[] | null
   recent_hits?: ProbeHit[]
   last_hit?: ProbeHit
   [k: string]: any
@@ -56,6 +58,24 @@ export interface Probe {
 
 // Live capture status for a channel (GET /probes/status).
 export interface ChannelStatus { channel_id: number; runtime_state?: string; last_snapshot_ms?: number; buffer_frames?: number }
+
+export function probeRangeDurationMs(status: {
+  time_range_ms?: number | [number, number] | null
+  first_timestamp_ms?: number | null
+  last_timestamp_ms?: number | null
+}): number | null {
+  const range = status?.time_range_ms
+  if (Array.isArray(range) && range.length >= 2) {
+    const first = Number(range[0])
+    const last = Number(range[1])
+    return Number.isFinite(first) && Number.isFinite(last) ? Math.max(0, last - first) : null
+  }
+  if (typeof range === 'number' && Number.isFinite(range)) return Math.max(0, range)
+  if (status?.first_timestamp_ms == null || status?.last_timestamp_ms == null) return null
+  const first = Number(status.first_timestamp_ms)
+  const last = Number(status.last_timestamp_ms)
+  return Number.isFinite(first) && Number.isFinite(last) ? Math.max(0, last - first) : null
+}
 
 export interface Benchmark {
   batch: number
@@ -93,6 +113,38 @@ export interface ProbeInput {
   bookmark_cooldown_sec?: number
   bookmark_dedupe_window_sec?: number
   image_probe?: ImageProbe | null
+  roi_enabled?: boolean
+  roi_norm?: RoiNorm | null
+}
+
+export function authorizeProbeInput(input: ProbeInput, canCreateBookmarks: boolean): ProbeInput {
+  const payload = { ...input }
+  if (!canCreateBookmarks) {
+    delete payload.bookmark
+    delete payload.bookmark_cooldown_sec
+    delete payload.bookmark_dedupe_window_sec
+  }
+  return payload
+}
+
+export function probeMutationRequiresBookmarkPermission(
+  probe: Pick<Probe, 'bookmark'> | null | undefined,
+  canCreateBookmarks: boolean,
+): boolean {
+  return !!probe?.bookmark && !canCreateBookmarks
+}
+
+// POST /probes/cast — copy the probe onto many channels at once.
+export interface CastInput extends Omit<ProbeInput, 'id' | 'channel_id'> {
+  channel_ids: number[]
+  conflict: 'skip' | 'create' | 'update'
+  copy_roi: boolean
+}
+export interface CastResult {
+  success?: boolean
+  error?: string
+  counts?: { created: number; updated: number; skipped: number; failed: number }
+  failed?: { channel_id: number; error: string }[]
 }
 
 export const probesApi = {
@@ -102,6 +154,7 @@ export const probesApi = {
   run: (id: string): Promise<ProbeRunResult> => api.postJson('/probes/run', { id }),
   bench: (batch = 16): Promise<Benchmark & { error?: string }> => api.get('/probes/bench', { batch: String(batch) }),
   status: (channelId: number): Promise<any> => api.get('/probes/status', { channel_id: String(channelId) }),
+  cast: (payload: CastInput): Promise<CastResult> => api.postJson('/probes/cast', payload),
   startCapture: (channelId: number, fps?: number): Promise<any> => api.postJson('/probes/start_capture', { channel_id: channelId, fps }),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/probes/stop_capture', { channel_id: channelId }),
 }

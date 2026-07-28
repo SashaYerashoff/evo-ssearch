@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { IconX, IconMessage, IconCopy, IconPhoto } from '@tabler/icons-react'
+import { IconX, IconMessage, IconCopy, IconPhoto, IconArrowsMaximize } from '@tabler/icons-react'
 import type { Detection } from '../../api/types'
-import { thumbSrc, describeFrame } from '../../api/detections'
+import { describeFrame, detImageSrc, fullDetectionImageSrc } from '../../api/detections'
 
 function fmtFull(ms: number | null): string {
   if (!ms) return '—'
@@ -15,9 +15,12 @@ export function InspectorModal({
   onClose: () => void
   onFindSimilar: (d: Detection) => void
 }) {
-  const src = thumbSrc(d)
+  const previewSrc = detImageSrc(d)
+  const fullSrc = fullDetectionImageSrc(d)
+  const [src, setSrc] = useState(fullSrc)
   const [desc, setDesc] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [zoom, setZoom] = useState(false)
 
   async function describe() {
     setBusy(true); setDesc(null)
@@ -34,36 +37,57 @@ export function InspectorModal({
 
   return (
     <div className="scrim" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal inspect-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div className="modal-title">Inspector · {d.probeName}</div>
           <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
         </div>
-        <div className="modal-body">
-          <div className="modal-frame">
-            {src ? <img src={src} alt={d.probeName} /> : <IconPhoto size={30} />}
-          </div>
-          <div className="kv">
-            <span className="k">Channel</span><span className="v">{d.channelTitle || `ch ${d.channelId ?? '—'}`}</span>
-            <span className="k">Source</span><span className="v">{d.sourceLabel}</span>
-            <span className="k">Time</span><span className="v">{fmtFull(d.tsMs)}</span>
-            <span className="k">Severity</span><span className="v" style={{ color: 'var(--danger)' }}>{d.severity}</span>
-            {(d.matchPct != null || scores) && (
+        <div className="modal-body inspect-body">
+          <div className="inspect-frame">
+            {src ? (
               <>
-                <span className="k">Match</span>
-                <span className="v">{d.matchPct != null ? `${d.matchPct}%` : '—'}{scores ? ` · ${scores}` : ''}</span>
+                <img
+                  src={src}
+                  alt={d.probeName}
+                  onClick={() => setZoom(true)}
+                  onError={() => {
+                    if (previewSrc && src !== previewSrc) setSrc(previewSrc)
+                  }}
+                />
+                <button className="inspect-expand" title="View full frame" onClick={() => setZoom(true)}><IconArrowsMaximize size={15} /></button>
               </>
-            )}
+            ) : <div className="inspect-noimg"><IconPhoto size={30} /> No frame</div>}
           </div>
-          {(busy || desc) && (
-            <div className="desc-box">{busy ? 'Generating description…' : desc}</div>
-          )}
-          <div className="modal-actions">
-            <button className="btn" onClick={describe} disabled={busy}><IconMessage size={15} /> Describe frame</button>
-            <button className="btn" onClick={() => onFindSimilar(d)}><IconCopy size={15} /> Find similar</button>
+          <div className="inspect-side">
+            <div className="kv">
+              <span className="k">Channel</span><span className="v">{d.channelTitle || `ch ${d.channelId ?? '—'}`}</span>
+              <span className="k">Source</span><span className="v">{d.sourceLabel}</span>
+              <span className="k">Time</span><span className="v">{fmtFull(d.tsMs)}</span>
+              <span className="k">Severity</span><span className="v" style={{ color: 'var(--danger)' }}>{d.severity}</span>
+              {(d.matchPct != null || scores) && (
+                <>
+                  <span className="k">Match</span>
+                  <span className="v">{d.matchPct != null ? `${d.matchPct}%` : '—'}{scores ? ` · ${scores}` : ''}</span>
+                </>
+              )}
+            </div>
+            {(busy || desc) && (
+              <div className="desc-box">{busy ? 'Generating description…' : desc}</div>
+            )}
+            <div className="modal-actions">
+              <button className="btn" onClick={describe} disabled={busy}><IconMessage size={15} /> Describe frame</button>
+              <button className="btn" onClick={() => onFindSimilar(d)}><IconCopy size={15} /> Find similar</button>
+            </div>
           </div>
         </div>
       </div>
+
+      {zoom && src && (
+        <div className="inspect-zoom" onClick={(e) => { e.stopPropagation(); setZoom(false) }}>
+          <img src={src} alt={d.probeName} onClick={(e) => e.stopPropagation()} />
+          <button className="modal-close inspect-zoom-close" onClick={(e) => { e.stopPropagation(); setZoom(false) }}><IconX size={22} /></button>
+        </div>
+      )}
     </div>
   )
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { IconX, IconDeviceFloppy } from '@tabler/icons-react'
-import { videoApi, type PromptSettings } from '../../api/video'
+import { buildPromptSettingsPayload, videoApi, type PromptSettings } from '../../api/video'
 
 const TABS: { key: string; label: string }[] = [
   { key: 'stream', label: 'Stream' }, { key: 'alerts', label: 'Alerts' },
@@ -8,12 +8,21 @@ const TABS: { key: string; label: string }[] = [
   { key: 'json', label: 'JSON alert' },
 ]
 
-export function PromptSettingsModal({ channelId, onClose }: { channelId: number; onClose: () => void }) {
+export function PromptSettingsModal({
+  channelId,
+  canCreateBookmarks,
+  onClose,
+}: {
+  channelId: number
+  canCreateBookmarks: boolean
+  onClose: () => void
+}) {
   const [s, setS] = useState<PromptSettings>({ rollup_prompts: {} })
   const [tab, setTab] = useState('stream')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
+  const tabs = canCreateBookmarks ? TABS : TABS.filter((item) => item.key !== 'json')
 
   useEffect(() => {
     videoApi.getPromptSettings(channelId).then((d) => { setS({ ...d, rollup_prompts: d.rollup_prompts || {} }); setLoaded(true) }).catch(() => setLoaded(true))
@@ -34,7 +43,11 @@ export function PromptSettingsModal({ channelId, onClose }: { channelId: number;
 
   async function save() {
     setBusy(true); setErr(null)
-    try { await videoApi.savePromptSettings({ ...s, channel_id: channelId }); onClose() }
+    try {
+      const payload = buildPromptSettingsPayload(s, channelId, canCreateBookmarks)
+      await videoApi.savePromptSettings(payload)
+      onClose()
+    }
     catch (e: any) { setErr(e?.message || 'Save failed') } finally { setBusy(false) }
   }
 
@@ -47,16 +60,16 @@ export function PromptSettingsModal({ channelId, onClose }: { channelId: number;
         </div>
         <div className="modal-body">
           <div className="vid-tabs">
-            {TABS.map((t) => <button key={t.key} className={`vid-tab ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>)}
+            {tabs.map((t) => <button key={t.key} className={`vid-tab ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>)}
           </div>
           <textarea className="vid-prompt-area" value={getVal()} onChange={(e) => setVal(e.target.value)}
             placeholder={loaded ? 'Prompt for this layer…' : 'Loading…'} rows={12} />
-          <div className="vid-bookmark-row">
+          {canCreateBookmarks && <div className="vid-bookmark-row">
             <label className="mon-check"><input type="checkbox" checked={!!s.bookmark_enabled} onChange={(e) => setS({ ...s, bookmark_enabled: e.target.checked })} /> Make bookmarks on alerts</label>
             <div className="wfield" style={{ maxWidth: 150 }}><label>Cooldown (s)</label>
               <input type="number" step="0.5" min="0" value={s.bookmark_cooldown_sec ?? 8} onChange={(e) => setS({ ...s, bookmark_cooldown_sec: Number(e.target.value) })} />
             </div>
-          </div>
+          </div>}
           {err && <div className="chat-error">{err}</div>}
           <div className="mon-modal-actions">
             <button className="mon-btn" onClick={onClose}>Close</button>
