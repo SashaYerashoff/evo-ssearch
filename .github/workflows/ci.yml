@@ -1,0 +1,45 @@
+name: EVA AI CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eva-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      EVOSSEARCH_OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+      - name: Check documentation drift
+        run: bash scripts/check_docs_drift.sh
+      - name: Compile production Python
+        run: |
+          python -m compileall -q \
+            agent_security archive_store.py attention_policy.py attention_store.py \
+            embedders eva_db heads inference_queue local_video_source.py \
+            luxriot_connector.py oldapp.py probe_manager.py road_events security
+      - name: Run test suite
+        run: python -m pytest -q

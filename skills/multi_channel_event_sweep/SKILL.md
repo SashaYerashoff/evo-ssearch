@@ -12,6 +12,14 @@ Trigger phrases:
 
 Goal: search a channel group for one event without pretending to review more channels than the turn can handle.
 
+Tools:
+- `normalize_time_window`
+- `list_video_summary_channels`
+- `get_video_summaries`
+- `get_visual_window_signals`
+- `get_detections`
+- `describe_frame`
+
 Default order:
 1. Normalize the time window with `normalize_time_window`.
 2. Resolve explicit channel IDs/titles if provided.

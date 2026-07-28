@@ -16,7 +16,8 @@ PRESERVED_ROOTS = {
     "detections_archive", "video", "models",
 }
 PRESERVED_NAMES = {
-    "probes_store.json", "luxriot_summary_state.json", "luxriot_rollups_cache.json",
+    "probes_store.json", "probe_channel_groups.json",
+    "luxriot_summary_state.json", "luxriot_rollups_cache.json",
 }
 PRESERVED_PATTERNS = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.sqlite3", "*.db", "*.log")
 

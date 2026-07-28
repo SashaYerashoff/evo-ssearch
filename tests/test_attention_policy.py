@@ -9,16 +9,26 @@ from attention_policy import (
     AttentionMode,
     AttentionPolicyConfig,
     AttentionVector,
+    CostBudgetConfig,
+    CostBudgetState,
+    CostedAttentionCandidate,
     CoordinatorConfig,
     CvSample,
     EmbeddingSnapshot,
     EpisodeRole,
+    FrameSelectorConfig,
     GlobalBudgetConfig,
     HomeostaticAttentionPolicy,
+    InferenceCost,
+    ModelFrameCandidate,
+    PORT_EIGHT_CHANNEL_PRESET,
     ProbeScore,
     aggregate_cv_intervals,
+    allocate_cost_aware_attention,
     allocate_global_attention,
     build_attention_episode,
+    profile_for_mode,
+    select_model_frames,
 )
 
 
@@ -432,6 +442,388 @@ class CoordinatorApiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "capacity exceeded"):
             coordinator.observe_cv("16", 0, 0.0, 0.0, "quiet")
         self.assertEqual(coordinator.status()["channel_count"], 16)
+
+
+class PortPresetTests(unittest.TestCase):
+    def test_exact_mode_contract_and_independent_one_hz_embeddings(self):
+        expected = {
+            AttentionMode.QUIET: (10_000, 120_000, 6, 8, 8, True),
+            AttentionMode.WATCH: (5_000, 90_000, 6, 8, 10, True),
+            AttentionMode.ACTIVE: (2_500, 60_000, 8, 12, 12, True),
+            AttentionMode.BURST: (1_000, 30_000, 10, 16, 16, True),
+            AttentionMode.DEGRADED: (15_000, 120_000, 4, 6, 6, True),
+        }
+        self.assertEqual(PORT_EIGHT_CHANNEL_PRESET.channel_limit, 8)
+        self.assertEqual(PORT_EIGHT_CHANNEL_PRESET.steady_l0_per_minute, 6.0)
+        for mode, values in expected.items():
+            profile = profile_for_mode(mode)
+            self.assertEqual(
+                (
+                    profile.cadence_ms,
+                    profile.deadline_ms,
+                    profile.min_frames,
+                    profile.target_frames,
+                    profile.max_frames,
+                    profile.dispatch_enabled,
+                ),
+                values,
+            )
+            self.assertEqual(profile.embedding_cadence_ms, 1_000)
+            self.assertEqual(profile.hard_accumulator_cap, 16)
+
+    def test_hard_cap_and_deadline_force_dispatch_in_every_mode(self):
+        for mode in AttentionMode:
+            profile = profile_for_mode(mode)
+            self.assertTrue(
+                profile.should_force_dispatch(
+                    accumulator_size=16,
+                    now_ms=1_001,
+                    last_dispatch_ms=1_000,
+                )
+            )
+            self.assertFalse(
+                profile.should_force_dispatch(
+                    accumulator_size=15,
+                    now_ms=profile.deadline_ms - 1,
+                    last_dispatch_ms=0,
+                )
+            )
+            self.assertTrue(
+                profile.should_force_dispatch(
+                    accumulator_size=4,
+                    now_ms=profile.deadline_ms,
+                    last_dispatch_ms=0,
+                )
+            )
+
+
+def _model_candidate(
+    index: int,
+    *,
+    roles=(),
+    vector=None,
+    tokens: int = 500,
+    salience: float = 0.5,
+    motion: float = 0.3,
+    probe: float = 0.2,
+) -> ModelFrameCandidate:
+    embedding = vector if vector is not None else (1.0, index + 1.0, 0.5)
+    return ModelFrameCandidate(
+        channel_id="7",
+        snapshot_id=f"s-{index:02d}",
+        timestamp_ms=index * 1_000,
+        embedding_ref=f"embedding://7/{index}",
+        frame_hash=f"hash-{index}",
+        roles=roles,
+        motion_score=motion,
+        probe_score=probe,
+        salience=salience,
+        sharpness_score=0.5,
+        estimated_tokens=tokens,
+        embedding=embedding,
+    )
+
+
+def _event_candidates(count: int = 20, *, tokens: int = 500):
+    role_map = {
+        0: (EpisodeRole.CONTROL,),
+        4: (EpisodeRole.PRE,),
+        5: (EpisodeRole.ONSET,),
+        8: (EpisodeRole.APEX,),
+        12: (EpisodeRole.POST,),
+    }
+    return [
+        _model_candidate(
+            index,
+            roles=role_map.get(index, ()),
+            tokens=tokens,
+            vector=(
+                1.0 if index % 3 == 0 else 0.0,
+                1.0 if index % 3 == 1 else 0.0,
+                1.0 if index % 3 == 2 else 0.0,
+                index / 20.0,
+            ),
+            salience=min(1.0, 0.3 + index / 30.0),
+            motion=min(1.0, index / 20.0),
+        )
+        for index in range(count)
+    ]
+
+
+class ModelFrameSelectorTests(unittest.TestCase):
+    def test_burst_selects_mandatory_anchors_chronologically_and_trims_tokens(self):
+        selection = select_model_frames(
+            "7",
+            _event_candidates(),
+            mode=AttentionMode.BURST,
+            token_budget=6_000,
+        )
+        self.assertTrue(selection.preflight_ok, selection.reasons)
+        self.assertEqual(len(selection.frames), 12)
+        self.assertEqual(selection.estimated_tokens, 6_000)
+        self.assertEqual(len(selection.trimmed_snapshot_ids), 4)
+        self.assertEqual(
+            [frame.timestamp_ms for frame in selection.frames],
+            sorted(frame.timestamp_ms for frame in selection.frames),
+        )
+        roles = {role for frame in selection.frames for role in frame.roles}
+        self.assertTrue(
+            {
+                EpisodeRole.CONTROL,
+                EpisodeRole.PRE,
+                EpisodeRole.ONSET,
+                EpisodeRole.APEX,
+                EpisodeRole.POST,
+                EpisodeRole.CURRENT,
+            }.issubset(roles)
+        )
+
+    def test_quiet_and_degraded_need_control_current_not_fake_event_roles(self):
+        candidates = [
+            _model_candidate(
+                index,
+                roles=(EpisodeRole.CONTROL,) if index == 0 else (),
+            )
+            for index in range(8)
+        ]
+        quiet = select_model_frames(
+            "7", candidates, mode="quiet", token_budget=4_000
+        )
+        self.assertTrue(quiet.preflight_ok, quiet.reasons)
+        self.assertEqual(quiet.missing_roles, ())
+        self.assertEqual(len(quiet.frames), 8)
+
+        degraded = select_model_frames(
+            "7", candidates, mode="degraded", token_budget=2_000
+        )
+        self.assertTrue(degraded.preflight_ok, degraded.reasons)
+        self.assertEqual(len(degraded.frames), 4)
+
+    def test_watch_preserves_present_event_anchors_without_requiring_missing_ones(self):
+        candidates = [
+            _model_candidate(
+                index,
+                roles=(EpisodeRole.CONTROL,)
+                if index == 0
+                else (EpisodeRole.PRE,)
+                if index == 3
+                else (EpisodeRole.POST,)
+                if index == 6
+                else (),
+            )
+            for index in range(10)
+        ]
+        selection = select_model_frames(
+            "7", candidates, mode="watch", token_budget=5_000
+        )
+        self.assertTrue(selection.preflight_ok, selection.reasons)
+        roles = {role for frame in selection.frames for role in frame.roles}
+        self.assertIn(EpisodeRole.PRE, roles)
+        self.assertIn(EpisodeRole.POST, roles)
+        self.assertNotIn(EpisodeRole.APEX, selection.missing_roles)
+
+    def test_active_missing_apex_fails_preflight_instead_of_fabricating_it(self):
+        candidates = [
+            candidate
+            for candidate in _event_candidates(14)
+            if EpisodeRole.APEX not in candidate.roles
+        ]
+        selection = select_model_frames(
+            "7", candidates, mode="active", token_budget=7_000
+        )
+        self.assertFalse(selection.preflight_ok)
+        self.assertIn(EpisodeRole.APEX, selection.missing_roles)
+
+    def test_redundancy_penalty_prefers_a_diverse_optional_frame(self):
+        candidates = _event_candidates(13)
+        apex = next(
+            candidate for candidate in candidates if EpisodeRole.APEX in candidate.roles
+        )
+        duplicate = _model_candidate(
+            6,
+            vector=apex.embedding,
+            salience=0.75,
+            motion=0.4,
+        )
+        diverse = _model_candidate(
+            7,
+            vector=(0.0, 0.0, 0.0, 1.0),
+            salience=1.0,
+            motion=1.0,
+        )
+        candidates[6] = duplicate
+        candidates[7] = diverse
+        selection = select_model_frames(
+            "7",
+            candidates,
+            mode="quiet",
+            token_budget=4_000,
+            config=FrameSelectorConfig(redundancy_weight=1.0),
+        )
+        ids = {frame.snapshot_id for frame in selection.frames}
+        self.assertIn(diverse.snapshot_id, ids)
+        self.assertNotIn(duplicate.snapshot_id, ids)
+
+    def test_mandatory_anchor_token_overflow_is_explicit(self):
+        selection = select_model_frames(
+            "7",
+            _event_candidates(14, tokens=1_000),
+            mode="active",
+            token_budget=5_000,
+        )
+        self.assertFalse(selection.preflight_ok)
+        self.assertGreater(selection.estimated_tokens, selection.token_budget)
+        self.assertIn(
+            "mandatory_anchors_exceed_token_budget", selection.reasons
+        )
+
+
+class CostAwareBudgetTests(unittest.TestCase):
+    def _decision(self, channel: str, mode: AttentionMode, debt: float = 0.0):
+        policy = HomeostaticAttentionPolicy(
+            AttentionPolicyConfig(
+                quiet_target_interval_ms=100_000,
+                active_target_interval_ms=10_000,
+            )
+        )
+        now = 1_000_000
+        if mode is AttentionMode.BURST:
+            vector = AttentionVector(now, burst=1.0)
+        elif mode is AttentionMode.ACTIVE:
+            vector = AttentionVector(
+                now,
+                motion_intensity=1.0,
+                motion_persistence=1.0,
+                probe_positive=1.0,
+            )
+        else:
+            vector = AttentionVector(now)
+        target = (
+            5_000
+            if mode is AttentionMode.BURST
+            else 10_000
+            if mode is AttentionMode.ACTIVE
+            else 100_000
+        )
+        last_vlm = int(now - debt * target)
+        return policy.evaluate(channel, vector, last_vlm_ms=last_vlm)
+
+    def test_steady_bucket_admits_six_reference_l0_requests_per_minute(self):
+        config = CostBudgetConfig(
+            reference_l0_tokens=100,
+            reference_l0_slot_seconds=10,
+        )
+        state = CostBudgetState(1_000_000, 600, 60)
+        candidates = [
+            CostedAttentionCandidate(
+                str(index),
+                self._decision(str(index), AttentionMode.QUIET, debt=0.5),
+                InferenceCost(40, 40, 20, 10),
+            )
+            for index in range(7)
+        ]
+        allocation = allocate_cost_aware_attention(
+            candidates, 1_000_000, state, config
+        )
+        self.assertEqual(len(allocation.selected), 6)
+        self.assertEqual(len(allocation.rejected), 1)
+        self.assertEqual(allocation.state_after.available_tokens, 0)
+        self.assertEqual(allocation.state_after.available_slot_seconds, 0)
+
+    def test_coverage_fairness_is_reserved_before_high_priority_work(self):
+        config = CostBudgetConfig(
+            reference_l0_tokens=100,
+            reference_l0_slot_seconds=10,
+            fairness_fraction=0.5,
+            max_jobs_per_cycle=2,
+        )
+        overdue = CostedAttentionCandidate(
+            "quiet-overdue",
+            self._decision("quiet-overdue", AttentionMode.QUIET, debt=2.0),
+            InferenceCost(20, 20, 10, 5),
+        )
+        active = CostedAttentionCandidate(
+            "active",
+            self._decision("active", AttentionMode.ACTIVE, debt=0.2),
+            InferenceCost(20, 20, 10, 5),
+        )
+        allocation = allocate_cost_aware_attention(
+            [active, overdue],
+            1_000_000,
+            CostBudgetState(1_000_000, 100, 10),
+            config,
+        )
+        self.assertEqual(
+            {entry.channel_id for entry in allocation.selected},
+            {"quiet-overdue", "active"},
+        )
+        phases = {entry.channel_id: entry.phase for entry in allocation.selected}
+        self.assertEqual(phases["quiet-overdue"], "fairness")
+
+    def test_burst_borrows_then_refill_repays_token_and_slot_debt(self):
+        config = CostBudgetConfig(
+            reference_l0_tokens=100,
+            reference_l0_slot_seconds=10,
+            burst_borrow_l0=2,
+            fairness_fraction=0.5,
+        )
+        overdue = CostedAttentionCandidate(
+            "quiet",
+            self._decision("quiet", AttentionMode.QUIET, debt=2),
+            InferenceCost(20, 20, 10, 5),
+        )
+        burst = CostedAttentionCandidate(
+            "burst",
+            self._decision("burst", AttentionMode.BURST, debt=0.2),
+            InferenceCost(80, 80, 40, 20),
+        )
+        allocation = allocate_cost_aware_attention(
+            [burst, overdue],
+            1_000_000,
+            CostBudgetState(1_000_000, 100, 10),
+            config,
+        )
+        self.assertEqual(
+            [entry.phase for entry in allocation.selected],
+            ["urgent", "fairness"],
+        )
+        self.assertEqual(allocation.state_after.available_tokens, -150)
+        self.assertEqual(allocation.state_after.available_slot_seconds, -15)
+        self.assertEqual(allocation.state_after.debt_l0(config), 1.5)
+
+        repayment = allocate_cost_aware_attention(
+            [],
+            1_015_000,
+            allocation.state_after,
+            config,
+        )
+        self.assertEqual(repayment.repaid_tokens, 150)
+        self.assertEqual(repayment.repaid_slot_seconds, 15)
+        self.assertEqual(repayment.state_after.debt_l0(config), 0)
+
+    def test_slot_seconds_can_be_limiting_even_when_tokens_fit(self):
+        config = CostBudgetConfig(
+            reference_l0_tokens=100,
+            reference_l0_slot_seconds=10,
+        )
+        candidates = [
+            CostedAttentionCandidate(
+                str(index),
+                self._decision(str(index), AttentionMode.QUIET, debt=0.2),
+                InferenceCost(20, 20, 10, 20),
+            )
+            for index in range(4)
+        ]
+        allocation = allocate_cost_aware_attention(
+            candidates,
+            1_000_000,
+            CostBudgetState(1_000_000, 600, 60),
+            config,
+        )
+        self.assertEqual(len(allocation.selected), 3)
+        self.assertEqual(
+            dict(allocation.rejected)["3"], "slot_seconds_budget_exhausted"
+        )
 
 
 if __name__ == "__main__":

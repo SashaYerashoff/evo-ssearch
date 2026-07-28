@@ -38,6 +38,136 @@ class EpisodeRole(str, Enum):
     ONSET = "onset"
     APEX = "apex"
     POST = "post"
+    CURRENT = "current"
+
+
+@dataclass(frozen=True)
+class ModeProfile:
+    """Port scheduling contract for one homeostatic mode.
+
+    ``cadence_ms`` is the earliest VLM admission cadence.  It does not control
+    the independent 1 Hz embedding/archive path.  ``deadline_ms`` is the hard
+    coverage deadline; reaching ``hard_accumulator_cap`` also forces admission.
+    """
+
+    mode: AttentionMode
+    cadence_ms: int
+    deadline_ms: int
+    min_frames: int
+    target_frames: int
+    max_frames: int
+    embedding_cadence_ms: int = 1_000
+    dispatch_enabled: bool = True
+    hard_accumulator_cap: int = 16
+
+    def __post_init__(self) -> None:
+        if self.cadence_ms <= 0:
+            raise ValueError("cadence_ms must be positive")
+        if self.deadline_ms < self.cadence_ms:
+            raise ValueError("deadline_ms must be at least cadence_ms")
+        if not 1 <= self.min_frames <= self.target_frames <= self.max_frames:
+            raise ValueError("frame targets must satisfy 1 <= min <= target <= max")
+        if not 4 <= self.min_frames <= 16:
+            raise ValueError("port min_frames must be between 4 and 16")
+        if not 4 <= self.max_frames <= 16:
+            raise ValueError("port max_frames must be between 4 and 16")
+        if self.embedding_cadence_ms <= 0:
+            raise ValueError("embedding_cadence_ms must be positive")
+        if self.hard_accumulator_cap != 16:
+            raise ValueError("port hard_accumulator_cap must be exactly 16")
+        if self.hard_accumulator_cap < self.max_frames:
+            raise ValueError("hard_accumulator_cap cannot be lower than max_frames")
+
+    def due_at(self, last_dispatch_ms: int) -> int:
+        return _timestamp(last_dispatch_ms, "last_dispatch_ms") + self.cadence_ms
+
+    def deadline_at(self, last_dispatch_ms: int) -> int:
+        return _timestamp(last_dispatch_ms, "last_dispatch_ms") + self.deadline_ms
+
+    def should_force_dispatch(
+        self,
+        *,
+        accumulator_size: int,
+        now_ms: int,
+        last_dispatch_ms: int,
+    ) -> bool:
+        if not self.dispatch_enabled:
+            return False
+        return (
+            int(accumulator_size) >= self.hard_accumulator_cap
+            or _timestamp(now_ms, "now_ms") >= self.deadline_at(last_dispatch_ms)
+        )
+
+
+@dataclass(frozen=True)
+class PortAttentionPreset:
+    """Deterministic deployment preset for one 4070-class VLM over 8 channels."""
+
+    name: str
+    channel_limit: int
+    steady_l0_per_minute: float
+    profiles: tuple[ModeProfile, ...]
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("preset name must not be empty")
+        if self.channel_limit <= 0:
+            raise ValueError("channel_limit must be positive")
+        steady = float(self.steady_l0_per_minute)
+        if not math.isfinite(steady) or steady <= 0:
+            raise ValueError("steady_l0_per_minute must be positive")
+        modes = [profile.mode for profile in self.profiles]
+        if len(modes) != len(set(modes)):
+            raise ValueError("preset profiles must have unique modes")
+        missing = set(AttentionMode).difference(modes)
+        if missing:
+            raise ValueError(
+                "preset is missing modes: "
+                + ", ".join(sorted(mode.value for mode in missing))
+            )
+        if any(profile.embedding_cadence_ms != 1_000 for profile in self.profiles):
+            raise ValueError("port embeddings must remain fixed at 1000 ms in every mode")
+        if any(profile.hard_accumulator_cap != 16 for profile in self.profiles):
+            raise ValueError("port accumulator hard cap must remain 16 in every mode")
+
+    def profile_for_mode(self, mode: AttentionMode | str) -> ModeProfile:
+        normalized = (
+            mode
+            if isinstance(mode, AttentionMode)
+            else AttentionMode(str(mode).strip().lower())
+        )
+        return next(profile for profile in self.profiles if profile.mode is normalized)
+
+
+PORT_EIGHT_CHANNEL_PRESET = PortAttentionPreset(
+    name="port-4070s-8ch",
+    channel_limit=8,
+    steady_l0_per_minute=6.0,
+    profiles=(
+        ModeProfile(AttentionMode.QUIET, 10_000, 120_000, 6, 8, 8),
+        ModeProfile(AttentionMode.WATCH, 5_000, 90_000, 6, 8, 10),
+        ModeProfile(AttentionMode.ACTIVE, 2_500, 60_000, 8, 12, 12),
+        ModeProfile(AttentionMode.BURST, 1_000, 30_000, 10, 16, 16),
+        ModeProfile(
+            AttentionMode.DEGRADED,
+            15_000,
+            120_000,
+            4,
+            6,
+            6,
+            dispatch_enabled=True,
+        ),
+    ),
+)
+
+
+def profile_for_mode(
+    mode: AttentionMode | str,
+    preset: PortAttentionPreset = PORT_EIGHT_CHANNEL_PRESET,
+) -> ModeProfile:
+    """Return the stable port cadence/deadline/frame contract for ``mode``."""
+
+    return preset.profile_for_mode(mode)
 
 
 def _finite(value: float, name: str) -> float:
@@ -950,6 +1080,415 @@ def allocate_global_attention(
 
 
 @dataclass(frozen=True)
+class InferenceCost:
+    """Preflight cost for one L0 request in both scarce resource dimensions."""
+
+    prompt_tokens: int
+    vision_tokens: int
+    expected_output_tokens: int
+    slot_seconds: float
+
+    def __post_init__(self) -> None:
+        for name in ("prompt_tokens", "vision_tokens", "expected_output_tokens"):
+            value = int(getattr(self, name))
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+            object.__setattr__(self, name, value)
+        if self.total_tokens <= 0:
+            raise ValueError("inference must consume at least one token")
+        if _non_negative(self.slot_seconds, "slot_seconds") == 0:
+            raise ValueError("slot_seconds must be positive")
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.vision_tokens + self.expected_output_tokens
+
+
+@dataclass(frozen=True)
+class CostBudgetConfig:
+    """Token bucket sized to six steady reference L0 requests per minute."""
+
+    steady_l0_per_minute: float = 6.0
+    reference_l0_tokens: int = 8_192
+    reference_l0_slot_seconds: float = 10.0
+    burst_borrow_l0: float = 2.0
+    fairness_fraction: float = 0.25
+    urgent_priority: float = 0.62
+    max_jobs_per_cycle: int = 8
+    refill_window_ms: int = 60_000
+
+    def __post_init__(self) -> None:
+        if _non_negative(
+            self.steady_l0_per_minute, "steady_l0_per_minute"
+        ) == 0:
+            raise ValueError("steady_l0_per_minute must be positive")
+        if self.reference_l0_tokens <= 0:
+            raise ValueError("reference_l0_tokens must be positive")
+        if _non_negative(
+            self.reference_l0_slot_seconds, "reference_l0_slot_seconds"
+        ) == 0:
+            raise ValueError("reference_l0_slot_seconds must be positive")
+        _non_negative(self.burst_borrow_l0, "burst_borrow_l0")
+        _unit(self.fairness_fraction, "fairness_fraction")
+        _non_negative(self.urgent_priority, "urgent_priority")
+        if self.max_jobs_per_cycle <= 0:
+            raise ValueError("max_jobs_per_cycle must be positive")
+        if self.refill_window_ms <= 0:
+            raise ValueError("refill_window_ms must be positive")
+
+    @property
+    def token_capacity(self) -> float:
+        return self.reference_l0_tokens * self.steady_l0_per_minute
+
+    @property
+    def slot_seconds_capacity(self) -> float:
+        return self.reference_l0_slot_seconds * self.steady_l0_per_minute
+
+    @property
+    def token_borrow_limit(self) -> float:
+        return self.reference_l0_tokens * self.burst_borrow_l0
+
+    @property
+    def slot_seconds_borrow_limit(self) -> float:
+        return self.reference_l0_slot_seconds * self.burst_borrow_l0
+
+    def equivalent_l0(self, cost: InferenceCost) -> float:
+        return max(
+            cost.total_tokens / self.reference_l0_tokens,
+            cost.slot_seconds / self.reference_l0_slot_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class CostBudgetState:
+    timestamp_ms: int
+    available_tokens: float
+    available_slot_seconds: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "timestamp_ms", _timestamp(self.timestamp_ms))
+        object.__setattr__(
+            self,
+            "available_tokens",
+            _finite(self.available_tokens, "available_tokens"),
+        )
+        object.__setattr__(
+            self,
+            "available_slot_seconds",
+            _finite(self.available_slot_seconds, "available_slot_seconds"),
+        )
+
+    def debt_l0(self, config: CostBudgetConfig) -> float:
+        return max(
+            max(0.0, -self.available_tokens) / config.reference_l0_tokens,
+            max(0.0, -self.available_slot_seconds)
+            / config.reference_l0_slot_seconds,
+        )
+
+
+def initial_cost_budget_state(
+    timestamp_ms: int,
+    config: CostBudgetConfig | None = None,
+    *,
+    fill_fraction: float = 1.0,
+) -> CostBudgetState:
+    policy = config or CostBudgetConfig()
+    fraction = _unit(fill_fraction, "fill_fraction")
+    return CostBudgetState(
+        timestamp_ms=_timestamp(timestamp_ms),
+        available_tokens=policy.token_capacity * fraction,
+        available_slot_seconds=policy.slot_seconds_capacity * fraction,
+    )
+
+
+@dataclass(frozen=True)
+class CostedAttentionCandidate:
+    channel_id: str
+    decision: AttentionDecision
+    cost: InferenceCost
+    episode_id: str = ""
+    ready_at_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if self.channel_id != self.decision.channel_id:
+            raise ValueError("candidate and decision channel_id must match")
+        object.__setattr__(self, "ready_at_ms", _timestamp(self.ready_at_ms))
+
+
+@dataclass(frozen=True)
+class CostAllocationEntry:
+    channel_id: str
+    episode_id: str
+    phase: str
+    cost: InferenceCost
+    equivalent_l0: float
+    priority: float
+    coverage_debt: float
+
+
+@dataclass(frozen=True)
+class CostAwareAllocation:
+    selected: tuple[CostAllocationEntry, ...]
+    rejected: tuple[tuple[str, str], ...]
+    state_before: CostBudgetState
+    state_after: CostBudgetState
+    repaid_tokens: float
+    repaid_slot_seconds: float
+
+    def printable(self, config: CostBudgetConfig | None = None) -> str:
+        policy = config or CostBudgetConfig()
+        return json.dumps(
+            {
+                "burst_debt_l0_after": round(
+                    self.state_after.debt_l0(policy), 6
+                ),
+                "burst_debt_l0_before": round(
+                    self.state_before.debt_l0(policy), 6
+                ),
+                "rejected": [
+                    {"channel_id": channel_id, "reason": reason}
+                    for channel_id, reason in self.rejected
+                ],
+                "repaid_slot_seconds": round(self.repaid_slot_seconds, 6),
+                "repaid_tokens": round(self.repaid_tokens, 6),
+                "selected": [
+                    {
+                        "channel_id": item.channel_id,
+                        "coverage_debt": round(item.coverage_debt, 6),
+                        "episode_id": item.episode_id,
+                        "equivalent_l0": round(item.equivalent_l0, 6),
+                        "phase": item.phase,
+                        "priority": round(item.priority, 6),
+                        "slot_seconds": round(item.cost.slot_seconds, 6),
+                        "tokens": item.cost.total_tokens,
+                    }
+                    for item in self.selected
+                ],
+                "state_after": {
+                    "available_slot_seconds": round(
+                        self.state_after.available_slot_seconds, 6
+                    ),
+                    "available_tokens": round(
+                        self.state_after.available_tokens, 6
+                    ),
+                    "timestamp_ms": self.state_after.timestamp_ms,
+                },
+                "state_before": {
+                    "available_slot_seconds": round(
+                        self.state_before.available_slot_seconds, 6
+                    ),
+                    "available_tokens": round(
+                        self.state_before.available_tokens, 6
+                    ),
+                    "timestamp_ms": self.state_before.timestamp_ms,
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+def replenish_cost_budget(
+    state: CostBudgetState,
+    now_ms: int,
+    config: CostBudgetConfig | None = None,
+) -> tuple[CostBudgetState, float, float]:
+    """Refill the bucket; negative burst balances are repaid before new credit."""
+
+    policy = config or CostBudgetConfig()
+    now = _timestamp(now_ms, "now_ms")
+    if now < state.timestamp_ms:
+        raise ValueError("budget timestamps must be monotonic")
+    elapsed = now - state.timestamp_ms
+    token_refill = policy.token_capacity * elapsed / policy.refill_window_ms
+    slot_refill = policy.slot_seconds_capacity * elapsed / policy.refill_window_ms
+    repaid_tokens = min(token_refill, max(0.0, -state.available_tokens))
+    repaid_slots = min(slot_refill, max(0.0, -state.available_slot_seconds))
+    replenished = CostBudgetState(
+        timestamp_ms=now,
+        available_tokens=min(
+            policy.token_capacity, state.available_tokens + token_refill
+        ),
+        available_slot_seconds=min(
+            policy.slot_seconds_capacity,
+            state.available_slot_seconds + slot_refill,
+        ),
+    )
+    return replenished, repaid_tokens, repaid_slots
+
+
+def allocate_cost_aware_attention(
+    candidates: Iterable[CostedAttentionCandidate],
+    now_ms: int,
+    state: CostBudgetState,
+    config: CostBudgetConfig | None = None,
+) -> CostAwareAllocation:
+    """Allocate token and slot-seconds jointly with burst borrowing and fairness."""
+
+    policy = config or CostBudgetConfig()
+    now = _timestamp(now_ms, "now_ms")
+    before, repaid_tokens, repaid_slots = replenish_cost_budget(state, now, policy)
+    ordered = sorted(candidates, key=lambda candidate: candidate.channel_id)
+    if len({candidate.channel_id for candidate in ordered}) != len(ordered):
+        raise ValueError("only one costed candidate per channel is allowed")
+    rejected: dict[str, str] = {}
+    eligible: list[CostedAttentionCandidate] = []
+    for candidate in ordered:
+        profile = profile_for_mode(candidate.decision.mode)
+        if not profile.dispatch_enabled:
+            rejected[candidate.channel_id] = "mode_dispatch_disabled"
+        elif candidate.ready_at_ms > now:
+            rejected[candidate.channel_id] = (
+                f"not_ready_until:{candidate.ready_at_ms}"
+            )
+        elif (
+            candidate.cost.total_tokens
+            > policy.token_capacity + policy.token_borrow_limit
+            or candidate.cost.slot_seconds
+            > policy.slot_seconds_capacity + policy.slot_seconds_borrow_limit
+        ):
+            rejected[candidate.channel_id] = "cost_exceeds_steady_plus_burst_limit"
+        else:
+            eligible.append(candidate)
+
+    tokens = before.available_tokens
+    slots = before.available_slot_seconds
+    selected: list[CostAllocationEntry] = []
+    selected_ids: set[str] = set()
+
+    def can_admit(
+        candidate: CostedAttentionCandidate, *, allow_borrow: bool
+    ) -> bool:
+        token_floor = -policy.token_borrow_limit if allow_borrow else 0.0
+        slot_floor = (
+            -policy.slot_seconds_borrow_limit if allow_borrow else 0.0
+        )
+        return (
+            tokens - candidate.cost.total_tokens >= token_floor - 1e-9
+            and slots - candidate.cost.slot_seconds >= slot_floor - 1e-9
+        )
+
+    def admit(candidate: CostedAttentionCandidate, phase: str) -> bool:
+        nonlocal tokens, slots
+        if len(selected) >= policy.max_jobs_per_cycle:
+            return False
+        if candidate.channel_id in selected_ids:
+            return False
+        borrow = candidate.decision.mode is AttentionMode.BURST
+        if not can_admit(candidate, allow_borrow=borrow):
+            return False
+        tokens -= candidate.cost.total_tokens
+        slots -= candidate.cost.slot_seconds
+        selected_ids.add(candidate.channel_id)
+        selected.append(
+            CostAllocationEntry(
+                channel_id=candidate.channel_id,
+                episode_id=candidate.episode_id,
+                phase=phase,
+                cost=candidate.cost,
+                equivalent_l0=policy.equivalent_l0(candidate.cost),
+                priority=candidate.decision.priority,
+                coverage_debt=candidate.decision.coverage_debt,
+            )
+        )
+        return True
+
+    overdue = sorted(
+        (
+            candidate
+            for candidate in eligible
+            if candidate.decision.coverage_debt >= 1.0
+            and candidate.decision.mode is not AttentionMode.BURST
+        ),
+        key=lambda candidate: (
+            -candidate.decision.coverage_debt,
+            candidate.decision.state.last_vlm_ms
+            if candidate.decision.state.last_vlm_ms is not None
+            else -1,
+            candidate.channel_id,
+        ),
+    )
+    fairness_tokens = max(0.0, tokens) * policy.fairness_fraction
+    fairness_slots = max(0.0, slots) * policy.fairness_fraction
+    fair_tokens_used = 0.0
+    fair_slots_used = 0.0
+    for candidate in overdue:
+        within_reserve = (
+            fair_tokens_used + candidate.cost.total_tokens <= fairness_tokens + 1e-9
+            and fair_slots_used + candidate.cost.slot_seconds
+            <= fairness_slots + 1e-9
+        )
+        first_fair_candidate = not any(
+            item.phase == "fairness" for item in selected
+        )
+        if not within_reserve and not first_fair_candidate:
+            continue
+        if admit(candidate, "fairness"):
+            fair_tokens_used += candidate.cost.total_tokens
+            fair_slots_used += candidate.cost.slot_seconds
+
+    urgent = sorted(
+        (
+            candidate
+            for candidate in eligible
+            if candidate.decision.mode is AttentionMode.BURST
+            or candidate.decision.priority >= policy.urgent_priority
+        ),
+        key=lambda candidate: (
+            -candidate.decision.priority,
+            -candidate.decision.coverage_debt,
+            candidate.channel_id,
+        ),
+    )
+    for candidate in urgent:
+        admit(candidate, "urgent")
+
+    priority = sorted(
+        eligible,
+        key=lambda candidate: (
+            -candidate.decision.priority,
+            -candidate.decision.coverage_debt,
+            candidate.channel_id,
+        ),
+    )
+    for candidate in priority:
+        admit(candidate, "priority")
+
+    for candidate in eligible:
+        if candidate.channel_id in selected_ids:
+            continue
+        rejected[candidate.channel_id] = (
+            "max_jobs_reached"
+            if len(selected) >= policy.max_jobs_per_cycle
+            else "token_budget_exhausted"
+            if tokens < candidate.cost.total_tokens
+            else "slot_seconds_budget_exhausted"
+        )
+    phase_order = {"urgent": 0, "fairness": 1, "priority": 2}
+    selected.sort(
+        key=lambda item: (
+            phase_order[item.phase],
+            -item.priority,
+            item.channel_id,
+        )
+    )
+    after = CostBudgetState(
+        timestamp_ms=now,
+        available_tokens=tokens,
+        available_slot_seconds=slots,
+    )
+    return CostAwareAllocation(
+        selected=tuple(selected),
+        rejected=tuple(sorted(rejected.items())),
+        state_before=before,
+        state_after=after,
+        repaid_tokens=repaid_tokens,
+        repaid_slot_seconds=repaid_slots,
+    )
+
+
+@dataclass(frozen=True)
 class EpisodeConfig:
     pre_roll_ms: int = 5_000
     post_roll_ms: int = 5_000
@@ -1029,6 +1568,439 @@ class AttentionEpisode:
             separators=(",", ":"),
             sort_keys=True,
         )
+
+
+@dataclass(frozen=True)
+class ModelFrameCandidate:
+    """Embedding-backed snapshot metadata eligible for one model request."""
+
+    channel_id: str
+    snapshot_id: str
+    timestamp_ms: int
+    embedding_ref: str
+    frame_hash: str = ""
+    roles: tuple[EpisodeRole, ...] = ()
+    motion_score: float = 0.0
+    probe_score: float = 0.0
+    salience: float = 0.0
+    sharpness_score: float = 0.0
+    estimated_tokens: int = 512
+    embedding: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.channel_id:
+            raise ValueError("channel_id must not be empty")
+        if not self.snapshot_id:
+            raise ValueError("snapshot_id must not be empty")
+        if not self.embedding_ref:
+            raise ValueError("embedding_ref must not be empty")
+        object.__setattr__(self, "timestamp_ms", _timestamp(self.timestamp_ms))
+        object.__setattr__(
+            self,
+            "roles",
+            tuple(
+                role if isinstance(role, EpisodeRole) else EpisodeRole(str(role))
+                for role in self.roles
+            ),
+        )
+        for name in (
+            "motion_score",
+            "probe_score",
+            "salience",
+            "sharpness_score",
+        ):
+            object.__setattr__(self, name, _unit(getattr(self, name), name))
+        if int(self.estimated_tokens) <= 0:
+            raise ValueError("estimated_tokens must be positive")
+        object.__setattr__(self, "estimated_tokens", int(self.estimated_tokens))
+        vector = tuple(
+            _finite(value, f"embedding[{index}]")
+            for index, value in enumerate(self.embedding)
+        )
+        object.__setattr__(self, "embedding", vector)
+
+
+@dataclass(frozen=True)
+class FrameSelectorConfig:
+    redundancy_weight: float = 0.42
+    temporal_coverage_weight: float = 0.12
+    required_roles: tuple[EpisodeRole, ...] = ()
+
+    def __post_init__(self) -> None:
+        _non_negative(self.redundancy_weight, "redundancy_weight")
+        _non_negative(self.temporal_coverage_weight, "temporal_coverage_weight")
+        normalized = tuple(
+            role if isinstance(role, EpisodeRole) else EpisodeRole(str(role))
+            for role in self.required_roles
+        )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("required_roles must be unique")
+        object.__setattr__(self, "required_roles", normalized)
+
+
+@dataclass(frozen=True)
+class SelectedModelFrame:
+    channel_id: str
+    snapshot_id: str
+    timestamp_ms: int
+    embedding_ref: str
+    frame_hash: str
+    roles: tuple[EpisodeRole, ...]
+    motion_score: float
+    probe_score: float
+    selection_score: float
+    redundancy: float
+    estimated_tokens: int
+
+
+@dataclass(frozen=True)
+class ModelFrameSelection:
+    channel_id: str
+    mode: AttentionMode
+    frames: tuple[SelectedModelFrame, ...]
+    token_budget: int
+    estimated_tokens: int
+    missing_roles: tuple[EpisodeRole, ...]
+    trimmed_snapshot_ids: tuple[str, ...]
+    preflight_ok: bool
+    reasons: tuple[str, ...]
+
+    def printable(self) -> str:
+        return json.dumps(
+            {
+                "channel_id": self.channel_id,
+                "estimated_tokens": self.estimated_tokens,
+                "frames": [
+                    {
+                        "embedding_ref": frame.embedding_ref,
+                        "estimated_tokens": frame.estimated_tokens,
+                        "frame_hash": frame.frame_hash,
+                        "motion_score": round(frame.motion_score, 6),
+                        "probe_score": round(frame.probe_score, 6),
+                        "redundancy": round(frame.redundancy, 6),
+                        "roles": [role.value for role in frame.roles],
+                        "selection_score": round(frame.selection_score, 6),
+                        "snapshot_id": frame.snapshot_id,
+                        "timestamp_ms": frame.timestamp_ms,
+                    }
+                    for frame in self.frames
+                ],
+                "missing_roles": [role.value for role in self.missing_roles],
+                "mode": self.mode.value,
+                "preflight_ok": self.preflight_ok,
+                "reasons": list(self.reasons),
+                "token_budget": self.token_budget,
+                "trimmed_snapshot_ids": list(self.trimmed_snapshot_ids),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+def _candidate_similarity(
+    left: ModelFrameCandidate, right: ModelFrameCandidate
+) -> float:
+    if left.snapshot_id == right.snapshot_id:
+        return 1.0
+    if left.frame_hash and left.frame_hash == right.frame_hash:
+        return 1.0
+    if (
+        left.embedding
+        and right.embedding
+        and len(left.embedding) == len(right.embedding)
+    ):
+        dot = sum(a * b for a, b in zip(left.embedding, right.embedding))
+        left_norm = math.sqrt(sum(value * value for value in left.embedding))
+        right_norm = math.sqrt(sum(value * value for value in right.embedding))
+        if left_norm > 0.0 and right_norm > 0.0:
+            return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+    return 0.0
+
+
+def select_model_frames(
+    channel_id: str,
+    candidates: Iterable[ModelFrameCandidate],
+    *,
+    mode: AttentionMode | str,
+    token_budget: int,
+    preset: PortAttentionPreset = PORT_EIGHT_CHANNEL_PRESET,
+    config: FrameSelectorConfig | None = None,
+) -> ModelFrameSelection:
+    """Choose 6-16 chronological model frames, then run token preflight.
+
+    The latest candidate is automatically tagged ``current``.  Other mandatory
+    roles must be assigned by the episode builder from CV interval/apex links.
+    Images are never accepted; output retains only snapshot and embedding refs.
+    """
+
+    if not channel_id:
+        raise ValueError("channel_id must not be empty")
+    if int(token_budget) <= 0:
+        raise ValueError("token_budget must be positive")
+    normalized_mode = (
+        mode if isinstance(mode, AttentionMode) else AttentionMode(str(mode).lower())
+    )
+    profile = preset.profile_for_mode(normalized_mode)
+    policy = config or FrameSelectorConfig()
+    automatic_required = (
+        (
+            EpisodeRole.CONTROL,
+            EpisodeRole.PRE,
+            EpisodeRole.ONSET,
+            EpisodeRole.APEX,
+            EpisodeRole.POST,
+            EpisodeRole.CURRENT,
+        )
+        if normalized_mode in (AttentionMode.ACTIVE, AttentionMode.BURST)
+        else (EpisodeRole.CONTROL, EpisodeRole.CURRENT)
+    )
+    required_roles = policy.required_roles or automatic_required
+    ordered = sorted(
+        (candidate for candidate in candidates if candidate.channel_id == channel_id),
+        key=lambda candidate: (candidate.timestamp_ms, candidate.snapshot_id),
+    )
+    if len({candidate.snapshot_id for candidate in ordered}) != len(ordered):
+        raise ValueError("snapshot_id values must be unique per selection")
+    if not ordered:
+        return ModelFrameSelection(
+            channel_id=channel_id,
+            mode=normalized_mode,
+            frames=(),
+            token_budget=int(token_budget),
+            estimated_tokens=0,
+            missing_roles=required_roles,
+            trimmed_snapshot_ids=(),
+            preflight_ok=False,
+            reasons=("no_embedding_backed_candidates",),
+        )
+
+    latest_id = ordered[-1].snapshot_id
+
+    def roles_for(candidate: ModelFrameCandidate) -> tuple[EpisodeRole, ...]:
+        roles = list(candidate.roles)
+        if candidate.snapshot_id == latest_id and EpisodeRole.CURRENT not in roles:
+            roles.append(EpisodeRole.CURRENT)
+        return tuple(roles)
+
+    roles_by_id = {candidate.snapshot_id: roles_for(candidate) for candidate in ordered}
+
+    def base_score(candidate: ModelFrameCandidate) -> float:
+        return (
+            0.42 * candidate.salience
+            + 0.28 * candidate.motion_score
+            + 0.20 * candidate.probe_score
+            + 0.10 * candidate.sharpness_score
+        )
+
+    event_roles = (
+        EpisodeRole.PRE,
+        EpisodeRole.ONSET,
+        EpisodeRole.APEX,
+        EpisodeRole.POST,
+    )
+    present_event_roles = tuple(
+        role
+        for role in event_roles
+        if any(role in roles_by_id[candidate.snapshot_id] for candidate in ordered)
+    )
+    anchor_roles = tuple(dict.fromkeys((*required_roles, *present_event_roles)))
+    missing_roles = tuple(
+        role
+        for role in required_roles
+        if not any(role in roles_by_id[candidate.snapshot_id] for candidate in ordered)
+    )
+    selected: dict[str, ModelFrameCandidate] = {}
+    protected: set[str] = set()
+    selection_metrics: dict[str, tuple[float, float]] = {}
+
+    for role in anchor_roles:
+        role_candidates = [
+            candidate
+            for candidate in ordered
+            if role in roles_by_id[candidate.snapshot_id]
+        ]
+        if not role_candidates:
+            continue
+        if role is EpisodeRole.CURRENT:
+            chosen = max(
+                role_candidates,
+                key=lambda candidate: (
+                    candidate.timestamp_ms,
+                    base_score(candidate),
+                    -candidate.estimated_tokens,
+                    candidate.snapshot_id,
+                ),
+            )
+        else:
+            chosen = max(
+                role_candidates,
+                key=lambda candidate: (
+                    base_score(candidate),
+                    -candidate.estimated_tokens,
+                    -candidate.timestamp_ms,
+                    candidate.snapshot_id,
+                ),
+            )
+        selected[chosen.snapshot_id] = chosen
+        protected.add(chosen.snapshot_id)
+        selection_metrics.setdefault(chosen.snapshot_id, (base_score(chosen), 0.0))
+
+    target = min(profile.max_frames, max(profile.min_frames, profile.target_frames))
+    while len(selected) < target:
+        remaining = [
+            candidate
+            for candidate in ordered
+            if candidate.snapshot_id not in selected
+        ]
+        if not remaining:
+            break
+        scored: list[tuple[float, float, ModelFrameCandidate]] = []
+        for candidate in remaining:
+            redundancy = max(
+                (
+                    _candidate_similarity(candidate, chosen)
+                    for chosen in selected.values()
+                ),
+                default=0.0,
+            )
+            total_span = max(1, ordered[-1].timestamp_ms - ordered[0].timestamp_ms)
+            temporal_distance = min(
+                (
+                    abs(candidate.timestamp_ms - chosen.timestamp_ms)
+                    for chosen in selected.values()
+                ),
+                default=total_span,
+            )
+            temporal_coverage = min(1.0, temporal_distance / total_span)
+            score = (
+                base_score(candidate)
+                + policy.temporal_coverage_weight * temporal_coverage
+                - policy.redundancy_weight * redundancy
+            )
+            scored.append((score, redundancy, candidate))
+        score, redundancy, chosen = max(
+            scored,
+            key=lambda item: (
+                item[0],
+                -item[1],
+                -item[2].estimated_tokens,
+                -item[2].timestamp_ms,
+                item[2].snapshot_id,
+            ),
+        )
+        selected[chosen.snapshot_id] = chosen
+        selection_metrics[chosen.snapshot_id] = (score, redundancy)
+
+    trimmed: list[str] = []
+
+    def selected_tokens() -> int:
+        return sum(candidate.estimated_tokens for candidate in selected.values())
+
+    while selected_tokens() > token_budget:
+        removable = [
+            candidate
+            for snapshot_id, candidate in selected.items()
+            if snapshot_id not in protected
+        ]
+        if not removable:
+            break
+        removed = min(
+            removable,
+            key=lambda candidate: (
+                selection_metrics[candidate.snapshot_id][0],
+                -candidate.estimated_tokens,
+                candidate.timestamp_ms,
+                candidate.snapshot_id,
+            ),
+        )
+        trimmed.append(removed.snapshot_id)
+        del selected[removed.snapshot_id]
+
+    if len(selected) < profile.min_frames:
+        refill = [
+            candidate
+            for candidate in ordered
+            if candidate.snapshot_id not in selected
+            and candidate.snapshot_id not in trimmed
+        ]
+        refill.sort(
+            key=lambda candidate: (
+                -base_score(candidate),
+                candidate.estimated_tokens,
+                candidate.timestamp_ms,
+                candidate.snapshot_id,
+            )
+        )
+        for candidate in refill:
+            if len(selected) >= profile.min_frames:
+                break
+            if selected_tokens() + candidate.estimated_tokens > token_budget:
+                continue
+            redundancy = max(
+                (
+                    _candidate_similarity(candidate, chosen)
+                    for chosen in selected.values()
+                ),
+                default=0.0,
+            )
+            selected[candidate.snapshot_id] = candidate
+            selection_metrics[candidate.snapshot_id] = (
+                base_score(candidate) - policy.redundancy_weight * redundancy,
+                redundancy,
+            )
+
+    frames = tuple(
+        SelectedModelFrame(
+            channel_id=candidate.channel_id,
+            snapshot_id=candidate.snapshot_id,
+            timestamp_ms=candidate.timestamp_ms,
+            embedding_ref=candidate.embedding_ref,
+            frame_hash=candidate.frame_hash,
+            roles=roles_by_id[candidate.snapshot_id],
+            motion_score=candidate.motion_score,
+            probe_score=candidate.probe_score,
+            selection_score=selection_metrics[candidate.snapshot_id][0],
+            redundancy=selection_metrics[candidate.snapshot_id][1],
+            estimated_tokens=candidate.estimated_tokens,
+        )
+        for candidate in sorted(
+            selected.values(),
+            key=lambda candidate: (candidate.timestamp_ms, candidate.snapshot_id),
+        )
+    )
+    estimated_tokens = sum(frame.estimated_tokens for frame in frames)
+    preflight_ok = (
+        not missing_roles
+        and profile.min_frames <= len(frames) <= profile.max_frames
+        and estimated_tokens <= token_budget
+    )
+    reasons: list[str] = [
+        f"profile={normalized_mode.value}:{profile.min_frames}/{profile.target_frames}/{profile.max_frames}",
+        f"frames={len(frames)}",
+        f"tokens={estimated_tokens}/{token_budget}",
+    ]
+    if missing_roles:
+        reasons.append(
+            "missing_roles=" + ",".join(role.value for role in missing_roles)
+        )
+    if trimmed:
+        reasons.append("token_preflight_trimmed=" + ",".join(trimmed))
+    if len(frames) < profile.min_frames:
+        reasons.append(f"below_min_frames={profile.min_frames}")
+    if estimated_tokens > token_budget:
+        reasons.append("mandatory_anchors_exceed_token_budget")
+    return ModelFrameSelection(
+        channel_id=channel_id,
+        mode=normalized_mode,
+        frames=frames,
+        token_budget=int(token_budget),
+        estimated_tokens=estimated_tokens,
+        missing_roles=missing_roles,
+        trimmed_snapshot_ids=tuple(trimmed),
+        preflight_ok=preflight_ok,
+        reasons=tuple(reasons),
+    )
 
 
 def build_control_episode(
@@ -2017,6 +2989,11 @@ __all__ = [
     "AttentionState",
     "AttentionVector",
     "AttentionWeights",
+    "CostAllocationEntry",
+    "CostAwareAllocation",
+    "CostBudgetConfig",
+    "CostBudgetState",
+    "CostedAttentionCandidate",
     "CoordinatorConfig",
     "CvSample",
     "DispatchReadiness",
@@ -2024,14 +3001,27 @@ __all__ = [
     "EpisodeConfig",
     "EpisodeFrame",
     "EpisodeRole",
+    "FrameSelectorConfig",
     "GlobalBudgetConfig",
     "HomeostaticAttentionPolicy",
+    "InferenceCost",
+    "ModeProfile",
+    "ModelFrameCandidate",
+    "ModelFrameSelection",
     "MotionInterval",
     "MotionKind",
+    "PORT_EIGHT_CHANNEL_PRESET",
     "PlannedDispatch",
+    "PortAttentionPreset",
     "ProbeScore",
+    "SelectedModelFrame",
     "aggregate_cv_intervals",
+    "allocate_cost_aware_attention",
     "allocate_global_attention",
     "build_attention_episode",
     "build_control_episode",
+    "initial_cost_budget_state",
+    "profile_for_mode",
+    "replenish_cost_budget",
+    "select_model_frames",
 ]

@@ -33,6 +33,9 @@ ARCHIVE_SOURCE_ALIASES = {
     "probes_run": "probe",
     "probes_query": "probe",
     "probe_daemon": "probe",
+    "semantic_snapshot": "semantic_snapshot",
+    "semantic_snapshots": "semantic_snapshot",
+    "continuous_clip": "semantic_snapshot",
     "vlm_summary": "vlm_summary",
     "vlm_alert": "vlm_alert",
 }
@@ -208,8 +211,10 @@ class PostgresDetectionsStore(_TenantRepository):
     ) -> None:
         super().__init__(pool, tenant_id)
         self.max_records = max(1000, int(max_records or 20000))
+        # Kept for constructor compatibility. Hard-cap deletion is performed
+        # only by apply_retention(), which returns image paths to the caller so
+        # database rows and filesystem snapshots are pruned together.
         self.cap_check_interval_sec = max(0.0, float(cap_check_interval_sec or 0.0))
-        self._last_cap_check_monotonic = 0.0
 
     @staticmethod
     def _row_to_dict(row: Sequence[Any], include_vectors: bool = False) -> Dict[str, Any]:
@@ -273,7 +278,6 @@ class PostgresDetectionsStore(_TenantRepository):
         with self.lock:
             with self.pool.transaction(self._context()) as connection:
                 inserted = self._insert_normalized(connection, normalized)
-                self._trim_to_cap(connection)
                 return inserted
 
     def add_detections(self, records: Sequence[Dict[str, Any]]) -> int:
@@ -294,8 +298,25 @@ class PostgresDetectionsStore(_TenantRepository):
                             inserted += 1
                     except Exception:
                         continue
-                self._trim_to_cap(connection)
         return inserted
+
+    def ensure_detections(self, records: Sequence[Dict[str, Any]]) -> int:
+        """Durably apply a validated idempotent batch.
+
+        A deterministic dedupe conflict means that row is already durable, so
+        it counts as success. Unlike the legacy best-effort bulk helper, this
+        method propagates normalization/database errors and lets the caller
+        retry or record an explicit coverage gap.
+        """
+
+        normalized_rows = [_normalize_detection(record) for record in records]
+        if not normalized_rows:
+            return 0
+        with self.lock:
+            with self.pool.transaction(self._context()) as connection:
+                for normalized in normalized_rows:
+                    self._insert_normalized(connection, normalized)
+        return len(normalized_rows)
 
     def _insert_normalized(self, connection: Any, normalized: Mapping[str, Any]) -> bool:
         payload = _decode_detection_payload(
@@ -357,38 +378,6 @@ class PostgresDetectionsStore(_TenantRepository):
             ),
         )
         return int(cursor.rowcount or 0) > 0
-
-    def _trim_to_cap(self, connection: Any) -> None:
-        now = time.monotonic()
-        if (
-            self.cap_check_interval_sec > 0
-            and self._last_cap_check_monotonic > 0
-            and now - self._last_cap_check_monotonic < self.cap_check_interval_sec
-        ):
-            return
-        self._last_cap_check_monotonic = now
-        row = connection.execute(
-            "SELECT COUNT(*) FROM archive.detections WHERE tenant_id = %s",
-            (self.tenant_id,),
-        ).fetchone()
-        total = int(row[0] or 0) if row else 0
-        if total <= self.max_records:
-            return
-        excess = total - self.max_records
-        connection.execute(
-            """
-            DELETE FROM archive.detections
-            WHERE tenant_id = %s
-              AND id IN (
-                  SELECT id
-                  FROM archive.detections
-                  WHERE tenant_id = %s
-                  ORDER BY id ASC
-                  LIMIT %s
-              )
-            """,
-            (self.tenant_id, self.tenant_id, int(excess)),
-        )
 
     def apply_retention(
         self,
@@ -598,6 +587,7 @@ class PostgresDetectionsStore(_TenantRepository):
         include_thumbnail: bool = True,
         channel_ids: Optional[Sequence[int]] = None,
         batch_id: Optional[str] = None,
+        parent_alert_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         limit = max(1, min(500, int(limit or 50)))
         offset = max(0, int(offset or 0))
@@ -609,6 +599,7 @@ class PostgresDetectionsStore(_TenantRepository):
             since_ms=since_ms,
             until_ms=until_ms,
             batch_id=batch_id,
+            parent_alert_id=parent_alert_id,
         )
         try:
             with self.lock:
@@ -1586,6 +1577,7 @@ class PostgresDetectionsStore(_TenantRepository):
         self,
         probe_id: Optional[str] = None,
         channel_id: Optional[int] = None,
+        channel_ids: Optional[Sequence[int]] = None,
         since_ms: Optional[int] = None,
         until_ms: Optional[int] = None,
         limit: int = 2000,
@@ -1595,6 +1587,7 @@ class PostgresDetectionsStore(_TenantRepository):
         where_sql, params = self._build_where(
             probe_id=probe_id,
             channel_id=channel_id,
+            channel_ids=channel_ids,
             source=source,
             since_ms=since_ms,
             until_ms=until_ms,
@@ -1657,6 +1650,7 @@ class PostgresDetectionsStore(_TenantRepository):
         only_with_dino: bool = False,
         ids: Optional[Sequence[int]] = None,
         batch_id: Optional[str] = None,
+        parent_alert_id: Optional[str] = None,
     ) -> Tuple[str, List[Any]]:
         where: List[str] = ["tenant_id = %s"]
         params: List[Any] = [self.tenant_id]
@@ -1701,6 +1695,10 @@ class PostgresDetectionsStore(_TenantRepository):
         if normalized_batch_id:
             where.append("payload_json->>'batch_id' = %s")
             params.append(normalized_batch_id)
+        normalized_parent_alert_id = str(parent_alert_id or "").strip()
+        if normalized_parent_alert_id:
+            where.append("payload_json->>'parent_alert_id' = %s")
+            params.append(normalized_parent_alert_id)
         if only_with_clip:
             where.append("clip_vec IS NOT NULL")
         if only_with_dino:

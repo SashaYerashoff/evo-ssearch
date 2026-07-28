@@ -15,7 +15,9 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
   search queries (`ViT-B/32`).
 - **VLM inference** (vLLM, `qwen3-vl-4b`) — produces video-descriptions; runs on
   dedicated host(s).
-- **Agent LM** (`qwen3.5-9b` class) — the conversational agent; separate endpoint.
+- **Agent LM** — the conversational agent profile. The constrained eight-channel
+  port deployment shares `qwen3-vl-4b` with the VLM under protected admission;
+  larger installations may use a separate 9B-class endpoint.
 - **Luxriot Evo** — source of channels/snapshots and sink for bookmarks.
 
 ## Deployment topology (pilot)
@@ -29,8 +31,10 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
                               |                       |
         snapshots/bookmarks   | SQL (RLS, 3 roles)    | HTTP
                               v                       v
-                         [Luxriot Evo NVR]     [vLLM host(s): qwen3-vl-4b]
-                                               [Agent LM host: qwen3.5-9b]
+                         [Luxriot Evo NVR]     [vLLM host(s): qwen3-vl-4b
+                                               VLM + protected agent profile]
+                                                      |
+                                               [optional quiet L3: 9B]
 ```
 
 Client specifics (hosts/IPs/ports) live in `install/field_rollout_demo.md`
@@ -86,8 +90,10 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 - **Hard kill (SIGKILL)** can lose up to the persist-debounce interval of summary
   history; durable settings/sessions use immediate writes.
 - **Inference queue** (`inference_queue/`) exists for durable, decoupled VLM
-  dispatch with a worker pool; disabled by default, enable only after load
-  validation.
+  dispatch with a worker pool. The clean appliance installer enables one
+  PostgreSQL-backed worker; the unconfigured development default remains off.
+  Evidence-bearing L0 windows are never heartbeat-coalesced, and terminal loss
+  is archived as an explicit coverage gap.
 
 ## Known scaling ceilings (pilot → 10k)
 

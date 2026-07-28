@@ -160,6 +160,7 @@ COMMON_EXCLUDES=(
   "--exclude=*.mov"
   "--exclude=*.mkv"
   "--exclude=probes_store.json"
+  "--exclude=probe_channel_groups.json"
   "--exclude=luxriot_summary_state.json"
   "--exclude=luxriot_rollups_cache.json"
   "--exclude=.env"

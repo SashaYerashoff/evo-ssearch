@@ -59,6 +59,7 @@ Thumbs.db
 .eva-runtime/
 .clip_index/
 probes_store.json
+probe_channel_groups.json
 luxriot_rollups_cache.json
 luxriot_summary_state.json
 inference_spool/

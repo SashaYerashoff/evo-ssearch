@@ -14,6 +14,7 @@ from .errors import (
     AuditUnavailableError,
     ChannelAccessDeniedError,
     InvalidToolArgumentsError,
+    PermissionDeniedError,
     ToolGatewayError,
 )
 from .gateway import ToolGateway
@@ -48,9 +49,20 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "update_probe",
         "update_prompt_settings",
         "restore_video_summary_history",
+        "apply_deployment_plan",
     }
 )
 _HIDDEN_UNTIL_APPROVALS = frozenset({"create_bookmark"})
+_STATE_WRITE_TOOLS = frozenset(
+    {
+        # These persist workflow checkpoints but do not alter live channels,
+        # prompts, probes, or model scheduling. They are audited as writes and
+        # intentionally do not create a UI approval plan.
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+    }
+)
 _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
     {
         "search_archive",
@@ -68,6 +80,7 @@ _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
         "count_video_summary_events",
         "track_visual_state_transitions",
         "generate_report",
+        "query_counted_state_metric",
     }
 )
 
@@ -100,6 +113,12 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "generate_report": Permission.REPORTS_VIEW,
     "restore_video_summary_history": Permission.CAPTURE_MANAGE,
     "get_video_summary_restore_status": Permission.STREAMS_VIEW,
+    "start_deployment": Permission.STREAMS_VIEW,
+    "configure_deployment": Permission.STREAMS_VIEW,
+    "survey_deployment": Permission.STREAMS_VIEW,
+    "apply_deployment_plan": Permission.SETTINGS_MANAGE,
+    "get_deployment_status": Permission.REPORTS_VIEW,
+    "query_counted_state_metric": Permission.DETECTIONS_VIEW,
 }
 
 _WRITE_TOOLS = _PREVIEW_ONLY_TOOLS | _HIDDEN_UNTIL_APPROVALS
@@ -114,6 +133,9 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "track_visual_state_transitions",
         "get_visual_window_signals",
         "create_bookmark",
+        "survey_deployment",
+        "apply_deployment_plan",
+        "query_counted_state_metric",
     }
 )
 
@@ -148,13 +170,28 @@ class EvaAgentToolAdapter:
             allowed_arguments = set(map(str, properties))
             if name in {"delete_probes", "update_probe"}:
                 allowed_arguments.update({"channel_id", "channel_ids"})
+            if name in {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+            }:
+                # Resolved server-side from the authenticated actor scope and
+                # durable deployment state. These are deliberately absent from
+                # the model-visible schemas unless channel_ids is a real
+                # configure_deployment input.
+                allowed_arguments.add("channel_ids")
+            if name == "query_counted_state_metric":
+                # Resolved server-side from the durable metric profile.
+                allowed_arguments.add("channel_id")
             policy = ToolPolicy(
                 required_permission=_TOOL_PERMISSIONS[name].value,
                 risk=(
                     ToolRisk.EXTERNAL_SIDE_EFFECT
                     if name == "create_bookmark"
                     else ToolRisk.WRITE
-                    if name in _WRITE_TOOLS
+                    if name in (_WRITE_TOOLS | _STATE_WRITE_TOOLS)
                     else ToolRisk.READ
                 ),
                 approval_required=name in _WRITE_TOOLS,
@@ -297,6 +334,8 @@ class EvaAgentToolAdapter:
     def _timeout_seconds(name: str) -> float:
         return {
             "survey_channels": 300.0,
+            "survey_deployment": 300.0,
+            "apply_deployment_plan": 300.0,
             "describe_frame": 120.0,
             "search_archive": 90.0,
             "get_visual_window_signals": 90.0,
@@ -476,7 +515,7 @@ class EvaAgentToolAdapter:
             ToolRisk.EXTERNAL_SIDE_EFFECT
             if name == "create_bookmark"
             else ToolRisk.WRITE
-            if name in _WRITE_TOOLS
+            if name in (_WRITE_TOOLS | _STATE_WRITE_TOOLS)
             else ToolRisk.READ
         )
         try:
@@ -573,6 +612,8 @@ class EvaAgentToolAdapter:
                 "agent filesystem image paths are disabled"
             )
 
+        self._prepare_deployment_arguments(name, prepared, context)
+
         self._resolve_channel_reference(prepared)
         if name == "describe_frame":
             self._resolve_detection_channel(prepared)
@@ -613,6 +654,111 @@ class EvaAgentToolAdapter:
         if name in _PREVIEW_ONLY_TOOLS:
             prepared.setdefault("preview", True)
         return prepared
+
+    def _prepare_deployment_arguments(
+        self,
+        name: str,
+        prepared: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> None:
+        deployment_tools = {
+            "configure_deployment",
+            "survey_deployment",
+            "apply_deployment_plan",
+            "get_deployment_status",
+        }
+        scoped_channels = self._scoped_channels(context)
+        if name == "start_deployment":
+            if scoped_channels is not None:
+                # Always overwrite: authorization scope is server-created and
+                # must never be widened by a hidden caller argument.
+                prepared["channel_ids"] = sorted(scoped_channels)
+            else:
+                prepared.pop("channel_ids", None)
+            return
+
+        if name in deployment_tools:
+            deployment_id = str(prepared.get("deployment_id") or "").strip()
+            try:
+                state = self._legacy_tools._deployment_store.load(deployment_id)
+            except Exception as exc:
+                raise InvalidToolArgumentsError(
+                    "deployment does not exist"
+                ) from exc
+            selected = [
+                str(item)
+                for item in (state.get("selected_channel_ids") or [])
+                if str(item).strip()
+            ]
+            inventory_scope = [
+                str(item.get("id"))
+                for item in (state.get("available_channels") or [])
+                if isinstance(item, Mapping) and item.get("id") is not None
+            ]
+            requested = prepared.get("channel_ids")
+            if name == "configure_deployment" and requested is not None:
+                requested_ids = [
+                    str(item).strip()
+                    for item in requested
+                    if str(item).strip()
+                ]
+                selected = requested_ids
+            elif not selected:
+                selected = inventory_scope
+            # Hidden channel_ids makes the generic gateway enforce every
+            # selected channel against the authenticated actor grant.
+            prepared["channel_ids"] = selected
+
+            if name == "apply_deployment_plan":
+                required = {
+                    Permission.SETTINGS_MANAGE.value,
+                    Permission.PROMPTS_MANAGE.value,
+                    Permission.PROBES_MANAGE.value,
+                    Permission.CAPTURE_MANAGE.value,
+                }
+                missing = sorted(required - set(context.permissions))
+                if missing:
+                    raise PermissionDeniedError(
+                        "Protocol Deploy apply requires settings, prompts, probes, "
+                        "and capture management permissions",
+                        details={"missing_permissions": missing},
+                    )
+            return
+
+        if name != "query_counted_state_metric":
+            return
+        metric_id = str(prepared.get("metric_id") or "").strip()
+        metric_name = str(prepared.get("metric_name") or "").strip().casefold()
+        requested_channel = str(prepared.get("channel_id") or "").strip()
+        try:
+            profiles = self._legacy_tools._deployment_store.list_counted_profiles()
+        except Exception as exc:
+            raise InvalidToolArgumentsError(
+                "counted-state profiles are unavailable"
+            ) from exc
+        matches = [
+            item
+            for item in profiles
+            if isinstance(item, Mapping)
+            and (
+                not requested_channel
+                or str(item.get("channel_id") or "") == requested_channel
+            )
+            and (
+                (metric_id and str(item.get("id") or "") == metric_id)
+                or (
+                    not metric_id
+                    and metric_name
+                    and str(item.get("name") or "").strip().casefold()
+                    == metric_name
+                )
+            )
+        ]
+        if len(matches) != 1:
+            raise InvalidToolArgumentsError(
+                "counted-state metric must resolve to exactly one profile"
+            )
+        prepared["channel_id"] = str(matches[0].get("channel_id"))
 
     def _resolve_channel_reference(self, arguments: dict[str, Any]) -> None:
         if arguments.get("channel_id") is not None:
@@ -770,6 +916,34 @@ class EvaAgentToolAdapter:
                 if str(item.get("channel_id")) in scoped_channels
             ]
             return {**result, "count": len(probes), "probes": probes}
+        if name in {
+            "start_deployment",
+            "configure_deployment",
+            "survey_deployment",
+            "get_deployment_status",
+        }:
+            available = [
+                item
+                for item in (result.get("available_channels") or ())
+                if isinstance(item, Mapping)
+                and str(item.get("id")) in scoped_channels
+            ]
+            surveys = [
+                item
+                for item in (result.get("surveys") or ())
+                if isinstance(item, Mapping)
+                and str(item.get("channel_id")) in scoped_channels
+            ]
+            return {
+                **result,
+                "available_channels": available,
+                "selected_channel_ids": [
+                    item
+                    for item in (result.get("selected_channel_ids") or ())
+                    if str(item) in scoped_channels
+                ],
+                **({"surveys": surveys} if "surveys" in result else {}),
+            }
         return result
 
     def _model_schema(self, name: str) -> dict[str, Any]:

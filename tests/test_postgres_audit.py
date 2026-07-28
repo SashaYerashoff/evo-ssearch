@@ -44,16 +44,29 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self, *, fail_insert: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_insert: Exception | None = None,
+        previous_hash: bytes | None = None,
+    ) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.fail_insert = fail_insert
+        self.previous_hash = previous_hash
 
     def execute(self, query: str, params: Any = None) -> _Cursor:
         self.calls.append((query, params))
+        if "SELECT event_hash" in query:
+            return _Cursor(
+                None
+                if self.previous_hash is None
+                else (self.previous_hash,)
+            )
         if "INSERT INTO audit.events" not in query:
             return _Cursor()
         if self.fail_insert is not None:
             raise self.fail_insert
+        self.previous_hash = params[14]
         return _Cursor((params[0],))
 
 
@@ -69,6 +82,14 @@ class _Pool:
 
 
 class PostgresAuditWriterTests(unittest.TestCase):
+    @staticmethod
+    def _insert_params(connection: _Connection) -> Any:
+        return next(
+            params
+            for query, params in connection.calls
+            if "INSERT INTO audit.events" in query
+        )
+
     def test_callable_inserts_all_event_fields_and_returns_uuid(self) -> None:
         pool = _Pool()
         event = make_event()
@@ -80,7 +101,8 @@ class PostgresAuditWriterTests(unittest.TestCase):
         context_params = pool.connection.calls[0][1]
         self.assertEqual(context_params, (TENANT_ID, ACTOR_ID, "request-42"))
 
-        insert_params = pool.connection.calls[1][1]
+        self.assertIn("pg_advisory_xact_lock", pool.connection.calls[1][0])
+        insert_params = self._insert_params(pool.connection)
         self.assertEqual(insert_params[0], event_id)
         self.assertEqual(insert_params[1], uuid.UUID(TENANT_ID))
         self.assertEqual(insert_params[2], event.timestamp)
@@ -94,6 +116,8 @@ class PostgresAuditWriterTests(unittest.TestCase):
         self.assertEqual(insert_params[10], event.channel_id)
         self.assertEqual(insert_params[11], "success")
         self.assertEqual(json.loads(insert_params[12]), {"rows": 3})
+        self.assertIsNone(insert_params[13])
+        self.assertEqual(len(insert_params[14]), 32)
 
     def test_result_aliases_are_normalized_and_unknown_values_fail_closed(self) -> None:
         aliases = {
@@ -109,7 +133,10 @@ class PostgresAuditWriterTests(unittest.TestCase):
             with self.subTest(alias=alias):
                 pool = _Pool()
                 PostgresAuditWriter(pool).write(make_event(result=alias))
-                self.assertEqual(pool.connection.calls[1][1][11], expected)
+                self.assertEqual(
+                    self._insert_params(pool.connection)[11],
+                    expected,
+                )
 
         pool = _Pool()
         with self.assertRaisesRegex(ValueError, "unsupported audit result"):
@@ -149,7 +176,7 @@ class PostgresAuditWriterTests(unittest.TestCase):
 
         PostgresAuditWriter(pool).write(make_event(details=details))
 
-        serialized = pool.connection.calls[1][1][12]
+        serialized = self._insert_params(pool.connection)[12]
         self.assertNotIn("bearer-secret", serialized)
         self.assertNotIn("db-secret", serialized)
         self.assertNotIn("raw-frame", serialized)
@@ -183,6 +210,51 @@ class PostgresAuditWriterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "returned no event id"):
             PostgresAuditWriter(_Pool(NoRowConnection())).write(make_event())
 
+    def test_consecutive_events_link_to_the_previous_hash(self) -> None:
+        pool = _Pool()
+        writer = PostgresAuditWriter(pool)
+
+        writer.write(make_event(request_id="first"))
+        first_insert = self._insert_params(pool.connection)
+        first_hash = first_insert[14]
+        writer.write(make_event(request_id="second"))
+        inserts = [
+            params
+            for query, params in pool.connection.calls
+            if "INSERT INTO audit.events" in query
+        ]
+        second_insert = inserts[1]
+
+        self.assertEqual(second_insert[13], first_hash)
+        self.assertEqual(len(second_insert[14]), 32)
+        self.assertNotEqual(second_insert[14], first_hash)
+
+    def test_invalid_stored_chain_head_fails_closed(self) -> None:
+        pool = _Pool(_Connection(previous_hash=b"short"))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "previous audit event hash is invalid",
+        ):
+            PostgresAuditWriter(pool).write(make_event())
+
+        self.assertFalse(
+            any(
+                "INSERT INTO audit.events" in query
+                for query, _params in pool.connection.calls
+            )
+        )
+
+    def test_naive_timestamp_is_rejected_before_transaction(self) -> None:
+        pool = _Pool()
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            PostgresAuditWriter(pool).write(
+                make_event(timestamp=datetime(2026, 6, 9, 12, 30))
+            )
+
+        self.assertEqual(pool.transactions, 0)
+
 
 @unittest.skipUnless(
     os.getenv("EVA_TEST_DATABASE_DSN"),
@@ -206,7 +278,7 @@ class PostgresAuditWriterLiveTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.pool.close()
 
-    def test_live_insert_and_append_only_trigger(self) -> None:
+    def test_live_insert_hash_chain_and_append_only_trigger(self) -> None:
         tenant_id = str(uuid.uuid4())
         actor_id = str(uuid.uuid4())
         event = make_event(
@@ -217,19 +289,38 @@ class PostgresAuditWriterLiveTests(unittest.TestCase):
         )
 
         event_id = self.writer.write(event)
+        second_event_id = self.writer.write(
+            make_event(
+                tenant_id=tenant_id,
+                actor_user_id=actor_id,
+                request_id="request-43",
+                result="ok",
+            )
+        )
 
         with self.psycopg.connect(self.dsn) as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
-                SELECT tenant_id, actor_user_id, channel_id, result, safe_details
+                SELECT
+                    id,
+                    tenant_id,
+                    actor_user_id,
+                    channel_id,
+                    result,
+                    safe_details,
+                    previous_event_hash,
+                    event_hash
                 FROM audit.events
-                WHERE id = %s
+                WHERE id IN (%s, %s)
+                ORDER BY sequence_number
                 """,
-                (event_id,),
-            ).fetchone()
+                (event_id, second_event_id),
+            ).fetchall()
+            row = rows[0]
             self.assertEqual(
-                row,
+                row[:6],
                 (
+                    event_id,
                     uuid.UUID(tenant_id),
                     uuid.UUID(actor_id),
                     17,
@@ -237,6 +328,10 @@ class PostgresAuditWriterLiveTests(unittest.TestCase):
                     {"safe": "visible", "token": REDACTED},
                 ),
             )
+            self.assertIsNone(row[6])
+            self.assertEqual(len(row[7]), 32)
+            self.assertEqual(rows[1][6], row[7])
+            self.assertEqual(len(rows[1][7]), 32)
 
         mutations = (
             "UPDATE audit.events SET result = 'failure' WHERE id = %s",

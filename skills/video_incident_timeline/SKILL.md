@@ -13,6 +13,14 @@ Trigger phrases:
 
 Goal: produce a chronological operator report for notable events on one channel or a small named channel set.
 
+Tools:
+- `normalize_time_window`
+- `list_video_summary_channels`
+- `get_video_summaries`
+- `get_visual_window_signals`
+- `get_detections`
+- `describe_frame`
+
 Default order:
 1. Normalize the period with `normalize_time_window`.
 2. Resolve channels. If none are named and many channels are active, use `list_video_summary_channels` and ask for confirmation before full research.

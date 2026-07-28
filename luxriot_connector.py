@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, cast
@@ -31,19 +32,31 @@ from attention_policy import (
     AttentionPolicyConfig,
     AttentionState,
     AttentionVector,
+    CostBudgetConfig,
+    CostBudgetState,
     CoordinatorConfig as AttentionCoordinatorConfig,
     CvSample as AttentionCvSample,
     EmbeddingSnapshot as AttentionEmbeddingSnapshot,
     EpisodeConfig as AttentionEpisodeConfig,
     GlobalBudgetConfig,
     HomeostaticAttentionPolicy,
+    InferenceCost,
     MotionInterval as PolicyMotionInterval,
     ProbeScore as AttentionProbeScore,
     aggregate_cv_intervals,
     allocate_global_attention,
     build_attention_episode,
+    initial_cost_budget_state,
+    profile_for_mode,
+    replenish_cost_budget,
 )
 from local_video_source import LocalVideoSourceRegistry
+from alert_probe_lifecycle import derive_parent_alert_id
+from rollup_deep_review import (
+    DeepReviewClientConfig,
+    OpenAICompatibleDeepReviewClient,
+    QuietWindowSchedule,
+)
 try:
     from road_events import (
         AutoSceneCardConfig,
@@ -134,36 +147,45 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
     "- Always append exactly one block at the end, prefixed with BATCH_STATE_JSON:.\n"
     "- Snapshot indices are 1-based and must reference snapshots supplied in this request.\n"
+    "- Snapshot indices are evidence references, not a batch-size checklist. List only the individual snapshots "
+    "that visibly support the corresponding event, state, or alert; never fill 1..N merely because N snapshots "
+    "were supplied. An empty or uncertain observation must use state unknown rather than invented indices.\n"
     "- Select exactly one cover. It is a navigation aid, not sufficient evidence by itself. Prefer the clearest "
     "snapshot that visibly represents the principal event or transition; maximum motion is not automatically the "
     "best cover. For a routine batch choose a stable representative scene; for degraded coverage choose the "
-    "snapshot that best shows the problem.\n"
+    "snapshot that best shows the problem. Cover kind must be exactly one of event, transition, routine, or "
+    "coverage_issue; confidence must be exactly one of high, medium, or low.\n"
     "- Use events to update episode continuity: new|continuing|resolved|uncertain. Novelty controls preservation "
-    "priority, not alert severity. Use observed_states for watched entities/triggers in the current snapshots.\n"
+    "priority, not alert severity. Scene status must be exactly one of matched, mismatch, uncertain, or unavailable. "
+    "Use observed_states for watched entities/triggers in the current snapshots.\n"
+    "- For observed_states, present means directly visible in every listed snapshot. Absent is allowed only when "
+    "the relevant scene area is clearly observable in the listed snapshots; otherwise use unknown. A name, breed, "
+    "ownership, or identity supplied by memory/policy is only a watch label and must remain unknown unless current "
+    "visual evidence distinguishes it. Evidence text and state must agree.\n"
     "- If no alert trigger matches, use \"alerts\": []. Otherwise include one alert object per distinct visible trigger.\n"
     "BATCH_STATE_JSON:\n"
     "{\n"
     "  \"version\": 1,\n"
-    "  \"cover\": {\"snapshot_index\": 1, \"kind\": \"event|transition|routine|coverage_issue\", "
-    "\"reason\": \"short visible reason\", \"confidence\": \"high|medium|low\"},\n"
-    "  \"scene\": {\"status\": \"matched|mismatch|uncertain|unavailable\", \"summary\": \"short current scene\"},\n"
+    "  \"cover\": {\"snapshot_index\": 1, \"kind\": \"event\", "
+    "\"reason\": \"short visible reason\", \"confidence\": \"high\"},\n"
+    "  \"scene\": {\"status\": \"matched\", \"summary\": \"short current scene\"},\n"
     "  \"events\": [\n"
     "    {\"event_id\": \"short stable batch label\", \"label\": \"observable event\", "
-    "\"state\": \"new|continuing|resolved|uncertain\", \"snapshot_indices\": [1], "
-    "\"summary\": \"grounded episode update\", \"novelty\": \"routine|expected_variation|novel|unknown\", "
+    "\"state\": \"new\", \"snapshot_indices\": [1], "
+    "\"summary\": \"grounded episode update\", \"novelty\": \"novel\", "
     "\"pass_up\": true}\n"
     "  ],\n"
     "  \"observed_states\": [\n"
     "    {\"key\": \"watched-state-key\", \"label\": \"watched entity or trigger\", "
-    "\"state\": \"present|absent|unknown\", \"snapshot_indices\": [1], \"evidence\": \"visible evidence\"}\n"
+    "\"state\": \"present\", \"snapshot_indices\": [1], \"evidence\": \"visible evidence\"}\n"
     "  ],\n"
-    "  \"routines\": [\"routine visibly reinforced in this batch\"],\n"
-    "  \"memory_pass\": [\"grounded item important for later consolidation\"],\n"
+    "  \"routines\": [],\n"
+    "  \"memory_pass\": [],\n"
     "  \"alerts\": [\n"
     "    {\n"
     "      \"title\": \"Short event title\",\n"
     "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
-    "      \"severity\": \"info|low|normal|high|critical\",\n"
+    "      \"severity\": \"low\",\n"
     "      \"state\": \"new\",\n"
     "      \"channel_id\": {channel_id},\n"
     "      \"timestamp_ms\": 0,\n"
@@ -184,7 +206,8 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "evaluate every operator-defined trigger independently against the current snapshots; "
     "if two distinct triggers are visible in the same batch, emit two alert objects; "
     "timestamp_ms should be observed batch epoch in milliseconds (or 0 if unknown); "
-    "do not select a cover, event, observed state, or alert from prior memory or a vector signal alone."
+    "do not select a cover, event, observed state, or alert from prior memory or a vector signal alone; "
+    "never copy field-description or schema-example text into the output."
 )
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
@@ -210,6 +233,9 @@ LIVE_OBSERVATION_STATE_PROMPT = (
     "- Evaluate every watched entity and operator-defined trigger independently against the CURRENT snapshots.\n"
     "- Put watched-entity/trigger states in BATCH_STATE_JSON.observed_states: present|absent|unknown with current "
     "snapshot indices and concise evidence. Prose may explain them but is not the machine state contract.\n"
+    "- Snapshot indices identify only frames that independently support the claim; do not emit the full 1..N range "
+    "unless every supplied snapshot was actually checked and visibly supports it. Use unknown when the sampled view "
+    "cannot establish absence or distinguish a policy-supplied name, breed, ownership, or identity.\n"
     "- If two distinct triggers are visible in the same batch, report both and emit two alert objects.\n"
     "- Claim enter/leave only when the current snapshots show a before/after transition; otherwise report the "
     "current state and let backend continuity tools compare adjacent batches.\n"
@@ -354,6 +380,11 @@ class AlertDeliveryResult(int):
                     "severity": severity,
                     "state": state,
                 }
+                alert_id = str(
+                    raw_event.get("id") or raw_event.get("alert_id") or ""
+                ).strip()
+                if alert_id:
+                    event["id"] = alert_id[:200]
                 channel_id = _parse_optional_int(raw_event.get("channel_id"))
                 if channel_id is not None:
                     event["channel_id"] = int(channel_id)
@@ -807,6 +838,38 @@ class LuxriotClient:
             title = str(title_value).strip() if title_value is not None else ""
             if not title:
                 title = f"Channel {channel_id if channel_id is not None else 'unknown'}"
+            enabled_value: Optional[bool] = None
+            for key in ("enabled", "isEnabled", "is_enabled", "active", "isActive"):
+                raw_enabled = item_map.get(key)
+                if isinstance(raw_enabled, bool):
+                    enabled_value = raw_enabled
+                    break
+            status_value: Optional[str] = None
+            for key in ("status", "state", "availability", "healthState"):
+                raw_status = item_map.get(key)
+                if raw_status is not None and str(raw_status).strip():
+                    status_value = str(raw_status).strip()
+                    break
+            status_token = str(status_value or "").strip().lower()
+            unavailable_tokens = {
+                "disabled",
+                "inactive",
+                "offline",
+                "unavailable",
+                "not_available",
+                "not available",
+                "unauthorized",
+            }
+            availability = (
+                "disabled"
+                if enabled_value is False
+                else "unavailable"
+                if status_token in unavailable_tokens
+                else "available"
+                if enabled_value is True
+                or status_token in {"active", "online", "available", "ready"}
+                else "unknown"
+            )
             cleaned.append(
                 {
                     "id": channel_id,
@@ -814,6 +877,9 @@ class LuxriotClient:
                     "title": title,
                     "server": item_map.get("server"),
                     "ptzCapabilities": item_map.get("ptzCapabilities"),
+                    "enabled": enabled_value,
+                    "status": status_value,
+                    "availability": availability,
                 }
             )
         return cleaned
@@ -1252,6 +1318,9 @@ class LuxriotCaptureSession:
         self.summary_condition = threading.Condition(self.lock)
         self.summary_queue: List[Tuple[List[Dict[str, Any]], str, Dict[str, Any]]] = []
         self.summary_coalesced_batches = 0
+        self.summary_coverage_gap_batches = 0
+        self.summary_coverage_gap_frames = 0
+        self.summary_coverage_gap_reasons: Dict[str, int] = {}
         self.summary_inflight = False
         self.summary_worker_thread = threading.Thread(target=self._summary_worker, daemon=True)
         self.last_error: Optional[str] = None
@@ -1929,6 +1998,17 @@ class LuxriotCaptureSession:
         first_source_timestamp_ms: Optional[int] = None
         last_source_timestamp_ms: Optional[int] = None
         stopped = False
+        local_source = (
+            getattr(self.client, "source", None)
+            if self.manager.is_local_channel(self.channel_id)
+            else None
+        )
+        direct_local_capture = bool(
+            local_source is not None
+            and str(getattr(local_source, "device", "")).startswith(
+                "/dev/video"
+            )
+        )
         self._mark_live_segment_inflight(budget)
 
         def close_window_io(*, terminate: bool) -> None:
@@ -1994,16 +2074,37 @@ class LuxriotCaptureSession:
             with tempfile.TemporaryDirectory(prefix=f"eva-live-ch{self.channel_id}-") as temp_dir:
                 stderr_path = Path(temp_dir) / "ffmpeg.stderr"
                 dense_max_edge = max(160, min(1280, int(self.max_edge or 800)))
+                input_args = (
+                    [
+                        "-f",
+                        "v4l2",
+                        "-input_format",
+                        str(getattr(local_source, "input_format", "mjpeg")),
+                        "-video_size",
+                        (
+                            f"{int(getattr(local_source, 'width', 1280))}x"
+                            f"{int(getattr(local_source, 'height', 720))}"
+                        ),
+                        "-framerate",
+                        f"{float(getattr(local_source, 'fps', 15.0)):g}",
+                        "-i",
+                        str(getattr(local_source, "device")),
+                    ]
+                    if direct_local_capture
+                    else [
+                        "-rw_timeout",
+                        rw_timeout_us,
+                        "-i",
+                        "pipe:0",
+                    ]
+                )
                 cmd = [
                     _ffmpeg_binary(),
                     "-hide_banner",
                     "-loglevel",
                     "error",
                     "-nostdin",
-                    "-rw_timeout",
-                    rw_timeout_us,
-                    "-i",
-                    "pipe:0",
+                    *input_args,
                     "-vf",
                     (
                         f"fps={fps:g},scale={dense_max_edge}:{dense_max_edge}:"
@@ -2022,22 +2123,36 @@ class LuxriotCaptureSession:
                 with stderr_path.open("wb") as stderr_output:
                     process = subprocess.Popen(
                         cmd,
-                        stdin=subprocess.PIPE,
+                        stdin=(
+                            subprocess.DEVNULL
+                            if direct_local_capture
+                            else subprocess.PIPE
+                        ),
                         stdout=subprocess.PIPE,
                         stderr=stderr_output,
                         bufsize=0,
-                    )
-                    feeder_thread = threading.Thread(
-                        target=feed_process,
-                        name=f"luxriot-feed-{self.channel_id}",
-                        daemon=True,
                     )
                     stdout_thread = threading.Thread(
                         target=read_stdout,
                         name=f"luxriot-decode-{self.channel_id}",
                         daemon=True,
                     )
-                    feeder_thread.start()
+                    if direct_local_capture:
+                        feed_state["source_anchor_ms"] = int(
+                            time.time() * 1000
+                        )
+                        feed_state["timestamp_source"] = (
+                            "local_v4l2_capture_started_at"
+                        )
+                        feed_ready.set()
+                        feed_done.set()
+                    else:
+                        feeder_thread = threading.Thread(
+                            target=feed_process,
+                            name=f"luxriot-feed-{self.channel_id}",
+                            daemon=True,
+                        )
+                        feeder_thread.start()
                     stdout_thread.start()
 
                     jpeg_buffer = bytearray()
@@ -2344,7 +2459,20 @@ class LuxriotCaptureSession:
             with self.lock:
                 self.capture_apex_probe_skipped_count += 1
             return None
-        cadence_ms = max(200, int(round(float(self.interval) * 1000.0)))
+        # Embedding/archive cadence is independent from both capture FPS and
+        # VLM admission cadence. In the port preset it remains exactly 1 Hz.
+        manager_config = getattr(self.manager, "config", None)
+        try:
+            cadence_ms = int(
+                getattr(
+                    manager_config,
+                    "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS",
+                    1000,
+                )
+            )
+        except (TypeError, ValueError):
+            cadence_ms = 1000
+        cadence_ms = max(200, min(60000, cadence_ms))
         cadence_slot = int(timestamp_ms) // cadence_ms
         with self.lock:
             last_embedding_slot = self._last_probe_embedding_slot
@@ -2379,12 +2507,43 @@ class LuxriotCaptureSession:
                 if "provenance" not in message or "keyword" not in message:
                     raise
                 result = probe_manager.add_frame(self.channel_id, image, int(timestamp_ms))
+            normalized_result = (
+                dict(result) if isinstance(result, Mapping) else None
+            )
+            archive_writer = getattr(
+                self.manager,
+                "semantic_snapshot_writer",
+                None,
+            )
+            if normalized_result is not None and archive_writer is not None:
+                try:
+                    archive_result = archive_writer.submit_probe_frame(
+                        normalized_result,
+                        provenance=dict(provenance),
+                    )
+                    to_dict = getattr(archive_result, "to_dict", None)
+                    normalized_result["semantic_archive"] = (
+                        to_dict()
+                        if callable(to_dict)
+                        else {"status": str(archive_result)}
+                    )
+                except Exception as archive_exc:
+                    # CLIP still completed and remains available to probes/L0.
+                    # The archive writer owns durable gap counters; an
+                    # unexpected adapter failure is also surfaced on this frame.
+                    normalized_result["semantic_archive"] = {
+                        "accepted": False,
+                        "status": "adapter_error",
+                        "reason": (
+                            f"{type(archive_exc).__name__}: {archive_exc}"
+                        )[:500],
+                    }
             self._clear_probe_error()
             with self.lock:
                 self.capture_apex_probe_dispatch_count += 1
                 self._last_probe_embedding_timestamp_ms = int(timestamp_ms)
                 self._last_probe_embedding_slot = int(cadence_slot)
-            return dict(result) if isinstance(result, Mapping) else None
+            return normalized_result
         except Exception as exc:
             if claimed_manager_slot:
                 release_manager_slot = getattr(
@@ -2554,6 +2713,146 @@ class LuxriotCaptureSession:
             "sharpness": round(float(self.manager._finite_float(companion.get("cv_sharpness_score")) or 0.0), 6),
             "activity": round(float(self.manager._finite_float(companion.get("cv_attention_score")) or 0.0), 6),
         }
+
+    def _link_completed_probe_embedding(
+        self,
+        *,
+        frame: Dict[str, Any],
+        embedding: Optional[Mapping[str, Any]],
+        selected_timestamp: int,
+        selected_hash: str,
+        interval_id: str,
+        motion_aggregate: Mapping[str, Any],
+        apex_available: bool,
+    ) -> None:
+        """Attach a completed CLIP result and emit its durable attention links."""
+
+        embedding_link: Optional[Dict[str, Any]] = None
+        if embedding is not None:
+            embedding_ref = str(
+                embedding.get("embedding_ref") or ""
+            ).strip()
+            snapshot_id = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    (
+                        f"eva-attention-snapshot:{self.channel_id}:"
+                        f"{selected_timestamp}:{selected_hash}"
+                    ),
+                )
+            )
+            frame["attention_snapshot_id"] = snapshot_id
+            frame["embedding_ref"] = embedding_ref
+            semantic_archive = embedding.get("semantic_archive")
+            if isinstance(semantic_archive, Mapping):
+                frame["semantic_archive"] = dict(semantic_archive)
+            self.manager.link_attention_snapshot(
+                channel_id=self.channel_id,
+                timestamp_ms=selected_timestamp,
+                snapshot_id=snapshot_id,
+                embedding_ref=embedding_ref,
+                frame_hash=selected_hash,
+            )
+            embedding_link = {
+                "id": str(
+                    uuid5(
+                        NAMESPACE_URL,
+                        (
+                            f"eva-attention-link:{interval_id}:"
+                            f"embedding:{snapshot_id}"
+                        ),
+                    )
+                ),
+                "interval_id": interval_id,
+                "occurred_at_ms": selected_timestamp,
+                "kind": "embedding",
+                "role": "support",
+                "embedding_snapshot_id": snapshot_id,
+            }
+            self.manager.emit_attention_event(
+                "embedding_snapshot",
+                {
+                    "snapshot": {
+                        "id": snapshot_id,
+                        "channel_id": int(self.channel_id),
+                        "captured_at_ms": selected_timestamp,
+                        "embedding_ref": embedding_ref,
+                        "embedding_model": "clip",
+                        "frame_ref": embedding_ref,
+                        "cadence_ms": max(
+                            200,
+                            int(
+                                getattr(
+                                    self.manager.config,
+                                    "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS",
+                                    1000,
+                                )
+                            ),
+                        ),
+                    },
+                },
+            )
+
+        if apex_available and embedding is not None:
+            apex_ref = (
+                f"vlm-apex:{self.channel_id}:"
+                f"{selected_timestamp}:{selected_hash}"
+            )
+            frame["attention_apex_ref"] = apex_ref
+            self.manager.link_attention_apex(
+                channel_id=self.channel_id,
+                timestamp_ms=selected_timestamp,
+                apex_id=apex_ref,
+            )
+        self.manager.emit_attention_event(
+            "motion_interval",
+            {
+                "interval": dict(motion_aggregate),
+                "links": [
+                    item
+                    for item in (embedding_link,)
+                    if item is not None
+                ],
+            },
+        )
+
+    def _admit_embedding_completed_frame(
+        self,
+        frame: Dict[str, Any],
+        embedding: Optional[Mapping[str, Any]],
+        *,
+        allow_stopped: bool = False,
+        trigger_summary: bool = False,
+    ) -> None:
+        """Admit only completed embedding-backed frames to adaptive L0."""
+
+        buffer_gap_frames: List[Dict[str, Any]] = []
+        with self.lock:
+            if self.stop_event.is_set() and not allow_stopped:
+                return
+            if (
+                not self.manager.attention_scheduler_enabled
+                or embedding is not None
+            ):
+                admitted_to_summary = self._admit_summary_frame_locked(frame)
+                selection = frame.get("capture_selection")
+                if isinstance(selection, dict):
+                    selection["summary_admitted"] = bool(
+                        admitted_to_summary
+                    )
+                    selection["summary_cadence_sec"] = round(
+                        float(self._summary_cadence_for_frame(frame)),
+                        3,
+                    )
+                self.recent_frames.append(frame)
+            buffer_gap_frames = self._enforce_buffer_locked()
+        if buffer_gap_frames:
+            self._note_summary_coverage_gap(
+                buffer_gap_frames,
+                reason="summary_frame_buffer_overflow",
+            )
+        if trigger_summary:
+            self._summarize_if_ready()
 
     def _finalize_capture_apex_bucket(self, bucket: Sequence[Mapping[str, Any]]) -> bool:
         candidates = [dict(item) for item in bucket if isinstance(item, Mapping)]
@@ -2835,93 +3134,61 @@ class LuxriotCaptureSession:
         }
         frame["motion_aggregate"] = dict(motion_aggregate)
 
-        embedding = self._add_selected_probe_frame(
-            selected.get("image"),
-            selected_timestamp,
-            provenance,
+        embedding: Optional[Dict[str, Any]] = None
+        embedding_async = bool(
+            getattr(
+                self.manager.config,
+                "LUXRIOT_CLIP_ASYNC_ENABLED",
+                False,
+            )
         )
-        embedding_link: Optional[Dict[str, Any]] = None
-        if embedding is not None:
-            embedding_ref = str(embedding.get("embedding_ref") or "").strip()
-            snapshot_id = str(
-                uuid5(
-                    NAMESPACE_URL,
-                    (
-                        f"eva-attention-snapshot:{self.channel_id}:"
-                        f"{selected_timestamp}:{selected_hash}"
-                    ),
-                )
-            )
-            frame["attention_snapshot_id"] = snapshot_id
-            frame["embedding_ref"] = embedding_ref
-            self.manager.link_attention_snapshot(
-                channel_id=self.channel_id,
-                timestamp_ms=selected_timestamp,
-                snapshot_id=snapshot_id,
-                embedding_ref=embedding_ref,
-                frame_hash=selected_hash,
-            )
-            embedding_link = {
-                "id": str(
-                    uuid5(
-                        NAMESPACE_URL,
-                        f"eva-attention-link:{interval_id}:embedding:{snapshot_id}",
-                    )
-                ),
-                "interval_id": interval_id,
-                "occurred_at_ms": selected_timestamp,
-                "kind": "embedding",
-                "role": "support",
-                "embedding_snapshot_id": snapshot_id,
-            }
-            self.manager.emit_attention_event(
-                "embedding_snapshot",
-                {
-                    "snapshot": {
-                        "id": snapshot_id,
-                        "channel_id": int(self.channel_id),
-                        "captured_at_ms": selected_timestamp,
-                        "embedding_ref": embedding_ref,
-                        "embedding_model": "clip",
-                        "frame_ref": embedding_ref,
-                        "cadence_ms": max(200, int(float(self.interval) * 1000.0)),
-                    },
-                },
+
+        def embedding_work() -> Optional[Dict[str, Any]]:
+            return self._add_selected_probe_frame(
+                selected.get("image"),
+                selected_timestamp,
+                provenance,
             )
 
-        if apex_available and embedding is not None:
-            apex_ref = (
-                f"vlm-apex:{self.channel_id}:{selected_timestamp}:{selected_hash}"
+        def embedding_complete(
+            result: Optional[Dict[str, Any]],
+            error: Optional[BaseException],
+        ) -> None:
+            if error is not None:
+                self._set_probe_error(error)
+            self._link_completed_probe_embedding(
+                frame=frame,
+                embedding=result,
+                selected_timestamp=selected_timestamp,
+                selected_hash=selected_hash,
+                interval_id=interval_id,
+                motion_aggregate=motion_aggregate,
+                apex_available=apex_available,
             )
-            frame["attention_apex_ref"] = apex_ref
-            self.manager.link_attention_apex(
-                channel_id=self.channel_id,
-                timestamp_ms=selected_timestamp,
-                apex_id=apex_ref,
+            self._admit_embedding_completed_frame(
+                frame,
+                result,
+                trigger_summary=True,
             )
-        self.manager.emit_attention_event(
-            "motion_interval",
-            {
-                "interval": motion_aggregate,
-                "links": [
-                    item
-                    for item in (embedding_link,)
-                    if item is not None
-                ],
-            },
-        )
+
+        if embedding_async:
+            embedding_async = self.manager.submit_probe_embedding(
+                embedding_work,
+                embedding_complete,
+            )
+        if not embedding_async:
+            embedding = embedding_work()
+            self._link_completed_probe_embedding(
+                frame=frame,
+                embedding=embedding,
+                selected_timestamp=selected_timestamp,
+                selected_hash=selected_hash,
+                interval_id=interval_id,
+                motion_aggregate=motion_aggregate,
+                apex_available=apex_available,
+            )
 
         with self.lock:
-            if not self.manager.attention_scheduler_enabled or embedding is not None:
-                admitted_to_summary = self._admit_summary_frame_locked(frame)
-                selection = frame.get("capture_selection")
-                if isinstance(selection, dict):
-                    selection["summary_admitted"] = bool(admitted_to_summary)
-                    selection["summary_cadence_sec"] = round(
-                        float(self._summary_cadence_for_frame(frame)),
-                        3,
-                    )
-                self.recent_frames.append(frame)
             self.capture_apex_selected_count += 1
             if not apex_available:
                 self.capture_apex_fallback_count += 1
@@ -2935,7 +3202,12 @@ class LuxriotCaptureSession:
                 self.capture_apex_companion_count += 1
             self.capture_apex_last_selection = dict(provenance)
             baseline_snapshot = self._capture_baseline_snapshot_locked()
-            self._enforce_buffer_locked()
+        if not embedding_async:
+            self._admit_embedding_completed_frame(
+                frame,
+                embedding,
+                allow_stopped=True,
+            )
 
         note_baseline = getattr(self.manager, "note_capture_baseline", None)
         if selector_enabled and callable(note_baseline):
@@ -2947,12 +3219,62 @@ class LuxriotCaptureSession:
         return True
 
     def _summary_cadence_for_frame(self, frame: Mapping[str, Any]) -> float:
+        if bool(getattr(self.manager, "attention_scheduler_enabled", False)):
+            mode = self._summary_attention_mode_for_frame(frame)
+            return float(profile_for_mode(mode).cadence_ms) / 1000.0
         mode = self._frame_capture_mode(frame)
         if mode == "burst":
             return float(self.summary_burst_cadence_sec)
         if mode == "normal":
             return float(self.summary_normal_cadence_sec)
         return float(self.summary_quiet_cadence_sec)
+
+    @classmethod
+    def _summary_attention_mode_for_frame(
+        cls,
+        frame: Mapping[str, Any],
+    ) -> AttentionMode:
+        raw_mode = str(frame.get("attention_mode") or "").strip().lower()
+        try:
+            if raw_mode:
+                return AttentionMode(raw_mode)
+        except ValueError:
+            pass
+        if bool(frame.get("frozen_signal")):
+            return AttentionMode.DEGRADED
+        capture_mode = cls._frame_capture_mode(frame)
+        if capture_mode == "burst":
+            return AttentionMode.BURST
+        if capture_mode == "normal":
+            return (
+                AttentionMode.ACTIVE
+                if cls._frame_activity_x(frame) >= 1.5
+                else AttentionMode.WATCH
+            )
+        if capture_mode == "disabled":
+            return AttentionMode.WATCH
+        return AttentionMode.QUIET
+
+    def _summary_profile_locked(self) -> Any:
+        """Return the strongest homeostatic profile represented in the batch."""
+
+        if not self.frames:
+            return profile_for_mode(AttentionMode.QUIET)
+        rank = {
+            AttentionMode.DEGRADED: 0,
+            AttentionMode.QUIET: 1,
+            AttentionMode.WATCH: 2,
+            AttentionMode.ACTIVE: 3,
+            AttentionMode.BURST: 4,
+        }
+        strongest = max(
+            (
+                self._summary_attention_mode_for_frame(frame)
+                for frame in self.frames
+            ),
+            key=lambda item: rank[item],
+        )
+        return profile_for_mode(strongest)
 
     def _admit_summary_frame_locked(self, frame: Dict[str, Any]) -> bool:
         """Admit an embedding-backed apex to the bounded VLM batch."""
@@ -3007,7 +3329,10 @@ class LuxriotCaptureSession:
         )
         return max(wall_age, source_age)
 
-    def _summary_deadline_frame_limit_locked(self) -> int:
+    def _summary_deadline_frame_limit_locked(
+        self,
+        window_sec: Optional[float] = None,
+    ) -> int:
         """Keep a newly arrived frame from extending one batch past its window."""
 
         if not self.frames:
@@ -3015,7 +3340,11 @@ class LuxriotCaptureSession:
         first_stamp = self._frame_captured_at(self.frames[0])
         if first_stamp <= 0.0:
             return len(self.frames)
-        cutoff = first_stamp + float(self.summary_max_window_sec)
+        cutoff = first_stamp + float(
+            self.summary_max_window_sec
+            if window_sec is None
+            else max(1.0, window_sec)
+        )
         included = 0
         for frame in self.frames:
             stamp = self._frame_captured_at(frame)
@@ -3140,7 +3469,7 @@ class LuxriotCaptureSession:
             self._capture_apex_bucket_start_ms = int(bucket_start_ms)
             self._capture_apex_bucket.append(candidate)
             self.capture_apex_raw_frame_count += 1
-        self.manager.observe_attention_cv(
+        attention_decision = self.manager.observe_attention_cv(
             channel_id=self.channel_id,
             timestamp_ms=int(timestamp_ms),
             motion_score=attention_motion_score,
@@ -3149,6 +3478,16 @@ class LuxriotCaptureSession:
             sharpness=attention_sharpness_score,
             source_health=0.0 if self.frozen_signal else 1.0,
         )
+        if attention_decision is not None:
+            frame["attention_mode"] = attention_decision.mode.value
+            frame["attention_priority"] = round(
+                float(attention_decision.priority),
+                6,
+            )
+            frame["attention_coverage_debt"] = round(
+                float(attention_decision.coverage_debt),
+                6,
+            )
         if completed_bucket:
             self._finalize_capture_apex_bucket(completed_bucket)
         if summarize and float(self.interval) >= 1.0:
@@ -3165,25 +3504,77 @@ class LuxriotCaptureSession:
             with self.lock:
                 pending_count = len(self.frames)
                 pending_age_sec = self._summary_pending_age_locked()
-                ready_by_size = (
-                    bool(size_trigger)
-                    and pending_count >= int(self.batch_size)
+                adaptive = bool(
+                    getattr(self.manager, "attention_scheduler_enabled", False)
                 )
-                ready_by_deadline = (
-                    pending_count > 0
-                    and pending_age_sec >= float(self.summary_max_window_sec)
-                )
-                frame_limit = min(
-                    int(self.summary_max_batch_frames),
-                    (
-                        int(self.batch_size)
-                        if ready_by_size
-                        else self._summary_deadline_frame_limit_locked()
-                    ),
-                )
+                workload_class = "heartbeat"
+                budget_mode = AttentionMode.QUIET
+                if adaptive:
+                    profile = self._summary_profile_locked()
+                    budget_mode = profile.mode
+                    target_frames = min(
+                        int(self.summary_max_batch_frames),
+                        int(profile.target_frames),
+                    )
+                    hard_cap = min(
+                        int(self.summary_max_batch_frames),
+                        int(profile.hard_accumulator_cap),
+                    )
+                    deadline_sec = float(profile.deadline_ms) / 1000.0
+                    ready_by_size = bool(size_trigger) and (
+                        pending_count >= target_frames
+                        or pending_count >= hard_cap
+                    )
+                    ready_by_deadline = (
+                        pending_count > 0
+                        and pending_age_sec >= deadline_sec
+                    )
+                    frame_limit = min(
+                        int(profile.max_frames),
+                        (
+                            pending_count
+                            if ready_by_size
+                            else self._summary_deadline_frame_limit_locked(
+                                deadline_sec
+                            )
+                        ),
+                    )
+                    if profile.mode in {
+                        AttentionMode.ACTIVE,
+                        AttentionMode.BURST,
+                    }:
+                        workload_class = "event"
+                else:
+                    ready_by_size = (
+                        bool(size_trigger)
+                        and pending_count >= int(self.batch_size)
+                    )
+                    ready_by_deadline = (
+                        pending_count > 0
+                        and pending_age_sec >= float(self.summary_max_window_sec)
+                    )
+                    frame_limit = min(
+                        int(self.summary_max_batch_frames),
+                        (
+                            int(self.batch_size)
+                            if ready_by_size
+                            else self._summary_deadline_frame_limit_locked()
+                        ),
+                    )
             if not ready_by_size and not ready_by_deadline:
                 return
-            if not self._enqueue_summary_batch(frame_limit=frame_limit):
+            if adaptive and not self.manager.reserve_l0_cost_budget(
+                mode=budget_mode,
+                frame_count=frame_limit,
+            ):
+                # Keep the complete embedding-backed accumulator. Refill repays
+                # burst debt first; the next 1 Hz observation retries without
+                # turning budget pressure into an archive or L0 coverage gap.
+                return
+            if not self._enqueue_summary_batch(
+                workload_class=workload_class,
+                frame_limit=frame_limit,
+            ):
                 return
 
     def _record_snapshot_result(self, latency_sec: float, *, success: bool) -> None:
@@ -3246,6 +3637,12 @@ class LuxriotCaptureSession:
             ):
                 if key in job_meta:
                     batch[key] = copy.deepcopy(job_meta[key])
+            queue_workload = str(workload_class or "heartbeat").strip().lower()
+            batch["lm_workload_class"] = {
+                "event": "alert",
+                "manual": "describe",
+                "heartbeat": "vlm",
+            }.get(queue_workload, "vlm")
             outcome = self.manager.dispatch_summary_batch(
                 batch,
                 workload_class=workload_class,
@@ -3257,15 +3654,46 @@ class LuxriotCaptureSession:
                         str(outcome.get("job_id") or "").strip() or None
                     )
             if not bool(outcome.get("accepted", True)):
-                if str(outcome.get("status") or "").strip().lower() in {
+                outcome_status = (
+                    str(outcome.get("status") or "rejected")
+                    .strip()
+                    .lower()
+                    .replace("-", "_")
+                )
+                if outcome_status in {
                     "superseded",
                     "stale_session",
                 }:
+                    with self.lock:
+                        self.dropped_frames += len(frame_items)
+                    self._note_summary_coverage_gap(
+                        frame_items,
+                        reason=f"lm_dispatch_{outcome_status}",
+                    )
                     return True
+                buffer_gap_frames: List[Dict[str, Any]] = []
                 with self.lock:
+                    if restore_on_failure:
+                        self.frames = frame_items + self.frames
+                        buffer_gap_frames = self._enforce_buffer_locked()
                     self._record_summary_failure_locked(
-                        f"summary batch was not accepted ({outcome.get('status') or 'rejected'})",
-                        dropped_frames=len(frame_items),
+                        f"summary batch was not accepted ({outcome_status})",
+                        dropped_frames=(
+                            len(buffer_gap_frames)
+                            if restore_on_failure
+                            else len(frame_items)
+                        ),
+                        increment_dropped_batch=not restore_on_failure,
+                    )
+                if buffer_gap_frames:
+                    self._note_summary_coverage_gap(
+                        buffer_gap_frames,
+                        reason="summary_frame_buffer_overflow",
+                    )
+                elif not restore_on_failure:
+                    self._note_summary_coverage_gap(
+                        frame_items,
+                        reason=f"lm_dispatch_{outcome_status}",
                     )
                 self.manager.complete_attention_job(
                     self.channel_id,
@@ -3275,13 +3703,30 @@ class LuxriotCaptureSession:
                 return False
             return True
         except Exception as exc:
+            buffer_gap_frames: List[Dict[str, Any]] = []
             with self.lock:
                 if restore_on_failure:
                     self.frames = frame_items + self.frames
-                    self._enforce_buffer_locked()
+                    buffer_gap_frames = self._enforce_buffer_locked()
                 self._record_summary_failure_locked(
                     exc,
-                    dropped_frames=0 if restore_on_failure else len(frame_items),
+                    dropped_frames=(
+                        len(buffer_gap_frames)
+                        if restore_on_failure
+                        else len(frame_items)
+                    ),
+                    increment_dropped_batch=not restore_on_failure,
+                )
+            if buffer_gap_frames:
+                self._note_summary_coverage_gap(
+                    buffer_gap_frames,
+                    reason="summary_frame_buffer_overflow",
+                )
+            elif not restore_on_failure:
+                self._note_summary_coverage_gap(
+                    frame_items,
+                    reason="lm_dispatch_exception",
+                    error=exc,
                 )
             self.manager.complete_attention_job(
                 self.channel_id,
@@ -3419,42 +3864,34 @@ class LuxriotCaptureSession:
         self.summary_coalesced_batches += 1
         return True
 
-    def _note_summary_coverage_gap(self, frames: Sequence[Mapping[str, Any]]) -> None:
-        """Write an explicit history gap for a window dropped under backpressure.
+    def _note_summary_coverage_gap(
+        self,
+        frames: Sequence[Mapping[str, Any]],
+        *,
+        reason: str,
+        error: Optional[object] = None,
+    ) -> None:
+        """Write an explicit history gap for an irreversibly lost L0 window.
 
         Must be called WITHOUT holding the session lock: the manager recorder
         takes its own cache lock and the safe order is manager -> session.
         """
 
-        recorder = getattr(self.manager, "record_summary_log", None)
+        recorder = getattr(self.manager, "record_summary_coverage_gap", None)
         if not callable(recorder) or not frames:
             return
-        stamps = [
-            self._frame_captured_at(frame)
-            for frame in frames
-            if isinstance(frame, Mapping)
-        ]
-        stamps = [stamp for stamp in stamps if stamp > 0]
-        now = time.time()
-        start_sec = min(stamps) if stamps else now
-        end_sec = max(stamps) if stamps else now
-        entry = {
-            "channel_id": int(self.channel_id),
-            "run_id": self.run_id,
-            "summary": (
-                "[coverage gap] L0 batch dropped under LM backpressure; "
-                "this interval has no description."
-            ),
-            "coverage_gap": True,
-            "gap_reason": "lm_backpressure_dropped_batch",
-            "frame_count": len(frames),
-            "batch_size": int(self.batch_size),
-            "batch_start_ms": int(start_sec * 1000.0),
-            "batch_end_ms": int(end_sec * 1000.0),
-            "created_at": now,
-        }
         try:
-            recorder(self.channel_id, entry)
+            source: Dict[str, Any] = {
+                "channel_id": int(self.channel_id),
+                "run_id": self.run_id,
+                "frames": list(frames),
+                "frame_count": len(frames),
+                "batch_size": int(self.batch_size),
+            }
+            if error is not None:
+                source["gap_error_type"] = error.__class__.__name__
+                source["gap_error"] = _safe_error_text(error, 500)
+            recorder(source, reason=reason)
         except Exception:
             # The counters already recorded the drop; the gap entry is honesty,
             # not a second failure channel.
@@ -3500,7 +3937,10 @@ class LuxriotCaptureSession:
                 self.summary_condition.notify_all()
                 queued = True
         for dropped_frames in gap_batches:
-            self._note_summary_coverage_gap(dropped_frames)
+            self._note_summary_coverage_gap(
+                dropped_frames,
+                reason="lm_backpressure_dropped_batch",
+            )
         if queued:
             return True
         return self._dispatch_summary_frames(
@@ -3691,15 +4131,19 @@ class LuxriotCaptureSession:
                     self.summary_inflight = False
                     self.summary_condition.notify_all()
 
-    def _enforce_buffer_locked(self) -> None:
-        """Ensure frame buffer does not grow unbounded."""
+    def _enforce_buffer_locked(self) -> List[Dict[str, Any]]:
+        """Ensure frame buffers stay bounded and return lost L0 frames."""
+
+        dropped_summary_frames: List[Dict[str, Any]] = []
         if self.max_buffer and len(self.frames) > self.max_buffer:
             overflow = len(self.frames) - self.max_buffer
             # Drop oldest frames to cap size; keep last max_buffer frames
+            dropped_summary_frames = list(self.frames[:overflow])
             self.frames = self.frames[-self.max_buffer :]
             self.dropped_frames += overflow
         if self.recent_max_buffer and len(self.recent_frames) > self.recent_max_buffer:
             self.recent_frames = self.recent_frames[-self.recent_max_buffer :]
+        return dropped_summary_frames
 
     def flush_now(self) -> None:
         """Force a summary of current buffer."""
@@ -3760,6 +4204,9 @@ class LuxriotCaptureSession:
             summary_failed_batches = self.summary_failed_batches
             summary_last_failure_at = self.summary_last_failure_at
             summary_last_success_at = self.summary_last_success_at
+            summary_coverage_gap_batches = self.summary_coverage_gap_batches
+            summary_coverage_gap_frames = self.summary_coverage_gap_frames
+            summary_coverage_gap_reasons = dict(self.summary_coverage_gap_reasons)
             last_error = self.last_error
             capture_apex_raw_frame_count = self.capture_apex_raw_frame_count
             capture_apex_selected_count = self.capture_apex_selected_count
@@ -3821,6 +4268,9 @@ class LuxriotCaptureSession:
             "queue_submissions": self.queue_submissions,
             "queue_dropped_batches": self.queue_dropped_batches,
             "summary_coalesced_batches": self.summary_coalesced_batches,
+            "summary_coverage_gap_batches": summary_coverage_gap_batches,
+            "summary_coverage_gap_frames": summary_coverage_gap_frames,
+            "summary_coverage_gap_reasons": summary_coverage_gap_reasons,
             "last_queue_job_id": self.last_queue_job_id,
             "last_error": last_error,
             "capture_last_error": capture_last_error,
@@ -3912,6 +4362,7 @@ class LuxriotCaptureSession:
 
 class LuxriotManager:
     ROLLUP_BACKFILL_STATE_KEY = "luxriot_rollup_backfill:active"
+    ROLLUP_L3_DEEP_SCHEDULE_KEY = "luxriot_rollup_l3_deep_schedule:v1"
     """Coordinator for Luxriot snapshots, summaries, and channel helpers."""
 
     DESIRED_LIVE_SESSIONS_KEY = "luxriot_live_sessions:v1"
@@ -3945,7 +4396,8 @@ class LuxriotManager:
             "Current snapshots override this memory. Do not assert that a person, animal, vehicle, "
             "object, or action is present from memory alone; verify presence in the current snapshots. "
             "Do not let routine baseline suppress visible security/safety alerts or operator-defined triggers. "
-            "Preserve new deviations, concrete operator-review incidents, and alert tuning signals."
+            "Preserve new deviations and concrete operator-review incidents. Treat alert-tuning proposals as "
+            "non-regulatory until an operator explicitly approves them."
         )
 
     @staticmethod
@@ -4024,12 +4476,29 @@ class LuxriotManager:
                 re.search(r"\breturn\s+markdown\b", lowered)
                 and re.search(r"\balerts?(?:/signals)?\b", lowered)
             )
+            # A stream-role prompt is allowed to explain how alerts, memory,
+            # attention, and operator criteria interact.  Only migrate lines
+            # that actually encode a concrete watch condition.  The previous
+            # keyword-only check treated canonical sentences such as
+            # "alert criteria are supplied separately" as legacy criteria and
+            # produced a warning for EVA's own default L0 prompt.
             criteria_hint = bool(
                 re.search(
-                    r"\b(alert|alerts|trigger|triggers|watch|flag|bookmark|notify|raise|pay attention|look for|monitor)\b",
+                    r"\b(?:alert|flag|bookmark|notify)\s+(?:if|when|whenever|on)\b"
+                    r"|\b(?:watch|look)\s+for\b"
+                    r"|\bmonitor\b.{0,80}\bfor\b"
+                    r"|\bpay\s+(?:special\s+)?attention\s+to\b"
+                    r"|\braise\s+(?:an?\s+)?alerts?\s+(?:if|when|whenever|on|for)\b"
+                    r"|\b(?:trigger|triggers)\s+(?:if|when|whenever|on|for|include)\b",
                     lowered,
                 )
             )
+            if criteria_hint and re.search(
+                r"\b(?:if|when|whenever)\s+(?:an?\s+)?"
+                r"(?:event|condition|criterion|criteria|trigger|profile)\b",
+                lowered,
+            ):
+                criteria_hint = False
             if is_json_contract or is_prose_alert_heading or is_prose_level_line or is_alert_section_instruction:
                 legacy_format = True
                 continue
@@ -4094,6 +4563,10 @@ class LuxriotManager:
         self.alert_parser = alert_parser
         self.probe_manager: Optional[ProbeManagerLike] = probe_manager
         self.probes_store: Optional[ProbeStoreLike] = None
+        # Runtime-injected durable sink for the already-computed 1 Hz CLIP
+        # snapshot. Kept duck-typed here so the connector does not depend on
+        # the PostgreSQL archive implementation.
+        self.semantic_snapshot_writer: Optional[Any] = None
         self.runtime_state_store = runtime_state_store
         self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
         self.summary_archive_callback: Optional[SummaryArchiveFn] = summary_archive_callback
@@ -4118,6 +4591,48 @@ class LuxriotManager:
         # per-session allowance, so all consumers share this atomic slot gate.
         self._probe_embedding_cadence_lock = threading.Lock()
         self._probe_embedding_cadence_slots: Dict[int, Tuple[int, Set[int]]] = {}
+        self._probe_embedding_async_enabled = bool(
+            getattr(config, "LUXRIOT_CLIP_ASYNC_ENABLED", False)
+        )
+        try:
+            embedding_workers = int(
+                getattr(config, "LUXRIOT_CLIP_ASYNC_WORKERS", 8)
+            )
+        except (TypeError, ValueError):
+            embedding_workers = 8
+        try:
+            embedding_capacity = int(
+                getattr(config, "LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY", 64)
+            )
+        except (TypeError, ValueError):
+            embedding_capacity = 64
+        self._probe_embedding_worker_count = max(
+            1,
+            min(16, embedding_workers),
+        )
+        self._probe_embedding_queue_capacity = max(
+            self._probe_embedding_worker_count,
+            min(512, embedding_capacity),
+        )
+        self._probe_embedding_executor = ThreadPoolExecutor(
+            max_workers=self._probe_embedding_worker_count,
+            thread_name_prefix="eva-live-clip",
+        )
+        self._probe_embedding_capacity = threading.BoundedSemaphore(
+            self._probe_embedding_queue_capacity
+        )
+        self._probe_embedding_runtime_lock = threading.Lock()
+        self._probe_embedding_runtime: Dict[str, Any] = {
+            "submitted_total": 0,
+            "completed_total": 0,
+            "failed_total": 0,
+            "rejected_total": 0,
+            "callback_failed_total": 0,
+            "pending": 0,
+            "in_flight": 0,
+            "stopped": False,
+            "last_error": None,
+        }
         # Manager helpers are layered (status/prompt/rollup paths call compact
         # helpers that may need the same cache). A re-entrant lock prevents one
         # request/background callback from permanently owning the global state
@@ -4314,7 +4829,13 @@ class LuxriotManager:
             attention_max_frames = 8
         snapshot_interval_ms = max(
             200,
-            int(float(getattr(config, "LUXRIOT_SNAPSHOT_INTERVAL", 1.0)) * 1000.0),
+            int(
+                getattr(
+                    config,
+                    "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS",
+                    1000,
+                )
+            ),
         )
         self.attention_coordinator = AttentionCoordinator(
             AttentionCoordinatorConfig(
@@ -4351,6 +4872,20 @@ class LuxriotManager:
         self._attention_dispatch_count = 0
         self._attention_rejected_count = 0
         self._attention_last_error: Optional[str] = None
+        self._l0_cost_budget_config = CostBudgetConfig(
+            steady_l0_per_minute=self.attention_requests_per_minute,
+        )
+        self._l0_cost_budget_state = initial_cost_budget_state(
+            int(time.time() * 1000.0),
+            self._l0_cost_budget_config,
+        )
+        self._l0_cost_budget_lock = threading.Lock()
+        self._l0_cost_budget_admitted = 0
+        self._l0_cost_budget_deferred = 0
+        self._l0_cost_budget_by_mode: Dict[str, int] = {}
+        self._l0_slot_seconds_ewma = (
+            self._l0_cost_budget_config.reference_l0_slot_seconds
+        )
         try:
             self.lm_input_warning_chars = int(getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000))
         except (TypeError, ValueError):
@@ -4557,6 +5092,247 @@ class LuxriotManager:
         for level in ("L1", "L2", "L3"):
             configured = str(getattr(config, f"LUXRIOT_ROLLUP_{level}_SYSTEM_PROMPT", "") or "").strip()
             self.rollup_llm_system_prompts[level] = configured or self.rollup_llm_system_prompt
+        self.rollup_l3_deep_enabled = bool(
+            getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_ENABLED", False)
+        )
+        self.rollup_l3_deep_base_url = str(
+            getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_BASE_URL", "") or ""
+        ).strip().rstrip("/")
+        self.rollup_l3_deep_model = str(
+            getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_MODEL", "") or ""
+        ).strip()
+        self._rollup_l3_deep_client: Optional[
+            OpenAICompatibleDeepReviewClient
+        ] = None
+        self._rollup_l3_deep_config_error: Optional[str] = None
+        if (
+            self.rollup_l3_deep_enabled
+            or self.rollup_l3_deep_base_url
+            or self.rollup_l3_deep_model
+        ):
+            try:
+                deep_client_config = DeepReviewClientConfig(
+                    base_url=self.rollup_l3_deep_base_url,
+                    model=self.rollup_l3_deep_model,
+                    api_key=str(
+                        getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_API_KEY", "") or ""
+                    ),
+                    connect_timeout_seconds=float(
+                        getattr(
+                            config,
+                            "LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC",
+                            5.0,
+                        )
+                    ),
+                    read_timeout_seconds=float(
+                        getattr(
+                            config,
+                            "LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC",
+                            600.0,
+                        )
+                    ),
+                    max_tokens=int(
+                        getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS", 3072)
+                    ),
+                    temperature=float(
+                        getattr(
+                            config,
+                            "LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE",
+                            0.1,
+                        )
+                    )
+                )
+                self._rollup_l3_deep_client = OpenAICompatibleDeepReviewClient(
+                    deep_client_config
+                )
+            except Exception as exc:
+                self._rollup_l3_deep_config_error = (
+                    _safe_error_text(exc, 240) or exc.__class__.__name__
+                )
+        try:
+            default_l3_schedule = QuietWindowSchedule(
+                enabled=bool(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_WINDOW_ENABLED",
+                        False,
+                    )
+                ),
+                timezone=str(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_WINDOW_TIMEZONE",
+                        "UTC",
+                    )
+                    or "UTC"
+                ),
+                start_local=str(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_WINDOW_START",
+                        "01:00",
+                    )
+                    or "01:00"
+                ),
+                end_local=str(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_WINDOW_END",
+                        "05:00",
+                    )
+                    or "05:00"
+                ),
+                days=str(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_WINDOW_DAYS",
+                        "mon,tue,wed,thu,fri,sat,sun",
+                    )
+                    or "mon,tue,wed,thu,fri,sat,sun"
+                ),
+                max_deferral_seconds=float(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC",
+                        86400.0,
+                    )
+                ),
+                poll_seconds=float(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC",
+                        60.0,
+                    )
+                ),
+                max_activity_x=float(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X",
+                        1.5,
+                    )
+                ),
+                alert_lookback_seconds=float(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC",
+                        900.0,
+                    )
+                ),
+                max_l0_coverage_debt=float(
+                    getattr(
+                        config,
+                        "LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT",
+                        0.75,
+                    )
+                ),
+            )
+        except Exception as exc:
+            self._rollup_l3_deep_config_error = (
+                self._rollup_l3_deep_config_error
+                or _safe_error_text(exc, 240)
+                or exc.__class__.__name__
+            )
+            default_l3_schedule = QuietWindowSchedule()
+        persisted_l3_schedule: Optional[Mapping[str, Any]] = None
+        if runtime_state_store is not None:
+            try:
+                loaded_schedule = runtime_state_store.load_state(
+                    self.ROLLUP_L3_DEEP_SCHEDULE_KEY
+                )
+                if isinstance(loaded_schedule, Mapping):
+                    persisted_l3_schedule = loaded_schedule
+            except Exception:
+                persisted_l3_schedule = None
+        if persisted_l3_schedule is not None:
+            try:
+                self.rollup_l3_deep_schedule = QuietWindowSchedule.from_mapping(
+                    persisted_l3_schedule,
+                    fallback=default_l3_schedule,
+                )
+                self._rollup_l3_deep_schedule_source = "runtime_state"
+            except Exception as exc:
+                self.rollup_l3_deep_schedule = default_l3_schedule
+                self._rollup_l3_deep_schedule_source = "config_invalid_runtime"
+                self._rollup_l3_deep_config_error = (
+                    self._rollup_l3_deep_config_error
+                    or _safe_error_text(exc, 240)
+                    or exc.__class__.__name__
+                )
+        else:
+            self.rollup_l3_deep_schedule = default_l3_schedule
+            self._rollup_l3_deep_schedule_source = "config"
+        try:
+            l3_queue_capacity = int(
+                getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY", 64)
+            )
+        except Exception:
+            l3_queue_capacity = 64
+        self.rollup_l3_deep_queue_capacity = max(
+            1,
+            min(256, l3_queue_capacity),
+        )
+        try:
+            l3_max_attempts = int(
+                getattr(config, "LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS", 3)
+            )
+        except Exception:
+            l3_max_attempts = 3
+        self.rollup_l3_deep_max_attempts = max(1, min(10, l3_max_attempts))
+        try:
+            l3_backoff_initial = float(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC",
+                    30.0,
+                )
+            )
+        except Exception:
+            l3_backoff_initial = 30.0
+        try:
+            l3_backoff_max = float(
+                getattr(
+                    config,
+                    "LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC",
+                    900.0,
+                )
+            )
+        except Exception:
+            l3_backoff_max = 900.0
+        self.rollup_l3_deep_backoff_initial_sec = max(
+            1.0,
+            min(3600.0, l3_backoff_initial),
+        )
+        self.rollup_l3_deep_backoff_max_sec = max(
+            self.rollup_l3_deep_backoff_initial_sec,
+            min(3600.0, l3_backoff_max),
+        )
+        self._rollup_l3_deep_semaphore = threading.BoundedSemaphore(1)
+        self._rollup_l3_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+            maxsize=self.rollup_l3_deep_queue_capacity
+        )
+        self._rollup_l3_queue_lock = threading.RLock()
+        self._rollup_l3_job_keys: Set[str] = set()
+        self._rollup_l3_stop = threading.Event()
+        self._rollup_l3_thread: Optional[threading.Thread] = None
+        self._rollup_l3_status: Dict[str, Any] = {
+            "enabled": bool(self.rollup_l3_deep_enabled),
+            "route": (
+                "deep_openai_compatible"
+                if self.rollup_l3_deep_enabled
+                else "agent_profile"
+            ),
+            "concurrency": 1,
+            "queue_capacity": int(self.rollup_l3_deep_queue_capacity),
+            "queued": 0,
+            "running": False,
+            "jobs_enqueued": 0,
+            "jobs_completed": 0,
+            "jobs_deferred": 0,
+            "jobs_failed": 0,
+            "deterministic_closures": 0,
+            "last_error": self._rollup_l3_deep_config_error,
+            "last_gate": None,
+        }
         self.rollup_summary_cache: Dict[str, Dict[str, Any]] = {}
         self._rollup_durable_last_prune_at = 0.0
         cache_file_raw = str(getattr(config, "LUXRIOT_ROLLUP_CACHE_FILE", "luxriot_rollups_cache.json") or "").strip()
@@ -4582,7 +5358,648 @@ class LuxriotManager:
             )
             self._rollup_backfill_thread.start()
         if self.rollup_scheduler_enabled:
+            self._start_rollup_l3_worker()
             self._start_rollup_scheduler()
+
+    def get_rollup_l3_deep_schedule(self) -> Dict[str, Any]:
+        """Return the operator-persistable quiet-window policy and runtime gate."""
+
+        with self.cache_lock:
+            schedule = self.rollup_l3_deep_schedule
+            source = self._rollup_l3_deep_schedule_source
+        gate = self._l3_deep_admission_gate(time.time())
+        return {
+            "schedule": schedule.as_dict(),
+            "source": source,
+            "deep_enabled": bool(self.rollup_l3_deep_enabled),
+            "deep_configured": bool(self._rollup_l3_deep_client is not None),
+            "gate": gate,
+        }
+
+    def rollup_l3_deep_status(self) -> Dict[str, Any]:
+        """Expose queue health and the future operator schedule/UI hook."""
+
+        with self._rollup_l3_queue_lock:
+            status = dict(self._rollup_l3_status)
+            status["queued"] = int(self._rollup_l3_queue.qsize())
+        with self.cache_lock:
+            schedule = self.rollup_l3_deep_schedule
+            source = self._rollup_l3_deep_schedule_source
+        status.update(
+            {
+                "configured": bool(self._rollup_l3_deep_client is not None),
+                "model": self.rollup_l3_deep_model or None,
+                "schedule": schedule.as_dict(),
+                "schedule_source": source,
+            }
+        )
+        return status
+
+    def set_rollup_l3_deep_schedule(
+        self,
+        schedule: Mapping[str, Any],
+        *,
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate and optionally persist a backend-only operator schedule.
+
+        This method is deliberately not exposed as an agent tool.  A future
+        operator UI/API may call it after its normal authorization boundary.
+        """
+
+        if not isinstance(schedule, Mapping):
+            raise ValueError("schedule must be an object")
+        with self.cache_lock:
+            current = self.rollup_l3_deep_schedule
+        normalized = QuietWindowSchedule.from_mapping(
+            schedule,
+            fallback=current,
+        )
+        if persist:
+            store = getattr(self, "runtime_state_store", None)
+            saver = getattr(store, "save_state", None)
+            if not callable(saver):
+                raise RuntimeError(
+                    "runtime state storage is required to persist the L3 schedule"
+                )
+            saver(self.ROLLUP_L3_DEEP_SCHEDULE_KEY, normalized.as_dict())
+        with self.cache_lock:
+            self.rollup_l3_deep_schedule = normalized
+            self._rollup_l3_deep_schedule_source = (
+                "runtime_state" if persist else "runtime"
+            )
+        return self.get_rollup_l3_deep_schedule()
+
+    def _l3_deep_admission_gate(self, now: float) -> Dict[str, Any]:
+        """Gate deep review on schedule, activity, alerts, and live L0 debt."""
+
+        with self.cache_lock:
+            schedule = self.rollup_l3_deep_schedule
+            sessions = list(self.sessions.values())
+            histories = {
+                int(channel_id): [
+                    dict(item)
+                    for item in logs
+                    if isinstance(item, Mapping)
+                ]
+                for channel_id, logs in self.summary_history.items()
+            }
+        schedule_status = schedule.window_status(float(now))
+        reasons: List[str] = []
+        if self.rollup_l3_deep_enabled and not bool(
+            schedule_status.get("allowed")
+        ):
+            reasons.append(str(schedule_status.get("reason") or "schedule_closed"))
+
+        max_activity_x = 0.0
+        activity_freshness_seconds = max(
+            60.0,
+            min(900.0, float(schedule.poll_seconds) * 2.0),
+        )
+        l0_queue_depth = 0
+        l0_inflight = 0
+        for session in sessions:
+            try:
+                status = session.status()
+            except Exception:
+                continue
+            l0_queue_depth += max(
+                0,
+                int(_parse_optional_int(status.get("summary_queue_depth")) or 0),
+            )
+            l0_inflight += int(bool(status.get("summary_inflight")))
+            selection = status.get("capture_apex_last_selection")
+            if isinstance(selection, Mapping):
+                selected_at_ms = _parse_optional_int(
+                    selection.get("selected_timestamp_ms")
+                )
+                activity_x = self._coerce_float(selection.get("activity_x"))
+                signal_is_fresh = (
+                    selected_at_ms is None
+                    or float(now) - float(selected_at_ms) / 1000.0
+                    <= activity_freshness_seconds
+                )
+                if activity_x is not None and signal_is_fresh:
+                    max_activity_x = max(max_activity_x, float(activity_x))
+
+        attention_channels: Sequence[Any] = ()
+        try:
+            attention_status = self.attention_coordinator.status()
+            channels_raw = attention_status.get("channels")
+            if isinstance(channels_raw, Sequence) and not isinstance(
+                channels_raw, (str, bytes, bytearray)
+            ):
+                attention_channels = channels_raw
+        except Exception:
+            attention_channels = ()
+        max_coverage_debt = 0.0
+        active_attention_channels = 0
+        for raw_channel in attention_channels:
+            if not isinstance(raw_channel, Mapping):
+                continue
+            decision = raw_channel.get("decision")
+            vector = (
+                decision.get("vector")
+                if isinstance(decision, Mapping)
+                else None
+            )
+            vector_at_ms = (
+                _parse_optional_int(vector.get("timestamp_ms"))
+                if isinstance(vector, Mapping)
+                else None
+            )
+            signal_is_fresh = (
+                vector_at_ms is None
+                or float(now) - float(vector_at_ms) / 1000.0
+                <= activity_freshness_seconds
+            )
+            activity_x = self._coerce_float(raw_channel.get("last_activity_x"))
+            if activity_x is not None and signal_is_fresh:
+                max_activity_x = max(max_activity_x, float(activity_x))
+            if isinstance(decision, Mapping) and signal_is_fresh:
+                mode = str(decision.get("mode") or "").strip().lower()
+                if mode in {"active", "burst"}:
+                    active_attention_channels += 1
+                debt = self._coerce_float(decision.get("coverage_debt"))
+                if debt is not None:
+                    max_coverage_debt = max(max_coverage_debt, float(debt))
+            if raw_channel.get("inflight_job_id"):
+                l0_inflight += 1
+
+        if (
+            max_activity_x > float(schedule.max_activity_x)
+            or active_attention_channels > 0
+        ):
+            reasons.append("activity_above_quiet_gate")
+        if (
+            l0_queue_depth > 0
+            or l0_inflight > 0
+            or max_coverage_debt > float(schedule.max_l0_coverage_debt)
+        ):
+            reasons.append("l0_attention_debt")
+
+        recent_alerts = 0
+        alert_cutoff = float(now) - float(schedule.alert_lookback_seconds)
+        for logs in histories.values():
+            for item in reversed(logs):
+                event_time = self._coerce_float(item.get("created_at"))
+                batch_end_ms = _parse_optional_int(item.get("batch_end_ms"))
+                if batch_end_ms is not None:
+                    event_time = max(
+                        float(event_time or 0.0),
+                        float(batch_end_ms) / 1000.0,
+                    )
+                if event_time is None or event_time < alert_cutoff:
+                    continue
+                recent_alerts += max(
+                    0,
+                    int(_parse_optional_int(item.get("alert_total")) or 0),
+                )
+        if recent_alerts > 0:
+            reasons.append("recent_alerts")
+
+        # Stable order keeps status/replay records deterministic.
+        reasons = list(dict.fromkeys(reasons))
+        gate = {
+            "allowed": not reasons,
+            "reasons": reasons,
+            "schedule": schedule_status,
+            "max_activity_x": round(max_activity_x, 4),
+            "activity_limit_x": float(schedule.max_activity_x),
+            "activity_freshness_seconds": activity_freshness_seconds,
+            "recent_alerts": int(recent_alerts),
+            "alert_lookback_seconds": float(schedule.alert_lookback_seconds),
+            "l0_queue_depth": int(l0_queue_depth),
+            "l0_inflight": int(l0_inflight),
+            "max_l0_coverage_debt": round(max_coverage_debt, 4),
+            "l0_coverage_debt_limit": float(
+                schedule.max_l0_coverage_debt
+            ),
+            "checked_at": float(now),
+        }
+        with self._rollup_l3_queue_lock:
+            self._rollup_l3_status["last_gate"] = dict(gate)
+        return gate
+
+    def _rollup_callback_for_level(
+        self,
+        level: str,
+    ) -> Callable[..., str]:
+        if (
+            self._normalize_rollup_level(level) == "L3"
+            and self.rollup_l3_deep_enabled
+        ):
+            return self._call_l3_deep_review
+        return self.lm_callback
+
+    def _call_l3_deep_review(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        _model_hint: Optional[str] = None,
+        **_kwargs: Any,
+    ) -> str:
+        gate = self._l3_deep_admission_gate(time.time())
+        if not bool(gate.get("allowed")):
+            reasons = ",".join(str(item) for item in gate.get("reasons") or [])
+            raise RuntimeError(
+                "L3 deep review deferred by quiet gate"
+                + (f": {reasons}" if reasons else "")
+            )
+        client = self._rollup_l3_deep_client
+        if client is None:
+            raise RuntimeError(
+                self._rollup_l3_deep_config_error
+                or "L3 deep-review endpoint is not configured"
+            )
+        acquire_timeout = min(
+            60.0,
+            max(1.0, float(client.config.connect_timeout_seconds)),
+        )
+        acquired = self._rollup_l3_deep_semaphore.acquire(
+            timeout=acquire_timeout
+        )
+        if not acquired:
+            raise RuntimeError("L3 deep-review concurrency slot is busy")
+        try:
+            return client(messages, self.rollup_l3_deep_model)
+        finally:
+            self._rollup_l3_deep_semaphore.release()
+
+    def _start_rollup_l3_worker(self) -> None:
+        with self._rollup_l3_queue_lock:
+            if (
+                self._rollup_l3_thread is not None
+                and self._rollup_l3_thread.is_alive()
+            ):
+                return
+            self._rollup_l3_stop.clear()
+            self._rollup_l3_thread = threading.Thread(
+                target=self._rollup_l3_worker_loop,
+                daemon=True,
+                name="eva-rollup-l3-review",
+            )
+            self._rollup_l3_thread.start()
+
+    def _enqueue_scheduled_l3(
+        self,
+        channel_id: int,
+        now: float,
+    ) -> bool:
+        window_sec = max(1, int(self.rollup_windows["L3"]))
+        closed_window_end = int(float(now) // window_sec) * window_sec
+        if closed_window_end <= 0:
+            return True
+        job_key = f"{int(channel_id)}:{closed_window_end}"
+        with self._rollup_l3_queue_lock:
+            if job_key in self._rollup_l3_job_keys:
+                return True
+            item = {
+                "job_key": job_key,
+                "channel_id": int(channel_id),
+                "window_end": int(closed_window_end),
+                "first_due_at": float(now),
+                "available_at": float(now),
+                "attempt": 0,
+                "closure_persisted": False,
+            }
+            try:
+                self._rollup_l3_queue.put_nowait(item)
+            except queue.Full:
+                self._rollup_l3_status["last_error"] = "l3_queue_full"
+                self._rollup_l3_status["queue_full"] = int(
+                    self._rollup_l3_status.get("queue_full") or 0
+                ) + 1
+                return False
+            self._rollup_l3_job_keys.add(job_key)
+            self._rollup_l3_status["jobs_enqueued"] = int(
+                self._rollup_l3_status.get("jobs_enqueued") or 0
+            ) + 1
+            self._rollup_l3_status["queued"] = int(
+                self._rollup_l3_queue.qsize()
+            )
+            return True
+
+    def _requeue_l3_job(
+        self,
+        item: Mapping[str, Any],
+        *,
+        available_at: float,
+    ) -> bool:
+        retry = dict(item)
+        retry["available_at"] = float(available_at)
+        try:
+            self._rollup_l3_queue.put_nowait(retry)
+        except queue.Full:
+            return False
+        with self._rollup_l3_queue_lock:
+            self._rollup_l3_status["queued"] = int(
+                self._rollup_l3_queue.qsize()
+            )
+        return True
+
+    def _finish_l3_job(
+        self,
+        item: Mapping[str, Any],
+        *,
+        completed: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        job_key = str(item.get("job_key") or "")
+        with self._rollup_l3_queue_lock:
+            self._rollup_l3_job_keys.discard(job_key)
+            self._rollup_l3_status["running"] = False
+            self._rollup_l3_status["active_channel_id"] = None
+            self._rollup_l3_status["queued"] = int(
+                self._rollup_l3_queue.qsize()
+            )
+            self._rollup_l3_status["last_completed_at"] = time.time()
+            self._rollup_l3_status["last_error"] = error
+            counter = "jobs_completed" if completed else "jobs_failed"
+            self._rollup_l3_status[counter] = int(
+                self._rollup_l3_status.get(counter) or 0
+            ) + 1
+
+    def _persist_l3_deterministic_closure(
+        self,
+        channel_id: int,
+        window_end: int,
+        *,
+        generation_status: str,
+        generation_error: Optional[str] = None,
+    ) -> int:
+        result = self.summary_rollups(
+            channel_id=int(channel_id),
+            run_selector="all",
+            start_ts=None,
+            end_ts=float(window_end) - 0.001,
+            level_limit=None,
+            synthesize=False,
+            target_level="L3",
+        )
+        levels = result.get("levels") if isinstance(result, Mapping) else None
+        rows_raw = levels.get("L3") if isinstance(levels, Mapping) else None
+        rows = (
+            rows_raw
+            if isinstance(rows_raw, Sequence)
+            and not isinstance(rows_raw, (str, bytes, bytearray))
+            else []
+        )
+        persisted = 0
+        for raw_node in rows:
+            if not isinstance(raw_node, Mapping):
+                continue
+            node = dict(raw_node)
+            node_end = self._coerce_float(node.get("window_end"))
+            if node_end is None or node_end > float(window_end):
+                continue
+            cached = self._get_cached_rollup_record(
+                str(node.get("rollup_id") or "")
+            )
+            if self._rollup_semantic_ready(cached):
+                continue
+            summary = str(node.get("summary") or "").strip()
+            rollup_id = str(node.get("rollup_id") or "").strip()
+            if not summary or not rollup_id:
+                continue
+            self._put_cached_rollup_summary(
+                rollup_id,
+                summary,
+                channel_id=int(channel_id),
+                level="L3",
+                source_level="L2",
+                window_start=self._coerce_float(node.get("window_start")),
+                window_end=node_end,
+                window_sec=_parse_optional_int(node.get("window_sec")) or 0,
+                item_count=_parse_optional_int(node.get("item_count")) or 0,
+                frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                source_tokens=_parse_optional_int(node.get("source_tokens")) or 0,
+                run_ids=node.get("run_ids"),
+                source_ids=node.get("source_ids"),
+                source_signature=node.get("source_signature"),
+                highlights=node.get("highlights"),
+                alert_counts=node.get("alert_counts"),
+                alert_total=node.get("alert_total"),
+                alert_severities=node.get("alert_severities"),
+                signal_digest=node.get("signal_digest"),
+                alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
+                alert_events=node.get("alert_events"),
+                alert_parser_breakdown=node.get("alert_parser_breakdown"),
+                state_transition_total=node.get("state_transition_total"),
+                summary_kind="review_pending",
+                operator_summary=summary,
+                memory_update={},
+                generation_status=str(generation_status),
+                generation_error=str(generation_error or "")[:240] or None,
+                format_version=ROLLUP_OPERATOR_FORMAT_VERSION,
+                review_only=True,
+                proposals_only=True,
+                mutations_applied=False,
+            )
+            persisted += 1
+        if persisted:
+            with self._rollup_l3_queue_lock:
+                self._rollup_l3_status["deterministic_closures"] = int(
+                    self._rollup_l3_status.get("deterministic_closures") or 0
+                ) + persisted
+        return persisted
+
+    def _rollup_l3_worker_loop(self) -> None:
+        while not self._rollup_l3_stop.is_set():
+            try:
+                item = self._rollup_l3_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                available_at = float(item.get("available_at") or 0.0)
+                now = time.time()
+                if available_at > now:
+                    if not self._requeue_l3_job(
+                        item,
+                        available_at=available_at,
+                    ):
+                        self._finish_l3_job(
+                            item,
+                            completed=False,
+                            error="l3_queue_full_during_delay",
+                        )
+                    # Do not let one delayed channel hold ready work behind it.
+                    if self._rollup_l3_queue.qsize() <= 1:
+                        self._rollup_l3_stop.wait(
+                            min(1.0, max(0.0, available_at - now))
+                        )
+                    continue
+                with self._rollup_l3_queue_lock:
+                    self._rollup_l3_status["running"] = True
+                    self._rollup_l3_status["queued"] = int(
+                        self._rollup_l3_queue.qsize()
+                    )
+                    self._rollup_l3_status["active_channel_id"] = int(
+                        item.get("channel_id") or 0
+                    )
+                    self._rollup_l3_status["last_started_at"] = now
+
+                channel_id = int(item.get("channel_id") or 0)
+                window_end = int(item.get("window_end") or 0)
+                if not bool(item.get("closure_persisted")):
+                    self._persist_l3_deterministic_closure(
+                        channel_id,
+                        window_end,
+                        generation_status="review_queued",
+                    )
+                    item["closure_persisted"] = True
+                if "L3" not in self.rollup_llm_levels:
+                    self._finish_l3_job(item, completed=True)
+                    continue
+
+                gate = self._l3_deep_admission_gate(now)
+                if self.rollup_l3_deep_enabled and not bool(
+                    gate.get("allowed")
+                ):
+                    first_due_at = float(item.get("first_due_at") or now)
+                    elapsed = max(0.0, now - first_due_at)
+                    if elapsed >= float(
+                        self.rollup_l3_deep_schedule.max_deferral_seconds
+                    ):
+                        error = "quiet_gate_deferral_exhausted:" + ",".join(
+                            str(value)
+                            for value in gate.get("reasons") or []
+                        )
+                        self._persist_l3_deterministic_closure(
+                            channel_id,
+                            window_end,
+                            generation_status="review_deferred",
+                            generation_error=error,
+                        )
+                        self._finish_l3_job(
+                            item,
+                            completed=False,
+                            error=error,
+                        )
+                        continue
+                    with self._rollup_l3_queue_lock:
+                        self._rollup_l3_status["jobs_deferred"] = int(
+                            self._rollup_l3_status.get("jobs_deferred") or 0
+                        ) + 1
+                        self._rollup_l3_status["running"] = False
+                    requeued = self._requeue_l3_job(
+                        item,
+                        available_at=now
+                        + float(self.rollup_l3_deep_schedule.poll_seconds),
+                    )
+                    if not requeued:
+                        self._persist_l3_deterministic_closure(
+                            channel_id,
+                            window_end,
+                            generation_status="review_deferred",
+                            generation_error="l3_queue_full_during_gate_deferral",
+                        )
+                        self._finish_l3_job(
+                            item,
+                            completed=False,
+                            error="l3_queue_full_during_gate_deferral",
+                        )
+                    continue
+
+                result = self._run_scheduled_rollup(
+                    channel_id,
+                    "L3",
+                    float(window_end) + 0.001,
+                )
+                levels = (
+                    result.get("levels")
+                    if isinstance(result, Mapping)
+                    else None
+                )
+                rows_raw = levels.get("L3") if isinstance(levels, Mapping) else None
+                rows = (
+                    rows_raw
+                    if isinstance(rows_raw, Sequence)
+                    and not isinstance(rows_raw, (str, bytes, bytearray))
+                    else []
+                )
+                completed = any(
+                    isinstance(row, Mapping)
+                    and self._rollup_semantic_ready(row)
+                    and abs(
+                        float(self._coerce_float(row.get("window_end")) or 0.0)
+                        - float(window_end)
+                    )
+                    < 1.0
+                    for row in rows
+                )
+                if completed:
+                    self._finish_l3_job(item, completed=True)
+                    continue
+                attempt = int(item.get("attempt") or 0) + 1
+                item["attempt"] = attempt
+                generation_errors = [
+                    str(row.get("generation_error") or "")
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("generation_error") or "").strip()
+                ]
+                error = (
+                    _safe_error_text(generation_errors[0], 240)
+                    if generation_errors
+                    else "l3_review_not_ready"
+                )
+                if attempt < self.rollup_l3_deep_max_attempts:
+                    delay = min(
+                        self.rollup_l3_deep_backoff_max_sec,
+                        self.rollup_l3_deep_backoff_initial_sec
+                        * (2 ** max(0, attempt - 1)),
+                    )
+                    with self._rollup_l3_queue_lock:
+                        self._rollup_l3_status["running"] = False
+                        self._rollup_l3_status["last_error"] = error
+                    if self._requeue_l3_job(
+                        item,
+                        available_at=time.time() + delay,
+                    ):
+                        continue
+                self._persist_l3_deterministic_closure(
+                    channel_id,
+                    window_end,
+                    generation_status="review_unavailable",
+                    generation_error=error,
+                )
+                self._finish_l3_job(
+                    item,
+                    completed=False,
+                    error=error,
+                )
+            except Exception as exc:
+                error = _safe_error_text(exc, 240) or exc.__class__.__name__
+                try:
+                    self._persist_l3_deterministic_closure(
+                        int(item.get("channel_id") or 0),
+                        int(item.get("window_end") or 0),
+                        generation_status="review_unavailable",
+                        generation_error=error,
+                    )
+                except Exception:
+                    pass
+                self._finish_l3_job(
+                    item,
+                    completed=False,
+                    error=error,
+                )
+            finally:
+                self._rollup_l3_queue.task_done()
+
+    def stop_rollup_workers(self, timeout: float = 2.0) -> None:
+        self._rollup_scheduler_stop.set()
+        self._rollup_l3_stop.set()
+        self._rollup_backfill_stop.set()
+        with self._rollup_backfill_condition:
+            self._rollup_backfill_condition.notify_all()
+        for thread in (
+            self._rollup_scheduler_thread,
+            self._rollup_l3_thread,
+            self._rollup_backfill_thread,
+        ):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=max(0.0, float(timeout)))
 
     def _start_rollup_scheduler(self) -> None:
         if self._rollup_scheduler_thread is not None and self._rollup_scheduler_thread.is_alive():
@@ -4762,13 +6179,56 @@ class LuxriotManager:
                 self._rollup_scheduler_stop.wait(min(10.0, wait_sec))
                 continue
             scheduler_key = (channel_id, level)
+            if level == "L3":
+                enqueued_at = time.time()
+                accepted = self._enqueue_scheduled_l3(
+                    channel_id,
+                    enqueued_at,
+                )
+                if accepted:
+                    next_due = self._rollup_next_due(
+                        channel_id,
+                        level,
+                        started_at=enqueued_at,
+                        completed_at=time.time(),
+                        channel_count=len(channels),
+                    )
+                    self._rollup_scheduler_due[scheduler_key] = next_due
+                    with self.cache_lock:
+                        self._rollup_scheduler_status.update(
+                            {
+                                "last_l3_enqueued_at": enqueued_at,
+                                "last_l3_enqueued_channel_id": int(channel_id),
+                                "last_l3_enqueue_error": None,
+                            }
+                        )
+                else:
+                    retry_at = time.time() + max(
+                        15.0,
+                        self.rollup_scheduler_spacing_sec,
+                    )
+                    self._rollup_scheduler_due[scheduler_key] = retry_at
+                    with self.cache_lock:
+                        self._rollup_scheduler_status.update(
+                            {
+                                "last_l3_enqueue_error": "l3_queue_full",
+                                "last_l3_enqueue_retry_at": retry_at,
+                            }
+                        )
+                # L3 always leaves this scheduler immediately.  Its dedicated
+                # single-concurrency worker may wait for the quiet gate without
+                # delaying L1/L2 or any live L0 capture worker.
+                continue
             # Rollups share the same LM admission resource with every live L0
             # stream.  A saturated queue on channel A must therefore defer a
             # scheduled rollup for channel B as well; checking only the rollup
             # channel let inactive/history channels consume capacity while a
             # live channel was already dropping/coalescing observations.
             with self.cache_lock:
-                rollup_model_hint = self._get_rollup_model_hint_locked(channel_id)
+                rollup_model_hint = self._get_rollup_model_hint_locked(
+                    channel_id,
+                    level,
+                )
             l0_backpressure = self._l0_backpressure_active(
                 model_hint=rollup_model_hint,
             )
@@ -5191,8 +6651,221 @@ class LuxriotManager:
                 "last_error": self._attention_last_error,
                 "last_plan": dict(self._attention_last_plan),
             }
+        runtime["l0_cost_budget"] = self.l0_cost_budget_status()
         runtime["coordinator"] = self.attention_coordinator.status()
+        runtime["clip_async_dispatch"] = self.probe_embedding_dispatch_status()
         return runtime
+
+    def submit_probe_embedding(
+        self,
+        work: Callable[[], Optional[Dict[str, Any]]],
+        callback: Callable[
+            [Optional[Dict[str, Any]], Optional[BaseException]],
+            None,
+        ],
+    ) -> bool:
+        """Run live CLIP work off the decoder thread with bounded admission."""
+
+        if not self._probe_embedding_async_enabled:
+            return False
+        if not self._probe_embedding_capacity.acquire(blocking=False):
+            with self._probe_embedding_runtime_lock:
+                self._probe_embedding_runtime["rejected_total"] += 1
+                self._probe_embedding_runtime["last_error"] = (
+                    "clip async dispatch queue is full"
+                )
+            return False
+        with self._probe_embedding_runtime_lock:
+            if bool(self._probe_embedding_runtime.get("stopped")):
+                self._probe_embedding_capacity.release()
+                return False
+            self._probe_embedding_runtime["submitted_total"] += 1
+            self._probe_embedding_runtime["pending"] += 1
+
+        def run() -> Optional[Dict[str, Any]]:
+            with self._probe_embedding_runtime_lock:
+                self._probe_embedding_runtime["pending"] = max(
+                    0,
+                    int(self._probe_embedding_runtime["pending"]) - 1,
+                )
+                self._probe_embedding_runtime["in_flight"] += 1
+            try:
+                return work()
+            finally:
+                with self._probe_embedding_runtime_lock:
+                    self._probe_embedding_runtime["in_flight"] = max(
+                        0,
+                        int(
+                            self._probe_embedding_runtime["in_flight"]
+                        ) - 1,
+                    )
+
+        def complete(future: Future[Optional[Dict[str, Any]]]) -> None:
+            result: Optional[Dict[str, Any]] = None
+            error: Optional[BaseException] = None
+            try:
+                result = future.result()
+            except BaseException as exc:
+                error = exc
+            with self._probe_embedding_runtime_lock:
+                self._probe_embedding_runtime["completed_total"] += 1
+                if error is not None:
+                    self._probe_embedding_runtime["failed_total"] += 1
+                    self._probe_embedding_runtime["last_error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:500]
+                else:
+                    self._probe_embedding_runtime["last_error"] = None
+            try:
+                callback(result, error)
+            except BaseException as exc:
+                with self._probe_embedding_runtime_lock:
+                    self._probe_embedding_runtime[
+                        "callback_failed_total"
+                    ] += 1
+                    self._probe_embedding_runtime["last_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )[:500]
+            finally:
+                self._probe_embedding_capacity.release()
+
+        try:
+            future = self._probe_embedding_executor.submit(run)
+        except RuntimeError as exc:
+            with self._probe_embedding_runtime_lock:
+                self._probe_embedding_runtime["pending"] = max(
+                    0,
+                    int(self._probe_embedding_runtime["pending"]) - 1,
+                )
+                self._probe_embedding_runtime["rejected_total"] += 1
+                self._probe_embedding_runtime["last_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )[:500]
+            self._probe_embedding_capacity.release()
+            return False
+        future.add_done_callback(complete)
+        return True
+
+    def probe_embedding_dispatch_status(self) -> Dict[str, Any]:
+        with self._probe_embedding_runtime_lock:
+            runtime = dict(self._probe_embedding_runtime)
+        return {
+            "enabled": bool(self._probe_embedding_async_enabled),
+            "workers": int(self._probe_embedding_worker_count),
+            "queue_capacity": int(self._probe_embedding_queue_capacity),
+            **runtime,
+        }
+
+    def stop_probe_embedding_executor(self, *, wait: bool = True) -> None:
+        with self._probe_embedding_runtime_lock:
+            if bool(self._probe_embedding_runtime.get("stopped")):
+                return
+            self._probe_embedding_runtime["stopped"] = True
+        self._probe_embedding_executor.shutdown(
+            wait=bool(wait),
+            cancel_futures=not bool(wait),
+        )
+
+    def reserve_l0_cost_budget(
+        self,
+        *,
+        mode: AttentionMode,
+        frame_count: int,
+    ) -> bool:
+        """Reserve global token and slot-seconds capacity for one L0 request."""
+
+        if not self.attention_scheduler_enabled:
+            return True
+        frames = max(1, min(16, int(frame_count)))
+        cost = InferenceCost(
+            prompt_tokens=1800,
+            vision_tokens=350 * frames,
+            expected_output_tokens=1000,
+            slot_seconds=max(
+                1.0,
+                float(self._l0_slot_seconds_ewma)
+                * max(0.5, frames / 8.0),
+            ),
+        )
+        with self._l0_cost_budget_lock:
+            now_ms = max(
+                int(time.time() * 1000.0),
+                int(self._l0_cost_budget_state.timestamp_ms),
+            )
+            replenished, _, _ = replenish_cost_budget(
+                self._l0_cost_budget_state,
+                now_ms,
+                self._l0_cost_budget_config,
+            )
+            token_floor = (
+                -self._l0_cost_budget_config.token_borrow_limit
+                if mode is AttentionMode.BURST
+                else 0.0
+            )
+            slot_floor = (
+                -self._l0_cost_budget_config.slot_seconds_borrow_limit
+                if mode is AttentionMode.BURST
+                else 0.0
+            )
+            admitted = (
+                replenished.available_tokens - cost.total_tokens
+                >= token_floor - 1e-9
+                and replenished.available_slot_seconds - cost.slot_seconds
+                >= slot_floor - 1e-9
+            )
+            if admitted:
+                self._l0_cost_budget_state = CostBudgetState(
+                    timestamp_ms=now_ms,
+                    available_tokens=(
+                        replenished.available_tokens - cost.total_tokens
+                    ),
+                    available_slot_seconds=(
+                        replenished.available_slot_seconds - cost.slot_seconds
+                    ),
+                )
+                self._l0_cost_budget_admitted += 1
+                key = mode.value
+                self._l0_cost_budget_by_mode[key] = (
+                    self._l0_cost_budget_by_mode.get(key, 0) + 1
+                )
+            else:
+                self._l0_cost_budget_state = replenished
+                self._l0_cost_budget_deferred += 1
+            return admitted
+
+    def note_l0_duration(self, duration_seconds: float) -> None:
+        duration = max(0.1, min(300.0, float(duration_seconds)))
+        with self._l0_cost_budget_lock:
+            self._l0_slot_seconds_ewma = (
+                0.85 * float(self._l0_slot_seconds_ewma)
+                + 0.15 * duration
+            )
+
+    def l0_cost_budget_status(self) -> Dict[str, Any]:
+        with self._l0_cost_budget_lock:
+            state = self._l0_cost_budget_state
+            config = self._l0_cost_budget_config
+            return {
+                "steady_reference_l0_per_minute": round(
+                    float(config.steady_l0_per_minute),
+                    3,
+                ),
+                "available_tokens": round(float(state.available_tokens), 3),
+                "available_slot_seconds": round(
+                    float(state.available_slot_seconds),
+                    3,
+                ),
+                "burst_debt_l0": round(float(state.debt_l0(config)), 3),
+                "slot_seconds_ewma": round(
+                    float(self._l0_slot_seconds_ewma),
+                    3,
+                ),
+                "admitted_total": int(self._l0_cost_budget_admitted),
+                "deferred_total": int(self._l0_cost_budget_deferred),
+                "admitted_by_mode": dict(
+                    sorted(self._l0_cost_budget_by_mode.items())
+                ),
+            }
 
     def _load_rollup_backfill_state(self) -> Dict[str, Any]:
         store = getattr(self, "runtime_state_store", None)
@@ -5748,7 +7421,8 @@ class LuxriotManager:
                     continue
                 with self.cache_lock:
                     rollup_model_hint = self._get_rollup_model_hint_locked(
-                        _parse_optional_int(item.get("channel_id"))
+                        _parse_optional_int(item.get("channel_id")),
+                        str(item.get("level") or ""),
                     )
                 if self._l0_backpressure_active(model_hint=rollup_model_hint):
                     self._rollup_backfill_state["status"] = "waiting_live"
@@ -6017,15 +7691,19 @@ class LuxriotManager:
         memory_authority = {
             "L1": (
                 "L1 memory authority is short-lived only: populate active_watchlist and preserved_deviations. "
-                "Leave routine_baseline, alert_tuning_notes, and ignore_as_routine empty."
+                "active_watchlist contains only unresolved/continuing items that need checking in the next window; "
+                "never copy completed past occurrences or timestamped alert history into it. Leave routine_baseline, "
+                "alert_tuning_notes, and ignore_as_routine empty."
             ),
             "L2": (
                 "L2 may propose a grounded routine_baseline and preserve recurrence/deviations. "
                 "Leave alert_tuning_notes and ignore_as_routine empty; those require L3 audit."
             ),
             "L3": (
-                "L3 may propose durable routine and alert tuning. Populate ignore_as_routine only from repeated "
-                "grounded benign behavior or supplied operator false-positive feedback; never suppress general hazards."
+                "L3 is review/proposal-only. It may propose durable routine and alert tuning, but the backend will not "
+                "apply those proposals to probes, thresholds, alert policy, or live sampling. Populate ignore_as_routine "
+                "only from repeated grounded benign behavior or supplied operator false-positive feedback; never suppress "
+                "general hazards."
             ),
         }.get(
             normalized_level,
@@ -6052,6 +7730,7 @@ class LuxriotManager:
                     "- Reconcile the deterministic L1-to-L2 audit and disclose any mismatch in Coverage and Interruptions.",
                     "- Use no more than the supplied four L0 drill samples to check interesting episodes; label the check as sampled.",
                     "- Analyze operator false-positive reasons separately in Alerts and Meaning and do not classify unreviewed alerts.",
+                    "- Present tuning and baseline changes as proposals for operator review; do not claim that any probe, threshold, policy, or sampling behavior was changed.",
                 ]
                 if normalized_level == "L3"
                 else []
@@ -6112,14 +7791,13 @@ class LuxriotManager:
                 return self._alert_meta_from_counts({severity: raw_total})
 
         text = str(summary_text or "")
-        if not text or not self.alert_parser or not self._contains_alerts_json(text):
+        if not text or not self._has_structured_alert_contract(text):
             return self._alert_meta_from_counts({})
-        try:
-            parsed_alerts = self.alert_parser(text, int(channel_id), int(timestamp_ms))
-        except TypeError:
-            parsed_alerts = cast(Any, self.alert_parser)(text, int(channel_id))
-        except Exception:
-            parsed_alerts = []
+        parsed_alerts = self._parse_structured_alerts(
+            text,
+            channel_id=int(channel_id),
+            timestamp_ms=int(timestamp_ms),
+        )
 
         counts: Dict[str, int] = {}
         if isinstance(parsed_alerts, Sequence) and not isinstance(parsed_alerts, (str, bytes, bytearray)):
@@ -6129,6 +7807,58 @@ class LuxriotManager:
                 severity = self._normalize_alert_severity(raw_alert.get("severity"))
                 counts[severity] = counts.get(severity, 0) + 1
         return self._alert_meta_from_counts(counts)
+
+    def _parse_structured_alerts(
+        self,
+        summary_text: str,
+        *,
+        channel_id: int,
+        timestamp_ms: int,
+    ) -> List[Dict[str, Any]]:
+        """Run the injected normalizer against JSON alerts, never prose.
+
+        The production parser still owns legacy severity aliases and field
+        normalization. Supplying a canonical JSON-only view prevents its old
+        prose fallback from turning a free-form sentence into a real alert.
+        """
+
+        raw_alerts = self._structured_alert_payloads(summary_text)
+        if not self.alert_parser:
+            return raw_alerts
+        parser_input = (
+            "BATCH_STATE_JSON:\n"
+            + json.dumps(
+                {"version": 1, "alerts": raw_alerts},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        try:
+            parsed = self.alert_parser(
+                parser_input,
+                int(channel_id),
+                int(timestamp_ms),
+            )
+        except TypeError:
+            try:
+                parsed = cast(Any, self.alert_parser)(
+                    parser_input,
+                    int(channel_id),
+                )
+            except Exception:
+                return raw_alerts
+        except Exception:
+            return raw_alerts
+        if not isinstance(parsed, Sequence) or isinstance(
+            parsed,
+            (str, bytes, bytearray),
+        ):
+            return raw_alerts
+        return [
+            dict(alert)
+            for alert in parsed
+            if isinstance(alert, Mapping)
+        ]
 
     @staticmethod
     def _normalize_observed_state_key(label: str) -> str:
@@ -6156,6 +7886,68 @@ class LuxriotManager:
         if re.search(r"\b(?:present|visible|detected|observed|seen|yes|active|in\s+frame)\b", lowered):
             return "present"
         return None
+
+    @classmethod
+    def _observed_state_conflicts_with_summary(
+        cls,
+        *,
+        label: str,
+        key: str,
+        state: str,
+        summary_prose: str,
+    ) -> bool:
+        """Detect explicit prose/JSON contradictions without guessing pixels."""
+
+        if state not in {"present", "absent"}:
+            return False
+        normalized_label = cls._normalize_observed_state_key(label)
+        normalized_key = cls._normalize_observed_state_key(key)
+        ignored = {
+            "person",
+            "people",
+            "cat",
+            "animal",
+            "vehicle",
+            "object",
+            "presence",
+            "state",
+            "trigger",
+        }
+        terms = {
+            token
+            for token in f"{normalized_label} {normalized_key}".split()
+            if len(token) >= 3 and token not in ignored
+        }
+        if not terms:
+            return False
+        prose = " ".join(str(summary_prose or "").lower().split())
+        for term in terms:
+            escaped = re.escape(term)
+            negative = bool(
+                re.search(
+                    rf"\b(?:no|not|without|absent|missing|unconfirmed|"
+                    rf"cannot\s+confirm|can't\s+confirm|no\s+(?:visual\s+)?evidence)"
+                    rf"\b.{{0,80}}\b{escaped}\b"
+                    rf"|\b{escaped}\b.{{0,80}}\b(?:not\s+visible|not\s+present|"
+                    rf"absent|missing|unconfirmed|no\s+(?:visual\s+)?evidence)\b",
+                    prose,
+                    flags=re.IGNORECASE,
+                )
+            )
+            positive = bool(
+                re.search(
+                    rf"\b{escaped}\b.{{0,60}}\b(?:is|remains|was|appears)?\s*"
+                    rf"(?:directly\s+)?(?:visible|present|seen|observed|detected)\b"
+                    rf"|\b(?:visible|present|seen|observed|detected)\b.{{0,60}}\b{escaped}\b",
+                    prose,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if (state == "present" and negative) or (
+                state == "absent" and positive
+            ):
+                return True
+        return False
 
     @classmethod
     def _extract_current_observed_states(cls, summary_text: str) -> List[Dict[str, Any]]:
@@ -6340,14 +8132,13 @@ class LuxriotManager:
         max_items: int = 5,
     ) -> List[str]:
         text = str(summary_text or "")
-        if not text or not self.alert_parser or not self._contains_alerts_json(text):
+        if not text or not self._has_structured_alert_contract(text):
             return []
-        try:
-            parsed_alerts = self.alert_parser(text, int(channel_id), int(timestamp_ms))
-        except TypeError:
-            parsed_alerts = cast(Any, self.alert_parser)(text, int(channel_id))
-        except Exception:
-            parsed_alerts = []
+        parsed_alerts = self._parse_structured_alerts(
+            text,
+            channel_id=int(channel_id),
+            timestamp_ms=int(timestamp_ms),
+        )
         if not isinstance(parsed_alerts, Sequence) or isinstance(parsed_alerts, (str, bytes, bytearray)):
             return []
         out: List[str] = []
@@ -6637,6 +8428,11 @@ class LuxriotManager:
                 "severity": severity,
                 "state": state,
             }
+            alert_id = str(
+                raw_event.get("id") or raw_event.get("alert_id") or ""
+            ).strip()
+            if alert_id:
+                event["id"] = alert_id[:200]
             channel_id = _parse_optional_int(raw_event.get("channel_id"))
             if channel_id is not None:
                 event["channel_id"] = int(channel_id)
@@ -6675,14 +8471,40 @@ class LuxriotManager:
             state = str(raw_obs.get("state") or "").strip().lower()
             if not key or state not in {"present", "absent", "unknown"}:
                 continue
-            out.append(
-                {
-                    "key": key,
-                    "label": str(raw_obs.get("label") or key).strip()[:120],
-                    "state": state,
-                    "evidence": str(raw_obs.get("evidence") or "").strip()[:300],
-                }
-            )
+            observation: Dict[str, Any] = {
+                "key": key,
+                "label": str(raw_obs.get("label") or key).strip()[:120],
+                "state": state,
+                "evidence": str(raw_obs.get("evidence") or "").strip()[:300],
+            }
+            raw_indices = raw_obs.get("snapshot_indices")
+            if isinstance(raw_indices, Sequence) and not isinstance(
+                raw_indices,
+                (str, bytes, bytearray),
+            ):
+                indices = [
+                    int(index)
+                    for index in (
+                        _parse_optional_int(raw_index)
+                        for raw_index in raw_indices
+                    )
+                    if index is not None and index > 0
+                ][:16]
+                if indices:
+                    observation["snapshot_indices"] = indices
+            raw_issues = raw_obs.get("validation_issues")
+            if isinstance(raw_issues, Sequence) and not isinstance(
+                raw_issues,
+                (str, bytes, bytearray),
+            ):
+                issues = [
+                    str(issue or "").strip().lower()[:80]
+                    for issue in raw_issues[:8]
+                    if str(issue or "").strip()
+                ]
+                if issues:
+                    observation["validation_issues"] = issues
+            out.append(observation)
         return out
 
     @classmethod
@@ -6752,7 +8574,10 @@ class LuxriotManager:
                 if not compacted:
                     continue
                 observation = compacted[0]
-                if isinstance(raw_item, Mapping):
+                if (
+                    isinstance(raw_item, Mapping)
+                    and "snapshot_indices" not in observation
+                ):
                     observation["snapshot_indices"] = [
                         int(snapshot_index)
                         for snapshot_index in (
@@ -8726,6 +10551,9 @@ class LuxriotManager:
             "summary_failed_batches",
             "summary_last_failure_at",
             "summary_last_success_at",
+            "summary_coverage_gap_batches",
+            "summary_coverage_gap_frames",
+            "summary_coverage_gap_reasons",
             "frozen_signal",
             "frozen_signal_since",
             "frozen_signal_age_sec",
@@ -8889,6 +10717,16 @@ class LuxriotManager:
             gap_reason = str(entry.get("gap_reason") or "").strip().lower()[:80]
             if gap_reason:
                 normalized["gap_reason"] = gap_reason
+            gap_error_type = re.sub(
+                r"[^A-Za-z0-9_.-]+",
+                "_",
+                str(entry.get("gap_error_type") or "").strip(),
+            )[:120]
+            if gap_error_type:
+                normalized["gap_error_type"] = gap_error_type
+            gap_error = _safe_error_text(entry.get("gap_error"), 500)
+            if gap_error:
+                normalized["gap_error"] = gap_error
         coalesced_raw = entry.get("coalesced")
         if isinstance(coalesced_raw, Mapping):
             coalesced_out: Dict[str, int] = {}
@@ -9249,6 +11087,13 @@ class LuxriotManager:
                 memory_raw = routine_value.get("memory")
                 if isinstance(memory_raw, Mapping):
                     loaded_entry["memory"] = dict(memory_raw)
+                field_times_raw = routine_value.get("memory_field_updated_at")
+                if isinstance(field_times_raw, Mapping):
+                    loaded_entry["memory_field_updated_at"] = {
+                        str(field): float(timestamp)
+                        for field, raw_timestamp in field_times_raw.items()
+                        if (timestamp := self._coerce_float(raw_timestamp)) is not None
+                    }
                 loaded_routines[int(channel_id)] = loaded_entry
         loaded_road_scene_calibrations: Dict[int, Dict[str, Any]] = {}
         if isinstance(road_scene_raw, Mapping):
@@ -10008,10 +11853,20 @@ class LuxriotManager:
         marker_text = str(marker or "").strip()
         if not haystack or not marker_text:
             return None
-        idx = haystack.upper().find(marker_text.upper())
-        if idx < 0:
+        compact_marker = re.sub(r"[^A-Z0-9]+", "", marker_text.upper())
+        marker_patterns = {
+            "BATCHSTATEJSON": r"\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:",
+            "ALERTSJSON": r"\bALERTS[\s_-]*JSON\s*:",
+            "MEMORYUPDATEJSON": r"\bMEMORY[\s_-]*UPDATE[\s_-]*JSON\s*:",
+        }
+        marker_match = re.search(
+            marker_patterns.get(compact_marker, re.escape(marker_text)),
+            haystack,
+            flags=re.IGNORECASE,
+        )
+        if marker_match is None:
             return None
-        tail = haystack[idx + len(marker_text) :].strip()
+        tail = haystack[marker_match.end() :].strip()
         if not tail:
             return None
         try:
@@ -10144,10 +11999,21 @@ class LuxriotManager:
         summary_text: object,
         frames: Sequence[Mapping[str, Any]],
     ) -> Dict[str, Any]:
+        summary_raw = str(summary_text or "")
+        marker_match = re.search(
+            r"\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:",
+            summary_raw,
+            flags=re.IGNORECASE,
+        )
+        summary_prose = (
+            summary_raw[: marker_match.start()]
+            if marker_match is not None
+            else summary_raw
+        )
         catalogue = cls._model_snapshot_catalogue(frames)
         max_snapshot_index = max(catalogue.keys(), default=max(1, len(frames)))
         raw = cls._extract_json_marker_payload(
-            str(summary_text or ""),
+            summary_raw,
             "BATCH_STATE_JSON:",
         )
         contract_status = "parsed" if isinstance(raw, Mapping) else "missing_fallback"
@@ -10251,16 +12117,56 @@ class LuxriotManager:
                     state = "unknown"
                 if not key or state not in {"present", "absent", "unknown"}:
                     continue
+                snapshot_indices = cls._normalize_snapshot_indices(
+                    raw_state.get("snapshot_indices"),
+                    max_snapshot_index,
+                )
+                evidence = cls._truncate_text(raw_state.get("evidence"), 300)
+                validation_issues: List[str] = []
+                evidence_state = cls._normalize_observed_state_value(evidence)
+                if state != "unknown" and not snapshot_indices:
+                    validation_issues.append("missing_snapshot_evidence")
+                if state != "unknown" and not evidence:
+                    validation_issues.append("missing_text_evidence")
+                if (
+                    state != "unknown"
+                    and evidence_state is not None
+                    and evidence_state != state
+                ):
+                    validation_issues.append("state_evidence_conflict")
+                if state == "absent" and not validation_issues and not re.search(
+                    r"\b(?:clear(?:ly)?|unobstructed|fully\s+visible|"
+                    r"entire\s+(?:area|scene|surface)\s+(?:is\s+)?visible|"
+                    r"(?:area|shelf|seat|doorway|entrance|zone|location)"
+                    r".{0,40}\b(?:visible|empty|clear))\b",
+                    evidence,
+                    flags=re.IGNORECASE,
+                ):
+                    validation_issues.append("absent_scope_unverified")
+                if (
+                    state != "unknown"
+                    and cls._observed_state_conflicts_with_summary(
+                        label=label or key,
+                        key=key,
+                        state=state,
+                        summary_prose=summary_prose,
+                    )
+                ):
+                    validation_issues.append("summary_state_conflict")
+                if validation_issues:
+                    state = "unknown"
                 observed_states.append(
                     {
                         "key": key,
                         "label": label or key,
                         "state": state,
-                        "snapshot_indices": cls._normalize_snapshot_indices(
-                            raw_state.get("snapshot_indices"),
-                            max_snapshot_index,
+                        "snapshot_indices": snapshot_indices,
+                        "evidence": evidence,
+                        **(
+                            {"validation_issues": validation_issues}
+                            if validation_issues
+                            else {}
                         ),
-                        "evidence": cls._truncate_text(raw_state.get("evidence"), 300),
                     }
                 )
 
@@ -10355,6 +12261,8 @@ class LuxriotManager:
             text = cls._truncate_text(text, max_len)
             if not text:
                 continue
+            if cls._is_batch_schema_placeholder(text):
+                continue
             dedupe_key = text.lower()
             if dedupe_key in seen:
                 continue
@@ -10363,6 +12271,20 @@ class LuxriotManager:
             if len(out) >= max(1, int(max_items)):
                 break
         return out
+
+    @staticmethod
+    def _is_batch_schema_placeholder(value: object) -> bool:
+        normalized = " ".join(str(value or "").strip().lower().split()).strip(" .")
+        return normalized in {
+            "routine visibly reinforced in this batch",
+            "grounded item important for later consolidation",
+            "short stable batch label",
+            "observable event",
+            "grounded episode update",
+            "watched entity or trigger",
+            "visible evidence",
+            "short current scene",
+        }
 
     @staticmethod
     def _dedupe_memory_items(*groups: Sequence[str], max_items: int = 6) -> List[str]:
@@ -10402,6 +12324,68 @@ class LuxriotManager:
             lines.append("Ignore as routine/noise: " + "; ".join(ignore))
         rendered = "\n".join(lines).strip()
         return cls._truncate_text(rendered, max_len)
+
+    @staticmethod
+    def _is_memory_schema_placeholder(value: object) -> bool:
+        normalized = " ".join(str(value or "").strip().lower().split()).strip(" .")
+        if not normalized:
+            return False
+        return normalized in {
+            "normal pattern for this channel, if grounded",
+            "normal pattern for this channel if grounded",
+            "normal pattern for this channel",
+            "normal pattern, if grounded",
+            "routine baseline if grounded",
+            "normal baseline if grounded",
+        }
+
+    def _live_channel_memory_payload(
+        self,
+        current: Mapping[str, Any],
+        *,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Return only memory that is authorized to regulate a live L0 call.
+
+        L3 tuning/ignore output is proposal-only.  Legacy deployments may
+        still have those fields in the persisted channel context, so keeping
+        them in storage for audit must not silently feed them back into L0.
+        The L1 watchlist is ephemeral and expires when the scheduler cannot
+        refresh it for two L1 windows.
+        """
+
+        raw_memory = current.get("memory")
+        memory = dict(raw_memory) if isinstance(raw_memory, Mapping) else {}
+        baseline = str(memory.get("routine_baseline") or "").strip()
+        if self._is_memory_schema_placeholder(baseline):
+            memory.pop("routine_baseline", None)
+
+        # These remain in durable state as review material, but they have no
+        # live regulatory authority until an explicit operator-approval path
+        # exists.
+        memory.pop("alert_tuning_notes", None)
+        memory.pop("ignore_as_routine", None)
+
+        field_times_raw = current.get("memory_field_updated_at")
+        field_times = dict(field_times_raw) if isinstance(field_times_raw, Mapping) else {}
+        watchlist_updated_at = (
+            self._coerce_float(field_times.get("active_watchlist"))
+            or self._coerce_float(current.get("updated_at"))
+            or self._coerce_float(current.get("window_end"))
+        )
+        l1_window_sec = max(60.0, float(self.rollup_windows.get("L1") or 900.0))
+        watchlist_ttl_sec = max(1800.0, 2.0 * l1_window_sec)
+        reference_now = float(now if now is not None else time.time())
+        if (
+            watchlist_updated_at is not None
+            and reference_now - float(watchlist_updated_at) > watchlist_ttl_sec
+        ):
+            memory.pop("active_watchlist", None)
+        return {
+            key: value
+            for key, value in memory.items()
+            if value not in (None, "", [], {})
+        }
 
     def _extract_memory_update(self, summary_text: object) -> Dict[str, Any]:
         text = str(summary_text or "").strip()
@@ -10467,6 +12451,8 @@ class LuxriotManager:
                     max_len=180,
                 ),
             }
+            if self._is_memory_schema_placeholder(memory.get("routine_baseline")):
+                memory["routine_baseline"] = ""
             memory["text"] = self._render_channel_memory_text(memory)
             return {key: value for key, value in memory.items() if value}
 
@@ -10513,6 +12499,8 @@ class LuxriotManager:
             cleaned = self._sanitize_l0_summary(text, max_len=520)
             if cleaned:
                 memory["routine_baseline"] = cleaned
+        if self._is_memory_schema_placeholder(memory.get("routine_baseline")):
+            memory.pop("routine_baseline", None)
         memory["text"] = self._render_channel_memory_text(memory)
         return {key: value for key, value in memory.items() if value}
 
@@ -10672,21 +12660,25 @@ class LuxriotManager:
         level: Optional[str] = None,
         memory_update: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        source_level = self._normalize_rollup_level(level) or ""
         if isinstance(memory_update, Mapping):
-            if not memory_update:
-                return
-            extracted_memory = self._extract_memory_update(
-                "MEMORY_UPDATE_JSON:\n"
-                + json.dumps(dict(memory_update), ensure_ascii=False)
+            extracted_memory = (
+                self._extract_memory_update(
+                    "MEMORY_UPDATE_JSON:\n"
+                    + json.dumps(dict(memory_update), ensure_ascii=False)
+                )
+                if memory_update
+                else {}
             )
         else:
             extracted_memory = self._extract_memory_update(summary_text)
-        if not extracted_memory:
+        # A valid empty L1 memory update still has meaning: it clears the
+        # short-lived watchlist. Other empty/invalid updates are no-ops.
+        if not extracted_memory and source_level != "L1":
             return
         channel_key = int(channel_id)
         rollup_key = str(rollup_id or "").strip()
         window_end_value = self._coerce_float(window_end) or 0.0
-        source_level = self._normalize_rollup_level(level) or ""
         changed = False
         with self.cache_lock:
             current = self.channel_routine_context.get(channel_key)
@@ -10698,10 +12690,22 @@ class LuxriotManager:
             current_memory_raw = current.get("memory") if isinstance(current, Mapping) else None
             current_memory = dict(current_memory_raw) if isinstance(current_memory_raw, Mapping) else {}
             merged_memory = dict(current_memory)
+            current_field_times_raw = (
+                current.get("memory_field_updated_at")
+                if isinstance(current, Mapping)
+                else None
+            )
+            merged_field_times = (
+                dict(current_field_times_raw)
+                if isinstance(current_field_times_raw, Mapping)
+                else {}
+            )
+            incoming_field_time = window_end_value or time.time()
             routine_baseline = str(extracted_memory.get("routine_baseline") or "").strip()
             current_routine_baseline = str(merged_memory.get("routine_baseline") or "").strip()
             if routine_baseline and (not incoming_is_older or not current_routine_baseline):
                 merged_memory["routine_baseline"] = routine_baseline
+                merged_field_times["routine_baseline"] = incoming_field_time
             for key, limit in (
                 ("active_watchlist", 5),
                 ("preserved_deviations", 7),
@@ -10710,7 +12714,13 @@ class LuxriotManager:
             ):
                 incoming_items = self._coerce_memory_items(extracted_memory.get(key), max_items=limit, max_len=220)
                 existing = self._coerce_memory_items(merged_memory.get(key), max_items=limit, max_len=220)
-                if incoming_is_older:
+                if key == "active_watchlist" and source_level == "L1":
+                    # L1 is the authority for the ephemeral next-window
+                    # watchlist. A newer L1 replaces it (including with []),
+                    # while historical backfill must never resurrect an old
+                    # watch item into the live present.
+                    merged = existing if incoming_is_older else incoming_items
+                elif incoming_is_older:
                     merged = self._dedupe_memory_items(existing, incoming_items, max_items=limit)
                 else:
                     merged = self._dedupe_memory_items(incoming_items, existing, max_items=limit)
@@ -10718,6 +12728,12 @@ class LuxriotManager:
                     merged_memory[key] = merged
                 elif key in merged_memory:
                     merged_memory.pop(key, None)
+                if incoming_items and not incoming_is_older:
+                    merged_field_times[key] = incoming_field_time
+                elif key == "active_watchlist" and source_level == "L1" and not incoming_is_older:
+                    merged_field_times[key] = incoming_field_time
+            if not merged_memory and current is None:
+                return
             routine_hint = self._render_channel_memory_text(merged_memory)
             if not routine_hint:
                 routine_hint = str(extracted_memory.get("text") or "").strip()
@@ -10743,6 +12759,7 @@ class LuxriotManager:
                     "window_end": stored_window_end,
                     "routine": routine_hint,
                     "memory": merged_memory,
+                    "memory_field_updated_at": merged_field_times,
                     "updated_at": time.time(),
                 }
                 changed = True
@@ -10751,10 +12768,12 @@ class LuxriotManager:
 
     def _get_channel_routine_prompt(self, channel_id: int) -> str:
         with self.cache_lock:
-            current = self.channel_routine_context.get(int(channel_id))
+            current_raw = self.channel_routine_context.get(int(channel_id))
+            current = dict(current_raw) if isinstance(current_raw, Mapping) else None
         if not isinstance(current, Mapping):
             return ""
-        routine = str(current.get("routine") or "").strip()
+        live_memory = self._live_channel_memory_payload(current)
+        routine = self._render_channel_memory_text(live_memory)
         return self._render_channel_memory_prompt(routine)
 
     def _build_vector_signal_bundle(
@@ -11039,12 +13058,21 @@ class LuxriotManager:
                     return str(rollup_prompts.get(normalized_level) or "")
         return self._default_rollup_prompt_for_level_locked(normalized_level)
 
-    def _get_rollup_model_hint_locked(self, channel_id: Optional[int] = None) -> Optional[str]:
+    def _get_rollup_model_hint_locked(
+        self,
+        channel_id: Optional[int] = None,
+        level: Optional[str] = None,
+    ) -> Optional[str]:
         # L1-L3 are text-only reasoning workloads.  A dedicated rollup model
         # (the agent profile by default) must win over the channel's live VLM
         # hint; otherwise a channel configured for an 8k vision model also
         # routes long historical aggregation there and deterministically
         # overflows its context window.
+        if (
+            self._normalize_rollup_level(level) == "L3"
+            and self.rollup_l3_deep_enabled
+        ):
+            return self.rollup_l3_deep_model or None
         fallback_hint = str(self.rollup_llm_model_hint or "").strip()
         if fallback_hint:
             return fallback_hint
@@ -11110,13 +13138,120 @@ class LuxriotManager:
             effective_capture_selector_enabled = self._get_capture_selector_enabled_locked(channel_id)
             effective_capture_selector_bias = self._get_capture_selector_bias_locked(channel_id)
             effective_bookmark = self._get_channel_bookmark_settings_locked(channel_id)
-            active_memory = ""
+            memory_state: Dict[str, Any] = {
+                "present": False,
+                "source_level": None,
+                "rollup_id": None,
+                "window_end": None,
+                "updated_at": None,
+                "routine_baseline": "",
+                "active_watchlist_count": 0,
+                "preserved_deviations_count": 0,
+                "alert_tuning_notes_count": 0,
+                "ignore_as_routine_count": 0,
+                "held_tuning_proposals_count": 0,
+                "held_routine_suppression_proposals_count": 0,
+            }
+            l0_batch_max_frames = 16
+            l0_batch_max_window_sec = 60.0
             if channel_id is not None:
                 current_memory = self.channel_routine_context.get(int(channel_id))
                 if isinstance(current_memory, Mapping):
-                    routine_text = str(current_memory.get("routine") or "").strip()
-                    if routine_text:
-                        active_memory = self._render_channel_memory_prompt(routine_text)
+                    stored_memory_payload = (
+                        dict(current_memory.get("memory"))
+                        if isinstance(current_memory.get("memory"), Mapping)
+                        else {}
+                    )
+                    memory_payload = self._live_channel_memory_payload(current_memory)
+                    memory_state.update(
+                        {
+                            "present": bool(memory_payload),
+                            "source_level": str(current_memory.get("source_level") or "").strip() or None,
+                            "rollup_id": str(current_memory.get("rollup_id") or "").strip() or None,
+                            "window_end": self._coerce_float(current_memory.get("window_end")),
+                            "updated_at": self._coerce_float(current_memory.get("updated_at")),
+                            "routine_baseline": self._truncate_text(
+                                str(memory_payload.get("routine_baseline") or "").strip(),
+                                280,
+                            ),
+                        }
+                    )
+                    for memory_key in (
+                        "active_watchlist",
+                        "preserved_deviations",
+                        "alert_tuning_notes",
+                        "ignore_as_routine",
+                    ):
+                        raw_items = memory_payload.get(memory_key)
+                        item_count = (
+                            len(raw_items)
+                            if isinstance(raw_items, Sequence)
+                            and not isinstance(raw_items, (str, bytes, bytearray))
+                            else (1 if str(raw_items or "").strip() else 0)
+                        )
+                        memory_state[f"{memory_key}_count"] = int(item_count)
+                    for stored_key, state_key in (
+                        ("alert_tuning_notes", "held_tuning_proposals_count"),
+                        (
+                            "ignore_as_routine",
+                            "held_routine_suppression_proposals_count",
+                        ),
+                    ):
+                        raw_items = stored_memory_payload.get(stored_key)
+                        memory_state[state_key] = int(
+                            len(raw_items)
+                            if isinstance(raw_items, Sequence)
+                            and not isinstance(raw_items, (str, bytes, bytearray))
+                            else (1 if str(raw_items or "").strip() else 0)
+                        )
+                active_session = self.sessions.get(int(channel_id))
+                if active_session is not None:
+                    l0_batch_max_frames = max(
+                        1,
+                        min(
+                            16,
+                            int(
+                                _parse_optional_int(
+                                    getattr(active_session, "summary_max_batch_frames", 16)
+                                )
+                                or 16
+                            ),
+                        ),
+                    )
+                    l0_batch_max_window_sec = max(
+                        1.0,
+                        float(
+                            self._coerce_float(
+                                getattr(active_session, "summary_max_window_sec", 60.0)
+                            )
+                            or 60.0
+                        ),
+                    )
+            rollup_due = {
+                level: (
+                    self._coerce_float(
+                        self._rollup_scheduler_due.get((int(channel_id), level))
+                    )
+                    if channel_id is not None
+                    else None
+                )
+                for level in ("L1", "L2", "L3")
+            }
+            rollup_scheduler_state = {
+                "enabled": bool(self.rollup_scheduler_enabled),
+                "running": bool(self._rollup_scheduler_status.get("running")),
+                "active_channel_id": _parse_optional_int(
+                    self._rollup_scheduler_status.get("active_channel_id")
+                ),
+                "active_level": str(
+                    self._rollup_scheduler_status.get("active_level") or ""
+                ).strip()
+                or None,
+                "last_completed_at": self._coerce_float(
+                    self._rollup_scheduler_status.get("last_completed_at")
+                ),
+                "last_error": self._rollup_scheduler_status.get("last_error"),
+            }
             raw_channel_overrides = (
                 self.channel_prompt_overrides.get(int(channel_id))
                 if channel_id is not None
@@ -11158,6 +13293,54 @@ class LuxriotManager:
                 "dirty": bool(self._summary_state_dirty),
             }
 
+        memory_metabolism = {
+            "status": "active" if memory_state.get("present") else "awaiting_consolidation",
+            "semantics": (
+                "L0 emits grounded continuity and salience; L1/L2 consolidate it into bounded "
+                "channel memory that returns to later L0 prompts as prior context. L3 audits "
+                "operator feedback and proposes durable tuning without mutating live regulation."
+            ),
+            "current_state": memory_state,
+            "scheduler": rollup_scheduler_state,
+            "stages": [
+                {
+                    "level": "L0",
+                    "cadence": (
+                        f"event-driven, at {int(l0_batch_max_frames)} snapshots "
+                        f"or by {l0_batch_max_window_sec:g}s"
+                    ),
+                    "reads": "current snapshots + P/N/M/CV/probes + prior channel memory",
+                    "writes": "BATCH_STATE_JSON continuity, routines, memory_pass, alerts",
+                    "applies_to_live_memory": False,
+                    "next_due_at": None,
+                },
+                {
+                    "level": "L1",
+                    "cadence": "15 minutes",
+                    "reads": "grounded L0 batches",
+                    "writes": "short-lived active watchlist and preserved deviations",
+                    "applies_to_live_memory": True,
+                    "next_due_at": rollup_due.get("L1"),
+                },
+                {
+                    "level": "L2",
+                    "cadence": "1 hour",
+                    "reads": "L1 episodes",
+                    "writes": "routine/recurrence baseline and preserved deviations",
+                    "applies_to_live_memory": True,
+                    "next_due_at": rollup_due.get("L2"),
+                },
+                {
+                    "level": "L3",
+                    "cadence": "8 hours, quiet-window gated for deep review",
+                    "reads": "L2 hierarchy + bounded L0 drills + operator feedback",
+                    "writes": "review-only durable-memory and probe/alert-tuning proposals",
+                    "applies_to_live_memory": False,
+                    "next_due_at": rollup_due.get("L3"),
+                },
+            ],
+        }
+
         def setting_source(field: str) -> str:
             if field in override_fields:
                 return "channel_override"
@@ -11183,7 +13366,11 @@ class LuxriotManager:
             "stream": {
                 "editable_prompt": effective_stream_prompt,
                 "source": setting_sources["stream_system_prompt"],
-                "backend_memory": active_memory,
+                "memory_context": {
+                    "present": bool(memory_state.get("present")),
+                    "source_level": memory_state.get("source_level"),
+                    "updated_at": memory_state.get("updated_at"),
+                },
                 "warnings": list(prompt_health.get("warnings") or []),
                 "notes": [
                     "Live L0 summaries use the editable stream prompt.",
@@ -11218,7 +13405,11 @@ class LuxriotManager:
                     "editable_prompt": effective_rollup_prompts.get(level, ""),
                     "source": setting_sources["rollup_prompts"][level],
                     "backend_instructions": self._rollup_backend_instruction_text(level),
-                    "active_memory": active_memory,
+                    "memory_context": {
+                        "present": bool(memory_state.get("present")),
+                        "source_level": memory_state.get("source_level"),
+                        "updated_at": memory_state.get("updated_at"),
+                    },
                     "notes": [
                         "The editable prompt is the system prompt.",
                         "The operator-format contract is always appended to the system prompt.",
@@ -11246,6 +13437,7 @@ class LuxriotManager:
             "persistence": persistence,
             "prompt_layers": prompt_layers,
             "prompt_health": prompt_health,
+            "memory_metabolism": memory_metabolism,
         }
 
     def update_prompt_settings(
@@ -11867,6 +14059,20 @@ class LuxriotManager:
             "signal_digest": dict(signal_digest),
             **alert_meta,
         }
+        generation_error = str(entry.get("generation_error") or "").strip()
+        if generation_error:
+            normalized["generation_error"] = generation_error[:240]
+        if level == "L3":
+            normalized["review_only"] = bool(
+                entry.get("review_only", True)
+            )
+            normalized["proposals_only"] = bool(
+                entry.get("proposals_only", True)
+            )
+            normalized["mutations_applied"] = False
+            route = str(entry.get("generation_route") or "").strip()
+            if route:
+                normalized["generation_route"] = route[:80]
         if alert_delivery_breakdown:
             normalized["alert_delivery_breakdown"] = alert_delivery_breakdown
         if alert_events:
@@ -12303,7 +14509,9 @@ class LuxriotManager:
             if summary_kind not in {"llm", "llm_cached"}:
                 continue
             level = self._normalize_rollup_level(row.get("level"))
-            if level not in {"L1", "L2", "L3"}:
+            # L3 is an audit/review product.  Its MEMORY_UPDATE_JSON is stored
+            # as a proposal but never enters the live channel routine context.
+            if level not in {"L1", "L2"}:
                 continue
             summary = str(row.get("summary") or "").strip()
             rollup_id = str(row.get("rollup_id") or "").strip()
@@ -12703,17 +14911,21 @@ class LuxriotManager:
                 children=children,
             )
             with self.cache_lock:
-                model_hint = self._get_rollup_model_hint_locked(channel_id)
-            if bool(getattr(self.lm_callback, "eva_workload_class", False)):
+                model_hint = self._get_rollup_model_hint_locked(
+                    channel_id,
+                    level,
+                )
+            callback = self._rollup_callback_for_level(level)
+            if bool(getattr(callback, "eva_workload_class", False)):
                 raw_summary = str(
-                    self.lm_callback(
+                    callback(
                         messages,
                         model_hint,
                         workload_class=workload_class,
                     )
                 ).strip()
             else:
-                raw_summary = str(self.lm_callback(messages, model_hint)).strip()
+                raw_summary = str(callback(messages, model_hint)).strip()
             operator_summary, memory_update = self._split_rollup_operator_output(raw_summary)
             operator_summary = self._normalize_rollup_operator_headings(operator_summary)
             contract_valid = bool(
@@ -12762,16 +14974,16 @@ class LuxriotManager:
                     ],
                 }
             )
-            if bool(getattr(self.lm_callback, "eva_workload_class", False)):
+            if bool(getattr(callback, "eva_workload_class", False)):
                 retry_raw = str(
-                    self.lm_callback(
+                    callback(
                         corrective_messages,
                         model_hint,
                         workload_class=workload_class,
                     )
                 ).strip()
             else:
-                retry_raw = str(self.lm_callback(corrective_messages, model_hint)).strip()
+                retry_raw = str(callback(corrective_messages, model_hint)).strip()
             retry_summary, retry_memory = self._split_rollup_operator_output(retry_raw)
             retry_summary = self._normalize_rollup_operator_headings(retry_summary)
             retry_contract_valid = bool(
@@ -12922,14 +15134,15 @@ class LuxriotManager:
                     node["format_version"] = cached_format_version
                     if cached_legacy and cached_signature != source_signature:
                         node["legacy_source_changed"] = True
-                    self._update_channel_routine_context(
-                        channel_id=channel_id,
-                        rollup_id=rollup_id,
-                        summary_text=node.get("summary"),
-                        window_end=self._coerce_float(node.get("window_end")),
-                        level=level,
-                        memory_update=node.get("memory_update") if isinstance(node.get("memory_update"), Mapping) else {},
-                    )
+                    if level != "L3":
+                        self._update_channel_routine_context(
+                            channel_id=channel_id,
+                            rollup_id=rollup_id,
+                            summary_text=node.get("summary"),
+                            window_end=self._coerce_float(node.get("window_end")),
+                            level=level,
+                            memory_update=node.get("memory_update") if isinstance(node.get("memory_update"), Mapping) else {},
+                        )
                     continue
             if remaining_budget <= 0:
                 node["generation_status"] = "deferred"
@@ -12974,6 +15187,14 @@ class LuxriotManager:
                     memory_update=memory_update,
                     generation_status="ready",
                     format_version=ROLLUP_OPERATOR_FORMAT_VERSION,
+                    review_only=level == "L3",
+                    proposals_only=level == "L3",
+                    mutations_applied=False if level == "L3" else None,
+                    generation_route=(
+                        "deep_openai_compatible"
+                        if level == "L3" and self.rollup_l3_deep_enabled
+                        else "agent_profile"
+                    ),
                 )
                 node["summary"] = summary
                 node["operator_summary"] = summary
@@ -12981,17 +15202,82 @@ class LuxriotManager:
                 node["summary_kind"] = "llm"
                 node["generation_status"] = "ready"
                 node["format_version"] = ROLLUP_OPERATOR_FORMAT_VERSION
-                self._update_channel_routine_context(
-                    channel_id=channel_id,
-                    rollup_id=rollup_id,
-                    summary_text=summary,
-                    window_end=self._coerce_float(node.get("window_end")),
-                    level=level,
-                    memory_update=memory_update,
-                )
+                if level != "L3":
+                    self._update_channel_routine_context(
+                        channel_id=channel_id,
+                        rollup_id=rollup_id,
+                        summary_text=summary,
+                        window_end=self._coerce_float(node.get("window_end")),
+                        level=level,
+                        memory_update=memory_update,
+                    )
+                else:
+                    node["review_only"] = True
+                    node["proposals_only"] = True
+                    node["mutations_applied"] = False
+                    node["generation_route"] = (
+                        "deep_openai_compatible"
+                        if self.rollup_l3_deep_enabled
+                        else "agent_profile"
+                    )
             else:
-                node["summary_kind"] = "degraded"
-                node["generation_status"] = "failed" if generation_error else "degraded"
+                if level == "L3":
+                    review_status = (
+                        "review_deferred"
+                        if generation_error
+                        and "deferred by quiet gate" in generation_error
+                        else "review_unavailable"
+                        if generation_error
+                        else "review_pending"
+                    )
+                    node["summary_kind"] = "review_pending"
+                    node["generation_status"] = review_status
+                    node["review_only"] = True
+                    node["proposals_only"] = True
+                    node["mutations_applied"] = False
+                    node["generation_route"] = (
+                        "deep_openai_compatible"
+                        if self.rollup_l3_deep_enabled
+                        else "agent_profile"
+                    )
+                    self._put_cached_rollup_summary(
+                        rollup_id,
+                        fallback,
+                        channel_id=channel_id,
+                        level=level,
+                        source_level=source_level,
+                        window_start=self._coerce_float(node.get("window_start")),
+                        window_end=self._coerce_float(node.get("window_end")),
+                        window_sec=_parse_optional_int(node.get("window_sec")) or 0,
+                        item_count=_parse_optional_int(node.get("item_count")) or 0,
+                        frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                        source_tokens=source_tokens,
+                        run_ids=node.get("run_ids"),
+                        source_ids=node.get("source_ids"),
+                        source_signature=source_signature,
+                        highlights=node.get("highlights"),
+                        alert_counts=node.get("alert_counts"),
+                        alert_total=node.get("alert_total"),
+                        alert_severities=node.get("alert_severities"),
+                        signal_digest=node.get("signal_digest"),
+                        alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
+                        alert_events=node.get("alert_events"),
+                        alert_parser_breakdown=node.get("alert_parser_breakdown"),
+                        state_transition_total=node.get("state_transition_total"),
+                        summary_kind="review_pending",
+                        operator_summary=fallback,
+                        memory_update={},
+                        generation_status=review_status,
+                        generation_error=generation_error,
+                        format_version=ROLLUP_OPERATOR_FORMAT_VERSION,
+                        review_only=True,
+                        proposals_only=True,
+                        mutations_applied=False,
+                        generation_route=node["generation_route"],
+                    )
+                else:
+                    node["summary_kind"] = "degraded"
+                    node["generation_status"] = "failed" if generation_error else "degraded"
                 if generation_error:
                     node["generation_error"] = generation_error
             remaining_budget -= 1
@@ -13482,6 +15768,128 @@ class LuxriotManager:
             return
         with self.cache_lock:
             self._merge_summary_history_locked(channel_id, [normalized])
+
+    def record_summary_coverage_gap(
+        self,
+        source: Mapping[str, Any],
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Persist one idempotent, explicit L0 coverage interruption."""
+
+        channel_id = _parse_optional_int(source.get("channel_id"))
+        if channel_id is None or channel_id < 1:
+            raise ValueError("coverage gap requires a positive channel_id")
+        normalized_reason = re.sub(
+            r"[^a-z0-9_]+",
+            "_",
+            str(reason or "unknown").strip().lower().replace("-", "_"),
+        ).strip("_")[:80] or "unknown"
+        raw_frames = source.get("frames")
+        frames = (
+            [dict(frame) for frame in raw_frames if isinstance(frame, Mapping)]
+            if isinstance(raw_frames, Sequence)
+            and not isinstance(raw_frames, (str, bytes, bytearray))
+            else []
+        )
+        stamps = [
+            stamp
+            for stamp in (
+                self._batch_frame_timestamp_ms(frame)
+                for frame in frames
+            )
+            if stamp is not None and stamp >= 0
+        ]
+        now = time.time()
+        fallback_ms = int(now * 1000.0)
+        batch_start_ms = _parse_optional_int(source.get("batch_start_ms"))
+        batch_end_ms = _parse_optional_int(source.get("batch_end_ms"))
+        if batch_start_ms is None:
+            batch_start_ms = min(stamps) if stamps else fallback_ms
+        if batch_end_ms is None:
+            batch_end_ms = max(stamps) if stamps else batch_start_ms
+        if batch_end_ms < batch_start_ms:
+            batch_start_ms, batch_end_ms = batch_end_ms, batch_start_ms
+        frame_count = max(
+            len(frames),
+            int(_parse_optional_int(source.get("frame_count")) or 0),
+        )
+        run_id = str(source.get("run_id") or "").strip()
+        source_batch_id = str(source.get("batch_id") or "").strip()
+        gap_id = "gap-" + self._stable_id(
+            [
+                str(channel_id),
+                run_id,
+                source_batch_id,
+                str(batch_start_ms),
+                str(batch_end_ms),
+                normalized_reason,
+            ],
+            length=24,
+        )
+        if normalized_reason == "lm_backpressure_dropped_batch":
+            summary = (
+                "[coverage gap] L0 batch dropped under LM backpressure; "
+                "this interval has no description."
+            )
+        else:
+            readable_reason = normalized_reason.replace("_", " ")
+            summary = (
+                "[coverage gap] No L0 description was produced for this "
+                f"interval ({readable_reason})."
+            )
+        entry = {
+            "channel_id": int(channel_id),
+            "run_id": run_id,
+            "batch_id": gap_id,
+            "summary": summary,
+            "coverage_gap": True,
+            "gap_reason": normalized_reason,
+            "frame_count": frame_count,
+            "source_frame_count": frame_count,
+            "selected_frame_count": 0,
+            "batch_size": int(
+                max(frame_count, _parse_optional_int(source.get("batch_size")) or 0)
+            ),
+            "batch_start_ms": int(batch_start_ms),
+            "batch_end_ms": int(batch_end_ms),
+            "created_at": now,
+        }
+        gap_error_type = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "_",
+            str(source.get("gap_error_type") or "").strip(),
+        )[:120]
+        if gap_error_type:
+            entry["gap_error_type"] = gap_error_type
+        gap_error = _safe_error_text(source.get("gap_error"), 500)
+        if gap_error:
+            entry["gap_error"] = gap_error
+        normalized = self._normalize_summary_log_entry(entry)
+        if normalized is None:
+            raise ValueError("coverage gap could not be normalized")
+        inserted = False
+        with self.cache_lock:
+            existing = self.summary_history.get(int(channel_id)) or []
+            if not any(
+                str(item.get("batch_id") or "") == gap_id
+                for item in existing
+                if isinstance(item, Mapping)
+            ):
+                self._merge_summary_history_locked(int(channel_id), [normalized])
+                inserted = True
+            session = self.sessions.get(int(channel_id))
+        if inserted and session is not None:
+            session_run_id = str(session.run_id or "").strip()
+            if not run_id or not session_run_id or run_id == session_run_id:
+                with session.lock:
+                    session.summary_coverage_gap_batches += 1
+                    session.summary_coverage_gap_frames += frame_count
+                    session.summary_coverage_gap_reasons[normalized_reason] = (
+                        session.summary_coverage_gap_reasons.get(normalized_reason, 0)
+                        + 1
+                    )
+        return dict(normalized)
 
     def set_summary_dispatcher(
         self,
@@ -14033,11 +16441,28 @@ class LuxriotManager:
         if warnings:
             llm_input_stats["warnings"] = warnings
         model_hint = str(batch.get("model_hint") or "").strip() or None
-        if bool(getattr(self.lm_callback, "eva_generation_preflight", False)):
+        lm_workload_class = (
+            str(batch.get("lm_workload_class") or "vlm").strip().lower()
+            or "vlm"
+        )
+        callback_supports_preflight = bool(
+            getattr(self.lm_callback, "eva_generation_preflight", False)
+        )
+        callback_supports_workload = bool(
+            getattr(self.lm_callback, "eva_workload_class", False)
+        )
+        callback_kwargs: Dict[str, Any] = {}
+        if callback_supports_preflight:
+            callback_kwargs["preflight"] = (
+                lambda: self._assert_summary_batch_current(batch)
+            )
+        if callback_supports_workload:
+            callback_kwargs["workload_class"] = lm_workload_class
+        if callback_kwargs:
             summary = self.lm_callback(
                 messages,
                 model_hint,
-                preflight=lambda: self._assert_summary_batch_current(batch),
+                **callback_kwargs,
             )
         else:
             summary = self.lm_callback(messages, model_hint)
@@ -14062,6 +16487,8 @@ class LuxriotManager:
             int(_parse_optional_int(batch.get("source_frame_count")) or 0),
         )
         frame_selection = self._compact_frame_selection(batch.get("frame_selection"))
+        duration_sec = max(0.0, time.time() - started)
+        self.note_l0_duration(duration_sec)
         entry: Dict[str, Any] = {
             "channel_id": int(channel_id),
             "run_id": str(batch.get("run_id") or "").strip(),
@@ -14078,7 +16505,7 @@ class LuxriotManager:
             "created_at": float(created_at),
             "batch_start_ms": batch_start_ms,
             "batch_end_ms": batch_end_ms,
-            "duration_sec": max(0.0, time.time() - started),
+            "duration_sec": duration_sec,
             "prompt": str(batch.get("prompt") or ""),
             "interval_sec": max(
                 0.2,
@@ -14186,10 +16613,6 @@ class LuxriotManager:
                 else None
             )
             state_observations = self._compact_state_observations(structured_states)
-            if not state_observations:
-                state_observations = self._extract_current_observed_states(
-                    str(normalized["summary"])
-                )
             state_transitions = self._update_observed_state_tracker(
                 channel_id,
                 state_observations,
@@ -14422,6 +16845,17 @@ class LuxriotManager:
         channels.extend(
             channel for channel in local_channels if int(channel["id"]) not in known_ids
         )
+        stream_meta = dict(getattr(client, "channel_inventory_meta", None) or {})
+        reconciliation: Dict[str, Any] = {
+            "performed": False,
+            "stopped_channel_ids": [],
+            "unavailable_channel_ids": [],
+            "missing_channel_ids": [],
+        }
+        if upstream_error is None and stream_meta.get("complete") is True:
+            reconciliation = self._reconcile_live_sessions_with_inventory(
+                channels
+            )
         refreshed_at = time.time()
         with self.cache_lock:
             self.channels_cache = (refreshed_at, [dict(channel) for channel in channels])
@@ -14429,12 +16863,76 @@ class LuxriotManager:
             self.channels_cache_last_error = upstream_error
             if upstream_error is None:
                 self.channels_cache_last_success_at = refreshed_at
-            stream_meta = dict(getattr(client, "channel_inventory_meta", None) or {})
             if stream_meta.get("error"):
                 stream_meta["error"] = _safe_error_text(stream_meta.get("error"), 500)
             stream_meta["local_channel_count"] = len(local_channels)
+            stream_meta["reconciliation"] = reconciliation
             self.channels_cache_stream_meta = stream_meta
         return [dict(channel) for channel in channels]
+
+    @staticmethod
+    def _channel_explicitly_unavailable(channel: Mapping[str, Any]) -> bool:
+        if channel.get("enabled") is False:
+            return True
+        return str(channel.get("availability") or "").strip().lower() in {
+            "disabled",
+            "offline",
+            "unavailable",
+        }
+
+    def _reconcile_live_sessions_with_inventory(
+        self,
+        channels: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        inventory_ids = {
+            int(channel_id)
+            for channel_id in (
+                _parse_optional_int(channel.get("id"))
+                for channel in channels
+                if isinstance(channel, Mapping)
+            )
+            if channel_id is not None and channel_id > 0
+        }
+        unavailable_ids = {
+            int(channel_id)
+            for channel_id in (
+                _parse_optional_int(channel.get("id"))
+                for channel in channels
+                if isinstance(channel, Mapping)
+                and self._channel_explicitly_unavailable(channel)
+            )
+            if channel_id is not None and channel_id > 0
+        }
+        with self.cache_lock:
+            active_video_ids = set(self.sessions)
+            active_analytics_ids = (
+                set(self.probe_sessions) | set(self.shared_probe_channels)
+            )
+        active_ids = active_video_ids | active_analytics_ids
+        missing_ids = active_ids - inventory_ids
+        stop_ids = sorted(missing_ids | (active_ids & unavailable_ids))
+        failures: Dict[str, str] = {}
+        for channel_id in stop_ids:
+            try:
+                if channel_id in active_video_ids:
+                    self.stop_session(channel_id, update_desired=False)
+                if channel_id in active_analytics_ids:
+                    self.stop_probe_capture(channel_id, pause=False)
+            except Exception as exc:
+                failures[str(channel_id)] = (
+                    _safe_error_text(exc, 240) or exc.__class__.__name__
+                )
+        return {
+            "performed": True,
+            "stopped_channel_ids": [
+                channel_id
+                for channel_id in stop_ids
+                if str(channel_id) not in failures
+            ],
+            "unavailable_channel_ids": sorted(unavailable_ids),
+            "missing_channel_ids": sorted(missing_ids),
+            "failures": failures,
+        }
 
     def channel_inventory_status(self) -> Dict[str, Any]:
         """Expose cache freshness without changing the long-standing list return type."""
@@ -14648,13 +17146,19 @@ class LuxriotManager:
         return None
 
     @classmethod
-    def _alert_output_diagnostics(cls, summary_text: str) -> Dict[str, Any]:
+    def _structured_alert_payloads(cls, summary_text: str) -> List[Dict[str, Any]]:
+        """Return alerts only from valid machine-readable output.
+
+        Prose alert headings remain visible as diagnostics for old archive
+        entries, but they are not authoritative enough to drive bookmarks,
+        alert badges, state, or memory.
+        """
+
         text = str(summary_text or "")
-        json_count = 0
-        seen_json: Set[str] = set()
+        payloads: List[Dict[str, Any]] = []
+        seen_payloads: Set[str] = set()
 
         def add_json_candidate(raw: Any) -> None:
-            nonlocal json_count
             if not isinstance(raw, Mapping):
                 return
             alerts = raw.get("alerts")
@@ -14664,10 +17168,14 @@ class LuxriotManager:
                 key = json.dumps(raw, ensure_ascii=False, sort_keys=True)
             except Exception:
                 key = repr(raw)
-            if key in seen_json:
+            if key in seen_payloads:
                 return
-            seen_json.add(key)
-            json_count += sum(1 for alert in alerts if isinstance(alert, Mapping))
+            seen_payloads.add(key)
+            payloads.extend(
+                dict(alert)
+                for alert in alerts
+                if isinstance(alert, Mapping)
+            )
 
         for match in re.finditer(r"```json(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
             try:
@@ -14675,23 +17183,25 @@ class LuxriotManager:
             except Exception:
                 continue
 
-        lowered = text.lower()
-        for marker in ("batch_state_json:", "alerts_json:"):
-            search_pos = 0
-            while True:
-                marker_idx = lowered.find(marker, search_pos)
-                if marker_idx < 0:
-                    break
-                chunk = cls._extract_balanced_json_blob(text, marker_idx + len(marker))
-                if not chunk:
-                    search_pos = marker_idx + 1
-                    continue
-                json_blob, next_idx = chunk
-                try:
-                    add_json_candidate(json.loads(json_blob))
-                except Exception:
-                    pass
-                search_pos = max(next_idx, marker_idx + 1)
+        marker_pattern = re.compile(
+            r"\b(?:BATCH[\s_-]*STATE[\s_-]*JSON|ALERTS[\s_-]*JSON)\s*:",
+            flags=re.IGNORECASE,
+        )
+        search_pos = 0
+        while True:
+            marker_match = marker_pattern.search(text, search_pos)
+            if marker_match is None:
+                break
+            chunk = cls._extract_balanced_json_blob(text, marker_match.end())
+            if not chunk:
+                search_pos = marker_match.start() + 1
+                continue
+            json_blob, next_idx = chunk
+            try:
+                add_json_candidate(json.loads(json_blob))
+            except Exception:
+                pass
+            search_pos = max(next_idx, marker_match.start() + 1)
 
         for match in re.finditer(r"\{\s*\"alerts\"\s*:", text, flags=re.IGNORECASE):
             chunk = cls._extract_balanced_json_blob(text, match.start())
@@ -14701,7 +17211,61 @@ class LuxriotManager:
                 add_json_candidate(json.loads(chunk[0]))
             except Exception:
                 continue
+        return payloads
 
+    @classmethod
+    def _has_structured_alert_contract(cls, summary_text: str) -> bool:
+        text = str(summary_text or "")
+        for match in re.finditer(r"```json(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+            try:
+                payload = json.loads(match.group(1))
+            except Exception:
+                continue
+            if isinstance(payload, Mapping) and isinstance(payload.get("alerts"), list):
+                return True
+
+        marker_pattern = re.compile(
+            r"\b(?:BATCH[\s_-]*STATE[\s_-]*JSON|ALERTS[\s_-]*JSON)\s*:",
+            flags=re.IGNORECASE,
+        )
+        search_pos = 0
+        while True:
+            marker_match = marker_pattern.search(text, search_pos)
+            if marker_match is None:
+                break
+            chunk = cls._extract_balanced_json_blob(text, marker_match.end())
+            if chunk:
+                try:
+                    payload = json.loads(chunk[0])
+                except Exception:
+                    payload = None
+                if isinstance(payload, Mapping):
+                    return True
+                search_pos = max(chunk[1], marker_match.start() + 1)
+            else:
+                search_pos = marker_match.start() + 1
+
+        for match in re.finditer(r"\{\s*\"alerts\"\s*:", text, flags=re.IGNORECASE):
+            chunk = cls._extract_balanced_json_blob(text, match.start())
+            if not chunk:
+                continue
+            try:
+                payload = json.loads(chunk[0])
+            except Exception:
+                continue
+            if isinstance(payload, Mapping) and isinstance(payload.get("alerts"), list):
+                return True
+        return False
+
+    @classmethod
+    def _alert_output_diagnostics(cls, summary_text: str) -> Dict[str, Any]:
+        text = str(summary_text or "")
+        structured_contract = cls._has_structured_alert_contract(text)
+        structured_alerts = cls._structured_alert_payloads(text)
+        json_count = len(structured_alerts)
+
+        # Count legacy prose separately. It is useful for diagnosing model
+        # contract drift, but is deliberately not promoted to a real alert.
         prose_count = len(
             re.findall(
                 r"^\s*(?:[-*•]|\d+[.)])?\s*"
@@ -14712,32 +17276,11 @@ class LuxriotManager:
             )
         )
         return {
-            "alerts_detected": cls._contains_alerts_json(text),
+            "alerts_detected": bool(structured_alerts or prose_count),
+            "structured_alert_contract": bool(structured_contract),
             "json_alert_count": int(max(0, json_count)),
             "prose_alert_count": int(max(0, prose_count)),
         }
-
-    @staticmethod
-    def _contains_alerts_json(summary_text: str) -> bool:
-        text = str(summary_text or "")
-        lowered = text.lower()
-        if (
-            "```json" in lowered
-            or "alerts_json:" in lowered
-            or "batch_state_json:" in lowered
-        ):
-            return True
-        if re.search(r'^\s*\{\s*["\']alerts["\']\s*:', text, flags=re.IGNORECASE | re.MULTILINE):
-            return True
-        if re.search(
-            r"^\s*(?:[-*•]|\d+[.)])?\s*"
-            r"(?:info(?:rmation(?:al)?)?|low|warn(?:ing)?|normal|moderate|high|critical|danger|emergency)"
-            r"\s*(?:level|alert|severity)?\s*[:\-–]\s*\S+",
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
-        ):
-            return True
-        return False
 
     def _bookmark_recently_sent_locked(self, channel_id: int, fingerprint: str, now_ms: int, cooldown_sec: float) -> bool:
         if cooldown_sec <= 0:
@@ -14808,11 +17351,17 @@ class LuxriotManager:
         max_ts_ms: Optional[int] = None,
     ) -> AlertDeliveryResult:
         diagnostics = self._alert_output_diagnostics(summary_text)
-        if not self.alert_parser:
+        structured_contract = bool(diagnostics.get("structured_alert_contract"))
+        if not structured_contract:
             return AlertDeliveryResult(
                 alerts_detected=bool(diagnostics.get("alerts_detected")),
                 json_alert_count=int(diagnostics.get("json_alert_count") or 0),
                 prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
+                parser_error=(
+                    "structured_alert_contract_missing"
+                    if bool(diagnostics.get("alerts_detected"))
+                    else None
+                ),
             )
         base_ts_ms = self._normalize_alert_timestamp_ms_bounded(
             default_ts_ms,
@@ -14823,34 +17372,14 @@ class LuxriotManager:
         with self.cache_lock:
             settings = self._get_channel_bookmark_settings_locked(channel_id)
         cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
-        if not bool(diagnostics.get("alerts_detected")):
-            return AlertDeliveryResult(
-                alerts_detected=False,
-                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
-                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
-            )
-        try:
-            parsed_alerts = self.alert_parser(summary_text, int(channel_id), base_ts_ms)
-        except TypeError:
-            try:
-                parsed_alerts = cast(Any, self.alert_parser)(summary_text, int(channel_id))
-            except Exception as exc:
-                return AlertDeliveryResult(
-                    alerts_detected=True,
-                    json_alert_count=int(diagnostics.get("json_alert_count") or 0),
-                    prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
-                    parser_error=_safe_error_text(exc, 240) or exc.__class__.__name__,
-                )
-        except Exception as exc:
-            return AlertDeliveryResult(
-                alerts_detected=True,
-                json_alert_count=int(diagnostics.get("json_alert_count") or 0),
-                prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
-                parser_error=_safe_error_text(exc, 240) or exc.__class__.__name__,
-            )
+        parsed_alerts = self._parse_structured_alerts(
+            summary_text,
+            channel_id=int(channel_id),
+            timestamp_ms=int(base_ts_ms),
+        )
         if not isinstance(parsed_alerts, list) or not parsed_alerts:
             return AlertDeliveryResult(
-                alerts_detected=True,
+                alerts_detected=bool(diagnostics.get("alerts_detected")),
                 json_alert_count=int(diagnostics.get("json_alert_count") or 0),
                 prose_alert_count=int(diagnostics.get("prose_alert_count") or 0),
             )
@@ -14879,6 +17408,10 @@ class LuxriotManager:
                     max_ts_ms=max_ts_ms,
                 ),
             }
+            alert["id"] = derive_parent_alert_id(
+                alert,
+                channel_id=int(channel_id),
+            )
             snapshot_indices = [
                 int(snapshot_index)
                 for snapshot_index in (
@@ -15415,6 +17948,8 @@ class LuxriotManager:
             "bookmark_last_error",
             "coverage_gap",
             "gap_reason",
+            "gap_error_type",
+            "gap_error",
             "coalesced",
             "archive_inserted",
             "thumbnail_detection_id",
@@ -15827,6 +18362,7 @@ class LuxriotManager:
             "shared_analytics_count": sum(1 for item in analytics_streams if bool(item.get("shared_capture"))),
             "attention": self.attention_status(),
             "rollup_scheduler": rollup_scheduler_status,
+            "rollup_l3_deep_review": self.rollup_l3_deep_status(),
             "rollup_backfill": self.rollup_backfill_status(),
         }
 

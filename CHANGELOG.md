@@ -33,14 +33,52 @@ Format loosely follows Keep a Changelog.
   required inventory/detail steps are enforced for video research; duplicate
   read calls are suppressed; video turns stop after a bounded 10 tool calls
   and synthesize from completed evidence instead of running until the chat
-  disconnects.
+  disconnects. EVA now discovers vLLM `max_model_len` and budgets against the
+  smaller served/configured context, runbooks expose explicit tool allowlists
+  with per-scenario call ceilings, and a failed final model synthesis returns
+  and persists an evidence-only result instead of discarding completed calls.
 - **UI:** the archive review modal pins preview, filmstrip, feedback, and
   summary to distinct grid rows, preserving a large snapshot preview while
-  long L0 text scrolls independently.
+  long L0 text scrolls independently. Agent research traces now preserve the
+  operator's expand/collapse choice during streaming and after session reload;
+  archive stream scope is a full-width searchable multi-select instead of a
+  clipped half-column checkbox list. Opening a VLM-feed cover now renders its
+  stored thumbnail immediately, loads batch neighbors from either the Video or
+  Archive workspace, and exits the loading state with a bounded fallback if
+  neighbor lookup stalls.
+- **Probes tab:** the Monitoring tab is now **Probes**. Probes carry an
+  `origin` of `operator`, `agent`, or `auto`, backfilled on read for probes
+  stored earlier, so an approved agent probe is no longer indistinguishable
+  from a hand-made one; an operator edit no longer strips a probe's authorship
+  or its alert lineage. The board nests operator-defined channel group →
+  channel → probes with grid and list layouts, author/state/search filters, an
+  activity sparkline in place of the empty preview placeholder, an expiry
+  countdown on temporary probes, and a jump from a background probe to its
+  parent alert in the archive. Channel groups are EVA-side file-backed state
+  (`EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE`); deleting a group never deletes
+  probes.
+- **Protocol Deploy:** the agent now commissions up to eight authorized
+  channels through a durable inventory → groups → visual survey → operator
+  policy → composite preview/apply workflow designed for a 4B head. Apply
+  preserves unrelated Alert Criteria and installs bounded starter probes,
+  counted-state profiles, the operator's preemptible 9B quiet window, and
+  optional live starts. The first 15-minute pass requests one bounded L1,
+  calibrates P/N/M from continuous semantic snapshots, and emits
+  proposal-only threshold/cadence changes. Counted transition/dwell queries
+  remain independent of alert cooldown and delivery.
+- **Offline port appliance:** an English interactive Ubuntu Server 24.04
+  installer and USB-bundle builder now cover a clean RTX 4070 Super / i9 /
+  64-GB deployment without network access. The bundle carries a local APT
+  repository, Python 3.12 wheelhouse, PostgreSQL 16, NVIDIA driver and HWE
+  kernel, Qwen3-VL-4B AWQ for vLLM, Qwen3.5-9B-MTP Q4 for preemptible CPU
+  review, CLIP weights, and portable llama.cpp source. The installer verifies
+  disk/GPU/schema state, preserves or backs up existing state, writes the
+  runtime `.env`, provisions systemd and TLS, and hands off to Protocol Deploy.
 - **Upgrade:** database migration required from β 0.8.4. Apply revisions
-  `20260725_0007`, `20260726_0008`, and `20260726_0009`; resulting schema head
-  is `20260726_0009`.
-- **Verification:** 782 passed, 23 skipped, 138 subtests passed.
+  `20260725_0007` through `20260727_0010`; resulting schema head is
+  `20260727_0010`. New audit writes form a concurrency-safe, tenant-scoped
+  SHA-256 chain.
+- **Verification:** 925 passed, 23 skipped, 156 subtests passed.
   See `readiness/RELEASE_NOTES_0.8.5.md`.
 
 ## β 0.8.4 — 2026-07-15 (attention decider, media broker, stabilization)

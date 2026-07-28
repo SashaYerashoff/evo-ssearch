@@ -90,6 +90,9 @@ class CompactAttentionSignalTests(unittest.TestCase):
 
         class Manager:
             probe_manager = ProbeManager()
+            config = SimpleNamespace(
+                LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS=1000,
+            )
 
             @staticmethod
             def should_dispatch_probe_frame(_channel_id, *, capture_kind):
@@ -113,13 +116,13 @@ class CompactAttentionSignalTests(unittest.TestCase):
         image = Image.new("RGB", (4, 4))
 
         first = session._add_selected_probe_frame(image, 10_000, {})
-        skipped = session._add_selected_probe_frame(image, 14_999, {})
-        second = session._add_selected_probe_frame(image, 15_000, {})
+        skipped = session._add_selected_probe_frame(image, 10_999, {})
+        second = session._add_selected_probe_frame(image, 11_000, {})
 
         self.assertIsNotNone(first)
         self.assertIsNone(skipped)
         self.assertIsNotNone(second)
-        self.assertEqual([timestamp for _channel, timestamp, _meta in calls], [10_000, 15_000])
+        self.assertEqual([timestamp for _channel, timestamp, _meta in calls], [10_000, 11_000])
         self.assertEqual(session.capture_apex_probe_skipped_count, 1)
 
 
@@ -198,7 +201,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in batches], [16])
             self.assertEqual(session.status()["pending_frames"], 0)
 
-    def test_quiet_frames_are_sampled_every_five_seconds_and_flush_at_one_minute(self):
+    def test_quiet_frames_are_sampled_every_ten_seconds_and_flush_at_target(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -213,17 +216,17 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
                 lambda frames, **_kwargs: batches.append(list(frames)) is None or True
             )
 
-            for offset in range(61):
+            for offset in range(71):
                 with session.lock:
                     session._admit_summary_frame_locked(
                         self._frame(100.0 + offset, "quiet")
                     )
                 session._summarize_if_ready()
 
-            self.assertEqual([len(batch) for batch in batches], [13])
+            self.assertEqual([len(batch) for batch in batches], [8])
             self.assertEqual(
                 [frame["captured_at"] for frame in batches[0]],
-                [100.0 + offset for offset in range(0, 61, 5)],
+                [100.0 + offset for offset in range(0, 71, 10)],
             )
 
     def test_attention_telemetry_does_not_start_sparse_vlm_dispatch_by_default(self):
@@ -244,7 +247,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertFalse(status["dispatch_enabled"])
             self.assertFalse(status["scheduler_alive"])
 
-    def test_deadline_excludes_a_frame_beyond_the_sixty_second_window(self):
+    def test_quiet_deadline_excludes_a_frame_beyond_the_120_second_window(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -261,8 +264,8 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             with session.lock:
                 session.frames = [
                     self._frame(100.0, "quiet"),
-                    self._frame(155.0, "quiet"),
-                    self._frame(161.0, "quiet"),
+                    self._frame(215.0, "quiet"),
+                    self._frame(221.0, "quiet"),
                 ]
                 session._summary_batch_opened_monotonic = 0.0
 
@@ -270,11 +273,11 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
 
             self.assertEqual(
                 [[frame["captured_at"] for frame in batch] for batch in batches],
-                [[100.0, 155.0]],
+                [[100.0, 215.0]],
             )
             self.assertEqual(
                 [frame["captured_at"] for frame in session.frames],
-                [161.0],
+                [221.0],
             )
 
     def test_attention_mode_retains_frozen_frames_for_quiet_heartbeat(self):

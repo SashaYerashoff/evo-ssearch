@@ -44,6 +44,12 @@ from agent_research import (
 from agent_security import ToolExecutionContext, ToolGatewayError
 from agent_security.audit import ToolAuditEvent
 from agent_security.eva_adapter import EvaAgentToolAdapter
+from deployment_workflow import (
+    DeploymentWorkflowError,
+    ProtocolDeploymentStore,
+    aggregate_counted_state_metric,
+    compact_deployment_state,
+)
 from lm_admission import (
     configured_lm_capacity,
     get_lm_admission_controller,
@@ -89,6 +95,30 @@ AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS = _int_env(
     minimum=5,
     maximum=16,
 )
+AGENT_INTENT_TOOL_CALL_LIMITS: Dict[str, int] = {
+    "help": 2,
+    "channel_inventory": 4,
+    "runtime": 3,
+    "prompt_policy": 6,
+    "video_research": AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+    "counted_state": 4,
+    "deployment": 8,
+    "archive_research": 12,
+    "probe_management": 16,
+    "bookmark": 6,
+    "summary_restore": 8,
+}
+AGENT_SKILL_TOOL_CALL_LIMITS: Dict[str, int] = {
+    "archive_research": 12,
+    "cross_channel_correlation": 10,
+    "multi_channel_event_sweep": 10,
+    "probe_tuning": 16,
+    "prompt_tuning": 6,
+    "protocol_deploy": 8,
+    "video_event_check": 10,
+    "video_incident_timeline": 10,
+    "video_summary_review": 10,
+}
 AGENT_CONTEXT_LIMIT_TOKENS = _int_env("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", 65_536, minimum=8_192)
 AGENT_MAX_OUTPUT_TOKENS = _int_env("EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS", 2_048, minimum=256, maximum=8_192)
 AGENT_CONTEXT_CHARS_PER_TOKEN = _int_env("EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN", 3, minimum=1, maximum=12)
@@ -108,16 +138,20 @@ if AGENT_CONTEXT_HARD_TOKENS <= AGENT_CONTEXT_WARNING_TOKENS:
     AGENT_CONTEXT_HARD_TOKENS = AGENT_CONTEXT_WARNING_TOKENS + 1_000
 
 ARCHIVE_SOURCE_LABELS = {
+    "semantic_snapshot": "Independent semantic snapshot",
     "probe": "Probe hit",
     "vlm_summary": "Video-description frame",
     "vlm_alert": "VLM alert frame",
 }
 ARCHIVE_SOURCE_ITEM_TYPES = {
+    "semantic_snapshot": "semantic_snapshot",
     "probe": "probe_detection",
     "vlm_summary": "video_description_frame",
     "vlm_alert": "video_description_alert",
 }
 ARCHIVE_SOURCE_ALIASES = {
+    "continuous_clip": "semantic_snapshot",
+    "semantic_snapshots": "semantic_snapshot",
     "detection": "probe",
     "detections": "probe",
     "probe_hit": "probe",
@@ -1568,8 +1602,20 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "sources": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["vlm_summary", "vlm_alert", "probe"]},
-                        "description": "Archive frame sources to scan. Default: ['vlm_summary','vlm_alert'].",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "semantic_snapshot",
+                                "vlm_summary",
+                                "vlm_alert",
+                                "probe",
+                            ],
+                        },
+                        "description": (
+                            "Archive frame sources to scan. Use semantic_snapshot for "
+                            "independent cadence-based CLIP coverage; default remains "
+                            "video-description evidence for ad-hoc investigations."
+                        ),
                     },
                     "since_hours": {
                         "type": "number",
@@ -1701,6 +1747,300 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         },
     },
 ]
+
+_TOOL_SCHEMAS.extend(
+    [
+        {
+            "type": "function",
+            "function": {
+                "name": "start_deployment",
+                "description": (
+                    "Start or resume the durable Protocol Deploy workflow. "
+                    "Returns the authorized channel inventory and asks the operator "
+                    "to select at most 8 channels. This is the C/inventory block."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target_channel_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 8,
+                            "description": "Requested pilot size. Default and maximum: 8.",
+                        },
+                        "resume_latest": {
+                            "type": "boolean",
+                            "description": "Resume the latest unfinished deployment. Default: true.",
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "configure_deployment",
+                "description": (
+                    "Save the operator-selected deployment scope, optional channel "
+                    "groups, alert/routine requirements, and consolidation quiet "
+                    "window. This changes only the durable draft, not live settings. "
+                    "Copy channel IDs from start_deployment and semantic requirements "
+                    "from the operator; do not invent private identity claims."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "deployment_id": {"type": "string"},
+                        "channel_ids": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {"type": "integer"},
+                            "description": "Selected channel IDs copied from inventory/operator.",
+                        },
+                        "groups": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "channel_ids": {
+                                        "type": "array",
+                                        "items": {"type": "integer"},
+                                    },
+                                },
+                                "required": ["name", "channel_ids"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "requirements": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "description": (
+                                "Operator-grounded policy packs. One pack may target "
+                                "one channel or a group of selected channels."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "channel_ids": {
+                                        "type": "array",
+                                        "items": {"type": "integer"},
+                                    },
+                                    "expected_routine": {"type": "string"},
+                                    "unexpected_severity": {
+                                        "type": "string",
+                                        "enum": [
+                                            "ignore",
+                                            "log",
+                                            "info",
+                                            "low",
+                                            "normal",
+                                            "high",
+                                            "critical",
+                                        ],
+                                    },
+                                    "novelty_sensitivity": {
+                                        "type": "string",
+                                        "enum": ["low", "balanced", "high"],
+                                    },
+                                    "alerts": {
+                                        "type": "array",
+                                        "maxItems": 6,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": {"type": "string"},
+                                                "description": {"type": "string"},
+                                                "severity": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "ignore",
+                                                        "log",
+                                                        "info",
+                                                        "low",
+                                                        "normal",
+                                                        "high",
+                                                        "critical",
+                                                    ],
+                                                },
+                                                "positive_query": {
+                                                    "type": "string",
+                                                    "description": "Visible CLIP-positive state.",
+                                                },
+                                                "contrast_query": {
+                                                    "type": "string",
+                                                    "description": "Visible contrast state; avoid literal negation.",
+                                                },
+                                                "counter_mode": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "none",
+                                                        "count_transitions",
+                                                        "measure_duration",
+                                                        "count_and_duration",
+                                                    ],
+                                                },
+                                                "positive_label": {"type": "string"},
+                                                "negative_label": {"type": "string"},
+                                                "count_transition": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "positive_to_negative",
+                                                        "negative_to_positive",
+                                                        "any",
+                                                    ],
+                                                },
+                                                "duration_state": {
+                                                    "type": "string",
+                                                    "enum": ["positive", "negative"],
+                                                },
+                                                "min_state_samples": {"type": "integer"},
+                                                "min_state_duration_sec": {"type": "number"},
+                                                "merge_gap_sec": {"type": "number"},
+                                                "alert_after_sec": {"type": "number"},
+                                            },
+                                            "required": ["name", "description", "severity"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": ["name", "channel_ids"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "quiet_window": {
+                            "type": "object",
+                            "description": (
+                                "Preferred, preemptible 9B consolidation window; "
+                                "live monitoring never stops."
+                            ),
+                            "properties": {
+                                "enabled": {"type": "boolean"},
+                                "timezone": {"type": "string"},
+                                "start_local": {"type": "string"},
+                                "end_local": {"type": "string"},
+                                "days": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 6,
+                                    },
+                                },
+                                "max_deferral_seconds": {"type": "number"},
+                            },
+                            "required": [
+                                "enabled",
+                                "timezone",
+                                "start_local",
+                                "end_local",
+                                "days",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["deployment_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "survey_deployment",
+                "description": (
+                    "Run one server-side, bounded live survey for the selected "
+                    "deployment channels and persist full results outside chat. "
+                    "Returns compact scene fingerprints suitable for a 4B agent."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "deployment_id": {"type": "string"},
+                        "fast_mode": {
+                            "type": "boolean",
+                            "description": "Use 2 samples over ~4 seconds instead of the normal survey.",
+                        },
+                    },
+                    "required": ["deployment_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_deployment_plan",
+                "description": (
+                    "Build and preview one composite deployment plan: channel groups, "
+                    "VLM Alert Criteria, bounded homeostatic probes, counted-state "
+                    "profiles, quiet window, and optional live start. Model calls must "
+                    "use preview=true; the operator applies the plan with the UI Apply button."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "deployment_id": {"type": "string"},
+                        "start_live": {"type": "boolean"},
+                        "commissioning_after_minutes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 120,
+                        },
+                        "preview": {"type": "boolean"},
+                    },
+                    "required": ["deployment_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_deployment_status",
+                "description": (
+                    "Read compact durable Protocol Deploy stage, applied receipt, "
+                    "and first commissioning status. Use deployment_id from a prior result."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"deployment_id": {"type": "string"}},
+                    "required": ["deployment_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_counted_state_metric",
+                "description": (
+                    "Aggregate a saved counted-state/duration-state profile from "
+                    "independent archived visual samples. Use for questions such as "
+                    "'how many times did the workstation occupant leave and how long "
+                    "was the workstation occupied'. Counts are episodes, not delivered alerts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "metric_id": {"type": "string"},
+                        "metric_name": {"type": "string"},
+                        "channel_id": {"type": "integer"},
+                        "since_hours": {"type": "number"},
+                        "from_ts": {"type": "number"},
+                        "to_ts": {"type": "number"},
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1869,7 +2209,9 @@ class _AgentLMClient:
     def __init__(self, base_url: str, model: str, api_key: str, timeout: int) -> None:
         if not base_url:
             raise ValueError("LM base URL is not configured (EVOSSEARCH_LM_BASE_URL).")
-        self.endpoint = base_url.rstrip("/") + "/chat/completions"
+        normalized_base_url = base_url.rstrip("/")
+        self.endpoint = normalized_base_url + "/chat/completions"
+        self.models_endpoint = normalized_base_url + "/models"
         self.model    = model
         self.timeout  = timeout
         self.admission_resource = normalize_lm_resource(base_url, model)
@@ -1880,6 +2222,79 @@ class _AgentLMClient:
         self.headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
+        self._server_context_limit_tokens: Optional[int] = None
+        self._server_context_limit_checked_at = 0.0
+        self._server_context_limit_probe_ok = False
+
+    def context_limit_tokens(self, *, force: bool = False) -> int:
+        """Return the smaller of EVA's configured limit and the served model limit."""
+
+        now = time.monotonic()
+        refresh_after = 300.0 if self._server_context_limit_probe_ok else 30.0
+        if (
+            not force
+            and self._server_context_limit_checked_at > 0.0
+            and (now - self._server_context_limit_checked_at) < refresh_after
+        ):
+            return min(
+                AGENT_CONTEXT_LIMIT_TOKENS,
+                self._server_context_limit_tokens or AGENT_CONTEXT_LIMIT_TOKENS,
+            )
+
+        self._server_context_limit_checked_at = now
+        try:
+            response = requests.get(
+                self.models_endpoint,
+                headers=self.headers,
+                timeout=(self.connect_timeout, min(15, self.connect_timeout)),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("data") if isinstance(payload, Mapping) else None
+            if not isinstance(rows, list):
+                rows = []
+            selected = next(
+                (
+                    row
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("id") or "").strip() == self.model
+                ),
+                None,
+            )
+            if selected is None:
+                selected = next(
+                    (row for row in rows if isinstance(row, Mapping)),
+                    None,
+                )
+            selected_meta = (
+                selected.get("meta")
+                if isinstance(selected, Mapping)
+                and isinstance(selected.get("meta"), Mapping)
+                else {}
+            )
+            raw_limit = (
+                selected.get("max_model_len")
+                or selected.get("context_length")
+                or selected.get("n_ctx")
+                or selected_meta.get("n_ctx")
+                if isinstance(selected, Mapping)
+                else None
+            )
+            served_limit = int(raw_limit)
+            if served_limit < 1_024:
+                raise ValueError("served max_model_len is implausibly small")
+            self._server_context_limit_tokens = served_limit
+            self._server_context_limit_probe_ok = True
+        except Exception:
+            # OpenAI-compatible servers are not required to expose max_model_len.
+            # Fall back to the configured contract and retry discovery later.
+            self._server_context_limit_probe_ok = False
+
+        return min(
+            AGENT_CONTEXT_LIMIT_TOKENS,
+            self._server_context_limit_tokens or AGENT_CONTEXT_LIMIT_TOKENS,
+        )
 
     def admission_status(self) -> Dict[str, Any]:
         status = self.admission_controller.status()
@@ -2076,6 +2491,8 @@ class AgentTools:
         encode_jpeg_fn: Callable[..., str],
         search_indexed_folder_fn: Callable[..., List[Dict[str, Any]]],
         search_detections_fn: Callable[..., List[Dict[str, Any]]],
+        channel_group_store: Any | None = None,
+        deployment_store: ProtocolDeploymentStore | None = None,
     ) -> None:
         self._ds   = detections_store
         self._ps   = probes_store
@@ -2086,9 +2503,24 @@ class AgentTools:
         self._jpeg = encode_jpeg_fn
         self._search_folder    = search_indexed_folder_fn
         self._search_det       = search_detections_fn
+        self._channel_groups = channel_group_store
+        self._deployment_store = deployment_store or ProtocolDeploymentStore(
+            getattr(luxriot_manager, "runtime_state_store", None)
+        )
         self._local = threading.local()
         self._workflow_jobs: Dict[str, _WorkflowJob] = {}
         self._workflow_jobs_lock = threading.RLock()
+        self._commissioning_lock = threading.RLock()
+        self._commissioning_threads: Dict[str, threading.Thread] = {}
+        try:
+            pending_deployments = self._deployment_store.list_states()
+        except Exception:
+            pending_deployments = []
+        for deployment in pending_deployments:
+            if str(deployment.get("stage") or "") == "commissioning_pending":
+                self._schedule_deployment_commissioning(
+                    str(deployment.get("deployment_id") or "")
+                )
 
     def _set_trusted_permissions(self, permissions: Optional[Sequence[str]]) -> None:
         """Authz set by the secure adapter from the execution context only.
@@ -2171,6 +2603,12 @@ class AgentTools:
             "list_video_summary_channels": self._list_video_summary_channels,
             "list_probes":          self._list_probes,
             "survey_channels":      self._survey_channels,
+            "start_deployment":     self._start_deployment,
+            "configure_deployment": self._configure_deployment,
+            "survey_deployment":    self._survey_deployment,
+            "apply_deployment_plan": self._apply_deployment_plan,
+            "get_deployment_status": self._get_deployment_status,
+            "query_counted_state_metric": self._query_counted_state_metric,
             "build_research_batch": self._build_research_batch,
             "create_probe":         self._create_probe,
             "deploy_summary":       self._deploy_summary,
@@ -4225,6 +4663,1037 @@ class AgentTools:
             "channels": survey_items,
         }
 
+    # ── Protocol Deploy ────────────────────────────────────────────────────
+
+    def _start_deployment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not hasattr(self._lxm, "get_channels"):
+            raise ToolError("Channel inventory is not available.")
+        try:
+            channels = self._lxm.get_channels(force=True)
+            allowed_channel_ids = {
+                str(item)
+                for item in (args.get("channel_ids") or [])
+                if str(item).strip()
+            }
+            if allowed_channel_ids:
+                channels = [
+                    item
+                    for item in (channels if isinstance(channels, list) else [])
+                    if isinstance(item, Mapping)
+                    and str(item.get("id")) in allowed_channel_ids
+                ]
+            resume_latest = bool(args.get("resume_latest", True))
+            if resume_latest and allowed_channel_ids:
+                latest = self._deployment_store.latest_unfinished()
+                if isinstance(latest, Mapping):
+                    latest_scope = {
+                        str(item)
+                        for item in (
+                            latest.get("selected_channel_ids")
+                            or [
+                                row.get("id")
+                                for row in (
+                                    latest.get("available_channels") or []
+                                )
+                                if isinstance(row, Mapping)
+                            ]
+                        )
+                        if str(item).strip()
+                    }
+                    if not latest_scope.issubset(allowed_channel_ids):
+                        resume_latest = False
+            state = self._deployment_store.start(
+                channels if isinstance(channels, list) else [],
+                target_channel_count=max(
+                    1,
+                    min(8, int(args.get("target_channel_count") or 8)),
+                ),
+                resume_latest=resume_latest,
+            )
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        except Exception as exc:
+            raise ToolError(f"Could not start Protocol Deploy: {exc}") from exc
+        return {
+            **compact_deployment_state(state),
+            "instruction": (
+                "Ask the operator to choose up to 8 channels and optional groups. "
+                "Then call configure_deployment with IDs copied from this inventory."
+            ),
+        }
+
+    def _configure_deployment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = str(args.get("deployment_id") or "").strip()
+        try:
+            state = self._deployment_store.configure(
+                deployment_id,
+                channel_ids=(
+                    args.get("channel_ids")
+                    if "channel_ids" in args
+                    else None
+                ),
+                groups=args.get("groups") if "groups" in args else None,
+                requirements=(
+                    args.get("requirements")
+                    if "requirements" in args
+                    else None
+                ),
+                quiet_window=(
+                    args.get("quiet_window")
+                    if "quiet_window" in args
+                    else None
+                ),
+            )
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        except Exception as exc:
+            raise ToolError(f"Could not configure deployment: {exc}") from exc
+        return {
+            **compact_deployment_state(state),
+            "instruction": {
+                "scope_configured": (
+                    "Call survey_deployment. After the compact scene survey, ask "
+                    "for expected routine, visible alert criteria, novelty response, "
+                    "counted states, and a preferred consolidation window."
+                ),
+                "requirements_configured": (
+                    "Call apply_deployment_plan with preview=true."
+                ),
+            }.get(str(state.get("stage") or ""), "Continue from next_action."),
+        }
+
+    def _survey_deployment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = str(args.get("deployment_id") or "").strip()
+        try:
+            state = self._deployment_store.load(deployment_id)
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        channel_ids = [
+            int(item) for item in (state.get("selected_channel_ids") or [])
+        ]
+        if not channel_ids:
+            raise ToolError("Configure deployment channels before survey.")
+        # Keep the vision task literal and shallow for Qwen3-VL-4B.  The
+        # language agent receives compact receipts, while full survey text is
+        # persisted in the durable deployment state.
+        survey_prompt = (
+            "Inspect only the supplied snapshots. Return four short lines: "
+            "SCENE: fixed physical area and camera viewpoint; "
+            "VISIBLE ROUTINE: repeated people/vehicles/objects only if visible; "
+            "CHANGES: observable motion or scene changes across snapshots; "
+            "CANDIDATE WATCHES: up to three concrete visible states worth asking "
+            "the operator about. Say UNKNOWN for ambiguity. Do not identify people, "
+            "infer intent, or choose alert severity."
+        )
+        try:
+            survey_result = self._survey_channels(
+                {
+                    "channel_ids": channel_ids,
+                    "fast_mode": bool(args.get("fast_mode", False)),
+                    "prompt": survey_prompt,
+                }
+            )
+            state = self._deployment_store.record_survey(
+                deployment_id,
+                survey_result,
+            )
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolError(f"Deployment survey failed: {exc}") from exc
+        surveys = [
+            {
+                "channel_id": row.get("channel_id"),
+                "title": row.get("title"),
+                "sample_count": row.get("sample_count"),
+                "scene_fingerprint": str(row.get("survey") or "")[:700],
+                "error": row.get("error"),
+            }
+            for row in (state.get("surveys") or [])
+            if isinstance(row, Mapping)
+        ]
+        return {
+            **compact_deployment_state(state),
+            "surveys": surveys,
+            "instruction": (
+                "Now ask the operator what is routine, which visible conditions "
+                "should alert on each channel/group, how severe unexpected activity "
+                "is, whether any state needs a counter/dwell metric, and the preferred "
+                "preemptible 9B consolidation window. Then call configure_deployment."
+            ),
+        }
+
+    @staticmethod
+    def _deployment_policy_prompt(
+        current_prompt: str,
+        deployment_id: str,
+        generated_prompt: str,
+    ) -> str:
+        start_marker = f"<!-- EVA_PROTOCOL_DEPLOY:{deployment_id}:BEGIN -->"
+        end_marker = f"<!-- EVA_PROTOCOL_DEPLOY:{deployment_id}:END -->"
+        current = str(current_prompt or "").strip()
+        pattern = re.compile(
+            re.escape(start_marker) + r".*?" + re.escape(end_marker),
+            flags=re.DOTALL,
+        )
+        preserved = pattern.sub("", current).strip()
+        section = (
+            f"{start_marker}\n{str(generated_prompt or '').strip()}\n{end_marker}"
+        )
+        return f"{preserved}\n\n{section}".strip() if preserved else section
+
+    @staticmethod
+    def _deployment_probe_payload(
+        raw_probe: Mapping[str, Any],
+        *,
+        existing: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        positives = [
+            str(item).strip()
+            for item in (raw_probe.get("positives") or [])
+            if str(item).strip()
+        ]
+        negatives = [
+            str(item).strip()
+            for item in (raw_probe.get("negatives") or [])
+            if str(item).strip()
+        ]
+        payload = {
+            "name": str(raw_probe.get("name") or "").strip(),
+            "channel_id": int(raw_probe.get("channel_id") or 0),
+            "positives": positives,
+            "negatives": negatives,
+            "pos_floor": float(raw_probe.get("pos_floor") or 0.20),
+            "margin": float(raw_probe.get("margin") or 0.05),
+            "bookmark_cooldown_sec": 20.0,
+            "bookmark_dedupe_window_sec": 60.0,
+            "top_k": max(1, int(raw_probe.get("top_k") or 6)),
+            "window_sec": max(0.0, float(raw_probe.get("window_sec") or 300.0)),
+            "severity": (
+                "normal"
+                if str(raw_probe.get("severity") or "").strip().lower()
+                in {"", "ignore", "log"}
+                else str(raw_probe.get("severity") or "normal")
+            ),
+            # Deployment probes are a cheap homeostatic attention layer. VLM
+            # alert policy owns notification; probes do not independently
+            # create recorder bookmarks by default.
+            "bookmark": False,
+            "enabled": bool(raw_probe.get("enabled", True)),
+            "image_probe": {
+                "enabled": False,
+                "data": None,
+                "name": None,
+                "pos_floor": 0.7,
+            },
+            "roi_enabled": False,
+            "roi_norm": None,
+            "pairs": _probe_pairs_from_lists(positives, negatives),
+            "last_hit": None,
+            "recent_hits": [],
+            "bookmark_gate": None,
+            "bookmark_gate_updated_at_ms": None,
+            "origin": "agent",
+            "deployment_id": raw_probe.get("deployment_id"),
+            "metric_profile_id": raw_probe.get("metric_profile_id"),
+        }
+        if existing:
+            payload = _merge_probe(dict(existing), payload)
+            payload["id"] = existing.get("id")
+        errors = _validate_probe(payload)
+        if errors:
+            raise DeploymentWorkflowError(
+                "invalid deployment probe: " + "; ".join(errors)
+            )
+        return payload
+
+    def _apply_deployment_plan(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = str(args.get("deployment_id") or "").strip()
+        preview = bool(args.get("preview", True))
+        try:
+            state = self._deployment_store.build_plan(
+                deployment_id,
+                start_live=bool(args.get("start_live", True)),
+                commissioning_after_minutes=max(
+                    1,
+                    min(
+                        120,
+                        int(args.get("commissioning_after_minutes") or 15),
+                    ),
+                ),
+            )
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        plan = (
+            dict(state.get("plan"))
+            if isinstance(state.get("plan"), Mapping)
+            else {}
+        )
+        diff = {
+            "channel_ids": [
+                int(item.get("channel_id"))
+                for item in (plan.get("channels") or [])
+                if isinstance(item, Mapping)
+            ],
+            "channel_group_count": len(plan.get("groups") or []),
+            "alert_policy_count": len(plan.get("channels") or []),
+            "probe_count": len(plan.get("probes") or []),
+            "counted_state_count": len(plan.get("counted_states") or []),
+            "quiet_window": copy.deepcopy(plan.get("quiet_window")),
+            "start_live": bool(plan.get("start_live", True)),
+            "commissioning_after_minutes": int(
+                plan.get("commissioning_after_minutes") or 15
+            ),
+        }
+        if preview:
+            return {
+                "status": "preview",
+                "deployment_id": deployment_id,
+                "stage": state.get("stage"),
+                "diff": diff,
+                "per_channel": [
+                    {
+                        "channel_id": item.get("channel_id"),
+                        "alert_policy_preview": str(
+                            item.get("alert_policy_prompt") or ""
+                        )[:1_200],
+                    }
+                    for item in (plan.get("channels") or [])
+                    if isinstance(item, Mapping)
+                ],
+                "operator_action": (
+                    "Review channels and use the UI Apply button. Applying starts "
+                    "a proposal-only commissioning pass after valid coverage accrues."
+                ),
+            }
+
+        applied: Dict[str, Any] = {
+            "groups": [],
+            "prompt_channels": [],
+            "probes": [],
+            "counted_states": [],
+            "live_channels": [],
+            "quiet_window": None,
+        }
+        errors: List[Dict[str, Any]] = []
+
+        if plan.get("groups"):
+            if self._channel_groups is None:
+                errors.append(
+                    {
+                        "stage": "groups",
+                        "error": "channel group store is unavailable",
+                    }
+                )
+            else:
+                existing_groups = self._channel_groups.list_groups()
+                by_name = {
+                    str(item.get("name") or "").strip().casefold(): item
+                    for item in existing_groups
+                    if isinstance(item, Mapping)
+                }
+                for group in plan.get("groups") or []:
+                    try:
+                        existing = by_name.get(
+                            str(group.get("name") or "").strip().casefold()
+                        )
+                        saved = self._channel_groups.upsert_group(
+                            group_id=existing.get("id") if existing else None,
+                            name=group.get("name"),
+                            channel_ids=group.get("channel_ids"),
+                        )
+                        applied["groups"].append(
+                            {
+                                "id": saved.get("id"),
+                                "name": saved.get("name"),
+                                "channel_ids": saved.get("channel_ids"),
+                            }
+                        )
+                    except Exception as exc:
+                        errors.append(
+                            {
+                                "stage": "groups",
+                                "name": group.get("name"),
+                                "error": str(exc),
+                            }
+                        )
+
+        for channel_plan in plan.get("channels") or []:
+            channel_id = int(channel_plan.get("channel_id") or 0)
+            try:
+                current = self._lxm.get_prompt_settings(channel_id=channel_id)
+                current_effective = (
+                    current.get("current")
+                    if isinstance(current.get("current"), Mapping)
+                    else current
+                )
+                current_alert_prompt = str(
+                    (current_effective or {}).get("alert_policy_prompt") or ""
+                )
+                merged_alert_prompt = self._deployment_policy_prompt(
+                    current_alert_prompt,
+                    deployment_id,
+                    str(channel_plan.get("alert_policy_prompt") or ""),
+                )
+                self._lxm.update_prompt_settings(
+                    channel_id=channel_id,
+                    alert_policy_prompt=merged_alert_prompt,
+                )
+                applied["prompt_channels"].append(channel_id)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "stage": "alert_policy",
+                        "channel_id": channel_id,
+                        "error": str(exc),
+                    }
+                )
+
+        existing_probes = self._ps.list_probes()
+        for raw_probe in plan.get("probes") or []:
+            channel_id = int(raw_probe.get("channel_id") or 0)
+            name = str(raw_probe.get("name") or "").strip()
+            existing = next(
+                (
+                    item
+                    for item in existing_probes
+                    if int(item.get("channel_id") or 0) == channel_id
+                    and str(item.get("name") or "").strip().casefold()
+                    == name.casefold()
+                ),
+                None,
+            )
+            try:
+                payload = self._deployment_probe_payload(
+                    raw_probe,
+                    existing=existing,
+                )
+                saved = self._ps.upsert_probe(payload)
+                applied["probes"].append(
+                    {
+                        "id": saved.get("id"),
+                        "name": saved.get("name"),
+                        "channel_id": saved.get("channel_id"),
+                    }
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "stage": "probes",
+                        "name": name,
+                        "channel_id": channel_id,
+                        "error": str(exc),
+                    }
+                )
+
+        try:
+            profiles = self._deployment_store.save_counted_profiles(
+                [
+                    item
+                    for item in (plan.get("counted_states") or [])
+                    if isinstance(item, Mapping)
+                ]
+            )
+            planned_ids = {
+                str(item.get("id"))
+                for item in (plan.get("counted_states") or [])
+                if isinstance(item, Mapping)
+            }
+            applied["counted_states"] = [
+                {
+                    "id": item.get("id"),
+                    "name": item.get("name"),
+                    "channel_id": item.get("channel_id"),
+                }
+                for item in profiles
+                if str(item.get("id")) in planned_ids
+            ]
+        except Exception as exc:
+            errors.append(
+                {"stage": "counted_states", "error": str(exc)}
+            )
+
+        quiet_window = plan.get("quiet_window")
+        if isinstance(quiet_window, Mapping):
+            try:
+                applied["quiet_window"] = self._lxm.set_rollup_l3_deep_schedule(
+                    quiet_window,
+                    persist=True,
+                ).get("schedule")
+            except Exception as exc:
+                errors.append(
+                    {"stage": "quiet_window", "error": str(exc)}
+                )
+
+        if bool(plan.get("start_live", True)):
+            current_sessions = getattr(self._lxm, "sessions", {})
+            for channel_id in diff["channel_ids"]:
+                if isinstance(current_sessions, Mapping) and channel_id in current_sessions:
+                    applied["live_channels"].append(channel_id)
+                    continue
+                try:
+                    self._lxm.start_session(channel_id)
+                    applied["live_channels"].append(channel_id)
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "stage": "start_live",
+                            "channel_id": channel_id,
+                            "error": str(exc),
+                        }
+                    )
+
+        receipt = {
+            "deployment_id": deployment_id,
+            "status": "partial" if errors else "applied",
+            "applied": applied,
+            "errors": errors,
+            "completed_at_ms": int(time.time() * 1000),
+        }
+        if not errors:
+            state = self._deployment_store.mark_applied(
+                deployment_id,
+                receipt=receipt,
+            )
+            self._schedule_deployment_commissioning(deployment_id)
+        else:
+            state = self._deployment_store.load(deployment_id)
+        return {
+            "status": "partial" if errors else "applied",
+            "deployment_id": deployment_id,
+            "stage": state.get("stage"),
+            "diff": diff,
+            "applied": applied,
+            "errors": errors,
+            "commissioning": copy.deepcopy(state.get("commissioning")),
+        }
+
+    def _get_deployment_status(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        deployment_id = str(args.get("deployment_id") or "").strip()
+        try:
+            state = self._deployment_store.load(deployment_id)
+        except DeploymentWorkflowError as exc:
+            raise ToolError(str(exc)) from exc
+        return {
+            **compact_deployment_state(state),
+            "commissioning_l1_reviews": [
+                {
+                    "channel_id": item.get("channel_id"),
+                    "status": item.get("status"),
+                    "summary": str(item.get("summary") or "")[:700],
+                    "generation_status": item.get("generation_status"),
+                    "window_start": item.get("window_start"),
+                    "window_end": item.get("window_end"),
+                    "error": item.get("error"),
+                }
+                for item in (
+                    (state.get("commissioning") or {}).get("l1_reviews") or []
+                )[:8]
+                if isinstance(item, Mapping)
+            ],
+            "commissioning_proposals": [
+                {
+                    "probe_name": item.get("probe_name"),
+                    "channel_id": item.get("channel_id"),
+                    "status": item.get("status"),
+                    "recommended_probe_args": item.get(
+                        "recommended_probe_args"
+                    ),
+                    "warnings": list(item.get("warnings") or [])[:4],
+                }
+                for item in (
+                    (state.get("commissioning") or {}).get("proposals") or []
+                )[:16]
+                if isinstance(item, Mapping)
+            ],
+        }
+
+    def _query_counted_state_metric(
+        self,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metric_id = str(args.get("metric_id") or "").strip()
+        metric_name = str(args.get("metric_name") or "").strip().casefold()
+        channel_id = _opt_int(args.get("channel_id"))
+        profiles = self._deployment_store.list_counted_profiles(
+            channel_id=channel_id,
+        )
+        matches = [
+            profile
+            for profile in profiles
+            if (metric_id and str(profile.get("id") or "") == metric_id)
+            or (
+                not metric_id
+                and metric_name
+                and str(profile.get("name") or "").strip().casefold()
+                == metric_name
+            )
+        ]
+        if not metric_id and not metric_name and len(profiles) == 1:
+            matches = profiles
+        if len(matches) != 1:
+            return {
+                "status": "needs_metric_selection",
+                "count": len(profiles),
+                "metrics": [
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "channel_id": item.get("channel_id"),
+                        "counter_mode": item.get("counter_mode"),
+                    }
+                    for item in profiles[:16]
+                ],
+                "instruction": (
+                    "Ask the operator to choose one metric_id/name and channel."
+                ),
+            }
+        profile = matches[0]
+        transition_args: Dict[str, Any] = {
+            "channel_id": int(profile.get("channel_id") or 0),
+            "subject_query": profile.get("subject_query"),
+            "positive_state_query": profile.get("positive_state_query"),
+            "negative_state_query": profile.get("negative_state_query"),
+            "positive_label": profile.get("positive_label"),
+            "negative_label": profile.get("negative_label"),
+            "sources": ["semantic_snapshot"],
+            "positive_floor": float(profile.get("positive_floor") or 0.18),
+            "negative_floor": float(profile.get("negative_floor") or 0.18),
+            "margin_threshold": float(
+                profile.get("margin_threshold") or 0.03
+            ),
+            "min_state_samples": int(
+                profile.get("min_state_samples") or 2
+            ),
+            "min_state_duration_sec": float(
+                profile.get("min_state_duration_sec") or 20.0
+            ),
+            "merge_gap_sec": float(profile.get("merge_gap_sec") or 15.0),
+            "candidate_limit": 100_000,
+            "transition_limit": 120,
+            "segment_limit": 200,
+            "evidence_limit": 24,
+        }
+        for key in ("since_hours", "from_ts", "to_ts"):
+            if args.get(key) is not None:
+                transition_args[key] = args.get(key)
+        result = self._track_visual_state_transitions(transition_args)
+        return {
+            "status": "complete",
+            **aggregate_counted_state_metric(profile, result),
+        }
+
+    def _schedule_deployment_commissioning(
+        self,
+        deployment_id: str,
+    ) -> None:
+        with self._commissioning_lock:
+            existing = self._commissioning_threads.get(deployment_id)
+            if existing is not None and existing.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._deployment_commissioning_loop,
+                args=(deployment_id,),
+                daemon=True,
+                name=f"eva-deploy-commission-{deployment_id[-6:]}",
+            )
+            self._commissioning_threads[deployment_id] = worker
+            worker.start()
+
+    def _deployment_commissioning_loop(self, deployment_id: str) -> None:
+        try:
+            deadline = time.time() + 24 * 3600
+            while time.time() < deadline:
+                try:
+                    state = self._deployment_store.load(deployment_id)
+                except Exception:
+                    return
+                commissioning = (
+                    state.get("commissioning")
+                    if isinstance(state.get("commissioning"), Mapping)
+                    else {}
+                )
+                if str(state.get("stage") or "") == "commissioned":
+                    return
+                due_at_ms = int(commissioning.get("due_at_ms") or 0)
+                delay = max(0.0, float(due_at_ms) / 1000.0 - time.time())
+                if delay > 0:
+                    time.sleep(min(60.0, delay))
+                    continue
+                result = self._run_deployment_commissioning(deployment_id)
+                self._deployment_store.record_commissioning(
+                    deployment_id,
+                    result,
+                )
+                if result.get("status") == "complete":
+                    return
+                time.sleep(60.0)
+        finally:
+            with self._commissioning_lock:
+                self._commissioning_threads.pop(deployment_id, None)
+
+    def _run_deployment_commissioning(
+        self,
+        deployment_id: str,
+    ) -> Dict[str, Any]:
+        state = self._deployment_store.load(deployment_id)
+        plan = (
+            state.get("plan")
+            if isinstance(state.get("plan"), Mapping)
+            else {}
+        )
+        applied_at_ms = int(state.get("applied_at_ms") or 0)
+        now_ms = int(time.time() * 1000)
+        channel_ids = [
+            int(item.get("channel_id") or 0)
+            for item in (plan.get("channels") or [])
+            if isinstance(item, Mapping)
+        ]
+        coverage: List[Dict[str, Any]] = []
+        coverage_ready = True
+        counter = getattr(self._ds, "count_vector_candidates", None)
+        for channel_id in channel_ids:
+            count = 0
+            try:
+                if callable(counter):
+                    count = int(
+                        counter(
+                            channel_id=channel_id,
+                            source="semantic_snapshot",
+                            since_ms=applied_at_ms or None,
+                            until_ms=now_ms,
+                            only_with_clip=True,
+                        )
+                    )
+            except Exception:
+                count = 0
+            ready = count >= 120
+            coverage_ready = coverage_ready and ready
+            coverage.append(
+                {
+                    "channel_id": channel_id,
+                    "semantic_snapshot_count": count,
+                    "ready": ready,
+                }
+            )
+        if not coverage_ready:
+            return {
+                "status": "waiting_coverage",
+                "coverage_ready": False,
+                "coverage": coverage,
+                "last_checked_at_ms": now_ms,
+                "last_error": None,
+                "proposals": [],
+            }
+
+        # The commissioning pass deliberately asks for one bounded L1
+        # synthesis. On the port profile that is the 4B agent head; its job is
+        # scene/episode review, while threshold arithmetic remains
+        # deterministic and independently reproducible below.
+        l1_reviews: List[Dict[str, Any]] = []
+        rollup_reader = getattr(self._lxm, "summary_rollups", None)
+        if callable(rollup_reader):
+            for channel_id in channel_ids:
+                try:
+                    rollups = rollup_reader(
+                        channel_id=channel_id,
+                        run_selector="all",
+                        start_ts=(
+                            float(applied_at_ms) / 1000.0
+                            if applied_at_ms
+                            else None
+                        ),
+                        end_ts=float(now_ms) / 1000.0,
+                        level_limit=4,
+                        synthesize=True,
+                        target_level="L1",
+                        synthesize_levels={"L1"},
+                        max_new_per_level=1,
+                    )
+                    l1_rows = (
+                        (rollups.get("levels") or {}).get("L1")
+                        if isinstance(rollups, Mapping)
+                        and isinstance(rollups.get("levels"), Mapping)
+                        else []
+                    )
+                    latest_l1 = (
+                        l1_rows[-1]
+                        if isinstance(l1_rows, list)
+                        and l1_rows
+                        and isinstance(l1_rows[-1], Mapping)
+                        else {}
+                    )
+                    l1_reviews.append(
+                        {
+                            "channel_id": channel_id,
+                            "status": (
+                                "available" if latest_l1 else "source_pending"
+                            ),
+                            "summary": str(
+                                latest_l1.get("summary") or ""
+                            )[:700],
+                            "generation_status": latest_l1.get(
+                                "generation_status"
+                            ),
+                            "window_start": latest_l1.get("window_start"),
+                            "window_end": latest_l1.get("window_end"),
+                        }
+                    )
+                except Exception as exc:
+                    l1_reviews.append(
+                        {
+                            "channel_id": channel_id,
+                            "status": "error",
+                            "error": str(exc)[:300],
+                        }
+                    )
+
+        configured_probes = [
+            item
+            for item in (self._ps.list_probes() or [])
+            if isinstance(item, Mapping)
+        ]
+        proposals: List[Dict[str, Any]] = []
+        for probe in (plan.get("probes") or [])[:32]:
+            if not isinstance(probe, Mapping):
+                continue
+            positives = list(probe.get("positives") or [])
+            negatives = list(probe.get("negatives") or [])
+            if not positives or not negatives:
+                continue
+            channel_id = int(probe.get("channel_id") or 0)
+            try:
+                calibration = self._calibrate_probe_from_archive(
+                    {
+                        "channel_id": channel_id,
+                        "event_query": str(positives[0]),
+                        "contrast_query": str(negatives[0]),
+                        "sources": ["semantic_snapshot"],
+                        "from_ts": float(applied_at_ms) / 1000.0,
+                        "to_ts": float(now_ms) / 1000.0,
+                        "candidate_limit": 20_000,
+                        "evidence_limit": 4,
+                        "min_frames": 24,
+                        "max_channels_per_call": 1,
+                    }
+                )
+                channel_rows = calibration.get("channels") or []
+                channel_result = (
+                    channel_rows[0]
+                    if channel_rows and isinstance(channel_rows[0], Mapping)
+                    else {}
+                )
+                thresholds = (
+                    channel_result.get("suggested_thresholds")
+                    if isinstance(
+                        channel_result.get("suggested_thresholds"),
+                        Mapping,
+                    )
+                    else {}
+                )
+                safe = bool(thresholds.get("safe_to_apply"))
+                current_probe = next(
+                    (
+                        item
+                        for item in configured_probes
+                        if int(item.get("channel_id") or 0) == channel_id
+                        and str(item.get("name") or "").strip().casefold()
+                        == str(probe.get("name") or "").strip().casefold()
+                    ),
+                    None,
+                )
+                transition_review: Dict[str, Any] = {}
+                cadence_proposal: Dict[str, Any] = {}
+                if safe:
+                    try:
+                        transition_review = self._track_visual_state_transitions(
+                            {
+                                "channel_id": channel_id,
+                                "positive_state_query": str(positives[0]),
+                                "negative_state_query": str(negatives[0]),
+                                "positive_label": "positive",
+                                "negative_label": "negative",
+                                "sources": ["semantic_snapshot"],
+                                "from_ts": float(applied_at_ms) / 1000.0,
+                                "to_ts": float(now_ms) / 1000.0,
+                                "positive_floor": float(
+                                    thresholds.get("pos_floor") or 0.20
+                                ),
+                                "negative_floor": float(
+                                    thresholds.get("pos_floor") or 0.20
+                                ),
+                                "margin_threshold": float(
+                                    thresholds.get("margin_thr") or 0.05
+                                ),
+                                "min_state_samples": 2,
+                                "min_state_duration_sec": 2.0,
+                                "merge_gap_sec": 3.0,
+                                "candidate_limit": 20_000,
+                                "transition_limit": 120,
+                                "segment_limit": 120,
+                                "evidence_limit": 6,
+                            }
+                        )
+                        entries = sorted(
+                            int(item.get("to_ms") or 0)
+                            for item in (
+                                transition_review.get("transitions") or []
+                            )
+                            if isinstance(item, Mapping)
+                            and str(item.get("from_state") or "") == "negative"
+                            and str(item.get("to_state") or "") == "positive"
+                            and int(item.get("to_ms") or 0) > 0
+                        )
+                        gaps = [
+                            max(0.0, float(right - left) / 1000.0)
+                            for left, right in zip(entries, entries[1:])
+                            if right > left
+                        ]
+                        median_gap = (
+                            float(np.median(np.asarray(gaps, dtype=np.float64)))
+                            if gaps
+                            else None
+                        )
+                        dedupe_sec = (
+                            max(30.0, min(600.0, median_gap * 0.4))
+                            if median_gap is not None
+                            else float(
+                                (current_probe or {}).get(
+                                    "bookmark_dedupe_window_sec"
+                                )
+                                or 60.0
+                            )
+                        )
+                        cooldown_sec = (
+                            max(10.0, min(300.0, dedupe_sec * 0.5))
+                            if median_gap is not None
+                            else float(
+                                (current_probe or {}).get(
+                                    "bookmark_cooldown_sec"
+                                )
+                                or 20.0
+                            )
+                        )
+                        cadence_proposal = {
+                            "appearance_episode_count": len(entries),
+                            "median_episode_gap_sec": (
+                                round(median_gap, 3)
+                                if median_gap is not None
+                                else None
+                            ),
+                            "bookmark_cooldown_sec": round(cooldown_sec, 3),
+                            "bookmark_dedupe_window_sec": round(
+                                dedupe_sec, 3
+                            ),
+                            "basis": (
+                                "observed_episode_cadence"
+                                if median_gap is not None
+                                else "retain_initial_defaults_until_more_episodes"
+                            ),
+                        }
+                    except Exception as exc:
+                        cadence_proposal = {
+                            "basis": "transition_review_failed",
+                            "error": str(exc)[:300],
+                        }
+                recommended_changes = (
+                    {
+                        "pos_floor": thresholds.get("pos_floor"),
+                        "margin_thr": thresholds.get("margin_thr"),
+                        "bookmark_cooldown_sec": cadence_proposal.get(
+                            "bookmark_cooldown_sec"
+                        ),
+                        "bookmark_dedupe_window_sec": cadence_proposal.get(
+                            "bookmark_dedupe_window_sec"
+                        ),
+                    }
+                    if safe
+                    else None
+                )
+                if recommended_changes is not None:
+                    recommended_changes = {
+                        key: value
+                        for key, value in recommended_changes.items()
+                        if value is not None
+                    }
+                recommended = (
+                    {
+                        "tool": "update_probe",
+                        "probe_name": probe.get("name"),
+                        "probe_id": (
+                            current_probe.get("id")
+                            if isinstance(current_probe, Mapping)
+                            else None
+                        ),
+                        "channel_id": channel_id,
+                        "changes": recommended_changes,
+                        "preview": True,
+                    }
+                    if safe
+                    else None
+                )
+                proposals.append(
+                    {
+                        "probe_name": probe.get("name"),
+                        "channel_id": channel_id,
+                        "status": (
+                            "threshold_proposal"
+                            if safe
+                            else "needs_review"
+                        ),
+                        "recommended_probe_args": recommended,
+                        "warnings": list(
+                            channel_result.get("warnings") or []
+                        )[:8],
+                        "separation_quality": thresholds.get(
+                            "separation_quality"
+                        ),
+                        "semantic_review": {
+                            "positive_query": str(positives[0]),
+                            "contrast_query": str(negatives[0]),
+                            "contrast_query_effective": calibration.get(
+                                "contrast_query_effective"
+                            ),
+                            "recommended_action": thresholds.get(
+                                "recommended_action"
+                            ),
+                        },
+                        "cadence_proposal": cadence_proposal,
+                        "transition_counts": (
+                            transition_review.get("counts")
+                            if isinstance(transition_review, Mapping)
+                            else None
+                        ),
+                    }
+                )
+            except Exception as exc:
+                proposals.append(
+                    {
+                        "probe_name": probe.get("name"),
+                        "channel_id": channel_id,
+                        "status": "calibration_error",
+                        "recommended_probe_args": None,
+                        "warnings": [str(exc)[:300]],
+                    }
+                )
+        return {
+            "status": "complete",
+            "coverage_ready": True,
+            "coverage": coverage,
+            "started_at_ms": now_ms,
+            "completed_at_ms": int(time.time() * 1000),
+            "l1_reviews": l1_reviews,
+            "proposals": proposals,
+            "proposal_only": True,
+            "operator_note": (
+                "Commissioning used independent semantic snapshots. Numerical "
+                "changes are proposals; semantic meaning, severity, and alert policy "
+                "require an operator-approved preview."
+            ),
+        }
+
     # ── build_research_batch ───────────────────────────────────────────────
 
     def _build_research_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -4389,6 +5858,10 @@ class AgentTools:
             "recent_hits": [],
             "bookmark_gate": None,
             "bookmark_gate_updated_at_ms": None,
+            # Agent-authored probes stay distinguishable after the operator
+            # applies the approval, which is the only point at which they reach
+            # the store.
+            "origin": "agent",
         }
         errors = _validate_probe(probe)
         if errors:
@@ -6831,7 +8304,13 @@ def _extract_requested_skill_slugs(message: Any) -> List[str]:
             continue
         doc = by_slug.get(slug) or {}
         for phrase in _skill_trigger_phrases(str(doc.get("content") or "")):
-            if phrase and phrase.lower() in lower:
+            if (
+                phrase
+                and re.search(
+                    rf"(?<!\w){re.escape(phrase.lower())}(?!\w)",
+                    lower,
+                )
+            ):
                 hits.append(slug)
                 break
     return list(dict.fromkeys(hits))
@@ -6859,6 +8338,33 @@ def _skill_tool_names(skill_slugs: Sequence[str]) -> set[str]:
         if str(doc.get("slug") or "").strip() not in slugs:
             continue
         content = str(doc.get("content") or "")
+        declared: List[str] = []
+        in_tools_section = False
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not in_tools_section:
+                if line.casefold() == "tools:":
+                    in_tools_section = True
+                continue
+            if not line:
+                if declared:
+                    break
+                continue
+            if line.startswith("#") or (
+                not line.startswith("- ")
+                and re.match(r"^[A-Za-z][A-Za-z0-9 _-]*:$", line)
+            ):
+                break
+            if not line.startswith("- "):
+                if declared:
+                    break
+                continue
+            match = re.fullmatch(r"-\s+`([A-Za-z0-9_]+)`", line)
+            if match:
+                declared.append(match.group(1))
+        if declared:
+            names.update(name for name in declared if name in known)
+            continue
         for tool_name in known:
             if tool_name in names:
                 continue
@@ -6901,11 +8407,46 @@ def _estimate_context_tokens(value: Any) -> int:
     return int((chars + AGENT_CONTEXT_CHARS_PER_TOKEN - 1) / AGENT_CONTEXT_CHARS_PER_TOKEN)
 
 
+def _context_budget_policy(context_limit_tokens: Optional[int] = None) -> Dict[str, int]:
+    """Derive safe warning/hard limits from the context the server actually serves."""
+
+    configured_limit = max(1_024, int(AGENT_CONTEXT_LIMIT_TOKENS))
+    served_limit = configured_limit
+    if context_limit_tokens is not None:
+        try:
+            served_limit = max(1_024, int(context_limit_tokens))
+        except (TypeError, ValueError):
+            served_limit = configured_limit
+    effective_limit = min(configured_limit, served_limit)
+    output_reserve = min(
+        max(256, int(AGENT_MAX_OUTPUT_TOKENS)),
+        max(256, effective_limit // 4),
+    )
+    safe_hard = max(1_024, effective_limit - output_reserve - 1_024)
+    safe_warning = max(512, effective_limit - output_reserve - 4_096)
+    hard_tokens = min(max(1_024, int(AGENT_CONTEXT_HARD_TOKENS)), safe_hard)
+    warning_tokens = min(
+        max(512, int(AGENT_CONTEXT_WARNING_TOKENS)),
+        safe_warning,
+        max(512, hard_tokens - 512),
+    )
+    if warning_tokens >= hard_tokens:
+        warning_tokens = max(512, hard_tokens - 512)
+    return {
+        "context_limit_tokens": effective_limit,
+        "output_reserve_tokens": output_reserve,
+        "warning_tokens": warning_tokens,
+        "hard_tokens": hard_tokens,
+    }
+
+
 def _context_budget_snapshot(
     messages: Sequence[Mapping[str, Any]],
     *,
     tool_schemas: Optional[Sequence[Mapping[str, Any]]] = None,
+    context_policy: Optional[Mapping[str, int]] = None,
 ) -> Dict[str, Any]:
+    policy = dict(context_policy or _context_budget_policy())
     message_chars = _estimate_context_chars(list(messages))
     tool_schema_chars = _estimate_context_chars(list(tool_schemas or [])) if tool_schemas else 0
     chars = message_chars + tool_schema_chars
@@ -6916,10 +8457,7 @@ def _context_budget_snapshot(
         "message_estimated_tokens": int((message_chars + AGENT_CONTEXT_CHARS_PER_TOKEN - 1) / AGENT_CONTEXT_CHARS_PER_TOKEN),
         "tool_schema_estimated_tokens": int((tool_schema_chars + AGENT_CONTEXT_CHARS_PER_TOKEN - 1) / AGENT_CONTEXT_CHARS_PER_TOKEN),
         "chars_per_token": AGENT_CONTEXT_CHARS_PER_TOKEN,
-        "context_limit_tokens": AGENT_CONTEXT_LIMIT_TOKENS,
-        "output_reserve_tokens": AGENT_MAX_OUTPUT_TOKENS,
-        "warning_tokens": AGENT_CONTEXT_WARNING_TOKENS,
-        "hard_tokens": AGENT_CONTEXT_HARD_TOKENS,
+        **policy,
     }
 
 
@@ -7053,7 +8591,9 @@ def _normalize_archive_source(value: Any) -> Optional[str]:
         return None
     source = ARCHIVE_SOURCE_ALIASES.get(source, source)
     if source not in ARCHIVE_SOURCE_LABELS:
-        raise ToolError("source must be one of: probe, vlm_summary, vlm_alert")
+        raise ToolError(
+            "source must be one of: semantic_snapshot, probe, vlm_summary, vlm_alert"
+        )
     return source
 
 
@@ -7452,7 +8992,20 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
         "list_attention_bursts",
         "count_video_summary_events",
         "track_visual_state_transitions",
+        "query_counted_state_metric",
         "generate_report",
+    }),
+    "counted_state": frozenset({
+        "normalize_time_window",
+        "query_counted_state_metric",
+    }),
+    "deployment": frozenset({
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+        "apply_deployment_plan",
+        "get_deployment_status",
+        "query_counted_state_metric",
     }),
     "archive_research": frozenset({
         "normalize_time_window",
@@ -7519,6 +9072,19 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     if re.search(r"\b(?:restore|backfill|rebuild)\b.*\b(?:summary|summaries|history|rollup)\b|восстанов|бэкфилл|достро.*суммар", text):
         add("summary_restore")
         return intents
+    if re.search(
+        r"\bprotocol\s*:?\s*deploy\b|\bdeployment\s+(?:setup|wizard|protocol)\b|"
+        r"протокол\s*:?\s*депло[йя]|сценари[йя]\s+депло[йя]|первичн\w*\s+настройк\w*\s+канал",
+        text,
+    ):
+        add("deployment")
+        return intents
+    if re.search(
+        r"\bhow\s+(?:many\s+times|long)\b|\bcount(?:ed)?\s+(?:state|event|transition)s?\b|"
+        r"сколько\s+(?:раз|времени)|как\s+долго|сч[её]тчик\w*\s+(?:состоян|событ)",
+        text,
+    ):
+        add("counted_state")
     if re.search(r"\bbookmark(?:s)?\b|закладк", text):
         add("bookmark")
         return intents
@@ -7580,11 +9146,16 @@ def _select_relevant_tool_schemas(
     allowed_names: set[str] = set()
     for intent in intents:
         allowed_names.update(_TOOL_INTENT_GROUPS.get(intent, ()))
-    # An activated runbook must be executable: expose the tools it names.
-    # This only widens within `schemas`, which are already permission-filtered.
-    allowed_names.update(
-        str(item) for item in (context.get("skill_tool_names") or ())
-    )
+    skill_tool_names = {
+        str(item)
+        for item in (context.get("skill_tool_names") or ())
+        if str(item)
+    }
+    if skill_tool_names:
+        # The activated playbook is the authoritative tool envelope. This
+        # avoids re-adding forbidden or unrelated tools from a broad lexical
+        # intent (especially important for small local models).
+        allowed_names = skill_tool_names
 
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
@@ -7735,6 +9306,21 @@ def _tool_schema_names(schemas: Sequence[Mapping[str, Any]]) -> set[str]:
     }
 
 
+def _turn_tool_call_limit(context: Mapping[str, Any]) -> int:
+    """Bound tool fan-out by operational intent and active playbook."""
+
+    limits: List[int] = []
+    for intent in context.get("tool_intents") or ():
+        limit = AGENT_INTENT_TOOL_CALL_LIMITS.get(str(intent))
+        if limit is not None:
+            limits.append(int(limit))
+    for slug in context.get("active_skill_slugs") or ():
+        limit = AGENT_SKILL_TOOL_CALL_LIMITS.get(str(slug))
+        if limit is not None:
+            limits.append(int(limit))
+    return max(1, min(limits)) if limits else AGENT_MAX_TOOL_CALLS_PER_TURN
+
+
 def _required_video_research_tool_call(
     context: Mapping[str, Any],
     schemas: Sequence[Mapping[str, Any]],
@@ -7812,6 +9398,21 @@ def _video_overview_research_plan_completed(context: Mapping[str, Any]) -> bool:
     """Return true once the bounded server-owned overview plan has enough data."""
 
     if not context.get("video_overview_request"):
+        return False
+    active_skills = {
+        str(item)
+        for item in (context.get("active_skill_slugs") or ())
+    }
+    if active_skills.intersection(
+        {
+            "cross_channel_correlation",
+            "multi_channel_event_sweep",
+            "video_event_check",
+            "video_incident_timeline",
+        }
+    ):
+        # These playbooks require a bounded evidence drill after the broad map.
+        # Their normal per-turn tool budget and context guard still cap the work.
         return False
     if (
         context.get("operator_relative_range")
@@ -8728,7 +10329,11 @@ def _video_research_response_needs_recovery(
     return factual_claim
 
 
-def _format_completion_fallback(ledger: Mapping[str, Any]) -> str:
+def _format_completion_fallback(
+    ledger: Mapping[str, Any],
+    *,
+    tool_messages: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
     """Produce an evidence-only answer when the local model returns no conclusion."""
 
     query = str(ledger.get("user_query") or "")
@@ -8782,6 +10387,58 @@ def _format_completion_fallback(ledger: Mapping[str, Any]) -> str:
                 f"- Frames CH {row.get('channel_id')}: {row.get('returned_frames') or row.get('count') or 0} "
                 f"returned, {row.get('image_url_count') or 0} image URLs."
             )
+    summary_samples: List[Dict[str, Any]] = []
+    for message in tool_messages or ():
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "") != "tool":
+            continue
+        if str(message.get("name") or "") != "get_video_summaries":
+            continue
+        content = message.get("content")
+        try:
+            payload = json.loads(content) if isinstance(content, str) else content
+        except Exception:
+            payload = None
+        if not isinstance(payload, Mapping):
+            continue
+        channel_id = payload.get("channel_id")
+        depth = payload.get("depth")
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries[:2]:
+            if not isinstance(entry, Mapping):
+                continue
+            summary = re.sub(r"\s+", " ", str(entry.get("summary") or "")).strip()
+            if not summary:
+                continue
+            summary_samples.append(
+                {
+                    "channel_id": channel_id,
+                    "depth": depth,
+                    "time": entry.get("time") or entry.get("window_start"),
+                    "alert_total": entry.get("alert_total"),
+                    "summary": summary[:360],
+                }
+            )
+    if summary_samples:
+        lines.append(
+            "Возвращённые фрагменты сводок:"
+            if russian
+            else "Returned summary samples:"
+        )
+        for row in summary_samples[:8]:
+            alert_note = (
+                f", alerts={row.get('alert_total')}"
+                if row.get("alert_total") is not None
+                else ""
+            )
+            lines.append(
+                f"- CH {row.get('channel_id')} {row.get('depth') or ''} "
+                f"{row.get('time') or 'time unavailable'}{alert_note}: "
+                f"{row.get('summary')}"
+            )
     for row in error_rows[:4]:
         lines.append(
             ("- Ошибка tool: " if russian else "- Tool error: ")
@@ -8828,6 +10485,8 @@ class AgentRunner:
         ] = None,
         tool_plan_store: Any | None = None,
         tool_approval_store: Any | None = None,
+        channel_group_store: Any | None = None,
+        deployment_store: ProtocolDeploymentStore | None = None,
     ) -> None:
         self._ps  = probes_store
         self._ds  = detections_store
@@ -8851,6 +10510,8 @@ class AgentRunner:
             encode_jpeg_fn=encode_jpeg_fn,
             search_indexed_folder_fn=search_indexed_folder_fn,
             search_detections_fn=search_detections_fn,
+            channel_group_store=channel_group_store,
+            deployment_store=deployment_store,
         )
         self._secure_tools = (
             EvaAgentToolAdapter(
@@ -9082,8 +10743,23 @@ class AgentRunner:
             ),
             secure_tool_mode=tool_context is not None,
         )
+        context_limit_reader = getattr(self._lm_client, "context_limit_tokens", None)
+        if callable(context_limit_reader):
+            try:
+                served_context_limit = int(context_limit_reader())
+            except Exception:
+                served_context_limit = AGENT_CONTEXT_LIMIT_TOKENS
+        else:
+            served_context_limit = AGENT_CONTEXT_LIMIT_TOKENS
+        context_policy = _context_budget_policy(served_context_limit)
         history = self.store.load_history(session_id, **store_owner)
-        history_prefix, history_budget = _trim_history_for_context_budget(history[:-1])
+        history_prefix, history_budget = _trim_history_for_context_budget(
+            history[:-1],
+            token_budget=min(
+                AGENT_CONTEXT_HISTORY_BUDGET_TOKENS,
+                max(1_000, context_policy["context_limit_tokens"] // 3),
+            ),
+        )
         if history_budget.get("trimmed_messages"):
             _signal_ledger_append(
                 turn_signal_ledger,
@@ -9098,6 +10774,7 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
+        turn_tool_context["active_skill_slugs"] = list(requested_skill_slugs)
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
         if requested_skill_tool_names:
             turn_tool_context["skill_tool_names"] = sorted(requested_skill_tool_names)
@@ -9141,6 +10818,7 @@ class AgentRunner:
         initial_budget = _context_budget_snapshot(
             in_flight,
             tool_schemas=available_tool_schemas,
+            context_policy=context_policy,
         )
         _signal_ledger_append(
             turn_signal_ledger,
@@ -9180,11 +10858,7 @@ class AgentRunner:
 
         # ── tool loop ──────────────────────────────────────────────────────
         tool_calls_used = 0
-        turn_tool_call_limit = (
-            AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS
-            if "video_research" in (turn_tool_context.get("tool_intents") or ())
-            else AGENT_MAX_TOOL_CALLS_PER_TURN
-        )
+        turn_tool_call_limit = _turn_tool_call_limit(turn_tool_context)
         turn_read_cache: Dict[str, Tuple[Any, Any]] = {}
         context_warning_sent = False
         context_hard_stop_sent = False
@@ -9220,9 +10894,10 @@ class AgentRunner:
             active_budget = _context_budget_snapshot(
                 in_flight,
                 tool_schemas=available_tool_schemas,
+                context_policy=context_policy,
             )
             if (
-                active_budget["estimated_tokens"] >= AGENT_CONTEXT_HARD_TOKENS
+                active_budget["estimated_tokens"] >= context_policy["hard_tokens"]
                 and not context_hard_stop_sent
             ):
                 context_hard_stop_sent = True
@@ -9248,12 +10923,12 @@ class AgentRunner:
                         "type": "context_budget",
                         "status": "hard_stop",
                         "estimated_tokens": active_budget["estimated_tokens"],
-                        "hard_tokens": AGENT_CONTEXT_HARD_TOKENS,
+                        "hard_tokens": context_policy["hard_tokens"],
                     }
                 )
                 break
             if (
-                active_budget["estimated_tokens"] >= AGENT_CONTEXT_WARNING_TOKENS
+                active_budget["estimated_tokens"] >= context_policy["warning_tokens"]
                 and not context_warning_sent
             ):
                 context_warning_sent = True
@@ -9278,7 +10953,7 @@ class AgentRunner:
                         "type": "context_budget",
                         "status": "warning",
                         "estimated_tokens": active_budget["estimated_tokens"],
-                        "warning_tokens": AGENT_CONTEXT_WARNING_TOKENS,
+                        "warning_tokens": context_policy["warning_tokens"],
                     }
                 )
             # Some read steps are protocol requirements, not model choices.
@@ -9581,14 +11256,17 @@ class AgentRunner:
         signal_ledger_message = _format_turn_signal_ledger_message(turn_signal_ledger)
         if signal_ledger_message:
             in_flight.append({"role": "system", "content": signal_ledger_message})
-        final_budget = _context_budget_snapshot(in_flight)
-        if final_budget["estimated_tokens"] >= AGENT_CONTEXT_HARD_TOKENS:
+        final_budget = _context_budget_snapshot(
+            in_flight,
+            context_policy=context_policy,
+        )
+        if final_budget["estimated_tokens"] >= context_policy["hard_tokens"]:
             in_flight, final_compaction = _compact_tool_messages_for_context_budget(
                 in_flight,
-                token_budget=max(8_000, AGENT_CONTEXT_HARD_TOKENS - 1_024),
+                token_budget=max(1_000, context_policy["hard_tokens"] - 1_024),
             )
             if (
-                _estimate_context_tokens(in_flight) >= AGENT_CONTEXT_HARD_TOKENS
+                _estimate_context_tokens(in_flight) >= context_policy["hard_tokens"]
                 and history_slice_end > history_slice_start
             ):
                 del in_flight[history_slice_start:history_slice_end]
@@ -9607,31 +11285,72 @@ class AgentRunner:
             })
 
         full_text_parts: List[str] = []
-        stream_cancel_event = threading.Event()
-        try:
-            for stream_kind, stream_value in _stream_items_with_heartbeats(
-                lambda: self._lm_client.stream_text(
-                    in_flight,
+        final_transport_error: Optional[Exception] = None
+        for stream_attempt in range(2):
+            stream_cancel_event = threading.Event()
+            try:
+                for stream_kind, stream_value in _stream_items_with_heartbeats(
+                    lambda: self._lm_client.stream_text(
+                        in_flight,
+                        cancel_event=stream_cancel_event,
+                    ),
+                    heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
+                    heartbeat_payload_fn=lambda: {
+                        "phase": "lm_final_response",
+                        "lm_admission": self._lm_client.admission_status(),
+                    },
                     cancel_event=stream_cancel_event,
-                ),
-                heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
-                heartbeat_payload_fn=lambda: {
-                    "phase": "lm_final_response",
-                    "lm_admission": self._lm_client.admission_status(),
-                },
-                cancel_event=stream_cancel_event,
-            ):
-                if stream_kind == "heartbeat":
-                    yield _sse(dict(stream_value))
-                    continue
-                chunk = str(stream_value)
-                full_text_parts.append(chunk)
-        except Exception as exc:
-            yield _sse({"type": "error", "message": f"Streaming error: {exc}"})
-            yield _sse({"type": "done", "session_id": session_id})
-            return
+                ):
+                    if stream_kind == "heartbeat":
+                        yield _sse(dict(stream_value))
+                        continue
+                    chunk = str(stream_value)
+                    full_text_parts.append(chunk)
+                final_transport_error = None
+                break
+            except Exception as exc:
+                final_transport_error = exc
+                if stream_attempt > 0 or full_text_parts:
+                    break
+                retry_budget = max(1_000, context_policy["hard_tokens"] - 2_048)
+                in_flight, retry_compaction = _compact_tool_messages_for_context_budget(
+                    in_flight,
+                    token_budget=retry_budget,
+                )
+                if history_slice_end > history_slice_start:
+                    del in_flight[history_slice_start:history_slice_end]
+                    retry_compaction["history_removed"] = (
+                        history_slice_end - history_slice_start
+                    )
+                retry_compaction["estimated_tokens"] = _estimate_context_tokens(
+                    in_flight
+                )
+                _signal_ledger_append(
+                    turn_signal_ledger,
+                    "context_budget",
+                    {"phase": "final_transport_retry", **retry_compaction},
+                    limit=4,
+                )
+                yield _sse({
+                    "type": "context_budget",
+                    "status": "retry_compacted",
+                    **retry_compaction,
+                })
 
-        final_text = "".join(full_text_parts)
+        if final_transport_error is not None:
+            final_text = _format_completion_fallback(
+                turn_signal_ledger,
+                tool_messages=in_flight,
+            )
+            yield _sse({
+                "type": "completion_recovery",
+                "message": (
+                    "Final model synthesis failed after the tools completed; "
+                    "using the completed tool results."
+                ),
+            })
+        else:
+            final_text = "".join(full_text_parts)
         if (
             _final_response_is_incomplete(final_text)
             or _video_research_response_needs_recovery(
@@ -9640,7 +11359,10 @@ class AgentRunner:
                 turn_signal_ledger,
             )
         ):
-            final_text = _format_completion_fallback(turn_signal_ledger)
+            final_text = _format_completion_fallback(
+                turn_signal_ledger,
+                tool_messages=in_flight,
+            )
             yield _sse({
                 "type": "completion_recovery",
                 "message": "The local model returned an incomplete final response; using completed tool results.",
@@ -12171,6 +13893,11 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
     json_prompt = str(current.get("json_alert_prompt") or "")
     health = current.get("prompt_health") if isinstance(current.get("prompt_health"), dict) else {}
     prompt_layers = current.get("prompt_layers") if isinstance(current.get("prompt_layers"), Mapping) else {}
+    metabolism = (
+        current.get("memory_metabolism")
+        if isinstance(current.get("memory_metabolism"), Mapping)
+        else {}
+    )
     compact_layers: Dict[str, Any] = {}
     layer_semantics = {
         "stream": "L0 live-description role/style; not channel-specific alert criteria.",
@@ -12226,6 +13953,35 @@ def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]
             "suggested_alert_policy_prompt": str(health.get("suggested_alert_policy_prompt") or "")[:1000],
         },
         "prompt_layers": compact_layers,
+        "memory_metabolism": {
+            "status": metabolism.get("status"),
+            "semantics": _compact_signal_value(metabolism.get("semantics"), 320),
+            "current_state": {
+                key: (metabolism.get("current_state") or {}).get(key)
+                for key in (
+                    "present",
+                    "source_level",
+                    "updated_at",
+                    "active_watchlist_count",
+                    "preserved_deviations_count",
+                    "alert_tuning_notes_count",
+                    "ignore_as_routine_count",
+                    "held_tuning_proposals_count",
+                    "held_routine_suppression_proposals_count",
+                )
+            }
+            if isinstance(metabolism.get("current_state"), Mapping)
+            else {},
+            "stages": [
+                {
+                    "level": stage.get("level"),
+                    "cadence": stage.get("cadence"),
+                    "applies_to_live_memory": bool(stage.get("applies_to_live_memory")),
+                }
+                for stage in list(metabolism.get("stages") or [])[:4]
+                if isinstance(stage, Mapping)
+            ],
+        },
         "rollup_prompts": {
             level: str(prompt or "")[:600]
             for level, prompt in rollups.items()
@@ -12303,6 +14059,160 @@ def _compact_coverage_for_model(value: Any) -> Optional[Dict[str, Any]]:
 def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
+
+    if tool_name in {
+        "start_deployment",
+        "configure_deployment",
+        "get_deployment_status",
+    }:
+        channels = (
+            result.get("available_channels")
+            if isinstance(result.get("available_channels"), list)
+            else []
+        )
+        compact_deployment = {
+            "deployment_id": result.get("deployment_id"),
+            "version": result.get("version"),
+            "stage": result.get("stage"),
+            "next_action": result.get("next_action"),
+            "target_channel_count": result.get("target_channel_count"),
+            "selected_channel_ids": result.get("selected_channel_ids"),
+            "groups": list(result.get("groups") or [])[:8],
+            "available_channels": [
+                {
+                    "id": row.get("id"),
+                    "title": row.get("title"),
+                    "type": row.get("type"),
+                }
+                for row in channels[:16]
+                if isinstance(row, Mapping)
+            ],
+            "survey_count": result.get("survey_count"),
+            "surveyed_channel_ids": result.get("surveyed_channel_ids"),
+            "requirement_pack_count": result.get("requirement_pack_count"),
+            "quiet_window": result.get("quiet_window"),
+            "plan_summary": result.get("plan_summary"),
+            "commissioning": result.get("commissioning"),
+            "instruction": result.get("instruction"),
+        }
+        if tool_name == "get_deployment_status":
+            compact_deployment["commissioning_l1_reviews"] = [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "status": row.get("status"),
+                    "summary": str(row.get("summary") or "")[:700],
+                    "generation_status": row.get("generation_status"),
+                    "window_start": row.get("window_start"),
+                    "window_end": row.get("window_end"),
+                    "error": row.get("error"),
+                }
+                for row in (result.get("commissioning_l1_reviews") or [])[:8]
+                if isinstance(row, Mapping)
+            ]
+            compact_deployment["commissioning_proposals"] = [
+                {
+                    "probe_name": row.get("probe_name"),
+                    "channel_id": row.get("channel_id"),
+                    "status": row.get("status"),
+                    "recommended_probe_args": row.get(
+                        "recommended_probe_args"
+                    ),
+                    "warnings": list(row.get("warnings") or [])[:4],
+                }
+                for row in (result.get("commissioning_proposals") or [])[:16]
+                if isinstance(row, Mapping)
+            ]
+        return compact_deployment
+
+    if tool_name == "survey_deployment":
+        surveys = (
+            result.get("surveys")
+            if isinstance(result.get("surveys"), list)
+            else []
+        )
+        return {
+            "deployment_id": result.get("deployment_id"),
+            "stage": result.get("stage"),
+            "next_action": result.get("next_action"),
+            "selected_channel_ids": result.get("selected_channel_ids"),
+            "survey_count": result.get("survey_count"),
+            "surveys": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "scene_fingerprint": str(
+                        row.get("scene_fingerprint") or ""
+                    )[:700],
+                    "error": row.get("error"),
+                }
+                for row in surveys[:8]
+                if isinstance(row, Mapping)
+            ],
+            "instruction": result.get("instruction"),
+        }
+
+    if tool_name == "apply_deployment_plan":
+        per_channel = (
+            result.get("per_channel")
+            if isinstance(result.get("per_channel"), list)
+            else []
+        )
+        errors = (
+            result.get("errors")
+            if isinstance(result.get("errors"), list)
+            else []
+        )
+        return _attach_action_plan_hint({
+            "status": result.get("status"),
+            "deployment_id": result.get("deployment_id"),
+            "stage": result.get("stage"),
+            "diff": result.get("diff"),
+            "per_channel": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "alert_policy_preview": str(
+                        row.get("alert_policy_preview") or ""
+                    )[:900],
+                }
+                for row in per_channel[:8]
+                if isinstance(row, Mapping)
+            ],
+            "applied": result.get("applied"),
+            "errors": errors[:8],
+            "commissioning": result.get("commissioning"),
+            "operator_action": result.get("operator_action"),
+            "action_receipt": result.get("action_receipt"),
+        }, result)
+
+    if tool_name == "query_counted_state_metric":
+        transitions = (
+            result.get("transitions")
+            if isinstance(result.get("transitions"), list)
+            else []
+        )
+        segments = (
+            result.get("segments")
+            if isinstance(result.get("segments"), list)
+            else []
+        )
+        return {
+            "status": result.get("status"),
+            "metric_id": result.get("metric_id"),
+            "metric_name": result.get("metric_name"),
+            "channel_id": result.get("channel_id"),
+            "counter_mode": result.get("counter_mode"),
+            "count_transition": result.get("count_transition"),
+            "duration_state": result.get("duration_state"),
+            "event_count": result.get("event_count"),
+            "duration_sec": result.get("duration_sec"),
+            "duration_human": result.get("duration_human"),
+            "coverage": result.get("coverage"),
+            "unknown_duration_sec": result.get("unknown_duration_sec"),
+            "notes": result.get("notes"),
+            "transitions": transitions[:12],
+            "segments": segments[:16],
+        }
 
     if tool_name == "get_visual_window_signals":
         source_rows = result.get("by_source") if isinstance(result.get("by_source"), list) else []

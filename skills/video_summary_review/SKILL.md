@@ -17,6 +17,15 @@ Trigger phrases:
 
 Goal: answer period-based questions from VLM video summaries with explicit coverage, timeline, and uncertainty.
 
+Tools:
+- `normalize_time_window`
+- `list_video_summary_channels`
+- `get_video_summaries`
+- `get_visual_window_signals`
+- `get_detections`
+- `describe_frame`
+- `search_archive`
+
 Default order:
 1. Normalize the operator's period with `normalize_time_window` unless exact Unix timestamps are already supplied.
 2. If the operator named one or more channels, resolve those channels and review only those channels.

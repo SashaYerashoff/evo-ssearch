@@ -75,7 +75,7 @@ def install_channel_memory(manager: LuxriotManager, channel_id: int = 7) -> None
     manager._update_channel_routine_context(
         channel_id=channel_id,
         rollup_id="l2-memory",
-        window_end=1234.0,
+        window_end=time.time(),
         level="L2",
         summary_text=(
             "MEMORY_UPDATE_JSON:\n"
@@ -200,6 +200,65 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         )
         self.assertTrue(archived[1]["is_cover"])
 
+    def test_batch_state_accepts_marker_alias_and_fails_conflicting_state_closed(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "Current scene.\n"
+            "BATCHSTATEJSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1},'
+            '"events":[],"observed_states":[{"key":"cat_orlandina",'
+            '"label":"Cat Orlandina","state":"absent","snapshot_indices":[1,2],'
+            '"evidence":"Cat is visible on the shelf in both snapshots"}],'
+            '"routines":["routine visibly reinforced in this batch"],'
+            '"memory_pass":["grounded item important for later consolidation"],'
+            '"alerts":[]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+
+        self.assertEqual(state["contract_status"], "parsed")
+        self.assertEqual(state["observed_states"][0]["state"], "unknown")
+        self.assertEqual(
+            state["observed_states"][0]["validation_issues"],
+            ["state_evidence_conflict"],
+        )
+        self.assertEqual(state["routines"], [])
+        self.assertEqual(state["memory_pass"], [])
+
+    def test_batch_state_rejects_prose_state_conflict_and_ungrounded_absence(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "No visual evidence of a person named Sasha in the current snapshots.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1},"events":[],'
+            '"observed_states":['
+            '{"key":"person_sasha","label":"person Sasha","state":"present",'
+            '"snapshot_indices":[1,2],"evidence":"person visible in both snapshots"},'
+            '{"key":"cat_orlandina","label":"cat Orlandina","state":"absent",'
+            '"snapshot_indices":[1,2],"evidence":"cat not visible"}'
+            '],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+        by_key = {item["key"]: item for item in state["observed_states"]}
+
+        self.assertEqual(by_key["person sasha"]["state"], "unknown")
+        self.assertIn(
+            "summary_state_conflict",
+            by_key["person sasha"]["validation_issues"],
+        )
+        self.assertEqual(by_key["cat orlandina"]["state"], "unknown")
+        self.assertIn(
+            "absent_scope_unverified",
+            by_key["cat orlandina"]["validation_issues"],
+        )
+
     def test_alert_policy_prompt_is_separate_from_stream_prompt(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -238,6 +297,132 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             self.assertIn("smoke near waste bins", health["suggested_alert_policy_prompt"])
             self.assertNotIn("Warning Level", health["suggested_stream_system_prompt"])
             self.assertNotIn("Alert when", health["suggested_stream_system_prompt"])
+
+    def test_criteria_only_monitor_prompt_migrates_out_of_stream_role(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            health = manager._legacy_alert_prompt_health(
+                (
+                    "Monitor workspace scene for presence changes of Sasha and cats.\n"
+                    "Alert when Sasha or either cat enters or leaves.\n"
+                    "Create alert if Sasha shows thumbs up."
+                ),
+                "",
+            )
+
+            self.assertTrue(health["needs_migration"])
+            self.assertEqual(health["suggested_stream_system_prompt"], "")
+            self.assertIn(
+                "Monitor workspace scene for presence changes",
+                health["suggested_alert_policy_prompt"],
+            )
+
+    def test_l0_alert_role_language_is_not_misclassified_as_watch_criteria(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            health = manager._legacy_alert_prompt_health(
+                (
+                    "You are EVA's visual-semantic intellectual core. "
+                    "Alert criteria and deployment rules are supplied separately. "
+                    "Match grounded current events with alert profiles and raise alerts "
+                    "if an event matches criteria. Alerts may regulate later attention."
+                ),
+                "Watch for smoke near the east gate.",
+            )
+
+            self.assertFalse(health["needs_migration"])
+            self.assertFalse(health["legacy_alert_criteria_in_stream"])
+            self.assertEqual(health["warnings"], [])
+
+    def test_prompt_settings_expose_compact_memory_metabolism_not_raw_memory_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            install_channel_memory(manager)
+
+            settings = manager.get_prompt_settings(channel_id=7)
+            metabolism = settings["memory_metabolism"]
+            current = metabolism["current_state"]
+
+            self.assertEqual(metabolism["status"], "active")
+            self.assertEqual(current["source_level"], "L2")
+            self.assertEqual(current["active_watchlist_count"], 1)
+            self.assertEqual(current["preserved_deviations_count"], 1)
+            self.assertEqual(
+                [stage["level"] for stage in metabolism["stages"]],
+                ["L0", "L1", "L2", "L3"],
+            )
+            self.assertTrue(metabolism["stages"][1]["applies_to_live_memory"])
+            self.assertTrue(metabolism["stages"][2]["applies_to_live_memory"])
+            self.assertFalse(metabolism["stages"][3]["applies_to_live_memory"])
+            self.assertNotIn("backend_memory", settings["prompt_layers"]["stream"])
+            self.assertNotIn("active_memory", settings["prompt_layers"]["rollups"]["L1"])
+            self.assertTrue(
+                settings["prompt_layers"]["stream"]["memory_context"]["present"]
+            )
+            self.assertEqual(current["alert_tuning_notes_count"], 0)
+            self.assertEqual(current["ignore_as_routine_count"], 0)
+            self.assertEqual(current["held_tuning_proposals_count"], 1)
+            self.assertEqual(
+                current["held_routine_suppression_proposals_count"],
+                1,
+            )
+            live_prompt = manager._get_channel_routine_prompt(7)
+            self.assertIn("vehicle drifting", live_prompt)
+            self.assertNotIn("keep drifting visible", live_prompt)
+            self.assertNotIn("parked maintenance vehicles", live_prompt)
+
+    def test_new_l1_replaces_and_can_clear_short_lived_watchlist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            now = time.time()
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-watch-a",
+                window_end=now,
+                level="L1",
+                memory_update={"active_watchlist": ["check unresolved east gate event"]},
+                summary_text="",
+            )
+            self.assertIn("east gate", manager._get_channel_routine_prompt(7))
+
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-watch-b",
+                window_end=now + 900,
+                level="L1",
+                memory_update={},
+                summary_text="",
+            )
+            self.assertNotIn(
+                "active_watchlist",
+                manager.channel_routine_context[7]["memory"],
+            )
+            self.assertEqual(manager._get_channel_routine_prompt(7), "")
+
+    def test_live_memory_expires_watchlist_and_rejects_schema_baseline_placeholder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            now = time.time()
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l2-placeholder",
+                window_end=now,
+                level="L2",
+                memory_update={
+                    "routine_baseline": "normal pattern for this channel, if grounded",
+                    "active_watchlist": ["old unresolved item"],
+                    "preserved_deviations": ["grounded prior deviation"],
+                },
+                summary_text="",
+            )
+            manager.channel_routine_context[7]["memory_field_updated_at"][
+                "active_watchlist"
+            ] = now - 3601
+
+            live_prompt = manager._get_channel_routine_prompt(7)
+            self.assertNotIn("normal pattern for this channel", live_prompt)
+            self.assertNotIn("old unresolved item", live_prompt)
+            self.assertIn("grounded prior deviation", live_prompt)
 
     def test_channel_memory_text_marks_prior_context_not_current_observation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -280,8 +465,17 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             diagnostics = result.as_dict()
             self.assertEqual(diagnostics["json_alert_count"], 1)
             self.assertEqual(diagnostics["prose_alert_count"], 1)
-            self.assertEqual(diagnostics["parser_alert_count"], 2)
+            self.assertEqual(diagnostics["parser_alert_count"], 1)
+            self.assertEqual(len(diagnostics["alert_events"]), 1)
+            self.assertEqual(diagnostics["alert_events"][0]["title"], "Vehicle drifting")
             self.assertEqual(result.alert_events[0]["snapshot_indices"], [2])
+            self.assertTrue(
+                result.alert_events[0]["id"].startswith("vlm-alert-")
+            )
+            self.assertEqual(
+                diagnostics["alert_events"][0]["id"],
+                result.alert_events[0]["id"],
+            )
 
 
 if __name__ == "__main__":

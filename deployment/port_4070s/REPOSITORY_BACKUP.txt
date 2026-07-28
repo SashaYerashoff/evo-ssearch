@@ -1,0 +1,19 @@
+EVA AI REPOSITORY BACKUP
+========================
+
+This directory complements the deployable source snapshot in ../repo/.
+
+evo-ssearch-all-refs.bundle contains every committed Git ref present when the
+USB kit was built. Verify and restore it with:
+
+  git bundle verify evo-ssearch-all-refs.bundle
+  git clone evo-ssearch-all-refs.bundle evo-ssearch-restored
+
+The bundle cannot contain uncommitted working-tree changes. Those are preserved
+in the adjacent ../repo/ snapshot, together with untracked source files that are
+part of the deployment. Local virtual environments, model caches, runtime
+state, database dumps, .git internals, and large review PDFs are intentionally
+excluded from that source snapshot.
+
+For incident recovery, keep both the Git clone and the ../repo/ snapshot until
+the deployed tree has been compared and committed intentionally.

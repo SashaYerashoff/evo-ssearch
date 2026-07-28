@@ -1,5 +1,3 @@
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Titillium+Web:wght@600;700&display=swap');
-
     :root {
         --bg: #0a0a0a;
         --panel: #161616;
@@ -1655,7 +1653,7 @@
         padding: 1rem;
     }
 
-    .monitor-box {
+    .probes-box {
         display: none;
         background: #111;
         border: 1px solid #222;
@@ -1957,6 +1955,102 @@
         min-height: 1.05rem;
     }
 
+    .memory-metabolism {
+        display: grid;
+        gap: 0.7rem;
+        padding: 0.8rem;
+        border: 1px solid rgba(50, 151, 121, 0.62);
+        border-radius: 10px;
+        background:
+            linear-gradient(135deg, rgba(12, 42, 39, 0.6), rgba(7, 16, 24, 0.78));
+    }
+
+    .memory-metabolism.is-hidden {
+        display: none;
+    }
+
+    .memory-metabolism-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 0.75rem;
+    }
+
+    .memory-metabolism-title {
+        color: #d9f4e9;
+        font-size: 0.82rem;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+    }
+
+    .memory-metabolism-summary,
+    .memory-metabolism-current {
+        color: #9fb8b2;
+        font-size: 0.78rem;
+        line-height: 1.45;
+    }
+
+    .memory-metabolism-state {
+        flex: 0 0 auto;
+        padding: 0.22rem 0.5rem;
+        border: 1px solid rgba(58, 188, 144, 0.55);
+        border-radius: 999px;
+        color: #8fe0c2;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.68rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    .memory-metabolism-stages {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.5rem;
+    }
+
+    .memory-metabolism-stage {
+        position: relative;
+        min-width: 0;
+        padding: 0.58rem;
+        border: 1px solid rgba(55, 78, 98, 0.82);
+        border-radius: 8px;
+        background: rgba(5, 13, 20, 0.64);
+    }
+
+    .memory-metabolism-stage.is-selected {
+        border-color: rgba(67, 202, 154, 0.82);
+        box-shadow: 0 0 0 1px rgba(67, 202, 154, 0.16);
+    }
+
+    .memory-metabolism-stage-level {
+        color: #d9e6e2;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.76rem;
+        font-weight: 700;
+    }
+
+    .memory-metabolism-stage-cadence {
+        margin-top: 0.2rem;
+        color: #75ceb0;
+        font-size: 0.7rem;
+    }
+
+    .memory-metabolism-stage-write {
+        margin-top: 0.35rem;
+        color: #91a3ad;
+        font-size: 0.7rem;
+        line-height: 1.35;
+    }
+
+    .memory-metabolism-stage-route {
+        margin-top: 0.35rem;
+        color: #688393;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.64rem;
+        text-transform: uppercase;
+    }
+
     .prompt-layer-details {
         border: 1px solid rgba(55, 78, 98, 0.88);
         border-radius: 8px;
@@ -1983,6 +2077,12 @@
         font-family: "JetBrains Mono", monospace;
         font-size: 0.76rem;
         line-height: 1.45;
+    }
+
+    @media (max-width: 760px) {
+        .memory-metabolism-stages {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
     }
 
     .prompt-bookmark-controls {
@@ -2806,16 +2906,7 @@
         margin-bottom: 0.4rem;
     }
 
-    /* Monitoring mock-inspired layout */
-    .monitor-grid {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: 1rem;
-        margin-bottom: 1rem;
-        align-items: start;
-    }
-
-    .monitor-panel {
+    .probes-panel {
         background: #111;
         border: 1px solid #222;
         border-radius: 10px;
@@ -2825,17 +2916,10 @@
         gap: var(--panel-gap);
     }
 
-    .monitor-panel h4 {
+    .probes-panel h4 {
         margin: 0 0 0.2rem 0;
         line-height: 1.25;
         letter-spacing: 0.01em;
-    }
-
-    .monitor-detections-panel .probe-nav {
-        display: grid;
-        grid-template-columns: auto 1fr auto;
-        gap: 0.5rem;
-        align-items: center;
     }
 
     .probe-nav-btn {
@@ -2857,37 +2941,6 @@
         cursor: default;
     }
 
-    .monitor-detections-panel .probe-results {
-        grid-template-columns: repeat(5, minmax(118px, 1fr));
-        min-height: 190px;
-        max-height: none;
-        overflow: hidden;
-        padding-right: 0;
-    }
-
-    .monitor-detections-panel .probe-results .loading {
-        grid-column: 1 / -1;
-        padding: 1.4rem 0.3rem;
-    }
-
-    .monitor-detections-panel .probe-result {
-        padding: 0.42rem;
-        min-width: 0;
-        display: flex;
-        flex-direction: column;
-        gap: 0.28rem;
-        border-color: #262626;
-    }
-
-    .monitor-detections-panel .probe-result img {
-        margin-bottom: 0;
-        width: 100%;
-        aspect-ratio: 16 / 9;
-        object-fit: cover;
-        border-radius: 5px;
-        border: 1px solid #202020;
-    }
-
     .probe-result-time {
         font-size: 0.74rem;
         color: #d8d8d8;
@@ -2903,7 +2956,7 @@
         line-height: 1.3;
     }
 
-    .monitor-stream-preview {
+    .probes-stream-preview {
         width: 100%;
         aspect-ratio: 16/9;
         background: #0a0a0a;
@@ -2913,13 +2966,13 @@
         overflow: hidden;
     }
 
-    .monitor-stream-preview img {
+    .probes-stream-preview img {
         width: 100%;
         height: 100%;
         object-fit: cover;
     }
 
-    .monitor-stream-overlay {
+    .probes-stream-overlay {
         position: absolute;
         inset: 0;
         display: flex;
@@ -2968,36 +3021,7 @@
         letter-spacing: 0.01em;
     }
 
-    .monitor-inline {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        flex-wrap: wrap;
-    }
-
-    .monitor-btn-row {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 0.5rem;
-        margin-top: 0.5rem;
-    }
-
-    .monitor-actions-row {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--panel-header-gap);
-        flex-wrap: wrap;
-        align-items: center;
-    }
-
-    .monitor-probe-header {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        flex-wrap: wrap;
-    }
-
-    .monitor-probe-form {
+    .probes-editor-form {
         display: flex;
         flex-direction: column;
         gap: 0.6rem;
@@ -3019,19 +3043,6 @@
     .probe-stream-actions {
         gap: 0.55rem;
         align-items: center;
-    }
-
-    .monitor-probe-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 0.8rem;
-    }
-
-    .monitor-probe-box {
-        background: #0c0c0c;
-        border: 1px solid #1f1f1f;
-        border-radius: 8px;
-        padding: 0.6rem;
     }
 
     .probe-shell {
@@ -3479,7 +3490,7 @@
         justify-self: end;
     }
 
-    .monitor-actions-bar {
+    .probes-actions-bar {
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -3487,7 +3498,7 @@
         flex-wrap: wrap;
     }
 
-    .monitor-actions-main {
+    .probes-actions-main {
         display: flex;
         gap: var(--panel-header-gap);
         flex-wrap: wrap;
@@ -3615,15 +3626,6 @@
         }
 
         .video-analysis-output {
-            min-height: 0;
-        }
-
-        .monitor-grid {
-            grid-template-columns: 1fr;
-        }
-
-        .monitor-detections-panel .probe-results {
-            grid-template-columns: repeat(5, minmax(0, 1fr));
             min-height: 0;
         }
 
@@ -4858,7 +4860,7 @@ body::after {
 
 .archive-box,
 .video-box,
-.monitor-box,
+.probes-box,
 .agent-box {
     width: 100%;
     height: 100%;
@@ -4880,8 +4882,7 @@ body::after {
 .archive-results-panel,
 .video-analysis-shell,
 .luxriot-card,
-.monitoring-toolbar,
-.monitor-panel,
+.probes-panel,
 .bench-card,
 .agent-sessions,
 .agent-chat-area,
@@ -5388,8 +5389,7 @@ textarea::placeholder {
 
 .luxriot-card,
 .video-analysis-shell,
-.monitoring-toolbar,
-.monitor-panel,
+.probes-panel,
 .bench-card,
 .agent-sessions,
 .agent-chat-area,
@@ -5405,7 +5405,7 @@ textarea::placeholder {
 }
 
 .luxriot-header h4,
-.monitor-panel h4,
+.probes-panel h4,
 .probe-header h4 {
     font-size: 1.02rem;
     font-weight: 600;
@@ -5724,26 +5724,10 @@ textarea::placeholder {
     border-color: rgba(37, 51, 66, 0.92);
 }
 
-.monitor-box {
+.probes-box {
     padding: 0;
     border: none;
     background: transparent;
-}
-
-.monitoring-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 18px 20px;
-}
-
-.monitoring-toolbar-title {
-    font-family: "JetBrains Mono", monospace;
-    font-size: 0.9rem;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
 }
 
 .probe-shell {
@@ -5769,19 +5753,12 @@ textarea::placeholder {
 }
 
 #probeCards:empty::before {
-    content: "Saved probes will appear here after the monitor catalog loads.";
+    content: "Saved probes will appear here after the probe catalog loads.";
     max-width: 260px;
     padding: 24px;
     color: var(--muted);
     text-align: center;
     line-height: 1.6;
-}
-
-.monitor-lower-grid {
-    display: grid;
-    grid-template-columns: minmax(260px, 0.8fr) minmax(0, 1.2fr);
-    gap: 18px;
-    align-items: start;
 }
 
 .bench-card {
@@ -5799,7 +5776,7 @@ textarea::placeholder {
     color: var(--text);
 }
 
-.monitor-panel {
+.probes-panel {
     padding: 18px;
 }
 
@@ -5827,7 +5804,7 @@ textarea::placeholder {
     background: #0a0d10;
 }
 
-.monitor-actions-bar {
+.probes-actions-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -5838,7 +5815,7 @@ textarea::placeholder {
     background: linear-gradient(180deg, rgba(19, 25, 32, 0.96), rgba(15, 18, 21, 0.96));
 }
 
-.monitor-actions-main {
+.probes-actions-main {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -6979,10 +6956,6 @@ textarea::placeholder {
         flex-basis: auto;
     }
 
-    .monitor-lower-grid {
-        grid-template-columns: 1fr;
-    }
-
     .agent-box {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas:
@@ -7061,19 +7034,17 @@ textarea::placeholder {
         grid-column: 1;
         grid-row: auto;
     }
-
-    .monitoring-toolbar,
-    .monitor-actions-bar {
+    .probes-actions-bar {
         flex-direction: column;
         align-items: stretch;
     }
 
-    .monitor-actions-main {
+    .probes-actions-main {
         width: 100%;
         justify-content: stretch;
     }
 
-    .monitor-actions-main > * {
+    .probes-actions-main > * {
         flex: 1 1 auto;
     }
 
@@ -7333,11 +7304,10 @@ textarea::placeholder {
 .luxriot-summaries-card,
 .video-analysis-shell,
 .luxriot-stream-card,
-.monitor-command-panel,
-.monitor-board-panel,
-.monitor-selection-panel,
+.probes-command-panel,
+.probes-board-panel,
+.probes-selection-panel,
 .bench-card,
-.monitor-detections-panel,
 .agent-sessions,
 .agent-chat-area,
 .agent-context {
@@ -8790,7 +8760,7 @@ textarea::placeholder {
     overflow: auto;
 }
 
-.monitor-box {
+.probes-box {
     grid-template-columns: minmax(250px, 300px) minmax(0, 1fr) minmax(320px, 380px);
     overflow: hidden;
 }
@@ -8798,9 +8768,9 @@ textarea::placeholder {
 /* Compact density for the non-video workspaces. */
 .archive-results-panel,
 .archive-inspector-panel,
-.monitor-command-panel,
-.monitor-board-panel,
-.monitor-selection-panel,
+.probes-command-panel,
+.probes-board-panel,
+.probes-selection-panel,
 .bench-card,
 .agent-sessions,
 .agent-chat-area,
@@ -8834,30 +8804,30 @@ textarea::placeholder {
     -webkit-line-clamp: 2;
 }
 
-.monitor-rail {
+.probes-rail {
     gap: 12px;
 }
 
-.monitor-command-panel .studio-panel-head,
-.monitor-board-panel .studio-panel-head,
-.monitor-selection-panel .studio-panel-head {
+.probes-command-panel .studio-panel-head,
+.probes-board-panel .studio-panel-head,
+.probes-selection-panel .studio-panel-head {
     margin-bottom: 10px;
     padding-bottom: 10px;
 }
 
-.monitor-selection-panel {
+.probes-selection-panel {
     gap: 12px;
 }
 
-.monitor-probe-summary {
+.probes-summary {
     gap: 10px;
 }
 
-.monitor-probe-stats {
+.probes-summary-stats {
     gap: 7px;
 }
 
-.monitor-probe-stat {
+.probes-summary-stat {
     padding: 9px 11px;
     border-radius: 10px;
 }
@@ -8878,13 +8848,13 @@ textarea::placeholder {
     gap: 16px;
 }
 
-.monitor-command-actions {
+.probes-command-actions {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
 }
 
-.monitor-board-panel .probe-shell {
+.probes-board-panel .probe-shell {
     flex: 1;
     min-height: 0;
 }
@@ -8900,25 +8870,25 @@ textarea::placeholder {
     cursor: pointer;
 }
 
-.monitor-selection-panel {
+.probes-selection-panel {
     display: flex;
     flex-direction: column;
     gap: 16px;
 }
 
-.monitor-probe-summary {
+.probes-summary {
     display: flex;
     flex-direction: column;
     gap: 14px;
 }
 
-.monitor-probe-hero {
+.probes-summary-hero {
     display: grid;
     grid-template-columns: 120px minmax(0, 1fr);
     gap: 14px;
 }
 
-.monitor-probe-thumb {
+.probes-summary-thumb {
     min-height: 120px;
     border-radius: 16px;
     overflow: hidden;
@@ -8931,36 +8901,36 @@ textarea::placeholder {
     text-align: center;
 }
 
-.monitor-probe-thumb img {
+.probes-summary-thumb img {
     width: 100%;
     height: 100%;
     object-fit: cover;
 }
 
-.monitor-probe-copy {
+.probes-summary-copy {
     display: flex;
     flex-direction: column;
     gap: 8px;
 }
 
-.monitor-probe-name {
+.probes-summary-name {
     font-size: 1.02rem;
     font-weight: 600;
     color: var(--text);
 }
 
-.monitor-probe-meta {
+.probes-summary-meta {
     color: var(--muted);
     font-size: 0.84rem;
     line-height: 1.45;
 }
 
-.monitor-probe-stats {
+.probes-summary-stats {
     display: grid;
     gap: 10px;
 }
 
-.monitor-probe-stat {
+.probes-summary-stat {
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -8970,7 +8940,7 @@ textarea::placeholder {
     background: rgba(12, 17, 23, 0.78);
 }
 
-.monitor-probe-stat-label {
+.probes-summary-stat-label {
     font-family: "JetBrains Mono", monospace;
     font-size: 0.68rem;
     font-weight: 700;
@@ -8979,30 +8949,19 @@ textarea::placeholder {
     color: var(--muted);
 }
 
-.monitor-probe-stat-value {
+.probes-summary-stat-value {
     color: var(--text);
     font-size: 0.88rem;
     line-height: 1.5;
 }
 
-.monitor-actions-bar {
+.probes-actions-bar {
     margin-top: auto;
     padding: 0;
     border: none;
     border-radius: 0;
     background: transparent;
     box-shadow: none;
-}
-
-.monitor-detections-panel .probe-nav {
-    flex: 1;
-    min-height: 260px;
-}
-
-.monitor-detections-panel .probe-results {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
 }
 
 .agent-box {
@@ -9696,7 +9655,7 @@ textarea::placeholder {
 
 @media (max-width: 1520px) {
     .archive-box,
-    .monitor-box,
+    .probes-box,
     .agent-box {
         grid-template-columns: minmax(240px, 286px) minmax(0, 1fr) minmax(290px, 338px);
     }
@@ -9729,9 +9688,9 @@ textarea::placeholder {
 
     .archive-results-head .archive-results-sub,
     .archive-inspector .studio-panel-sub,
-    .monitor-command-panel .studio-panel-sub,
-    .monitor-board-panel .studio-panel-sub,
-    .monitor-selection-panel .studio-panel-sub,
+    .probes-command-panel .studio-panel-sub,
+    .probes-board-panel .studio-panel-sub,
+    .probes-selection-panel .studio-panel-sub,
     .agent-sessions-sub,
     .agent-chat-sub {
         display: none;
@@ -9743,7 +9702,7 @@ textarea::placeholder {
         grid-template-columns: minmax(300px, 320px) minmax(0, 1fr) minmax(320px, 350px);
     }
 
-    .monitor-box {
+    .probes-box {
         grid-template-columns: minmax(240px, 270px) minmax(0, 1fr) minmax(300px, 330px);
     }
 
@@ -9764,14 +9723,14 @@ textarea::placeholder {
 @media (max-width: 1260px) {
     .archive-box,
     .video-box,
-    .monitor-box,
+    .probes-box,
     .agent-box {
         grid-template-columns: minmax(240px, 280px) minmax(0, 1fr);
     }
 
     .archive-inspector,
     .video-inspector,
-    .monitor-inspector,
+    .probes-inspector,
     .agent-inspector {
         display: none;
     }
@@ -9812,7 +9771,7 @@ textarea::placeholder {
     .studio-mode,
     .archive-box,
     .video-box,
-    .monitor-box,
+    .probes-box,
     .agent-box {
         grid-template-columns: 1fr;
         height: auto;
@@ -9862,7 +9821,7 @@ textarea::placeholder {
         padding-right: 0;
     }
 
-    .monitor-probe-hero {
+    .probes-summary-hero {
         grid-template-columns: 1fr;
     }
 
@@ -10019,6 +9978,35 @@ body.auth-required {
     background: #0a1318;
 }
 
+.auth-password-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+}
+
+.auth-password-row input {
+    width: 100%;
+}
+
+.auth-password-toggle {
+    min-width: 58px;
+    padding: 0 10px;
+    border: 1px solid #334752;
+    border-radius: 6px;
+    color: #a9bac4;
+    background: #101a20;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+}
+
+.auth-password-toggle:hover,
+.auth-password-toggle:focus-visible {
+    border-color: #00d68f;
+    color: #eef5f7;
+}
+
 .auth-login-status {
     min-height: 18px;
     color: #ff9a9a;
@@ -10039,7 +10027,7 @@ body.auth-required {
 .studio-mode,
 .archive-box,
 .video-box,
-.monitor-box,
+.probes-box,
 .agent-box {
     min-height: 0;
     overflow: hidden;
@@ -10054,9 +10042,9 @@ body.auth-required {
 .video-rail,
 .video-workspace,
 .video-inspector,
-.monitor-rail,
-.monitor-workspace,
-.monitor-inspector,
+.probes-rail,
+.probes-workspace,
+.probes-inspector,
 .agent-rail,
 .agent-workspace,
 .agent-inspector {
@@ -10204,22 +10192,104 @@ body.ui-lite [style*="backdrop-filter"] {
     backdrop-filter: none !important;
 }
 
-/* Archive channel scope: checkbox chips make multi-stream selection explicit. */
+/* Archive channel scope: compact full-width disclosure with searchable multi-select. */
+.archive-streams-group {
+    grid-column: 1 / -1;
+    min-width: 0;
+}
+
 .archive-channel-picker {
+    position: relative;
+    min-width: 0;
+}
+
+.archive-channel-picker-toggle {
+    width: 100%;
+    min-width: 0;
+    min-height: 42px;
     display: grid;
-    gap: 6px;
-    max-height: 178px;
-    padding: 7px;
-    overflow-y: auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 11px;
     border: 1px solid var(--field-border);
     border-radius: 10px;
+    color: var(--text);
     background: rgba(11, 16, 21, 0.96);
-    scrollbar-width: thin;
+    cursor: pointer;
+    text-align: left;
+}
+
+.archive-channel-picker-toggle:hover,
+.archive-channel-picker-toggle:focus-visible,
+.archive-channel-picker.is-open .archive-channel-picker-toggle {
+    border-color: rgba(0, 214, 143, 0.58);
+    box-shadow: 0 0 0 2px rgba(0, 214, 143, 0.09);
+    outline: none;
+}
+
+.archive-channel-picker-summary {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 0.84rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.archive-channel-picker-chevron {
+    color: var(--muted);
+    font-size: 1rem;
+    line-height: 1;
+    transition: transform 0.16s ease;
+}
+
+.archive-channel-picker.is-open .archive-channel-picker-chevron {
+    transform: rotate(180deg);
+}
+
+.archive-channel-popover {
+    display: grid;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+    margin-top: 7px;
+    padding: 9px;
+    border: 1px solid rgba(0, 214, 143, 0.32);
+    border-radius: 12px;
+    background: rgba(7, 12, 17, 0.98);
+    box-shadow: 0 14px 30px rgba(0, 0, 0, 0.28);
+}
+
+.archive-channel-popover[hidden] {
+    display: none;
+}
+
+.archive-channel-picker-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.archive-channel-picker-toolbar input[type="search"] {
+    width: 100%;
+    min-width: 0;
+}
+
+.archive-channel-picker-toolbar .feature-btn,
+.archive-channel-picker-footer .feature-btn {
+    min-height: 36px;
+    padding: 7px 10px;
 }
 
 .archive-channel-options {
     display: grid;
     gap: 5px;
+    max-height: 218px;
+    min-height: 0;
+    padding-right: 3px;
+    overflow-y: auto;
+    scrollbar-width: thin;
 }
 
 .archive-channel-option {
@@ -10249,15 +10319,59 @@ body.ui-lite [style*="backdrop-filter"] {
 
 .archive-channel-option span {
     min-width: 0;
+}
+
+.archive-channel-option-copy {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+}
+
+.archive-channel-option-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.archive-channel-option-id {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 0.68rem;
 }
 
 .archive-channel-option-all {
     border-bottom: 1px solid rgba(37, 51, 66, 0.72);
     border-radius: 8px 8px 2px 2px;
     color: var(--muted);
+}
+
+.archive-channel-empty {
+    padding: 12px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-align: center;
+}
+
+.archive-channel-empty[hidden] {
+    display: none;
+}
+
+.archive-channel-picker-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(37, 51, 66, 0.72);
+}
+
+.archive-channel-picker-footer span {
+    min-width: 0;
+    color: var(--muted);
+    font-size: 0.68rem;
+    line-height: 1.35;
 }
 
 /* Probe board: keep operational controls together per source channel. */
@@ -10313,34 +10427,521 @@ body.ui-lite [style*="backdrop-filter"] {
     align-items: start;
 }
 
-.probe-temporary-group {
+/* ── Probe board: operator group -> channel -> probes ─────────────────── */
+
+.probes-group {
+    display: grid;
+    gap: 12px;
     min-width: 0;
-    padding-top: 2px;
-    border-top: 1px solid rgba(37, 51, 66, 0.58);
 }
 
-.probe-temporary-group > summary {
-    padding: 9px 2px 7px;
+.probes-group-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 2px 0;
+    min-width: 0;
+}
+
+.probes-group-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--text);
     cursor: pointer;
+}
+
+.probes-group-toggle:hover {
+    background: rgba(0, 229, 255, 0.06);
+}
+
+.probes-group-chevron {
+    flex: 0 0 auto;
+    width: 0;
+    height: 0;
+    border-left: 5px solid currentColor;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    color: var(--accent-cyan);
+    transform: rotate(90deg);
+    transition: transform 0.15s ease;
+}
+
+.probes-group.is-collapsed .probes-group-chevron {
+    transform: rotate(0deg);
+}
+
+.probes-group-name {
+    overflow: hidden;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.probes-group-meta {
+    flex: 1 1 auto;
     color: var(--muted);
     font-family: "JetBrains Mono", monospace;
     font-size: 0.68rem;
+    letter-spacing: 0.04em;
+}
+
+.probes-group.is-synthetic .probes-group-name {
+    color: var(--muted);
+}
+
+.probes-group-edit {
+    flex: 0 0 auto;
+}
+
+.probes-group-body {
+    display: grid;
+    gap: 12px;
+    min-width: 0;
+}
+
+.probes-group.is-collapsed .probes-group-body {
+    display: none;
+}
+
+.probes-group-new {
+    padding: 0;
+    border-style: dashed;
+    background: transparent;
+}
+
+/* ── Origin badges ────────────────────────────────────────────────────── */
+
+.probes-origin-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.6rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.probes-origin-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+}
+
+.probes-origin-dot.is-operator { background: var(--muted); }
+.probes-origin-dot.is-agent { background: var(--accent-cyan); }
+.probes-origin-dot.is-auto { background: var(--accent-amber); }
+
+.probes-origin-badge.is-operator {
+    border-color: rgba(129, 147, 164, 0.34);
+    background: rgba(129, 147, 164, 0.1);
+    color: var(--muted);
+}
+
+.probes-origin-badge.is-agent {
+    border-color: var(--accent-cyan-dim);
+    background: rgba(0, 229, 255, 0.09);
+    color: var(--accent-cyan);
+}
+
+.probes-origin-badge.is-auto {
+    border-color: var(--accent-amber-dim);
+    background: rgba(240, 160, 48, 0.09);
+    color: var(--accent-amber);
+}
+
+.probes-ttl {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    border: 1px solid var(--accent-amber-dim);
+    border-radius: 999px;
+    color: var(--accent-amber);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.6rem;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+/* ── Activity sparkline (replaces the empty preview placeholder) ───────── */
+
+.probes-spark {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    padding: 6px 8px;
+}
+
+.probes-spark svg {
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+}
+
+.probes-spark-line {
+    fill: none;
+    stroke: var(--accent-cyan);
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+}
+
+.probes-spark.is-over .probes-spark-line {
+    stroke: var(--accent-green);
+}
+
+.probes-spark-floor {
+    stroke: rgba(240, 160, 48, 0.5);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+    vector-effect: non-scaling-stroke;
+}
+
+.probes-spark-head {
+    fill: var(--accent-cyan);
+}
+
+.probes-spark.is-over .probes-spark-head {
+    fill: var(--accent-green);
+}
+
+.probes-spark.is-empty line {
+    stroke: rgba(129, 147, 164, 0.3);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+}
+
+.probes-spark-label {
+    position: absolute;
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
 }
 
-.probe-temporary-group[open] > summary {
-    color: var(--accent);
+/* ── Board toolbar and view toggle ────────────────────────────────────── */
+
+.probes-board-tools {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
 }
 
-.probe-temporary-group > .probe-channel-card-grid {
-    padding-top: 4px;
+.probes-view-toggle {
+    display: inline-flex;
+    padding: 2px;
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius-md);
+    background: var(--field);
 }
 
-.probe-channel-group-new {
-    padding: 0;
-    border-style: dashed;
+.probes-view-btn {
+    padding: 4px 12px;
+    border: 0;
+    border-radius: calc(var(--radius-md) - 3px);
     background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.probes-view-btn:hover {
+    color: var(--text);
+}
+
+.probes-view-btn.is-active {
+    background: var(--accent-cyan-dim);
+    color: var(--accent-cyan);
+}
+
+/* ── Filter rail ──────────────────────────────────────────────────────── */
+
+.probes-filter-panel,
+.probes-groups-panel {
+    display: grid;
+    gap: var(--panel-gap);
+    align-content: start;
+}
+
+.probes-filter-search input {
+    width: 100%;
+}
+
+.probes-filter-block {
+    display: grid;
+    gap: 6px;
+}
+
+.probes-filter-label {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+.probes-filter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.probes-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 9px;
+    border: 1px solid var(--panel-border);
+    border-radius: 999px;
+    background: var(--field);
+    color: var(--muted);
+    cursor: pointer;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.64rem;
+    letter-spacing: 0.04em;
+}
+
+.probes-chip:hover {
+    border-color: var(--accent-cyan-dim);
+    color: var(--text);
+}
+
+.probes-chip.is-active {
+    border-color: var(--accent-cyan);
+    background: var(--accent-cyan-dim);
+    color: var(--accent-cyan);
+}
+
+.probes-chip-count {
+    padding: 0 4px;
+    border-radius: 999px;
+    background: rgba(129, 147, 164, 0.16);
+    font-size: 0.6rem;
+}
+
+.probes-filter-reset {
+    flex: 0 0 auto;
+}
+
+.probes-group-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.probes-group-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 5px 10px;
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius-md);
+    background: var(--field);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 0.74rem;
+}
+
+.probes-group-chip:hover {
+    border-color: var(--accent-cyan-dim);
+}
+
+.probes-group-chip-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.probes-group-chip-count {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+}
+
+.probes-group-empty,
+.probes-empty-filtered {
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.probes-empty-filtered {
+    display: grid;
+    gap: 10px;
+    justify-items: start;
+}
+
+.probes-group-owner {
+    margin-left: auto;
+    color: var(--accent-amber);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.62rem;
+}
+
+/* ── List view ────────────────────────────────────────────────────────── */
+
+.probes-row-list {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+}
+
+.probes-row {
+    display: grid;
+    grid-template-columns:
+        minmax(64px, auto) minmax(48px, auto) minmax(120px, 2fr)
+        minmax(56px, auto) minmax(72px, 1fr) minmax(64px, auto)
+        minmax(72px, auto) minmax(72px, auto) minmax(0, auto) auto;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding: 6px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: 0.74rem;
+}
+
+.probes-row:hover {
+    border-color: var(--panel-border);
+    background: rgba(0, 229, 255, 0.04);
+}
+
+.probes-row.active {
+    border-color: var(--accent-cyan-dim);
+    background: rgba(0, 229, 255, 0.08);
+}
+
+.probes-row > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.probes-row-name {
+    font-weight: 500;
+}
+
+.probes-row-channel,
+.probes-row-last,
+.probes-row-score,
+.probes-row-gate {
+    color: var(--muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+}
+
+.probes-row-spark {
+    height: 20px;
+}
+
+.probes-row-spark .probes-spark {
+    padding: 0;
+}
+
+.probes-row-spark .probes-spark-label {
+    display: none;
+}
+
+.probes-row-actions {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
+}
+
+/* ── Card head tags and inspector additions ───────────────────────────── */
+
+.probe-mini-head-tags,
+.probes-summary-tags {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex-wrap: wrap;
+}
+
+.probes-summary-signal {
+    display: grid;
+    gap: 6px;
+    padding: 10px 12px;
+    border: 1px solid var(--panel-border);
+    border-radius: var(--radius-md);
+    background: var(--field);
+}
+
+.probes-summary-signal .probes-spark {
+    height: 48px;
+    padding: 0;
+}
+
+.probes-summary-lineage {
+    display: grid;
+    gap: 8px;
+}
+
+.probes-lineage-jump {
+    justify-self: start;
+}
+
+.probe-group-body {
+    display: grid;
+    gap: 12px;
+}
+
+.probe-group-name-row {
+    display: grid;
+    gap: 6px;
+}
+
+.probe-group-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.probe-group-channel-list {
+    max-height: 44vh;
+    overflow-y: auto;
+}
+
+@media (max-width: 1100px) {
+    .probes-row {
+        grid-template-columns: minmax(64px, auto) minmax(48px, auto) minmax(120px, 1fr) minmax(56px, auto) auto;
+    }
+
+    .probes-row-spark,
+    .probes-row-last,
+    .probes-row-score,
+    .probes-row-gate,
+    .probes-row-ttl {
+        display: none;
+    }
 }
 
 @media (max-width: 720px) {
@@ -10527,7 +11128,6 @@ body.ui-lite [style*="backdrop-filter"] {
 /* UI layout consistency contract: repeated cards own their row; media owns clipping. */
 #probeCards,
 .results-grid,
-.monitor-detections-panel .probe-results,
 .agent-det-grid,
 .agent-search-results-grid,
 .agent-evidence-grid {
@@ -10539,15 +11139,13 @@ body.ui-lite [style*="backdrop-filter"] {
 }
 
 #probeCards,
-.results-grid,
-.monitor-detections-panel .probe-results {
+.results-grid{
     overflow-x: hidden;
     overflow-y: auto;
 }
 
 .probe-mini-card,
-#results > .result-item,
-.monitor-detections-panel .probe-result {
+#results > .result-item{
     min-width: 0;
     overflow: hidden;
 }
@@ -10572,18 +11170,6 @@ body.ui-lite [style*="backdrop-filter"] {
 .archive-inspector-body .result-item.expanded {
     contain: none;
     overflow: visible;
-}
-
-.monitor-detections-panel .probe-results {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
-    max-height: none;
-}
-
-.monitor-detections-panel .probe-result img {
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    object-fit: cover;
 }
 
 .agent-det-grid,
@@ -10964,19 +11550,19 @@ body::-webkit-scrollbar-thumb:hover,
 /* Narrow Archive/Monitoring/Agent workspaces: no clipped grid rows or nested page traps. */
 @media (max-width: 920px) {
     .archive-box,
-    .monitor-box,
+    .probes-box,
     .agent-box,
     .archive-rail,
     .archive-workspace,
-    .monitor-rail,
-    .monitor-workspace,
+    .probes-rail,
+    .probes-workspace,
     .agent-rail,
     .agent-workspace {
         overflow: visible;
     }
 
     .archive-box,
-    .monitor-box,
+    .probes-box,
     .agent-box {
         height: auto;
         min-height: 0;
@@ -10984,7 +11570,7 @@ body::-webkit-scrollbar-thumb:hover,
     }
 
     .archive-rail,
-    .monitor-rail,
+    .probes-rail,
     .agent-rail {
         height: auto;
         min-height: max-content;
@@ -11003,8 +11589,8 @@ body::-webkit-scrollbar-thumb:hover,
         min-height: max(560px, 70dvh);
     }
 
-    .monitor-workspace,
-    .monitor-board-panel {
+    .probes-workspace,
+    .probes-board-panel {
         height: max(600px, 74dvh);
         min-height: max(600px, 74dvh);
     }

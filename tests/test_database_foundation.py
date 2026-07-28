@@ -20,6 +20,9 @@ from archive_store import PostgresDetectionsStore
 
 
 ROOT = Path(__file__).resolve().parent.parent
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+WSGI_SOURCE = (ROOT / "wsgi.py").read_text(encoding="utf-8")
+ARCHIVE_STORE_SOURCE = (ROOT / "archive_store.py").read_text(encoding="utf-8")
 MIGRATION = ROOT / "migrations" / "versions" / (
     "20260609_0001_secure_foundation.py"
 )
@@ -46,6 +49,9 @@ ATTENTION_STORAGE_MIGRATION = ROOT / "migrations" / "versions" / (
 )
 VLM_BATCH_IDENTITY_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260726_0009_vlm_batch_identity.py"
+)
+AUDIT_HASH_CHAIN_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260727_0010_audit_hash_chain.py"
 )
 
 
@@ -125,6 +131,19 @@ class OptionalDependencyTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(CURRENT_SCHEMA_REVISION, completed.stdout)
+
+    def test_repository_ci_runs_drift_compile_and_full_tests(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("ubuntu-24.04", workflow)
+        self.assertIn("scripts/check_docs_drift.sh", workflow)
+        self.assertIn("python -m compileall", workflow)
+        self.assertIn("python -m pytest -q", workflow)
+        self.assertIn('EVOSSEARCH_OFFLINE_MODE: "true"', workflow)
+
+    def test_wsgi_starts_scheduled_retention_and_cap_has_no_orphan_delete_path(self):
+        self.assertIn("ensure_archive_retention_thread()", WSGI_SOURCE)
+        self.assertNotIn("_trim_to_cap", ARCHIVE_STORE_SOURCE)
+        self.assertIn("deleted_image_paths", ARCHIVE_STORE_SOURCE)
 
     def test_pool_reports_actionable_error_when_driver_is_missing(self):
         settings = DatabaseSettings(dsn="postgresql://db/eva")
@@ -234,6 +253,22 @@ class ArchiveChannelFilterTests(unittest.TestCase):
         self.assertEqual(
             params,
             [store.tenant_id, 7, "vlm_summary", "vlm-7c6512"],
+        )
+
+    def test_parent_alert_scope_is_parameterized(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+
+        where_sql, params = store._build_where(
+            channel_id=7,
+            source="vlm_alert",
+            parent_alert_id="vlm-alert-exact",
+        )
+
+        self.assertIn("payload_json->>'parent_alert_id' = %s", where_sql)
+        self.assertEqual(
+            params,
+            [store.tenant_id, 7, "vlm_alert", "vlm-alert-exact"],
         )
 
 
@@ -417,7 +452,7 @@ class MigrationContentTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260726_0009"',
             vlm_batch_identity_source,
         )
         self.assertIn(
@@ -431,6 +466,29 @@ class MigrationContentTests(unittest.TestCase):
         self.assertIn(
             "payload_json->>'batch_id'",
             vlm_batch_identity_source,
+        )
+        audit_hash_chain_source = AUDIT_HASH_CHAIN_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            audit_hash_chain_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260726_0009"',
+            audit_hash_chain_source,
+        )
+        self.assertIn(
+            "GRANT SELECT (tenant_id, sequence_number, event_hash)",
+            audit_hash_chain_source,
+        )
+        self.assertIn(
+            "ix_audit_events_tenant_sequence",
+            audit_hash_chain_source,
+        )
+        self.assertIn(
+            "octet_length(event_hash) = 32",
+            audit_hash_chain_source,
         )
         self.assertIn(
             "CREATE TABLE archive.attention_probe_scores",

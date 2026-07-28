@@ -39,6 +39,13 @@ uses to dig through volume.
 - Prompt settings are split by purpose: L0 description behavior is
   `stream_system_prompt`; **Alert Criteria** is `alert_policy_prompt`; the
   structured alert parser contract is `json_alert_prompt`.
+- `Protocol: Deploy` starts a durable commissioning workflow for at most eight
+  channels. The agent inventories authorized channels, persists the selected
+  scope/groups, performs one bounded scene survey, collects operator-grounded
+  routine/alert/counting policy, and returns one composite preview. The UI
+  Apply action installs the channel groups, Alert Criteria, bounded starter
+  probes, counted-state profiles, quiet-window preference, and optional live
+  starts. A service restart does not lose the deployment stage.
 
 **Internal tools (agent-invoked, for semantic bulk comparison)**
 - `query_probe` / `list_probes` / `get_visual_window_signals` — CLIP P/N/M
@@ -62,6 +69,10 @@ uses to dig through volume.
   reconstruct a long checklist from chat. For multiple alert classes or many
   channels, the agent should continue by `job_id` instead of dumping raw P/N/M
   traces.
+- `query_counted_state_metric` — answers transition-count and dwell-time
+  questions from the continuous `semantic_snapshot` archive. Counts are state
+  episodes, not delivered alerts, so bookmark cooldown/dedup does not change
+  the answer. Unknown/no-coverage time is reported separately.
 
 **Time & scope helpers**
 - `normalize_time_window` — turns "last 2 hours", "yesterday evening" into exact
@@ -75,7 +86,9 @@ uses to dig through volume.
   in that window. Unscoped "search everything for two weeks" only inspects the
   most recent slice — always scope.
 - For "how many times X" questions, expect **candidates** with boundary frames;
-  ask it to describe those frames to confirm.
+  ask it to describe those frames to confirm. A configured counted-state
+  profile makes the query reproducible across operators and keeps alert
+  delivery out of the count.
 - Read its **coverage line**: it states the period requested, period inspected,
   entries returned, and whether the result was truncated.
 
@@ -108,9 +121,10 @@ uses to dig through volume.
 
 - Up to 64 tool calls per turn; broad multi-channel research is chunked across
   turns and reports which channels remain unchecked.
-- The agent reassembles its working state from the conversation each turn; it has
-  no persistent self between turns beyond the stored session. Long investigations
-  may need re-grounding — restate the channel/period if a thread drifts.
+- Ordinary investigations reassemble working state from the conversation.
+  Protocol Deploy and its first commissioning receipt are separately persisted
+  in the tenant runtime store, so the workflow can resume after a new chat or
+  EVA restart.
 
 ## Safety posture (why human-in-the-loop)
 

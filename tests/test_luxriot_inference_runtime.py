@@ -1146,6 +1146,79 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
 
 
 class LuxriotCaptureDispatchTests(unittest.TestCase):
+    def test_async_clip_dispatch_does_not_block_capture_bucket_rollover(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingProbeManager:
+            def add_frame(
+                self,
+                channel_id,
+                _image,
+                timestamp_ms,
+                provenance=None,
+            ):
+                started.set()
+                if not release.wait(timeout=3.0):
+                    raise RuntimeError("test embedding release timed out")
+                return {
+                    "channel_id": channel_id,
+                    "timestamp_ms": timestamp_ms,
+                    "embedding_ref": f"probe-buffer:{channel_id}:1",
+                    "embedding": np.asarray([1.0, 0.0], dtype=np.float32),
+                    "thumbnail": "jpeg",
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_CLIP_ASYNC_ENABLED": True,
+                    "LUXRIOT_CLIP_ASYNC_WORKERS": 2,
+                    "LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY": 8,
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                },
+            )
+            manager.probe_manager = BlockingProbeManager()
+            manager.shared_probe_channels.add(7)
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=8,
+                prompt="Describe.",
+                run_id="run-7",
+            )
+            first = Image.new("RGB", (24, 16), color=(0, 0, 0))
+            second = Image.new("RGB", (24, 16), color=(32, 32, 32))
+
+            session._accept_captured_frame(
+                first,
+                100_100,
+                summarize=False,
+            )
+            started_at = time.monotonic()
+            session._accept_captured_frame(
+                second,
+                101_100,
+                summarize=False,
+            )
+            elapsed = time.monotonic() - started_at
+
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(len(session.frames), 0)
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not session.frames:
+                time.sleep(0.01)
+            self.assertEqual(len(session.frames), 1)
+            self.assertTrue(session.frames[0].get("embedding_ref"))
+            status = manager.probe_embedding_dispatch_status()
+            self.assertEqual(status["submitted_total"], 1)
+            self.assertEqual(status["completed_total"], 1)
+            self.assertEqual(status["failed_total"], 0)
+            manager.stop_probe_embedding_executor(wait=True)
+
     def test_summary_flush_preserves_recent_preview_frames(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -1229,7 +1302,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(len(session.frames), 2)
             self.assertIn("database unavailable", session.last_error)
-            self.assertEqual(session.queue_dropped_batches, 1)
+            self.assertEqual(session.queue_dropped_batches, 0)
+            self.assertEqual(session.summary_coverage_gap_batches, 0)
 
     def test_capture_loop_keeps_summary_failure_visible(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1259,7 +1333,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(len(session.frames), 1)
             self.assertIn("vlm unavailable", session.last_error)
-            self.assertEqual(session.queue_dropped_batches, 1)
+            self.assertEqual(session.queue_dropped_batches, 0)
+            self.assertEqual(session.summary_coverage_gap_batches, 0)
 
     def test_normal_capture_does_not_clear_summary_failure_before_success(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1286,6 +1361,15 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(session.summary_failed_batches, 1)
             self.assertEqual(session.queue_dropped_batches, 1)
             self.assertEqual(session.dropped_frames, 2)
+            gaps = [
+                row
+                for row in manager.summary_history.get(7, [])
+                if row.get("coverage_gap")
+            ]
+            self.assertEqual(len(gaps), 1)
+            self.assertEqual(gaps[0]["gap_reason"], "lm_dispatch_exception")
+            self.assertEqual(gaps[0]["gap_error_type"], "RuntimeError")
+            self.assertEqual(gaps[0]["gap_error"], "vlm unavailable")
 
             session._accept_captured_frame(
                 SimpleNamespace(width=1280, height=720),
@@ -1743,6 +1827,63 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("sample-token", status["last_error"])
             self.assertNotIn("sample-password", status["stream"]["error"])
             self.assertNotIn("sample-token", status["stream"]["error"])
+
+    def test_complete_inventory_stops_missing_and_disabled_live_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+
+            class Client:
+                channel_inventory_meta = {
+                    "complete": True,
+                    "completion": "explicit",
+                }
+
+                def get_channels(self):
+                    return [
+                        {
+                            "id": 7,
+                            "title": "Disabled",
+                            "enabled": False,
+                            "availability": "disabled",
+                        },
+                        {
+                            "id": 9,
+                            "title": "Available",
+                            "enabled": True,
+                            "availability": "available",
+                        },
+                    ]
+
+            manager.sessions = {7: object(), 8: object()}
+            manager.probe_sessions = {7: object()}
+            with (
+                patch.object(manager, "build_client", return_value=Client()),
+                patch.object(manager, "stop_session") as stop_session,
+                patch.object(manager, "stop_probe_capture") as stop_probe,
+            ):
+                channels = manager.get_channels(force=True)
+
+            self.assertEqual([row["id"] for row in channels], [7, 9])
+            self.assertEqual(
+                {call.args[0] for call in stop_session.call_args_list},
+                {7, 8},
+            )
+            stop_probe.assert_called_once_with(7, pause=False)
+            reconciliation = manager.channel_inventory_status()["stream"][
+                "reconciliation"
+            ]
+            self.assertEqual(
+                reconciliation["stopped_channel_ids"],
+                [7, 8],
+            )
+            self.assertEqual(
+                reconciliation["unavailable_channel_ids"],
+                [7],
+            )
+            self.assertEqual(
+                reconciliation["missing_channel_ids"],
+                [8],
+            )
 
     def test_superseded_session_completion_has_no_archive_bookmark_state_or_history_side_effects(self):
         archived = []
@@ -3434,11 +3575,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
     def test_summary_alert_counts_roll_up_by_severity(self):
         with tempfile.TemporaryDirectory() as temp:
             def parse_alerts(text, _channel_id, _default_ts_ms=None):
-                if "critical-event" in text:
-                    return [{"severity": "critical"}, {"severity": "normal"}]
-                if "low-event" in text:
-                    return [{"severity": "low"}]
-                return []
+                payload = json.loads(text.split("BATCH_STATE_JSON:", 1)[1])
+                return list(payload.get("alerts") or [])
 
             manager = build_manager(Path(temp), alert_parser=parse_alerts)
             now = time.time()
@@ -3447,7 +3585,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 {
                     "channel_id": 7,
                     "run_id": "run-7",
-                    "summary": "critical-event\nALERTS_JSON:\n{\"alerts\":[]}",
+                    "summary": (
+                        "critical-event\nALERTS_JSON:\n"
+                        "{\"alerts\":[{\"severity\":\"critical\"},{\"severity\":\"normal\"}]}"
+                    ),
                     "frame_count": 2,
                     "created_at": now,
                 },
@@ -3457,7 +3598,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 {
                     "channel_id": 7,
                     "run_id": "run-7",
-                    "summary": "low-event\nALERTS_JSON:\n{\"alerts\":[]}",
+                    "summary": (
+                        "low-event\nALERTS_JSON:\n"
+                        "{\"alerts\":[{\"severity\":\"low\"}]}"
+                    ),
                     "frame_count": 2,
                     "created_at": now + 1.0,
                 },
@@ -3989,7 +4133,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("vehicle performs drifting", joined)
             self.assertIn("partially obstructed", joined)
 
-    def test_prose_alert_section_can_drive_alert_metadata_and_bookmarks(self):
+    def test_prose_alert_section_is_diagnostic_only_and_cannot_drive_bookmarks(self):
         with tempfile.TemporaryDirectory() as temp:
             def parse_alerts(text, channel_id, default_ts_ms=None):
                 alerts = []
@@ -4035,9 +4179,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 },
             )
             logs = manager.session_status(7, run_selector="all")["logs"]
-            self.assertEqual(logs[0]["alert_counts"], {"low": 1, "info": 1})
-            self.assertEqual(logs[0]["signal_digest"]["alerts"], {"low": 1, "info": 1})
-            self.assertIn("Person waves", " ".join(logs[0]["signal_digest"]["alert_events"]))
+            self.assertEqual(logs[0]["alert_counts"], {})
+            self.assertNotIn("alerts", logs[0]["signal_digest"])
 
             manager.default_bookmark_enabled = True
             manager.default_bookmark_cooldown_sec = 0.0
@@ -4048,8 +4191,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     summary,
                     default_ts_ms=1_781_700_000_000,
                 )
-            self.assertEqual(count, 2)
-            self.assertEqual([item["severity"] for item in sent], ["info", "low"])
+            self.assertEqual(count, 0)
+            self.assertEqual(sent, [])
+            self.assertEqual(
+                count.as_dict()["alert_parser_error"],
+                "structured_alert_contract_missing",
+            )
 
     def test_lm_alert_parser_handles_prose_and_warning_severity(self):
         parser = load_lm_alert_parser()
@@ -4222,6 +4369,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     "created_at": 100.0,
                     "batch_start_ms": 100000,
                     "batch_end_ms": 112000,
+                    "batch_state": {
+                        "version": 1,
+                        "contract_status": "parsed",
+                        "observed_states": [
+                            {
+                                "key": "person near entrance",
+                                "label": "Person near entrance",
+                                "state": "present",
+                                "snapshot_indices": [1, 12],
+                                "evidence": "visible near doorway",
+                            }
+                        ],
+                        "alerts": [],
+                    },
                 }
             )
             second = manager.accept_summary_entry(
@@ -4237,6 +4398,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     "created_at": 113.0,
                     "batch_start_ms": 113000,
                     "batch_end_ms": 125000,
+                    "batch_state": {
+                        "version": 1,
+                        "contract_status": "parsed",
+                        "observed_states": [
+                            {
+                                "key": "person near entrance",
+                                "label": "Person near entrance",
+                                "state": "absent",
+                                "snapshot_indices": [1, 12],
+                                "evidence": "entrance area is clear",
+                            }
+                        ],
+                        "alerts": [],
+                    },
                 }
             )
             third = manager.accept_summary_entry(
@@ -4252,6 +4427,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     "created_at": 126.0,
                     "batch_start_ms": 126000,
                     "batch_end_ms": 138000,
+                    "batch_state": {
+                        "version": 1,
+                        "contract_status": "parsed",
+                        "observed_states": [
+                            {
+                                "key": "person near entrance",
+                                "label": "Person near entrance",
+                                "state": "absent",
+                                "snapshot_indices": [1, 12],
+                                "evidence": "entrance area remains clear",
+                            }
+                        ],
+                        "alerts": [],
+                    },
                 }
             )
 
@@ -4404,6 +4593,26 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     "created_at": 100.0,
                     "batch_start_ms": 100000,
                     "batch_end_ms": 112000,
+                    "batch_state": {
+                        "version": 1,
+                        "contract_status": "parsed",
+                        "observed_states": [
+                            {
+                                "key": "person near entrance",
+                                "label": "Person near entrance",
+                                "state": "present",
+                                "snapshot_indices": [1],
+                                "evidence": "visible near doorway",
+                            }
+                        ],
+                        "alerts": [
+                            {
+                                "title": "Person down",
+                                "severity": "high",
+                                "state": "new",
+                            }
+                        ],
+                    },
                 }
             )
             session = LuxriotCaptureSession(
@@ -5797,9 +6006,9 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             rollups = manager.summary_rollups(7, run_selector="all", level_limit=10)
             routine_text = rollups["routine_context"]["routine"]
-            self.assertIn("quiet exterior road", routine_text)
+            self.assertIn("low traffic near the gate", routine_text)
             self.assertIn("vehicle drifting", routine_text)
-            self.assertIn("do not collapse drifting into routine traffic", routine_text)
+            self.assertNotIn("do not collapse drifting into routine traffic", routine_text)
 
             batch = manager.create_summary_batch(
                 channel_id=7,
@@ -5812,7 +6021,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertIn("vehicle drifting", batch["system_prompt"])
 
-    def test_older_memory_update_merges_items_without_replacing_newer_baseline(self):
+    def test_older_memory_update_preserves_deviation_without_resurrecting_watchlist(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             manager._update_channel_routine_context(
@@ -5849,7 +6058,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(context["window_end"], 200.0)
             self.assertEqual(memory["routine_baseline"], "new quiet lobby baseline")
             self.assertIn("north door", routine_text)
-            self.assertIn("east gate vehicle", routine_text)
+            self.assertNotIn("east gate vehicle", routine_text)
             self.assertIn("vehicle drifting", routine_text)
             self.assertIn("keep drifting visible", routine_text)
             self.assertNotIn("old busy lobby baseline", routine_text)
@@ -6126,17 +6335,32 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
 
         self.assertEqual(seen_models, ["vlm-a"])
 
-    def test_queued_heartbeat_coalescing_removes_superseded_spool(self):
+    def test_l0_heartbeat_windows_remain_distinct_in_durable_queue(self):
         self.runtime.stop()
-        first = self.runtime.enqueue_summary(self.batch(start=100.0))
-        second = self.runtime.enqueue_summary(self.batch(start=200.0))
+        repository = InMemoryInferenceQueueRepository()
+        runtime = LuxriotInferenceQueueRuntime(
+            manager=self.manager,
+            enqueue_repository=repository,
+            worker_repository=repository,
+            tenant_id=str(uuid4()),
+            capacity=2,
+            spool_directory=self.directory / "spool-distinct",
+            default_model="qwen35-9b-q4_k_m",
+            worker_count=0,
+        )
+        first = runtime.enqueue_summary(self.batch(start=100.0))
+        second = runtime.enqueue_summary(self.batch(start=200.0))
 
-        self.assertEqual(first["job_id"], second["job_id"])
-        self.assertEqual(second["status"], "coalesced")
-        spool_files = list((self.directory / "spool").glob("*.json"))
-        self.assertEqual(len(spool_files), 1)
-        job = self.repository.get_job(second["job_id"])
-        self.assertEqual(spool_files[0].name, job.payload["spool_file"])
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertEqual(first["status"], "enqueued")
+        self.assertEqual(second["status"], "enqueued")
+        self.assertEqual(repository.metrics_snapshot().coalesced_count, 0)
+        self.assertEqual(
+            len(list((self.directory / "spool-distinct").glob("*.json"))),
+            2,
+        )
+        jobs = repository.list_jobs()
+        self.assertTrue(all(job.payload["coalesce_heartbeat"] is False for job in jobs))
 
     def test_manual_work_evicts_heartbeat_and_removes_its_spool(self):
         heartbeat = self.runtime.enqueue_summary(self.batch(channel_id=7))
@@ -6151,6 +6375,13 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(len(spool_files), 1)
         manual_job = self.repository.get_job(manual["job_id"])
         self.assertEqual(spool_files[0].name, manual_job.payload["spool_file"])
+        gaps = [
+            row
+            for row in self.manager.summary_history.get(7, [])
+            if row.get("coverage_gap")
+        ]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["gap_reason"], "inference_queue_evicted")
 
 
 if __name__ == "__main__":

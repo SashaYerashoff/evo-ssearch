@@ -52,7 +52,7 @@ def _expected_version() -> str:
 
 
 EXPECTED_VERSION = _expected_version()
-EXPECTED_SCHEMA = "20260726_0009"
+EXPECTED_SCHEMA = "20260727_0010"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
@@ -409,6 +409,19 @@ def prepare_env_values(
             "EVOSSEARCH_APP_VERSION": EXPECTED_VERSION,
             "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED": "true",
             "EVOSSEARCH_AUTH_ENABLED": "true",
+            "EVOSSEARCH_OFFLINE_MODE": "true",
+            "EVOSSEARCH_MODEL_CACHE_DIR": "/var/lib/eva-ai/models/huggingface",
+            "EVOSSEARCH_OPENAI_CLIP_CACHE_DIR": "/var/lib/eva-ai/models/clip",
+            "EVOSSEARCH_TRUSTED_PROXY_HOPS": "1",
+            "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT": "0.28",
+            "EVOSSEARCH_PROBE_MARGIN_DEFAULT": "0.08",
+            "EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC": "2.5",
+            "EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB": "2.0",
+            "EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT": "5.0",
+            "EVOSSEARCH_INFERENCE_QUEUE_ENABLED": "true",
+            "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR": "/var/lib/eva-ai/inference-spool",
+            "EVOSSEARCH_INFERENCE_QUEUE_CAPACITY": "200",
+            "EVOSSEARCH_INFERENCE_WORKER_COUNT": "1",
             "EVOSSEARCH_DB_STRICT_RUNTIME_ROLES": "true",
             "EVOSSEARCH_ARCHIVE_STORE": "postgres",
             "EVOSSEARCH_EMBEDDER": "clip",
@@ -971,6 +984,35 @@ def _chown_tree(path: Path, user: str, group: str) -> None:
             os.lchown(Path(root) / name, uid, gid)
 
 
+def _ensure_runtime_directories(
+    values: Mapping[str, str],
+    *,
+    user: str,
+    group: str,
+) -> list[Path]:
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    created: list[Path] = []
+    for key in (
+        "EVOSSEARCH_MODEL_CACHE_DIR",
+        "EVOSSEARCH_OPENAI_CLIP_CACHE_DIR",
+        "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR",
+    ):
+        raw = str(values.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute() or path == Path("/"):
+            raise InstallerError(
+                f"{key} must be a safe absolute runtime directory"
+            )
+        path.mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o750)
+        created.append(path)
+    return created
+
+
 def _backup_file(path: Path) -> Path | None:
     if not path.is_file():
         return None
@@ -1056,6 +1098,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
             _ensure_service_account(options, runner)
         options.app_dir.mkdir(parents=True, exist_ok=True)
         options.backup_root.mkdir(parents=True, exist_ok=True)
+        if not prepared.env.existing:
+            _ensure_runtime_directories(
+                prepared.values,
+                user=options.service_user,
+                group=options.service_group,
+            )
         if not app_preexisted:
             uid = pwd.getpwnam(options.service_user).pw_uid
             gid = grp.getgrnam(options.service_group).gr_gid

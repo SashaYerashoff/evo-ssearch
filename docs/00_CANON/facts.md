@@ -24,8 +24,8 @@ Last reviewed: 2026-07-27 (β 0.8.5)
 | Fact | Value |
 |---|---|
 | Control plane | PostgreSQL (required in secure deployment) |
-| Alembic schema head | `20260726_0009` |
-| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260726_0009` |
+| Alembic schema head | `20260727_0010` |
+| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260727_0010` |
 | Migration needed for this working tree | **Yes**: run `alembic upgrade head` |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |
@@ -38,7 +38,7 @@ Last reviewed: 2026-07-27 (β 0.8.5)
 | Auth model | Named users + role-based access (admin / engineer / operator / viewer) |
 | Legacy admin-token | **Not** the current auth model; do not document it as current |
 | Channel scope | Per-user channel grants; all-channel grant supported |
-| Audit | Sensitive endpoints and agent tool calls are audited |
+| Audit | Sensitive endpoints and agent tool calls are audited; new events form a tenant-scoped SHA-256 hash chain |
 
 ## Runtime model
 
@@ -49,7 +49,7 @@ Last reviewed: 2026-07-27 (β 0.8.5)
 | App bind | Gunicorn serves plain HTTP on `EVOSSEARCH_HOST:EVOSSEARCH_PORT` (`5000` default) |
 | Browser entrypoint | HTTPS/TLS reverse proxy or site TLS boundary `[FIELD]`; office/demo may use HTTP-only internally |
 | Liveness / readiness | `GET /health`, `GET /ready` |
-| Inference queue | Present but **disabled by default**; summary dispatch is synchronous in-process |
+| Inference queue | Code default is off for unconfigured development; the clean appliance installer enables the PostgreSQL queue, one worker, and `/var/lib/eva-ai/inference-spool` |
 | Rollup durability | Closed semantic L1–L3 windows are stored as queryable `archive.runtime_state` rows; a bounded hot cache is also flushed by Gunicorn worker hooks (`gunicorn_conf.py`) |
 
 HTTP/TLS invariant: port number alone does not make the app HTTPS. If operators
@@ -64,8 +64,9 @@ and that mode is not client-facing.
 |---|---|
 | Production embedder | CLIP `ViT-B/32` |
 | DINO / fusion / Mask2Former segments | Experimental, disabled in production |
-| VLM (video-description) model | Configured by `EVOSSEARCH_LM_PROFILE_VLM_MODEL`; current constrained demo profile may use the same `qwen3.5-9b-mtp` model as the agent |
-| Agent LM model | `qwen3.5-9b` class / `qwen3.5-9b-mtp` demo profile |
+| VLM (video-description) model | Configured by `EVOSSEARCH_LM_PROFILE_VLM_MODEL`; the Ventspils eight-channel deployment target is `Qwen3-VL-4B` |
+| Agent LM model | Configured by the agent LM profile; the Ventspils eight-channel deployment initially shares `Qwen3-VL-4B` with the VLM under protected admission |
+| Optional deep L3 model | A separate proposal-only 9B-class endpoint admitted only in the operator-defined quiet window and deferred by live attention/alert debt |
 | Inference topology | VLM on dedicated vLLM host(s); app + CLIP + agent + DB on a separate host `[FIELD]` |
 
 ## Supported platform

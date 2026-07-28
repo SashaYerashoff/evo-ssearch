@@ -49,6 +49,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_GUNICORN_WORKERS` (`1`) | Must stay `1` |
 | `EVOSSEARCH_GUNICORN_THREADS` (`8`) | HTTP request threads inside the single required worker. Eight leaves capacity for bounded live-media responses plus Agent/status traffic |
 | `EVOSSEARCH_SETTINGS_LOCAL_ONLY` (`true`) | Restrict settings writes |
+| `EVOSSEARCH_TRUSTED_PROXY_HOPS` (`0`) | Number of reverse-proxy hops trusted for client IP, scheme, and host. Keep `0` when EVA is directly reachable; the clean appliance installer binds EVA to loopback and sets `1` for its local proxy |
 | `EVOSSEARCH_CONFIG_ENV_FILE` | Absolute path declaration for Settings precedence/provenance, normally identical to systemd `EnvironmentFile`. It does not load or retarget the Settings editor by itself |
 | `EVOSSEARCH_SITE_TIMEZONE` (`UTC`) | Optional neutral fallback for agent calendar normalization. Omit it unless the deployment explicitly configures a timezone; operator-facing UI uses the browser timezone without displaying a location label. |
 
@@ -137,12 +138,30 @@ provide recorder archive playback or an Evo bookmark destination.
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC` (`45`) | Initial per-window ETA estimate until the durable worker measures the deployed LM |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL` (`agent` profile when configured) | Text-only L1–L3 model/profile selector; intentionally independent of each live channel's VLM selector |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED` (`false`) | Route L3 only to a separate OpenAI-compatible text endpoint. L1/L2 remain on `ROLLUP_LLM_MODEL`; there is no fallback/offload to the live model |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL` / `_MODEL` / `_API_KEY` | Separate CPU/deep-review endpoint (for example a local llama.cpp 9B server); the key is optional for a local unauthenticated endpoint |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC` (`5`) / `_READ_TIMEOUT_SEC` (`600`) | Bounded connect/read timeouts for deep L3 |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS` (`3072`) / `_TEMPERATURE` (`0.1`) | Deep-review generation bounds |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY` (`64`) | Dedicated bounded L3 queue. It has one worker and cannot block live L0 or scheduled L1/L2 |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS` (`3`) / `_BACKOFF_INITIAL_SEC` (`30`) / `_BACKOFF_MAX_SEC` (`900`) | Bounded retries with exponential backoff; terminal failure retains a deterministic proposal-only L3 closure |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_ENABLED` (`false`) | Fail-closed operator switch for scheduled deep L3. Enabling deep routing alone does not invent a fixed “night” schedule |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_TIMEZONE` (`EVOSSEARCH_SITE_TIMEZONE` or `UTC`) / `_START` (`01:00`) / `_END` (`05:00`) / `_DAYS` (all days) | Operator-defined local quiet window. Cross-midnight windows are assigned to the day on which they start |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC` (`86400`) / `_POLL_SEC` (`60`) | Bound activity-gate deferral and its recheck cadence |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X` (`1.5`) / `_ALERT_LOOKBACK_SEC` (`900`) / `_MAX_L0_DEBT` (`0.75`) | Deep L3 runs only with quiet attention, no recent alerts, and bounded L0 coverage debt |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY` (`true`) | Window labeling |
 | `EVOSSEARCH_LUXRIOT_ALERTS_JSON_PROMPT` / `_SYSTEM_PROMPT_DEFAULT` | Prompt templates; the legacy-named alerts field now stores the unified `BATCH_STATE_JSON` contract |
 | `EVOSSEARCH_LUXRIOT_ALERT_POLICY_PROMPT` (`empty`) | Optional default operator alert criteria appended separately from role/summary prompt |
 | `EVOSSEARCH_LUXRIOT_STATE_TRANSITIONS_ENABLED` (`true`) | Backend diff of L0 current-observed-state rows across batches |
 | `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_CONFIRM_BATCHES` (`2`) | Confirmation hysteresis before appearance/disappearance is emitted |
 | `EVOSSEARCH_LUXRIOT_STATE_TRANSITION_ALERT_EVENTS` (`true`) | Store confirmed transitions as internal VLM alert events/evidence; does not send Luxriot bookmarks by itself |
+
+The L3 quiet-window object is also available through
+`LuxriotManager.get_rollup_l3_deep_schedule()` and can be validated/persisted by
+`set_rollup_l3_deep_schedule(...)`. These are backend hooks for a future
+authorized operator UI/API; they are intentionally not agent tools. Every L3
+row is marked `review_only`, `proposals_only`, and `mutations_applied=false`.
+L3 memory/tuning suggestions are retained for review but never alter probes,
+thresholds, alert policy, live sampling, or the live routine context.
 
 ## LM profiles (API keys are secrets)
 
@@ -164,18 +183,18 @@ provide recorder archive playback or an Evo bookmark destination.
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS` (`65536`) | Actual context served by the agent model; the inference server must expose the same or a larger context |
+| `EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS` (`65536`) | Requested EVA-side ceiling. EVA reads `max_model_len` from OpenAI-compatible `/v1/models` when available and budgets against the smaller served/configured value; servers without that field must still be configured to the same or larger context |
 | `EVOSSEARCH_AGENT_MAX_OUTPUT_TOKENS` (`2048`) | Reserved maximum final-answer budget |
 | `EVOSSEARCH_AGENT_CONTEXT_CHARS_PER_TOKEN` (`3`) | Conservative JSON/tool-result token estimator divisor |
 | `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`16000`) | Old chat history budget before trimming |
 | `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`52000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
 | `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and compacts tool payloads before the final model call |
 
-## Inference queue (disabled by default)
+## Inference queue
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_INFERENCE_QUEUE_ENABLED` (`false`) | Durable summary queue; keep off until validated |
+| `EVOSSEARCH_INFERENCE_QUEUE_ENABLED` (`false`) | Durable summary queue. Code default stays off for unconfigured development; the clean appliance installer enables it |
 | `EVOSSEARCH_INFERENCE_QUEUE_CAPACITY` (`200`) | Max queued batches |
 | `EVOSSEARCH_INFERENCE_WORKER_COUNT` (`0`) | Local worker threads |
 | `EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID` / `_SPOOL_DIR` | Tenant + spool |
@@ -198,7 +217,13 @@ provide recorder archive playback or an Evo bookmark destination.
 |---|---|
 | `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
 | `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
+| `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.28`) | Default positive CLIP similarity floor for newly created and ad-hoc probes; existing saved probe thresholds are preserved |
+| `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.08`) | Default positive-minus-negative score margin for newly created and ad-hoc probes |
+| `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |
+| `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB` (`2.0`) | Stop writing new filesystem snapshots below this free-space floor while continuing metadata rows |
+| `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT` (`5.0`) | Stop writing new filesystem snapshots below this filesystem free-space percentage |
 | `EVOSSEARCH_PROBE_BOOKMARK_*` | Probe bookmark cooldown/dedup/thresholds |
+| `EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE` (`probe_channel_groups.json`) | Operator-defined channel groups for the Probes board. File-backed presentation state, not tenant archive data; losing it only un-groups the board and never affects probes |
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED` (`true`) | Feed compact CLIP/road-CV attention cues into L0 video-description prompts |
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT` (`6`) | Max active channel probes scanned per L0 batch for vector/homeostasis cues |
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_TOP_HITS` (`2`) | Max live CLIP hits considered per probe signal |
@@ -232,7 +257,12 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_SUMMARY_BURST_CADENCE_SEC` (`1`) | Saved-snapshot cadence admitted during bursts |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED` (`false`) | Enable homeostatic CV/embedding attention telemetry and adaptive L0 frame admission |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED` (`false`) | Experimental sparse coordinator-owned VLM dispatch; normally off because L0 delivery is owned by the bounded per-channel batch accumulator |
-| `EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS` (`false`) | Produce one sparse CLIP embedding per configured snapshot cadence for every live video channel |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS` (`false`) | Produce CLIP embeddings for every enabled live video channel, independently of alerts and VLM admission |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS` (`1000`) | Durable semantic-index cadence. Port preset invariant is one embedding-backed snapshot per second/channel; changing VLM cadence never changes this archive path |
+| `EVOSSEARCH_LUXRIOT_CLIP_ASYNC_ENABLED` (`true`) / `_WORKERS` (`8`) / `_QUEUE_CAPACITY` (`64`) | Bounded decoder-to-CLIP dispatch. Keeps synchronous embedding latency from backpressuring ffmpeg capture; one worker can wait per channel while the shared CLIP batcher combines cross-channel requests |
+| `EVOSSEARCH_LIVE_CLIP_BATCH_SIZE` (`8`) / `_BATCH_WAIT_MS` (`75`) / `_BATCH_QUEUE_CAPACITY` (`128`) / `_BATCH_TIMEOUT_SEC` (`15`) | Cross-channel CLIP microbatch execution. Every submitted cadence slot receives one result or an explicit error; batching is not sampling |
+| `EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED` (`true`) | Persist every cadence embedding+thumbnail as `source=semantic_snapshot`, whether or not a probe/alert matched |
+| `EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE` (`512`) / `_BATCH_SIZE` (`32`) | Bounded asynchronous PostgreSQL writer for semantic snapshots; backpressure and write failures are exposed as archive gaps |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED` (`false`) | Require PostgreSQL attention telemetry (`20260726_0008`) |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_RING_SECONDS` (`90`) | Bounded in-memory evidence ring; stores selected embedding frames, never dense CV frames |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE` (`6`) | Global VLM token-bucket refill rate across channels |
@@ -241,6 +271,12 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES` (`8`) | Maximum saved embedding frames in one episode |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED` (`false`) | Admit bounded, temporary attention-only probes from direct VLM alerts |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC` (`300`) | TTL for alert-derived probes |
+
+With the attention scheduler enabled, the `port-4070s-8ch` contract overrides
+the three legacy cadence/window values above: quiet `10 s / 120 s / 6-8-8`,
+watch `5 s / 90 s / 6-8-10`, active `2.5 s / 60 s / 8-12-12`, burst
+`1 s / 30 s / 10-16-16`, degraded `15 s / 120 s / 4-6-6`. Every mode retains
+the independent 1 Hz semantic archive and the hard 16-frame accumulator cap.
 
 See `docs/architecture/adaptive_attention_runtime.md` for retention, evidence
 links, P/N/M semantics, and the deployed office profile.
@@ -266,6 +302,9 @@ links, P/N/M semantics, and the deployed office profile.
 |---|---|
 | `EVOSSEARCH_EMBEDDER` (`clip`) | Production embedder |
 | `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`ViT-B/32`) | CLIP model |
+| `EVOSSEARCH_OFFLINE_MODE` (`true`) | Blocks Hugging Face/Transformers and OpenAI CLIP downloads; missing artifacts fail closed |
+| `EVOSSEARCH_MODEL_CACHE_DIR` (`~/.cache/eva-ai/models`) | Local Hugging Face/Transformers model cache |
+| `EVOSSEARCH_OPENAI_CLIP_CACHE_DIR` (`~/.cache/clip`) | Local OpenAI CLIP weights cache |
 | `EVOSSEARCH_RERANK_ENABLED` / `_TOP_K` | Re-rank toggle |
 | `EVOSSEARCH_DINO_*`, `EVOSSEARCH_M2F_*`, `EVOSSEARCH_FUSION_*` | Experimental; disabled in prod |
 | `EVOSSEARCH_INDEXED_FOLDER_ENABLED` / `_OFFLINE_VIDEO_ENABLED` / `_PROBE_SNAP_ENABLED` (`false`) | Legacy/hidden feature flags |

@@ -1,14 +1,17 @@
 import unittest
 import base64
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import oldapp
 from PIL import Image
+from probe_board import ChannelGroupStore
 from unittest.mock import patch
 from security import ALL_CHANNELS, Permission, Role, digest_session_token
 from security.http_auth import AuthenticationService
@@ -1253,6 +1256,32 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(payload["required_revision"], "20260612_0005")
         self.assertNotIn("archive.detections", payload["error"])
 
+    def test_prompt_editor_cannot_mutate_process_global_skills(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.AGENT_USE.value,
+                    Permission.PROMPTS_MANAGE.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch("oldapp._save_skill_record") as save_skill:
+            response = self.client.post(
+                "/agent/skills/create",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "name": "Global mutation",
+                    "content": "# changed",
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+        save_skill.assert_not_called()
+
     def test_luxriot_prompt_bookmark_settings_require_bookmark_permission(self) -> None:
         self.repository.identity = _Identity(
             permissions=frozenset(
@@ -1499,6 +1528,88 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
         delete_probe.assert_not_called()
+
+    def test_probe_channel_groups_are_filtered_and_mixed_groups_are_read_only(
+        self,
+    ) -> None:
+        self.repository.identity = replace(
+            self.repository.identity,
+            permissions=frozenset(
+                {
+                    Permission.PROBES_MANAGE.value,
+                    Permission.REPORTS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ChannelGroupStore(Path(temp_dir) / "probe_channel_groups.json")
+            mixed_group = store.upsert_group(
+                name="Mixed scope",
+                channel_ids=[7, 8],
+            )
+            store.upsert_group(
+                name="Hidden scope",
+                channel_ids=[9],
+            )
+            with (
+                patch("oldapp.channel_group_store", store),
+                patch("oldapp.probes_store.list_probes", return_value=[]),
+            ):
+                listed = self.client.get("/probes/channel_groups")
+                board = self.client.get("/probes/list")
+                delete = self.client.post(
+                    "/probes/channel_groups/delete",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"id": mixed_group["id"]},
+                )
+                rename = self.client.post(
+                    "/probes/channel_groups/save",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"id": mixed_group["id"], "name": "Claimed"},
+                )
+                claim = self.client.post(
+                    "/probes/channel_groups/save",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"name": "Claim channel", "channel_ids": [7]},
+                )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(board.status_code, 200)
+        expected_groups = [
+            {
+                "name": "Mixed scope",
+                "channel_ids": [7],
+                "read_only": True,
+            }
+        ]
+        for response in (listed, board):
+            self.assertEqual(
+                [
+                    {
+                        "name": group["name"],
+                        "channel_ids": group["channel_ids"],
+                        "read_only": group.get("read_only"),
+                    }
+                    for group in response.get_json()["groups"]
+                ]
+                if "groups" in response.get_json()
+                else [
+                    {
+                        "name": group["name"],
+                        "channel_ids": group["channel_ids"],
+                        "read_only": group.get("read_only"),
+                    }
+                    for group in response.get_json()["channel_groups"]
+                ],
+                expected_groups,
+            )
+        self.assertEqual(delete.status_code, 403)
+        self.assertEqual(rename.status_code, 403)
+        self.assertEqual(claim.status_code, 403)
 
     def test_legacy_folder_routes_require_all_channel_for_scoped_users(self) -> None:
         _, csrf_token = self._login()

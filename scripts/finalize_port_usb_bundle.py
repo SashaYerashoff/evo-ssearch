@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Create the portable manifest and checksum inventory for the port USB."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+VERSION = "β 0.8.5"
+CRITICAL = (
+    "repo/VERSION",
+    "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
+    "models/qwen3-vl-4b-awq/model.safetensors",
+    "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
+    "models/clip/ViT-B-32.pt",
+)
+
+
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("bundle", type=Path)
+    args = parser.parse_args()
+    root = args.bundle.resolve()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    if not files:
+        raise SystemExit("Bundle is empty.")
+    critical = {}
+    for relative in CRITICAL:
+        path = root / relative
+        if not path.is_file():
+            raise SystemExit(f"Missing critical payload: {relative}")
+        critical[relative] = digest(path)
+    payload_bytes = sum(path.stat().st_size for path in files)
+    manifest = {
+        "format": 1,
+        "version": VERSION,
+        "schema_head": "20260727_0010",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "target": {
+            "os": "Ubuntu Server 24.04 amd64",
+            "gpu": "NVIDIA GeForce RTX 4070 Super 12 GB",
+            "cpu": "Intel Core i9 14th Gen",
+            "ram_gib": 64,
+            "channels": 8,
+        },
+        "payload_bytes": payload_bytes,
+        "minimum_free_bytes": max(45 * 1024**3, payload_bytes + 25 * 1024**3),
+        "critical_sha256": critical,
+        "models": {
+            "live_vlm": "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0",
+            "deep_review": "Qwen3.5-9B-MTP Q4_K_M / llama.cpp CPU",
+            "semantic_index": "OpenAI CLIP ViT-B/32 CPU",
+        },
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    checksum_path = root / "SHA256SUMS"
+    with checksum_path.open("w", encoding="utf-8") as handle:
+        for path in files:
+            if path.name in {"SHA256SUMS", "manifest.json"}:
+                continue
+            handle.write(f"{digest(path)}  {path.relative_to(root)}\n")
+    print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

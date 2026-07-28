@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -31,6 +32,39 @@ def test_cef_safe_section_removes_card_backdrop_filters():
     assert ".action-icon" in section
     assert ".probe-action-btn" in section
     assert "backdrop-filter: none;" in section
+
+
+def test_ui_has_no_runtime_google_font_dependency():
+    assert "fonts.googleapis.com" not in CSS
+    assert "fonts.gstatic.com" not in CSS
+
+
+def test_probe_editor_uses_backend_injected_threshold_defaults():
+    assert "const PROBE_POS_FLOOR_DEFAULT = {probe_pos_floor_default};" in JS
+    assert "const PROBE_MARGIN_DEFAULT = {probe_margin_default};" in JS
+    assert "value=\"0.28\"" in TEMPLATE
+    assert "value=\"0.08\"" in TEMPLATE
+
+
+def test_login_form_is_password_manager_friendly_and_keeps_typing_focus():
+    assert 'autocomplete="username"' in TEMPLATE
+    assert 'autocomplete="current-password"' in TEMPLATE
+    assert 'id="authPasswordToggle"' in TEMPLATE
+    assert "active === authUsernameInput" in JS
+    assert "active === authPasswordInput" in JS
+    assert "? authPasswordInput" in JS
+
+
+def test_global_skill_editing_requires_settings_management_in_ui():
+    assert "const canManageSkills = userHasPermission('settings:manage');" in JS
+    assert "setElementHidden(agentCreateSkillBtn, !canManageSkills);" in JS
+    assert "${canManageSkills ? `<button" in JS
+
+
+def test_channel_reload_marks_unavailable_inventory_and_skips_selection():
+    assert "ch.enabled === false" in JS
+    assert "['disabled', 'offline', 'unavailable'].includes(availability)" in JS
+    assert "stopped unavailable:" in JS
 
 
 def test_studio_scroll_contract_has_stable_gutters():
@@ -106,10 +140,15 @@ def test_repeated_grid_consistency_contract_prevents_card_overlap():
     assert "grid-auto-rows: max-content;" in section
     assert "overflow-x: hidden;" in section
     assert "overflow-y: auto;" in section
-    assert "repeat(auto-fit, minmax(min(100%, 120px), 1fr))" in section
     assert "repeat(auto-fit, minmax(min(100%, 88px), 1fr))" in section
     assert ".archive-inspector-body .result-item" in section
     assert "contain: none;" in section
+
+
+def test_probe_card_grid_uses_auto_fit_template():
+    """Probe cards must reflow instead of overlapping at any board width."""
+    section = CSS.split(".probe-channel-card-grid {", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));" in section
 
 
 def test_modal_consistency_contract_has_bounded_scroll_bodies():
@@ -156,6 +195,39 @@ def test_archive_review_modal_uses_shared_surface_not_hud_chrome():
     assert "border-radius: 22px;" in shell_section
     assert "border: 1px dashed" not in shell_section
     assert "background-size:" not in section
+
+
+def test_video_feed_cover_is_a_first_class_archive_review_image():
+    helper = JS.split("function archiveResultDirectImageSrc", 1)[1].split(
+        "function archiveResultHasImage", 1
+    )[0]
+    assert "result.image_url || result.thumbnail_url" in helper
+    assert r"^\/detections\/thumbnail\/\d+" in helper
+    assert "archiveResultDirectImageSrc(result)" in JS.split(
+        "function archiveResultHasImage", 1
+    )[1].split("function archiveResultImageSrc", 1)[0]
+    assert "const direct = archiveResultDirectImageSrc(result);" in JS.split(
+        "function archiveResultImageSrc", 1
+    )[1].split("function abortUiRequest", 1)[0]
+    assert "image_url: `/detections/thumbnail/${Math.trunc(detectionId)}`" in JS
+    assert "Frame preview unavailable" in JS
+
+
+def test_archive_review_batch_lookup_is_bounded_and_keeps_selected_evidence():
+    section = JS.split("async function archiveReviewLoadBatchFrames", 1)[1].split(
+        "function closeArchiveReviewModal", 1
+    )[0]
+    freshness = JS.split("function isCurrentArchiveReviewRequest", 1)[1].split(
+        "function clearArchiveMediaVideo", 1
+    )[0]
+    assert "ARCHIVE_REVIEW_BATCH_TIMEOUT_MS = 12000" in JS
+    assert "requestContext.controller.abort()" in section
+    assert "window.clearTimeout(timeoutId)" in section
+    assert "context.frames = archiveReviewLocalBatchFrames(context.baseResult)" in section
+    assert "Neighboring batch frames timed out; showing the selected evidence frame." in section
+    assert "context.framesLoading = false" in section
+    assert "currentMode === 'archive'" not in freshness
+    assert "currentMode === 'archive'" not in section
 
 
 def test_unified_scrollbar_contract_covers_modals_and_panels():
@@ -226,7 +298,7 @@ def test_remaining_studio_tabs_keep_inspectors_until_tablet_and_stack_on_mobile(
     compact = CSS.split('Compact density for the non-video workspaces', 1)[1]
     for selector in (
         '.archive-search-shell .archive-section',
-        '.monitor-selection-panel',
+        '.probes-selection-panel',
         '.agent-chat-topbar',
         '.agent-messages',
     ):
@@ -235,15 +307,15 @@ def test_remaining_studio_tabs_keep_inspectors_until_tablet_and_stack_on_mobile(
     tablet = CSS.split('@media (max-width: 1440px)', 1)[1].split(
         '@media (max-width: 1260px)', 1
     )[0]
-    assert '.monitor-box {' in tablet
+    assert '.probes-box {' in tablet
     assert '.agent-box {' in tablet
-    assert '.monitor-inspector' not in tablet
+    assert '.probes-inspector' not in tablet
     assert '.agent-inspector' not in tablet
 
     assert 'Narrow Archive/Monitoring/Agent workspaces' in CSS
     narrow = CSS.split('Narrow Archive/Monitoring/Agent workspaces', 1)[1]
     assert '.archive-search-shell' in narrow
-    assert '.monitor-board-panel' in narrow
+    assert '.probes-board-panel' in narrow
     assert '.agent-chat-area' in narrow
     assert 'grid-auto-rows: max-content;' in narrow
     assert '.results-grid,' in narrow
@@ -322,10 +394,38 @@ def test_agent_research_trace_stays_collapsed_and_keeps_current_tool_visible():
     events = JS.split("function handleAgentEvent", 1)[1].split(
         "function finishStreamingBubble", 1
     )[0]
-    assert "traceEl.open = false" in streaming
+    persisted = JS.split("function appendAssistantBubble", 1)[1].split(
+        "function isAgentNearBottom", 1
+    )[0]
+    trace_factory = JS.split("function createAgentToolTrace", 1)[1].split(
+        "function bindAgentTracePreference", 1
+    )[0]
+    assert "traceEl.open = false" in trace_factory
+    assert "if (!bubble.traceUserToggled)" in finish
     assert "bubble.traceEl.open = false" in finish
+    assert "bindAgentTracePreference(bubble, traceSummary)" in streaming
+    assert "bindAgentTracePreference(bubble, traceSummary)" in persisted
+    assert "bodyEl.appendChild(traceEl)" in persisted
     assert "bubble.currentToolName = String(evt.name)" in events
     assert "`Running ${bubble.currentToolName}...`" in events
+
+
+def test_archive_channel_picker_is_full_width_searchable_and_collapsible():
+    assert 'class="input-group archive-streams-group"' in TEMPLATE
+    assert 'id="archiveChannelPickerToggle"' in TEMPLATE
+    assert 'id="archiveChannelPickerSummary"' in TEMPLATE
+    assert 'id="archiveChannelPopover"' in TEMPLATE
+    assert 'id="archiveChannelSearch"' in TEMPLATE
+    assert 'id="archiveChannelReset"' in TEMPLATE
+    assert 'id="archiveChannelDone"' in TEMPLATE
+    assert ".archive-streams-group" in CSS
+    assert "grid-column: 1 / -1" in CSS
+    assert ".archive-channel-picker-toggle" in CSS
+    assert ".archive-channel-popover[hidden]" in CSS
+    assert "function updateArchiveChannelPickerSummary" in JS
+    assert "function setArchiveChannelPickerOpen" in JS
+    assert "function filterArchiveChannelOptions" in JS
+    assert "archiveChannelSelectionChanged()" in JS
 
 
 def test_video_rollups_label_imported_legacy_semantics_as_ready():
@@ -337,6 +437,9 @@ def test_video_rollups_label_imported_legacy_semantics_as_ready():
 
 def test_vlm_machine_json_label_is_semantic_not_generic_only():
     assert "function summarizeMachineJson" in JS
+    assert r"BATCH[\s_-]*STATE[\s_-]*JSON" in JS
+    assert "label: isBatchState ? 'Batch state' : 'System message'" in JS
+    assert "Object.prototype.hasOwnProperty.call(parsed, 'observed_states')" in JS
     assert "System message" in JS
     assert "Memory/homeostasis" in JS
     assert "kind: 'alert'" in JS
@@ -739,13 +842,101 @@ def test_archive_channel_filter_is_an_explicit_multi_select():
     assert ".archive-channel-option" in CSS
 
 
-def test_probe_board_groups_cards_by_channel():
+def test_probe_board_groups_cards_by_group_then_channel():
+    """The board nests operator-defined group -> channel -> probes."""
     for token in (
-        "const probesByChannel = new Map()",
+        "function probeBoardTree(",
         'class="probe-channel-group"',
         'class="probe-channel-card-grid"',
         "probe-channel-group-count",
+        "Ungrouped channels",
     ):
         assert token in JS
-    assert ".probe-channel-group" in CSS
-    assert ".probe-channel-card-grid" in CSS
+    for selector in (".probe-channel-group", ".probe-channel-card-grid", ".probes-group-body"):
+        assert selector in CSS
+
+
+def test_probe_board_offers_grid_and_list_views():
+    assert 'class="probes-view-toggle"' in TEMPLATE
+    assert 'data-view="grid"' in TEMPLATE
+    assert 'data-view="list"' in TEMPLATE
+    assert "function probeRowHtml(" in JS
+    assert "function probeCardHtml(" in JS
+    assert "probeBoardView === 'list'" in JS
+    for selector in (".probes-view-btn", ".probes-row", ".probes-row-list"):
+        assert selector in CSS
+
+
+def test_probe_cards_show_authorship_and_replace_empty_preview_with_sparkline():
+    """Origin is rendered from data, and an empty preview shows signal history."""
+    assert "function probeOriginKey(" in JS
+    assert "function probeOriginBadgeHtml(" in JS
+    for origin in ("operator", "agent", "auto"):
+        assert f"is-{origin}" in CSS
+    assert "function probeSparklineHtml(" in JS
+    # The old dead-space placeholder must not come back.
+    assert "NO PREVIEW" not in TEMPLATE.upper()
+    assert ".probes-spark" in CSS
+    assert ".probes-origin-badge" in CSS
+
+
+def test_probe_board_filters_are_present_and_resettable():
+    assert 'id="probeSearchInput"' in TEMPLATE
+    assert 'id="probeOriginFilters"' in TEMPLATE
+    assert 'id="probeStateFilters"' in TEMPLATE
+    assert 'id="probeFilterResetBtn"' in TEMPLATE
+    assert "function probeMatchesBoardFilters(" in JS
+    assert "function resetProbeBoardFilters(" in JS
+    assert ".probes-chip" in CSS
+
+
+def test_probe_board_toggled_buttons_use_the_class_the_toggler_sets():
+    """setElementHidden toggles .is-hidden, so a bare `hidden` attribute here
+    would leave the button permanently invisible."""
+    assert "element.classList.toggle('is-hidden'" in JS
+    for button_id in ("probeFilterResetBtn", "probeGroupDeleteBtn"):
+        start = TEMPLATE.index(f'id="{button_id}"')
+        tag = TEMPLATE[start:TEMPLATE.index(">", start)]
+        assert "is-hidden" in tag, f"{button_id} must start hidden via the class"
+        assert not re.search(r"\bhidden\b(?!-)", tag.replace("is-hidden", "")), (
+            f"{button_id} must not mix the hidden attribute with .is-hidden"
+        )
+
+
+def test_probe_channel_group_editor_is_wired():
+    assert 'id="probeGroupModal"' in TEMPLATE
+    assert 'id="probeGroupChannelList"' in TEMPLATE
+    for token in (
+        "/probes/channel_groups/save",
+        "/probes/channel_groups/delete",
+        "function openProbeGroupModal(",
+    ):
+        assert token in JS
+    assert ".probes-group-chip" in CSS
+
+
+def test_probe_group_mutations_follow_probes_manage_permission():
+    for element in (
+        "probeGroupNewBtn",
+        "probeGroupSaveBtn",
+        "probeGroupDeleteBtn",
+    ):
+        assert element in JS
+    assert "group.read_only || !userHasPermission('probes:manage')" in JS
+    assert "if (!userHasPermission('probes:manage')) return;" in JS
+
+
+def test_probe_lineage_jump_uses_exact_parent_alert_id_with_legacy_fallback():
+    assert "parent_alert_id: parentAlertId" in JS
+    assert "Opened exact parent VLM alert." in JS
+    assert "Parent VLM alert time window" in JS
+
+
+def test_probes_tab_is_not_labelled_monitoring():
+    """The tab, its mode key, and its CSS shell all say 'probes'."""
+    assert 'id="probesModeBtn"' in TEMPLATE
+    assert ">Probes</button>" in TEMPLATE
+    assert "setMode('probes')" in JS
+    assert "'monitor'" not in JS
+    assert "monitor-box" not in CSS
+    assert "monitor-detections-panel" not in CSS

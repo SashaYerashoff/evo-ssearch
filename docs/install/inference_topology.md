@@ -8,12 +8,15 @@ specifics are `[FIELD]`. Variables: [config_reference](../00_CANON/config_refere
 | Workload | Model | Where | Why separate |
 |---|---|---|---|
 | Video-description (VLM) | `qwen/qwen3-vl-4b` | Dedicated vLLM host(s) `[FIELD]` | The firehose: many batches/min across channels |
-| Agent LM | `qwen3.5-9b` class | Separate endpoint `[FIELD]` | Must stay responsive during demo, not compete with the VLM firehose |
+| Agent LM | `qwen3-vl-4b` in the constrained eight-channel profile; optional 9B-class scale-out | Shared protected vLLM profile or separate endpoint `[FIELD]` | Small-head tool use stays bounded by composite workflows and admission |
+| Deep L3 review | optional 9B-class model | Separate endpoint, often CPU/offloaded `[FIELD]` | Proposal-only consolidation inside an operator-defined quiet window |
 | CLIP embedding | `ViT-B/32` | App host (in-process) | Embeds every frame for search/probes; keep off the VLM GPUs |
 
-Keep the **agent endpoint physically separate** from the VLM endpoints — otherwise
-operator questions compete with the description firehose and the agent stalls
-during the demo.
+For the single-4070S eight-channel appliance, agent and VLM may intentionally
+share the same Qwen3-VL-4B endpoint. EVA's admission controller reserves a
+protected agent/alert/rollup slot; L0 may borrow it only while protected work is
+not waiting. At larger scale, separate the agent endpoint so operator questions
+do not compete with the description firehose.
 
 ## Profiles
 
@@ -24,16 +27,24 @@ EVOSSEARCH_LM_PROFILES=agent,vlm
 EVOSSEARCH_LM_AGENT_PROFILE_ID=agent
 EVOSSEARCH_LM_VLM_PROFILE_ID=vlm
 EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL=<agent-host>/v1
-EVOSSEARCH_LM_PROFILE_AGENT_MODEL=<agent-model>
+EVOSSEARCH_LM_PROFILE_AGENT_MODEL=qwen/qwen3-vl-4b
 EVOSSEARCH_LM_PROFILE_VLM_BASE_URL=<vlm-host>/v1
 EVOSSEARCH_LM_PROFILE_VLM_MODEL=qwen/qwen3-vl-4b
 EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=65536
 ```
 
-The agent inference server must expose at least the same 65,536-token context.
-For llama.cpp use `-c 65536`; for vLLM set the equivalent max model length and
-confirm `/v1/models` reports `meta.n_ctx` or `max_model_len` at or above 65536.
-Changing only the EVA environment does not enlarge the model server context.
+For the full configured budget, the agent inference server must expose at least
+the same 65,536-token context. For llama.cpp use `-c 65536`; for vLLM set the
+equivalent max model length and confirm `/v1/models` reports `meta.n_ctx` or
+`max_model_len` at or above 65536. When `/v1/models` reports a smaller
+`max_model_len`, EVA automatically lowers its warning, compaction, and hard-stop
+budgets to that served limit. This keeps long tool workflows safe but does not
+create additional server context; changing only the EVA environment never
+enlarges the model server context.
+
+Optional 9B deep L3 is configured through
+`EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_*`; it is not the live agent fallback and
+does not run outside the persisted quiet-window and attention gates.
 
 ## Multiple VLM hosts (balancer)
 

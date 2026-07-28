@@ -65,7 +65,7 @@ class UpdateBundleTests(unittest.TestCase):
     def test_release_identity_and_schema_gate_match_the_current_tree(self):
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         self.assertIn(f'EXPECTED_VERSION="{version}"', SCRIPT)
-        self.assertIn('EXPECTED_SCHEMA="20260726_0009"', SCRIPT)
+        self.assertIn('EXPECTED_SCHEMA="20260727_0010"', SCRIPT)
 
     def test_human_confirmation_and_restart_are_separate(self):
         confirmation = SCRIPT.index("Install %s now?")

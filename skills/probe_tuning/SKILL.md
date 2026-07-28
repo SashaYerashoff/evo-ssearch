@@ -14,6 +14,17 @@ Trigger phrases:
 
 Goal: tune probes using evidence from short-term, medium-term, and broader history.
 
+Tools:
+- `list_probes`
+- `get_detection_summary`
+- `prepare_probe_calibration_batch`
+- `calibrate_probe_from_archive`
+- `build_research_batch`
+- `get_video_summaries`
+- `describe_frame`
+- `create_probe`
+- `update_probe`
+
 Use this skill only when the operator explicitly asks to tune, inspect, create, cast, or report on probes. For ordinary status reports, incident reports, channel-health checks, and video-history questions, use video-summary workflows first and treat probes only as a secondary CLIP/P/N/M corroboration signal.
 
 Default order:

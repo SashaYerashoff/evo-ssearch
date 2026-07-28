@@ -15,6 +15,13 @@ Trigger phrases:
 
 Goal: compare candidate events across channels and propose possible links with explicit uncertainty.
 
+Tools:
+- `normalize_time_window`
+- `get_video_summaries`
+- `get_detections`
+- `get_visual_window_signals`
+- `describe_frame`
+
 Default order:
 1. Normalize the period with `normalize_time_window` and resolve all mentioned channels.
 2. Build per-channel event candidates using VLM summaries first (`get_video_summaries`) and VLM archive frames second (`get_detections` with `source="vlm_summary"`/`source="vlm_alert"`).

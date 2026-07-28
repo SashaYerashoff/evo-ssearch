@@ -31,6 +31,7 @@ from .models import (
     MetricsSnapshot,
     RetryPolicy,
     WorkloadClass,
+    heartbeat_coalescing_enabled,
 )
 
 
@@ -111,7 +112,7 @@ class PostgresInferenceQueueRepository:
                             duplicate, EnqueueStatus.IDEMPOTENT
                         )
 
-                if job.workload_class is WorkloadClass.HEARTBEAT:
+                if heartbeat_coalescing_enabled(job):
                     queued = self._find_queued_heartbeat(
                         connection,
                         channel_id=channel_id,
@@ -840,7 +841,7 @@ class PostgresInferenceQueueRepository:
     def _queued_successor(
         self, connection: Any, job: InferenceJob
     ) -> InferenceJob | None:
-        if job.workload_class is not WorkloadClass.HEARTBEAT:
+        if not heartbeat_coalescing_enabled(job):
             return None
         return self._find_queued_heartbeat(
             connection,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,7 +129,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             installer.EXPECTED_VERSION,
             (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertEqual(installer.EXPECTED_SCHEMA, "20260726_0009")
+        self.assertEqual(installer.EXPECTED_SCHEMA, "20260727_0010")
 
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -184,6 +185,33 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         second = installer.render_env_update(first, second_updates)
         self.assertEqual(second, first)
 
+    def test_fresh_runtime_directories_are_bounded_owned_and_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            values = {
+                "EVOSSEARCH_MODEL_CACHE_DIR": str(root / "models/hf"),
+                "EVOSSEARCH_OPENAI_CLIP_CACHE_DIR": str(root / "models/clip"),
+                "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR": str(root / "spool"),
+            }
+            identity = type("Identity", (), {"pw_uid": 1234})()
+            group = type("Group", (), {"gr_gid": 1235})()
+            with (
+                patch.object(installer.pwd, "getpwnam", return_value=identity),
+                patch.object(installer.grp, "getgrnam", return_value=group),
+                patch.object(installer.os, "chown") as chown,
+            ):
+                created = installer._ensure_runtime_directories(
+                    values,
+                    user="eva",
+                    group="eva",
+                )
+
+            self.assertEqual(len(created), 3)
+            self.assertEqual(chown.call_count, 3)
+            for path in created:
+                self.assertTrue(path.is_dir())
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
+
     def test_adopt_updates_only_managed_release_version(self):
         existing = dict(COMPLETE_ENV)
         existing.update({
@@ -222,6 +250,11 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS"], "120")
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_BYTES"], "268435456")
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS"], "60")
+        self.assertEqual(values["EVOSSEARCH_OFFLINE_MODE"], "true")
+        self.assertEqual(values["EVOSSEARCH_TRUSTED_PROXY_HOPS"], "1")
+        self.assertEqual(values["EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT"], "0.28")
+        self.assertEqual(values["EVOSSEARCH_INFERENCE_QUEUE_ENABLED"], "true")
+        self.assertEqual(values["EVOSSEARCH_INFERENCE_WORKER_COUNT"], "1")
         rendered = installer.render_env_update("", updates)
         self.assertIn("EVO-SECRET-DO-NOT-PRINT", rendered)
 

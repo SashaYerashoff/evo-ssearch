@@ -221,6 +221,21 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("create_probe", probe_tools)
         self.assertIn("calibrate_probe_from_archive", probe_tools)
         self.assertNotIn("get_video_summaries", probe_tools)
+        self.assertEqual(
+            names("Hi, Protocol: Deploy, target 8 channels"),
+            {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+                "query_counted_state_metric",
+            },
+        )
+        self.assertEqual(
+            names("How many times did the person leave the workstation?"),
+            {"normalize_time_window", "query_counted_state_metric"},
+        )
 
     def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
         initial = _seed_turn_tool_context(
@@ -434,6 +449,137 @@ class AgentToolLoopTests(unittest.TestCase):
         }
         self.assertEqual(exposed, set())
 
+    def test_protocol_deploy_trigger_activates_only_composite_workflow_tools(self):
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "Hi, Protocol: Deploy, target 8 channels"
+            ),
+            ["protocol_deploy"],
+        )
+        names = agent._skill_tool_names(["protocol_deploy"])
+        self.assertTrue(
+            {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+                "query_counted_state_metric",
+            }.issubset(names)
+        )
+        self.assertTrue(
+            {
+                "survey_channels",
+                "update_prompt_settings",
+                "create_probe",
+            }.isdisjoint(names)
+        )
+
+    def test_all_runbooks_have_bounded_explicit_tool_envelopes(self):
+        expected = {
+            "archive_research": {
+                "normalize_time_window", "search_archive", "get_detections",
+                "build_research_batch", "describe_frame",
+            },
+            "cross_channel_correlation": {
+                "normalize_time_window", "get_video_summaries", "get_detections",
+                "get_visual_window_signals", "describe_frame",
+            },
+            "multi_channel_event_sweep": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame",
+            },
+            "probe_tuning": {
+                "list_probes", "get_detection_summary",
+                "prepare_probe_calibration_batch", "calibrate_probe_from_archive",
+                "build_research_batch", "get_video_summaries", "describe_frame",
+                "create_probe", "update_probe",
+            },
+            "prompt_tuning": {
+                "normalize_time_window", "get_prompt_settings",
+                "get_video_summaries", "get_detections",
+                "update_prompt_settings",
+            },
+            "protocol_deploy": {
+                "start_deployment", "configure_deployment", "survey_deployment",
+                "apply_deployment_plan", "get_deployment_status",
+                "normalize_time_window", "query_counted_state_metric",
+            },
+            "video_event_check": {
+                "normalize_time_window", "get_video_summaries",
+                "get_visual_window_signals", "search_archive",
+                "get_detections", "describe_frame",
+            },
+            "video_incident_timeline": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame",
+            },
+            "video_summary_review": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame", "search_archive",
+            },
+        }
+
+        for slug, tool_names in expected.items():
+            with self.subTest(slug=slug):
+                self.assertEqual(agent._skill_tool_names([slug]), tool_names)
+                context = _seed_turn_tool_context(f'use playbook "{slug}"')
+                context["active_skill_slugs"] = [slug]
+                context["skill_tool_names"] = sorted(tool_names)
+                context["video_inventory_completed"] = True
+                schemas = _select_relevant_tool_schemas(
+                    agent._TOOL_SCHEMAS,
+                    context,
+                )
+                exposed = {row["function"]["name"] for row in schemas}
+                self.assertEqual(exposed, tool_names)
+                budget = _context_budget_snapshot(
+                    [{"role": "user", "content": "audit"}],
+                    tool_schemas=schemas,
+                    context_policy=agent._context_budget_policy(32768),
+                )
+                self.assertLess(budget["tool_schema_estimated_tokens"], 8_000)
+                self.assertLessEqual(agent._turn_tool_call_limit(context), 16)
+
+    def test_runbook_trigger_matching_does_not_activate_singular_substring(self):
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "check channels for smoke during the last hour"
+            ),
+            ["multi_channel_event_sweep"],
+        )
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "check channel #118 for smoke during the last hour"
+            ),
+            ["video_event_check"],
+        )
+
+    def test_evidence_playbooks_are_not_stopped_after_overview_map(self):
+        base = {
+            "video_overview_request": True,
+            "video_inventory_completed": True,
+            "video_inventory_requires_confirmation": False,
+            "video_candidate_channel_ids": [118],
+            "video_detail_completed_channel_ids": [118],
+        }
+        self.assertTrue(agent._video_overview_research_plan_completed(base))
+        for slug in (
+            "cross_channel_correlation",
+            "multi_channel_event_sweep",
+            "video_event_check",
+            "video_incident_timeline",
+        ):
+            with self.subTest(slug=slug):
+                self.assertFalse(
+                    agent._video_overview_research_plan_completed(
+                        {**base, "active_skill_slugs": [slug]}
+                    )
+                )
+
     def test_write_tool_compaction_returns_stable_preview_envelope(self):
         raw = {
             "status": "preview",
@@ -464,6 +610,30 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(deleted["deleted"], 2)
         self.assertEqual(len(deleted["targets"]), 2)
         self.assertNotIn("action_plan", deleted)
+
+        deployment = _compact_tool_result_for_model(
+            "apply_deployment_plan",
+            {
+                "status": "preview",
+                "deployment_id": "deploy-123456789abc",
+                "diff": {"channel_ids": [7], "probe_count": 2},
+                "approval": {
+                    "plan_id": "plan-deploy",
+                    "action": "apply_deployment_plan",
+                    "expires_at": "2026-07-28T20:00:00+00:00",
+                    "required_permission": "settings:manage",
+                },
+            },
+        )
+        self.assertNotIn("approval", deployment)
+        self.assertEqual(
+            deployment["action_plan"]["plan_id"],
+            "plan-deploy",
+        )
+        self.assertEqual(
+            deployment["action_plan"]["status"],
+            "awaiting_ui_apply",
+        )
 
     def test_plain_chat_omits_empty_tools_payload(self):
         client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
@@ -505,6 +675,34 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(
             post.call_args.kwargs["json"]["chat_template_kwargs"],
             {"enable_thinking": False},
+        )
+
+    def test_agent_uses_smaller_context_limit_reported_by_inference_server(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3-vl-4b", "", 120)
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [
+                {
+                    "id": "qwen3-vl-4b",
+                    "max_model_len": 32768,
+                }
+            ]
+        }
+
+        with patch.object(agent.requests, "get", return_value=response) as get:
+            served_limit = client.context_limit_tokens()
+            cached_limit = client.context_limit_tokens()
+
+        self.assertEqual(served_limit, 32768)
+        self.assertEqual(cached_limit, 32768)
+        self.assertEqual(get.call_count, 1)
+        policy = agent._context_budget_policy(served_limit)
+        self.assertEqual(policy["context_limit_tokens"], 32768)
+        self.assertLess(policy["warning_tokens"], policy["hard_tokens"])
+        self.assertLess(
+            policy["hard_tokens"] + policy["output_reserve_tokens"],
+            served_limit,
         )
 
         class StreamResponse:
@@ -694,6 +892,68 @@ class AgentToolLoopTests(unittest.TestCase):
         final_text = "".join(item.get("content", "") for item in events if item.get("type") == "text")
         self.assertIn("CH 112", final_text)
         self.assertNotIn("Let me fetch", final_text)
+
+    def test_final_transport_failure_retries_then_returns_and_persists_tool_fallback(self):
+        class BrokenFinalLM(_FakeLMClient):
+            def __init__(self):
+                super().__init__(tool_rounds=1, tool_name="get_video_summaries")
+                self.stream_attempts = 0
+
+            def context_limit_tokens(self):
+                return 32768
+
+            def stream_text(self, messages, cancel_event=None):
+                self.stream_attempts += 1
+                self.final_messages = list(messages)
+                raise RuntimeError("synthetic final transport failure")
+                yield  # pragma: no cover
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = BrokenFinalLM()
+        runner._tools = _FakeTools(result={
+            "channel_id": 118,
+            "depth": "L2",
+            "count": 5,
+            "total_in_window": 18,
+            "semantic_status": "ready",
+            "coverage": {"status": "partial", "truncated": False},
+            "entries": [
+                {
+                    "time": "2026-07-28 01:00",
+                    "alert_total": 2,
+                    "summary": "A vehicle repeatedly drifts through the intersection.",
+                }
+            ],
+        })
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        payloads = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "test",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._lm_client.stream_attempts, 2)
+        self.assertTrue(
+            any(item.get("type") == "completion_recovery" for item in payloads)
+        )
+        self.assertFalse(any(item.get("type") == "error" for item in payloads))
+        final_text = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text"
+        )
+        self.assertIn("CH 118", final_text)
+        self.assertIn("repeatedly drifts", final_text)
+        persisted_roles = [row.get("role") for row in runner.store.messages]
+        self.assertIn("tool", persisted_roles)
+        self.assertEqual(persisted_roles[-1], "assistant")
 
     def test_archive_tool_compaction_preserves_source_semantics(self):
         compact = _compact_tool_result_for_model(

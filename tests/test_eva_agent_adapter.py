@@ -6,9 +6,11 @@ from agent_security import (
     AuditUnavailableError,
     ChannelAccessDeniedError,
     InvalidToolArgumentsError,
+    PermissionDeniedError,
     ToolExecutionContext,
 )
 from agent_security.eva_adapter import EvaAgentToolAdapter
+from deployment_workflow import ProtocolDeploymentStore
 from security import Permission
 
 
@@ -36,6 +38,7 @@ class _LegacyTools:
         self.seen_trusted = None
         self.fail_name = None
         self.results = {}
+        self._deployment_store = ProtocolDeploymentStore()
 
     def _set_trusted_permissions(self, permissions):
         self._trusted = frozenset(str(item) for item in (permissions or ()))
@@ -281,6 +284,85 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             "properties"
         ]["preview"]
         self.assertEqual(preview["enum"], [True])
+        deployment_apply = schemas["apply_deployment_plan"]["function"][
+            "parameters"
+        ]["properties"]["preview"]
+        self.assertEqual(deployment_apply["enum"], [True])
+
+    def test_deployment_scope_is_resolved_before_dispatch(self):
+        result = self.adapter.execute(
+            "start_deployment",
+            {"target_channel_count": 8},
+            self.context,
+        )
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+
+        state = self.legacy._deployment_store.start(
+            [{"id": 7, "title": "Door"}, {"id": 8, "title": "Yard"}],
+            resume_latest=False,
+        )
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "configure_deployment",
+                {
+                    "deployment_id": state["deployment_id"],
+                    "channel_ids": [8],
+                },
+                self.context,
+            )
+
+    def test_counted_metric_profile_is_channel_scoped(self):
+        self.legacy._deployment_store.save_counted_profiles(
+            [
+                {
+                    "id": "metric-yard",
+                    "name": "Yard occupancy",
+                    "channel_id": 8,
+                }
+            ]
+        )
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "query_counted_state_metric",
+                {"metric_id": "metric-yard"},
+                self.context,
+            )
+
+    def test_deployment_apply_requires_all_composite_permissions(self):
+        state = self.legacy._deployment_store.start(
+            [{"id": 7, "title": "Door"}],
+            resume_latest=False,
+        )
+        self.legacy._deployment_store.configure(
+            state["deployment_id"],
+            channel_ids=[7],
+        )
+        missing_capture = ToolExecutionContext(
+            actor_id=self.context.actor_id,
+            tenant_id=self.context.tenant_id,
+            roles={"admin"},
+            permissions={
+                permission.value
+                for permission in Permission
+                if permission is not Permission.CAPTURE_MANAGE
+            },
+            allowed_channel_ids={"7"},
+        )
+
+        with self.assertRaises(PermissionDeniedError) as raised:
+            self.adapter.execute(
+                "apply_deployment_plan",
+                {
+                    "deployment_id": state["deployment_id"],
+                    "preview": True,
+                },
+                missing_capture,
+            )
+
+        self.assertIn(
+            Permission.CAPTURE_MANAGE.value,
+            raised.exception.details["missing_permissions"],
+        )
 
     def test_list_results_are_filtered_to_channel_grants(self):
         channels = self.adapter.execute("list_channels", {}, self.context)

@@ -224,6 +224,7 @@ if [[ -e "${APP_DIR}" ]]; then
     --exclude="${APP_BASE}/*.mov" \
     --exclude="${APP_BASE}/*.mkv" \
     --exclude="${APP_BASE}/probes_store.json" \
+    --exclude="${APP_BASE}/probe_channel_groups.json" \
     --exclude="${APP_BASE}/luxriot_summary_state.json" \
     --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
     --exclude="${APP_BASE}/*.sqlite3" \

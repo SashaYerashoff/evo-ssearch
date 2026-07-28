@@ -238,6 +238,7 @@ tar \
   --exclude="${APP_BASE}/*.mov" \
   --exclude="${APP_BASE}/*.mkv" \
   --exclude="${APP_BASE}/probes_store.json" \
+  --exclude="${APP_BASE}/probe_channel_groups.json" \
   --exclude="${APP_BASE}/luxriot_summary_state.json" \
   --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
   --exclude="${APP_BASE}/*.sqlite3" \
@@ -246,6 +247,11 @@ tar \
   -czf "${BACKUP_DIR}/code.tgz" \
   -C "${APP_PARENT}" "${APP_BASE}"
 ok "backed up current code"
+if [[ -f "${APP_DIR}/probe_channel_groups.json" ]]; then
+  install -m 0600 "${APP_DIR}/probe_channel_groups.json" \
+    "${BACKUP_DIR}/probe_channel_groups.json"
+  ok "backed up probe channel groups"
+fi
 
 if [[ "${SKIP_PG_DUMP}" != true ]]; then
   if command -v pg_dump >/dev/null 2>&1; then
@@ -317,6 +323,7 @@ RSYNC_EXCLUDES=(
   "--exclude=*.mov"
   "--exclude=*.mkv"
   "--exclude=probes_store.json"
+  "--exclude=probe_channel_groups.json"
   "--exclude=luxriot_summary_state.json"
   "--exclude=luxriot_rollups_cache.json"
   "--exclude=.env"

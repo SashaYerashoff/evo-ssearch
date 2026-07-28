@@ -97,6 +97,231 @@ class LMAdmissionTests(unittest.TestCase):
         self.assertEqual(status["queued"], 0)
         self.assertEqual(status["counters"]["timed_out_total"], 1)
 
+    def test_live_l0_borrows_fourth_slot_without_high_priority_backlog(self):
+        controller = LMAdmissionController(protected_slots=1)
+        resource = "shared-gpu"
+        tickets = [
+            controller.acquire(
+                resource,
+                workload="vlm",
+                capacity=4,
+                timeout=0.2,
+            )
+            for _index in range(4)
+        ]
+        try:
+            status = controller.status()["resources"][0]
+            self.assertEqual(status["active"], 4)
+            self.assertEqual(status["active_by_class"], {"live_l0": 4})
+            self.assertEqual(
+                status["live_l0_limit_while_protected_waiting"],
+                3,
+            )
+            self.assertEqual(
+                status["reservation"]["borrowed_slots_active"],
+                1,
+            )
+            self.assertEqual(
+                status["reservation"]["borrowed_slot_admissions_total"],
+                1,
+            )
+            self.assertEqual(status["reservation"]["debt_current"], 0)
+        finally:
+            for ticket in tickets:
+                controller.release(resource, ticket)
+
+    def test_interactive_agent_uses_reserved_slot_before_older_rollup(self):
+        controller = LMAdmissionController(protected_slots=1)
+        resource = "shared-gpu"
+        live_tickets = [
+            controller.acquire(resource, workload="heartbeat", capacity=4)
+            for _index in range(4)
+        ]
+        order = []
+        agent_admitted = threading.Event()
+        rollup_admitted = threading.Event()
+        release_agent = threading.Event()
+        release_rollup = threading.Event()
+
+        def contender(workload, admitted, release_gate):
+            ticket = controller.acquire(
+                resource,
+                workload=workload,
+                capacity=4,
+                timeout=2,
+            )
+            order.append(workload)
+            admitted.set()
+            release_gate.wait(timeout=2)
+            controller.release(resource, ticket)
+
+        rollup_thread = threading.Thread(
+            target=contender,
+            args=("rollup", rollup_admitted, release_rollup),
+        )
+        agent_thread = threading.Thread(
+            target=contender,
+            args=("agent", agent_admitted, release_agent),
+        )
+        rollup_thread.start()
+        self._wait_for_queued(controller, 1)
+        agent_thread.start()
+        self._wait_for_queued(controller, 2)
+
+        try:
+            controller.release(resource, live_tickets.pop())
+            self.assertTrue(agent_admitted.wait(timeout=1))
+            self.assertFalse(rollup_admitted.is_set())
+            self.assertEqual(order, ["agent"])
+
+            release_agent.set()
+            self.assertTrue(rollup_admitted.wait(timeout=1))
+            self.assertEqual(order, ["agent", "rollup"])
+
+            status = controller.status()["resources"][0]
+            self.assertGreater(
+                status["average_wait_ms_by_class"]["agent"],
+                0.0,
+            )
+            self.assertGreater(
+                status["average_wait_ms_by_class"]["rollup"],
+                0.0,
+            )
+            self.assertGreaterEqual(
+                status["reservation"]["reserved_slot_admissions_total"],
+                2,
+            )
+        finally:
+            release_agent.set()
+            release_rollup.set()
+            agent_thread.join(timeout=2)
+            rollup_thread.join(timeout=2)
+            for ticket in live_tickets:
+                controller.release(resource, ticket)
+        self.assertFalse(agent_thread.is_alive())
+        self.assertFalse(rollup_thread.is_alive())
+
+    def test_alert_preempts_older_ordinary_l0_waiter(self):
+        controller = LMAdmissionController(protected_slots=1)
+        resource = "shared-gpu"
+        blocker = controller.acquire(
+            resource,
+            workload="vlm",
+            capacity=1,
+        )
+        order = []
+        alert_admitted = threading.Event()
+        l0_admitted = threading.Event()
+        release_alert = threading.Event()
+
+        def ordinary_l0():
+            ticket = controller.acquire(
+                resource,
+                workload="heartbeat",
+                capacity=1,
+                timeout=2,
+            )
+            order.append("l0")
+            l0_admitted.set()
+            controller.release(resource, ticket)
+
+        def alert():
+            ticket = controller.acquire(
+                resource,
+                workload="alert",
+                capacity=1,
+                timeout=2,
+            )
+            order.append("alert")
+            alert_admitted.set()
+            release_alert.wait(timeout=2)
+            controller.release(resource, ticket)
+
+        l0_thread = threading.Thread(target=ordinary_l0)
+        alert_thread = threading.Thread(target=alert)
+        l0_thread.start()
+        self._wait_for_queued(controller, 1)
+        alert_thread.start()
+        self._wait_for_queued(controller, 2)
+
+        try:
+            controller.release(resource, blocker)
+            self.assertTrue(alert_admitted.wait(timeout=1))
+            self.assertFalse(l0_admitted.is_set())
+            self.assertEqual(order, ["alert"])
+            status = controller.status()["resources"][0]
+            self.assertEqual(
+                status["counters"]["preemptions_alert_over_l0_total"],
+                1,
+            )
+            self.assertEqual(
+                status["reservation"]["preemptions_total"],
+                1,
+            )
+        finally:
+            release_alert.set()
+            alert_thread.join(timeout=2)
+            l0_thread.join(timeout=2)
+        self.assertEqual(order, ["alert", "l0"])
+        self.assertFalse(alert_thread.is_alive())
+        self.assertFalse(l0_thread.is_alive())
+
+    def test_reservation_debt_tracks_borrowed_slot_until_agent_admission(self):
+        controller = LMAdmissionController(protected_slots=1)
+        resource = "shared-gpu"
+        live_tickets = [
+            controller.acquire(resource, workload="vlm", capacity=4)
+            for _index in range(4)
+        ]
+        agent_admitted = threading.Event()
+        release_agent = threading.Event()
+
+        def agent():
+            ticket = controller.acquire(
+                resource,
+                workload="interactive",
+                capacity=4,
+                timeout=2,
+            )
+            agent_admitted.set()
+            release_agent.wait(timeout=2)
+            controller.release(resource, ticket)
+
+        thread = threading.Thread(target=agent)
+        thread.start()
+        self._wait_for_queued(controller, 1)
+        time.sleep(0.02)
+        waiting_status = controller.status()["resources"][0]
+        self.assertEqual(waiting_status["reservation"]["debt_current"], 1)
+        self.assertEqual(waiting_status["reservation"]["debt_max"], 1)
+        self.assertGreater(
+            waiting_status["reservation"]["debt_ms_total"],
+            0.0,
+        )
+        self.assertEqual(
+            waiting_status["counters"]["reservation_debt_events_total"],
+            1,
+        )
+
+        try:
+            controller.release(resource, live_tickets.pop())
+            self.assertTrue(agent_admitted.wait(timeout=1))
+            admitted_status = controller.status()["resources"][0]
+            self.assertEqual(
+                admitted_status["active_by_class"],
+                {"agent": 1, "live_l0": 3},
+            )
+            self.assertEqual(
+                admitted_status["reservation"]["debt_current"],
+                0,
+            )
+        finally:
+            release_agent.set()
+            thread.join(timeout=2)
+            for ticket in live_tickets:
+                controller.release(resource, ticket)
+        self.assertFalse(thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,16 @@
             <label for="authUsername">Username</label>
             <input id="authUsername" name="username" type="text" autocomplete="username" required />
             <label for="authPassword">Password</label>
-            <input id="authPassword" name="password" type="password" autocomplete="current-password" required />
+            <div class="auth-password-row">
+                <input id="authPassword" name="password" type="password" autocomplete="current-password" required />
+                <button
+                    id="authPasswordToggle"
+                    class="auth-password-toggle"
+                    type="button"
+                    aria-label="Show password"
+                    aria-pressed="false"
+                    title="Show password">SHOW</button>
+            </div>
             <button id="authLoginBtn" class="feature-btn primary" type="submit">Sign in</button>
             <div id="authLoginStatus" class="auth-login-status" role="alert"></div>
         </form>
@@ -35,7 +44,7 @@
                 <div class="search-mode-tabs">
                     <button id="archiveModeBtn" class="mode-tab active"><span class="mode-dot"></span>Archive</button>
                     <button id="videoModeBtn" class="mode-tab"><span class="mode-dot"></span>Video</button>
-                    <button id="monitorModeBtn" class="mode-tab"><span class="mode-dot"></span>Monitoring</button>
+                    <button id="probesModeBtn" class="mode-tab"><span class="mode-dot"></span>Probes</button>
                     <button id="agentModeBtn" class="mode-tab agent-tab-btn"><span class="mode-dot"></span>Agent</button>
                 </div>
             </div>
@@ -65,14 +74,32 @@
                             <div class="archive-section-title">Frame Archive</div>
                             <div class="section-help">Load archived frames from video descriptions, VLM alerts, and secondary CLIP probe hits before drilling down.</div>
                             <div class="archive-filter-grid">
-                                <div class="input-group">
+                                <div class="input-group archive-streams-group">
                                     <span class="input-label">Streams:</span>
                                     <div id="archiveChannelFilter" class="archive-channel-picker" role="group" aria-label="Archive streams">
-                                        <label class="archive-channel-option archive-channel-option-all">
-                                            <input type="checkbox" data-archive-channel-all checked>
-                                            <span>All streams</span>
-                                        </label>
-                                        <div id="archiveChannelOptions" class="archive-channel-options"></div>
+                                        <button id="archiveChannelPickerToggle" class="archive-channel-picker-toggle" type="button"
+                                                aria-expanded="false" aria-controls="archiveChannelPopover">
+                                            <span id="archiveChannelPickerSummary" class="archive-channel-picker-summary">All streams</span>
+                                            <span class="archive-channel-picker-chevron" aria-hidden="true">⌄</span>
+                                        </button>
+                                        <div id="archiveChannelPopover" class="archive-channel-popover" role="dialog"
+                                             aria-label="Select archive streams" hidden>
+                                            <div class="archive-channel-picker-toolbar">
+                                                <input id="archiveChannelSearch" type="search" placeholder="Filter streams..."
+                                                       autocomplete="off" aria-label="Filter archive streams">
+                                                <button id="archiveChannelReset" class="feature-btn" type="button">Use all</button>
+                                            </div>
+                                            <label class="archive-channel-option archive-channel-option-all">
+                                                <input type="checkbox" data-archive-channel-all checked>
+                                                <span>All current and future streams</span>
+                                            </label>
+                                            <div id="archiveChannelOptions" class="archive-channel-options"></div>
+                                            <div id="archiveChannelEmpty" class="archive-channel-empty" hidden>No matching streams</div>
+                                            <div class="archive-channel-picker-footer">
+                                                <span>Choose several streams or keep the dynamic “All” scope.</span>
+                                                <button id="archiveChannelDone" class="feature-btn primary" type="button">Done</button>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="input-group">
@@ -85,6 +112,7 @@
                                     <label for="archiveSourceFilter" class="input-label">Source:</label>
                                     <select id="archiveSourceFilter">
                                         <option value="">All evidence</option>
+                                        <option value="semantic_snapshot">Continuous CLIP archive</option>
                                         <option value="vlm_summary">Video descriptions</option>
                                         <option value="vlm_alert">VLM alerts</option>
                                         <option value="probe">Secondary CLIP probes</option>
@@ -461,19 +489,67 @@
                 </aside>
             </div>
 
-            <div id="monitorBox" class="monitor-box studio-mode">
-                <aside class="studio-rail monitor-rail">
-                    <div class="monitor-command-panel studio-panel">
+            <div id="probesBox" class="probes-box studio-mode">
+                <aside class="studio-rail probes-rail">
+                    <div class="probes-command-panel studio-panel">
                         <div class="studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">CLIP Probes</div>
                                 <div class="studio-panel-sub">Engineer diagnostics for secondary semantic signals.</div>
                             </div>
                         </div>
-                        <div class="monitor-command-actions">
+                        <div class="probes-command-actions">
                             <button id="probeReloadBtn" class="feature-btn">Refresh list</button>
                             <button id="probeNewBtn" class="feature-btn primary">+ New CLIP Probe</button>
                         </div>
+                    </div>
+
+                    <div class="probes-filter-panel studio-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Filters</div>
+                                <div class="studio-panel-sub">Narrow the board without changing probe state.</div>
+                            </div>
+                            <button id="probeFilterResetBtn" class="feature-btn probes-filter-reset is-hidden">Reset</button>
+                        </div>
+                        <label class="probes-filter-search">
+                            <span class="sr-only">Search probes by name</span>
+                            <input type="search" id="probeSearchInput" class="input-text" placeholder="Search probe or channel..." autocomplete="off" />
+                        </label>
+                        <div class="probes-filter-block">
+                            <div class="probes-filter-label">Created by</div>
+                            <div class="probes-filter-chips" id="probeOriginFilters" role="group" aria-label="Filter by probe author">
+                                <button type="button" class="probes-chip" data-filter="origin" data-value="operator" aria-pressed="false">
+                                    <span class="probes-origin-dot is-operator" aria-hidden="true"></span>Operator<span class="probes-chip-count" data-count="operator">0</span>
+                                </button>
+                                <button type="button" class="probes-chip" data-filter="origin" data-value="agent" aria-pressed="false">
+                                    <span class="probes-origin-dot is-agent" aria-hidden="true"></span>Agent<span class="probes-chip-count" data-count="agent">0</span>
+                                </button>
+                                <button type="button" class="probes-chip" data-filter="origin" data-value="auto" aria-pressed="false">
+                                    <span class="probes-origin-dot is-auto" aria-hidden="true"></span>Background VLM<span class="probes-chip-count" data-count="auto">0</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="probes-filter-block">
+                            <div class="probes-filter-label">State</div>
+                            <div class="probes-filter-chips" id="probeStateFilters" role="group" aria-label="Filter by probe state">
+                                <button type="button" class="probes-chip" data-filter="state" data-value="running" aria-pressed="false">Running</button>
+                                <button type="button" class="probes-chip" data-filter="state" data-value="paused" aria-pressed="false">Paused</button>
+                                <button type="button" class="probes-chip" data-filter="state" data-value="idle" aria-pressed="false">Idle</button>
+                                <button type="button" class="probes-chip" data-filter="state" data-value="disabled" aria-pressed="false">Disabled</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="probes-groups-panel studio-panel">
+                        <div class="studio-panel-head">
+                            <div>
+                                <div class="studio-panel-title">Channel groups</div>
+                                <div class="studio-panel-sub">Operator-defined grouping. A channel belongs to one group.</div>
+                            </div>
+                        </div>
+                        <div id="probeGroupList" class="probes-group-list"></div>
+                        <button id="probeGroupNewBtn" class="feature-btn">+ New group</button>
                     </div>
 
                     <div class="bench-card studio-panel">
@@ -486,12 +562,19 @@
                     </div>
                 </aside>
 
-                <section class="studio-workspace monitor-workspace">
-                    <div class="monitor-board-panel studio-panel studio-panel--workspace">
+                <section class="studio-workspace probes-workspace">
+                    <div class="probes-board-panel studio-panel studio-panel--workspace">
                         <div class="studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">CLIP Probe Board</div>
                                 <div class="studio-panel-sub">Secondary visual-similarity signals for engineer tuning and agent-assisted checks.</div>
+                            </div>
+                            <div class="probes-board-tools">
+                                <div id="probeBoardCount" class="probe-meta">No probes</div>
+                                <div class="probes-view-toggle" role="group" aria-label="Board layout">
+                                    <button type="button" class="probes-view-btn" data-view="grid" aria-pressed="true" title="Grid view">Grid</button>
+                                    <button type="button" class="probes-view-btn" data-view="list" aria-pressed="false" title="List view">List</button>
+                                </div>
                             </div>
                         </div>
                         <div class="probe-shell">
@@ -500,20 +583,20 @@
                     </div>
                 </section>
 
-                <aside class="studio-inspector monitor-inspector">
-                    <div class="monitor-selection-panel studio-panel">
+                <aside class="studio-inspector probes-inspector">
+                    <div class="probes-selection-panel studio-panel">
                         <div class="studio-panel-head">
                             <div>
                                 <div class="studio-panel-title">Selected CLIP Probe</div>
                                 <div class="studio-panel-sub">Current state, last signal, and direct engineer actions.</div>
                             </div>
-                            <div id="monitorSelectionStatus" class="probe-meta">No probe selected</div>
+                            <div id="probesSelectionStatus" class="probe-meta">No probe selected</div>
                         </div>
-                        <div id="monitorProbeSummary" class="monitor-probe-summary">
+                        <div id="probesSummary" class="probes-summary">
                             <div class="studio-empty-state">Select a CLIP probe card to inspect its live state and operate it from here.</div>
                         </div>
-                        <div class="monitor-actions-bar">
-                            <div class="monitor-actions-main">
+                        <div class="probes-actions-bar">
+                            <div class="probes-actions-main">
                                 <button id="probeEditBtn" class="feature-btn">CLIP probe settings</button>
                                 <button id="probeRunBtn" class="feature-btn primary">Run CLIP probe</button>
                             </div>
@@ -608,7 +691,7 @@
             </div>
             <div class="probe-editor-modal-body">
                 <div class="probe-editor-layout">
-                    <div class="monitor-panel">
+                    <div class="probes-panel">
                         <div class="probe-header split probe-panel-heading-row">
                             <h4 class="probe-panel-heading">Live stream</h4>
                             <span id="probeStatus" class="luxriot-status">Idle</span>
@@ -617,9 +700,9 @@
                             <label>Channel:</label>
                             <select id="probeChannelSelect" class="luxriot-mini-input probe-select-grow"></select>
                         </div>
-                        <div class="monitor-stream-preview">
+                        <div class="probes-stream-preview">
                             <img id="probePreviewImg" src="" alt="" />
-                            <div id="probePreviewOverlay" class="monitor-stream-overlay">No channel</div>
+                            <div id="probePreviewOverlay" class="probes-stream-overlay">No channel</div>
                             <div id="probeRoiLayer" class="probe-roi-layer" aria-label="Draw probe ROI"></div>
                             <div id="probeRoiBox" class="probe-roi-box"></div>
                         </div>
@@ -636,7 +719,7 @@
                         <div id="probeRoiInfo" class="probe-meta-inline">Full frame matching</div>
                     </div>
                     <div class="probe-editor-settings">
-                        <div class="monitor-probe-form">
+                        <div class="probes-editor-form">
                             <div class="probe-row probe-name-row">
                                 <label>Probe name:</label>
                                 <input type="text" id="probeName" class="input-text" placeholder="Provide descriptive name" />
@@ -663,8 +746,8 @@
                             <div class="probe-row probe-threshold-row probe-pairs-threshold-row probe-panel-heading-row">
                                 <div class="probe-pairs-threshold-title probe-panel-heading">Text Probe Settings:</div>
                                 <div class="probe-pairs-threshold-controls">
-                                    <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.2" /></div>
-                                    <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" min="0" value="0.05" /></div>
+                                    <div class="small-label-group">Positive: <input type="number" id="probePosFloor" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" value="0.28" /></div>
+                                    <div class="small-label-group">Margin: <input type="number" id="probeMargin" class="settings-input luxriot-mini-input probe-short-input probe-threshold-input" step="0.01" min="0" value="0.08" /></div>
                                 </div>
                             </div>
                             <div class="probe-row probe-threshold-row probe-pairs-threshold-row">
@@ -764,6 +847,34 @@
         </div>
     </div>
 
+    <div id="probeGroupModal" class="settings-modal">
+        <div class="settings-modal-content probe-group-modal-content">
+            <div class="settings-header">
+                <h2 id="probeGroupModalTitle">Channel group</h2>
+                <button class="close-btn" id="closeProbeGroup">&times;</button>
+            </div>
+            <div class="probe-group-body">
+                <label class="probe-group-name-row">
+                    <span>Group name</span>
+                    <input type="text" id="probeGroupName" class="input-text" placeholder="Perimeter, Berth 3, Gates..." maxlength="80" />
+                </label>
+                <div class="probe-group-toolbar">
+                    <span class="probe-meta">Channels in this group</span>
+                    <span id="probeGroupSelectedMeta" class="probe-meta">0 selected</span>
+                </div>
+                <div id="probeGroupChannelList" class="admin-channel-list probe-group-channel-list">
+                    <div class="admin-empty">Channel list is not loaded yet.</div>
+                </div>
+                <div id="probeGroupStatus" class="probe-meta">A channel picked here is removed from whichever group held it before.</div>
+            </div>
+            <div class="settings-actions probe-editor-modal-actions">
+                <button id="probeGroupDeleteBtn" class="settings-btn is-hidden">Delete group</button>
+                <button id="probeGroupCancelBtn" class="settings-btn">Cancel</button>
+                <button id="probeGroupSaveBtn" class="settings-btn primary">Save group</button>
+            </div>
+        </div>
+    </div>
+
     <div id="agentSkillModal" class="settings-modal">
         <div class="settings-modal-content prompt-modal-content">
             <div class="settings-header">
@@ -850,8 +961,19 @@
                     </label>
                 </div>
                 <div id="luxriotPromptModalMeta" class="prompt-modal-meta">Editing stream system prompt used for live summaries.</div>
+                <section id="luxriotMemoryMetabolism" class="memory-metabolism is-hidden" aria-live="polite">
+                    <div class="memory-metabolism-head">
+                        <div>
+                            <div class="memory-metabolism-title">Memory metabolism</div>
+                            <div id="luxriotMemoryMetabolismSummary" class="memory-metabolism-summary"></div>
+                        </div>
+                        <span id="luxriotMemoryMetabolismState" class="memory-metabolism-state">Awaiting state</span>
+                    </div>
+                    <div id="luxriotMemoryMetabolismStages" class="memory-metabolism-stages"></div>
+                    <div id="luxriotMemoryMetabolismCurrent" class="memory-metabolism-current"></div>
+                </section>
                 <details id="luxriotPromptLayerDetails" class="prompt-layer-details">
-                    <summary>Effective prompt layers</summary>
+                    <summary>Advanced: effective prompt assembly</summary>
                     <pre id="luxriotPromptLayerContent" class="prompt-layer-content"></pre>
                 </details>
                 <div class="settings-actions">

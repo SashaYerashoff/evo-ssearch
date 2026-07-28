@@ -1,5 +1,15 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+if str(os.getenv("EVOSSEARCH_OFFLINE_MODE", "true") or "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}:
+    # Transformers/Hugging Face must fail closed when an appliance bundle is
+    # missing a model instead of attempting an external fetch.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import atexit
 import base64
 import copy
@@ -11,6 +21,7 @@ import math
 import pickle
 import re
 import secrets
+import shutil
 import socket
 import sys
 import tempfile
@@ -25,6 +36,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote, urlencode
+from urllib.parse import urlparse
 from threading import Lock
 
 _EVA_RUNTIME_PYTHON = Path(__file__).resolve().parent / ".eva-runtime" / "python"
@@ -38,6 +50,7 @@ from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
 from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import config
 from agent_postgres_store import PostgresAgentStore, record_agent_tool_run_audit
@@ -50,7 +63,16 @@ from archive_store import (
     PostgresProbesStore,
     PostgresRuntimeStateStore,
 )
-from alert_probe_lifecycle import AlertProbeLifecycle
+from alert_probe_lifecycle import AlertProbeLifecycle, derive_parent_alert_id
+from probe_board import (
+    PROBE_ORIGINS,
+    ChannelGroupError,
+    ChannelGroupStore,
+    annotate_probe_origin,
+    carry_probe_provenance,
+    coerce_probe_origin,
+    normalize_probe_origin,
+)
 from attention_store import (
     AttentionBatch,
     AttentionEpisodeRecord,
@@ -70,6 +92,7 @@ from inference_queue import (
     LuxriotInferenceQueueRuntime,
     PostgresInferenceQueueRepository,
 )
+from embedding_batcher import ImageEmbeddingBatcher
 from lm_admission import (
     configured_lm_capacity,
     get_lm_admission_controller,
@@ -78,6 +101,7 @@ from lm_admission import (
 from luxriot_connector import DEFAULT_BATCH_STATE_JSON_PROMPT, LuxriotManager
 from probe_manager import ProbeManager
 from road_events import AutoSceneCardConfig, DecodedVideoFrame, infer_scene_card_from_frames
+from semantic_snapshot_archive import SemanticSnapshotArchiveWriter
 from security import (
     ALL_CHANNELS,
     AuditEvent,
@@ -103,6 +127,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
+if int(getattr(config, "TRUSTED_PROXY_HOPS", 0) or 0) > 0:
+    trusted_hops = int(config.TRUSTED_PROXY_HOPS)
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=trusted_hops,
+        x_proto=trusted_hops,
+        x_host=trusted_hops,
+    )
 if config.CORS_ALLOWED_ORIGINS:
     CORS(app, resources={r"/*": {"origins": list(config.CORS_ALLOWED_ORIGINS)}})
 
@@ -115,6 +147,8 @@ clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
 clip_runtime_device = device
 _clip_module: Optional[Any] = None
+_live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
+_live_clip_batcher_lock = Lock()
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -255,6 +289,7 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "index_segments": Permission.MODELS_MANAGE,
     "luxriot_start_capture": Permission.CAPTURE_MANAGE,
     "luxriot_prompt_settings": Permission.PROMPTS_MANAGE,
+    "luxriot_rollup_l3_schedule": Permission.SETTINGS_MANAGE,
     "luxriot_stop_capture": Permission.CAPTURE_MANAGE,
     "luxriot_flush_capture": Permission.CAPTURE_MANAGE,
     "luxriot_stop_stream": Permission.CAPTURE_MANAGE,
@@ -267,12 +302,17 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "probes_save": Permission.PROBES_MANAGE,
     "probes_cast": Permission.PROBES_MANAGE,
     "probes_delete": Permission.PROBES_MANAGE,
+    "probes_channel_groups_save": Permission.PROBES_MANAGE,
+    "probes_channel_groups_delete": Permission.PROBES_MANAGE,
     "probes_run": Permission.PROBES_RUN,
     "agent_chat": Permission.AGENT_USE,
     "agent_action_plan_execute": Permission.AGENT_USE,
     "agent_config": Permission.MODELS_MANAGE,
-    "agent_skills_create": Permission.PROMPTS_MANAGE,
-    "agent_skill_detail": Permission.PROMPTS_MANAGE,
+    # Skills are process-global filesystem playbooks. Only the system settings
+    # administrator may mutate them; tenant prompt editors may still read/run
+    # the shared catalog without changing another user's agent behavior.
+    "agent_skills_create": Permission.SETTINGS_MANAGE,
+    "agent_skill_detail": Permission.SETTINGS_MANAGE,
     "agent_session": Permission.AGENT_USE,
     "save_settings": Permission.SETTINGS_MANAGE,
     "save_settings_env": Permission.SETTINGS_MANAGE,
@@ -314,9 +354,11 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_session_status": Permission.STREAMS_VIEW,
     "luxriot_summary_history": Permission.REPORTS_VIEW,
     "luxriot_summary_rollups": Permission.REPORTS_VIEW,
+    "luxriot_rollup_l3_schedule": Permission.STREAMS_VIEW,
     "luxriot_streams_status": Permission.STREAMS_VIEW,
     "probes_status": Permission.STREAMS_VIEW,
     "probes_list": Permission.REPORTS_VIEW,
+    "probes_channel_groups_list": Permission.REPORTS_VIEW,
     "probes_bench": Permission.DIAGNOSTICS_VIEW,
     "agent_sessions": Permission.AGENT_USE,
     "agent_config": Permission.AGENT_USE,
@@ -847,6 +889,42 @@ def _request_channel_ids() -> Set[int]:
     channel_ids.update(
         _request_image_channel_ids(endpoint, view_args, payload, form)
     )
+    if endpoint in {
+        "probes_channel_groups_save",
+        "probes_channel_groups_delete",
+    }:
+        group_id = ""
+        if isinstance(payload, Mapping):
+            group_id = str(payload.get("id") or "").strip()
+        try:
+            groups = channel_group_store.list_groups()
+        except Exception:
+            groups = []
+            g.channel_resolution_error = "probe_channel_group_owner_lookup_failed"
+        matched_group_id = not group_id
+        claimed_channel_ids = set(channel_ids)
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            current_group_id = str(group.get("id") or "").strip()
+            member_channel_ids = {
+                int(channel_id)
+                for channel_id in (
+                    _to_optional_int(value)
+                    for value in (group.get("channel_ids") or [])
+                )
+                if channel_id is not None and channel_id > 0
+            }
+            is_target_group = bool(group_id and current_group_id == group_id)
+            if is_target_group:
+                matched_group_id = True
+            # Claiming a channel reassigns it out of its prior group. Include
+            # that entire group in authorization so a scoped operator cannot
+            # mutate the hidden half of a mixed, read-only group.
+            if is_target_group or member_channel_ids.intersection(claimed_channel_ids):
+                channel_ids.update(member_channel_ids)
+        if group_id and not matched_group_id:
+            g.channel_resolution_error = "probe_channel_group_owner_missing"
 
     if not channel_ids and endpoint in _DEFAULT_CHANNEL_ENDPOINTS:
         default_channel = _to_optional_int(config.LUXRIOT_DEFAULT_CHANNEL_ID)
@@ -1499,16 +1577,84 @@ def _release_cuda_memory() -> None:
 
 def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
     clip_module = _get_clip_module()
-    model, preprocess = clip_module.load(model_name, device=target_device)
+    model_ref = str(model_name or "").strip()
+    download_root = Path(
+        getattr(
+            config,
+            "OPENAI_CLIP_CACHE_DIR",
+            Path.home() / ".cache" / "clip",
+        )
+    ).expanduser()
+    if bool(getattr(config, "OFFLINE_MODE", True)):
+        explicit_path = Path(model_ref).expanduser()
+        if explicit_path.is_file():
+            model_ref = str(explicit_path.resolve())
+        else:
+            registries = (
+                getattr(clip_module, "_MODELS", {}),
+                getattr(getattr(clip_module, "clip", None), "_MODELS", {}),
+            )
+            model_url = next(
+                (
+                    registry.get(model_ref)
+                    for registry in registries
+                    if isinstance(registry, Mapping) and registry.get(model_ref)
+                ),
+                None,
+            )
+            filenames = []
+            if model_url:
+                filenames.append(Path(urlparse(str(model_url)).path).name)
+            # openai-clip keeps its registry in the private ``clip.clip``
+            # submodule in some releases.  The public package does not promise
+            # that mapping, but its on-disk naming is stable (ViT-B/32 ->
+            # ViT-B-32.pt), so retain a bounded compatibility fallback.
+            normalized_filename = (
+                model_ref.replace("\\", "-").replace("/", "-").strip("-") + ".pt"
+            )
+            if normalized_filename not in filenames:
+                filenames.append(normalized_filename)
+            cached_model = next(
+                (
+                    candidate
+                    for filename in filenames
+                    if filename
+                    for candidate in (download_root / filename,)
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            if cached_model is None:
+                raise RuntimeError(
+                    f"CLIP model {model_ref!r} is not present in offline cache "
+                    f"{download_root}. Copy the model artifact before startup "
+                    "or explicitly set EVOSSEARCH_OFFLINE_MODE=false."
+                )
+            model_ref = str(cached_model)
+    model, preprocess = clip_module.load(
+        model_ref,
+        device=target_device,
+        download_root=str(download_root),
+    )
     cast(torch.nn.Module, model).eval()
     return cast(torch.nn.Module, model), preprocess
 
 
 def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
-    model = AutoModel.from_pretrained(model_name)
+    local_only = bool(getattr(config, "OFFLINE_MODE", True))
+    model = AutoModel.from_pretrained(
+        model_name,
+        local_files_only=local_only,
+        cache_dir=str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+    )
     cast(torch.nn.Module, model).to(target_device)
     cast(torch.nn.Module, model).eval()
-    processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+    processor = AutoProcessor.from_pretrained(
+        model_name,
+        use_fast=True,
+        local_files_only=local_only,
+        cache_dir=str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+    )
     return cast(torch.nn.Module, model), processor
 
 
@@ -1546,6 +1692,34 @@ def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarra
             image_features = cast(Any, clip_model).encode_image(image_batch)
         image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
     return image_features.cpu().numpy().astype(np.float32, copy=False)
+
+
+def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
+    """Return the shared cross-channel CLIP microbatcher.
+
+    The caller-facing API remains one image in/one embedding out. The worker
+    only combines concurrent channel submissions; it never samples or drops a
+    cadence slot silently.
+    """
+
+    global _live_clip_batcher
+    with _live_clip_batcher_lock:
+        if _live_clip_batcher is None:
+            _live_clip_batcher = ImageEmbeddingBatcher(
+                _clip_image_embeddings_from_pils,
+                max_batch_size=int(getattr(config, "LIVE_CLIP_BATCH_SIZE", 8)),
+                max_wait_ms=float(
+                    getattr(config, "LIVE_CLIP_BATCH_WAIT_MS", 75.0)
+                ),
+                queue_capacity=int(
+                    getattr(config, "LIVE_CLIP_BATCH_QUEUE_CAPACITY", 128)
+                ),
+                request_timeout_sec=float(
+                    getattr(config, "LIVE_CLIP_BATCH_TIMEOUT_SEC", 15.0)
+                ),
+                autostart=False,
+            )
+        return _live_clip_batcher
 
 
 def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
@@ -1682,6 +1856,8 @@ def ensure_mask_head() -> Optional["Mask2FormerHead"]:
                 model_name=config.MASK2FORMER_MODEL,
                 device=target_device,
                 max_size=config.MASK2FORMER_MAX_SIZE,
+                local_files_only=bool(getattr(config, "OFFLINE_MODE", True)),
+                cache_dir=str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
             )
             mask2former_head = cast(Any, created_head)
         except Exception as exc:
@@ -1772,7 +1948,7 @@ def get_text_embedding(text: str) -> np.ndarray:
 
 def get_probe_image_embedding_from_pil(pil_image: Image.Image) -> np.ndarray:
     """Probe image embeddings always use the CLIP-like backend so SigLIP2 can drive probe matching."""
-    return get_image_embedding_from_pil(pil_image, embedder="clip")
+    return _get_live_clip_batcher().embed_one(pil_image)
 
 
 def get_probe_text_embedding(text: str) -> np.ndarray:
@@ -1998,6 +2174,14 @@ def serve_app_js():
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
     js = js.replace('{luxriot_batch_default}', str(luxriot_default_batch))
+    js = js.replace(
+        '{probe_pos_floor_default}',
+        json.dumps(float(config.PROBE_POS_FLOOR_DEFAULT)),
+    )
+    js = js.replace(
+        '{probe_margin_default}',
+        json.dumps(float(config.PROBE_MARGIN_DEFAULT)),
+    )
     js = js.replace('{auth_enabled_json}', json.dumps(bool(config.AUTH_ENABLED)))
     js = js.replace(
         '{auth_csrf_cookie_json}',
@@ -3957,6 +4141,32 @@ PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "Rules: separate routine baseline from deviations; keep it factual and concise; avoid repetition; "
     "the backend appends current-observation and BATCH_STATE_JSON instructions; follow that final output contract."
 )
+
+
+def _is_previous_luxriot_system_prompt(value: object) -> bool:
+    """Recognize shipped legacy defaults without matching arbitrary custom roles."""
+
+    normalized = "\n".join(
+        line.strip()
+        for line in str(value or "").strip().splitlines()
+        if line.strip()
+    )
+    lowered = normalized.lower()
+    return bool(
+        normalized == PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT.strip()
+        or (
+            lowered.startswith("you are a cctv operator assistant for luxriot.")
+            and "### scene description" in lowered
+            and "### activity description" in lowered
+            and "### worth to remember" in lowered
+            and (
+                "batch_state_json" in lowered
+                or "emit alerts json only" in lowered
+            )
+        )
+    )
+
+
 LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "You are EVA's visual-semantic intellectual core within an intelligent security system that may operate "
     "from a home installation to city-scale infrastructure. You do not imitate a human guard or analyst. "
@@ -3990,7 +4200,7 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
 current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()
 if (
     not current_stream_prompt
-    or current_stream_prompt == PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT.strip()
+    or _is_previous_luxriot_system_prompt(current_stream_prompt)
 ):
     config.LUXRIOT_SYSTEM_PROMPT_DEFAULT = LUXRIOT_SYSTEM_PROMPT_DEFAULT
 
@@ -4012,10 +4222,27 @@ try:
         changed_prompt_defaults = False
         if (
             not str(luxriot_manager.system_prompt or '').strip()
-            or str(luxriot_manager.system_prompt or '').strip()
-            == PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT.strip()
+            or _is_previous_luxriot_system_prompt(
+                luxriot_manager.system_prompt
+            )
         ):
             luxriot_manager.system_prompt = LUXRIOT_SYSTEM_PROMPT_DEFAULT
+            changed_prompt_defaults = True
+        default_prompt_health = luxriot_manager._legacy_alert_prompt_health(
+            luxriot_manager.system_prompt,
+            luxriot_manager.alert_policy_prompt,
+        )
+        if bool(default_prompt_health.get('needs_migration')):
+            migrated_stream = str(
+                default_prompt_health.get('suggested_stream_system_prompt') or ''
+            ).strip()
+            migrated_policy = str(
+                default_prompt_health.get('suggested_alert_policy_prompt') or ''
+            ).strip()
+            luxriot_manager.system_prompt = (
+                migrated_stream or LUXRIOT_SYSTEM_PROMPT_DEFAULT
+            )
+            luxriot_manager.alert_policy_prompt = migrated_policy
             changed_prompt_defaults = True
         if str(luxriot_manager.default_json_alert_prompt or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
             luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
@@ -4057,6 +4284,46 @@ try:
                 continue
             channel_overrides = dict(raw_overrides)
             channel_changed = False
+            if _is_previous_luxriot_system_prompt(
+                channel_overrides.get('stream_system_prompt')
+            ):
+                # Shipped defaults persisted as channel overrides must follow
+                # the upgraded global L0 role, not pin an old copy forever.
+                channel_overrides.pop('stream_system_prompt', None)
+                channel_changed = True
+            if 'stream_system_prompt' in channel_overrides:
+                effective_channel_policy = (
+                    str(channel_overrides.get('alert_policy_prompt') or '')
+                    if 'alert_policy_prompt' in channel_overrides
+                    else str(luxriot_manager.alert_policy_prompt or '')
+                )
+                channel_prompt_health = luxriot_manager._legacy_alert_prompt_health(
+                    channel_overrides.get('stream_system_prompt'),
+                    effective_channel_policy,
+                )
+                if bool(channel_prompt_health.get('needs_migration')):
+                    migrated_stream = str(
+                        channel_prompt_health.get(
+                            'suggested_stream_system_prompt'
+                        )
+                        or ''
+                    ).strip()
+                    migrated_policy = str(
+                        channel_prompt_health.get(
+                            'suggested_alert_policy_prompt'
+                        )
+                        or ''
+                    ).strip()
+                    if migrated_stream:
+                        channel_overrides['stream_system_prompt'] = (
+                            migrated_stream
+                        )
+                    else:
+                        # A criteria-only override must inherit the canonical
+                        # L0 role after its criteria move to Alert Policy.
+                        channel_overrides.pop('stream_system_prompt', None)
+                    channel_overrides['alert_policy_prompt'] = migrated_policy
+                    channel_changed = True
             if str(channel_overrides.get('json_alert_prompt') or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
                 channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
                 channel_changed = True
@@ -4253,6 +4520,24 @@ def _build_archive_stores() -> Tuple[Any, Any]:
 
 probes_store, detections_store = _build_archive_stores()
 luxriot_manager.probes_store = probes_store
+semantic_snapshot_writer: Optional[SemanticSnapshotArchiveWriter] = None
+if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
+    semantic_snapshot_writer = SemanticSnapshotArchiveWriter(
+        detections_store,
+        cadence_ms=int(
+            getattr(config, "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS", 1000)
+        ),
+        max_queue=int(
+            getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE", 512)
+        ),
+        batch_size=int(
+            getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE", 32)
+        ),
+    )
+luxriot_manager.semantic_snapshot_writer = semantic_snapshot_writer
+channel_group_store = ChannelGroupStore(
+    getattr(config, "PROBE_CHANNEL_GROUPS_FILE", "probe_channel_groups.json")
+)
 
 
 def _attention_batch_from_event(
@@ -4572,8 +4857,16 @@ def _admit_alert_derived_probes(
         fallback = any(probe.generated_fallback for probe in admission.probes)
         for store_payload, probe in zip(
             admission.store_payloads(
-                pos_floor=0.32 if fallback else 0.2,
-                margin=0.08 if fallback else 0.05,
+                pos_floor=(
+                    max(0.32, float(config.PROBE_POS_FLOOR_DEFAULT))
+                    if fallback
+                    else float(config.PROBE_POS_FLOOR_DEFAULT)
+                ),
+                margin=(
+                    max(0.10, float(config.PROBE_MARGIN_DEFAULT))
+                    if fallback
+                    else float(config.PROBE_MARGIN_DEFAULT)
+                ),
             ),
             admission.probes,
         ):
@@ -4722,6 +5015,11 @@ def _check_database_ready() -> Dict[str, Any]:
             "max_records": int(getattr(config, "ARCHIVE_MAX_RECORDS", 5000000)),
             "prune_interval_sec": float(getattr(config, "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC", 3600.0)),
             "last_result": dict(_archive_retention_last_result),
+            "scheduler_running": bool(
+                archive_retention_thread is not None
+                and archive_retention_thread.is_alive()
+            ),
+            "disk": detection_archive.disk_status(refresh=True),
         },
     )
 
@@ -5029,12 +5327,84 @@ def _check_attention_ready() -> Dict[str, Any]:
         }
     writer_stats = writer.stats()
     lifecycle_status = _alert_probe_lifecycle.status(include_inactive=False)
+    semantic_status = (
+        semantic_snapshot_writer.status()
+        if semantic_snapshot_writer is not None
+        else {
+            "enabled": False,
+            "cadence_ms": int(
+                getattr(
+                    config,
+                    "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS",
+                    1000,
+                )
+            ),
+        }
+    )
+    clip_batch_status = (
+        _live_clip_batcher.status()
+        if _live_clip_batcher is not None
+        else {
+            "started": False,
+            "queue_depth": 0,
+            "max_batch_size": int(
+                getattr(config, "LIVE_CLIP_BATCH_SIZE", 8)
+            ),
+        }
+    )
+    with luxriot_manager.cache_lock:
+        capture_sessions = list(luxriot_manager.sessions.values())
+    capture_runtime = []
+    for session in capture_sessions:
+        try:
+            session_status = session.status()
+        except Exception as exc:
+            capture_runtime.append(
+                {
+                    "channel_id": getattr(session, "channel_id", None),
+                    "status_error": type(exc).__name__,
+                }
+            )
+            continue
+        capture_runtime.append(
+            {
+                key: session_status.get(key)
+                for key in (
+                    "channel_id",
+                    "running",
+                    "active_capture_source",
+                    "live_segment_inflight",
+                    "live_segment_inflight_frames",
+                    "live_segment_inflight_represented_seconds",
+                    "last_live_segment_completed_at",
+                    "last_live_segment_represented_seconds",
+                    "last_live_segment_error",
+                    "snapshot_count",
+                    "snapshot_failed_count",
+                    "capture_apex_probe_dispatch_count",
+                    "capture_apex_probe_failure_count",
+                    "capture_apex_probe_skipped_count",
+                    "pending_frames",
+                    "summary_queue_depth",
+                    "summary_inflight",
+                    "capture_last_error",
+                    "probe_last_error",
+                    "summary_last_error",
+                )
+            }
+        )
     return _component_result(
         bool(health.get("ok")) if required else True,
         str(health.get("status") or "unknown"),
         required=required,
         backend=health.get("backend"),
         writer=writer_stats,
+        semantic_snapshot_archive=semantic_status,
+        clip_microbatcher=clip_batch_status,
+        capture_runtime=sorted(
+            capture_runtime,
+            key=lambda item: int(item.get("channel_id") or 0),
+        ),
         scheduler=luxriot_manager.attention_status(),
         alert_probe_counts=lifecycle_status.get("counts"),
         store_error=health.get("error"),
@@ -6230,6 +6600,7 @@ def _get_agent_runner() -> Any:
             tool_audit_callback=_write_agent_tool_audit,
             tool_plan_store=approval_store,
             tool_approval_store=approval_store,
+            channel_group_store=channel_group_store,
         )
         return _agent_runner
 
@@ -6398,7 +6769,12 @@ DETECTIONS_SEARCH_DEFAULT_HOURS = 24.0
 DETECTIONS_SEARCH_SHARD_OVERFETCH = 200
 DETECTIONS_SEARCH_DINO_POOL_MIN = 64
 DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER = 8
-ARCHIVE_SOURCE_FILTERS = {"probe", "vlm_summary", "vlm_alert"}
+ARCHIVE_SOURCE_FILTERS = {
+    "probe",
+    "semantic_snapshot",
+    "vlm_summary",
+    "vlm_alert",
+}
 ARCHIVE_SOURCE_ALIASES = {
     "probe": "probe",
     "probes_run": "probe",
@@ -6406,6 +6782,9 @@ ARCHIVE_SOURCE_ALIASES = {
     "probe_daemon": "probe",
     "detection": "probe",
     "detections": "probe",
+    "semantic_snapshot": "semantic_snapshot",
+    "semantic_snapshots": "semantic_snapshot",
+    "continuous_clip": "semantic_snapshot",
     "vlm_summary": "vlm_summary",
     "video_description": "vlm_summary",
     "video_descriptions": "vlm_summary",
@@ -6425,6 +6804,8 @@ def _archive_source_label(value: Any) -> str:
     source = _normalize_archive_source_filter(value)
     if source == "probe":
         return "Probe hit"
+    if source == "semantic_snapshot":
+        return "Continuous CLIP snapshot"
     if source == "vlm_summary":
         return "Video description"
     if source == "vlm_alert":
@@ -6436,6 +6817,8 @@ def _archive_item_type(value: Any) -> str:
     source = _normalize_archive_source_filter(value)
     if source == "probe":
         return "probe_detection"
+    if source == "semantic_snapshot":
+        return "semantic_snapshot"
     if source == "vlm_summary":
         return "video_description_frame"
     if source == "vlm_alert":
@@ -6638,6 +7021,25 @@ class _AdaptiveDetectionArchive:
         self.margin_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_MARGIN_DELTA", 0.08))
         self.score_delta_thr = float(getattr(config, "DETECTIONS_RETENTION_SCORE_DELTA", 0.08))
         self.jpeg_quality = int(getattr(config, "DETECTIONS_ARCHIVE_JPEG_QUALITY", 88))
+        self.disk_min_free_bytes = int(
+            max(
+                0.0,
+                float(getattr(config, "ARCHIVE_DISK_MIN_FREE_GB", 2.0)),
+            )
+            * 1024
+            * 1024
+            * 1024
+        )
+        self.disk_min_free_percent = float(
+            max(
+                0.0,
+                getattr(config, "ARCHIVE_DISK_MIN_FREE_PERCENT", 5.0),
+            )
+        )
+        self._disk_status: Dict[str, Any] = {
+            "ok": True,
+            "status": "not_checked",
+        }
 
         self._lock = threading.RLock()
         self._state: Dict[str, Dict[str, Any]] = {}
@@ -6696,6 +7098,9 @@ class _AdaptiveDetectionArchive:
     ) -> Optional[str]:
         if not self.archive_enabled:
             return None
+        disk_status = self.disk_status(refresh=True)
+        if not bool(disk_status.get("ok")):
+            return None
         pil_img = _thumbnail_to_pil_image(thumbnail_b64)
         if pil_img is None:
             return None
@@ -6704,11 +7109,55 @@ class _AdaptiveDetectionArchive:
         probe_slug = _slug_token(probe_id, "probe")
         source_slug = _slug_token(source, "probe")
         out_dir = self.root / f"ch{int(channel_id)}" / date_key / probe_slug
-        out_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{int(timestamp_ms)}_{source_slug}_{uuid.uuid4().hex[:8]}.jpg"
-        out_path = out_dir / filename
-        pil_img.save(str(out_path), format="JPEG", quality=self.jpeg_quality)
-        return str(out_path)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{int(timestamp_ms)}_{source_slug}_{uuid.uuid4().hex[:8]}.jpg"
+            out_path = out_dir / filename
+            pil_img.save(str(out_path), format="JPEG", quality=self.jpeg_quality)
+            return str(out_path)
+        except OSError as exc:
+            self._disk_status = {
+                **self.disk_status(refresh=True),
+                "ok": False,
+                "status": "write_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            return None
+
+    def disk_status(self, *, refresh: bool = False) -> Dict[str, Any]:
+        if not refresh and self._disk_status.get("status") != "not_checked":
+            return dict(self._disk_status)
+        try:
+            usage = shutil.disk_usage(self.root)
+            total = int(usage.total)
+            free = int(usage.free)
+            free_percent = (float(free) / float(total) * 100.0) if total else 0.0
+            low_bytes = (
+                self.disk_min_free_bytes > 0
+                and free < self.disk_min_free_bytes
+            )
+            low_percent = (
+                self.disk_min_free_percent > 0
+                and free_percent < self.disk_min_free_percent
+            )
+            self._disk_status = {
+                "ok": not (low_bytes or low_percent),
+                "status": "low_space" if (low_bytes or low_percent) else "ready",
+                "path": str(self.root),
+                "total_bytes": total,
+                "free_bytes": free,
+                "free_percent": round(free_percent, 2),
+                "min_free_bytes": self.disk_min_free_bytes,
+                "min_free_percent": self.disk_min_free_percent,
+            }
+        except Exception as exc:
+            self._disk_status = {
+                "ok": False,
+                "status": "check_error",
+                "path": str(self.root),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return dict(self._disk_status)
 
     def _update_state_locked(
         self,
@@ -6837,6 +7286,7 @@ class _AdaptiveDetectionArchive:
             "kept": bool(keep),
             "record_persisted": bool(keep_record),
             "similarity_to_last_kept": similarity,
+            "archive_disk": self.disk_status(),
         }
         return keep_record, saved_path, meta
 
@@ -6864,6 +7314,8 @@ detection_archive = _AdaptiveDetectionArchive()
 _archive_retention_lock = threading.RLock()
 _archive_retention_last_run = 0.0
 _archive_retention_last_result: Dict[str, Any] = {}
+archive_retention_stop = threading.Event()
+archive_retention_thread: Optional[threading.Thread] = None
 
 
 def _delete_retained_archive_images(image_paths: Sequence[Any]) -> Dict[str, Any]:
@@ -6943,6 +7395,50 @@ def _apply_archive_retention(*, force: bool = False) -> Dict[str, Any]:
             _archive_retention_last_run = now
             _archive_retention_last_result = dict(result)
             return result
+
+
+def _archive_retention_daemon() -> None:
+    while not archive_retention_stop.is_set():
+        _apply_archive_retention(force=True)
+        interval = max(
+            60.0,
+            float(
+                getattr(
+                    config,
+                    "ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC",
+                    3600.0,
+                )
+            ),
+        )
+        archive_retention_stop.wait(interval)
+
+
+def ensure_archive_retention_thread() -> None:
+    """Run row/file retention even while every video source is idle."""
+
+    global archive_retention_thread
+    if (
+        archive_retention_thread is not None
+        and archive_retention_thread.is_alive()
+    ):
+        return
+    archive_retention_stop.clear()
+    archive_retention_thread = threading.Thread(
+        target=_archive_retention_daemon,
+        name="eva-archive-retention",
+        daemon=True,
+    )
+    archive_retention_thread.start()
+
+
+def _stop_archive_retention_thread() -> None:
+    global archive_retention_thread
+    archive_retention_stop.set()
+    if (
+        archive_retention_thread is not None
+        and archive_retention_thread.is_alive()
+    ):
+        archive_retention_thread.join(timeout=1.5)
 
 
 class _ProbeBookmarkGate:
@@ -7160,6 +7656,12 @@ def _maybe_send_probe_bookmark(
         return False, {"reason": "bookmark_not_authorized", "source": source}
 
     channel_id = _to_int(probe_like.get("channel_id"), config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    if luxriot_manager.is_local_channel(channel_id):
+        return False, {
+            "reason": "local_source_no_recorder",
+            "source": source,
+            "sent": False,
+        }
     probe_key = _probe_bookmark_identity(probe_like)
     probe_name = str(probe_like.get("name") or "probe")
     severity = str(probe_like.get("severity") or "critical")
@@ -7374,6 +7876,11 @@ def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str
             "state": state,
             "channel_id": channel_id,
         }
+        alert_id = str(
+            raw_event.get("id") or raw_event.get("alert_id") or ""
+        ).strip()
+        if alert_id:
+            event["id"] = alert_id[:200]
         if timestamp_ms is not None:
             event["timestamp_ms"] = int(max(0, timestamp_ms))
         status = str(raw_event.get("delivery_status") or "").strip().lower()
@@ -7707,6 +8214,15 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "timestamp_ms": event_ts,
                 "delivery_status": str(alert_event.get("delivery_status") or ""),
             }
+            parent_alert_id = str(
+                alert_event.get("id") or alert_event.get("alert_id") or ""
+            ).strip()
+            if not parent_alert_id:
+                parent_alert_id = derive_parent_alert_id(
+                    event_payload,
+                    channel_id=channel_id,
+                )
+            event_payload["id"] = parent_alert_id
             if alert_event.get("error"):
                 event_payload["error"] = str(alert_event.get("error") or "")[:240]
             event_hash = hashlib.sha1(
@@ -7715,6 +8231,7 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
             alert_payload = {
                 **base_payload,
                 "source": "vlm_alert",
+                "parent_alert_id": parent_alert_id,
                 "severity": severity,
                 "alert_event": event_payload,
                 "alert_event_index": event_index,
@@ -7989,8 +8506,8 @@ def _probe_daemon() -> None:
                             probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
                             probe.get('positives', []),
                             probe.get('negatives', []),
-                            probe.get('pos_floor', 0.2),
-                            probe.get('margin', 0.05),
+                            probe.get('pos_floor', config.PROBE_POS_FLOOR_DEFAULT),
+                            probe.get('margin', config.PROBE_MARGIN_DEFAULT),
                             probe.get('top_k', 6),
                             window_sec=probe.get('window_sec', 300.0),
                             image_probe=probe.get('image_probe'),
@@ -8943,6 +9460,378 @@ def _build_detection_search_coverage(
     }
 
 
+def _finalize_detection_search_results(
+    *,
+    clip_hits: Sequence[Tuple[int, float]],
+    candidate_map: Mapping[int, Dict[str, Any]],
+    dino_query_vec: Optional[np.ndarray],
+    mode: str,
+    sort_by: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Hydrate and optionally DINO-rerank an already complete CLIP ranking."""
+
+    alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
+    if mode == "clip":
+        alpha = 0.0
+    elif mode == "dino":
+        alpha = 1.0
+
+    dino_scores: Dict[int, float] = {}
+    if mode in {"dino", "fusion"} and dino_query_vec is not None:
+        pool_size = min(
+            len(clip_hits),
+            max(
+                DETECTIONS_SEARCH_DINO_POOL_MIN,
+                limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER,
+            ),
+        )
+        pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
+        dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
+        dino_dim = (
+            int(dino_query_vec.shape[0])
+            if dino_query_vec.ndim == 1
+            else 0
+        )
+        for det_id in pool_ids:
+            vec = dino_vectors.get(det_id)
+            if vec is None:
+                continue
+            if dino_dim <= 0 or vec.ndim != 1 or int(vec.shape[0]) != dino_dim:
+                continue
+            dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
+
+    scored: List[Tuple[int, float, float, Optional[float], bool]] = []
+    for det_id, clip_score in clip_hits:
+        dino_score = dino_scores.get(det_id)
+        dino_fallback = False
+        if mode == "clip":
+            final_score = clip_score
+        elif dino_query_vec is None:
+            dino_fallback = True
+            final_score = clip_score
+        elif mode == "dino":
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = dino_score
+        else:
+            if dino_score is None:
+                dino_fallback = True
+                final_score = clip_score
+            else:
+                final_score = (
+                    (1.0 - alpha) * clip_score
+                    + alpha * dino_score
+                )
+        scored.append(
+            (
+                det_id,
+                float(final_score),
+                float(clip_score),
+                dino_score,
+                dino_fallback,
+            )
+        )
+
+    if sort_by == "time":
+        scored.sort(
+            key=lambda row: int(
+                candidate_map.get(row[0], {}).get("timestamp_ms") or 0
+            ),
+            reverse=True,
+        )
+    else:
+        scored.sort(key=lambda row: row[1], reverse=True)
+
+    top_scored = scored[:limit]
+    hydrated_by_id: Dict[int, Dict[str, Any]] = {}
+    try:
+        hydrated_rows = detections_store.fetch_detections_by_ids(
+            [det_id for det_id, *_rest in top_scored],
+            include_vectors=False,
+            include_thumbnail=True,
+        )
+        hydrated_by_id = {
+            int(row["id"]): row
+            for row in hydrated_rows
+            if isinstance(row, Mapping)
+            and _to_optional_int(row.get("id")) is not None
+        }
+    except Exception:
+        hydrated_by_id = {}
+
+    results: List[Dict[str, Any]] = []
+    for det_id, final_score, clip_score, dino_score, dino_fallback in top_scored:
+        item = hydrated_by_id.get(det_id) or candidate_map.get(det_id)
+        if not item:
+            continue
+        results.append(
+            _build_detection_search_result(
+                item=item,
+                score=final_score,
+                clip_score=clip_score,
+                dino_score=dino_score,
+                mode=mode,
+                alpha=alpha,
+                dino_fallback=dino_fallback,
+            )
+        )
+    return results
+
+
+def _detection_row_matches_filters(
+    item: Mapping[str, Any],
+    *,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    channel_ids: Optional[Sequence[int]],
+    source: Optional[str],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+) -> bool:
+    if probe_id and str(item.get("probe_id") or "") != str(probe_id):
+        return False
+    allowed_channels = {
+        int(value)
+        for value in (channel_ids or [])
+        if _to_optional_int(value) is not None
+    }
+    if channel_id is not None:
+        allowed_channels.add(int(channel_id))
+    item_channel = _to_optional_int(item.get("channel_id"))
+    if allowed_channels and item_channel not in allowed_channels:
+        return False
+    if source:
+        item_source = _normalize_archive_source_filter(item.get("source"))
+        if item_source != source:
+            return False
+    timestamp_ms = _to_optional_int(item.get("timestamp_ms"))
+    if timestamp_ms is None:
+        return False
+    if since_ms is not None and timestamp_ms < int(since_ms):
+        return False
+    if until_ms is not None and timestamp_ms > int(until_ms):
+        return False
+    return True
+
+
+def _search_semantic_snapshot_shards(
+    *,
+    clip_query_vec: np.ndarray,
+    dino_query_vec: Optional[np.ndarray],
+    mode: str,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    channel_ids: Optional[Sequence[int]],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    sort_by: str,
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+    """Search every continuous-CLIP shard without a newest-first row cap.
+
+    Hourly semantic shards are exact flat FAISS indexes.  For legacy daily
+    shards, and for partial boundary hours, the search progressively widens
+    until it has the top ``limit`` eligible rows from that shard or exhausts
+    it.  Therefore a 24-hour/eight-channel query does not silently collapse to
+    the newest 20k archive rows.
+    """
+
+    try:
+        shards = detections_store.summarize_shards(
+            probe_id=probe_id,
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            source="semantic_snapshot",
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=5000,
+        )
+    except AttributeError:
+        return None
+
+    total_candidates = sum(
+        max(0, int(item.get("clip_count") or 0))
+        for item in shards
+        if isinstance(item, Mapping)
+    )
+    if not shards:
+        coverage = _build_detection_search_coverage(
+            candidates=[],
+            total_candidates=0,
+            candidate_limit=0,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            source="semantic_snapshot",
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+        )
+        coverage["search_strategy"] = "hourly_sharded_exact"
+        coverage["shards_searched"] = 0
+        return [], coverage
+
+    query_dim = (
+        int(clip_query_vec.shape[0])
+        if clip_query_vec.ndim == 1
+        else 0
+    )
+    initial_k = max(32, int(limit) * 4)
+    states: Dict[str, Dict[str, Any]] = {}
+    failed_shards: List[str] = []
+    for summary in shards:
+        shard_key = str(summary.get("shard_key") or "").strip()
+        if not shard_key:
+            continue
+        index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        if index_obj is None or shard_ids is None or shard_ids.size == 0:
+            failed_shards.append(shard_key)
+            continue
+        index_dim = _to_optional_int(getattr(index_obj, "d", None))
+        if query_dim <= 0 or (
+            index_dim is not None
+            and index_dim != query_dim
+        ):
+            failed_shards.append(shard_key)
+            continue
+        size = int(shard_ids.size)
+        states[shard_key] = {
+            "index": index_obj,
+            "ids": shard_ids,
+            "size": size,
+            "k": min(size, initial_k),
+            "eligible": {},
+            "complete": False,
+        }
+
+    candidate_map: Dict[int, Dict[str, Any]] = {}
+    score_by_id: Dict[int, float] = {}
+    while True:
+        pending = [
+            (shard_key, state)
+            for shard_key, state in states.items()
+            if not bool(state["complete"])
+        ]
+        if not pending:
+            break
+
+        requested_ids: Set[int] = set()
+        owner_by_id: Dict[int, str] = {}
+        for shard_key, state in pending:
+            sims, inds = _faiss_search(
+                state["index"],
+                clip_query_vec.reshape(1, -1),
+                int(state["k"]),
+            )
+            shard_ids = state["ids"]
+            for local_idx, score in zip(inds[0], sims[0]):
+                local_int = int(local_idx)
+                if local_int < 0 or local_int >= int(shard_ids.size):
+                    continue
+                det_id = int(shard_ids[local_int])
+                score_by_id[det_id] = float(score)
+                if det_id not in candidate_map:
+                    requested_ids.add(det_id)
+                    owner_by_id[det_id] = shard_key
+
+        fetched_rows = detections_store.fetch_detections_by_ids(
+            sorted(requested_ids),
+            include_vectors=False,
+            include_thumbnail=False,
+        ) if requested_ids else []
+        for row in fetched_rows:
+            if not isinstance(row, Mapping):
+                continue
+            det_id = _to_optional_int(row.get("id"))
+            if det_id is None:
+                continue
+            shard_key = owner_by_id.get(det_id)
+            if not shard_key or shard_key not in states:
+                continue
+            if not _detection_row_matches_filters(
+                row,
+                probe_id=probe_id,
+                channel_id=channel_id,
+                channel_ids=channel_ids,
+                source="semantic_snapshot",
+                since_ms=since_ms,
+                until_ms=until_ms,
+            ):
+                continue
+            item = dict(row)
+            candidate_map[det_id] = item
+            states[shard_key]["eligible"][det_id] = item
+
+        for _shard_key, state in pending:
+            if (
+                len(state["eligible"]) >= limit
+                or int(state["k"]) >= int(state["size"])
+            ):
+                state["complete"] = True
+            else:
+                state["k"] = min(
+                    int(state["size"]),
+                    max(int(state["k"]) + 1, int(state["k"]) * 4),
+                )
+
+    clip_hits: List[Tuple[int, float]] = []
+    for state in states.values():
+        shard_hits = sorted(
+            (
+                (int(det_id), float(score_by_id[det_id]))
+                for det_id in state["eligible"]
+                if det_id in score_by_id
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        clip_hits.extend(shard_hits[:limit])
+    clip_hits.sort(key=lambda item: item[1], reverse=True)
+
+    results = _finalize_detection_search_results(
+        clip_hits=clip_hits,
+        candidate_map=candidate_map,
+        dino_query_vec=dino_query_vec,
+        mode=mode,
+        sort_by=sort_by,
+        limit=limit,
+    )
+    timestamps = [
+        int(item.get("timestamp_ms") or 0)
+        for item in candidate_map.values()
+        if _to_optional_int(item.get("timestamp_ms")) is not None
+    ]
+    coverage = {
+        "candidate_limit": None,
+        "scanned_candidates": int(total_candidates),
+        "total_candidates": int(total_candidates),
+        "truncated": bool(failed_shards),
+        "result_limit": int(limit),
+        "source": "semantic_snapshot",
+        "channel_id": channel_id,
+        "channel_ids": list(
+            channel_ids
+            or ([channel_id] if channel_id is not None else [])
+        ),
+        "requested_since_ms": since_ms,
+        "requested_until_ms": until_ms,
+        "scanned_oldest_ms": min(timestamps) if timestamps else None,
+        "scanned_newest_ms": max(timestamps) if timestamps else None,
+        "must_state_coverage": bool(failed_shards),
+        "search_strategy": "hourly_sharded_exact",
+        "shards_searched": len(states),
+        "shards_failed": failed_shards,
+        "note": (
+            "Continuous CLIP snapshots were ranked across every matching shard."
+            if not failed_shards
+            else "Some continuous CLIP shards could not be searched."
+        ),
+    }
+    return results, coverage
+
+
 def _search_detections_archive(
     *,
     clip_query_vec: np.ndarray,
@@ -8961,6 +9850,111 @@ def _search_detections_archive(
 ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
     limit = max(1, min(config.MAX_RESULTS, int(limit or config.DEFAULT_RESULTS)))
     candidate_limit = max(limit, min(DETECTIONS_SEARCH_MAX_CANDIDATES, int(candidate_limit or 20000)))
+    if source == "semantic_snapshot":
+        semantic_result = _search_semantic_snapshot_shards(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=dino_query_vec,
+            mode=mode,
+            probe_id=probe_id,
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            sort_by=sort_by,
+        )
+        if semantic_result is not None:
+            results, coverage = semantic_result
+            return (results, coverage) if include_coverage else results
+
+    if source is None and probe_id is None:
+        source_results: List[Dict[str, Any]] = []
+        source_coverages: Dict[str, Dict[str, Any]] = {}
+        for scoped_source in (
+            "semantic_snapshot",
+            "vlm_alert",
+            "vlm_summary",
+            "probe",
+        ):
+            scoped_payload = _search_detections_archive(
+                clip_query_vec=clip_query_vec,
+                dino_query_vec=dino_query_vec,
+                mode=mode,
+                probe_id=None,
+                channel_id=channel_id,
+                channel_ids=channel_ids,
+                source=scoped_source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                sort_by=sort_by,
+                candidate_limit=candidate_limit,
+                include_coverage=True,
+            )
+            scoped_results, scoped_coverage = scoped_payload
+            source_results.extend(scoped_results)
+            source_coverages[scoped_source] = scoped_coverage
+
+        deduped: Dict[int, Dict[str, Any]] = {}
+        without_id: List[Dict[str, Any]] = []
+        for item in source_results:
+            det_id = _to_optional_int(item.get("detection_id"))
+            if det_id is None:
+                without_id.append(item)
+                continue
+            previous = deduped.get(det_id)
+            if previous is None or float(item.get("similarity") or 0.0) > float(
+                previous.get("similarity") or 0.0
+            ):
+                deduped[det_id] = item
+        merged = [*deduped.values(), *without_id]
+        if sort_by == "time":
+            merged.sort(
+                key=lambda item: int(item.get("timestamp_ms") or 0),
+                reverse=True,
+            )
+        else:
+            merged.sort(
+                key=lambda item: float(item.get("similarity") or 0.0),
+                reverse=True,
+            )
+        merged = merged[:limit]
+        total_candidates = sum(
+            int(item.get("total_candidates") or 0)
+            for item in source_coverages.values()
+        )
+        truncated = any(
+            bool(item.get("truncated"))
+            for item in source_coverages.values()
+        )
+        coverage = {
+            "candidate_limit": candidate_limit,
+            "scanned_candidates": sum(
+                int(item.get("scanned_candidates") or 0)
+                for item in source_coverages.values()
+            ),
+            "total_candidates": total_candidates,
+            "truncated": truncated,
+            "result_limit": int(limit),
+            "source": None,
+            "channel_id": channel_id,
+            "channel_ids": list(
+                channel_ids
+                or ([channel_id] if channel_id is not None else [])
+            ),
+            "requested_since_ms": since_ms,
+            "requested_until_ms": until_ms,
+            "must_state_coverage": truncated,
+            "search_strategy": "source_fanout",
+            "sources": source_coverages,
+            "note": (
+                "All archive evidence sources were searched independently."
+                if not truncated
+                else "At least one non-continuous archive source used a limited candidate window."
+            ),
+        }
+        return (merged, coverage) if include_coverage else merged
+
     clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
     channel_scope: Dict[str, Any] = {"channel_id": channel_id}
     if channel_ids and len(channel_ids) > 1:
@@ -9065,86 +10059,14 @@ def _search_detections_archive(
         )
         return ([], coverage) if include_coverage else []
 
-    alpha = max(0.0, min(1.0, float(config.FUSION_ALPHA)))
-    if mode == "clip":
-        alpha = 0.0
-    elif mode == "dino":
-        alpha = 1.0
-
-    dino_scores: Dict[int, float] = {}
-    if mode in {"dino", "fusion"} and dino_query_vec is not None:
-        pool_size = min(len(clip_hits), max(DETECTIONS_SEARCH_DINO_POOL_MIN, limit * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER))
-        pool_ids = [det_id for det_id, _ in clip_hits[:pool_size]]
-        dino_vectors = _ensure_dino_vectors_for_ids(pool_ids)
-        dino_dim = int(dino_query_vec.shape[0]) if dino_query_vec.ndim == 1 else 0
-        for det_id in pool_ids:
-            vec = dino_vectors.get(det_id)
-            if vec is None:
-                continue
-            if dino_dim <= 0 or vec.ndim != 1 or int(vec.shape[0]) != dino_dim:
-                continue
-            dino_scores[det_id] = float(np.dot(dino_query_vec, vec))
-
-    scored: List[Tuple[int, float, float, Optional[float], bool]] = []
-    for det_id, clip_score in clip_hits:
-        dino_score = dino_scores.get(det_id)
-        dino_fallback = False
-        if mode == "clip":
-            final_score = clip_score
-        elif dino_query_vec is None:
-            dino_fallback = True
-            final_score = clip_score
-        elif mode == "dino":
-            if dino_score is None:
-                dino_fallback = True
-                final_score = clip_score
-            else:
-                final_score = dino_score
-        else:
-            if dino_score is None:
-                dino_fallback = True
-                final_score = clip_score
-            else:
-                final_score = (1.0 - alpha) * clip_score + alpha * dino_score
-        scored.append((det_id, float(final_score), float(clip_score), dino_score, dino_fallback))
-
-    if sort_by == "time":
-        scored.sort(key=lambda row: int(candidate_map.get(row[0], {}).get("timestamp_ms") or 0), reverse=True)
-    else:
-        scored.sort(key=lambda row: row[1], reverse=True)
-
-    top_scored = scored[:limit]
-    hydrated_by_id: Dict[int, Dict[str, Any]] = {}
-    try:
-        hydrated_rows = detections_store.fetch_detections_by_ids(
-            [det_id for det_id, *_rest in top_scored],
-            include_vectors=False,
-            include_thumbnail=True,
-        )
-        hydrated_by_id = {
-            int(row["id"]): row
-            for row in hydrated_rows
-            if isinstance(row, Mapping) and _to_optional_int(row.get("id")) is not None
-        }
-    except Exception:
-        hydrated_by_id = {}
-
-    results: List[Dict[str, Any]] = []
-    for det_id, final_score, clip_score, dino_score, dino_fallback in top_scored:
-        item = hydrated_by_id.get(det_id) or candidate_map.get(det_id)
-        if not item:
-            continue
-        results.append(
-            _build_detection_search_result(
-                item=item,
-                score=final_score,
-                clip_score=clip_score,
-                dino_score=dino_score,
-                mode=mode,
-                alpha=alpha,
-                dino_fallback=dino_fallback,
-            )
-        )
+    results = _finalize_detection_search_results(
+        clip_hits=clip_hits,
+        candidate_map=candidate_map,
+        dino_query_vec=dino_query_vec,
+        mode=mode,
+        sort_by=sort_by,
+        limit=limit,
+    )
     coverage = _build_detection_search_coverage(
         candidates=candidates,
         total_candidates=total_candidates,
@@ -9154,6 +10076,7 @@ def _search_detections_archive(
         limit=limit,
         source=source,
         channel_id=channel_id,
+        channel_ids=channel_ids,
     )
     return (results, coverage) if include_coverage else results
 
@@ -10559,7 +11482,12 @@ def luxriot_channels():
                 for channel in channels
                 if _can_access_context_channel(context, channel.get("id"))
             ]
-        return jsonify({'channels': channels})
+        return jsonify(
+            {
+                'channels': channels,
+                'inventory': luxriot_manager.channel_inventory_status(),
+            }
+        )
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
@@ -12092,6 +13020,56 @@ def luxriot_summary_rollups():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/luxriot/rollups/l3-schedule', methods=['GET', 'POST'])
+def luxriot_rollup_l3_schedule():
+    """Read or persist the operator-defined deep-review quiet window."""
+
+    if request.method == 'GET':
+        try:
+            return jsonify(luxriot_manager.get_rollup_l3_deep_schedule())
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    schedule = (
+        data.get('schedule')
+        if isinstance(data.get('schedule'), Mapping)
+        else data
+    )
+    try:
+        result = luxriot_manager.set_rollup_l3_deep_schedule(
+            cast(Mapping[str, Any], schedule),
+            persist=True,
+        )
+        result_schedule = (
+            result.get("schedule")
+            if isinstance(result, Mapping)
+            and isinstance(result.get("schedule"), Mapping)
+            else {}
+        )
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.rollup_l3_schedule.update.completed",
+            result="success",
+            target_type="luxriot_rollup_l3_schedule",
+            target_id="global",
+            details={"enabled": bool(result_schedule.get("enabled"))},
+        )
+        if audit_error is not None:
+            return audit_error
+        return jsonify({'success': True, **result})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception(
+            "L3 quiet-window update failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({'error': str(exc)}), 500
+
+
 @app.route('/luxriot/history', methods=['GET'])
 def luxriot_summary_history():
     channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
@@ -12138,6 +13116,31 @@ def luxriot_summary_history():
 def luxriot_streams_status():
     try:
         status = luxriot_manager.streams_status()
+        status["semantic_snapshot_archive"] = (
+            semantic_snapshot_writer.status()
+            if semantic_snapshot_writer is not None
+            else {
+                "enabled": False,
+                "cadence_ms": int(
+                    getattr(
+                        config,
+                        "LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS",
+                        1000,
+                    )
+                ),
+            }
+        )
+        status["clip_microbatcher"] = (
+            _live_clip_batcher.status()
+            if _live_clip_batcher is not None
+            else {
+                "started": False,
+                "max_batch_size": int(
+                    getattr(config, "LIVE_CLIP_BATCH_SIZE", 8)
+                ),
+                "queue_depth": 0,
+            }
+        )
         return jsonify(
             _filter_stream_status_for_context(
                 status,
@@ -12338,13 +13341,15 @@ def probes_query():
     positives = data.get('positives') or []
     negatives = data.get('negatives') or []
     try:
-        pos_floor = float(data.get('pos_floor', 0.2))
+        pos_floor = float(
+            data.get('pos_floor', config.PROBE_POS_FLOOR_DEFAULT)
+        )
     except Exception:
-        pos_floor = 0.2
+        pos_floor = float(config.PROBE_POS_FLOOR_DEFAULT)
     try:
-        margin_thr = float(data.get('margin', 0.05))
+        margin_thr = float(data.get('margin', config.PROBE_MARGIN_DEFAULT))
     except Exception:
-        margin_thr = 0.05
+        margin_thr = float(config.PROBE_MARGIN_DEFAULT)
     try:
         top_k = int(data.get('top_k', 5))
     except Exception:
@@ -12373,17 +13378,21 @@ def probes_query():
         if bookmark_guard is not None:
             return bookmark_guard
         probe_like["bookmark_authorized"] = True
-    result = probe_manager.query(
-        channel_id,
-        positives,
-        negatives,
-        pos_floor,
-        margin_thr,
-        top_k,
-        window_sec=window_sec,
-        image_probe=data.get('image_probe'),
-        roi_norm=probe_roi_norm if probe_roi_enabled else None,
-        roi_padding=PROBE_ROI_PADDING,
+    result = _query_probe_with_capture_warmup(
+        channel_id=channel_id,
+        fps=data.get('fps'),
+        query=lambda: probe_manager.query(
+            channel_id,
+            positives,
+            negatives,
+            pos_floor,
+            margin_thr,
+            top_k,
+            window_sec=window_sec,
+            image_probe=data.get('image_probe'),
+            roi_norm=probe_roi_norm if probe_roi_enabled else None,
+            roi_padding=PROBE_ROI_PADDING,
+        ),
     )
     status_code = 200 if 'error' not in result else 400
     hits = result.get('results') or []
@@ -12486,6 +13495,80 @@ def _probe_int(val: Any, default: int) -> int:
         return default
 
 
+def _probe_result_frame_count(result: Mapping[str, Any]) -> Optional[int]:
+    raw = result.get("frames_indexed")
+    if raw is None and isinstance(result.get("status"), Mapping):
+        raw = cast(Mapping[str, Any], result["status"]).get("frames")
+    return _to_optional_int(raw)
+
+
+def _query_probe_with_capture_warmup(
+    *,
+    channel_id: int,
+    query: Callable[[], Dict[str, Any]],
+    fps: Any = None,
+) -> Dict[str, Any]:
+    """Retry an empty live-buffer query after capture produces its first frame."""
+
+    result = query()
+    if "error" in result or _probe_result_frame_count(result) != 0:
+        return result
+
+    try:
+        if luxriot_manager.is_probe_capture_paused(channel_id):
+            result["capture_warming_up"] = False
+            result["capture_state"] = "paused"
+            return result
+    except Exception:
+        pass
+
+    fps_value: Optional[float] = None
+    try:
+        if fps is not None and float(fps) > 0:
+            fps_value = float(fps)
+    except (TypeError, ValueError):
+        fps_value = None
+
+    try:
+        capture_state = luxriot_manager.start_probe_capture(
+            int(channel_id),
+            fps=fps_value,
+            clear_pause=False,
+        )
+    except Exception as exc:
+        result["capture_warming_up"] = False
+        result["capture_state"] = "start_failed"
+        result["capture_error"] = str(exc)
+        return result
+
+    timeout_sec = float(
+        getattr(config, "PROBE_CAPTURE_WARMUP_SEC", 2.5) or 0.0
+    )
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    frames_indexed = 0
+    while True:
+        try:
+            status = probe_manager.status(int(channel_id))
+            frames_indexed = int(status.get("frames") or 0)
+        except Exception:
+            frames_indexed = 0
+        if frames_indexed > 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    if frames_indexed > 0:
+        retried = query()
+        retried["capture_warming_up"] = False
+        retried["capture_state"] = capture_state
+        retried["capture_warmup_retry"] = True
+        return retried
+
+    result["capture_warming_up"] = True
+    result["capture_state"] = capture_state
+    result["capture_warmup_timeout_sec"] = timeout_sec
+    return result
+
+
 def _probe_text_values(raw: Any) -> List[str]:
     if not isinstance(raw, (list, tuple)):
         return []
@@ -12556,6 +13639,8 @@ def _build_probe_payload(
     name_override: Optional[str] = None,
     cast_group_id: Optional[str] = None,
     cast_base_name: Optional[str] = None,
+    origin_override: Optional[str] = None,
+    origin_meta: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     try:
         channel_id = int(channel_id_override if channel_id_override is not None else (data.get('channel_id') or config.LUXRIOT_DEFAULT_CHANNEL_ID))
@@ -12602,8 +13687,17 @@ def _build_probe_payload(
         "channel_id": channel_id,
         "positives": positives,
         "negatives": negatives,
-        "pos_floor": _probe_float(data.get('pos_floor'), 0.2),
-        "margin": max(0.0, _probe_float(data.get('margin'), 0.05)),
+        "pos_floor": _probe_float(
+            data.get('pos_floor'),
+            float(config.PROBE_POS_FLOOR_DEFAULT),
+        ),
+        "margin": max(
+            0.0,
+            _probe_float(
+                data.get('margin'),
+                float(config.PROBE_MARGIN_DEFAULT),
+            ),
+        ),
         "bookmark_cooldown_sec": max(
             0.0,
             _probe_float(
@@ -12633,6 +13727,15 @@ def _build_probe_payload(
         "bookmark_gate": existing.get("bookmark_gate"),
         "bookmark_gate_updated_at_ms": existing.get("bookmark_gate_updated_at_ms"),
     }
+    # This function rebuilds the probe from the request body, so authorship and
+    # alert lineage must be carried over explicitly: an operator editing an
+    # alert-derived probe must not silently turn it into an operator probe.
+    if origin_override is not None:
+        probe["origin"] = coerce_probe_origin(origin_override)
+    if origin_meta is not None:
+        probe["origin_meta"] = dict(origin_meta)
+    carry_probe_provenance(probe, existing_probe)
+    probe.setdefault("origin", normalize_probe_origin(existing))
     if cast_group_id:
         probe["cast_group_id"] = str(cast_group_id)
     if cast_base_name:
@@ -12837,6 +13940,76 @@ def probes_cast():
     ), status
 
 
+def _probe_channel_group_by_id(group_id: Any) -> Dict[str, Any]:
+    normalized = str(group_id or "").strip()
+    if not normalized:
+        return {}
+    return next(
+        (
+            dict(group)
+            for group in channel_group_store.list_groups()
+            if str(group.get("id") or "") == normalized
+        ),
+        {},
+    )
+
+
+def _visible_probe_channel_groups(
+    context: Optional[AuthContext] = None,
+) -> List[Dict[str, Any]]:
+    """Return group presentation state without leaking unauthorized channels."""
+
+    groups = channel_group_store.list_groups()
+    if not _auth_enabled() or context is None or not _is_channel_scoped(context):
+        return groups
+    visible: List[Dict[str, Any]] = []
+    for raw_group in groups:
+        group = dict(raw_group)
+        stored_channel_ids = [
+            int(channel_id)
+            for channel_id in (group.get("channel_ids") or [])
+            if _to_optional_int(channel_id) is not None
+            and int(channel_id) > 0
+        ]
+        visible_channel_ids = [
+            channel_id
+            for channel_id in stored_channel_ids
+            if _can_access_context_channel(context, channel_id)
+        ]
+        if not visible_channel_ids:
+            continue
+        group["channel_ids"] = visible_channel_ids
+        group["read_only"] = len(visible_channel_ids) != len(stored_channel_ids)
+        visible.append(group)
+    return visible
+
+
+def _probe_channel_group_scope_error(
+    group: Mapping[str, Any],
+):
+    """Reject a scoped mutation unless every existing member is authorized."""
+
+    context = _current_auth_context()
+    if (
+        not _auth_enabled()
+        or context is None
+        or not _is_channel_scoped(context)
+    ):
+        return None
+    channel_ids = [
+        int(channel_id)
+        for channel_id in (group.get("channel_ids") or [])
+        if _to_optional_int(channel_id) is not None
+        and int(channel_id) > 0
+    ]
+    if not channel_ids or any(
+        not _can_access_context_channel(context, channel_id)
+        for channel_id in channel_ids
+    ):
+        return jsonify({"error": "Access denied"}), 403
+    return None
+
+
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
     probes = probes_store.list_probes()
@@ -12855,7 +14028,9 @@ def probes_list():
     expired_temporary_count = 0
     active_probes: List[Dict[str, Any]] = []
     for raw_probe in probes:
-        probe = dict(raw_probe)
+        # Probes stored before ``origin`` existed are backfilled on read so the
+        # board can filter by authorship without a store rewrite.
+        probe = annotate_probe_origin(raw_probe)
         expires_at_ms = _to_optional_int(probe.get("expires_at_ms"))
         expired_temporary = bool(probe.get("temporary")) and (
             expires_at_ms is not None and expires_at_ms <= now_ms
@@ -12868,6 +14043,7 @@ def probes_list():
     response = jsonify(
         {
             'probes': probes,
+            'channel_groups': _visible_probe_channel_groups(context),
             'counts': {
                 'visible': len(probes),
                 'persistent': sum(
@@ -12878,6 +14054,12 @@ def probes_list():
                 ),
                 'temporary_expired_hidden': expired_temporary_count,
                 'stored': all_count,
+                'by_origin': {
+                    origin: sum(
+                        1 for probe in probes if probe.get('origin') == origin
+                    )
+                    for origin in PROBE_ORIGINS
+                },
             },
         }
     )
@@ -12885,6 +14067,83 @@ def probes_list():
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     return response
+
+
+@app.route('/probes/channel_groups', methods=['GET'])
+def probes_channel_groups_list():
+    return jsonify(
+        {'groups': _visible_probe_channel_groups(_current_auth_context())}
+    )
+
+
+@app.route('/probes/channel_groups/save', methods=['POST'])
+def probes_channel_groups_save():
+    # _MUTATION_ENDPOINT_PERMISSIONS maps this endpoint to PROBES_MANAGE, so the
+    # mutation guard already enforces it; grouping is board organisation, not a
+    # settings-level change.
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    existing_group = _probe_channel_group_by_id(data.get('id'))
+    if existing_group:
+        scope_error = _probe_channel_group_scope_error(existing_group)
+        if scope_error is not None:
+            return scope_error
+    elif _auth_enabled() and not str(data.get('id') or '').strip():
+        context = _current_auth_context()
+        if (
+            context is not None
+            and _is_channel_scoped(context)
+            and not list(data.get('channel_ids') or [])
+        ):
+            return jsonify({'error': 'Select at least one authorized channel'}), 403
+    try:
+        group = channel_group_store.upsert_group(
+            group_id=data.get('id'),
+            name=data.get('name'),
+            channel_ids=data.get('channel_ids'),
+            position=_to_optional_int(data.get('position')),
+        )
+    except ChannelGroupError as exc:
+        return jsonify({'error': str(exc)}), 400
+    visible_groups = _visible_probe_channel_groups(_current_auth_context())
+    visible_group = next(
+        (
+            item
+            for item in visible_groups
+            if str(item.get('id') or '') == str(group.get('id') or '')
+        ),
+        group,
+    )
+    return jsonify(
+        {'success': True, 'group': visible_group, 'groups': visible_groups}
+    )
+
+
+@app.route('/probes/channel_groups/delete', methods=['POST'])
+def probes_channel_groups_delete():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    group_id = str(data.get('id') or '').strip()
+    if not group_id:
+        return jsonify({'error': 'Provide group id'}), 400
+    existing_group = _probe_channel_group_by_id(group_id)
+    if existing_group:
+        scope_error = _probe_channel_group_scope_error(existing_group)
+        if scope_error is not None:
+            return scope_error
+    # Deleting a group only un-groups its channels; probes are never touched.
+    if not channel_group_store.delete_group(group_id):
+        return jsonify({'error': 'Group not found'}), 404
+    return jsonify(
+        {
+            'success': True,
+            'groups': _visible_probe_channel_groups(_current_auth_context()),
+        }
+    )
 
 
 @app.route('/probes/delete', methods=['POST'])
@@ -12923,17 +14182,24 @@ def probes_run():
             return bookmark_guard
         probe['bookmark_authorized'] = True
     probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
-    result = probe_manager.query(
-        probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID),
-        probe.get('positives', []),
-        probe.get('negatives', []),
-        probe.get('pos_floor', 0.2),
-        probe.get('margin', 0.05),
-        probe.get('top_k', 6),
-        window_sec=probe.get('window_sec', 300.0),
-        image_probe=probe.get('image_probe'),
-        roi_norm=probe_roi_norm if probe_roi_enabled else None,
-        roi_padding=PROBE_ROI_PADDING,
+    probe_channel_id = int(
+        probe.get('channel_id', config.LUXRIOT_DEFAULT_CHANNEL_ID)
+    )
+    result = _query_probe_with_capture_warmup(
+        channel_id=probe_channel_id,
+        fps=probe.get('fps'),
+        query=lambda: probe_manager.query(
+            probe_channel_id,
+            probe.get('positives', []),
+            probe.get('negatives', []),
+            probe.get('pos_floor', config.PROBE_POS_FLOOR_DEFAULT),
+            probe.get('margin', config.PROBE_MARGIN_DEFAULT),
+            probe.get('top_k', 6),
+            window_sec=probe.get('window_sec', 300.0),
+            image_probe=probe.get('image_probe'),
+            roi_norm=probe_roi_norm if probe_roi_enabled else None,
+            roi_padding=PROBE_ROI_PADDING,
+        ),
     )
     if 'error' in result:
         return jsonify(result), 400
@@ -13234,10 +14500,13 @@ def detections_list():
     source_raw = request.args.get('source')
     source = _normalize_archive_source_filter(source_raw)
     if source_raw is not None and str(source_raw).strip() and source is None:
-        return jsonify({'error': 'source must be one of: probe, vlm_summary, vlm_alert'}), 400
+        return jsonify({'error': 'source must be one of: semantic_snapshot, probe, vlm_summary, vlm_alert'}), 400
     batch_id = str(request.args.get('batch_id') or '').strip()
     if len(batch_id) > 120:
         return jsonify({'error': 'batch_id is too long'}), 400
+    parent_alert_id = str(request.args.get('parent_alert_id') or '').strip()
+    if len(parent_alert_id) > 200:
+        return jsonify({'error': 'parent_alert_id is too long'}), 400
 
     try:
         channel_id, channel_ids = _parse_channel_filter_values(
@@ -13297,6 +14566,7 @@ def detections_list():
             offset=offset,
             include_thumbnail=include_thumbnail,
             batch_id=batch_id or None,
+            parent_alert_id=parent_alert_id or None,
             **channel_scope,
         )
         return jsonify(
@@ -13315,6 +14585,7 @@ def detections_list():
                     'until_ms': until_ms,
                     'include_thumbnail': include_thumbnail,
                     'batch_id': batch_id or None,
+                    'parent_alert_id': parent_alert_id or None,
                 },
             }
         )
@@ -13333,7 +14604,7 @@ def detections_summary():
     source_raw = request.args.get('source')
     source = _normalize_archive_source_filter(source_raw)
     if source_raw is not None and str(source_raw).strip() and source is None:
-        return jsonify({'error': 'source must be one of: probe, vlm_summary, vlm_alert'}), 400
+        return jsonify({'error': 'source must be one of: semantic_snapshot, probe, vlm_summary, vlm_alert'}), 400
     try:
         channel_id, channel_ids = _parse_channel_filter_values(
             request.args.getlist('channel_id'),
@@ -15188,7 +16459,7 @@ def _shutdown_background_workers() -> None:
     global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
     global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
-    global _attention_writer
+    global _attention_writer, _live_clip_batcher, semantic_snapshot_writer
     try:
         luxriot_manager.stop_attention_scheduler()
         luxriot_manager.stop_all_streams(
@@ -15197,12 +16468,25 @@ def _shutdown_background_workers() -> None:
             pause_analytics=False,
             update_desired=False,
         )
+        luxriot_manager.stop_probe_embedding_executor(wait=True)
     except Exception:
         pass
     try:
         if _attention_writer is not None:
             _attention_writer.close(flush_timeout_seconds=3.0)
             _attention_writer = None
+    except Exception:
+        pass
+    try:
+        if semantic_snapshot_writer is not None:
+            semantic_snapshot_writer.stop(drain=True, timeout=5.0)
+            semantic_snapshot_writer = None
+    except Exception:
+        pass
+    try:
+        if _live_clip_batcher is not None:
+            _live_clip_batcher.stop(timeout_sec=5.0)
+            _live_clip_batcher = None
     except Exception:
         pass
     try:
@@ -15253,6 +16537,10 @@ def _shutdown_background_workers() -> None:
         _stop_probe_daemon_thread()
     except Exception:
         pass
+    try:
+        _stop_archive_retention_thread()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
@@ -15265,4 +16553,5 @@ if __name__ == '__main__':
         print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
     ensure_probe_daemon_thread()
+    ensure_archive_retention_thread()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

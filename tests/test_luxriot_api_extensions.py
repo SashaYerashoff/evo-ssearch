@@ -102,8 +102,26 @@ def test_luxriot_client_merges_fragmented_channel_initial_state_and_deltas():
     channels = client.get_channels()
 
     assert channels == [
-        {"id": 7, "guid": None, "title": "North gate", "server": 1, "ptzCapabilities": None},
-        {"id": 9, "guid": None, "title": "West", "server": 2, "ptzCapabilities": None},
+        {
+            "id": 7,
+            "guid": None,
+            "title": "North gate",
+            "server": 1,
+            "ptzCapabilities": None,
+            "enabled": None,
+            "status": None,
+            "availability": "unknown",
+        },
+        {
+            "id": 9,
+            "guid": None,
+            "title": "West",
+            "server": 2,
+            "ptzCapabilities": None,
+            "enabled": None,
+            "status": None,
+            "availability": "unknown",
+        },
     ]
     assert client.channel_inventory_meta["complete"] is True
     assert client.channel_inventory_meta["completion"] == "explicit"
@@ -134,6 +152,42 @@ def test_luxriot_client_applies_unmarked_resource_deltas_in_initial_burst():
     assert channels[0]["title"] == "Updated"
     assert client.channel_inventory_meta["completion"] == "eof"
     assert client.channel_inventory_meta["payload_count"] == 3
+
+
+def test_luxriot_client_preserves_explicit_channel_availability():
+    response = FakeResponse(
+        lines=[
+            json.dumps(
+                {
+                    "type": "initial_complete",
+                    "added": {
+                        "channels": [
+                            {
+                                "id": 7,
+                                "title": "Disabled camera",
+                                "enabled": False,
+                            },
+                            {
+                                "id": 8,
+                                "title": "Offline camera",
+                                "status": "offline",
+                            },
+                        ]
+                    },
+                }
+            ),
+        ]
+    )
+    client = LuxriotClient("http://luxriot.test", "user", "pass")
+    client.session = FakeSession([response])
+    client.CHANNEL_STREAM_SETTLE_SEC = 0.01
+
+    channels = client.get_channels()
+
+    assert channels[0]["enabled"] is False
+    assert channels[0]["availability"] == "disabled"
+    assert channels[1]["status"] == "offline"
+    assert channels[1]["availability"] == "unavailable"
 
 
 def test_luxriot_client_rejects_explicitly_incomplete_channel_initial_state():

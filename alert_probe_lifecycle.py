@@ -270,6 +270,10 @@ class AlertDerivedProbe:
             "recent_hits": [],
             "temporary": True,
             "runtime_status": self.status,
+            # ``origin`` is probe authorship (operator/agent/auto) as consumed by
+            # the Probes board; ``source`` keeps this lifecycle's own lineage
+            # guard value, which is a different axis with a similar name.
+            "origin": "auto",
             "source": self.origin,
             "generation": self.generation,
             "generated_fallback": self.generated_fallback,
@@ -422,6 +426,19 @@ class AlertEventContext:
             "severity": self.severity,
             "timestamp_ms": self.timestamp_ms,
         }
+
+
+def derive_parent_alert_id(
+    event: Mapping[str, Any],
+    *,
+    channel_id: Optional[int] = None,
+) -> str:
+    """Return the shared archive/probe lineage id for one VLM alert event."""
+
+    return AlertEventContext.from_mapping(
+        event,
+        channel_id=channel_id,
+    ).parent_alert_id
 
 
 SimilarityFn = Callable[[AlertProbeSpec, AlertProbeSpec], float]

@@ -16,10 +16,13 @@
     const folderInput = document.getElementById('folderPath');
     const AUTH_ENABLED = {auth_enabled_json};
     const AUTH_CSRF_COOKIE = {auth_csrf_cookie_json};
+    const PROBE_POS_FLOOR_DEFAULT = {probe_pos_floor_default};
+    const PROBE_MARGIN_DEFAULT = {probe_margin_default};
     const authGate = document.getElementById('authGate');
     const authLoginForm = document.getElementById('authLoginForm');
     const authUsernameInput = document.getElementById('authUsername');
     const authPasswordInput = document.getElementById('authPassword');
+    const authPasswordToggle = document.getElementById('authPasswordToggle');
     const authLoginBtn = document.getElementById('authLoginBtn');
     const authLoginStatus = document.getElementById('authLoginStatus');
     const authTokenBtn = document.getElementById('authTokenBtn');
@@ -51,8 +54,8 @@
     const videoOutput = document.getElementById('videoOutput');
     const videoFrames = document.getElementById('videoFrames');
     const saveSummaryBtn = document.getElementById('saveSummaryBtn');
-    const monitorModeBtn = document.getElementById('monitorModeBtn');
-    const monitorBox = document.getElementById('monitorBox');
+    const probesModeBtn = document.getElementById('probesModeBtn');
+    const probesBox = document.getElementById('probesBox');
     const agentModeBtn = document.getElementById('agentModeBtn');
     const agentBox = document.getElementById('agentBox');
     const agentModelInput = document.getElementById('agentModelInput');
@@ -113,6 +116,11 @@
     const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
     const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
     const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
+    const luxriotMemoryMetabolism = document.getElementById('luxriotMemoryMetabolism');
+    const luxriotMemoryMetabolismSummary = document.getElementById('luxriotMemoryMetabolismSummary');
+    const luxriotMemoryMetabolismState = document.getElementById('luxriotMemoryMetabolismState');
+    const luxriotMemoryMetabolismStages = document.getElementById('luxriotMemoryMetabolismStages');
+    const luxriotMemoryMetabolismCurrent = document.getElementById('luxriotMemoryMetabolismCurrent');
     const luxriotPromptLayerDetails = document.getElementById('luxriotPromptLayerDetails');
     const luxriotPromptLayerContent = document.getElementById('luxriotPromptLayerContent');
     const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
@@ -195,8 +203,25 @@
     const probeCards = document.getElementById('probeCards');
     const probeNewBtn = document.getElementById('probeNewBtn');
     const probeReloadBtn = document.getElementById('probeReloadBtn');
+    const probeSearchInput = document.getElementById('probeSearchInput');
+    const probeOriginFilters = document.getElementById('probeOriginFilters');
+    const probeStateFilters = document.getElementById('probeStateFilters');
+    const probeFilterResetBtn = document.getElementById('probeFilterResetBtn');
+    const probeBoardCount = document.getElementById('probeBoardCount');
+    const probeGroupListEl = document.getElementById('probeGroupList');
+    const probeGroupNewBtn = document.getElementById('probeGroupNewBtn');
+    const probeGroupModal = document.getElementById('probeGroupModal');
+    const probeGroupModalTitle = document.getElementById('probeGroupModalTitle');
+    const probeGroupNameInput = document.getElementById('probeGroupName');
+    const probeGroupChannelList = document.getElementById('probeGroupChannelList');
+    const probeGroupSelectedMeta = document.getElementById('probeGroupSelectedMeta');
+    const probeGroupStatus = document.getElementById('probeGroupStatus');
+    const probeGroupSaveBtn = document.getElementById('probeGroupSaveBtn');
+    const probeGroupDeleteBtn = document.getElementById('probeGroupDeleteBtn');
+    const probeGroupCancelBtn = document.getElementById('probeGroupCancelBtn');
+    const probeGroupCloseBtn = document.getElementById('closeProbeGroup');
     let probePreviewImg = document.getElementById('probePreviewImg');
-    const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.monitor-stream-preview') : null;
+    const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.probes-stream-preview') : null;
     const probePreviewOverlay = document.getElementById('probePreviewOverlay');
     const probeRoiLayer = document.getElementById('probeRoiLayer');
     const probeRoiBox = document.getElementById('probeRoiBox');
@@ -235,6 +260,13 @@
     const archiveInspectorBody = document.getElementById('archiveInspectorBody');
     const archiveInspectorEmpty = document.getElementById('archiveInspectorEmpty');
     const archiveChannelFilter = document.getElementById('archiveChannelFilter');
+    const archiveChannelPickerToggle = document.getElementById('archiveChannelPickerToggle');
+    const archiveChannelPickerSummary = document.getElementById('archiveChannelPickerSummary');
+    const archiveChannelPopover = document.getElementById('archiveChannelPopover');
+    const archiveChannelSearch = document.getElementById('archiveChannelSearch');
+    const archiveChannelReset = document.getElementById('archiveChannelReset');
+    const archiveChannelDone = document.getElementById('archiveChannelDone');
+    const archiveChannelEmpty = document.getElementById('archiveChannelEmpty');
     const archiveChannelOptions = document.getElementById('archiveChannelOptions');
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
     const archiveProbeFilterGroup = archiveProbeFilter ? archiveProbeFilter.closest('.input-group') : null;
@@ -255,8 +287,8 @@
     const probeEnableToggle = document.getElementById('probeEnableToggle');
     const probeBenchBtn = document.getElementById('probeBenchBtn');
     const probeBenchOutput = document.getElementById('probeBenchOutput');
-    const monitorProbeSummary = document.getElementById('monitorProbeSummary');
-    const monitorSelectionStatus = document.getElementById('monitorSelectionStatus');
+    const probesSummary = document.getElementById('probesSummary');
+    const probesSelectionStatus = document.getElementById('probesSelectionStatus');
     const imageLightboxModal = document.getElementById('imageLightboxModal');
     const closeImageLightboxBtn = document.getElementById('closeImageLightbox');
     const imageLightboxImg = document.getElementById('imageLightboxImg');
@@ -381,6 +413,7 @@
     let luxriotPromptSettingSources = null;
     let luxriotPromptOverrideFields = [];
     let luxriotPromptPersistence = null;
+    let luxriotMemoryMetabolismData = null;
     let luxriotPromptLoadedSettings = null;
     let luxriotPromptFormChannelId = null;
     let luxriotPromptRequestGeneration = 0;
@@ -405,6 +438,17 @@
     let probeList = [];
     let probeCatalog = [];
     let activeProbeId = null;
+    const PROBE_ORIGINS = ['operator', 'agent', 'auto'];
+    const PROBE_BOARD_VIEW_KEY = 'eva.probes.boardView';
+    const PROBE_BOARD_COLLAPSED_KEY = 'eva.probes.collapsedGroups';
+    let probeChannelGroups = [];
+    let probeBoardView = 'grid';
+    let probeBoardQuery = '';
+    const probeBoardOriginFilter = new Set();
+    const probeBoardStateFilter = new Set();
+    const probeBoardCollapsed = new Set();
+    let probeGroupEditorId = null;
+    let probeGroupSelectedChannels = new Set();
     const probeCaptureState = {};
     const probeChannelRuntime = {};
     const probeCaptureManualStop = {};
@@ -436,6 +480,7 @@
     let archiveFilterAbortController = null;
     let archiveReviewRequestGeneration = 0;
     let archiveReviewAbortController = null;
+    const ARCHIVE_REVIEW_BATCH_TIMEOUT_MS = 12000;
     let archiveMediaRequestGeneration = 0;
     let archiveMediaAbortController = null;
     let archiveMediaLoadTimer = null;
@@ -689,7 +734,22 @@
         authGate.classList.toggle('is-hidden', !visible);
         document.body.classList.toggle('auth-required', visible);
         if (authLoginStatus) authLoginStatus.textContent = message;
-        if (visible && authUsernameInput) authUsernameInput.focus();
+        if (visible) {
+            const active = document.activeElement;
+            const alreadyTyping = (
+                active === authUsernameInput
+                || active === authPasswordInput
+            );
+            if (!alreadyTyping) {
+                const focusTarget = (
+                    authUsernameInput
+                    && String(authUsernameInput.value || '').trim()
+                )
+                    ? authPasswordInput
+                    : authUsernameInput;
+                if (focusTarget) focusTarget.focus();
+            }
+        }
     }
 
     window.fetch = (input, init = {}) => {
@@ -753,6 +813,20 @@
     }
 
     if (AUTH_ENABLED && authLoginForm) {
+        if (authPasswordToggle && authPasswordInput) {
+            authPasswordToggle.addEventListener('click', () => {
+                const show = authPasswordInput.type === 'password';
+                authPasswordInput.type = show ? 'text' : 'password';
+                authPasswordToggle.textContent = show ? 'HIDE' : 'SHOW';
+                authPasswordToggle.setAttribute('aria-pressed', show ? 'true' : 'false');
+                authPasswordToggle.setAttribute(
+                    'aria-label',
+                    show ? 'Hide password' : 'Show password',
+                );
+                authPasswordToggle.title = show ? 'Hide password' : 'Show password';
+                authPasswordInput.focus();
+            });
+        }
         authLoginForm.addEventListener('submit', async (event) => {
             event.preventDefault();
             if (authLoginBtn) authLoginBtn.disabled = true;
@@ -1051,13 +1125,19 @@
             return { main: mainText, json: jsonBlock, marker: 'fenced_json' };
         }
 
-        for (const marker of ['BATCH_STATE_JSON:', 'ALERTS_JSON:', 'MEMORY_UPDATE_JSON:']) {
-            const markerIndex = full.toUpperCase().indexOf(marker);
-            if (markerIndex >= 0) {
+        const markerPatterns = [
+            { marker: 'BATCH_STATE_JSON:', pattern: /\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:/i },
+            { marker: 'ALERTS_JSON:', pattern: /\bALERTS[\s_-]*JSON\s*:/i },
+            { marker: 'MEMORY_UPDATE_JSON:', pattern: /\bMEMORY[\s_-]*UPDATE[\s_-]*JSON\s*:/i },
+        ];
+        for (const candidate of markerPatterns) {
+            const match = candidate.pattern.exec(full);
+            if (match) {
+                const markerIndex = Number(match.index);
                 const mainText = full.slice(0, markerIndex).trim();
-                const jsonBlock = full.slice(markerIndex + marker.length).trim();
+                const jsonBlock = full.slice(markerIndex + match[0].length).trim();
                 if (jsonBlock) {
-                    return { main: mainText, json: jsonBlock, marker };
+                    return { main: mainText, json: jsonBlock, marker: candidate.marker };
                 }
             }
         }
@@ -1066,8 +1146,14 @@
         const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
         if (startIndex >= 0) {
             const jsonCandidate = full.slice(startIndex).trim();
-            const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
-            if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+            const looksLikeMachineState = (
+                jsonCandidate.includes('"alerts"')
+                || jsonCandidate.includes("'alerts'")
+                || jsonCandidate.includes('"observed_states"')
+                || jsonCandidate.includes('"memory_pass"')
+                || jsonCandidate.includes('"routine_baseline"')
+            );
+            if (looksLikeMachineState && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
                 const mainText = full.slice(0, startIndex).trim();
                 return { main: mainText, json: jsonCandidate, marker: 'trailing_json' };
             }
@@ -1178,19 +1264,41 @@
         const sizeLabel = `${lineCount} line${lineCount === 1 ? '' : 's'}`;
         const parsed = parseSummaryMachineJson(text);
         const markerText = String(marker || '').toUpperCase();
-        const haystack = `${markerText}\n${text}`.toLowerCase();
-
-        if (
+        const isBatchState = Boolean(
+            markerText.includes('BATCH_STATE_JSON')
+            || (
+                parsed
+                && typeof parsed === 'object'
+                && (
+                    Object.prototype.hasOwnProperty.call(parsed, 'cover')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'events')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'observed_states')
+                )
+            )
+        );
+        const isMemoryUpdate = Boolean(
             markerText.includes('MEMORY_UPDATE_JSON')
-            || /\b(homeostasis|memory_update|memory update|routine_baseline|baseline|prior)\b/i.test(haystack)
-        ) {
-            return { label: 'Memory/homeostasis', meta: sizeLabel, kind: 'memory' };
-        }
+            || (
+                parsed
+                && typeof parsed === 'object'
+                && !isBatchState
+                && (
+                    Object.prototype.hasOwnProperty.call(parsed, 'routine_baseline')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'active_watchlist')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'preserved_deviations')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'alert_tuning_notes')
+                )
+            )
+        );
 
         const alerts = parsed && Array.isArray(parsed.alerts) ? parsed.alerts : null;
         if (alerts) {
             if (!alerts.length) {
-                return { label: 'System message', meta: `no alerts · ${sizeLabel}`, kind: 'system' };
+                return {
+                    label: isBatchState ? 'Batch state' : 'System message',
+                    meta: `no alerts · ${sizeLabel}`,
+                    kind: isBatchState ? 'machine' : 'system',
+                };
             }
             const first = alerts[0] || {};
             const title = shortMachineJsonTitle(
@@ -1206,6 +1314,12 @@
             return { label: `${title}${countLabel}`, meta, kind: 'alert' };
         }
 
+        if (isMemoryUpdate) {
+            return { label: 'Memory/homeostasis', meta: sizeLabel, kind: 'memory' };
+        }
+        if (isBatchState) {
+            return { label: 'Batch state', meta: sizeLabel, kind: 'machine' };
+        }
         if (lineCount <= 3) {
             return { label: 'System message', meta: sizeLabel, kind: 'system' };
         }
@@ -1235,7 +1349,7 @@
                 return userHasPermission('detections:view');
             case 'video':
                 return userHasPermission('streams:view');
-            case 'monitor':
+            case 'probes':
                 return canUseProbeDiagnostics();
             case 'agent':
                 return userHasPermission('agent:use');
@@ -1245,7 +1359,7 @@
     }
 
     function firstAllowedMode() {
-        return ['archive', 'video', 'monitor', 'agent'].find((mode) => canUseMode(mode)) || 'archive';
+        return ['archive', 'video', 'probes', 'agent'].find((mode) => canUseMode(mode)) || 'archive';
     }
 
     function setMode(mode) {
@@ -1255,13 +1369,13 @@
         currentMode = mode;
         archiveModeBtn.classList.toggle('active', mode === 'archive');
         videoModeBtn.classList.toggle('active', mode === 'video');
-        monitorModeBtn.classList.toggle('active', mode === 'monitor');
+        probesModeBtn.classList.toggle('active', mode === 'probes');
         if (agentModeBtn) agentModeBtn.classList.toggle('active', mode === 'agent');
         if (headerStatusText) {
             const statusByMode = {
                 archive: 'Archive Research Ready',
                 video: 'Live Video Ops',
-                monitor: 'CLIP Probe Diagnostics',
+                probes: 'CLIP Probe Board',
                 agent: 'Agent Session Active',
             };
             headerStatusText.textContent = statusByMode[mode] || 'Command Center Online';
@@ -1270,7 +1384,7 @@
             archiveBox.style.display = mode === 'archive' ? 'grid' : 'none';
         }
         videoBox.style.display = mode === 'video' ? 'grid' : 'none';
-        monitorBox.style.display = mode === 'monitor' ? 'grid' : 'none';
+        probesBox.style.display = mode === 'probes' ? 'grid' : 'none';
         if (agentBox) agentBox.style.display = mode === 'agent' ? 'grid' : 'none';
         if (mode !== 'archive') {
             invalidateArchiveResultContext();
@@ -1299,12 +1413,12 @@
                 .catch((err) => {
                     setLuxriotStatus(`Luxriot init failed: ${err.message || err}`, true);
                 });
-        } else if (mode === 'monitor') {
+        } else if (mode === 'probes') {
             stopLuxriotPreview(true);
             stopLuxriotSummaryPoll();
             void ensureLuxriotInit()
                 .then(() => {
-                    if (currentMode !== 'monitor') return;
+                    if (currentMode !== 'probes') return;
                     syncProbeChannelSelect();
                     syncProbePreview(getSelectedProbeChannelId());
                     refreshProbeStatus();
@@ -3212,6 +3326,9 @@
                 throw new Error(data.error);
             }
             const channels = data.channels || [];
+            const inventory = data.inventory && typeof data.inventory === 'object'
+                ? data.inventory
+                : {};
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
             Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
             if (!channels.length) {
@@ -3229,14 +3346,26 @@
                     const id = parseInt(String(rawId || ''), 10);
                     if (!Number.isFinite(id)) return '';
                     const label = normalizeLuxriotChannelName(ch, id);
+                    const availability = String(ch.availability || '').trim().toLowerCase();
+                    const unavailable = ch.enabled === false
+                        || ['disabled', 'offline', 'unavailable'].includes(availability);
+                    const optionLabel = unavailable
+                        ? `${label} [${availability || 'disabled'}]`
+                        : label;
                     luxriotChannelNameById[String(id)] = label;
                     luxriotChannelMetaById[String(id)] = ch;
                     const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
-                    return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
+                    const disabled = unavailable ? 'disabled' : '';
+                    return `<option value="${id}" ${selected} ${disabled}>${escapeHtml(optionLabel)}</option>`;
                 })
                 .filter((item) => Boolean(item));
             luxriotChannelSelect.innerHTML = options.join('');
             const channelIds = channels
+                .filter((ch) => {
+                    const availability = String(ch.availability || '').trim().toLowerCase();
+                    return ch.enabled !== false
+                        && !['disabled', 'offline', 'unavailable'].includes(availability);
+                })
                 .map((ch) => parseInt(String(ch.id ?? ch.channel_id ?? ''), 10))
                 .filter((id) => Number.isFinite(id));
             if (!channelIds.some((id) => String(id) === String(luxriotActiveChannel))) {
@@ -3253,7 +3382,12 @@
             syncLuxriotLiveIntervalInput(luxriotActiveChannel);
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
-            setLuxriotStatus(`Loaded ${channels.length} channels`);
+            const staleSuffix = inventory.stale ? ' · stale inventory' : '';
+            const stopped = inventory?.stream?.reconciliation?.stopped_channel_ids || [];
+            const stoppedSuffix = stopped.length
+                ? ` · stopped unavailable: ${stopped.join(', ')}`
+                : '';
+            setLuxriotStatus(`Loaded ${channels.length} channels${staleSuffix}${stoppedSuffix}`, Boolean(inventory.stale));
         } catch (err) {
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
             Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
@@ -3372,6 +3506,97 @@
         return rollups[level] && typeof rollups[level] === 'object' ? rollups[level] : null;
     }
 
+    function updateLuxriotMemoryMetabolism() {
+        if (
+            !luxriotMemoryMetabolism
+            || !luxriotMemoryMetabolismSummary
+            || !luxriotMemoryMetabolismState
+            || !luxriotMemoryMetabolismStages
+            || !luxriotMemoryMetabolismCurrent
+        ) return;
+        const metabolism = luxriotMemoryMetabolismData && typeof luxriotMemoryMetabolismData === 'object'
+            ? luxriotMemoryMetabolismData
+            : null;
+        if (!metabolism) {
+            luxriotMemoryMetabolism.classList.add('is-hidden');
+            luxriotMemoryMetabolismStages.innerHTML = '';
+            luxriotMemoryMetabolismCurrent.textContent = '';
+            return;
+        }
+
+        const state = metabolism.current_state && typeof metabolism.current_state === 'object'
+            ? metabolism.current_state
+            : {};
+        const stages = Array.isArray(metabolism.stages) ? metabolism.stages : [];
+        const selectedTab = String(luxriotPromptModalTab || 'stream').toUpperCase();
+        const selectedLevel = ['L1', 'L2', 'L3'].includes(selectedTab) ? selectedTab : 'L0';
+        const scheduler = metabolism.scheduler && typeof metabolism.scheduler === 'object'
+            ? metabolism.scheduler
+            : {};
+        const sourceLevel = String(state.source_level || '').trim().toUpperCase();
+        const statusText = state.present
+            ? `Active${sourceLevel ? ` · ${sourceLevel}` : ''}`
+            : 'Awaiting consolidation';
+
+        luxriotMemoryMetabolismSummary.textContent = String(
+            metabolism.semantics
+            || 'Grounded L0 state is consolidated by L1/L2 and returned to later batches as prior context.'
+        );
+        luxriotMemoryMetabolismState.textContent = statusText;
+        luxriotMemoryMetabolismStages.innerHTML = stages.map((rawStage) => {
+            const stage = rawStage && typeof rawStage === 'object' ? rawStage : {};
+            const level = String(stage.level || '?').toUpperCase();
+            const applies = Boolean(stage.applies_to_live_memory);
+            const nextDueSeconds = Number(stage.next_due_at);
+            const nextDue = Number.isFinite(nextDueSeconds) && nextDueSeconds > 0
+                ? new Date(nextDueSeconds * 1000).toLocaleString()
+                : '';
+            const route = level === 'L3'
+                ? 'proposal only'
+                : applies
+                    ? 'returns to live L0'
+                    : 'feeds consolidation';
+            const title = [
+                String(stage.reads || '').trim(),
+                nextDue ? `Next scheduled run: ${nextDue}` : '',
+            ].filter(Boolean).join('\n');
+            return `
+                <div class="memory-metabolism-stage ${level === selectedLevel ? 'is-selected' : ''}" title="${escapeHtml(title)}">
+                    <div class="memory-metabolism-stage-level">${escapeHtml(level)}</div>
+                    <div class="memory-metabolism-stage-cadence">${escapeHtml(stage.cadence || 'configured cadence')}</div>
+                    <div class="memory-metabolism-stage-write">${escapeHtml(stage.writes || '')}</div>
+                    <div class="memory-metabolism-stage-route">${escapeHtml(route)}</div>
+                </div>
+            `;
+        }).join('');
+
+        const counts = [
+            ['watchlist', state.active_watchlist_count],
+            ['deviations', state.preserved_deviations_count],
+            ['held tuning proposals', state.held_tuning_proposals_count],
+            ['held suppression proposals', state.held_routine_suppression_proposals_count],
+        ].map(([label, value]) => `${label}: ${Math.max(0, Number(value) || 0)}`);
+        const baseline = String(state.routine_baseline || '').trim();
+        const updatedSeconds = Number(state.updated_at);
+        const updated = Number.isFinite(updatedSeconds) && updatedSeconds > 0
+            ? new Date(updatedSeconds * 1000).toLocaleString()
+            : '';
+        const schedulerText = scheduler.last_error
+            ? `Scheduler error: ${String(scheduler.last_error).slice(0, 160)}`
+            : scheduler.enabled
+                ? (scheduler.running ? `Scheduler running ${scheduler.active_level || ''}`.trim() : 'Scheduler enabled')
+                : 'Scheduler disabled';
+        luxriotMemoryMetabolismCurrent.textContent = state.present
+            ? [
+                baseline ? `Current routine candidate: ${baseline}` : 'No durable routine candidate.',
+                counts.join(' · '),
+                updated ? `Memory refreshed ${updated}.` : '',
+                schedulerText,
+            ].filter(Boolean).join(' ')
+            : `No consolidated channel memory yet. ${schedulerText}. Current snapshots still override all prior context.`;
+        luxriotMemoryMetabolism.classList.remove('is-hidden');
+    }
+
     function updateLuxriotPromptLayerDetails() {
         if (!luxriotPromptLayerDetails || !luxriotPromptLayerContent) return;
         const layer = getLuxriotPromptLayerForTab(luxriotPromptModalTab);
@@ -3396,12 +3621,13 @@
         if (backendInstructions) {
             lines.push(`Backend instructions appended by EVA AI:\n${backendInstructions}`);
         }
-        const backendMemory = String(layer.backend_memory || layer.active_memory || '').trim();
-        if (backendMemory) {
-            lines.push(`Active channel memory appended by EVA AI:\n${backendMemory}`);
-        } else {
-            lines.push('Active channel memory: none for the selected channel yet.');
-        }
+        const memoryContext = layer.memory_context && typeof layer.memory_context === 'object'
+            ? layer.memory_context
+            : {};
+        const memorySource = String(memoryContext.source_level || '').trim().toUpperCase();
+        lines.push(memoryContext.present
+            ? `Channel memory: appended internally as prior context${memorySource ? ` from ${memorySource}` : ''}; current snapshots override it.`
+            : 'Channel memory: none for the selected channel yet.');
         luxriotPromptLayerContent.textContent = lines.join('\n\n');
         luxriotPromptLayerDetails.classList.remove('is-hidden');
     }
@@ -3533,6 +3759,9 @@
         luxriotPromptPersistence = settings.persistence && typeof settings.persistence === 'object'
             ? settings.persistence
             : null;
+        luxriotMemoryMetabolismData = settings.memory_metabolism && typeof settings.memory_metabolism === 'object'
+            ? settings.memory_metabolism
+            : null;
         luxriotPromptLoadedSettings = {
             stream_system_prompt: String(settings.stream_system_prompt || ''),
             alert_policy_prompt: String(settings.alert_policy_prompt || ''),
@@ -3551,6 +3780,7 @@
         if (luxriotPromptModalInput && activeInput) {
             luxriotPromptModalInput.value = String(activeInput.value || '');
         }
+        updateLuxriotMemoryMetabolism();
         updateLuxriotPromptLayerDetails();
     }
 
@@ -3601,6 +3831,8 @@
         if (clearFormIdentity) {
             luxriotPromptFormChannelId = null;
             luxriotPromptLoadedSettings = null;
+            luxriotMemoryMetabolismData = null;
+            updateLuxriotMemoryMetabolism();
         }
         setLuxriotPromptApplyAvailability(false);
     }
@@ -3777,6 +4009,7 @@
                     : 'not persisted yet';
             luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}. Source: ${sourceLabel}; ${persistenceLabel}.`;
         }
+        updateLuxriotMemoryMetabolism();
         updateLuxriotPromptLayerDetails();
     }
 
@@ -4850,7 +5083,7 @@
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                         </div>
                     </div>
-                    <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson)}</div>
+                    <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson, 'Machine JSON', summaryParts.marker)}</div>
                 </div>
             `;
         }).join('');
@@ -6208,11 +6441,11 @@
     function syncUiAccess() {
         const archiveAllowed = canUseMode('archive');
         const videoAllowed = canUseMode('video');
-        const monitorAllowed = canUseMode('monitor');
+        const probesAllowed = canUseMode('probes');
         const agentAllowed = canUseMode('agent');
         setElementHidden(archiveModeBtn, !archiveAllowed);
         setElementHidden(videoModeBtn, !videoAllowed);
-        setElementHidden(monitorModeBtn, !monitorAllowed);
+        setElementHidden(probesModeBtn, !probesAllowed);
         setElementHidden(agentModeBtn, !agentAllowed);
 
         if (AUTH_ENABLED && authCurrentUser && !canUseMode(currentMode)) {
@@ -6221,6 +6454,7 @@
 
         const canCapture = userHasPermission('capture:manage');
         const canPromptManage = userHasPermission('prompts:manage');
+        const canManageSkills = userHasPermission('settings:manage');
         const canProbeRun = userHasPermission('probes:run');
         const canProbeManage = userHasPermission('probes:manage');
         const canDiagnostics = userHasPermission('diagnostics:view');
@@ -6276,6 +6510,9 @@
             probeSnapUseBtn,
             probeRoiToggleBtn,
             probeRoiClearBtn,
+            probeGroupNewBtn,
+            probeGroupSaveBtn,
+            probeGroupDeleteBtn,
         ].forEach((element) => {
             setElementHidden(element, !canProbeManage);
             setControlDisabled(element, !canProbeManage);
@@ -6295,9 +6532,9 @@
             setControlDisabled(element, !canBookmarks || !canProbeManage);
         });
 
-        setElementHidden(agentCreateSkillBtn, !canPromptManage);
-        setControlDisabled(agentCreateSkillBtn, !canPromptManage);
-        setControlDisabled(agentSkillSaveBtn, !canPromptManage);
+        setElementHidden(agentCreateSkillBtn, !canManageSkills);
+        setControlDisabled(agentCreateSkillBtn, !canManageSkills);
+        setControlDisabled(agentSkillSaveBtn, !canManageSkills);
         setControlDisabled(agentModelApplyBtn, !canModelsManage);
         if (agentModelInput) {
             agentModelInput.title = canModelsManage ? '' : 'Model changes require models:manage.';
@@ -7316,6 +7553,8 @@
                 badges.push({ label: 'Video description', classes: 'mode-clip' });
             } else if (source === 'vlm_alert') {
                 badges.push({ label: 'VLM alert', classes: 'warning' });
+            } else if (source === 'semantic_snapshot') {
+                badges.push({ label: 'Continuous CLIP', classes: 'mode-clip' });
             } else if (source === 'probe') {
                 badges.push({
                     label: canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence',
@@ -7395,6 +7634,7 @@
     function archiveLogicalSource(source) {
         const normalized = String(source || '').trim().toLowerCase();
         if (['probe', 'probes_run', 'probes_query', 'probe_daemon'].includes(normalized)) return 'probe';
+        if (['semantic_snapshot', 'semantic_snapshots', 'continuous_clip'].includes(normalized)) return 'semantic_snapshot';
         if (['vlm_summary', 'video_description', 'video_descriptions'].includes(normalized)) return 'vlm_summary';
         if (['vlm_alert', 'alert', 'alerts'].includes(normalized)) return 'vlm_alert';
         return normalized;
@@ -7403,6 +7643,7 @@
     function archiveSourceLabel(source, fallbackLabel = '') {
         const normalized = archiveLogicalSource(source);
         if (normalized === 'probe') return canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence';
+        if (normalized === 'semantic_snapshot') return 'Continuous CLIP snapshot';
         if (normalized === 'vlm_summary') return 'Video description';
         if (normalized === 'vlm_alert') return 'VLM alert';
         if (fallbackLabel) return String(fallbackLabel);
@@ -7412,6 +7653,7 @@
     function archiveSourcePluralLabel(source) {
         const normalized = archiveLogicalSource(source);
         if (normalized === 'probe') return canUseProbeDiagnostics() ? 'CLIP probe hits' : 'archive evidence';
+        if (normalized === 'semantic_snapshot') return 'continuous CLIP snapshots';
         if (normalized === 'vlm_summary') return 'video descriptions';
         if (normalized === 'vlm_alert') return 'VLM alerts';
         return 'archive items';
@@ -7459,8 +7701,24 @@
         return source === 'vlm_summary' || source === 'vlm_alert';
     }
 
+    function archiveResultDirectImageSrc(result) {
+        if (!result) return '';
+        const direct = String(result.image_url || result.thumbnail_url || '').trim();
+        if (/^\/detections\/thumbnail\/\d+(?:[?#].*)?$/.test(direct)) {
+            return direct;
+        }
+        if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(direct)) {
+            return direct;
+        }
+        return '';
+    }
+
     function archiveResultHasImage(result) {
-        return Boolean(result && (String(result.path || '').trim() || String(result.thumbnail || '').trim()));
+        return Boolean(result && (
+            String(result.path || '').trim()
+            || String(result.thumbnail || '').trim()
+            || archiveResultDirectImageSrc(result)
+        ));
     }
 
     function archiveResultImageSrc(result) {
@@ -7469,6 +7727,8 @@
         if (thumb) {
             return thumb.startsWith('data:') ? thumb : `data:image/jpeg;base64,${thumb}`;
         }
+        const direct = archiveResultDirectImageSrc(result);
+        if (direct) return direct;
         const path = String(result.path || '').trim();
         return path ? buildImageFetchUrl(path, result) : '';
     }
@@ -7578,7 +7838,6 @@
             && archiveReviewAbortController === requestContext.controller
             && !requestContext.controller.signal.aborted
             && archiveReviewContext === requestContext.context
-            && currentMode === 'archive'
         );
     }
 
@@ -8115,12 +8374,65 @@
             .filter((value) => /^\d+$/.test(value));
     }
 
+    function updateArchiveChannelPickerSummary() {
+        if (!archiveChannelPickerSummary) return;
+        const selectedInputs = archiveChannelOptions
+            ? Array.from(archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]:checked'))
+            : [];
+        const labels = selectedInputs.map((input) => {
+            const option = input.closest('.archive-channel-option');
+            return String(option?.dataset.archiveChannelName || input.value || '').trim();
+        }).filter(Boolean);
+        let summary = 'All streams';
+        if (labels.length === 1) {
+            summary = labels[0];
+        } else if (labels.length > 1) {
+            summary = `${labels.length} streams selected`;
+        }
+        archiveChannelPickerSummary.textContent = summary;
+        archiveChannelPickerSummary.title = labels.length > 1 ? labels.join(', ') : summary;
+    }
+
+    function setArchiveChannelPickerOpen(open, focusSearch = false) {
+        if (!archiveChannelPopover || !archiveChannelPickerToggle) return;
+        const shouldOpen = Boolean(open);
+        archiveChannelPopover.hidden = !shouldOpen;
+        archiveChannelPickerToggle.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+        archiveChannelFilter?.classList.toggle('is-open', shouldOpen);
+        if (shouldOpen && focusSearch && archiveChannelSearch) {
+            window.requestAnimationFrame(() => archiveChannelSearch.focus());
+        }
+    }
+
+    function filterArchiveChannelOptions() {
+        if (!archiveChannelOptions) return;
+        const query = String(archiveChannelSearch?.value || '').trim().toLocaleLowerCase();
+        let visible = 0;
+        archiveChannelOptions.querySelectorAll('.archive-channel-option[data-archive-channel-name]').forEach((option) => {
+            const haystack = String(option.dataset.archiveChannelSearch || option.dataset.archiveChannelName || '').toLocaleLowerCase();
+            const matches = !query || haystack.includes(query);
+            option.hidden = !matches;
+            if (matches) visible += 1;
+        });
+        if (archiveChannelEmpty) archiveChannelEmpty.hidden = visible > 0;
+    }
+
+    function archiveChannelSelectionChanged() {
+        syncArchiveChannelAllOption();
+        invalidateArchiveResultContext();
+        archiveDetectionsOffset = 0;
+        archiveDetectionsHasMore = false;
+        updateArchiveDetectionsNav();
+        refreshArchiveProbeFilter();
+    }
+
     function syncArchiveChannelAllOption() {
         if (!archiveChannelFilter) return;
         const allInput = archiveChannelFilter.querySelector('input[data-archive-channel-all]');
         if (allInput) {
             allInput.checked = selectedArchiveChannelIds().length === 0;
         }
+        updateArchiveChannelPickerSummary();
     }
 
     function renderArchiveChannelOptions(options, selectedIds = []) {
@@ -8129,14 +8441,20 @@
         const before = selectedArchiveChannelIds().join(',');
         archiveChannelOptions.innerHTML = options.map((option) => {
             const value = String(option.value);
+            const label = String(option.label);
             return `
-                <label class="archive-channel-option">
+                <label class="archive-channel-option" data-archive-channel-name="${escapeHtml(label)}"
+                       data-archive-channel-search="${escapeHtml(`${label} #${value}`)}">
                     <input type="checkbox" value="${escapeHtml(value)}" data-archive-channel-id ${selected.has(value) ? 'checked' : ''}>
-                    <span>${escapeHtml(String(option.label))}</span>
+                    <span class="archive-channel-option-copy">
+                        <span class="archive-channel-option-name">${escapeHtml(label)}</span>
+                        <span class="archive-channel-option-id">#${escapeHtml(value)}</span>
+                    </span>
                 </label>
             `;
         }).join('');
         syncArchiveChannelAllOption();
+        filterArchiveChannelOptions();
         if (selectedArchiveChannelIds().join(',') !== before) {
             invalidateArchiveResultContext();
         }
@@ -8619,6 +8937,11 @@
             }
         }
         if (e.key !== 'Escape') return;
+        if (archiveChannelPickerToggle?.getAttribute('aria-expanded') === 'true') {
+            setArchiveChannelPickerOpen(false);
+            archiveChannelPickerToggle.focus();
+            return;
+        }
         if (imageLightboxModal && imageLightboxModal.style.display === 'block') {
             closeImageLightbox();
             return;
@@ -10104,7 +10427,7 @@
         });
     }
     
-    // -------- Monitoring / Probes --------
+    // -------- Probes board --------
     function setProbeStatus(message, isError = false) {
         if (!probeStatus) return;
         probeStatus.textContent = message;
@@ -10631,7 +10954,7 @@
     function isCurrentProbeMediaRequest(generation, channelId) {
         return generation === probePreviewGeneration
             && probePreviewChannelId === channelId
-            && currentMode === 'monitor'
+            && currentMode === 'probes'
             && probeEditorModal
             && probeEditorModal.style.display === 'block'
             && getSelectedProbeChannelId() === channelId;
@@ -10715,7 +11038,7 @@
 
     function startProbePreview(channelId, force = false) {
         if (!probePreviewImg || !probePreviewViewport) return;
-        if (currentMode !== 'monitor') return;
+        if (currentMode !== 'probes') return;
         if (
             !force
             && probePreviewChannelId === channelId
@@ -10861,7 +11184,7 @@
     }
 
     function syncProbePreview(channelIdOverride = null) {
-        if (currentMode !== 'monitor') {
+        if (currentMode !== 'probes') {
             stopProbePreview();
             return;
         }
@@ -11214,8 +11537,15 @@
             pairs: serializeProbePairsForStorage(editorPairs),
             positives,
             negatives,
-            pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
-            margin: Math.max(0, parseFloat(probeMarginInput?.value) || 0.05),
+            pos_floor: Number.isFinite(parseFloat(probePosFloorInput?.value))
+                ? parseFloat(probePosFloorInput.value)
+                : PROBE_POS_FLOOR_DEFAULT,
+            margin: Math.max(
+                0,
+                Number.isFinite(parseFloat(probeMarginInput?.value))
+                    ? parseFloat(probeMarginInput.value)
+                    : PROBE_MARGIN_DEFAULT,
+            ),
             top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
             window_sec: parseFloat(probeWindowSecInput?.value) || 300,
             fps: parseFloat(probeFpsInput?.value) || 0,
@@ -11376,13 +11706,137 @@
         };
     }
 
-    function renderMonitorProbeInspector() {
-        if (!monitorProbeSummary) return;
+    /**
+     * Authorship block for the inspector.
+     *
+     * For a background VLM probe this is the only place an operator can see
+     * which alert produced it, so the parent alert is offered as a jump into
+     * the archive rather than as an opaque id.
+     */
+    function probesLineageHtml(probe, originView) {
+        const rows = [`
+            <div class="probes-summary-stat">
+                <span class="probes-summary-stat-label">Created by</span>
+                <span class="probes-summary-stat-value" title="${escapeHtml(originView.title)}">${escapeHtml(originView.label)}</span>
+            </div>`];
+        if (originView.key === 'agent') {
+            const planId = probe.origin_meta?.plan_id;
+            if (planId) {
+                rows.push(`
+                    <div class="probes-summary-stat">
+                        <span class="probes-summary-stat-label">Approval plan</span>
+                        <span class="probes-summary-stat-value">${escapeHtml(String(planId))}</span>
+                    </div>`);
+            }
+        }
+        if (originView.key === 'auto') {
+            const alertTitle = String(probe.parent_alert_title || '').trim();
+            const alertTs = Number(probe.parent_alert_timestamp_ms);
+            rows.push(`
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Parent alert</span>
+                    <span class="probes-summary-stat-value" title="${escapeHtml(String(probe.parent_alert_description || alertTitle || ''))}">${escapeHtml(alertTitle || String(probe.parent_alert_id || 'unknown'))}</span>
+                </div>`);
+            if (Number.isFinite(alertTs)) {
+                rows.push(`
+                    <div class="probes-summary-stat">
+                        <span class="probes-summary-stat-label">Alert time</span>
+                        <span class="probes-summary-stat-value">${escapeHtml(new Date(alertTs).toLocaleString())}</span>
+                    </div>`);
+            }
+        }
+        const jump = originView.key === 'auto'
+            && String(probe.parent_alert_id || '').trim()
+            && Number.isFinite(Number(probe.parent_alert_timestamp_ms))
+            ? `<button type="button" class="feature-btn probes-lineage-jump" id="probeLineageJumpBtn">Open parent alert in archive</button>`
+            : '';
+        return `<div class="probes-summary-lineage">
+            <div class="probes-summary-stats">${rows.join('')}</div>
+            ${jump}
+        </div>`;
+    }
+
+    /**
+     * Point the archive at the alert that spawned a background probe: same
+     * channel, VLM-alert source, and a window bracketing the alert timestamp.
+     */
+    async function jumpToProbeParentAlert(probe) {
+        const alertTs = Number(probe?.parent_alert_timestamp_ms);
+        const parentAlertId = String(probe?.parent_alert_id || '').trim();
+        if (!Number.isFinite(alertTs) || !parentAlertId) return;
+        const channelId = parseInt(String(probe.channel_id || ''), 10);
+        if (archiveSourceFilter) {
+            archiveSourceFilter.value = 'vlm_alert';
+        }
+        if (archiveChannelOptions && Number.isFinite(channelId)) {
+            archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]').forEach((input) => {
+                input.checked = String(input.value) === String(channelId);
+            });
+            syncArchiveChannelAllOption();
+            invalidateArchiveResultContext();
+        }
+        // An absolute From/To window overrides the relative "Last Nh" select, so
+        // the hours dropdown is deliberately left alone.
+        const pad = 15 * 60 * 1000;
+        if (archiveFromTimeInput) archiveFromTimeInput.value = toArchiveLocalDateTimeInput(alertTs - pad);
+        if (archiveToTimeInput) archiveToTimeInput.value = toArchiveLocalDateTimeInput(alertTs + pad);
+        setMode('archive');
+        const params = new URLSearchParams({
+            source: 'vlm_alert',
+            parent_alert_id: parentAlertId,
+            limit: '1',
+            offset: '0',
+        });
+        if (Number.isFinite(channelId)) {
+            params.set('channel_id', String(channelId));
+        }
+        const requestContext = beginArchiveEvidenceRequest(loadDetectionsBtn);
+        if (resultsContainer) {
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Opening parent VLM alert...</div>';
+        }
+        setArchiveDetectionsMeta('Opening parent VLM alert...');
+        try {
+            const response = await fetch(`/detections/list?${params.toString()}`, {
+                signal: requestContext.controller.signal,
+            });
+            const data = await parseApiJson(response, 'Failed to open parent VLM alert');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
+            const mapped = normalizeDetectionResults(
+                Array.isArray(data.detections) ? data.detections : []
+            );
+            if (mapped.length) {
+                archiveLastQueryText = `Parent VLM alert ${parentAlertId}`;
+                archiveDetectionsOffset = 0;
+                archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : mapped.length;
+                archiveDetectionsHasMore = false;
+                displayResults(mapped);
+                setArchiveDetectionsMeta('Opened exact parent VLM alert.');
+                updateArchiveDetectionsNav();
+                openArchiveReviewModal(0, mapped[0]);
+                return;
+            }
+        } catch (error) {
+            if (error?.name === 'AbortError') return;
+        }
+        // Alerts archived before stable lineage ids existed cannot be addressed
+        // exactly; retain the bounded channel/time fallback for those rows.
+        archiveLastQueryText = 'Parent VLM alert time window';
+        await loadDetectionsArchive(true);
+    }
+
+    /** Inverse of parseArchiveLocalDateTimeMs: epoch ms -> local datetime-local value. */
+    function toArchiveLocalDateTimeInput(ms) {
+        const localMs = ms - new Date(ms).getTimezoneOffset() * 60000;
+        return new Date(localMs).toISOString().slice(0, 16);
+    }
+
+    function renderProbesInspector() {
+        if (!probesSummary) return;
         const probe = activeProbeId ? probeList.find((p) => String(p.id) === String(activeProbeId)) : null;
         if (!probe) {
-            monitorProbeSummary.innerHTML = '<div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>';
-            if (monitorSelectionStatus) {
-                monitorSelectionStatus.textContent = 'No probe selected';
+            probesSummary.innerHTML = '<div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>';
+            if (probesSelectionStatus) {
+                probesSelectionStatus.textContent = 'No probe selected';
             }
             return;
         }
@@ -11407,163 +11861,380 @@
         const negativeCount = Array.isArray(probe.pairs) ? probe.pairs.filter((pair) => String(pair?.negative || '').trim()).length : 0;
         const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
 
-        if (monitorSelectionStatus) {
-            monitorSelectionStatus.textContent = `${status.toUpperCase()} · Ch ${probe.channel_id || luxriotActiveChannel}`;
+        const originView = probeOriginView(probe);
+        const ttl = probeTemporaryTtl(probe);
+
+        if (probesSelectionStatus) {
+            probesSelectionStatus.textContent = `${status.toUpperCase()} · Ch ${probe.channel_id || luxriotActiveChannel}`;
         }
 
-        monitorProbeSummary.innerHTML = `
-            <div class="monitor-probe-hero">
-                <div class="monitor-probe-thumb ${thumbSrc ? '' : 'is-empty'}">
+        probesSummary.innerHTML = `
+            <div class="probes-summary-hero">
+                <div class="probes-summary-thumb ${thumbSrc ? '' : 'is-empty'}">
                     ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(probe.name || 'probe preview')}" />` : '<span>No preview</span>'}
                 </div>
-                <div class="monitor-probe-copy">
-                    <div class="probe-status-pill ${pillClass}">${status}</div>
-                    <div class="monitor-probe-name">${escapeHtml(probe.name || 'unnamed probe')}</div>
-                    <div class="monitor-probe-meta">Channel ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || 'n/a'))}</div>
-                    <div class="monitor-probe-meta">Last event: ${escapeHtml(ts)}</div>
+                <div class="probes-summary-copy">
+                    <div class="probes-summary-tags">
+                        <div class="probe-status-pill ${pillClass}">${status}</div>
+                        ${probeOriginBadgeHtml(probe)}
+                        ${ttl ? `<span class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</span>` : ''}
+                    </div>
+                    <div class="probes-summary-name">${escapeHtml(probe.name || 'unnamed probe')}</div>
+                    <div class="probes-summary-meta">Channel ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || 'n/a'))}</div>
+                    <div class="probes-summary-meta">Last event: ${escapeHtml(ts)}</div>
                 </div>
             </div>
-            <div class="monitor-probe-stats">
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Scores</span>
-                    <span class="monitor-probe-stat-value">${escapeHtml(scores)}</span>
+            <div class="probes-summary-signal">
+                <div class="probes-summary-stat-label">Recent positive score</div>
+                ${probeSparklineHtml(probe, { width: 260, height: 48 })}
+            </div>
+            ${probesLineageHtml(probe, originView)}
+            <div class="probes-summary-stats">
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Scores</span>
+                    <span class="probes-summary-stat-value">${escapeHtml(scores)}</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Bookmark gate</span>
-                    <span class="monitor-probe-stat-value" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Bookmark gate</span>
+                    <span class="probes-summary-stat-value" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Text pairs</span>
-                    <span class="monitor-probe-stat-value">${positiveCount} positive · ${negativeCount} negative</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Text pairs</span>
+                    <span class="probes-summary-stat-value">${positiveCount} positive · ${negativeCount} negative</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Image probe</span>
-                    <span class="monitor-probe-stat-value">${probe.image_probe?.enabled !== false && probe.image_probe?.data ? 'enabled' : 'off'}</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Image probe</span>
+                    <span class="probes-summary-stat-value">${probe.image_probe?.enabled !== false && probe.image_probe?.data ? 'enabled' : 'off'}</span>
                 </div>
             </div>
         `;
     }
 
-    function renderProbeCards() {
-        if (!probeCards) return;
-        if (!probeList.length) {
-            const emptyCardsHtml = `
-                <div class="probe-mini-card new-probe-card">
-                    <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
-                        ${probeActionIcon('new')}
-                        <span>New Probe</span>
-                    </button>
-                </div>`;
-            if (probeCardsRenderKey !== emptyCardsHtml) {
-                probeCards.innerHTML = emptyCardsHtml;
-                probeCardsRenderKey = emptyCardsHtml;
-            }
-            renderMonitorProbeInspector();
-            return;
+    const PROBE_ORIGIN_VIEWS = {
+        operator: { label: 'Operator', short: 'OP', title: 'Created by an operator' },
+        agent: { label: 'Agent', short: 'AI', title: 'Created by the agent and applied after operator approval' },
+        auto: { label: 'Background VLM', short: 'VLM', title: 'Temporary follow-up raised automatically from a VLM alert' },
+    };
+
+    function probeOriginKey(probe) {
+        const raw = String(probe?.origin || '').trim().toLowerCase();
+        if (PROBE_ORIGINS.includes(raw)) return raw;
+        // Mirror the server-side backfill so a stale cached probe still renders
+        // with a truthful badge instead of silently claiming operator authorship.
+        if (probe?.temporary || probe?.parent_alert_id) return 'auto';
+        return 'operator';
+    }
+
+    function probeOriginView(probe) {
+        const key = probeOriginKey(probe);
+        return { key, ...PROBE_ORIGIN_VIEWS[key] };
+    }
+
+    function probeOriginBadgeHtml(probe) {
+        const view = probeOriginView(probe);
+        return `<span class="probes-origin-badge is-${view.key}" title="${escapeHtml(view.title)}">`
+            + `<span class="probes-origin-dot is-${view.key}" aria-hidden="true"></span>`
+            + `<span class="probes-origin-text">${escapeHtml(view.short)}</span></span>`;
+    }
+
+    function probeStatusView(probe) {
+        const channelId = parseInt(String(probe?.channel_id || luxriotActiveChannel), 10);
+        const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
+        const status = probe?.enabled === false
+            ? 'disabled'
+            : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
+        const pillClass = status === 'disabled'
+            ? 'pill-disabled'
+            : status === 'running'
+                ? 'pill-running'
+                : status === 'paused'
+                    ? 'pill-paused'
+                    : 'pill-idle';
+        return { status, pillClass, channelId };
+    }
+
+    function probeHitSeries(probe) {
+        const hits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
+            ? probe.recent_hits
+            : (probe?.last_hit ? [probe.last_hit] : []);
+        return hits
+            .filter((hit) => hit && Number.isFinite(Number(hit.pos_score)))
+            .map((hit) => ({
+                score: Number(hit.pos_score),
+                margin: Number(hit.margin),
+                timestampMs: Number(hit.timestamp_ms),
+            }))
+            .sort((left, right) => (left.timestampMs || 0) - (right.timestampMs || 0))
+            .slice(-24);
+    }
+
+    /**
+     * Activity sparkline over the probe's retained hits.
+     *
+     * This replaces the empty "NO PREVIEW" placeholder: a probe with no stored
+     * thumbnail still has a signal history worth seeing, and a flat baseline is
+     * an honest "no hits yet" rather than dead space.
+     */
+    function probeSparklineHtml(probe, { width = 160, height = 34 } = {}) {
+        const series = probeHitSeries(probe);
+        if (!series.length) {
+            return `<div class="probes-spark is-empty" title="No probe hits recorded yet">
+                <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+                    <line x1="0" y1="${height - 1}" x2="${width}" y2="${height - 1}" />
+                </svg>
+                <span class="probes-spark-label">no hits yet</span>
+            </div>`;
         }
-        const cardById = new Map(probeList.map((p) => {
-            const last = p.last_hit;
-            const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-            const channelId = parseInt(String(p.channel_id || luxriotActiveChannel), 10);
-            const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
-            const status = p.enabled === false
-                ? 'disabled'
-                : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
-            const pillClass = status === 'disabled'
-                ? 'pill-disabled'
-                : status === 'running'
-                    ? 'pill-running'
-                    : status === 'paused'
-                        ? 'pill-paused'
-                        : 'pill-idle';
-            const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
-            const toggleAction = status === 'disabled' ? 'enable' : 'disable';
-            const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
-            const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
-            const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
-            return [String(p.id), `
-                <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}" data-probe-id="${p.id}">
-                    <div class="probe-mini-card-head">
+        const floor = Number.isFinite(Number(probe?.pos_floor)) ? Number(probe.pos_floor) : null;
+        const values = series.map((point) => point.score);
+        const scaleCandidates = values.concat(floor === null ? [] : [floor]);
+        const min = Math.min(...scaleCandidates);
+        const max = Math.max(...scaleCandidates);
+        const span = max - min > 1e-6 ? max - min : 1;
+        const stepX = series.length > 1 ? width / (series.length - 1) : width;
+        const toY = (value) => height - 2 - ((value - min) / span) * (height - 4);
+        const points = series
+            .map((point, index) => `${(index * stepX).toFixed(1)},${toY(point.score).toFixed(1)}`)
+            .join(' ');
+        const floorLine = floor === null
+            ? ''
+            : `<line class="probes-spark-floor" x1="0" y1="${toY(floor).toFixed(1)}" x2="${width}" y2="${toY(floor).toFixed(1)}" />`;
+        const lastPoint = series[series.length - 1];
+        const overFloor = floor !== null && lastPoint.score >= floor;
+        const title = `${series.length} hit${series.length === 1 ? '' : 's'} · last P ${lastPoint.score.toFixed(3)}`
+            + (floor === null ? '' : ` · floor ${floor.toFixed(3)}`);
+        return `<div class="probes-spark ${overFloor ? 'is-over' : ''}" title="${escapeHtml(title)}">
+            <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+                ${floorLine}
+                <polyline class="probes-spark-line" points="${points}" />
+                <circle class="probes-spark-head" cx="${((series.length - 1) * stepX).toFixed(1)}" cy="${toY(lastPoint.score).toFixed(1)}" r="2" />
+            </svg>
+        </div>`;
+    }
+
+    function probeTemporaryTtl(probe) {
+        if (!probe?.temporary) return null;
+        const expiresAt = Number(probe.expires_at_ms);
+        if (!Number.isFinite(expiresAt)) return { text: 'temporary', title: 'Temporary probe without a stored expiry' };
+        const remainingMs = expiresAt - Date.now();
+        if (remainingMs <= 0) return { text: 'expiring', title: 'Past its expiry; the next lifecycle sweep retires it' };
+        const minutes = Math.floor(remainingMs / 60000);
+        const text = minutes >= 60
+            ? `${Math.floor(minutes / 60)}h ${minutes % 60}m left`
+            : minutes >= 1
+                ? `${minutes}m left`
+                : `${Math.max(1, Math.round(remainingMs / 1000))}s left`;
+        return { text, title: `Retires at ${new Date(expiresAt).toLocaleString()}` };
+    }
+
+    function probeChannelLabel(channelId) {
+        if (!Number.isFinite(channelId)) return 'Unassigned channel';
+        return luxriotChannelNameById[String(channelId)] || getLuxriotChannelLabel(channelId);
+    }
+
+    function probeMatchesBoardFilters(probe) {
+        if (probeBoardOriginFilter.size && !probeBoardOriginFilter.has(probeOriginKey(probe))) {
+            return false;
+        }
+        if (probeBoardStateFilter.size && !probeBoardStateFilter.has(probeStatusView(probe).status)) {
+            return false;
+        }
+        if (!probeBoardQuery) return true;
+        const channelId = parseInt(String(probe?.channel_id || ''), 10);
+        const haystack = [
+            probe?.name || '',
+            Number.isFinite(channelId) ? String(channelId) : '',
+            Number.isFinite(channelId) ? probeChannelLabel(channelId) : '',
+            probe?.parent_alert_title || '',
+        ].join(' ').toLowerCase();
+        return haystack.includes(probeBoardQuery);
+    }
+
+    /**
+     * Assemble the board tree: operator-defined group -> channel -> probes.
+     *
+     * Channels the operator has not placed in a group fall into a synthetic
+     * "Ungrouped" bucket rendered last, so a fresh install still shows every
+     * probe without requiring any grouping setup first.
+     */
+    function probeBoardTree(probes) {
+        const groupIdByChannel = new Map();
+        probeChannelGroups.forEach((group) => {
+            (group.channel_ids || []).forEach((channelId) => {
+                const parsed = parseInt(String(channelId), 10);
+                if (Number.isFinite(parsed)) groupIdByChannel.set(parsed, String(group.id));
+            });
+        });
+
+        const byChannel = new Map();
+        probes.forEach((probe) => {
+            const parsed = parseInt(String(probe.channel_id || ''), 10);
+            const key = Number.isFinite(parsed) ? parsed : null;
+            if (!byChannel.has(key)) byChannel.set(key, []);
+            byChannel.get(key).push(probe);
+        });
+
+        const groupsById = new Map();
+        probeChannelGroups.forEach((group) => {
+            groupsById.set(String(group.id), {
+                id: String(group.id),
+                name: String(group.name || 'Group'),
+                synthetic: false,
+                channels: [],
+            });
+        });
+        const ungrouped = { id: '__ungrouped__', name: 'Ungrouped channels', synthetic: true, channels: [] };
+
+        Array.from(byChannel.entries())
+            .sort(([left], [right]) => {
+                if (left === null) return 1;
+                if (right === null) return -1;
+                return left - right;
+            })
+            .forEach(([channelId, channelProbes]) => {
+                const entry = {
+                    channelId,
+                    label: probeChannelLabel(channelId),
+                    probes: channelProbes,
+                    runningCount: channelProbes.filter((probe) => probeStatusView(probe).status === 'running').length,
+                };
+                const groupId = channelId === null ? null : groupIdByChannel.get(channelId);
+                const target = (groupId && groupsById.get(groupId)) || ungrouped;
+                target.channels.push(entry);
+            });
+
+        const ordered = probeChannelGroups
+            .map((group) => groupsById.get(String(group.id)))
+            .filter((group) => group && group.channels.length);
+        if (ungrouped.channels.length) ordered.push(ungrouped);
+        return ordered;
+    }
+
+    function probeCardHtml(probe) {
+        const { status, pillClass } = probeStatusView(probe);
+        const last = probe.last_hit;
+        const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
+        const thumbSrc = last?.thumbnail || probe.image_probe?.data || '';
+        const toggleAction = status === 'disabled' ? 'enable' : 'disable';
+        const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
+        const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
+        const gateView = describeProbeBookmarkGate(probe.bookmark_gate, probe.bookmark !== false);
+        const ttl = probeTemporaryTtl(probe);
+        return `
+            <div class="probe-mini-card ${activeProbeId === probe.id ? 'active' : ''}" data-probe-id="${probe.id}">
+                <div class="probe-mini-card-head">
+                    <div class="probe-mini-head-tags">
                         <div class="probe-status-pill ${pillClass}">${status}</div>
-                        <div class="probe-mini-actions probe-mini-primary-actions">
-                            <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
-                            <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
-                        </div>
+                        ${probeOriginBadgeHtml(probe)}
                     </div>
-                    <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
-                        ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
+                    <div class="probe-mini-actions probe-mini-primary-actions">
+                        <button class="probe-action-btn" data-action="${toggleAction}" data-id="${probe.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                        <button class="probe-action-btn" data-action="expand" data-id="${probe.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
                     </div>
-                    <div class="probe-mini-content">
-                        <div class="probe-mini-name" title="${escapeHtml(p.name || 'unnamed')}">${escapeHtml(p.name || 'unnamed')}</div>
-                        <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
-                        <div class="probe-mini-score">${scores}</div>
-                        <div class="probe-mini-card-foot">
-                            <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
-                            <div class="probe-mini-actions probe-mini-danger-actions">
-                                <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
-                            </div>
+                </div>
+                <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
+                    ${thumbSrc
+                        ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(probe.name || 'probe preview')}" />`
+                        : probeSparklineHtml(probe)}
+                </div>
+                <div class="probe-mini-content">
+                    <div class="probe-mini-name" title="${escapeHtml(probe.name || 'unnamed')}">${escapeHtml(probe.name || 'unnamed')}</div>
+                    <div class="probe-mini-meta">Ch ${probe.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
+                    <div class="probe-mini-score">${scores}</div>
+                    <div class="probe-mini-card-foot">
+                        <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
+                        ${ttl ? `<div class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</div>` : ''}
+                        <div class="probe-mini-actions probe-mini-danger-actions">
+                            <button class="probe-action-btn delete" data-action="delete" data-id="${probe.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
                         </div>
                     </div>
                 </div>
-            `];
-        }));
-        const probesByChannel = new Map();
-        probeList.forEach((probe) => {
-            const parsedChannelId = parseInt(String(probe.channel_id || ''), 10);
-            const groupKey = Number.isFinite(parsedChannelId) ? String(parsedChannelId) : 'unassigned';
-            if (!probesByChannel.has(groupKey)) probesByChannel.set(groupKey, []);
-            probesByChannel.get(groupKey).push(probe);
-        });
-        const channelGroups = Array.from(probesByChannel.entries()).sort(([left], [right]) => {
-            if (left === 'unassigned') return 1;
-            if (right === 'unassigned') return -1;
-            return Number(left) - Number(right);
-        });
-        const groupedHtml = channelGroups.map(([groupKey, probes]) => {
-            const channelId = Number.parseInt(groupKey, 10);
-            const channelLabel = Number.isFinite(channelId)
-                ? (luxriotChannelNameById[groupKey] || getLuxriotChannelLabel(channelId))
-                : 'Unassigned channel';
-            const runningCount = probes.filter((probe) => {
-                const probeChannelId = Number.parseInt(String(probe.channel_id || ''), 10);
-                return probe.enabled !== false && probeChannelRuntime[probeChannelId] === 'running';
-            }).length;
-            const persistentProbes = probes.filter((probe) => probe.temporary !== true);
-            const temporaryProbes = probes.filter((probe) => probe.temporary === true);
-            const persistentCards = persistentProbes
-                .map((probe) => cardById.get(String(probe.id)) || '')
-                .join('');
-            const temporaryCards = temporaryProbes
-                .map((probe) => cardById.get(String(probe.id)) || '')
-                .join('');
-            return `
-                <section class="probe-channel-group" data-probe-channel="${escapeHtml(groupKey)}">
-                    <div class="probe-channel-group-head">
-                        <div>
-                            <div class="probe-channel-group-kicker">Channel ${Number.isFinite(channelId) ? escapeHtml(String(channelId)) : '—'}</div>
-                            <div class="probe-channel-group-name">${escapeHtml(channelLabel)}</div>
-                        </div>
-                        <div class="probe-channel-group-count">${persistentProbes.length} saved · ${temporaryProbes.length} temporary · ${runningCount} running</div>
+            </div>
+        `;
+    }
+
+    function probeRowHtml(probe) {
+        const { status, pillClass } = probeStatusView(probe);
+        const last = probe.last_hit;
+        const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : '—';
+        const toggleAction = status === 'disabled' ? 'enable' : 'disable';
+        const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
+        const gateView = describeProbeBookmarkGate(probe.bookmark_gate, probe.bookmark !== false);
+        const ttl = probeTemporaryTtl(probe);
+        const pm = `${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(2) : '—'} / ${Number.isFinite(last?.margin) ? last.margin.toFixed(2) : '—'}`;
+        return `
+            <div class="probes-row ${activeProbeId === probe.id ? 'active' : ''}" data-probe-id="${probe.id}">
+                <span class="probes-row-state"><span class="probe-status-pill ${pillClass}" title="${status}">${status}</span></span>
+                <span class="probes-row-origin">${probeOriginBadgeHtml(probe)}</span>
+                <span class="probes-row-name" title="${escapeHtml(probe.name || 'unnamed')}">${escapeHtml(probe.name || 'unnamed')}</span>
+                <span class="probes-row-channel">Ch ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || '—'))}</span>
+                <span class="probes-row-spark">${probeSparklineHtml(probe, { width: 96, height: 20 })}</span>
+                <span class="probes-row-last">${escapeHtml(ts)}</span>
+                <span class="probes-row-score" title="last positive / margin">${escapeHtml(pm)}</span>
+                <span class="probes-row-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
+                <span class="probes-row-ttl">${ttl ? `<span class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</span>` : ''}</span>
+                <span class="probes-row-actions probe-mini-actions">
+                    <button class="probe-action-btn" data-action="${toggleAction}" data-id="${probe.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                    <button class="probe-action-btn" data-action="expand" data-id="${probe.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
+                    <button class="probe-action-btn delete" data-action="delete" data-id="${probe.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
+                </span>
+            </div>
+        `;
+    }
+
+    function probeChannelSectionHtml(channel) {
+        const body = probeBoardView === 'list'
+            ? `<div class="probes-row-list" role="table">
+                ${channel.probes.map(probeRowHtml).join('')}
+            </div>`
+            : `<div class="probe-channel-card-grid">
+                ${channel.probes.map(probeCardHtml).join('')}
+            </div>`;
+        return `
+            <section class="probe-channel-group" data-probe-channel="${escapeHtml(channel.channelId === null ? 'unassigned' : String(channel.channelId))}">
+                <div class="probe-channel-group-head">
+                    <div>
+                        <div class="probe-channel-group-kicker">Channel ${channel.channelId === null ? '—' : escapeHtml(String(channel.channelId))}</div>
+                        <div class="probe-channel-group-name">${escapeHtml(channel.label)}</div>
                     </div>
-                    ${persistentCards ? `
-                        <div class="probe-channel-card-grid">
-                            ${persistentCards}
-                        </div>
-                    ` : ''}
-                    ${temporaryCards ? `
-                        <details class="probe-temporary-group">
-                            <summary>Temporary alert checks · ${temporaryProbes.length} active</summary>
-                            <div class="probe-channel-card-grid">
-                                ${temporaryCards}
-                            </div>
-                        </details>
-                    ` : ''}
-                </section>
-            `;
-        }).join('');
-        const cardsHtml = `
-            ${groupedHtml}
-            <section class="probe-channel-group probe-channel-group-new">
+                    <div class="probe-channel-group-count">${channel.probes.length} probe${channel.probes.length === 1 ? '' : 's'} · ${channel.runningCount} running</div>
+                </div>
+                ${body}
+            </section>
+        `;
+    }
+
+    function probeGroupSectionHtml(group) {
+        const probeCount = group.channels.reduce((total, channel) => total + channel.probes.length, 0);
+        const runningCount = group.channels.reduce((total, channel) => total + channel.runningCount, 0);
+        const collapsed = probeBoardCollapsed.has(group.id);
+        return `
+            <section class="probes-group ${collapsed ? 'is-collapsed' : ''} ${group.synthetic ? 'is-synthetic' : ''}" data-group-id="${escapeHtml(group.id)}">
+                <div class="probes-group-head">
+                    <button type="button" class="probes-group-toggle" data-action="toggle-group" data-group-id="${escapeHtml(group.id)}"
+                            aria-expanded="${collapsed ? 'false' : 'true'}" title="${collapsed ? 'Expand group' : 'Collapse group'}">
+                        <span class="probes-group-chevron" aria-hidden="true"></span>
+                        <span class="probes-group-name">${escapeHtml(group.name)}</span>
+                    </button>
+                    <div class="probes-group-meta">${group.channels.length} channel${group.channels.length === 1 ? '' : 's'} · ${probeCount} probe${probeCount === 1 ? '' : 's'} · ${runningCount} running</div>
+                    ${group.synthetic || group.read_only || !userHasPermission('probes:manage') ? '' : `<button type="button" class="probe-action-btn probes-group-edit" data-action="edit-group" data-group-id="${escapeHtml(group.id)}" title="Edit group" aria-label="Edit group">${probeActionIcon('expand')}</button>`}
+                </div>
+                <div class="probes-group-body">
+                    ${group.channels.map(probeChannelSectionHtml).join('')}
+                </div>
+            </section>
+        `;
+    }
+
+    function renderProbeCards() {
+        if (!probeCards) return;
+        probeCards.classList.toggle('is-list-view', probeBoardView === 'list');
+        const visible = probeList.filter(probeMatchesBoardFilters);
+        const filtersActive = Boolean(probeBoardQuery) || probeBoardOriginFilter.size > 0 || probeBoardStateFilter.size > 0;
+
+        let cardsHtml;
+        if (!probeList.length) {
+            cardsHtml = `
                 <div class="probe-channel-card-grid">
                     <div class="probe-mini-card new-probe-card">
                         <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
@@ -11571,15 +12242,323 @@
                             <span>New Probe</span>
                         </button>
                     </div>
-                </div>
-            </section>
-        `;
+                </div>`;
+        } else if (!visible.length) {
+            cardsHtml = `<div class="studio-empty-state probes-empty-filtered">
+                No probe matches the current filters.
+                <button type="button" class="feature-btn" data-action="reset-filters">Reset filters</button>
+            </div>`;
+        } else {
+            cardsHtml = `
+                ${probeBoardTree(visible).map(probeGroupSectionHtml).join('')}
+                ${filtersActive ? '' : `
+                <section class="probes-group probes-group-new">
+                    <div class="probe-channel-card-grid">
+                        <div class="probe-mini-card new-probe-card">
+                            <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
+                                ${probeActionIcon('new')}
+                                <span>New Probe</span>
+                            </button>
+                        </div>
+                    </div>
+                </section>`}
+            `;
+        }
+
         if (probeCardsRenderKey !== cardsHtml) {
             probeCards.innerHTML = cardsHtml;
             probeCardsRenderKey = cardsHtml;
         }
-        renderMonitorProbeInspector();
+        renderProbeBoardMeta(visible);
+        renderProbesInspector();
     }
+
+    function renderProbeBoardMeta(visible) {
+        const counts = { operator: 0, agent: 0, auto: 0 };
+        probeList.forEach((probe) => { counts[probeOriginKey(probe)] += 1; });
+        if (probeOriginFilters) {
+            probeOriginFilters.querySelectorAll('[data-count]').forEach((node) => {
+                node.textContent = String(counts[node.dataset.count] ?? 0);
+            });
+        }
+        const filtersActive = Boolean(probeBoardQuery) || probeBoardOriginFilter.size > 0 || probeBoardStateFilter.size > 0;
+        setElementHidden(probeFilterResetBtn, !filtersActive);
+        if (probeBoardCount) {
+            const total = probeList.length;
+            probeBoardCount.textContent = !total
+                ? 'No probes'
+                : filtersActive
+                    ? `${visible.length} of ${total} probes`
+                    : `${total} probe${total === 1 ? '' : 's'}`;
+        }
+        [probeOriginFilters, probeStateFilters].forEach((container) => {
+            if (!container) return;
+            const set = container === probeOriginFilters ? probeBoardOriginFilter : probeBoardStateFilter;
+            container.querySelectorAll('.probes-chip').forEach((chip) => {
+                const active = set.has(chip.dataset.value);
+                chip.classList.toggle('is-active', active);
+                chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+        });
+        document.querySelectorAll('.probes-view-btn').forEach((button) => {
+            const active = button.dataset.view === probeBoardView;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    // ── Probe board preferences, filters, and channel groups ───────────────
+
+    function loadProbeBoardPrefs() {
+        try {
+            const view = localStorage.getItem(PROBE_BOARD_VIEW_KEY);
+            if (view === 'grid' || view === 'list') probeBoardView = view;
+            const collapsed = JSON.parse(localStorage.getItem(PROBE_BOARD_COLLAPSED_KEY) || '[]');
+            if (Array.isArray(collapsed)) collapsed.forEach((id) => probeBoardCollapsed.add(String(id)));
+        } catch (_) {
+            // A corrupt or unavailable localStorage must not block the board.
+        }
+    }
+
+    function persistProbeBoardPrefs() {
+        try {
+            localStorage.setItem(PROBE_BOARD_VIEW_KEY, probeBoardView);
+            localStorage.setItem(PROBE_BOARD_COLLAPSED_KEY, JSON.stringify(Array.from(probeBoardCollapsed)));
+        } catch (_) {
+            // Preferences are a convenience; failing to persist is not an error.
+        }
+    }
+
+    function setProbeBoardView(view) {
+        const next = view === 'list' ? 'list' : 'grid';
+        if (next === probeBoardView) return;
+        probeBoardView = next;
+        persistProbeBoardPrefs();
+        renderProbeCards();
+    }
+
+    function resetProbeBoardFilters() {
+        probeBoardOriginFilter.clear();
+        probeBoardStateFilter.clear();
+        probeBoardQuery = '';
+        if (probeSearchInput) probeSearchInput.value = '';
+        renderProbeCards();
+    }
+
+    function handleProbeFilterChipClick(event) {
+        const chip = event.target.closest('.probes-chip[data-filter]');
+        if (!chip) return;
+        const set = chip.dataset.filter === 'origin' ? probeBoardOriginFilter : probeBoardStateFilter;
+        const value = chip.dataset.value || '';
+        if (set.has(value)) set.delete(value); else set.add(value);
+        renderProbeCards();
+    }
+
+    function renderProbeGroupList() {
+        if (!probeGroupListEl) return;
+        if (!probeChannelGroups.length) {
+            probeGroupListEl.innerHTML = '<div class="probes-group-empty">No groups yet. Channels are listed under "Ungrouped".</div>';
+            return;
+        }
+        const canManageGroups = userHasPermission('probes:manage');
+        probeGroupListEl.innerHTML = probeChannelGroups.map((group) => {
+            const channelCount = (group.channel_ids || []).length;
+            const editable = canManageGroups && group.read_only !== true;
+            const title = editable
+                ? `Edit ${String(group.name || 'group')}`
+                : `${String(group.name || 'group')} · view only`;
+            return `
+                <button type="button" class="probes-group-chip" data-group-id="${escapeHtml(String(group.id))}" title="${escapeHtml(title)}" ${editable ? '' : 'disabled'}>
+                    <span class="probes-group-chip-name">${escapeHtml(String(group.name || 'group'))}</span>
+                    <span class="probes-group-chip-count">${channelCount} ch</span>
+                </button>
+            `;
+        }).join('');
+    }
+
+    async function loadProbeChannelGroups() {
+        try {
+            const resp = await fetch(`/probes/channel_groups?t=${Date.now()}`, { cache: 'no-store' });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : [];
+            renderProbeGroupList();
+            renderProbeCards();
+        } catch (_) {
+            // Grouping is presentation only: on failure the board still renders
+            // every channel under "Ungrouped".
+        }
+    }
+
+    function setProbeGroupModalVisibility(visible) {
+        if (!probeGroupModal) return;
+        probeGroupModal.style.display = visible ? 'flex' : 'none';
+    }
+
+    function renderProbeGroupChannelList() {
+        if (!probeGroupChannelList) return;
+        const catalog = getProbeCastChannelCatalog();
+        if (!catalog.length) {
+            probeGroupChannelList.innerHTML = '<div class="admin-empty">Channel list is not loaded yet.</div>';
+            if (probeGroupSelectedMeta) probeGroupSelectedMeta.textContent = '0 selected';
+            return;
+        }
+        const claimedElsewhere = new Map();
+        probeChannelGroups.forEach((group) => {
+            if (String(group.id) === String(probeGroupEditorId)) return;
+            (group.channel_ids || []).forEach((channelId) => {
+                claimedElsewhere.set(Number(channelId), String(group.name || 'another group'));
+            });
+        });
+        probeGroupChannelList.innerHTML = catalog.map((channel) => {
+            const channelId = Number(channel.id);
+            const checked = probeGroupSelectedChannels.has(channelId);
+            const owner = claimedElsewhere.get(channelId);
+            return `
+                <label class="admin-channel-row">
+                    <input type="checkbox" data-channel-id="${channelId}" ${checked ? 'checked' : ''} />
+                    <span class="admin-channel-label">Ch ${channelId} · ${escapeHtml(String(channel.label || ''))}</span>
+                    ${owner ? `<span class="probes-group-owner" title="Selecting this channel moves it out of ${escapeHtml(owner)}">in ${escapeHtml(owner)}</span>` : ''}
+                </label>
+            `;
+        }).join('');
+        if (probeGroupSelectedMeta) {
+            probeGroupSelectedMeta.textContent = `${probeGroupSelectedChannels.size} selected`;
+        }
+    }
+
+    function openProbeGroupModal(groupId = '') {
+        if (!userHasPermission('probes:manage')) return;
+        const group = groupId ? probeChannelGroups.find((item) => String(item.id) === String(groupId)) : null;
+        if (group?.read_only === true) return;
+        probeGroupEditorId = group ? String(group.id) : null;
+        probeGroupSelectedChannels = new Set(
+            ((group && group.channel_ids) || []).map((channelId) => Number(channelId)).filter(Number.isFinite)
+        );
+        if (probeGroupModalTitle) probeGroupModalTitle.textContent = group ? 'Edit channel group' : 'New channel group';
+        if (probeGroupNameInput) probeGroupNameInput.value = group ? String(group.name || '') : '';
+        if (probeGroupStatus) {
+            probeGroupStatus.textContent = 'A channel picked here is removed from whichever group held it before.';
+        }
+        setElementHidden(probeGroupDeleteBtn, !group || group.read_only === true);
+        renderProbeGroupChannelList();
+        setProbeGroupModalVisibility(true);
+        if (probeGroupNameInput) probeGroupNameInput.focus();
+    }
+
+    async function saveProbeGroup() {
+        if (!userHasPermission('probes:manage')) return;
+        const name = String(probeGroupNameInput?.value || '').trim();
+        if (!name) {
+            if (probeGroupStatus) probeGroupStatus.textContent = 'Provide a group name.';
+            return;
+        }
+        try {
+            const resp = await fetch('/probes/channel_groups/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: probeGroupEditorId || undefined,
+                    name,
+                    channel_ids: Array.from(probeGroupSelectedChannels),
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                if (probeGroupStatus) probeGroupStatus.textContent = data.error || 'Failed to save group.';
+                return;
+            }
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : probeChannelGroups;
+            renderProbeGroupList();
+            renderProbeCards();
+            setProbeGroupModalVisibility(false);
+        } catch (err) {
+            if (probeGroupStatus) probeGroupStatus.textContent = `Failed to save group: ${err.message}`;
+        }
+    }
+
+    async function deleteProbeGroup() {
+        if (!userHasPermission('probes:manage')) return;
+        if (!probeGroupEditorId) return;
+        const group = probeChannelGroups.find((item) => String(item.id) === String(probeGroupEditorId));
+        const label = group ? String(group.name || 'this group') : 'this group';
+        if (!window.confirm(`Delete group "${label}"? Its channels move to Ungrouped. Probes are not deleted.`)) {
+            return;
+        }
+        try {
+            const resp = await fetch('/probes/channel_groups/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: probeGroupEditorId }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                if (probeGroupStatus) probeGroupStatus.textContent = data.error || 'Failed to delete group.';
+                return;
+            }
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : [];
+            probeBoardCollapsed.delete(String(probeGroupEditorId));
+            persistProbeBoardPrefs();
+            renderProbeGroupList();
+            renderProbeCards();
+            setProbeGroupModalVisibility(false);
+        } catch (err) {
+            if (probeGroupStatus) probeGroupStatus.textContent = `Failed to delete group: ${err.message}`;
+        }
+    }
+
+    function bindProbeBoardControls() {
+        loadProbeBoardPrefs();
+        if (probeSearchInput) {
+            probeSearchInput.addEventListener('input', () => {
+                probeBoardQuery = String(probeSearchInput.value || '').trim().toLowerCase();
+                renderProbeCards();
+            });
+        }
+        if (probeOriginFilters) probeOriginFilters.addEventListener('click', handleProbeFilterChipClick);
+        if (probeStateFilters) probeStateFilters.addEventListener('click', handleProbeFilterChipClick);
+        if (probeFilterResetBtn) probeFilterResetBtn.addEventListener('click', resetProbeBoardFilters);
+        document.querySelectorAll('.probes-view-btn').forEach((button) => {
+            button.addEventListener('click', () => setProbeBoardView(button.dataset.view));
+        });
+        if (probeGroupNewBtn) probeGroupNewBtn.addEventListener('click', () => openProbeGroupModal(''));
+        if (probeGroupListEl) {
+            probeGroupListEl.addEventListener('click', (event) => {
+                const chip = event.target.closest('.probes-group-chip[data-group-id]');
+                if (chip) openProbeGroupModal(chip.dataset.groupId);
+            });
+        }
+        if (probeGroupChannelList) {
+            probeGroupChannelList.addEventListener('change', (event) => {
+                const input = event.target.closest('input[data-channel-id]');
+                if (!input) return;
+                const channelId = Number(input.dataset.channelId);
+                if (!Number.isFinite(channelId)) return;
+                if (input.checked) probeGroupSelectedChannels.add(channelId);
+                else probeGroupSelectedChannels.delete(channelId);
+                if (probeGroupSelectedMeta) {
+                    probeGroupSelectedMeta.textContent = `${probeGroupSelectedChannels.size} selected`;
+                }
+            });
+        }
+        if (probesSummary) {
+            // The inspector re-renders on every board refresh, so the lineage
+            // jump is bound by delegation rather than to the button itself.
+            probesSummary.addEventListener('click', (event) => {
+                if (!event.target.closest('#probeLineageJumpBtn')) return;
+                const probe = activeProbeId
+                    ? probeList.find((item) => String(item.id) === String(activeProbeId))
+                    : null;
+                if (probe) jumpToProbeParentAlert(probe);
+            });
+        }
+        if (probeGroupSaveBtn) probeGroupSaveBtn.addEventListener('click', saveProbeGroup);
+        if (probeGroupDeleteBtn) probeGroupDeleteBtn.addEventListener('click', deleteProbeGroup);
+        [probeGroupCancelBtn, probeGroupCloseBtn].forEach((button) => {
+            if (button) button.addEventListener('click', () => setProbeGroupModalVisibility(false));
+        });
+    }
+
 
     function setActiveProbe(probe) {
         activeProbeId = probe && probe.id ? probe.id : null;
@@ -11588,8 +12567,8 @@
             probeChannelSelect.value = probe.channel_id;
             syncProbePreview(probe.channel_id);
         }
-        if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
-        if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
+        if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? PROBE_POS_FLOOR_DEFAULT;
+        if (probeMarginInput) probeMarginInput.value = probe?.margin ?? PROBE_MARGIN_DEFAULT;
         if (probeFpsInput) probeFpsInput.value = probe?.fps ?? 0;
         if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
@@ -11674,6 +12653,10 @@
             const data = await resp.json();
             probeList = data.probes || [];
             probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
+            if (Array.isArray(data.channel_groups)) {
+                probeChannelGroups = data.channel_groups;
+                renderProbeGroupList();
+            }
             await refreshProbeRuntimeState(false);
             if (showStatus) {
                 const counts = data.counts || {};
@@ -11960,18 +12943,18 @@
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
         if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = '8';
         if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = '20';
-        if (probePosFloorInput) probePosFloorInput.value = '0.2';
-        if (probeMarginInput) probeMarginInput.value = '0.05';
+        if (probePosFloorInput) probePosFloorInput.value = String(PROBE_POS_FLOOR_DEFAULT);
+        if (probeMarginInput) probeMarginInput.value = String(PROBE_MARGIN_DEFAULT);
         if (probeFpsInput) probeFpsInput.value = '0';
         if (probeWindowSecInput) probeWindowSecInput.value = '300';
         updateProbeCaptureMeta(getSelectedProbeChannelId());
-        renderMonitorProbeInspector();
+        renderProbesInspector();
     }
 
     function handleProbeCardClick(event) {
         const btn = event.target.closest('button[data-action]');
         if (!btn) {
-            const card = event.target.closest('.probe-mini-card[data-probe-id]');
+            const card = event.target.closest('.probe-mini-card[data-probe-id], .probes-row[data-probe-id]');
             if (!card) return;
             const probe = probeList.find((p) => String(p.id) === String(card.dataset.probeId || ''));
             if (probe) {
@@ -11983,6 +12966,25 @@
         const action = btn.getAttribute('data-action');
         const probe = probeList.find(p => String(p.id) === String(id));
         if (!action) return;
+        if (action === 'toggle-group') {
+            const groupId = btn.getAttribute('data-group-id') || '';
+            if (probeBoardCollapsed.has(groupId)) {
+                probeBoardCollapsed.delete(groupId);
+            } else {
+                probeBoardCollapsed.add(groupId);
+            }
+            persistProbeBoardPrefs();
+            renderProbeCards();
+            return;
+        }
+        if (action === 'edit-group') {
+            openProbeGroupModal(btn.getAttribute('data-group-id') || '');
+            return;
+        }
+        if (action === 'reset-filters') {
+            resetProbeBoardFilters();
+            return;
+        }
         if (action === 'expand' && probe) {
             setActiveProbe(probe);
             if (probeEditorModal) {
@@ -12134,6 +13136,7 @@
     if (probeCards) {
         probeCards.addEventListener('click', handleProbeCardClick);
     }
+    bindProbeBoardControls();
     if (probeNewBtn) {
         probeNewBtn.addEventListener('click', () => {
             resetProbeDraftEditor();
@@ -12270,7 +13273,7 @@
     // Mode switching
     if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
     if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
-    if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+    if (probesModeBtn) probesModeBtn.addEventListener('click', () => setMode('probes'));
     if (agentModeBtn) agentModeBtn.addEventListener('click', () => { setMode('agent'); agentInit(); });
     if (loadDetectionsBtn) {
         loadDetectionsBtn.addEventListener('click', () => {
@@ -12312,13 +13315,43 @@
             } else if (target?.matches('input[data-archive-channel-id]')) {
                 syncArchiveChannelAllOption();
             }
-            invalidateArchiveResultContext();
-            archiveDetectionsOffset = 0;
-            archiveDetectionsHasMore = false;
-            updateArchiveDetectionsNav();
-            refreshArchiveProbeFilter();
+            archiveChannelSelectionChanged();
         });
     }
+    if (archiveChannelPickerToggle) {
+        archiveChannelPickerToggle.addEventListener('click', () => {
+            const open = archiveChannelPickerToggle.getAttribute('aria-expanded') === 'true';
+            setArchiveChannelPickerOpen(!open, !open);
+        });
+    }
+    if (archiveChannelSearch) {
+        archiveChannelSearch.addEventListener('input', filterArchiveChannelOptions);
+    }
+    if (archiveChannelReset) {
+        archiveChannelReset.addEventListener('click', () => {
+            archiveChannelOptions?.querySelectorAll('input[data-archive-channel-id]').forEach((input) => {
+                input.checked = false;
+            });
+            if (archiveChannelSearch) archiveChannelSearch.value = '';
+            filterArchiveChannelOptions();
+            archiveChannelSelectionChanged();
+        });
+    }
+    if (archiveChannelDone) {
+        archiveChannelDone.addEventListener('click', () => {
+            setArchiveChannelPickerOpen(false);
+            archiveChannelPickerToggle?.focus();
+        });
+    }
+    document.addEventListener('click', (event) => {
+        if (
+            archiveChannelFilter
+            && archiveChannelPickerToggle?.getAttribute('aria-expanded') === 'true'
+            && !archiveChannelFilter.contains(event.target)
+        ) {
+            setArchiveChannelPickerOpen(false);
+        }
+    });
     if (archiveSourceFilter) {
         archiveSourceFilter.addEventListener('change', () => {
             invalidateArchiveResultContext();
@@ -13189,10 +14222,36 @@
         const mediaActive = ['loading', 'playing'].includes(context.mediaState || '');
         const imageSrc = archiveResultImageSrc(activeResult);
         if (archiveReviewImg && !mediaActive) {
+            const expectedIdentity = identity;
+            archiveReviewImg.onload = () => {
+                if (
+                    context !== archiveReviewContext
+                    || archiveReviewFrameIdentity(context.result) !== expectedIdentity
+                    || ['loading', 'playing'].includes(context.mediaState || '')
+                ) return;
+                archiveReviewImg.classList.remove('is-hidden');
+                if (archiveReviewFrameEmpty) {
+                    archiveReviewFrameEmpty.textContent = 'No frame';
+                    archiveReviewFrameEmpty.classList.add('is-hidden');
+                }
+            };
+            archiveReviewImg.onerror = () => {
+                if (
+                    context !== archiveReviewContext
+                    || archiveReviewFrameIdentity(context.result) !== expectedIdentity
+                    || ['loading', 'playing'].includes(context.mediaState || '')
+                ) return;
+                archiveReviewImg.classList.add('is-hidden');
+                if (archiveReviewFrameEmpty) {
+                    archiveReviewFrameEmpty.textContent = 'Frame preview unavailable';
+                    archiveReviewFrameEmpty.classList.remove('is-hidden');
+                }
+            };
             archiveReviewImg.src = imageSrc || '';
             archiveReviewImg.classList.toggle('is-hidden', !imageSrc);
         }
         if (archiveReviewFrameEmpty && !mediaActive) {
+            if (!imageSrc) archiveReviewFrameEmpty.textContent = 'No frame';
             archiveReviewFrameEmpty.classList.toggle('is-hidden', Boolean(imageSrc));
         }
         archiveReviewRenderFrameNav();
@@ -13248,6 +14307,7 @@
         const batchEnd = Number(payload.batch_end_ms ?? context.baseResult.batch_end_ms);
         if (!Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(batchStart) || !Number.isFinite(batchEnd)) return;
         const requestContext = beginArchiveReviewRequest(context);
+        requestContext.timedOut = false;
         context.framesLoading = true;
         archiveReviewRenderFilmstrip();
         const params = new URLSearchParams();
@@ -13262,6 +14322,15 @@
         }
         params.set('limit', '120');
         params.set('offset', '0');
+        const timeoutId = window.setTimeout(() => {
+            requestContext.timedOut = true;
+            requestContext.controller.abort();
+        }, ARCHIVE_REVIEW_BATCH_TIMEOUT_MS);
+        const stillOwnsRequest = () => Boolean(
+            requestContext.generation === archiveReviewRequestGeneration
+            && archiveReviewAbortController === requestContext.controller
+            && archiveReviewContext === context
+        );
         try {
             const response = await fetch(`/detections/list?${params.toString()}`, {
                 signal: requestContext.controller.signal,
@@ -13282,12 +14351,16 @@
             context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
             context.framesError = '';
         } catch (error) {
-            if ((error && error.name === 'AbortError') || !isCurrentArchiveReviewRequest(requestContext)) return;
+            if (!stillOwnsRequest()) return;
+            if ((error && error.name === 'AbortError') && !requestContext.timedOut) return;
             context.frames = archiveReviewLocalBatchFrames(context.baseResult);
             context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
-            context.framesError = error.message || 'Batch frames unavailable.';
+            context.framesError = requestContext.timedOut
+                ? 'Neighboring batch frames timed out; showing the selected evidence frame.'
+                : (error.message || 'Batch frames unavailable.');
         } finally {
-            if (isCurrentArchiveReviewRequest(requestContext)) {
+            window.clearTimeout(timeoutId);
+            if (stillOwnsRequest()) {
                 context.framesLoading = false;
                 archiveReviewRenderActiveFrame();
                 archiveReviewAbortController = null;
@@ -15146,11 +16219,23 @@
             const textEl = document.createElement('div');
             textEl.className = 'agent-msg-text';
             if (text) textEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+            const { traceEl, traceSummary, actionsEl } = createAgentToolTrace();
             bodyEl.appendChild(textEl);
+            bodyEl.appendChild(traceEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            const bubble = { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
+            const bubble = {
+                el: div,
+                bodyEl,
+                textEl,
+                traceEl,
+                actionsEl,
+                actionCount: 0,
+                text: text || '',
+                traceUserToggled: false,
+            };
+            bindAgentTracePreference(bubble, traceSummary);
             syncAgentEvidenceIdCard(bubble);
             scrollToBottom(true);
             return bubble;
@@ -15168,6 +16253,28 @@
             bubble.textEl.innerHTML = `<span class="agent-typing-indicator agent-typing-indicator-${mode}"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-label">${safeMessage}</span></span>`;
         }
 
+        function createAgentToolTrace() {
+            const traceEl = document.createElement('details');
+            traceEl.className = 'agent-tool-trace';
+            traceEl.open = false;
+            traceEl.hidden = true;
+            const traceSummary = document.createElement('summary');
+            traceSummary.className = 'agent-tool-trace-summary';
+            traceSummary.textContent = 'Research trace';
+            const actionsEl = document.createElement('div');
+            actionsEl.className = 'agent-msg-actions';
+            traceEl.appendChild(traceSummary);
+            traceEl.appendChild(actionsEl);
+            return { traceEl, traceSummary, actionsEl };
+        }
+
+        function bindAgentTracePreference(bubble, traceSummary) {
+            if (!bubble || !traceSummary) return;
+            traceSummary.addEventListener('click', () => {
+                bubble.traceUserToggled = true;
+            });
+        }
+
         function startStreamingBubble() {
             const el = elMessages();
             if (!el) return null;
@@ -15181,23 +16288,24 @@
             bodyEl.className = 'agent-msg-body';
             const textEl = document.createElement('div');
             textEl.className = 'agent-msg-text';
-            const traceEl = document.createElement('details');
-            traceEl.className = 'agent-tool-trace';
-            traceEl.open = false;
-            traceEl.hidden = true;
-            const traceSummary = document.createElement('summary');
-            traceSummary.className = 'agent-tool-trace-summary';
-            traceSummary.textContent = 'Research trace';
-            const actionsEl = document.createElement('div');
-            actionsEl.className = 'agent-msg-actions';
-            traceEl.appendChild(traceSummary);
-            traceEl.appendChild(actionsEl);
+            const { traceEl, traceSummary, actionsEl } = createAgentToolTrace();
             bodyEl.appendChild(textEl);
             bodyEl.appendChild(traceEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            const bubble = { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '', currentToolName: '' };
+            const bubble = {
+                el: div,
+                bodyEl,
+                textEl,
+                traceEl,
+                actionsEl,
+                actionCount: 0,
+                text: '',
+                currentToolName: '',
+                traceUserToggled: false,
+            };
+            bindAgentTracePreference(bubble, traceSummary);
             setStreamingStatus(bubble, 'Thinking through the request...', 'thinking');
             scrollToBottom(true);
             return bubble;
@@ -16720,7 +17828,9 @@
                 const hasText = String(bubble.text || '').trim().length > 0;
                 const hasActions = Number(bubble.actionCount || 0) > 0;
                 bubble.traceEl.hidden = !hasActions;
-                bubble.traceEl.open = false;
+                if (!bubble.traceUserToggled) {
+                    bubble.traceEl.open = false;
+                }
             }
             promoteStandaloneAgentApprovalCards(bubble);
             syncAgentEvidenceIdCard(bubble);
@@ -16951,6 +18061,7 @@
                     agentSkillList.innerHTML = '<div class="agent-probe-empty">No skills yet</div>';
                     return;
                 }
+                const canManageSkills = userHasPermission('settings:manage');
                 agentSkillList.innerHTML = skills.map((skill) => `
                     <div class="agent-skill-row" data-skill-slug="${escapeHtml(skill.slug || '')}">
                         <button
@@ -16960,12 +18071,12 @@
                             data-agent-skill-run="${escapeHtml(skill.slug || '')}">
                             <span class="agent-skill-run-title">${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}</span>
                         </button>
-                        <button
+                        ${canManageSkills ? `<button
                             class="feature-btn agent-skill-edit"
                             type="button"
                             title="Edit skill"
                             aria-label="Edit skill ${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}"
-                            data-agent-skill-edit="${escapeHtml(skill.slug || '')}">&#9998;</button>
+                            data-agent-skill-edit="${escapeHtml(skill.slug || '')}">&#9998;</button>` : ''}
                     </div>
                 `).join('');
             } catch(e) {
@@ -16974,6 +18085,7 @@
         }
 
         async function agentOpenSkillEditor(slug) {
+            if (!userHasPermission('settings:manage')) return;
             try {
                 const r = await fetch(`/agent/skills/${encodeURIComponent(slug)}`);
                 const data = await r.json();
@@ -16985,7 +18097,7 @@
         }
 
         async function agentSaveSkill() {
-            if (!agentSkillDraft) return;
+            if (!agentSkillDraft || !userHasPermission('settings:manage')) return;
             const payload = {
                 name: (agentSkillNameInput?.value || '').trim(),
                 slug: (agentSkillSlugInput?.value || '').trim(),

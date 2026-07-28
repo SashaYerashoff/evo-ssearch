@@ -485,6 +485,27 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                     "suggested_stream_system_prompt": "Describe public space activity.",
                     "suggested_alert_policy_prompt": "Flag people fighting.",
                 },
+                "memory_metabolism": {
+                    "status": "active",
+                    "semantics": "L1/L2 memory returns to later L0 as prior context.",
+                    "current_state": {
+                        "present": True,
+                        "source_level": "L2",
+                        "active_watchlist_count": 2,
+                    },
+                    "stages": [
+                        {
+                            "level": "L1",
+                            "cadence": "15 minutes",
+                            "applies_to_live_memory": True,
+                        },
+                        {
+                            "level": "L3",
+                            "cadence": "8 hours",
+                            "applies_to_live_memory": False,
+                        },
+                    ],
+                },
             }
         )
 
@@ -494,6 +515,10 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertIn("Operator watch/alert criteria", compact["prompt_layers"]["alerts"]["semantics"])
         self.assertIn("BATCH_STATE_JSON", compact["prompt_layers"]["json"]["semantics"])
         self.assertIn("compressed memory maps", compact["prompt_layers"]["rollups"]["semantics"])
+        self.assertEqual(compact["memory_metabolism"]["status"], "active")
+        self.assertEqual(compact["memory_metabolism"]["current_state"]["source_level"], "L2")
+        self.assertTrue(compact["memory_metabolism"]["stages"][0]["applies_to_live_memory"])
+        self.assertFalse(compact["memory_metabolism"]["stages"][1]["applies_to_live_memory"])
 
     def test_system_prompt_reframes_sensitive_visible_evidence_instead_of_refusing(self):
         class _ProbeStore:

@@ -10,7 +10,7 @@ set -Eeuo pipefail
 umask 077
 
 EXPECTED_VERSION="β 0.8.5"
-EXPECTED_SCHEMA="20260726_0009"
+EXPECTED_SCHEMA="20260727_0010"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
@@ -910,6 +910,7 @@ if [[ "${MODE}" == "user" ]]; then
     --exclude="${APP_BASE}/*.mov" \
     --exclude="${APP_BASE}/*.mkv" \
     --exclude="${APP_BASE}/probes_store.json" \
+    --exclude="${APP_BASE}/probe_channel_groups.json" \
     --exclude="${APP_BASE}/luxriot_summary_state.json" \
     --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
     --exclude="${APP_BASE}/*.sqlite3" \
@@ -918,6 +919,10 @@ if [[ "${MODE}" == "user" ]]; then
     -czf "${BACKUP_DIR}/code.tgz" \
     -C "${APP_PARENT}" "${APP_BASE}"
   printf '%s\n' "${BACKUP_DIR}" > "${BACKUP_ROOT}/LATEST"
+  if [[ -f "${APP_DIR}/probe_channel_groups.json" ]]; then
+    install -m 0600 "${APP_DIR}/probe_channel_groups.json" \
+      "${BACKUP_DIR}/probe_channel_groups.json"
+  fi
 
   COPY_EXCLUDES=(
     --exclude=.git --exclude=.local --exclude=.venv
@@ -925,6 +930,7 @@ if [[ "${MODE}" == "user" ]]; then
     --exclude=dist --exclude=node_modules --exclude=detections_archive
     --exclude=video --exclude=models --exclude='*.mp4' --exclude='*.avi'
     --exclude='*.mov' --exclude='*.mkv' --exclude=probes_store.json
+    --exclude=probe_channel_groups.json
     --exclude=luxriot_summary_state.json --exclude=luxriot_rollups_cache.json
     --exclude=.env --exclude='.env.*' --exclude='*.sqlite3' --exclude='*.db'
     --exclude='*.log'
