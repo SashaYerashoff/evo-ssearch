@@ -2314,8 +2314,14 @@ class _AgentLMClient:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         cancel_event: Optional[threading.Event] = None,
+        tool_choice: str = "auto",
     ) -> _LMResponse:
-        """Blocking non-streaming call with tools. Returns parsed response."""
+        """Blocking non-streaming call with tools. Returns parsed response.
+
+        ``tool_choice`` is forwarded only when tools are available. Operator
+        Mode uses ``required`` for its first model-owned decision; ordinary
+        agent turns retain ``auto``.
+        """
         effective_tools = _TOOL_SCHEMAS if tools is None else tools
         allowed_tool_names = {
             str((schema.get("function") or {}).get("name") or "").strip()
@@ -2331,7 +2337,9 @@ class _AgentLMClient:
         }
         if effective_tools:
             payload["tools"] = effective_tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = (
+                tool_choice if tool_choice in {"auto", "required"} else "auto"
+            )
         with self.admission_controller.admission(
             self.admission_resource,
             workload="agent",
@@ -10604,6 +10612,7 @@ class AgentRunner:
         message: str,
         image_b64: Optional[str] = None,
         tool_context: Optional[ToolExecutionContext] = None,
+        force_tools: bool = False,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
@@ -10996,12 +11005,18 @@ class AgentRunner:
             else:
                 # Run the blocking LM call in a thread so we can emit heartbeats.
                 lm_cancel_event = threading.Event()
+                lm_tool_kwargs = (
+                    {"tool_choice": "required"}
+                    if force_tools and tool_calls_used == 0 and available_tool_schemas
+                    else {}
+                )
                 try:
                     lm_response = yield from _run_with_heartbeats(
                         fn=lambda: self._lm_client.call_with_tools(
                             in_flight,
                             tools=available_tool_schemas,
                             cancel_event=lm_cancel_event,
+                            **lm_tool_kwargs,
                         ),
                         heartbeat_interval=AGENT_HEARTBEAT_INTERVAL,
                         heartbeat_payload_fn=lambda: {

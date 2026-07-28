@@ -1,0 +1,246 @@
+import { useEffect, useState, useCallback } from 'react'
+import { IconX, IconDeviceFloppy, IconRotate, IconSearch } from '@tabler/icons-react'
+import type { AuthUser, Channel } from '../../api/types'
+import { canViewSettingsTab, hasPermission, PERMISSION } from '../../api/access'
+import { normalizeArchiveCapacity, settingsApi, type Settings } from '../../api/settings'
+import { TABS, WRITABLE_KEYS, SEVERITY_KEYS, type FieldDef } from './defs'
+import { EnvTab } from './EnvTab'
+import { AuditTab } from './AuditTab'
+import { UsersTab } from './UsersTab'
+import { Dropdown } from '../shell/Dropdown'
+
+const DEFAULTS: Settings = {
+  host: '0.0.0.0', port: 5000, debug: false,
+  minResults: 3, maxResults: 48, defaultResults: 12,
+  embedder: 'clip', clipModel: 'ViT-B/32', dinoModel: 'dinov3_vitb16', dinoEmbedDim: 1280, dinoWeightsPath: '',
+  fusionEnabled: false, fusionAlpha: 0.7, batchSize: 32, thumbnailQuality: 85,
+  rerankEnabled: false, rerankTopK: 50, segmentsEnabled: false, segmentMinPatches: 3, maxCommentLength: 100, maxFileSize: 50,
+  luxriotBaseUrl: '', luxriotUsername: '', luxriotPassword: '', luxriotDefaultChannelId: 1,
+  luxriotSnapshotInterval: 5, luxriotSnapshotMaxEdge: 800, luxriotMaxBufferFrames: 180,
+  luxriotSummaryRetentionDays: 7, luxriotSummaryHistoryLimit: 10080, luxriotAutoBookmarks: false,
+  probeBookmarkCooldownSec: 8, probeBookmarkDedupeWindowSec: 20, probeBookmarkSimHigh: 0.985,
+  probeBookmarkMarginDelta: 0.08, probeBookmarkScoreDelta: 0.08, probeBookmarkMaxFrameGap: 8,
+  luxriotSeverityMap: { info: 'info', low: 'low', normal: 'normal', high: 'high', critical: 'critical' },
+  archiveRetentionEnabled: true, archiveRowRetentionDays: 90, archiveThumbnailRetentionDays: 14, archiveMaxRecords: 5000000,
+  archiveEstimateChannels: 50, archiveEstimateFramesPerBatch: 4, archiveEstimateAvgJpegKb: 100, archiveEstimateProbeRecordsPerChannelDay: 250,
+}
+
+function FieldRow({ f, value, disabled, onChange }: { f: FieldDef; value: any; disabled?: boolean; onChange: (v: any) => void }) {
+  const label = <span className="set-label">{f.label}</span>
+  if (f.type === 'checkbox') {
+    return <label className="set-row set-check"><input type="checkbox" disabled={disabled} checked={!!value} onChange={(e) => onChange(e.target.checked)} />{label}</label>
+  }
+  if (f.type === 'range') {
+    return (
+      <div className="set-row">
+        {label}
+        <div className="set-range-wrap">
+          <input type="range" disabled={disabled} min={f.min} max={f.max} step={f.step} value={Number(value ?? 0)} onChange={(e) => onChange(Number(e.target.value))} />
+          <span className="set-range-val">{value}</span>
+        </div>
+        {f.note && <div className="set-note">{f.note}</div>}
+      </div>
+    )
+  }
+  return (
+    <div className="set-row">
+      {label}
+      {f.type === 'select'
+        ? <Dropdown disabled={disabled} value={String(value ?? '')} onChange={onChange} options={(f.options || []).map((o) => ({ value: o.v, label: o.label || o.v }))} />
+        : <input type={f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text'}
+            disabled={disabled}
+            min={f.min} max={f.max} step={f.step}
+            value={f.type === 'password' ? (value ?? '') : (value ?? '')}
+            placeholder={f.type === 'password' ? '•••••• (unchanged)' : ''}
+            onChange={(e) => onChange(f.type === 'number' ? (e.target.value === '' ? '' : Number(e.target.value)) : e.target.value)} />}
+      {f.note && <div className="set-note">{f.note}</div>}
+    </div>
+  )
+}
+
+export function SettingsModal({
+  user,
+  channels,
+  onRefreshChannels,
+  onClose,
+}: {
+  user: AuthUser
+  channels: Channel[]
+  onRefreshChannels?: () => Promise<void> | void
+  onClose: () => void
+}) {
+  const [s, setS] = useState<Settings>({})
+  const [tab, setTab] = useState('server')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [status, setStatus] = useState<{ msg: string; ok: boolean } | null>(null)
+  const [capacity, setCapacity] = useState<any>(null)
+  const [search, setSearch] = useState('')
+  const canReadSettings = canViewSettingsTab(user, 'settings')
+  const canManageSettings = hasPermission(user, PERMISSION.settingsManage)
+  const canReadCapacity = hasPermission(user, PERMISSION.diagnosticsView)
+
+  useEffect(() => {
+    if (canReadSettings) {
+      settingsApi.get().then((r) => setS(r.settings || {})).catch(() => setStatus({ msg: 'Failed to load settings', ok: false })).finally(() => setLoading(false))
+    } else {
+      setLoading(false)
+    }
+    if (canReadCapacity) settingsApi.archiveCapacity().then(setCapacity).catch(() => {})
+  }, [canReadCapacity, canReadSettings])
+
+  const patch = useCallback((k: string, v: any) => setS((x) => ({ ...x, [k]: v })), [])
+  const patchSev = (k: string, v: string) => setS((x) => ({ ...x, luxriotSeverityMap: { ...(x.luxriotSeverityMap || {}), [k]: v } }))
+
+  async function save() {
+    setSaving(true); setStatus(null)
+    try {
+      const payload: Settings = {}
+      for (const k of WRITABLE_KEYS) {
+        if (k === 'luxriotPassword' && !s[k]) continue // blank = keep current
+        if (s[k] !== undefined) payload[k] = s[k]
+      }
+      if (Number(payload.minResults) >= Number(payload.maxResults)) throw new Error('Min results must be less than max results')
+      const r = await settingsApi.save(payload)
+      if (!r.success) throw new Error(r.error || 'Save failed')
+      setStatus({ msg: r.message || 'Settings saved. Some changes need a server restart.', ok: true })
+    } catch (e: any) { setStatus({ msg: e?.message || 'Save failed', ok: false }) }
+    finally { setSaving(false) }
+  }
+  function reset() {
+    setS((x) => ({ ...x, ...DEFAULTS, luxriotSeverityMap: { ...DEFAULTS.luxriotSeverityMap } }))
+    setStatus({ msg: 'Reverted to defaults — press Save settings to persist.', ok: true })
+  }
+
+  const q = search.trim().toLowerCase()
+  const fieldMatch = (label: string) => label.toLowerCase().includes(q)
+  const tabHasMatch = (t: (typeof TABS)[number]) => {
+    if (!q) return true
+    if (t.label.toLowerCase().includes(q)) return true
+    if (t.custom) return t.custom.includes(q)
+    return !!t.sections?.some((sec) => sec.title.toLowerCase().includes(q) || sec.fields?.some((f) => fieldMatch(f.label)))
+  }
+  const tabKind = (custom?: string) => custom === 'users' ? 'users' : custom === 'audit' ? 'audit' : custom === 'env' ? 'env' : 'settings'
+  const permittedTabs = TABS.filter((candidate) => canViewSettingsTab(user, tabKind(candidate.custom)))
+  const visibleTabs = permittedTabs.filter(tabHasMatch)
+  const activeId = visibleTabs.some((t) => t.id === tab) ? tab : (visibleTabs[0]?.id ?? tab)
+  const activeTab = permittedTabs.find((t) => t.id === activeId) ?? permittedTabs[0]
+  const capacitySummary = normalizeArchiveCapacity(capacity)
+
+  return (
+    <div className="scrim" onClick={onClose}>
+      <div className="modal set-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <div className="modal-title">Settings</div>
+            <div className="brand-sub">Tune runtime, ranking, Luxriot integration, and environment.</div>
+          </div>
+          <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
+        </div>
+
+        <div className="set-body">
+          <aside className="set-nav">
+            <div className="set-search">
+              <IconSearch size={15} />
+              <input placeholder="Search settings…" value={search} onChange={(e) => setSearch(e.target.value)} />
+            </div>
+            <div className="set-navlist">
+              {visibleTabs.map((t) => (
+                <button key={t.id} className={`set-navitem ${activeId === t.id ? 'on' : ''}`} onClick={() => setTab(t.id)}>{t.label}</button>
+              ))}
+              {visibleTabs.length === 0 && <div className="set-note" style={{ padding: '10px 12px' }}>No matches.</div>}
+            </div>
+          </aside>
+
+          <div className="set-content">
+            {loading && <div className="loading-state"><div className="spinner" /></div>}
+            {!loading && activeTab?.custom === 'env' && <EnvTab />}
+            {!loading && activeTab?.custom === 'audit' && <AuditTab />}
+            {!loading && activeTab?.custom === 'users' && (
+              <UsersTab
+                currentUserId={user.id}
+                currentSessionId={user.currentSessionId}
+                channels={channels}
+                onRefreshChannels={onRefreshChannels}
+              />
+            )}
+            {!loading && activeTab && !activeTab.custom && activeTab.sections?.map((sec, i) => {
+              const titleMatch = !q || sec.title.toLowerCase().includes(q)
+              if (sec.kind) {
+                if (!titleMatch) return null
+                return (
+                  <div key={i} className="set-section">
+                    <h3>{sec.title}</h3>
+                    {sec.help && <p className="set-section-help">{sec.help}</p>}
+                    {sec.kind === 'severity' ? (
+                      <div className="set-sev">
+                        {SEVERITY_KEYS.map((k) => (
+                          <div key={k} className="set-row"><span className="set-label">{k}</span>
+                            <input disabled={!canManageSettings} value={s.luxriotSeverityMap?.[k] ?? k} onChange={(e) => patchSev(k, e.target.value)} /></div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="set-capacity">
+                        {capacity ? (
+                          <>
+                            <div><span>Daily frame rows</span><b>{fmt(capacitySummary.dailyFrameRows)}</b></div>
+                            <div><span>Retained frame rows</span><b>{fmt(capacitySummary.retainedFrameRows)}</b></div>
+                            <div><span>Estimated storage</span><b>{fmtBytes(capacitySummary.totalBytes)}</b></div>
+                            <div><span>Current archive rows</span><b>{fmt(capacitySummary.currentRows)}</b></div>
+                          </>
+                        ) : <div className="set-note">Capacity estimate unavailable.</div>}
+                      </div>
+                    )}
+                  </div>
+                )
+              }
+              const fields = (sec.fields || []).filter((f) => !q || titleMatch || fieldMatch(f.label))
+              if (!fields.length) return null
+              return (
+                <div key={i} className="set-section">
+                  <h3>{sec.title} {sec.experimental && (
+                    <span className={`set-exp ${s.experimentalEmbeddersEnabled ? 'on' : ''}`}
+                      title={s.experimentalEmbeddersEnabled
+                        ? 'Experimental embedders are enabled (EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=true)'
+                        : 'Ignored while experimental embedders are disabled — set EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=true and restart'}>
+                      experimental · {s.experimentalEmbeddersEnabled ? 'on' : 'off'}
+                    </span>
+                  )}</h3>
+                  {sec.help && <p className="set-section-help">{sec.help}</p>}
+                  <div className="set-fields">
+                    {fields.map((f) => <FieldRow key={f.key} f={f} value={s[f.key]} disabled={!canManageSettings} onChange={(v) => patch(f.key, v)} />)}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        <div className="set-footer">
+          <div className={`set-status ${status ? (status.ok ? 'ok' : 'err') : ''}`}>{status?.msg || ''}</div>
+          {activeTab && !activeTab.custom && canManageSettings && (
+            <div className="set-actions">
+              <button className="mon-btn" onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
+              <button className="mon-btn accent" disabled={saving} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : 'Save settings'}</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function fmt(n: any): string {
+  if (n === null || n === undefined || n === '') return '—'
+  const v = Number(n)
+  return isFinite(v) ? v.toLocaleString() : '—'
+}
+
+function fmtBytes(n: number | null): string {
+  if (n == null || !Number.isFinite(n)) return '—'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  let value = Math.max(0, n)
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: value >= 100 ? 0 : 1 })} ${units[unit]}`
+}

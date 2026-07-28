@@ -42,6 +42,7 @@ class _Identity:
 
 @dataclass(frozen=True)
 class _Session:
+    session_id: str
     identity: _Identity
     csrf_digest: str
     expires_at: datetime
@@ -123,6 +124,7 @@ class _Repository:
     ):
         session_id = f"session-{len(self.sessions) + 1}"
         self.sessions[token] = _Session(
+            session_id=session_id,
             identity=identity,
             csrf_digest=digest_session_token(csrf_token),
             expires_at=expires_at,
@@ -416,6 +418,10 @@ class HttpAuthRouteTests(unittest.TestCase):
         me = self.client.get("/auth/me")
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.get_json()["user"]["username"], "engineer")
+        self.assertEqual(
+            me.get_json()["sessionId"],
+            login.get_json()["sessionId"],
+        )
 
         missing_csrf = self.client.post("/auth/logout")
         self.assertEqual(missing_csrf.status_code, 403)

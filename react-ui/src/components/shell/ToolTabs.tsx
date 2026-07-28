@@ -1,0 +1,26 @@
+import type { ReactNode } from 'react'
+
+// Folder-style tool tabs: a fixed tab row on top, the active tab's controls
+// open in a panel right below. Tabs never move — the active one lights up.
+export interface ToolTab { id: string; icon: ReactNode; label: string; summary: string }
+
+export function ToolTabs({ tabs, active, onSelect, children }: {
+  tabs: ToolTab[]
+  active: string
+  onSelect: (id: string) => void
+  children: ReactNode
+}) {
+  return (
+    <div className="tool-tabs">
+      <div className="atp-tabrow">
+        {tabs.map((t) => (
+          <button key={t.id} className={`atp-tab ${active === t.id ? 'on' : ''}`} onClick={() => onSelect(t.id)} title={t.label}>
+            <b>{t.icon} {t.label}</b>
+            <span>{t.summary}</span>
+          </button>
+        ))}
+      </div>
+      <div className="atp-tabpanel" key={active}>{children}</div>
+    </div>
+  )
+}

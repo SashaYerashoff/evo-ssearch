@@ -6296,7 +6296,10 @@ class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):
         self.assertTrue(outcome["accepted"])
 
         self.runtime.start()
-        self.wait_for(lambda: bool(archived))
+        # The archive callback runs before the accepted entry is published to
+        # summary_history. Wait for the worker-visible completion boundary so
+        # this assertion cannot race the next line in accept_summary_entry().
+        self.wait_for(lambda: bool(self.manager.summary_history.get(7)))
 
         frames = archived[0]["archive_frames"]
         self.assertEqual([frame["anchor_role"] for frame in frames], ["first", "last"])

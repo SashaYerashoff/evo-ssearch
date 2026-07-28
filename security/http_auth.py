@@ -44,6 +44,7 @@ class IdentityRecord(Protocol):
 
 @runtime_checkable
 class SessionRecord(Protocol):
+    session_id: str
     identity: IdentityRecord
     csrf_digest: str
     expires_at: datetime

@@ -654,6 +654,40 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertNotIn("tools", payload)
         self.assertNotIn("tool_choice", payload)
 
+    def test_operator_mode_can_require_the_first_model_owned_tool_decision(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+        client.admission_controller = Admission()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}]
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_channels",
+                    "description": "List channels.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        with patch.object(agent.requests, "post", return_value=response) as post:
+            client.call_with_tools(
+                [{"role": "user", "content": "inspect the console"}],
+                tools=tools,
+                tool_choice="required",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(payload["tools"], tools)
+
     def test_agent_disables_model_thinking_for_tool_and_final_calls(self):
         client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
 

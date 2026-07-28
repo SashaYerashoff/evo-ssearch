@@ -310,7 +310,7 @@ CPU/iGPU. The installer also accepts external OpenAI-compatible endpoints.
 
 ## Verification
 
-- Full project suite: **925 passed, 23 skipped, 156 subtests passed**.
+- Full project suite: **926 passed, 23 skipped, 156 subtests passed**.
 - Archive modal regression contract: **45 passed** in the focused UI/CSS suite.
 - Visual archive-modal smoke: Chromium at `1040×896`, with a long L0 summary
   and hidden feedback panel, retained the large preview and independent summary

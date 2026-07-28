@@ -78,7 +78,7 @@ Format loosely follows Keep a Changelog.
   `20260725_0007` through `20260727_0010`; resulting schema head is
   `20260727_0010`. New audit writes form a concurrency-safe, tenant-scoped
   SHA-256 chain.
-- **Verification:** 925 passed, 23 skipped, 156 subtests passed.
+- **Verification:** 926 passed, 23 skipped, 156 subtests passed.
   See `readiness/RELEASE_NOTES_0.8.5.md`.
 
 ## β 0.8.4 — 2026-07-15 (attention decider, media broker, stabilization)
