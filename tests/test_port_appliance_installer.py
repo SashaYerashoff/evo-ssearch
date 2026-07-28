@@ -15,6 +15,15 @@ sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
 
 
+def test_usb_builder_excludes_the_unused_react_workspace():
+    builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--exclude=react-ui/" in builder
+    assert "--delete-excluded" in builder
+
+
 def test_port_profile_keeps_gpu_for_vllm_and_clip_on_cpu():
     assert installer.PORT_ENV["CUDA_VISIBLE_DEVICES"] == "-1"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER"] == "clip"

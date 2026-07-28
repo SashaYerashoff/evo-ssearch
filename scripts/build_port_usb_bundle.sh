@@ -30,12 +30,13 @@ mkdir -p "${STAGING_ROOT}/wheelhouse"
 mkdir -p "${STAGING_ROOT}/apt"
 mkdir -p "${STAGING_ROOT}/repository-backup"
 
-rsync -a --delete \
+rsync -a --delete --delete-excluded \
     --exclude=.git \
     --exclude=.venv \
     --exclude=.local \
     --exclude=.pytest_cache \
     --exclude=__pycache__ \
+    --exclude=react-ui/ \
     --exclude='*.pyc' \
     --exclude='*.dump' \
     --exclude='*.bak' \
