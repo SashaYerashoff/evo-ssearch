@@ -28,11 +28,20 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
+            requirements-db.txt
             requirements-test.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: react-ui/package-lock.json
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-test.txt
+      - name: Install React dependencies
+        working-directory: react-ui
+        run: npm ci
       - name: Check documentation drift
         run: bash scripts/check_docs_drift.sh
       - name: Compile production Python
@@ -43,3 +52,9 @@ jobs:
             luxriot_connector.py oldapp.py probe_manager.py road_events security
       - name: Run test suite
         run: python -m pytest -q
+      - name: Run React contract tests
+        working-directory: react-ui
+        run: npm test
+      - name: Build React prototype
+        working-directory: react-ui
+        run: npm run build
