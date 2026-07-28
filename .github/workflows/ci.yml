@@ -2,6 +2,8 @@ name: EVA AI CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -15,11 +17,28 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: eva
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d eva"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       EVOSSEARCH_OFFLINE_MODE: "true"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      EVA_DATABASE_DSN: postgresql://postgres:postgres@127.0.0.1:5432/eva
+      EVOSSEARCH_AUTH_TENANT_ID: 00000000-0000-4000-8000-000000000001
+      EVOSSEARCH_ARCHIVE_TENANT_ID: 00000000-0000-4000-8000-000000000001
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +61,8 @@ jobs:
       - name: Install React dependencies
         working-directory: react-ui
         run: npm ci
+      - name: Migrate test database
+        run: alembic upgrade head
       - name: Check documentation drift
         run: bash scripts/check_docs_drift.sh
       - name: Compile production Python
