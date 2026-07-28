@@ -66,6 +66,19 @@ export interface CaptureInput {
   system_prompt?: string
 }
 
+export function buildCaptureInput(
+  channelId: number,
+  values: { batch: string; every: string; model: string; prompt: string },
+): CaptureInput {
+  return {
+    channel_id: channelId,
+    batch_size: Number(values.batch),
+    interval_sec: Number(values.every),
+    model: values.model.trim() || undefined,
+    prompt: values.prompt.trim() || undefined,
+  }
+}
+
 export interface PromptSettings {
   channel_id?: number | null
   stream_system_prompt?: string
@@ -77,12 +90,55 @@ export interface PromptSettings {
   [k: string]: any
 }
 
+export function buildPromptSettingsPayload(
+  settings: PromptSettings,
+  channelId: number,
+  canCreateBookmarks: boolean,
+): PromptSettings {
+  const payload = { ...settings, channel_id: channelId }
+  if (!canCreateBookmarks) {
+    delete payload.json_alert_prompt
+    delete payload.bookmark_enabled
+    delete payload.bookmark_cooldown_sec
+  }
+  return payload
+}
+
+export interface LmModelCatalog {
+  models?: string[]
+  default_model?: string
+  auto_model_selector?: string
+  auto_model_label?: string
+  error?: string | null
+  [k: string]: any
+}
+
+export interface SessionQuery extends Record<string, unknown> {
+  channel_id: string
+  limit: string
+  from_ts?: number
+  to_ts?: number
+}
+
+export function buildSessionQuery(
+  channelId: number,
+  opts: { limit?: number; from_ts?: number; to_ts?: number } = {},
+): SessionQuery {
+  return {
+    channel_id: String(channelId),
+    limit: String(opts.limit ?? 40),
+    from_ts: opts.from_ts,
+    to_ts: opts.to_ts,
+  }
+}
+
 export const videoApi = {
   streams: (): Promise<StreamsStatus> => api.get('/luxriot/streams'),
+  lmModels: (): Promise<LmModelCatalog> => api.get('/lm/models'),
   rollups: (channelId: number, opts: { level_limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<RollupsResponse> =>
     api.get('/luxriot/rollups', { channel_id: String(channelId), level_limit: String(opts.level_limit ?? 60), from_ts: opts.from_ts, to_ts: opts.to_ts }),
-  session: (channelId: number, limit = 40): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
-    api.get('/luxriot/session', { channel_id: String(channelId), limit: String(limit) }),
+  session: (channelId: number, opts: { limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
+    api.get('/luxriot/session', buildSessionQuery(channelId, opts)),
   startCapture: (b: CaptureInput): Promise<{ success: boolean; session?: any; error?: string }> => api.postJson('/luxriot/start_capture', b),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/luxriot/stop_capture', { channel_id: channelId }),
   flushCapture: (channelId: number): Promise<{ success: boolean; status?: { logs?: SummaryEntry[] }; items?: number }> =>

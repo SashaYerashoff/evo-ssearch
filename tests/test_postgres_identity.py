@@ -106,6 +106,7 @@ class IdentityRecordTests(unittest.TestCase):
     def test_records_are_immutable(self) -> None:
         record = identity()
         session = SessionRecord(
+            session_id=str(uuid.uuid4()),
             identity=record,
             csrf_digest="digest",
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -121,6 +122,7 @@ class RepositoryUnitTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tenant_id = uuid.uuid4()
         self.user_id = uuid.uuid4()
+        self.session_id = str(uuid.uuid4())
         self.hasher = StubHasher()
 
     def test_authenticate_is_case_insensitive_and_switches_actor_after_verify(self):
@@ -214,7 +216,7 @@ class RepositoryUnitTests(unittest.TestCase):
             [
                 (
                     "s.revoked_at IS NULL",
-                    Result(row=(self.user_id, csrf_digest, expiry)),
+                    Result(row=(uuid.UUID(self.session_id), self.user_id, csrf_digest, expiry)),
                 ),
                 ("set_config('eva.actor_id'", Result(row=("",))),
                 ("UPDATE iam.sessions", Result(rowcount=1)),
@@ -229,6 +231,7 @@ class RepositoryUnitTests(unittest.TestCase):
         self.assertEqual(
             session,
             SessionRecord(
+                session_id=self.session_id,
                 identity=expected,
                 csrf_digest=csrf_digest.hex(),
                 expires_at=expiry,

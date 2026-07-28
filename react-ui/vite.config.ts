@@ -4,10 +4,10 @@ import react from '@vitejs/plugin-react'
 // The React prototype talks to the existing Flask backend running on :5000.
 // Everything under these prefixes is proxied there so cookies/CSRF/SSE work.
 const API_TARGET = 'http://127.0.0.1:5000'
-const API_PREFIXES = [
+export const API_PREFIXES = [
   '/auth', '/detections', '/luxriot', '/probes', '/agent',
   '/describe_image', '/lm', '/settings', '/health', '/ready',
-  '/branding', '/image', '/comments', '/commented_images',
+  '/branding', '/image', '/comments', '/commented_images', '/audit',
 ]
 
 export default defineConfig({

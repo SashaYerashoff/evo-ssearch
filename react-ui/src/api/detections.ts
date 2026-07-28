@@ -15,8 +15,18 @@ export async function getChannels(): Promise<Channel[]> {
 }
 
 function num(v: any): number | null {
+  if (v === null || v === undefined || v === '') return null
   const n = Number(v)
   return Number.isFinite(n) ? n : null
+}
+
+function stableHash(value: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
 }
 
 /** Normalize a /detections/list row OR a /detections/search_* row into one shape. */
@@ -25,13 +35,17 @@ export function normalizeDetection(raw: any, channels?: Map<number, string>): De
   const channelId = num(raw.channel_id)
   const tsMs = num(raw.recorded_at_ms) ?? num(raw.timestamp_ms)
   const source = String(raw.source || '')
+  const fallbackIdentity = [
+    raw.shard_key, raw.image_path, raw.path, raw.probe_id, channelId, tsMs,
+    raw.filename, raw.anchor_frame_index, raw.frame_index,
+  ].map((v) => String(v ?? '')).join('|')
   // match %: search rows carry `similarity`; list rows carry it inside payload.
   const sim =
     num(raw.similarity) ??
     num(raw?.payload?.context?.bookmark_gate?.similarity)
   const matchPct = sim != null ? Math.round(sim * 100) : null
   return {
-    key: `${source}:${id ?? raw.shard_key ?? Math.random()}:${tsMs ?? ''}`,
+    key: `${source}:${id ?? raw.shard_key ?? stableHash(fallbackIdentity)}:${tsMs ?? ''}`,
     id,
     channelId,
     channelTitle: channelId != null ? channels?.get(channelId) : undefined,
@@ -55,34 +69,89 @@ function channelMap(channels: Channel[]): Map<number, string> {
   return new Map(channels.map((c) => [c.id, c.title]))
 }
 
-export async function listArchive(f: ArchiveFilters, channels: Channel[]): Promise<{ items: Detection[]; total: number; hasMore: boolean }> {
-  const res = await api.get('/detections/list', {
+export interface ArchiveFilterPayload extends Record<string, string | number | undefined> {
+  channel_id: string | undefined
+  source: string | undefined
+  probe_id: string | undefined
+  hours: number | undefined
+  since_ms: string | undefined
+  until_ms: string | undefined
+}
+
+/** The shared backend filter contract used by list, text search and image search. */
+export function buildArchiveFilterPayload(f: ArchiveFilters): ArchiveFilterPayload {
+  const customRange = !!(f.sinceMs || f.untilMs)
+  return {
     channel_id: f.channelId,
     source: f.source,
-    hours: f.sinceMs ? undefined : (f.hours ?? '24'),
+    probe_id: f.source === 'probe' ? f.probeId : undefined,
+    hours: customRange ? undefined : Number(f.hours ?? '24'),
     since_ms: f.sinceMs,
     until_ms: f.untilMs,
-    limit: f.rows ?? '24',
-  })
+  }
+}
+
+export function buildArchiveListQuery(f: ArchiveFilters, offset = 0): Record<string, string | number | undefined> {
+  return {
+    ...buildArchiveFilterPayload(f),
+    limit: Number(f.rows || 24),
+    offset: Math.max(0, offset),
+  }
+}
+
+export function buildArchiveSearchPayload(f: ArchiveFilters): Record<string, string | number | undefined> {
+  return {
+    ...buildArchiveFilterPayload(f),
+    limit: Number(f.rows || 24),
+    sort_by: f.sortBy || 'similarity',
+  }
+}
+
+export async function listArchive(
+  f: ArchiveFilters,
+  channels: Channel[],
+  offset = 0,
+): Promise<{ items: Detection[]; total: number; hasMore: boolean; offset: number }> {
+  const res = await api.get('/detections/list', buildArchiveListQuery(f, offset))
   const cmap = channelMap(channels)
   return {
     items: (res.detections || []).map((d: any) => normalizeDetection(d, cmap)),
     total: res.total ?? 0,
     hasMore: !!res.has_more,
+    offset: Number(res.offset ?? offset),
   }
 }
 
 export async function searchText(query: string, f: ArchiveFilters, channels: Channel[]): Promise<Detection[]> {
   const res = await api.postJson('/detections/search_text', {
     query,
-    channel_id: f.channelId || undefined,
-    source: f.source || undefined,
-    hours: f.hours ? Number(f.hours) : 24,
-    limit: Number(f.rows || 24),
-    sort_by: f.sortBy || 'similarity',
+    ...buildArchiveSearchPayload(f),
   })
   const cmap = channelMap(channels)
   return (res.results || []).map((d: any) => normalizeDetection(d, cmap))
+}
+
+export interface ArchiveProbeOption {
+  id: string
+  name: string
+  hitCount: number
+}
+
+export async function getArchiveProbeOptions(f: ArchiveFilters): Promise<ArchiveProbeOption[]> {
+  if (f.source !== 'probe') return []
+  const res = await api.get('/detections/summary', {
+    ...buildArchiveFilterPayload(f),
+    limit: 300,
+  })
+  return (res.summary || []).flatMap((item: any) => {
+    const id = String(item?.probe_id || '').trim()
+    if (!id) return []
+    return [{
+      id,
+      name: String(item?.probe_name || id),
+      hitCount: Number(item?.hit_count || 0),
+    }]
+  })
 }
 
 /** Describe a frame with the VLM. Returns the description text (`summary`). */
@@ -119,6 +188,14 @@ export function detImageSrc(d: Detection): string | null {
   if (d.imageRef && String(d.imageRef).startsWith('/')) return `/detections/image?image_path=${encodeURIComponent(String(d.imageRef))}`
   if (d.id != null) return `/detections/thumbnail/${d.id}`
   return null
+}
+
+/** Full-resolution Inspector source. Server paths are always routed through the guarded endpoint. */
+export function fullDetectionImageSrc(d: Detection): string | null {
+  if (d.imageRef) return `/detections/image?image_path=${encodeURIComponent(String(d.imageRef))}`
+  const url = d.raw?.image_url
+  if (url) return String(url)
+  return detImageSrc(d)
 }
 
 /** Normalize an arbitrary agent tool_result into grid-ready detections. */

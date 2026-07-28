@@ -4401,6 +4401,7 @@ def auth_login():
             {
                 "success": True,
                 "user": _identity_payload(login.identity),
+                "sessionId": login.session_id,
                 "expiresAt": login.expires_at.isoformat(),
                 "csrfHeader": "X-CSRF-Token",
             }
@@ -4443,6 +4444,7 @@ def auth_me():
         {
             "success": True,
             "user": _identity_payload(session_record.identity),
+            "sessionId": session_record.session_id,
             "expiresAt": session_record.expires_at.isoformat(),
             "csrfHeader": "X-CSRF-Token",
         }

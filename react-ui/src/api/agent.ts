@@ -21,6 +21,52 @@ function getCookie(name: string): string | null {
   return m ? decodeURIComponent(m[1]) : null
 }
 
+export function agentSubmissionText(message: string, imageB64?: string | null): string {
+  const text = String(message || '').trim()
+  if (text) return text
+  return imageB64 ? 'Describe this image.' : ''
+}
+
+/** Incremental SSE parser supporting LF/CRLF, split chunks and an unterminated EOF frame. */
+export class AgentSseParser {
+  private buffer = ''
+
+  push(chunk: string, final = false): AgentEvent[] {
+    this.buffer += chunk
+    const events: AgentEvent[] = []
+    let separator = this.buffer.match(/\r?\n\r?\n/)
+    while (separator?.index !== undefined) {
+      const frame = this.buffer.slice(0, separator.index)
+      this.buffer = this.buffer.slice(separator.index + separator[0].length)
+      const event = this.parseFrame(frame)
+      if (event) events.push(event)
+      separator = this.buffer.match(/\r?\n\r?\n/)
+    }
+    if (final) {
+      const event = this.parseFrame(this.buffer)
+      this.buffer = ''
+      if (event) events.push(event)
+    }
+    return events
+  }
+
+  private parseFrame(frame: string): AgentEvent | null {
+    const payload = frame
+      .split(/\r?\n/)
+      .filter((line) => line === 'data' || line.startsWith('data:'))
+      .map((line) => line === 'data' ? '' : line.slice(5).replace(/^ /, ''))
+      .join('\n')
+      .trim()
+    if (!payload) return null
+    try {
+      const parsed = JSON.parse(payload)
+      return parsed && typeof parsed === 'object' ? parsed as AgentEvent : null
+    } catch {
+      return null
+    }
+  }
+}
+
 export async function streamAgent(
   message: string,
   opts: { sessionId?: string | null; imageB64?: string | null; operatorMode?: boolean; signal?: AbortSignal },
@@ -49,22 +95,14 @@ export async function streamAgent(
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
-  let buf = ''
+  const parser = new AgentSseParser()
   while (true) {
     const { value, done } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    // frames separated by a blank line
-    let idx: number
-    while ((idx = buf.indexOf('\n\n')) !== -1) {
-      const frame = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
-      const line = frame.split('\n').find((l) => l.startsWith('data:'))
-      if (!line) continue
-      const payload = line.slice(5).trim()
-      if (!payload) continue
-      try { onEvent(JSON.parse(payload) as AgentEvent) } catch { /* ignore keep-alives */ }
+    if (done) {
+      for (const event of parser.push(decoder.decode(), true)) onEvent(event)
+      break
     }
+    for (const event of parser.push(decoder.decode(value, { stream: true }))) onEvent(event)
   }
 }
 
