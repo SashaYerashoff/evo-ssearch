@@ -15,9 +15,9 @@ export interface AgentAction { name: string; args: any; done: boolean; error?: s
 const LS_SESSION = 'evs_agent_session_id'
 const LS_WIDTH = 'evs_agent_half_width'
 const MIN_W = 420          // agent panel never narrower than this
-// keep enough console behind the panel for the toolbar to stay one line (~620px)
-// and a full 5-wide row of result cards (rail + padding + 5 × 172 + gaps)
-const MIN_CONSOLE = 1010
+// keep enough console behind the panel for the toolbar to stay one line
+// and a full 6-wide row of result cards (rail + padding + 6 × 172 + gaps)
+const MIN_CONSOLE = 1180
 const maxWidth = () => Math.max(MIN_W, window.innerWidth - MIN_CONSOLE)
 // effective half-width: use the saved value or a default a touch under half, always clamped
 const DEFAULT_FRAC = 0.42

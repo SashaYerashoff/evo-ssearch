@@ -310,7 +310,6 @@ export function ArchiveScreen({
       ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
       : null,
     (filters.sinceMs || filters.untilMs) ? 'custom range' : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h'),
-    `${filters.rows || '24'} rows`,
   ].filter(Boolean).join(' · ')
   const q = textValue.trim()
   const textSummary = q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—'

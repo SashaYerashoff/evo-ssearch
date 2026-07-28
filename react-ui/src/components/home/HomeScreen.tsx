@@ -19,7 +19,32 @@ const EDGES: [number, number][] = [
   [15, 16], [16, 17], [15, 21], [16, 21], [17, 21], [18, 21], [19, 21], [20, 17], [18, 19], [19, 20], [20, 21],
   [15, 1], [15, 2], [15, 3], [16, 3], [16, 4], [16, 5], [17, 5], [17, 6], [17, 7], [20, 7], [20, 8], [20, 9], [19, 10], [19, 11], [18, 12], [18, 13], [15, 14], [18, 14],
 ]
-const NODES = [...RING, ...CORE]
+// deep-structure nodes appended AFTER ring+core (keeps existing indices/NERVES valid),
+// adds interior density so the brain reads as a real mesh, not a sparse web
+const EXTRA: [number, number][] = [
+  [500, 252], [520, 292], [480, 272], [555, 258], [560, 200],
+  [612, 236], [610, 340], [600, 312], [640, 190], [690, 210],
+  [720, 258], [740, 300], [660, 322], [583, 300], [636, 262],
+  [512, 224], [700, 240], [548, 224], [672, 300], [590, 178],
+]
+const RING_N = RING.length
+const CORE_N = CORE.length
+const NODES = [...RING, ...CORE, ...EXTRA]
+
+const distN = (a: [number, number], b: [number, number]) => Math.hypot(a[0] - b[0], a[1] - b[1])
+// fine synaptic web: connect every node to its k nearest neighbours (organic density)
+function nearestEdges(nodes: [number, number][], k: number): [number, number][] {
+  const seen = new Set<string>()
+  const out: [number, number][] = []
+  nodes.forEach((n, i) => {
+    nodes.map((m, j) => ({ j, d: distN(n, m) })).filter((o) => o.j !== i).sort((a, b) => a.d - b.d).slice(0, k)
+      .forEach((o) => { const key = i < o.j ? `${i}-${o.j}` : `${o.j}-${i}`; if (!seen.has(key)) { seen.add(key); out.push([Math.min(i, o.j), Math.max(i, o.j)]) } })
+  })
+  return out
+}
+const MESH_EDGES = nearestEdges(NODES, 3)
+// tiny satellite dots hung off deep nodes for texture
+const MICRO: [number, number][] = EXTRA.map(([x, y], i) => [x + (i % 2 ? 9 : -9), y + (i % 3 ? -7 : 8)] as [number, number])
 
 // optic-nerve threads; each STARTS behind the eyelid (hidden by the opaque iris,
 // so it looks like it slips out from behind the eye) and ends exactly on a neuron.
@@ -57,8 +82,8 @@ const BEAM_HALF_W = 26       // half-width at the start
 const BEAM_SPREAD = Math.tan((8 * Math.PI) / 180)  // widens ~8° per side
 const fmtTimer = (s: number) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
-interface FlyFrame { id: number; sx: number; sy: number; p: number; label: string; det: { x: number; y: number; w: number; h: number }; cx?: number; cy?: number }
-interface BrainEvent { id: number; nerve: number; casc: { ni: number; hop: number }[] }
+interface FlyFrame { id: number; sx: number; sy: number; p: number; label: string; det: { x: number; y: number; w: number; h: number }; bad?: boolean; cx?: number; cy?: number }
+interface BrainEvent { id: number; nerve: number; casc: { ni: number; hop: number }[]; bad?: boolean }
 interface EvapPart { px: number; py: number; ex: number; ey: number; s: number; rot: number; delay: number; fill: string }
 interface Evap { id: number; x: number; y: number; parts: EvapPart[] }
 interface MetadataStreamSnapshot {
@@ -80,14 +105,17 @@ const STREAM_STORAGE_KEY = 'eva.home.metadata-stream.v1'
 const SERVER_START_TOLERANCE_MS = 2500
 const AVERAGE_SPAWN_MS = 875
 
+const BAD_LABELS = ['CORRUPT · ??', 'signal lost', 'decode err', 'malformed', 'ERR · 0x1F']
 function makeFlyFrame(id: number, p = 0): FlyFrame {
   const sp = SPAWNS[Math.floor(Math.random() * SPAWNS.length)]
+  const bad = Math.random() < 0.08   // rare harmful frame
   return {
     id,
     sx: sp[0] + rnd(-30, 30),
     sy: sp[1] + rnd(-25, 25),
     p,
-    label: LABELS[Math.floor(Math.random() * LABELS.length)],
+    bad,
+    label: bad ? BAD_LABELS[Math.floor(Math.random() * BAD_LABELS.length)] : LABELS[Math.floor(Math.random() * LABELS.length)],
     det: DETS[Math.floor(Math.random() * DETS.length)],
   }
 }
@@ -180,25 +208,28 @@ export function HomeScreen({
   const idRef = useRef(initialSnapshot?.nextId ?? 1)
   const spawnAt = useRef(performance.now() + (initialSnapshot?.spawnDelayMs ?? 0))
   const beamRef = useRef<SVGPathElement>(null)
-  const eyePressRef = useRef(initialSnapshot?.eyePresses ?? 0)
+  // the GAME never survives a reload/navigation — only the ambient frame stream does
+  const eyePressRef = useRef(0)
   const blinkTimerRef = useRef<number | null>(null)
   const serverBootRef = useRef<number | null>(initialSnapshot?.serverStartedAtMs ?? null)
-  const gameStateRef = useRef({
-    gameActive: initialSnapshot?.gameActive ?? false,
-    eyePresses: initialSnapshot?.eyePresses ?? 0,
-    count: initialSnapshot?.count ?? 0,
-    secs: initialSnapshot?.secs ?? 0,
-  })
+  const gameStateRef = useRef({ gameActive: false, eyePresses: 0, count: 0, secs: 0 })
   const [, force] = useState(0)
   const [events, setEvents] = useState<BrainEvent[]>([])
   const [evaps, setEvaps] = useState<Evap[]>([])
-  const [gameActive, setGameActive] = useState(initialSnapshot?.gameActive ?? false)
-  const [eyePresses, setEyePresses] = useState(initialSnapshot?.eyePresses ?? 0)
+  const [gameActive, setGameActive] = useState(false)
+  const [eyePresses, setEyePresses] = useState(0)
   const [blinkTick, setBlinkTick] = useState(0)
   const [manualBlink, setManualBlink] = useState(false)
   // Game score — hidden until the five-click eye activation.
-  const [count, setCount] = useState(initialSnapshot?.count ?? 0)
-  const [secs, setSecs] = useState(initialSnapshot?.secs ?? 0)
+  const [count, setCount] = useState(0)
+  const [secs, setSecs] = useState(0)
+
+  // leaving the Home screen (navigate away) ends the game
+  useEffect(() => {
+    if (active) return
+    eyePressRef.current = 0
+    setEyePresses(0); setGameActive(false); setCount(0); setSecs(0)
+  }, [active])
 
   useEffect(() => {
     gameStateRef.current = { gameActive, eyePresses, count, secs }
@@ -375,19 +406,23 @@ export function HomeScreen({
 
       if (caught.length) {
         framesRef.current = list.filter((f) => !caught.includes(f))
+        // score + dissolve only for good frames consumed during an active game
         if (gameActive) {
-          setCount((c) => c + caught.length)
-          for (const f of caught) {
-            // pixel-dissolve burst where the frame touched the eye
+          const good = caught.filter((f) => !f.bad)
+          if (good.length) setCount((c) => c + good.length)
+          for (const f of good) {
             const evap = makeEvap(idRef.current++, f.cx ?? EYE[0], f.cy ?? EYE[1])
             setEvaps((es) => [...es, evap])
             window.setTimeout(() => setEvaps((es) => es.filter((e) => e.id !== evap.id)), 1400)
-            // packet + excitation cascade in the brain
-            const nerve = Math.floor(Math.random() * NERVES.length)
-            const ev: BrainEvent = { id: idRef.current++, nerve, casc: makeCascade(nerve) }
-            setEvents((es) => [...es, ev])
-            window.setTimeout(() => setEvents((es) => es.filter((e) => e.id !== ev.id)), 4500)
           }
+        }
+        // brain impulse fires for EVERY metadata frame — game or not, watched or not.
+        // bad frames throw a red glitch ripple across the whole brain instead of a cascade.
+        for (const f of caught) {
+          const nerve = Math.floor(Math.random() * NERVES.length)
+          const ev: BrainEvent = { id: idRef.current++, nerve, casc: makeCascade(nerve), bad: f.bad }
+          setEvents((es) => [...es, ev])
+          window.setTimeout(() => setEvents((es) => es.filter((e) => e.id !== ev.id)), f.bad ? 1700 : 4500)
         }
         force((n) => n + 1)
       }
@@ -465,22 +500,56 @@ export function HomeScreen({
             <path d="M 750 205 C 738 230, 752 250, 740 275" />
             <path d="M 520 300 C 545 310, 570 308, 590 318" />
           </g>
+          {/* cerebellum striations */}
           <g stroke="rgba(56,224,212,0.4)" strokeWidth="1.2" fill="none">
             <path d="M 676 350 C 690 342, 712 340, 730 346" />
             <path d="M 682 358 C 696 351, 714 349, 728 354" />
+            <path d="M 688 366 C 700 360, 716 358, 726 362" />
           </g>
+          {/* extra gyri folds — denser cortical texture */}
+          <g stroke="rgba(56,224,212,0.28)" strokeWidth="1.2" fill="none">
+            <path d="M 528 170 C 548 186, 542 208, 560 222" />
+            <path d="M 596 132 C 606 156, 598 176, 612 196" />
+            <path d="M 672 128 C 678 158, 664 176, 678 200" />
+            <path d="M 740 168 C 730 192, 744 210, 734 236" />
+            <path d="M 470 240 C 492 250, 500 270, 522 278" />
+            <path d="M 560 260 C 584 268, 606 262, 628 272" />
+            <path d="M 632 210 C 646 226, 638 246, 654 262" />
+            <path d="M 700 250 C 690 272, 704 288, 694 310" />
+          </g>
+          {/* inner contour for depth */}
+          <path d="M 470 278 C 452 234, 480 182, 536 172 C 566 150, 620 148, 656 164
+                   C 704 156, 750 184, 760 226 C 770 262, 758 292, 732 308"
+            stroke="rgba(56,224,212,0.18)" strokeWidth="1" fill="none" />
           <path d="M 662 350 C 652 368, 640 382, 628 398"
             stroke="rgba(56,224,212,0.6)" strokeWidth="2.2" fill="none" strokeLinecap="round" />
 
+          {/* fine synaptic web (nearest-neighbour) under the structural mesh */}
+          <g stroke="rgba(56,224,212,0.16)" strokeWidth="0.8" fill="none">
+            {MESH_EDGES.map(([a, b], i) => (
+              <line key={`m${i}`} x1={NODES[a][0]} y1={NODES[a][1]} x2={NODES[b][0]} y2={NODES[b][1]} />
+            ))}
+          </g>
+          {/* structural mesh */}
           <g stroke="url(#sp-line)" strokeWidth="1.3" opacity="0.5" fill="none">
             {EDGES.map(([a, b], i) => (
               <line key={i} x1={NODES[a][0]} y1={NODES[a][1]} x2={NODES[b][0]} y2={NODES[b][1]} />
             ))}
           </g>
-          {NODES.map(([x, y], i) => (
-            <circle key={i} className={`sp-node n${i % 6}`} cx={x} cy={y} r={i < RING.length ? 3.6 : 5.2}
-              fill={i < RING.length ? '#38e0d4' : '#00d68f'} />
+          {/* satellite micro-dots for texture */}
+          {MICRO.map(([x, y], i) => (
+            <circle key={`mi${i}`} cx={x} cy={y} r={1.3} fill="rgba(122,247,230,0.5)" />
           ))}
+          {/* neurons: ring (bright), core (large), deep (small dim) */}
+          {NODES.map(([x, y], i) => {
+            const isRing = i < RING_N
+            const isCore = i >= RING_N && i < RING_N + CORE_N
+            return (
+              <circle key={i} className={`sp-node n${i % 6}`} cx={x} cy={y}
+                r={isRing ? 3.6 : isCore ? 5.2 : 2.4}
+                fill={isRing ? '#38e0d4' : isCore ? '#00d68f' : 'rgba(122,247,230,0.7)'} />
+            )
+          })}
         </g>
 
         {/* optic-nerve threads */}
@@ -496,7 +565,7 @@ export function HomeScreen({
 
         {/* ===== game: metadata frames drifting toward the eye ===== */}
         {framesRef.current.map((f) => (
-          <g key={f.id} className="sp-frame"
+          <g key={f.id} className={`sp-frame ${f.bad ? 'bad' : ''}`}
             transform={`translate(${f.sx} ${f.sy})`} style={{ opacity: 0 }}
             ref={(el) => { if (el) frameEls.current.set(f.id, el); else frameEls.current.delete(f.id) }}>
             <rect className="fr" x={-38} y={-22} width={76} height={44} rx={4} />
@@ -555,10 +624,27 @@ export function HomeScreen({
           </g>
         ))}
 
-        {/* ===== catch events: packet climbs a nerve, then the cascade rolls out ===== */}
+        {/* ===== catch events: packet climbs a nerve, then the cascade (or bad glitch) rolls out ===== */}
         {events.map((ev) => {
           const nerve = NERVES[ev.nerve]
           const tip = NODES[nerve.node]
+          if (ev.bad) {
+            // harmful frame → red data spike + a glitch ripple across the WHOLE brain
+            return (
+              <g key={ev.id}>
+                <circle className="sp-up-once" style={{ offsetPath: `path('${nerve.path}')` }}
+                  r={5} fill="#ff5a6a" filter="url(#sp-glow)" />
+                <ellipse className="sp-glitch-ring" cx={612} cy={244} rx={192} ry={134}
+                  fill="rgba(255,70,90,0.05)" stroke="rgba(255,90,106,0.55)" strokeWidth={1.6} />
+                <ellipse className="sp-glitch-ring two" cx={612} cy={244} rx={192} ry={134}
+                  fill="none" stroke="rgba(255,120,134,0.4)" strokeWidth={1.2} />
+                {NODES.map(([x, y], i) => (
+                  <circle key={i} className="sp-glitch-node" cx={x} cy={y} r={i < RING_N ? 4 : 3}
+                    fill="#ff6a78" style={{ animationDelay: `${(1.0 + distN(NODES[i], tip) / 460).toFixed(2)}s` }} />
+                ))}
+              </g>
+            )
+          }
           return (
             <g key={ev.id}>
               <circle className="sp-up-once" style={{ offsetPath: `path('${nerve.path}')` }}
@@ -567,7 +653,7 @@ export function HomeScreen({
                 cx={tip[0]} cy={tip[1]} r={105} fill="none" stroke="rgba(56,224,212,0.5)" strokeWidth={1.6} />
               {ev.casc.map(({ ni, hop }) => (
                 <circle key={ni} className="sp-casc-once" style={{ animationDelay: `${(1.05 + hop * 0.3).toFixed(2)}s` }}
-                  cx={NODES[ni][0]} cy={NODES[ni][1]} r={ni < RING.length ? 4.5 : 6} fill="#7af7e6" />
+                  cx={NODES[ni][0]} cy={NODES[ni][1]} r={ni < RING_N ? 4.5 : 6} fill="#7af7e6" />
               ))}
             </g>
           )

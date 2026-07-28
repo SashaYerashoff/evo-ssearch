@@ -56,7 +56,7 @@
 }
 .home-screen.home-screen-hidden { display: none; }
 @keyframes splash-in { from { opacity: 0 } to { opacity: 1 } }
-.home-screen svg { width: min(94vw, 1240px); max-height: 92vh; flex: 0 1 auto; }
+.home-screen svg { width: min(97vw, 1520px); max-height: 96vh; flex: 0 1 auto; }
 .splash-logo { height: 30px; filter: drop-shadow(0 3px 12px rgba(0,0,0,0.4)); }
 .splash-title { display: flex; align-items: center; gap: 10px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 20px; font-weight: 700; letter-spacing: .22em; text-transform: uppercase; color: var(--text); }
 .splash-sub { font-size: 12.5px; color: var(--text-mut); letter-spacing: .05em; }
@@ -106,6 +106,21 @@
 .sp-frame .det-g { opacity: 0; transition: opacity .25s ease; }
 .sp-frame.det-on .det-g { opacity: 1; }
 .sp-frame.analyzing rect.fr { stroke: #00d68f; }
+/* harmful (error) frame — red */
+.sp-frame.bad rect.fr { stroke: #ff5a6a; fill: rgba(40,12,18,0.74); }
+.sp-frame.bad .det { stroke: #ff5a6a; fill: rgba(214,40,60,0.1); }
+.sp-frame.bad text { fill: #ff8a94; }
+.sp-frame.bad > path { stroke: rgba(255,90,106,0.9) !important; }
+.sp-frame.bad.analyzing rect.fr { stroke: #ff8a94; }
+
+/* bad-frame glitch: a red ripple ring over the brain + red flash rolling across all neurons */
+@keyframes sp-glitch-ring { 0% { opacity: .6; transform: scale(.25) } 100% { opacity: 0; transform: scale(1.18) } }
+.sp-glitch-ring { transform-box: fill-box; transform-origin: center; opacity: 0; will-change: transform, opacity;
+  animation: sp-glitch-ring 1.15s ease-out .95s both; }
+.sp-glitch-ring.two { animation-delay: 1.15s; animation-duration: 1s; }
+@keyframes sp-glitch-node { 0% { opacity: 0; transform: scale(.3) } 22% { opacity: 1; transform: scale(1.5) } 100% { opacity: 0; transform: scale(.3) } }
+.sp-glitch-node { transform-box: fill-box; transform-origin: center; opacity: 0; will-change: transform, opacity;
+  animation: sp-glitch-node .7s ease-out both; }
 
 /* the eye's line-of-sight capture cone */
 .sp-beam { transition: opacity .18s ease; pointer-events: none; }
