@@ -21,6 +21,83 @@ export interface SummaryTextParts {
   marker: string
 }
 
+export type SummaryPeriod =
+  | 'live'
+  | 'today'
+  | 'yesterday'
+  | 'day_before_yesterday'
+  | '7d'
+  | '30d'
+  | 'custom'
+
+export type SummaryResolution = 'AUTO' | 'L0' | 'L1' | 'L2' | 'L3'
+
+export interface SummaryPeriodBounds {
+  from_ts?: number
+  to_ts?: number
+}
+
+function localDayStart(nowMs: number, dayOffset: number): number {
+  const now = new Date(nowMs)
+  return new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + dayOffset,
+  ).getTime() / 1000
+}
+
+export function summaryPeriodBounds(
+  period: SummaryPeriod,
+  nowMs = Date.now(),
+  custom: SummaryPeriodBounds = {},
+): SummaryPeriodBounds {
+  const nowSec = nowMs / 1000
+  if (period === 'live') return {}
+  if (period === 'today') return { from_ts: localDayStart(nowMs, 0), to_ts: nowSec }
+  if (period === 'yesterday') {
+    return {
+      from_ts: localDayStart(nowMs, -1),
+      to_ts: localDayStart(nowMs, 0) - 0.001,
+    }
+  }
+  if (period === 'day_before_yesterday') {
+    return {
+      from_ts: localDayStart(nowMs, -2),
+      to_ts: localDayStart(nowMs, -1) - 0.001,
+    }
+  }
+  if (period === '7d') return { from_ts: nowSec - 7 * 86400, to_ts: nowSec }
+  if (period === '30d') return { from_ts: nowSec - 30 * 86400, to_ts: nowSec }
+  const from = Number(custom.from_ts)
+  const to = Number(custom.to_ts)
+  if (!Number.isFinite(from) && !Number.isFinite(to)) return {}
+  if (Number.isFinite(from) && Number.isFinite(to) && from > to) {
+    return { from_ts: to, to_ts: from }
+  }
+  return {
+    from_ts: Number.isFinite(from) ? from : undefined,
+    to_ts: Number.isFinite(to) ? to : undefined,
+  }
+}
+
+export function resolveSummaryResolution(
+  resolution: SummaryResolution,
+  period: SummaryPeriod,
+  bounds: SummaryPeriodBounds = {},
+): 'L0' | 'L1' | 'L2' | 'L3' {
+  if (resolution !== 'AUTO') return resolution
+  if (period === 'live') return 'L0'
+  if (period === 'today' || period === 'yesterday' || period === 'day_before_yesterday') return 'L1'
+  if (period === '7d') return 'L2'
+  if (period === '30d') return 'L3'
+  const duration = Number(bounds.to_ts) - Number(bounds.from_ts)
+  if (!Number.isFinite(duration) || duration <= 0) return 'L3'
+  if (duration <= 8 * 3600) return 'L0'
+  if (duration <= 36 * 3600) return 'L1'
+  if (duration <= 8 * 86400) return 'L2'
+  return 'L3'
+}
+
 export function summaryEntryKey(entry: SummaryEntry, index: number): string {
   const values = [
     entry.rollup_id,

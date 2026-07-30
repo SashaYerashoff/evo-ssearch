@@ -119,6 +119,7 @@ describe('React/backend contract normalizers', () => {
     expect(buildSessionQuery(7, { limit: 60, from_ts: 1234 })).toEqual({
       channel_id: '7',
       limit: '60',
+      run: undefined,
       from_ts: 1234,
       to_ts: undefined,
     })
@@ -128,6 +129,7 @@ describe('React/backend contract normalizers', () => {
     expect(buildSummaryFeedQuery(7, { limit: 240, from_ts: 1234 })).toEqual({
       channel_id: '7',
       limit: '240',
+      run: undefined,
       from_ts: 1234,
       to_ts: undefined,
       view: 'feed',

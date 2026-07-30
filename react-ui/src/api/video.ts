@@ -151,17 +151,19 @@ export interface LmModelCatalog {
 export interface SessionQuery extends Record<string, unknown> {
   channel_id: string
   limit: string
+  run?: string
   from_ts?: number
   to_ts?: number
 }
 
 export function buildSessionQuery(
   channelId: number,
-  opts: { limit?: number; from_ts?: number; to_ts?: number } = {},
+  opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {},
 ): SessionQuery {
   return {
     channel_id: String(channelId),
     limit: String(opts.limit ?? 40),
+    run: opts.run,
     from_ts: opts.from_ts,
     to_ts: opts.to_ts,
   }
@@ -169,7 +171,7 @@ export function buildSessionQuery(
 
 export function buildSummaryFeedQuery(
   channelId: number,
-  opts: { limit?: number; from_ts?: number; to_ts?: number } = {},
+  opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {},
 ): SessionQuery & { view: 'feed' } {
   return { ...buildSessionQuery(channelId, opts), view: 'feed' }
 }
@@ -177,9 +179,25 @@ export function buildSummaryFeedQuery(
 export const videoApi = {
   streams: (): Promise<StreamsStatus> => api.get('/luxriot/streams'),
   lmModels: (): Promise<LmModelCatalog> => api.get('/lm/models'),
-  rollups: (channelId: number, opts: { level_limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<RollupsResponse> =>
-    api.get('/luxriot/rollups', { channel_id: String(channelId), level_limit: String(opts.level_limit ?? 60), from_ts: opts.from_ts, to_ts: opts.to_ts }),
-  session: (channelId: number, opts: { limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
+  rollups: (
+    channelId: number,
+    opts: {
+      level_limit?: number
+      run?: string
+      from_ts?: number
+      to_ts?: number
+      target_level?: 'L1' | 'L2' | 'L3'
+    } = {},
+  ): Promise<RollupsResponse> =>
+    api.get('/luxriot/rollups', {
+      channel_id: String(channelId),
+      level_limit: String(opts.level_limit ?? 60),
+      run: opts.run,
+      from_ts: opts.from_ts,
+      to_ts: opts.to_ts,
+      target_level: opts.target_level,
+    }),
+  session: (channelId: number, opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
     api.get('/luxriot/session', buildSummaryFeedQuery(channelId, opts)),
   startCapture: (b: CaptureInput): Promise<{ success: boolean; session?: any; error?: string }> => api.postJson('/luxriot/start_capture', b),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/luxriot/stop_capture', { channel_id: channelId }),

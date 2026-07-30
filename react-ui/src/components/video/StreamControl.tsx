@@ -13,14 +13,24 @@ import {
 import type { Channel } from '../../api/types'
 import { Dropdown, type DropOption } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
+import type { SummaryPeriod, SummaryResolution } from './summaryView'
 
 const BATCHES = ['4', '8', '12', '16', '24', '32']
-export const HISTORY = [
-  { v: '6', label: 'Last 6 hours' }, { v: '24', label: 'Last day' }, { v: '72', label: 'Last 3 days' },
-  { v: '168', label: 'Last week' }, { v: '720', label: 'Last month' }, { v: '0', label: 'All history' },
+export const PERIODS: Array<{ v: SummaryPeriod; label: string }> = [
+  { v: 'live', label: 'Live' },
+  { v: 'today', label: 'Today' },
+  { v: 'yesterday', label: 'Yesterday' },
+  { v: 'day_before_yesterday', label: 'Day before yesterday' },
+  { v: '7d', label: 'Last 7 days' },
+  { v: '30d', label: 'Last 30 days' },
+  { v: 'custom', label: 'Custom range…' },
 ]
-export const DEPTH = [
-  { v: 'L0', label: 'Live' }, { v: 'L1', label: 'Minutes' }, { v: 'L2', label: 'Hours' }, { v: 'L3', label: 'Days' },
+export const RESOLUTIONS: Array<{ v: SummaryResolution; label: string }> = [
+  { v: 'AUTO', label: 'Auto' },
+  { v: 'L0', label: 'Observations' },
+  { v: 'L1', label: '15 minute summaries' },
+  { v: 'L2', label: '1 hour summaries' },
+  { v: 'L3', label: '8 hour summaries' },
 ]
 
 export function StreamControl(p: {
@@ -37,8 +47,11 @@ export function StreamControl(p: {
   capturing: boolean; busy: boolean
   onStart: () => void; onStop: () => void; onFlush: () => void
   onPromptSettings: () => void
-  history: string; onHistory: (v: string) => void
-  depth: string; onDepth: (v: string) => void
+  period: SummaryPeriod; onPeriod: (v: SummaryPeriod) => void
+  resolution: SummaryResolution; onResolution: (v: SummaryResolution) => void
+  customFrom: string; onCustomFrom: (v: string) => void
+  customTo: string; onCustomTo: (v: string) => void
+  onApplyCustom: () => void
   onRefreshFeed: () => void
   live: boolean; onToggleLive: () => void
   summaryCount: number
@@ -50,8 +63,8 @@ export function StreamControl(p: {
   const chTitle = p.channels.find((c) => c.id === p.channelId)?.title || '—'
   const streamSummary = `${chTitle} · batch ${p.batch} · ${p.every}s · ${p.capturing ? 'capturing' : 'idle'}`
   const lensSummary = [
-    HISTORY.find((h) => h.v === p.history)?.label || 'Last 6 hours',
-    DEPTH.find((d) => d.v === p.depth)?.label || 'Live',
+    PERIODS.find((item) => item.v === p.period)?.label || 'Live',
+    RESOLUTIONS.find((item) => item.v === p.resolution)?.label || 'Auto',
     p.live ? 'live on' : 'live off',
   ].join(' · ')
 
@@ -94,26 +107,44 @@ export function StreamControl(p: {
           </div>
         </div>
       ) : (
-        <div className="vid-lens-controls">
-          <div className="vid-lens-fields">
-            <div className="wfield hist"><label>History</label>
-              <Dropdown value={p.history} onChange={p.onHistory} options={HISTORY.map((h) => ({ value: h.v, label: h.label }))} />
+        <div className="vid-lens-stack">
+          <div className="vid-tb-row vid-lens-row">
+            <div className="wfield hist"><label>Period</label>
+              <Dropdown
+                value={p.period}
+                onChange={(value) => p.onPeriod(value as SummaryPeriod)}
+                options={PERIODS.map((item) => ({ value: item.v, label: item.label }))}
+              />
             </div>
-            <div className="wfield sm"><label>Depth</label>
-              <Dropdown value={p.depth} onChange={p.onDepth} options={DEPTH.map((d) => ({ value: d.v, label: d.label }))} />
+            <div className="wfield resolution"><label>Resolution</label>
+              <Dropdown
+                value={p.resolution}
+                onChange={(value) => p.onResolution(value as SummaryResolution)}
+                options={RESOLUTIONS.map((item) => ({ value: item.v, label: item.label }))}
+              />
             </div>
-            <span className="vid-lens-count">{p.summaryCount} summaries</span>
+            <div className="vid-tb-actions">
+              <button className="mon-btn" onClick={p.onRefreshFeed}><IconReload size={14} /> Refresh</button>
+              <button className={`mon-btn ${p.live ? 'accent' : ''}`} onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? 'Live on' : 'Live off'}</button>
+              <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onCollapseAll}>
+                <IconChevronsUp size={14} /> Collapse all
+              </button>
+              <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onExpandAll}>
+                <IconChevronsDown size={14} /> Expand all
+              </button>
+            </div>
           </div>
-          <div className="vid-lens-actions">
-            <button className="mon-btn" onClick={p.onRefreshFeed}><IconReload size={14} /> Refresh</button>
-            <button className={`mon-btn ${p.live ? 'accent' : ''}`} onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? 'Live on' : 'Live off'}</button>
-            <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onCollapseAll}>
-              <IconChevronsUp size={14} /> Collapse all
-            </button>
-            <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onExpandAll}>
-              <IconChevronsDown size={14} /> Expand all
-            </button>
-          </div>
+          {p.period === 'custom' && (
+            <div className="vid-lens-custom">
+              <div className="wfield"><label>From</label>
+                <input type="datetime-local" value={p.customFrom} onChange={(event) => p.onCustomFrom(event.target.value)} />
+              </div>
+              <div className="wfield"><label>To</label>
+                <input type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} />
+              </div>
+              <button className="mon-btn" onClick={p.onApplyCustom}><IconReload size={14} /> Apply</button>
+            </div>
+          )}
         </div>
       )}
     </ToolTabs>

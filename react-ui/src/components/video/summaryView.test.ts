@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
+  resolveSummaryResolution,
   summaryAlertCounts,
   summaryBurst,
   summaryEntryKey,
+  summaryPeriodBounds,
   summarySemanticStatus,
   splitSummaryMachineJson,
 } from './summaryView'
@@ -56,5 +58,31 @@ describe('video summary view metadata', () => {
       machineJson: '{"events":[]}',
       marker: 'BATCH_STATE_JSON:',
     })
+  })
+
+  it('matches the legacy period windows in the browser timezone', () => {
+    const now = new Date(2026, 6, 31, 12, 30, 0).getTime()
+    expect(summaryPeriodBounds('live', now)).toEqual({})
+    expect(summaryPeriodBounds('today', now)).toEqual({
+      from_ts: new Date(2026, 6, 31).getTime() / 1000,
+      to_ts: now / 1000,
+    })
+    expect(summaryPeriodBounds('yesterday', now)).toEqual({
+      from_ts: new Date(2026, 6, 30).getTime() / 1000,
+      to_ts: new Date(2026, 6, 31).getTime() / 1000 - 0.001,
+    })
+    expect(summaryPeriodBounds('custom', now, { from_ts: 20, to_ts: 10 })).toEqual({
+      from_ts: 10,
+      to_ts: 20,
+    })
+  })
+
+  it('uses the legacy Auto resolution policy', () => {
+    expect(resolveSummaryResolution('AUTO', 'live')).toBe('L0')
+    expect(resolveSummaryResolution('AUTO', 'today')).toBe('L1')
+    expect(resolveSummaryResolution('AUTO', '7d')).toBe('L2')
+    expect(resolveSummaryResolution('AUTO', '30d')).toBe('L3')
+    expect(resolveSummaryResolution('AUTO', 'custom', { from_ts: 0, to_ts: 6 * 3600 })).toBe('L0')
+    expect(resolveSummaryResolution('L2', 'live')).toBe('L2')
   })
 })

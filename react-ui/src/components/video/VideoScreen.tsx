@@ -17,12 +17,17 @@ import { StreamControl } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import {
   SUMMARY_SEVERITIES,
+  resolveSummaryResolution,
   splitSummaryMachineJson,
   summaryAlertCounts,
   summaryBurst,
   summaryEntryKey,
   summaryLevel,
+  summaryPeriodBounds,
   summarySemanticStatus,
+  type SummaryPeriod,
+  type SummaryPeriodBounds,
+  type SummaryResolution,
 } from './summaryView'
 
 function asTimestampMs(value: unknown): number | null {
@@ -41,6 +46,32 @@ function fmtTimestamp(value: unknown): string {
     minute: '2-digit',
     second: '2-digit',
   })
+}
+
+function formatDatetimeLocal(timestampSec: number): string {
+  const date = new Date(timestampSec * 1000)
+  if (!Number.isFinite(date.getTime())) return ''
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+  ].join('T')
+}
+
+function parseDatetimeLocal(value: string): number | undefined {
+  const timestampMs = new Date(String(value || '')).getTime()
+  return Number.isFinite(timestampMs) ? timestampMs / 1000 : undefined
+}
+
+function defaultCustomRange(): { inputs: { from: string; to: string }; bounds: SummaryPeriodBounds } {
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime() / 1000
+  const bounds = { from_ts: yesterday, to_ts: today - 0.001 }
+  return {
+    inputs: { from: formatDatetimeLocal(yesterday), to: formatDatetimeLocal(today) },
+    bounds,
+  }
 }
 
 function summaryRange(entry: SummaryEntry): string {
@@ -232,8 +263,12 @@ export function VideoScreen({
   const [every, setEvery] = useState('5')
   const [model, setModel] = useState('auto')
   const [prompt, setPrompt] = useState('')
-  const [history, setHistory] = useState('6')
-  const [depth, setDepth] = useState('L0')
+  const [period, setPeriod] = useState<SummaryPeriod>('live')
+  const [resolution, setResolution] = useState<SummaryResolution>('AUTO')
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo] = useState('')
+  const [customBounds, setCustomBounds] = useState<SummaryPeriodBounds>({})
+  const [renderedDepth, setRenderedDepth] = useState<'L0' | 'L1' | 'L2' | 'L3'>('L0')
   const [live, setLive] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -258,22 +293,37 @@ export function VideoScreen({
 
   const loadFeed = useCallback(async () => {
     if (channelId == null) return
-    const from_ts = history !== '0' ? Math.floor(Date.now() / 1000 - Number(history) * 3600) : undefined
+    const bounds = summaryPeriodBounds(period, Date.now(), customBounds)
+    const targetDepth = resolveSummaryResolution(resolution, period, bounds)
+    const run = period === 'live' ? 'live' : 'all'
     try {
       let entries: SummaryEntry[] = []
-      if (depth === 'L0') {
-        const response = await videoApi.session(channelId, { limit: 240, from_ts })
+      let displayDepth = targetDepth
+      if (targetDepth === 'L0') {
+        const response = await videoApi.session(channelId, { limit: 240, run, ...bounds })
         entries = response.logs || []
       } else {
-        const response = await videoApi.rollups(channelId, { level_limit: 240, from_ts })
-        entries = (response.levels as any)?.[depth] || []
+        const response = await videoApi.rollups(channelId, {
+          level_limit: 240,
+          run,
+          ...bounds,
+          target_level: targetDepth,
+        })
+        entries = (response.levels as any)?.[targetDepth] || []
+        if (!entries.length && resolution === 'AUTO' && period !== 'live') {
+          const fallback = await videoApi.session(channelId, { limit: 240, run: 'all', ...bounds })
+          entries = fallback.logs || []
+          displayDepth = 'L0'
+        }
       }
+      setRenderedDepth(displayDepth)
       setFeed(entries.slice().sort((left, right) => (
         Number(left.created_at ?? left.window_start ?? 0)
         - Number(right.created_at ?? right.window_start ?? 0)
       )))
+      setError(null)
     } catch (e: any) { setError(e?.message || 'Feed failed') }
-  }, [channelId, depth, history])
+  }, [channelId, customBounds, period, resolution])
 
   useEffect(() => { loadStreams() }, [loadStreams])
   useEffect(() => { loadFeed() }, [loadFeed])
@@ -285,12 +335,17 @@ export function VideoScreen({
       setChannelId(nextChannel)
     }
     const nextDepth = String(payload.depth || '').toUpperCase()
-    if (['L0', 'L1', 'L2', 'L3'].includes(nextDepth)) setDepth(nextDepth)
+    if (['AUTO', 'L0', 'L1', 'L2', 'L3'].includes(nextDepth)) {
+      setResolution(nextDepth as SummaryResolution)
+    }
     const sinceMs = Number(payload.since_ms)
     const untilMs = Number(payload.until_ms)
     if (Number.isFinite(sinceMs) && Number.isFinite(untilMs) && untilMs >= sinceMs) {
-      const hours = Math.max(1, Math.ceil((untilMs - sinceMs) / 3_600_000))
-      setHistory(String(hours))
+      const bounds = { from_ts: sinceMs / 1000, to_ts: untilMs / 1000 }
+      setCustomFrom(formatDatetimeLocal(bounds.from_ts))
+      setCustomTo(formatDatetimeLocal(bounds.to_ts))
+      setCustomBounds(bounds)
+      setPeriod('custom')
       setLive(false)
     }
     if (action === 'open_prompt_settings' && canManagePrompts) setPromptOpen(true)
@@ -370,6 +425,34 @@ export function VideoScreen({
       return next
     })
   }, [])
+  const selectPeriod = useCallback((nextPeriod: SummaryPeriod) => {
+    if (nextPeriod === 'custom' && (!customFrom || !customTo)) {
+      const initial = defaultCustomRange()
+      setCustomFrom(initial.inputs.from)
+      setCustomTo(initial.inputs.to)
+      setCustomBounds(initial.bounds)
+    }
+    setPeriod(nextPeriod)
+    setLive(nextPeriod === 'live')
+  }, [customFrom, customTo])
+  const applyCustomRange = useCallback(() => {
+    const from_ts = parseDatetimeLocal(customFrom)
+    const to_ts = parseDatetimeLocal(customTo)
+    if (!Number.isFinite(from_ts) || !Number.isFinite(to_ts)) {
+      setError('Choose both From and To values for the custom summary period.')
+      return
+    }
+    setCustomBounds({ from_ts, to_ts })
+    setLive(false)
+  }, [customFrom, customTo])
+  const toggleLive = useCallback(() => {
+    if (period !== 'live') {
+      setPeriod('live')
+      setLive(true)
+      return
+    }
+    setLive((current) => !current)
+  }, [period])
 
   return (
     <div className="vid-cols">
@@ -380,8 +463,10 @@ export function VideoScreen({
         canCapture={canCapture} canManagePrompts={canManagePrompts}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
-        history={history} onHistory={setHistory} depth={depth} onDepth={setDepth}
-        onRefreshFeed={loadFeed} live={live} onToggleLive={() => setLive((v) => !v)}
+        period={period} onPeriod={selectPeriod} resolution={resolution} onResolution={setResolution}
+        customFrom={customFrom} onCustomFrom={setCustomFrom} customTo={customTo} onCustomTo={setCustomTo}
+        onApplyCustom={applyCustomRange}
+        onRefreshFeed={loadFeed} live={live} onToggleLive={toggleLive}
         summaryCount={feed.length} onCollapseAll={collapseAll} onExpandAll={expandAll}
       />
 
@@ -427,7 +512,7 @@ export function VideoScreen({
             <div>
               <div className="mon-panel-title">VLM feed</div>
               <div className="vid-feed-meta">
-                {channelName(channelId ?? -1) || 'No channel'} · {depth} · {feed.length} summaries
+                {channelName(channelId ?? -1) || 'No channel'} · {resolution === 'AUTO' ? `Auto → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
                 {live ? ' · following live' : ' · fixed view'}
               </div>
             </div>
@@ -446,7 +531,7 @@ export function VideoScreen({
                 <SummaryCard
                   key={key}
                   entry={entry}
-                  selectedDepth={depth}
+                  selectedDepth={renderedDepth}
                   collapsed={collapsedSummaries.has(key)}
                   canExport={canExport}
                   onToggle={() => toggleSummary(key)}
