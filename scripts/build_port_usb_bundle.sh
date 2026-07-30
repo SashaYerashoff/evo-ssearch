@@ -28,6 +28,7 @@ mkdir -p "${STAGING_ROOT}/models/clip"
 mkdir -p "${STAGING_ROOT}/llama.cpp"
 mkdir -p "${STAGING_ROOT}/wheelhouse"
 mkdir -p "${STAGING_ROOT}/apt"
+mkdir -p "${STAGING_ROOT}/installer-deb"
 mkdir -p "${STAGING_ROOT}/repository-backup"
 
 rsync -a --delete --delete-excluded \
@@ -89,6 +90,8 @@ install -p -m 0644 \
 git -C "${REPO_ROOT}" bundle create \
     "${STAGING_ROOT}/repository-backup/evo-ssearch-all-refs.bundle" \
     --all
+python3 "${SCRIPT_DIR}/build_appliance_installer_deb.py" \
+    --output-dir "${STAGING_ROOT}/installer-deb"
 
 echo "Base payload prepared at ${STAGING_ROOT}"
 echo "Populate wheelhouse/ and apt/, then run scripts/finalize_port_usb_bundle.py."

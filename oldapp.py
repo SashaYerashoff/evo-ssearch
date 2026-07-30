@@ -1798,6 +1798,13 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         raise ValueError(f"Unsupported embedder: {target}")
 
 
+# Appliances index every channel continuously.  Loading the configured
+# embedder while the worker boots makes /ready meaningful and prevents the
+# first archive frame from paying (or discovering) the model-load failure.
+if bool(getattr(config, "EMBEDDER_EAGER_LOAD", False)):
+    ensure_embedder_loaded(active_embedder)
+
+
 def reset_embedder_runtime_state() -> None:
     """Clear loaded embedding backends so they can be re-initialized."""
     global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device, dino_encoder

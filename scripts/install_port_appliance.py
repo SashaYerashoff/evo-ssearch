@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -38,6 +39,8 @@ DEFAULT_ROOT = Path("/opt/eva-ai")
 DEFAULT_DATA = Path("/var/lib/eva-ai")
 DEFAULT_CONFIG = Path("/etc/eva-ai")
 DEFAULT_BACKUPS = Path("/var/backups/eva-ai")
+DEFAULT_INSTALLER_STATE = Path("/var/lib/eva-ai-installer/install-state.json")
+DEFAULT_OFFLINE_APT_ROOT = Path("/var/cache/eva-ai-offline-apt")
 DEFAULT_VLM_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_VLM_MODEL = "qwen/qwen3-vl-4b"
 DEFAULT_DEEP_URL = "http://127.0.0.1:1236/v1"
@@ -59,6 +62,7 @@ PORT_ENV = {
     "EVOSSEARCH_TRUSTED_PROXY_HOPS": "1",
     "EVOSSEARCH_DB_STRICT_RUNTIME_ROLES": "true",
     "EVOSSEARCH_EMBEDDER": "clip",
+    "EVOSSEARCH_EMBEDDER_EAGER_LOAD": "true",
     "EVOSSEARCH_INDEX_MODE": "clip",
     "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "ViT-B/32",
     "EVOSSEARCH_CLIP_MODEL": "ViT-B/32",
@@ -152,6 +156,103 @@ class InstallError(RuntimeError):
 
 
 @dataclass
+class InstallJournal:
+    """Secret-free, crash-safe record of installer phase boundaries.
+
+    Completed phases are deliberately replayed on a retry.  Every phase in this
+    installer is idempotent, and replaying it is safer than trusting a stale
+    "completed" marker after a power loss.
+    """
+
+    path: Path = DEFAULT_INSTALLER_STATE
+    dry_run: bool = False
+    secrets_to_redact: tuple[str, ...] = ()
+    payload: dict = field(default_factory=dict)
+
+    def add_secrets(self, values: Iterable[str]) -> None:
+        additions = tuple(str(value) for value in values if value)
+        self.secrets_to_redact = tuple(
+            dict.fromkeys((*self.secrets_to_redact, *additions))
+        )
+
+    def _safe(self, value: str) -> str:
+        safe = str(value)
+        for secret in sorted(self.secrets_to_redact, key=len, reverse=True):
+            safe = safe.replace(secret, "***")
+        return safe
+
+    def _write(self) -> None:
+        if self.dry_run:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        _atomic_write(
+            self.path,
+            json.dumps(self.payload, indent=2, sort_keys=True) + "\n",
+            0o600,
+        )
+
+    def begin(self, bundle_root: Path, answers: "Answers") -> None:
+        previous = {}
+        if self.path.is_file():
+            try:
+                previous = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous = {}
+        attempts = int(previous.get("attempts") or 0) + 1
+        manifest_path = bundle_root / "manifest.json"
+        bundle_id = ""
+        if manifest_path.is_file():
+            bundle_id = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        self.payload = {
+            "format": 1,
+            "version": VERSION,
+            "bundle_id": bundle_id,
+            "attempts": attempts,
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "last_completed_phase": previous.get("last_completed_phase"),
+            "target": {
+                "install_root": str(answers.install_root),
+                "data_root": str(answers.data_root),
+                "config_root": str(answers.config_root),
+                "evo_url": answers.evo_url,
+                "evo_username": answers.evo_username,
+                "local_vlm": answers.local_vlm,
+                "vlm_url": answers.vlm_url,
+                "local_deep": answers.local_deep,
+                "deep_url": answers.deep_url,
+                "timezone": answers.timezone,
+                "admin_username": answers.admin_username,
+            },
+            "phases": {},
+        }
+        self._write()
+
+    def mark(self, phase: str, status: str, detail: str = "") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        phases = self.payload.setdefault("phases", {})
+        phases[phase] = {
+            "status": status,
+            "updated_at": now,
+            **({"detail": self._safe(detail)[:500]} if detail else {}),
+        }
+        if status == "completed":
+            self.payload["last_completed_phase"] = phase
+        elif status == "failed":
+            self.payload["status"] = "failed"
+            self.payload["failed_phase"] = phase
+        self.payload["updated_at"] = now
+        self._write()
+
+    def complete(self) -> None:
+        self.payload["status"] = "complete"
+        self.payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self.payload.pop("failed_phase", None)
+        self._write()
+
+
+@dataclass
 class Hardware:
     gpu_lines: list[str] = field(default_factory=list)
     nvidia_pci: bool = False
@@ -196,6 +297,10 @@ class Runner:
             safe = safe.replace(secret, "***")
         return safe
 
+    def add_secrets(self, values: Iterable[str]) -> None:
+        additions = tuple(str(value) for value in values if value)
+        self.secrets = tuple(dict.fromkeys((*self.secrets, *additions)))
+
     def run(
         self,
         command: Sequence[str | Path],
@@ -228,6 +333,18 @@ class Runner:
         return completed
 
 
+def run_phase(journal: InstallJournal, name: str, operation):
+    print(f"\n== {name} ==")
+    journal.mark(name, "running")
+    try:
+        result = operation()
+    except Exception as exc:
+        journal.mark(name, "failed", f"{type(exc).__name__}: {exc}")
+        raise
+    journal.mark(name, "completed")
+    return result
+
+
 def _prompt(label: str, default: str | None = None) -> str:
     suffix = f" [{default}]" if default else ""
     entered = input(f"{label}{suffix}: ").strip()
@@ -240,6 +357,21 @@ def _prompt_secret(label: str, *, minimum: int = 1) -> str:
         if len(value) >= minimum:
             return value
         print(f"Please enter at least {minimum} characters.")
+
+
+def _read_secret_file(path_value: str | None, label: str, *, minimum: int) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    try:
+        value = path.read_text(encoding="utf-8").rstrip("\r\n")
+    except OSError as exc:
+        raise InstallError(f"Cannot read {label} file {path}: {exc}") from exc
+    if len(value) < minimum:
+        raise InstallError(f"{label} must contain at least {minimum} characters.")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise InstallError(f"{label} file must contain exactly one line.")
+    return value
 
 
 def _yes_no(label: str, default: bool = True) -> bool:
@@ -262,6 +394,8 @@ def _url(value: str) -> str:
     parsed = urlsplit(text)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise InstallError(f"Not a valid HTTP(S) URL: {value!r}")
+    if parsed.username or parsed.password:
+        raise InstallError("URLs containing embedded credentials are not supported.")
     return text.rstrip("/")
 
 
@@ -320,6 +454,25 @@ def nearest_existing(path: Path) -> Path:
 
 def disk_free_gib(path: Path) -> float:
     return shutil.disk_usage(nearest_existing(path)).free / (1024**3)
+
+
+def validate_target_host(os_release: Path = Path("/etc/os-release")) -> None:
+    machine = platform.machine().lower()
+    if machine not in {"x86_64", "amd64"}:
+        raise InstallError(
+            f"This bundle targets Ubuntu 24.04 amd64; detected architecture {machine!r}."
+        )
+    values: dict[str, str] = {}
+    if os_release.is_file():
+        for line in os_release.read_text(encoding="utf-8").splitlines():
+            key, separator, raw = line.partition("=")
+            if separator:
+                values[key] = raw.strip().strip("\"'")
+    if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
+        raise InstallError(
+            "This appliance bundle requires Ubuntu Server 24.04. "
+            f"Detected {values.get('ID', 'unknown')} {values.get('VERSION_ID', 'unknown')}."
+        )
 
 
 def evo_reachable(url: str) -> tuple[bool, str]:
@@ -421,26 +574,74 @@ def database_exists() -> bool:
 
 def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
     if non_interactive:
-        required = (args.evo_url, args.evo_username, args.evo_password)
+        if args.evo_password and args.evo_password_file:
+            raise InstallError(
+                "Use either --evo-password or --evo-password-file, not both."
+            )
+        evo_password = args.evo_password or _read_secret_file(
+            args.evo_password_file,
+            "Evo password",
+            minimum=1,
+        )
+        admin_password = _read_secret_file(
+            args.admin_password_file,
+            "administrator password",
+            minimum=12,
+        )
+        required = (args.evo_url, args.evo_username, evo_password, admin_password)
         if not all(required):
             raise InstallError(
-                "--non-interactive requires --evo-url, --evo-username and --evo-password"
+                "--non-interactive requires Evo URL/username/password and "
+                "--admin-password-file"
+            )
+        if args.no_deep_review and args.external_deep_url:
+            raise InstallError(
+                "--no-deep-review cannot be combined with --external-deep-url"
             )
         root = Path(args.install_root or DEFAULT_ROOT)
+        local_deep = not bool(args.external_deep_url) and not args.no_deep_review
+        deep_url = (
+            ""
+            if args.no_deep_review
+            else _url(args.external_deep_url or DEFAULT_DEEP_URL)
+        )
+        deep_model = (
+            ""
+            if not deep_url
+            else args.external_deep_model or DEFAULT_DEEP_MODEL
+        )
+        quiet_enabled = bool(
+            deep_url and args.quiet_window_start and args.quiet_window_end
+        )
+        if bool(args.quiet_window_start) != bool(args.quiet_window_end):
+            raise InstallError(
+                "Both --quiet-window-start and --quiet-window-end are required."
+            )
+        if quiet_enabled and (
+            not _valid_clock(args.quiet_window_start)
+            or not _valid_clock(args.quiet_window_end)
+        ):
+            raise InstallError("Quiet-window times must use valid HH:MM values.")
         answers = Answers(
             install_root=root,
             data_root=Path(args.data_root or DEFAULT_DATA),
             config_root=Path(args.config_root or DEFAULT_CONFIG),
             evo_url=_url(args.evo_url),
             evo_username=args.evo_username,
-            evo_password=args.evo_password,
+            evo_password=evo_password,
             local_vlm=not bool(args.external_vlm_url),
             vlm_url=_url(args.external_vlm_url or DEFAULT_VLM_URL),
             vlm_model=args.external_vlm_model or DEFAULT_VLM_MODEL,
-            local_deep=not bool(args.external_deep_url),
-            deep_url=_url(args.external_deep_url or DEFAULT_DEEP_URL),
-            deep_model=args.external_deep_model or DEFAULT_DEEP_MODEL,
+            local_deep=local_deep,
+            deep_url=deep_url,
+            deep_model=deep_model,
             timezone=args.timezone or "Europe/Riga",
+            quiet_enabled=quiet_enabled,
+            quiet_start=args.quiet_window_start or "01:00",
+            quiet_end=args.quiet_window_end or "05:00",
+            admin_username=args.admin_username or "admin",
+            admin_display_name=args.admin_display_name or "EVA Administrator",
+            admin_password=admin_password,
         )
         return answers
 
@@ -643,9 +844,37 @@ def install_offline_apt(
     runner: Runner,
     *,
     include_nvidia: bool,
+    apt_root: Path = DEFAULT_OFFLINE_APT_ROOT,
 ) -> None:
-    repo = bundle_root / "apt"
-    package_file = repo / "package-names.txt"
+    source_repo = bundle_root / "apt"
+    digest_source = source_repo / "Packages.gz"
+    if not digest_source.is_file():
+        digest_source = source_repo / "package-names.txt"
+    packages_digest = hashlib.sha256(digest_source.read_bytes()).hexdigest()[:16]
+    repos_root = apt_root / "repos"
+    repo = repos_root / packages_digest
+    runner.run(("install", "-d", "-o", "root", "-g", "root", "-m", "0755", apt_root))
+    runner.run(
+        ("install", "-d", "-o", "root", "-g", "root", "-m", "0755", repos_root)
+    )
+    if runner.dry_run:
+        print(f"+ stage offline APT repository {source_repo} -> {repo}")
+    elif not repo.is_dir():
+        candidate = repos_root / f".{packages_digest}.{os.getpid()}.tmp"
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        shutil.copytree(source_repo, candidate, symlinks=False)
+        for path in candidate.rglob("*"):
+            current_mode = path.stat().st_mode & 0o777
+            os.chmod(path, current_mode | (0o055 if path.is_dir() else 0o044))
+        os.chmod(candidate, 0o755)
+        os.replace(candidate, repo)
+
+    package_file = (
+        repo / "package-names.txt"
+        if (repo / "package-names.txt").is_file()
+        else source_repo / "package-names.txt"
+    )
     packages = (
         [
             line.strip()
@@ -661,11 +890,52 @@ def install_offline_apt(
             for package in packages
             if not package.startswith("nvidia-")
         ]
-    apt_state = Path("/var/cache/eva-ai-offline-apt")
-    source_file = apt_state / "eva-ai-offline.list"
-    lists_dir = apt_state / "lists"
-    cache_dir = apt_state / "cache"
-    runner.run(("mkdir", "-p", lists_dir / "partial", cache_dir / "archives" / "partial"))
+    source_file = apt_root / "eva-ai-offline.list"
+    lists_dir = apt_root / "lists"
+    cache_dir = apt_root / "cache"
+    runner.run(
+        ("install", "-d", "-o", "root", "-g", "root", "-m", "0755", lists_dir)
+    )
+    runner.run(
+        (
+            "install",
+            "-d",
+            "-o",
+            "_apt",
+            "-g",
+            "root",
+            "-m",
+            "0700",
+            lists_dir / "partial",
+        )
+    )
+    runner.run(
+        (
+            "install",
+            "-d",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "-m",
+            "0755",
+            cache_dir,
+            cache_dir / "archives",
+        )
+    )
+    runner.run(
+        (
+            "install",
+            "-d",
+            "-o",
+            "_apt",
+            "-g",
+            "root",
+            "-m",
+            "0700",
+            cache_dir / "archives" / "partial",
+        )
+    )
     source_text = f"deb [trusted=yes] file:{repo.resolve()} ./\n"
     if not runner.dry_run:
         _atomic_write(source_file, source_text, 0o644)
@@ -680,8 +950,13 @@ def install_offline_apt(
         f"Dir::Cache={cache_dir}",
         "-o",
         "Acquire::Languages=none",
+        "-o",
+        "Acquire::Retries=0",
     )
-    runner.run(("apt-get", *apt_options, "update"))
+    apt_env = dict(os.environ)
+    apt_env["DEBIAN_FRONTEND"] = "noninteractive"
+    apt_env["APT_LISTCHANGES_FRONTEND"] = "none"
+    runner.run(("apt-get", *apt_options, "update"), env=apt_env)
     runner.run(
         (
             "apt-get",
@@ -690,7 +965,8 @@ def install_offline_apt(
             "-y",
             "install",
             *packages,
-        )
+        ),
+        env=apt_env,
     )
 
 
@@ -729,6 +1005,13 @@ def ensure_accounts_and_dirs(answers: Answers, runner: Runner) -> None:
     runner.run(("chown", "-R", "eva:eva", answers.install_root, answers.data_root))
     runner.run(("chmod", "0755", answers.install_root))
     runner.run(("chmod", "0750", answers.data_root, answers.config_root))
+
+
+def quiesce_existing_runtime(runner: Runner) -> None:
+    """Stop only EVA-owned services before replacing code and configuration."""
+
+    for service in ("eva-ai", "eva-vllm", "eva-deep-review"):
+        runner.run(("systemctl", "stop", service), check=False)
 
 
 def backup_existing(
@@ -796,6 +1079,8 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
         (
             "rsync",
             "-a",
+            "--delete",
+            "--delete-delay",
             "--exclude=.venv",
             "--exclude=.git",
             str(bundle_root / "repo") + "/",
@@ -807,6 +1092,7 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
             (
                 "rsync",
                 "-a",
+                "--delete",
                 str(bundle_root / "models" / "qwen3-vl-4b-awq") + "/",
                 str(answers.data_root / "models" / "qwen3-vl-4b-awq") + "/",
             )
@@ -816,6 +1102,7 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
             (
                 "rsync",
                 "-a",
+                "--delete",
                 str(bundle_root / "models" / "qwen3.5-9b-mtp") + "/",
                 str(answers.data_root / "models" / "qwen3.5-9b-mtp") + "/",
             )
@@ -980,6 +1267,42 @@ def build_llama_cpp(answers: Answers, runner: Runner) -> None:
     runner.run(("chown", "-R", "eva:eva", source))
 
 
+TENANT_ID_KEYS = (
+    "EVOSSEARCH_AUTH_TENANT_ID",
+    "EVOSSEARCH_ARCHIVE_TENANT_ID",
+    "EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID",
+)
+
+OBSOLETE_OR_UNSAFE_ENV_KEYS = {
+    # Named-user authentication is mandatory for the appliance.  Carrying a
+    # token from an old developer install silently re-enables a second auth
+    # model and was one of the field-install failure modes.
+    "EVOSSEARCH_ADMIN_TOKEN",
+}
+
+
+def resolve_tenant_id(existing: Mapping[str, str]) -> str:
+    configured = {
+        key: str(existing.get(key) or "").strip()
+        for key in TENANT_ID_KEYS
+        if str(existing.get(key) or "").strip()
+    }
+    normalized: set[str] = set()
+    for key, value in configured.items():
+        try:
+            normalized.add(str(uuid.UUID(value)))
+        except ValueError as exc:
+            raise InstallError(
+                f"{key} is not a valid UUID; refusing to change tenant identity."
+            ) from exc
+    if len(normalized) > 1:
+        raise InstallError(
+            "The configured auth, archive and inference tenant IDs disagree; "
+            "refusing to merge tenant data automatically."
+        )
+    return next(iter(normalized), str(uuid.uuid4()))
+
+
 def render_runtime_env(
     answers: Answers,
     existing: Mapping[str, str],
@@ -1036,10 +1359,9 @@ def render_runtime_env(
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_END": answers.quiet_end,
         }
     )
-    tenant_id = existing.get("EVOSSEARCH_AUTH_TENANT_ID") or str(uuid.uuid4())
-    values["EVOSSEARCH_AUTH_TENANT_ID"] = tenant_id
-    values["EVOSSEARCH_ARCHIVE_TENANT_ID"] = tenant_id
-    values["EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID"] = tenant_id
+    tenant_id = resolve_tenant_id(existing)
+    for key in TENANT_ID_KEYS:
+        values[key] = tenant_id
     values.update(passwords)
     values.update(
         {
@@ -1062,20 +1384,39 @@ def render_runtime_env(
         }
     )
     for key, value in existing.items():
-        if key not in values:
+        if key not in values and key not in OBSOLETE_OR_UNSAFE_ENV_KEYS:
             values[key] = value
     return values
+
+
+def validate_runtime_config(answers: Answers, runner: Runner) -> None:
+    runner.run(
+        (
+            answers.install_root / "app" / ".venv" / "bin" / "python",
+            answers.install_root / "app" / "scripts" / "validate_appliance_config.py",
+            "--env-file",
+            answers.config_root / "eva-ai.env",
+        )
+    )
 
 
 def install_systemd_units(answers: Answers, runner: Runner) -> None:
     app_dir = answers.install_root / "app"
     env_file = answers.config_root / "eva-ai.env"
+    validate_config = app_dir / "scripts" / "validate_appliance_config.py"
     units: dict[Path, str] = {}
+    local_vlm_dependencies = ""
+    if answers.local_vlm:
+        local_vlm_dependencies = (
+            "After=eva-vllm.service\n"
+            "Wants=eva-vllm.service\n"
+        )
     units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
 Description=EVA AI eight-channel appliance
 After=network-online.target postgresql.service
 Wants=network-online.target
 Requires=postgresql.service
+{local_vlm_dependencies}
 
 [Service]
 Type=simple
@@ -1084,10 +1425,12 @@ Group=eva
 WorkingDirectory={app_dir}
 EnvironmentFile={env_file}
 Environment=EVOSSEARCH_CONFIG_ENV_FILE={env_file}
+ExecStartPre={app_dir}/.venv/bin/python {validate_config} --from-environment
+ExecStartPre={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 600
 ExecStart={app_dir}/run_prod.sh
 Restart=on-failure
 RestartSec=5
-TimeoutStartSec=180
+TimeoutStartSec=660
 TimeoutStopSec=120
 KillSignal=SIGTERM
 UMask=0077
@@ -1152,6 +1495,16 @@ WantedBy=multi-user.target
             print(f"+ write {path}")
         else:
             _atomic_write(path, content, 0o644)
+    retired_units = []
+    if not answers.local_vlm:
+        retired_units.append(("eva-vllm", Path("/etc/systemd/system/eva-vllm.service")))
+    if not answers.local_deep:
+        retired_units.append(
+            ("eva-deep-review", Path("/etc/systemd/system/eva-deep-review.service"))
+        )
+    for service, path in retired_units:
+        runner.run(("systemctl", "disable", "--now", service), check=False)
+        runner.run(("rm", "-f", path))
     runner.run(("systemctl", "daemon-reload"))
     services = ["postgresql", "eva-ai"]
     if answers.local_vlm:
@@ -1159,6 +1512,14 @@ WantedBy=multi-user.target
     if answers.local_deep:
         services.append("eva-deep-review")
     runner.run(("systemctl", "enable", *services))
+    runner.run(
+        (
+            "ln",
+            "-sfn",
+            app_dir / "scripts" / "eva_appliance_doctor.py",
+            "/usr/local/sbin/eva-ai-doctor",
+        )
+    )
 
 
 def configure_nginx(answers: Answers, runner: Runner) -> None:
@@ -1236,28 +1597,76 @@ def configure_nginx(answers: Answers, runner: Runner) -> None:
     runner.run(("systemctl", "enable", "--now", "nginx"))
 
 
-def start_and_verify(answers: Answers, runner: Runner) -> None:
-    if answers.local_vlm:
-        runner.run(("systemctl", "restart", "eva-vllm"))
-    if answers.local_deep:
-        runner.run(("systemctl", "restart", "eva-deep-review"))
-    runner.run(("systemctl", "restart", "eva-ai"))
-    if runner.dry_run:
-        return
-    deadline = time.monotonic() + 180
-    health_url = "http://127.0.0.1:5000/health"
+def _wait_for_json_endpoint(
+    url: str,
+    *,
+    label: str,
+    timeout_sec: int,
+    expected_status: str | None = None,
+    expected_model: str | None = None,
+) -> dict:
+    deadline = time.monotonic() + timeout_sec
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(health_url, timeout=5) as response:
+            with urllib.request.urlopen(url, timeout=8) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            if payload.get("status") == "ok":
-                print(f"EVA health OK: {payload}")
-                return
+            if expected_status and payload.get("status") != expected_status:
+                last_error = f"status={payload.get('status')!r}"
+            elif expected_model:
+                model_ids = {
+                    str(item.get("id") or "")
+                    for item in payload.get("data", [])
+                    if isinstance(item, Mapping)
+                }
+                if expected_model not in model_ids:
+                    last_error = (
+                        f"expected model {expected_model!r}; available={sorted(model_ids)!r}"
+                    )
+                else:
+                    print(f"{label} ready: {expected_model}")
+                    return payload
+            else:
+                print(f"{label} ready.")
+                return payload
         except Exception as exc:  # bounded readiness retry
-            last_error = str(exc)
+            last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(3)
-    raise InstallError(f"EVA did not become healthy within 180 seconds: {last_error}")
+    raise InstallError(f"{label} did not become ready within {timeout_sec}s: {last_error}")
+
+
+def start_and_verify(answers: Answers, runner: Runner) -> None:
+    if answers.local_vlm:
+        runner.run(("systemctl", "restart", "eva-vllm"))
+    if not runner.dry_run:
+        _wait_for_json_endpoint(
+            answers.vlm_url.rstrip("/") + "/models",
+            label="Local VLM" if answers.local_vlm else "External VLM",
+            timeout_sec=600 if answers.local_vlm else 60,
+            expected_model=answers.vlm_model,
+        )
+    if answers.local_deep:
+        runner.run(("systemctl", "restart", "eva-deep-review"))
+    if answers.deep_url and not runner.dry_run:
+        _wait_for_json_endpoint(
+            answers.deep_url.rstrip("/") + "/models",
+            label=(
+                "Local deep-review model"
+                if answers.local_deep
+                else "External deep-review model"
+            ),
+            timeout_sec=300 if answers.local_deep else 60,
+            expected_model=answers.deep_model,
+        )
+    runner.run(("systemctl", "restart", "eva-ai"))
+    if runner.dry_run:
+        return
+    _wait_for_json_endpoint(
+        "http://127.0.0.1:5000/ready",
+        label="EVA and required dependencies",
+        timeout_sec=300,
+        expected_status="ready",
+    )
 
 
 def bootstrap_admin(
@@ -1297,60 +1706,153 @@ def apply_install(
         dry_run=dry_run,
         secrets_to_redact=(answers.evo_password, answers.admin_password),
     )
-    install_offline_apt(
-        bundle_root,
-        runner,
-        include_nvidia=answers.local_vlm,
+    journal = InstallJournal(
+        dry_run=dry_run,
+        secrets_to_redact=(answers.evo_password, answers.admin_password),
     )
-    ensure_accounts_and_dirs(answers, runner)
+    journal.begin(bundle_root, answers)
+    try:
+        run_phase(
+            journal,
+            "offline_apt",
+            lambda: install_offline_apt(
+                bundle_root,
+                runner,
+                include_nvidia=answers.local_vlm,
+            ),
+        )
 
-    if answers.local_vlm and not hardware.nvidia_ready:
-        if not hardware.nvidia_pci:
-            raise InstallError(
-                "Local VLM was selected but no NVIDIA GPU is visible on PCI. "
-                "Rerun and select an external endpoint."
-            )
-        runner.run(("modprobe", "nvidia"), check=False)
-        refreshed = detect_hardware() if not dry_run else hardware
-        if not dry_run and not refreshed.nvidia_ready:
-            raise InstallError(
-                "The NVIDIA driver packages were installed but the GPU is not active. "
-                "Reboot, rerun this installer, and keep the same answers."
-            )
+        def confirm_database_discovery() -> None:
+            if not dry_run and not db_was_present and database_exists():
+                raise InstallError(
+                    "An existing EVA database became visible after PostgreSQL tools "
+                    "were installed. Rerun the installer so it can report the schema "
+                    "and request backup/migration approval before changing it."
+                )
 
-    env_file = answers.config_root / "eva-ai.env"
-    existing_env = parse_env(env_file)
-    backup = backup_existing(
-        answers,
-        runner,
-        db_exists=db_was_present,
-    )
-    print(f"Backup directory: {backup}")
-    sync_payload(bundle_root, answers, runner)
-    install_python_envs(bundle_root, answers, runner)
-    build_llama_cpp(answers, runner)
-    passwords = prepare_database(
-        answers,
-        runner,
-        db_was_present=db_was_present,
-        existing_env=existing_env,
-    )
-    values = render_runtime_env(answers, existing_env, passwords)
-    if runner.dry_run:
-        print(f"+ write {env_file} (secrets redacted)")
-    else:
-        _atomic_write(env_file, render_env(values), 0o600)
-    install_systemd_units(answers, runner)
-    configure_nginx(answers, runner)
-    start_and_verify(answers, runner)
-    bootstrap_admin(answers, values, runner)
+        run_phase(journal, "database_discovery", confirm_database_discovery)
+        run_phase(
+            journal,
+            "filesystem",
+            lambda: ensure_accounts_and_dirs(answers, runner),
+        )
 
-    if not runner.dry_run:
-        revision = current_schema()
-        if revision != EXPECTED_SCHEMA:
-            raise InstallError(
-                f"Installed database revision is {revision!r}; expected {EXPECTED_SCHEMA}"
-            )
+        def activate_gpu() -> None:
+            if not answers.local_vlm or hardware.nvidia_ready:
+                return
+            if not hardware.nvidia_pci:
+                raise InstallError(
+                    "Local VLM was selected but no NVIDIA GPU is visible on PCI. "
+                    "Rerun and select an external endpoint."
+                )
+            runner.run(("modprobe", "nvidia"), check=False)
+            refreshed = detect_hardware() if not dry_run else hardware
+            if not dry_run and not refreshed.nvidia_ready:
+                raise InstallError(
+                    "The NVIDIA driver is installed but the GPU is not active. "
+                    "Reboot and rerun this installer; completed phases are safe to replay."
+                )
+
+        run_phase(journal, "gpu", activate_gpu)
+        run_phase(
+            journal,
+            "quiesce_runtime",
+            lambda: quiesce_existing_runtime(runner),
+        )
+
+        env_file = answers.config_root / "eva-ai.env"
+        existing_env = parse_env(env_file)
+        backup = run_phase(
+            journal,
+            "backup",
+            lambda: backup_existing(
+                answers,
+                runner,
+                db_exists=db_was_present,
+            ),
+        )
+        print(f"Backup directory: {backup}")
+        run_phase(
+            journal,
+            "application_payload",
+            lambda: sync_payload(bundle_root, answers, runner),
+        )
+        run_phase(
+            journal,
+            "python_environments",
+            lambda: install_python_envs(bundle_root, answers, runner),
+        )
+        run_phase(
+            journal,
+            "deep_review_runtime",
+            lambda: build_llama_cpp(answers, runner),
+        )
+        passwords = run_phase(
+            journal,
+            "database",
+            lambda: prepare_database(
+                answers,
+                runner,
+                db_was_present=db_was_present,
+                existing_env=existing_env,
+            ),
+        )
+        runner.add_secrets(passwords.values())
+        journal.add_secrets(passwords.values())
+        values = render_runtime_env(answers, existing_env, passwords)
+
+        def write_configuration() -> None:
+            if runner.dry_run:
+                print(f"+ write {env_file} (secrets redacted)")
+            else:
+                _atomic_write(env_file, render_env(values), 0o600)
+
+        run_phase(journal, "configuration", write_configuration)
+        run_phase(
+            journal,
+            "configuration_preflight",
+            lambda: validate_runtime_config(answers, runner),
+        )
+        run_phase(
+            journal,
+            "systemd_units",
+            lambda: install_systemd_units(answers, runner),
+        )
+        run_phase(
+            journal,
+            "reverse_proxy",
+            lambda: configure_nginx(answers, runner),
+        )
+        run_phase(
+            journal,
+            "administrator",
+            lambda: bootstrap_admin(answers, values, runner),
+        )
+        run_phase(
+            journal,
+            "services_and_readiness",
+            lambda: start_and_verify(answers, runner),
+        )
+
+        def verify_schema() -> None:
+            if runner.dry_run:
+                return
+            revision = current_schema()
+            if revision != EXPECTED_SCHEMA:
+                raise InstallError(
+                    f"Installed database revision is {revision!r}; "
+                    f"expected {EXPECTED_SCHEMA}"
+                )
+
+        run_phase(journal, "schema_verification", verify_schema)
+    except Exception:
+        print(
+            f"Installer state: {journal.path}. Fix the reported cause and rerun; "
+            "completed phases are idempotent.",
+            file=sys.stderr,
+        )
+        raise
+    journal.complete()
     print("\nINSTALLATION COMPLETE")
     print("Open EVA AI at: https://<this-server-ip>/")
     print("The TLS certificate is locally generated; import/trust it on operator workstations.")
@@ -1372,10 +1874,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evo-url")
     parser.add_argument("--evo-username")
     parser.add_argument("--evo-password")
+    parser.add_argument("--evo-password-file")
     parser.add_argument("--external-vlm-url")
     parser.add_argument("--external-vlm-model")
     parser.add_argument("--external-deep-url")
     parser.add_argument("--external-deep-model")
+    parser.add_argument("--no-deep-review", action="store_true")
+    parser.add_argument("--quiet-window-start")
+    parser.add_argument("--quiet-window-end")
+    parser.add_argument("--admin-username")
+    parser.add_argument("--admin-display-name")
+    parser.add_argument("--admin-password-file")
     parser.add_argument("--timezone")
     return parser
 
@@ -1392,6 +1901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(f"EVA AI {VERSION} offline port-appliance installer")
         print("Target: RTX 4070 Super, Intel Core i9 14th Gen, 64 GB RAM, Ubuntu 24.04.")
+        validate_target_host()
         manifest = read_manifest(bundle_root)
         verify_critical_payload(bundle_root, manifest)
         answers = gather_answers(args.non_interactive, args)

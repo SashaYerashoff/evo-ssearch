@@ -6,18 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-
-
-VERSION = "β 0.8.5"
-CRITICAL = (
-    "repo/VERSION",
-    "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
-    "models/qwen3-vl-4b-awq/model.safetensors",
-    "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
-    "models/clip/ViT-B-32.pt",
-)
 
 
 def digest(path: Path) -> str:
@@ -33,11 +24,27 @@ def main() -> int:
     parser.add_argument("bundle", type=Path)
     args = parser.parse_args()
     root = args.bundle.resolve()
+    version = (root / "repo" / "VERSION").read_text(encoding="utf-8").strip()
+    version_match = re.search(r"\d+(?:\.\d+)+", version)
+    if version_match is None:
+        raise SystemExit(f"Cannot derive a Debian version from {version!r}")
+    debian_version = version_match.group(0)
+    critical_files = (
+        "repo/VERSION",
+        "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
+        "models/qwen3-vl-4b-awq/model.safetensors",
+        "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
+        "models/clip/ViT-B-32.pt",
+        (
+            "installer-deb/"
+            f"eva-ai-appliance-installer_{debian_version}_amd64.deb"
+        ),
+    )
     files = sorted(path for path in root.rglob("*") if path.is_file())
     if not files:
         raise SystemExit("Bundle is empty.")
     critical = {}
-    for relative in CRITICAL:
+    for relative in critical_files:
         path = root / relative
         if not path.is_file():
             raise SystemExit(f"Missing critical payload: {relative}")
@@ -45,7 +52,7 @@ def main() -> int:
     payload_bytes = sum(path.stat().st_size for path in files)
     manifest = {
         "format": 1,
-        "version": VERSION,
+        "version": version,
         "schema_head": "20260727_0010",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": {

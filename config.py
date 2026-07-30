@@ -184,6 +184,10 @@ class Config:
         or 'ViT-B/32'
     )
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
+    EMBEDDER_EAGER_LOAD = _get_bool_env(
+        'EVOSSEARCH_EMBEDDER_EAGER_LOAD',
+        'false',
+    )
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
     if not EXPERIMENTAL_EMBEDDERS_ENABLED:
         EMBEDDER = 'clip'

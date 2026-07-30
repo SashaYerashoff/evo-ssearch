@@ -730,6 +730,23 @@ def test_prompt_apply_only_posts_fields_changed_from_loaded_channel_settings():
     assert "baseline.bookmark_enabled" in collect
 
 
+def test_prompt_modal_preserves_unsaved_alert_criteria_until_explicit_save_or_discard():
+    assert "function syncLuxriotPromptModalEditorToDraft" in JS
+    assert "function hasLuxriotPromptDraftChanges" in JS
+    assert "Apply or close the modal and discard the draft before reloading saved settings." in JS
+    assert "Discard unsaved prompt changes?" in JS
+    assert "Discard unsaved prompt changes and switch channels?" in JS
+    assert "window.addEventListener('beforeunload'" in JS
+    assert "luxriotPromptModalInput.disabled = busy || !canManage || !ready" in JS
+    assert "luxriotPromptApplyBtn.textContent = saving" in JS
+
+    apply_listener = JS.split(
+        "luxriotPromptApplyBtn.addEventListener('click'", 1
+    )[1].split("if (luxriotPromptModalInput)", 1)[0]
+    assert "await applyLuxriotPromptModal()" in apply_listener
+    assert "closeLuxriotPromptModal()" not in apply_listener
+
+
 def test_prompt_modal_can_explicitly_reset_channel_overrides_to_inherited_defaults():
     assert 'id="luxriotPromptResetBtn"' in TEMPLATE
     assert "function getClearableLuxriotPromptOverrideFields" in JS

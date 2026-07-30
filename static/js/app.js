@@ -419,6 +419,7 @@
     let luxriotPromptRequestGeneration = 0;
     let luxriotPromptLoadAbortController = null;
     let luxriotPromptSaveAbortController = null;
+    let luxriotPromptModalNotice = '';
     let luxriotInitialized = false;
     let luxriotInitPromise = null;
     const probeHitsCacheByKey = {};
@@ -3695,6 +3696,24 @@
         return payload;
     }
 
+    function isLuxriotPromptModalOpen() {
+        return Boolean(luxriotPromptModal && luxriotPromptModal.style.display === 'block');
+    }
+
+    function syncLuxriotPromptModalEditorToDraft() {
+        const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+        if (targetInput && luxriotPromptModalInput) {
+            targetInput.value = String(luxriotPromptModalInput.value || '');
+        }
+    }
+
+    function hasLuxriotPromptDraftChanges() {
+        if (!luxriotPromptLoadedSettings || !Number.isFinite(luxriotPromptFormChannelId)) {
+            return false;
+        }
+        return Object.keys(collectLuxriotPromptSettings()).length > 0;
+    }
+
     function applyLuxriotPromptSettingsFromPayload(payload) {
         const settings = payload && typeof payload === 'object' ? payload : {};
         if (luxriotSystemPromptInput && Object.prototype.hasOwnProperty.call(settings, 'stream_system_prompt')) {
@@ -3795,22 +3814,97 @@
         ));
     }
 
-    function setLuxriotPromptApplyAvailability(loading = false) {
+    function updateLuxriotPromptModalMeta() {
+        if (!luxriotPromptModalMeta) return;
+        const tabValue = luxriotPromptModalTab;
+        const channelId = Number.isFinite(luxriotPromptFormChannelId)
+            ? luxriotPromptFormChannelId
+            : getSelectedLuxriotChannel();
+        const channelLabel = getLuxriotChannelLabel(channelId);
+        const sourceKey = tabValue === 'stream'
+            ? 'stream_system_prompt'
+            : tabValue === 'alerts'
+                ? 'alert_policy_prompt'
+                : tabValue === 'json'
+                    ? 'json_alert_prompt'
+                    : null;
+        const source = sourceKey
+            ? String(luxriotPromptSettingSources?.[sourceKey] || '')
+            : String(luxriotPromptSettingSources?.rollup_prompts?.[tabValue] || '');
+        const sourceLabels = {
+            channel_override: 'channel override',
+            persisted_runtime_default: 'persisted runtime default',
+            config_default: 'configuration default',
+        };
+        const sourceLabel = sourceLabels[source] || 'source unknown';
+        const persistence = luxriotPromptPersistence;
+        const persistenceLabel = persistence?.last_error
+            ? `persistence error: ${String(persistence.last_error).slice(0, 160)}`
+            : persistence?.persisted
+                ? `saved revision ${Number(persistence.revision || 0)}`
+                : 'not persisted yet';
+        const operationLabel = luxriotPromptSaveAbortController
+            ? 'Saving changes…'
+            : luxriotPromptLoadAbortController
+                ? 'Loading saved settings…'
+                : hasLuxriotPromptDraftChanges()
+                    ? 'Unsaved changes.'
+                    : luxriotPromptModalNotice;
+        luxriotPromptModalMeta.textContent = [
+            `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`,
+            `Source: ${sourceLabel}; ${persistenceLabel}.`,
+            operationLabel,
+        ].filter(Boolean).join(' ');
+    }
+
+    function setLuxriotPromptApplyAvailability() {
         const canManage = userHasPermission('prompts:manage');
         const selectedChannelId = getSelectedLuxriotChannel();
         const formMatchesChannel = Number.isFinite(luxriotPromptFormChannelId)
             && selectedChannelId === luxriotPromptFormChannelId;
+        const loading = Boolean(luxriotPromptLoadAbortController);
+        const saving = Boolean(luxriotPromptSaveAbortController);
+        const busy = loading || saving;
+        const ready = Boolean(luxriotPromptLoadedSettings) && formMatchesChannel;
+        const dirty = ready && hasLuxriotPromptDraftChanges();
         if (luxriotPromptApplyBtn) {
-            luxriotPromptApplyBtn.disabled = Boolean(loading)
-                || !canManage
-                || !formMatchesChannel;
+            luxriotPromptApplyBtn.disabled = busy || !canManage || !dirty;
+            luxriotPromptApplyBtn.textContent = saving
+                ? 'Saving…'
+                : loading
+                    ? 'Loading…'
+                    : dirty
+                        ? 'Apply changes'
+                        : 'No changes';
         }
         if (luxriotPromptResetBtn) {
-            luxriotPromptResetBtn.disabled = Boolean(loading)
-            || !canManage
-                || !formMatchesChannel
+            luxriotPromptResetBtn.disabled = busy
+                || !canManage
+                || !ready
                 || getClearableLuxriotPromptOverrideFields().length === 0;
         }
+        if (luxriotPromptModalInput) {
+            luxriotPromptModalInput.disabled = busy || !canManage || !ready;
+        }
+        luxriotPromptTabButtons.forEach((button) => {
+            button.disabled = busy || !ready;
+        });
+        if (luxriotBookmarkEnabledInput) {
+            luxriotBookmarkEnabledInput.disabled = busy
+                || !canManage
+                || !ready
+                || !userHasPermission('bookmarks:create');
+        }
+        if (luxriotBookmarkCooldownInput) {
+            luxriotBookmarkCooldownInput.disabled = busy
+                || !canManage
+                || !ready
+                || !userHasPermission('bookmarks:create');
+        }
+        if (luxriotSelectorBiasInput) {
+            luxriotSelectorBiasInput.disabled = busy || !canManage || !ready;
+        }
+        updateLuxriotPromptModalMeta();
     }
 
     function abortLuxriotPromptController(controller) {
@@ -3831,10 +3925,14 @@
         if (clearFormIdentity) {
             luxriotPromptFormChannelId = null;
             luxriotPromptLoadedSettings = null;
+            luxriotPromptModalNotice = '';
             luxriotMemoryMetabolismData = null;
             updateLuxriotMemoryMetabolism();
+            if (luxriotPromptModalInput) {
+                luxriotPromptModalInput.value = '';
+            }
         }
-        setLuxriotPromptApplyAvailability(false);
+        setLuxriotPromptApplyAvailability();
     }
 
     function isCurrentLuxriotPromptRequest(generation, controller, channelId) {
@@ -3851,11 +3949,21 @@
         if (!Number.isFinite(channelId)) {
             return false;
         }
+        if (isLuxriotPromptModalOpen() && hasLuxriotPromptDraftChanges()) {
+            const sameChannel = luxriotPromptFormChannelId === channelId;
+            luxriotPromptModalNotice = 'Apply or close the modal and discard the draft before reloading saved settings.';
+            setLuxriotPromptApplyAvailability();
+            if (showError || sameChannel) {
+                setLuxriotStatus(luxriotPromptModalNotice, true);
+            }
+            return false;
+        }
         invalidateLuxriotPromptRequests({ clearFormIdentity: luxriotPromptFormChannelId !== channelId });
         const generation = luxriotPromptRequestGeneration;
         const controller = new AbortController();
         luxriotPromptLoadAbortController = controller;
-        setLuxriotPromptApplyAvailability(true);
+        luxriotPromptModalNotice = '';
+        setLuxriotPromptApplyAvailability();
         try {
             const params = new URLSearchParams();
             params.set('channel_id', String(channelId));
@@ -3872,6 +3980,7 @@
             }
             applyLuxriotPromptSettingsFromPayload(data);
             luxriotPromptFormChannelId = channelId;
+            luxriotPromptModalNotice = 'Saved settings loaded.';
             setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
             return true;
         } catch (err) {
@@ -3881,13 +3990,16 @@
             if (showError && generation === luxriotPromptRequestGeneration) {
                 setLuxriotStatus(err.message || 'Failed to load prompt settings', true);
             }
+            if (generation === luxriotPromptRequestGeneration) {
+                luxriotPromptModalNotice = 'Could not load saved settings.';
+            }
             return false;
         } finally {
             if (luxriotPromptLoadAbortController === controller) {
                 luxriotPromptLoadAbortController = null;
             }
             if (generation === luxriotPromptRequestGeneration) {
-                setLuxriotPromptApplyAvailability(false);
+                setLuxriotPromptApplyAvailability();
             }
         }
     }
@@ -3905,7 +4017,8 @@
         const generation = ++luxriotPromptRequestGeneration;
         const controller = new AbortController();
         luxriotPromptSaveAbortController = controller;
-        setLuxriotPromptApplyAvailability(true);
+        luxriotPromptModalNotice = '';
+        setLuxriotPromptApplyAvailability();
         const payload = payloadOverride && typeof payloadOverride === 'object'
             ? { ...payloadOverride }
             : collectLuxriotPromptSettings();
@@ -3928,13 +4041,19 @@
             applyLuxriotPromptSettingsFromPayload(data);
             clearLuxriotLiveIntervalDirty(channelId);
             luxriotPromptFormChannelId = channelId;
+            luxriotPromptModalNotice = 'Saved.';
             return data;
+        } catch (err) {
+            if (!err || err.name !== 'AbortError') {
+                luxriotPromptModalNotice = 'Save failed; your changes are still in the editor.';
+            }
+            throw err;
         } finally {
             if (luxriotPromptSaveAbortController === controller) {
                 luxriotPromptSaveAbortController = null;
             }
             if (generation === luxriotPromptRequestGeneration) {
-                setLuxriotPromptApplyAvailability(false);
+                setLuxriotPromptApplyAvailability();
             }
         }
     }
@@ -3951,7 +4070,8 @@
             throw new Error('This channel has no prompt or bookmark overrides you can reset.');
         }
         const confirmed = window.confirm(
-            `Remove ${clearOverrideFields.length} channel-specific override(s) for ${getLuxriotChannelLabel(formChannelId)} and use inherited defaults?`
+            `${hasLuxriotPromptDraftChanges() ? 'Discard the unsaved prompt changes and ' : ''}`
+            + `remove ${clearOverrideFields.length} channel-specific override(s) for ${getLuxriotChannelLabel(formChannelId)} and use inherited defaults?`
         );
         if (!confirmed) return null;
         const result = await persistLuxriotPromptSettings(formChannelId, {
@@ -3964,10 +4084,7 @@
 
     function setLuxriotPromptModalTab(tab) {
         const normalized = String(tab || '').trim().toLowerCase();
-        const previousInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-        if (luxriotPromptModalInput && previousInput) {
-            previousInput.value = luxriotPromptModalInput.value || '';
-        }
+        syncLuxriotPromptModalEditorToDraft();
         const tabValue = (normalized === 'stream' || normalized === 'alerts' || normalized === 'json')
             ? normalized
             : normalized.toUpperCase();
@@ -3980,37 +4097,10 @@
             const sourceInput = getLuxriotPromptInputByTab(tabValue);
             luxriotPromptModalInput.value = sourceInput ? String(sourceInput.value || '') : '';
         }
-        if (luxriotPromptModalMeta) {
-            const channelId = Number.isFinite(luxriotPromptFormChannelId)
-                ? luxriotPromptFormChannelId
-                : getSelectedLuxriotChannel();
-            const channelLabel = getLuxriotChannelLabel(channelId);
-            const sourceKey = tabValue === 'stream'
-                ? 'stream_system_prompt'
-                : tabValue === 'alerts'
-                    ? 'alert_policy_prompt'
-                    : tabValue === 'json'
-                        ? 'json_alert_prompt'
-                        : null;
-            const source = sourceKey
-                ? String(luxriotPromptSettingSources?.[sourceKey] || '')
-                : String(luxriotPromptSettingSources?.rollup_prompts?.[tabValue] || '');
-            const sourceLabels = {
-                channel_override: 'channel override',
-                persisted_runtime_default: 'persisted runtime default',
-                config_default: 'configuration default',
-            };
-            const sourceLabel = sourceLabels[source] || 'source unknown';
-            const persistence = luxriotPromptPersistence;
-            const persistenceLabel = persistence?.last_error
-                ? `persistence error: ${String(persistence.last_error).slice(0, 160)}`
-                : persistence?.persisted
-                    ? `saved revision ${Number(persistence.revision || 0)}`
-                    : 'not persisted yet';
-            luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}. Source: ${sourceLabel}; ${persistenceLabel}.`;
-        }
+        updateLuxriotPromptModalMeta();
         updateLuxriotMemoryMetabolism();
         updateLuxriotPromptLayerDetails();
+        setLuxriotPromptApplyAvailability();
     }
 
     function openLuxriotPromptModal() {
@@ -4019,13 +4109,23 @@
         const channelId = getSelectedLuxriotChannel();
         luxriotPromptModal.style.display = 'block';
         setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+        setLuxriotPromptApplyAvailability();
         void refreshLuxriotPromptSettings(true, channelId);
     }
 
-    function closeLuxriotPromptModal() {
-        if (!luxriotPromptModal) return;
+    function closeLuxriotPromptModal({ force = false } = {}) {
+        if (!luxriotPromptModal) return false;
+        syncLuxriotPromptModalEditorToDraft();
+        if (
+            !force
+            && hasLuxriotPromptDraftChanges()
+            && !window.confirm('Discard unsaved prompt changes?')
+        ) {
+            return false;
+        }
         invalidateLuxriotPromptRequests({ clearFormIdentity: true });
         luxriotPromptModal.style.display = 'none';
+        return true;
     }
 
     async function applyLuxriotPromptModal() {
@@ -4035,12 +4135,15 @@
             await refreshLuxriotPromptSettings(true, selectedChannelId);
             throw new Error('The selected channel changed. Its prompt settings were reloaded; review them and Apply again.');
         }
-        const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-        if (targetInput && luxriotPromptModalInput) {
-            targetInput.value = luxriotPromptModalInput.value || '';
+        syncLuxriotPromptModalEditorToDraft();
+        if (!hasLuxriotPromptDraftChanges()) {
+            luxriotPromptModalNotice = 'No changes to save.';
+            setLuxriotPromptApplyAvailability();
+            return null;
         }
-        await persistLuxriotPromptSettings(formChannelId);
+        const result = await persistLuxriotPromptSettings(formChannelId);
         setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(formChannelId)}`);
+        return result;
     }
 
     function isCurrentLuxriotMediaRequest(requestSeq, channelId) {
@@ -6493,7 +6596,7 @@
         if (!canBookmarks && String(luxriotPromptModalTab || '').trim().toLowerCase() === 'json') {
             setLuxriotPromptModalTab('stream');
         }
-        setLuxriotPromptApplyAvailability(false);
+        setLuxriotPromptApplyAvailability();
         setPermissionHidden(saveSummaryBtn, !canBookmarks);
         setControlDisabled(saveSummaryBtn, !canBookmarks);
 
@@ -9967,25 +10070,39 @@
         luxriotPromptApplyBtn.addEventListener('click', async () => {
             try {
                 await applyLuxriotPromptModal();
-                closeLuxriotPromptModal();
             } catch (err) {
                 setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                setLuxriotPromptApplyAvailability();
             }
         });
     }
     if (luxriotPromptModalInput) {
+        luxriotPromptModalInput.addEventListener('input', () => {
+            syncLuxriotPromptModalEditorToDraft();
+            luxriotPromptModalNotice = '';
+            setLuxriotPromptApplyAvailability();
+        });
         luxriotPromptModalInput.addEventListener('keydown', async (event) => {
             if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'enter') {
                 event.preventDefault();
                 try {
                     await applyLuxriotPromptModal();
-                    closeLuxriotPromptModal();
                 } catch (err) {
                     setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                    setLuxriotPromptApplyAvailability();
                 }
             }
         });
     }
+    [luxriotBookmarkEnabledInput, luxriotBookmarkCooldownInput, luxriotSelectorBiasInput]
+        .filter((element) => Boolean(element))
+        .forEach((element) => {
+            const eventName = element === luxriotBookmarkCooldownInput ? 'input' : 'change';
+            element.addEventListener(eventName, () => {
+                luxriotPromptModalNotice = '';
+                setLuxriotPromptApplyAvailability();
+            });
+        });
     luxriotPromptTabButtons.forEach((button) => {
         button.addEventListener('click', () => {
             const tab = button.dataset.luxriotPromptTab || 'stream';
@@ -9999,6 +10116,11 @@
             }
         });
     }
+    window.addEventListener('beforeunload', (event) => {
+        if (!isLuxriotPromptModalOpen() || !hasLuxriotPromptDraftChanges()) return;
+        event.preventDefault();
+        event.returnValue = '';
+    });
     if (luxriotRefreshSummariesBtn) {
         luxriotRefreshSummariesBtn.addEventListener('click', async () => {
             setSummaryRefreshButtonState('busy');
@@ -10408,6 +10530,16 @@
     }
     if (luxriotChannelSelect) {
         luxriotChannelSelect.addEventListener('change', () => {
+            const draftChannelId = luxriotPromptFormChannelId;
+            if (isLuxriotPromptModalOpen() && hasLuxriotPromptDraftChanges()) {
+                if (!window.confirm('Discard unsaved prompt changes and switch channels?')) {
+                    if (Number.isFinite(draftChannelId)) {
+                        luxriotChannelSelect.value = String(draftChannelId);
+                    }
+                    return;
+                }
+                invalidateLuxriotPromptRequests({ clearFormIdentity: true });
+            }
             clearLuxriotLiveIntervalDirty();
             luxriotActiveChannel = getSelectedLuxriotChannel();
             syncProbeChannelSelect();

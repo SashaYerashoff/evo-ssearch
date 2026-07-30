@@ -1493,6 +1493,40 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertEqual(restored.get_prompt_settings(channel_id=7)["override_fields"], [])
 
+    def test_manual_alert_criteria_survive_runtime_manager_reload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            criteria = (
+                "Alert when a person leaves the workstation. "
+                "Do not alert for the resident cat."
+            )
+
+            saved = manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=criteria,
+            )
+
+            self.assertEqual(saved["alert_policy_prompt"], criteria)
+            self.assertEqual(
+                saved["setting_sources"]["alert_policy_prompt"],
+                "channel_override",
+            )
+            self.assertIn("alert_policy_prompt", saved["override_fields"])
+            self.assertTrue(saved["persistence"]["persisted"])
+
+            restored = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+            )
+            restored_settings = restored.get_prompt_settings(channel_id=7)
+            self.assertEqual(restored_settings["alert_policy_prompt"], criteria)
+            self.assertEqual(
+                restored_settings["setting_sources"]["alert_policy_prompt"],
+                "channel_override",
+            )
+            self.assertIn("alert_policy_prompt", restored_settings["override_fields"])
+
     def test_prompt_update_rejects_setting_and_clearing_the_same_override(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp), runtime_state_store=MemoryRuntimeStateStore())
