@@ -93,6 +93,23 @@ class InferenceQueueTests(unittest.TestCase):
         self.assertEqual(metrics.queue_depth, 2)
         self.assertEqual(metrics.coalesced_count, 1)
 
+    def test_evidence_heartbeat_can_opt_out_of_replacement(self):
+        first = self.enqueue(
+            WorkloadClass.HEARTBEAT,
+            payload={"frame": "window-1", "coalesce_heartbeat": False},
+        )
+        second = self.enqueue(
+            WorkloadClass.HEARTBEAT,
+            payload={"frame": "window-2", "coalesce_heartbeat": False},
+        )
+
+        self.assertEqual(first.status, EnqueueStatus.ENQUEUED)
+        self.assertEqual(second.status, EnqueueStatus.ENQUEUED)
+        self.assertNotEqual(first.job.id, second.job.id)
+        metrics = self.repository.metrics_snapshot()
+        self.assertEqual(metrics.queue_depth, 2)
+        self.assertEqual(metrics.coalesced_count, 0)
+
     def test_queued_heartbeat_coalescing_refreshes_newest_content(self):
         original_deadline = self.clock.now() + timedelta(minutes=5)
         first = self.enqueue(

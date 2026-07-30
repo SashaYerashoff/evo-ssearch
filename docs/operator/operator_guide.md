@@ -17,7 +17,7 @@ Terms: [glossary](../00_CANON/glossary.md). Ready-made scenarios:
 - Log in with your named account. Your **role** (admin / engineer / operator /
   viewer) and **channel grants** decide what you see. If a tab or channel is
   missing, you don't have the grant — ask an admin.
-- The workspace has tabs: **Video**, **Archive Research**, **Monitoring**,
+- The workspace has tabs: **Video**, **Archive Research**, **Probes**,
   **Agent**. For public-order monitoring you mostly live in **Video** and
   **Agent**.
 
@@ -31,12 +31,21 @@ This is where the system's always-on description of each channel lives.
   the desired live session, so the service can restore it after restart.
 - **Stream context** — channel, cadence, batch size, model, queue, and runtime
   state.
-- **Summary Lens** — filters what level/source you are reading in the VLM feed.
-  It does not change what happened in the video; it changes which summaries are
-  shown.
-- **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = live per-batch)
-  and the rollups (L1/L2/L3 = 15 min / 1 h / 6 h summaries). Collapsed summary
-  rows show **alert badges** when something was flagged.
+- **VLM Feed controls** keep three choices separate: **Period** (Live, Today,
+  Yesterday, a calendar range), **Resolution** (Auto, observations, 15 min,
+  1 h, 6 h), and **Follow live**. Historical periods span service restarts and
+  are read from the PostgreSQL archive in pages; `Load earlier` retrieves the
+  next page without restarting analysis.
+- **VLM Feed / L0–L3** — the running **video-descriptions** (L0 = per-batch
+  observations) and the rollups (L1/L2/L3 = 15 min / 1 h / 8 h summaries).
+  `Auto` chooses a practical resolution for the selected period. Collapsed
+  summary rows show **alert badges** when something was flagged.
+- Rollup status is explicit: **semantic** is a completed operator narrative,
+  **aggregation pending** is an open window, and **semantic unavailable** is a
+  coverage/status fallback rather than a behavioral conclusion. Use **Generate
+  semantic** to retry one degraded historical window, or **Drill L0** to inspect
+  its source observations. Internal homeostasis/memory payloads are not shown in
+  operator summaries.
 - **Channel Runtime / stream health** — whether the channel is actively
   producing descriptions and whether there are **coverage gaps / dropped
   batches**. A channel that is *quiet* is fine; a channel that is *blind* (gaps)
@@ -44,8 +53,9 @@ This is where the system's always-on description of each channel lives.
 
 Prompt/settings note: **Alert Criteria** is the plain-language "watch for /
 alert on" policy. The L0 stream prompt is for description style/role. The
-`ALERTS_JSON` template is a machine-readable contract and should not be edited
-unless an engineer is intentionally changing parser/schema behavior.
+legacy-named JSON template is the unified machine-readable `BATCH_STATE_JSON`
+contract and should not be edited unless an engineer is intentionally changing
+parser/schema behavior.
 
 What to do here: confirm your demo channels are running, skim recent L1/L2 for
 context, check coverage/health, and note any alert badges before you ask the
@@ -96,13 +106,30 @@ For digging through stored frames directly.
 - **Result card** — score details, source label (video-description frame vs probe
   hit), **Preview** and **describe** for a VLM read, and **Find similar**.
 
-## 5. Monitoring / Probes (mostly agent-driven now)
+## 5. Probes tab (mostly agent-driven now)
 
 Probes are CLIP matchers. In this deployment they're primarily the agent's
 bulk-search tool; as an operator you'll mainly **read** probe hits if shown. You
 can view the Probe Board; creating/tuning probes is an engineer/agent task. (A
 curated watch-list probe set may be cast on demo channels as a safety-net
 detector — see the demo runbook.)
+
+The board nests **channel group → channel → probes**. Channel groups are
+EVA-side labels you create yourself ("Perimeter", "Berth 3"); a channel belongs
+to one group, and channels you have not grouped appear under **Ungrouped**.
+Deleting a group never deletes probes.
+
+Every probe card carries a badge saying who created it:
+
+- **OP** — an operator created it by hand.
+- **AI** — the agent proposed it and an operator approved the change.
+- **VLM** — a temporary follow-up raised automatically from a video-description
+  alert. These carry a countdown to their expiry, never write recorder
+  bookmarks, and the inspector links back to the parent alert in the archive.
+
+Use the **Created by** and **State** filters plus the search box to narrow the
+board; **Grid** suits a few probes per channel and **List** suits many. Filtering
+changes only what you see, never probe state.
 
 Important: a probe **negative** is not "no X". CLIP negatives must be visible
 contrast/background states, such as "people standing normally with empty hands"

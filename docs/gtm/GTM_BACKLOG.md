@@ -116,7 +116,10 @@ Required to call it GA. Slows every future fix until done.
 
 ### A-3 — Real test suite + CI
 - **Effort:** L · **Owner:** Backend + QA
-- **Why:** ~12 smoke tests, <15% coverage, no CI (`.github/workflows` absent).
+- **Status:** In progress. A GitHub Actions workflow now runs the docs-drift
+  gate, Python compilation, and the full pytest suite on every push/PR.
+- **Remaining:** executable browser coverage and an enforced measured coverage
+  floor.
 - **Acceptance criteria:**
   - Unit tests for embedding pipeline, detection dedup/retention, probe logic, agent
     tool dispatch.

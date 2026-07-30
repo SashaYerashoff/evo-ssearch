@@ -3,7 +3,7 @@ import os
 import threading
 import time
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -129,21 +129,49 @@ class ProbeBuffer:
                 self.roi_cache.pop(key, None)
             self.roi_cache_order = [key for key in self.roi_cache_order if key not in set(empty_keys)]
 
-    def add(self, embedding: np.ndarray, timestamp_ms: int, channel_id: int, thumb: str) -> None:
+    def add(
+        self,
+        embedding: np.ndarray,
+        timestamp_ms: int,
+        channel_id: int,
+        thumb: str,
+        provenance: Optional[Mapping[str, Any]] = None,
+    ) -> int:
         emb = self._normalize_vec(embedding)
         if self.embeddings and emb.shape != self.embeddings[0].shape:
             self.clear()
         frame_uid = int(self.next_uid)
         self.next_uid += 1
         self.embeddings.append(emb)
-        self.meta.append(
-            {
-                "uid": frame_uid,
-                "timestamp_ms": timestamp_ms,
-                "channel_id": channel_id,
-                "thumb": thumb,
-            }
-        )
+        meta_row: Dict[str, Any] = {
+            "uid": frame_uid,
+            "timestamp_ms": timestamp_ms,
+            "channel_id": channel_id,
+            "thumb": thumb,
+        }
+        if isinstance(provenance, Mapping):
+            selection_provenance: Dict[str, Any] = {}
+            for key in (
+                "version",
+                "policy",
+                "bucket_start_ms",
+                "source_frame_indices",
+                "source_timestamps_ms",
+                "source_frame_hashes",
+                "selected_source_frame_index",
+                "selected_timestamp_ms",
+                "selected_frame_hash",
+                "selection_source",
+                "selection_score",
+                "score_source",
+                "apex_available",
+                "fallback_reason",
+            ):
+                if key in provenance:
+                    selection_provenance[key] = provenance.get(key)
+            if selection_provenance:
+                meta_row["selection_provenance"] = selection_provenance
+        self.meta.append(meta_row)
         if len(self.embeddings) > self.max_frames:
             excess = len(self.embeddings) - self.max_frames
             if excess > 0:
@@ -153,6 +181,71 @@ class ProbeBuffer:
                 removed_uids = [uid for uid in (_to_optional_int(item.get("uid")) for item in removed) if uid is not None]
                 self._prune_roi_cache_uids(removed_uids)
         self._rebuild_index()
+        return frame_uid
+
+    def score(
+        self,
+        pos_embs: np.ndarray,
+        neg_embs: np.ndarray,
+        *,
+        min_ts_ms: Optional[int] = None,
+        max_ts_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return P/N/M for every buffered embedding in a bounded time window."""
+
+        if not self.embeddings or pos_embs.ndim != 2 or pos_embs.shape[0] == 0:
+            return []
+        selected_idx: List[int] = []
+        for idx, row in enumerate(self.meta):
+            timestamp_ms = _to_optional_int(row.get("timestamp_ms"))
+            if timestamp_ms is None:
+                continue
+            if min_ts_ms is not None and timestamp_ms < int(min_ts_ms):
+                continue
+            if max_ts_ms is not None and timestamp_ms > int(max_ts_ms):
+                continue
+            selected_idx.append(idx)
+        if not selected_idx:
+            return []
+        mat = np.stack(
+            [self.embeddings[idx] for idx in selected_idx],
+            axis=0,
+        ).astype(np.float32)
+        if int(mat.shape[1]) != int(pos_embs.shape[1]):
+            raise ValueError(
+                "Probe vector dimension mismatch. Clear the live probe buffer after changing the CLIP model."
+            )
+        if neg_embs.size > 0 and (
+            neg_embs.ndim != 2
+            or int(neg_embs.shape[1]) != int(pos_embs.shape[1])
+        ):
+            raise ValueError(
+                "Positive and negative probe vectors use different embedding dimensions."
+            )
+        pos_max = (mat @ pos_embs.T).max(axis=1)
+        neg_max = (
+            (mat @ neg_embs.T).max(axis=1)
+            if neg_embs.size > 0
+            else np.zeros_like(pos_max)
+        )
+        margin = pos_max - neg_max
+        results: List[Dict[str, Any]] = []
+        for output_index, meta_index in enumerate(selected_idx):
+            meta_row = self.meta[meta_index]
+            result: Dict[str, Any] = {
+                "frame_uid": int(meta_row.get("uid") or 0),
+                "timestamp_ms": int(meta_row.get("timestamp_ms") or 0),
+                "channel_id": int(meta_row.get("channel_id") or 0),
+                "pos_score": float(pos_max[output_index]),
+                "neg_score": float(neg_max[output_index]),
+                "margin": float(margin[output_index]),
+            }
+            if isinstance(meta_row.get("selection_provenance"), Mapping):
+                result["selection_provenance"] = dict(
+                    meta_row.get("selection_provenance") or {}
+                )
+            results.append(result)
+        return results
 
     def _embed_roi_thumb(
         self,
@@ -295,6 +388,11 @@ class ProbeBuffer:
                     "pos_score": p,
                     "neg_score": n,
                     "margin": m,
+                    **(
+                        {"selection_provenance": dict(meta_row.get("selection_provenance") or {})}
+                        if isinstance(meta_row.get("selection_provenance"), Mapping)
+                        else {}
+                    ),
                 }
             )
         return results
@@ -324,31 +422,108 @@ class ProbeManager:
         self.embed_image_fn = embed_image_fn
         self.embed_text_fn = embed_text_fn
         self.jpeg_encoder = jpeg_encoder
+        self._text_embedding_cache: Dict[str, np.ndarray] = {}
+        self._text_embedding_cache_lock = threading.Lock()
+        self._text_embedding_cache_limit = 512
 
     def _buffer(self, channel_id: int) -> ProbeBuffer:
         if channel_id not in self.buffers:
             self.buffers[channel_id] = ProbeBuffer(self.max_frames, self.thumb_edge)
         return self.buffers[channel_id]
 
-    def add_frame(self, channel_id: int, pil_image: Image.Image, timestamp_ms: Optional[int]) -> None:
+    def add_frame(
+        self,
+        channel_id: int,
+        pil_image: Image.Image,
+        timestamp_ms: Optional[int],
+        provenance: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         ts_ms = timestamp_ms or int(time.time() * 1000)
         emb = self.embed_image_fn(pil_image)
         thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
         with self.lock:
             buf = self._buffer(channel_id)
-            buf.add(emb, ts_ms, channel_id, thumb)
+            frame_uid = buf.add(
+                emb,
+                ts_ms,
+                channel_id,
+                thumb,
+                provenance=provenance,
+            )
+        return {
+            "channel_id": int(channel_id),
+            "frame_uid": int(frame_uid),
+            "timestamp_ms": int(ts_ms),
+            "embedding_ref": f"probe-buffer:{int(channel_id)}:{int(frame_uid)}",
+            "embedding": emb,
+            "thumbnail": thumb,
+        }
 
     def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         embs = []
         for t in texts:
-            if not t or not str(t).strip():
+            normalized = " ".join(str(t or "").split())
+            if not normalized:
                 continue
-            embs.append(self.embed_text_fn(str(t)))
+            cache_key = normalized.casefold()
+            with self._text_embedding_cache_lock:
+                cached = self._text_embedding_cache.get(cache_key)
+            if cached is None:
+                cached = np.asarray(
+                    self.embed_text_fn(normalized),
+                    dtype=np.float32,
+                ).flatten()
+                norm = max(float(np.linalg.norm(cached)), 1e-8)
+                cached = cached / norm
+                with self._text_embedding_cache_lock:
+                    self._text_embedding_cache[cache_key] = cached
+                    while len(self._text_embedding_cache) > self._text_embedding_cache_limit:
+                        oldest = next(iter(self._text_embedding_cache))
+                        self._text_embedding_cache.pop(oldest, None)
+            embs.append(cached)
         if not embs:
             return np.zeros((0, 0), dtype=np.float32)
         mat = np.stack(embs, axis=0).astype(np.float32)
         mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
         return mat
+
+    def score_frames(
+        self,
+        channel_id: int,
+        positives: Sequence[str],
+        negatives: Sequence[str],
+        *,
+        min_ts_ms: Optional[int] = None,
+        max_ts_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Score all saved embedding snapshots without applying hit thresholds."""
+
+        pos_texts = [str(item).strip() for item in positives if str(item).strip()]
+        neg_texts = [str(item).strip() for item in negatives if str(item).strip()]
+        if not pos_texts:
+            return {"error": "Provide at least one positive probe."}
+        pos_embs = self._embed_texts(pos_texts)
+        neg_embs = self._embed_texts(neg_texts)
+        with self.lock:
+            buf = self.buffers.get(int(channel_id))
+            if buf is None:
+                return {"results": [], "frames_indexed": 0}
+            try:
+                results = buf.score(
+                    pos_embs,
+                    neg_embs,
+                    min_ts_ms=min_ts_ms,
+                    max_ts_ms=max_ts_ms,
+                )
+            except ValueError as exc:
+                buf.clear()
+                return {"error": str(exc), "frames_indexed": 0}
+            status = buf.status()
+        return {
+            "results": results,
+            "status": status,
+            "frames_indexed": status.get("frames", 0),
+        }
 
     def _embed_image_base64(self, data: str) -> Optional[np.ndarray]:
         try:
@@ -448,3 +623,5 @@ class ProbeManager:
     def clear_all(self) -> None:
         with self.lock:
             self.buffers.clear()
+        with self._text_embedding_cache_lock:
+            self._text_embedding_cache.clear()

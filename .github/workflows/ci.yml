@@ -1,0 +1,81 @@
+name: EVA AI CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eva-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: eva
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d eva"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      EVOSSEARCH_OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      EVA_DATABASE_DSN: postgresql://postgres:postgres@127.0.0.1:5432/eva
+      EVOSSEARCH_AUTH_TENANT_ID: 00000000-0000-4000-8000-000000000001
+      EVOSSEARCH_ARCHIVE_TENANT_ID: 00000000-0000-4000-8000-000000000001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-db.txt
+            requirements-test.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: react-ui/package-lock.json
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+      - name: Install React dependencies
+        working-directory: react-ui
+        run: npm ci
+      - name: Migrate test database
+        run: alembic upgrade head
+      - name: Check documentation drift
+        run: bash scripts/check_docs_drift.sh
+      - name: Compile production Python
+        run: |
+          python -m compileall -q \
+            agent_security archive_store.py attention_policy.py attention_store.py \
+            embedders eva_db heads inference_queue local_video_source.py \
+            luxriot_connector.py oldapp.py probe_manager.py road_events security
+      - name: Run test suite
+        run: python -m pytest -q
+      - name: Run React contract tests
+        working-directory: react-ui
+        run: npm test
+      - name: Build React prototype
+        working-directory: react-ui
+        run: npm run build

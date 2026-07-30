@@ -21,6 +21,7 @@ from .models import (
     MetricsSnapshot,
     RetryPolicy,
     WorkloadClass,
+    heartbeat_coalescing_enabled,
 )
 
 
@@ -300,11 +301,11 @@ class InMemoryInferenceQueueRepository:
             self._idempotency[(job.tenant_id, job.idempotency_key)] = job.id
 
     def _activate(self, job: InferenceJob) -> None:
-        if job.workload_class is WorkloadClass.HEARTBEAT:
+        if heartbeat_coalescing_enabled(job):
             self._heartbeats[self._heartbeat_key(job)] = job.id
 
     def _deactivate(self, job: InferenceJob) -> None:
-        if job.workload_class is WorkloadClass.HEARTBEAT:
+        if heartbeat_coalescing_enabled(job):
             key = self._heartbeat_key(job)
             if self._heartbeats.get(key) == job.id:
                 self._heartbeats.pop(key, None)
@@ -320,7 +321,7 @@ class InMemoryInferenceQueueRepository:
     def _coalesced_heartbeat(
         self, job: InferenceJob
     ) -> Optional[Tuple[InferenceJob, Mapping[str, object]]]:
-        if job.workload_class is not WorkloadClass.HEARTBEAT:
+        if not heartbeat_coalescing_enabled(job):
             return None
         existing_id = self._heartbeats.get(self._heartbeat_key(job))
         if existing_id is None:
@@ -357,7 +358,7 @@ class InMemoryInferenceQueueRepository:
         )
 
     def _queued_heartbeat(self, job: InferenceJob) -> Optional[InferenceJob]:
-        if job.workload_class is not WorkloadClass.HEARTBEAT:
+        if not heartbeat_coalescing_enabled(job):
             return None
         queued_id = self._heartbeats.get(self._heartbeat_key(job))
         if queued_id is None or queued_id == job.id:

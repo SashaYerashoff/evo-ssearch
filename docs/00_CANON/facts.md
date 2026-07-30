@@ -7,26 +7,26 @@ fact changes, change it here first.
 Markers: `[FIELD]` = client-specific, filled only in the internal field-rollout
 doc, never in shareable docs. `[VERIFY]` = confirm before relying on it.
 
-Last reviewed: 2026-07-02 (β 0.8.3)
+Last reviewed: 2026-07-27 (β 0.8.5)
 
 ## Product & version
 
 | Fact | Value |
 |---|---|
 | Product | Luxriot EVA AI |
-| Current version | `β 0.8.3` |
+| Current version | `β 0.8.5` |
 | Release class | Production-pilot beta (supervised, closed network) |
 | Version source of truth | `VERSION` file; `EVOSSEARCH_APP_VERSION` overrides only if set |
-| Previous baseline | `β 0.8.2.1` |
+| Previous baseline | `β 0.8.4` |
 
 ## Database
 
 | Fact | Value |
 |---|---|
 | Control plane | PostgreSQL (required in secure deployment) |
-| Alembic schema head | `20260614_0006` |
-| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260614_0006` |
-| Migration needed for 0.8.2.1 → 0.8.3 | **No** (code-only patch) |
+| Alembic schema head | `20260727_0010` |
+| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260727_0010` |
+| Migration needed for this working tree | **Yes**: run `alembic upgrade head` |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |
 | Runtime DB roles | Separate DSNs for API, audit, worker, migration |
@@ -38,7 +38,7 @@ Last reviewed: 2026-07-02 (β 0.8.3)
 | Auth model | Named users + role-based access (admin / engineer / operator / viewer) |
 | Legacy admin-token | **Not** the current auth model; do not document it as current |
 | Channel scope | Per-user channel grants; all-channel grant supported |
-| Audit | Sensitive endpoints and agent tool calls are audited |
+| Audit | Sensitive endpoints and agent tool calls are audited; new events form a tenant-scoped SHA-256 hash chain |
 
 ## Runtime model
 
@@ -49,8 +49,8 @@ Last reviewed: 2026-07-02 (β 0.8.3)
 | App bind | Gunicorn serves plain HTTP on `EVOSSEARCH_HOST:EVOSSEARCH_PORT` (`5000` default) |
 | Browser entrypoint | HTTPS/TLS reverse proxy or site TLS boundary `[FIELD]`; office/demo may use HTTP-only internally |
 | Liveness / readiness | `GET /health`, `GET /ready` |
-| Inference queue | Present but **disabled by default**; summary dispatch is synchronous in-process |
-| Graceful-restart durability | Gunicorn worker hooks flush summary state + rollup cache (`gunicorn_conf.py`) |
+| Inference queue | Code default is off for unconfigured development; the clean appliance installer enables the PostgreSQL queue, one worker, and `/var/lib/eva-ai/inference-spool` |
+| Rollup durability | Closed semantic L1–L3 windows are stored as queryable `archive.runtime_state` rows; a bounded hot cache is also flushed by Gunicorn worker hooks (`gunicorn_conf.py`) |
 
 HTTP/TLS invariant: port number alone does not make the app HTTPS. If operators
 open EVA AI through HTTPS (reverse proxy or TLS-terminating service), set
@@ -64,8 +64,9 @@ and that mode is not client-facing.
 |---|---|
 | Production embedder | CLIP `ViT-B/32` |
 | DINO / fusion / Mask2Former segments | Experimental, disabled in production |
-| VLM (video-description) model | Configured by `EVOSSEARCH_LM_PROFILE_VLM_MODEL`; current constrained demo profile may use the same `qwen3.5-9b-mtp` model as the agent |
-| Agent LM model | `qwen3.5-9b` class / `qwen3.5-9b-mtp` demo profile |
+| VLM (video-description) model | Configured by `EVOSSEARCH_LM_PROFILE_VLM_MODEL`; the Ventspils eight-channel deployment target is `Qwen3-VL-4B` |
+| Agent LM model | Configured by the agent LM profile; the Ventspils eight-channel deployment initially shares `Qwen3-VL-4B` with the VLM under protected admission |
+| Optional deep L3 model | A separate proposal-only 9B-class endpoint admitted only in the operator-defined quiet window and deferred by live attention/alert debt |
 | Inference topology | VLM on dedicated vLLM host(s); app + CLIP + agent + DB on a separate host `[FIELD]` |
 
 ## Supported platform

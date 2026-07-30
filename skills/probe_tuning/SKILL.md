@@ -14,6 +14,17 @@ Trigger phrases:
 
 Goal: tune probes using evidence from short-term, medium-term, and broader history.
 
+Tools:
+- `list_probes`
+- `get_detection_summary`
+- `prepare_probe_calibration_batch`
+- `calibrate_probe_from_archive`
+- `build_research_batch`
+- `get_video_summaries`
+- `describe_frame`
+- `create_probe`
+- `update_probe`
+
 Use this skill only when the operator explicitly asks to tune, inspect, create, cast, or report on probes. For ordinary status reports, incident reports, channel-health checks, and video-history questions, use video-summary workflows first and treat probes only as a secondary CLIP/P/N/M corroboration signal.
 
 Default order:
@@ -27,6 +38,32 @@ Default order:
 7. Compare the probe behavior to `get_video_summaries` if LLM summaries exist for that period.
 8. Only then propose `create_probe` or `update_probe` with `preview=true`. If a batch result returned non-null `recommended_probe_args`, pass those args through; do not rewrite them into calibration-shaped arguments. If `safe_to_apply=false` or `recommended_probe_args` is null, do not propose probe changes yet.
 9. Do not apply from chat. Tell the operator to use the UI Apply button on the preview card; treat the later trusted action receipt as the only proof that the probe changed.
+
+Embedding-model transition:
+
+- Treat a CLIP/SigLIP2 model change as a new calibration epoch. Similarity
+  scores, `pos_floor`, `margin`, archived vectors, and image probes are not
+  portable between embedding spaces.
+- Do not tune SigLIP2 from legacy CLIP vectors. The archive calibration tool
+  skips vectors whose recorded embedding space is missing or mismatched when
+  SigLIP2 is active; report that rejected coverage instead of treating it as
+  target absence.
+- Start SigLIP2 probes in `shadow`: they may prioritize frame review but must
+  not regulate attention or corroborate an alert until their current embedding
+  space has been stamped by an operator-approved create/update preview.
+- Accumulate independent semantic snapshots before calibration. Use at least
+  15 minutes/120 samples per channel for a first provisional pass, then compare
+  a recent window with a broader routine window. Rare events need operator
+  examples or reviewed VLM-alert frames; routine-only data cannot calibrate
+  their positive threshold.
+- For each probe, compare a visible positive phrase with a visible contrast
+  phrase, inspect representative high-margin and ambiguous frames, and accept
+  thresholds only when `safe_to_apply=true`. One threshold set per channel is
+  the default.
+- After Apply, observe a fresh window and compare hit rate, false positives,
+  missed reviewed events, attention debt, and VLM batch admission. Roll back
+  the probe to shadow if the new space over-fires or suppresses unrelated
+  novelty.
 
 VLM-alert to probe workflow:
 - Use this when the operator asks to double-check video-description alerts with probes.

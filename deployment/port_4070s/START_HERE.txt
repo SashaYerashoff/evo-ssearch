@@ -1,0 +1,61 @@
+EVA AI 0.8.5 — OFFLINE PORT APPLIANCE
+======================================
+
+Target:
+  Ubuntu Server 24.04 amd64
+  NVIDIA RTX 4070 Super 12 GB
+  Intel Core i9 14th Gen
+  64 GB RAM
+  up to 8 homeostatically regulated video channels
+
+1. Install Ubuntu Server from this USB.
+2. After the first boot, mount the writable USB partition.
+3. Open a terminal in the EVA-AI-0.8.5-PORT folder.
+4. Optional integrity check:
+
+       sha256sum -c SHA256SUMS
+
+5. Preferred: install the small bootstrap package, then start the English
+   interactive installer:
+
+       sudo dpkg -i installer-deb/eva-ai-appliance-installer_*_amd64.deb
+       sudo eva-ai-install --bundle-root "$PWD"
+
+   Recovery/direct path (functionally equivalent):
+
+       ./install.sh
+
+The installer asks for the Luxriot Evo address and credentials, installation
+paths, local or external inference placement, an optional 9B quiet window, and
+the first EVA administrator account. It checks disk space, GPU visibility,
+PostgreSQL/schema state, takes a backup when upgrading, installs only from the
+USB, writes /etc/eva-ai/eva-ai.env, and starts the systemd services.
+Offline APT content is first staged on the local disk so installation does not
+depend on FAT/exFAT/desktop mount permissions. Interrupted phases are recorded
+in /var/lib/eva-ai-installer/install-state.json and are safe to replay.
+
+Default layout:
+  /opt/eva-ai       application and inference runtimes
+  /var/lib/eva-ai   models, semantic archive state, spool and media metadata
+  /etc/eva-ai       site configuration and TLS keypair
+  /var/backups/eva-ai
+
+After installation:
+  Open https://<server-ip>/
+  Log in with the EVA administrator created by the installer.
+  Run: Protocol: Deploy
+
+Diagnostics:
+  sudo eva-ai-doctor --output /tmp/eva-ai-doctor.json
+  See repo/deployment/port_4070s/FIELD_RECOVERY.md for a secret-safe handoff.
+
+The locally generated TLS certificate must be trusted on operator workstations.
+The 9B endpoint is proposal-only and its quiet window can be enabled or changed
+later in EVA.
+
+Backup note:
+  repo/ is the exact deployable working-tree snapshot packaged for this field
+  build, including current uncommitted and untracked source files (except local
+  caches, environments, runtime data, and large review PDFs).
+  repository-backup/evo-ssearch-all-refs.bundle contains all committed Git refs
+  and history. See repository-backup/README.txt for restoration commands.

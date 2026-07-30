@@ -2,6 +2,13 @@
 
 Goal: refine VLM descriptions and alert prompts with explicit evidence.
 
+Tools:
+- `normalize_time_window`
+- `get_prompt_settings`
+- `get_video_summaries`
+- `get_detections`
+- `update_prompt_settings`
+
 Default order:
 1. Resolve the target channel first. Use `channel_id` when explicit, otherwise pass `channel_ref` such as `#115` or `stream`.
 2. Read `get_prompt_settings` for either global defaults or the target channel.

@@ -22,7 +22,7 @@ distinct. When in doubt, link here.
 - **L0 / L1 / L2 / L3** — summary levels by time window:
   - **L0** = per-batch live video-description (frame-time anchored).
   - **L1 / L2 / L3** = rollups over progressively larger windows
-    (default ~15 min / 1 h / 6 h). L1–L3 may be LLM-synthesized or deterministic.
+    (default ~15 min / 1 h / 8 h). L1–L3 may be LLM-synthesized or deterministic.
 - **Read-only rollup** — reading rollups for investigation **without** triggering
   LLM synthesis (used by agent investigation tools).
 - **Salience-weighted compression** — when a rollup exceeds its budget, alert /
@@ -30,10 +30,14 @@ distinct. When in doubt, link here.
 
 ## Alerts & bookmarks
 
-- **ALERTS_JSON** — a structured alert block the VLM appends to a video-description
-  when a security/safety trigger is visible. The structured layer behind severity
-  badges and alert counts. Always requested; independent of bookmark settings.
-- **Alert** — one parsed entry from ALERTS_JSON (title, description, severity, state, timestamp).
+- **BATCH_STATE_JSON** — the single structured current-batch contract appended by
+  the VLM. It carries the chosen cover, scene/episode continuity, observed states,
+  routine and memory-pass items, and zero or more grounded alerts. Always requested;
+  independent of bookmark settings.
+- **ALERTS_JSON** — legacy input format accepted while reading older summaries; it
+  is no longer requested from the VLM.
+- **Alert** — one parsed entry from `BATCH_STATE_JSON.alerts` (title, description,
+  severity, state, timestamp, and snapshot references).
 - **Severity** — `info | low | normal | high | critical`.
 - **Bookmark** — an event pushed **into Luxriot Evo** from an alert. Gated by
   `bookmark_enabled` and a per-channel cooldown. A bookmark can fail to deliver
@@ -48,6 +52,26 @@ distinct. When in doubt, link here.
   **stricter**; lowering makes it more permissive.
 - **Watch-list probes** — a curated probe set (e.g. fighting, vehicle drifting)
   cast across channels as a parallel, VLM-independent detector.
+- **Probe origin** — probe authorship, stored as `origin` on the probe and shown
+  as a badge on the Probes board. Exactly one of:
+  - **`operator`** — created through the operator UI. Probes stored before this
+    field existed are backfilled to `operator` on read.
+  - **`agent`** — proposed by the agent and written only once an operator
+    approved the change. An agent editing an existing probe does not take over
+    its authorship.
+  - **`auto`** — a temporary follow-up created by the alert-probe lifecycle from
+    a VLM alert. Distinct from the lifecycle's own `source: vlm_alert` lineage
+    guard, which answers a different question.
+- **Channel group** — an operator-defined label grouping channels on the Probes
+  board. EVA-side only; Luxriot exposes no group concept. A channel belongs to
+  at most one group, and ungrouped channels render under "Ungrouped".
+- **Counted-state profile** — an operator-approved pair of visible states plus
+  a transition/dwell rule. EVA evaluates it over continuous archived semantic
+  snapshots; its episode count is independent of whether an alert/bookmark was
+  sent, deduplicated, or suppressed by cooldown.
+- **Protocol Deploy** — the durable, approval-gated initial commissioning
+  workflow for at most eight channels: inventory → scope/groups → visual survey
+  → operator policy → composite preview/apply → proposal-only commissioning.
 
 ## Archive & search
 
@@ -55,6 +79,8 @@ distinct. When in doubt, link here.
   - **`probe`** — an actual probe hit.
   - **`vlm_summary`** — a frame sampled from a video-description batch.
   - **`vlm_alert`** — a frame anchored to a VLM alert.
+  - **`semantic_snapshot`** — the continuous cadence-selected CLIP snapshot,
+    archived independently of probes, VLM alerts, and VLM admission.
 - **Frame archive** — PostgreSQL `archive.detections`; each row carries a CLIP
   vector (`bytea`) + thumbnail, indexed by time/channel/source.
 - **Semantic search** — text/image → CLIP vector → ranked against candidate
@@ -70,8 +96,9 @@ distinct. When in doubt, link here.
 - **Run / session** — a capture session for one channel. Runs have start/end
   times; a drop + reconnect produces a closed run and a new run. Source of
   "what connected / dropped over a period."
-- **Inference queue / spool** — durable queue for summary batches (present,
-  disabled by default).
+- **Inference queue / spool** — durable queue for summary batches. The code
+  default is off for unconfigured development; the clean appliance profile
+  enables it with one worker.
 - **Tenant** — RLS isolation key; all archive/agent/audit rows are tenant-scoped.
 
 ## Concepts

@@ -2,6 +2,13 @@
 
 Goal: answer archive questions with evidence, not guesses.
 
+Tools:
+- `normalize_time_window`
+- `search_archive`
+- `get_detections`
+- `build_research_batch`
+- `describe_frame`
+
 Default order:
 1. Normalize the request into absolute time windows when possible.
 2. For operational camera-history questions, start with `search_archive` over `source="vlm_summary"` and `source="vlm_alert"` when the source is not otherwise specified.

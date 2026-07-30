@@ -1,14 +1,17 @@
 import unittest
 import base64
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import oldapp
 from PIL import Image
+from probe_board import ChannelGroupStore
 from unittest.mock import patch
 from security import ALL_CHANNELS, Permission, Role, digest_session_token
 from security.http_auth import AuthenticationService
@@ -295,6 +298,46 @@ class _AgentRunner:
 
 
 class HttpAuthRouteTests(unittest.TestCase):
+    def test_video_lm_generation_preflight_runs_after_admission_before_http(self):
+        order = []
+
+        class Admission:
+            def __enter__(self):
+                order.append("admitted")
+                return "ticket"
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                order.append("released")
+                return False
+
+        class Superseded(RuntimeError):
+            superseded = True
+
+        marker = Superseded("old generation")
+
+        def preflight():
+            order.append("preflight")
+            raise marker
+
+        profile = {
+            "id": "vlm-test",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "qwen-test",
+            "api_key": "",
+            "timeout": 30,
+            "kind": "vlm",
+        }
+        with (
+            patch("oldapp._resolve_lm_profile", return_value=profile),
+            patch.object(oldapp._lm_admission_controller, "admission", return_value=Admission()),
+            patch("oldapp.requests.post") as post,
+        ):
+            with self.assertRaises(Superseded):
+                oldapp._call_video_understanding([], preflight=preflight)
+
+        self.assertEqual(order, ["admitted", "preflight", "released"])
+        post.assert_not_called()
+
     def setUp(self) -> None:
         self.original = {
             "AUTH_ENABLED": oldapp.config.AUTH_ENABLED,
@@ -500,6 +543,8 @@ class HttpAuthRouteTests(unittest.TestCase):
     def test_sensitive_reads_require_login_and_channel_scope(self) -> None:
         anonymous = self.client.get("/luxriot/channels")
         self.assertEqual(anonymous.status_code, 401)
+        anonymous_media = self.client.head("/luxriot/media/live/7")
+        self.assertEqual(anonymous_media.status_code, 401)
 
         self._login()
         allowed = self.client.get("/luxriot/channels")
@@ -507,6 +552,12 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         denied_snapshot = self.client.get("/luxriot/snapshot/8")
         self.assertEqual(denied_snapshot.status_code, 403)
+        denied_media = self.client.head("/luxriot/media/archive/8?time_ms=1700000000000")
+        self.assertEqual(denied_media.status_code, 403)
+        denied_archive_snapshot = self.client.get(
+            "/luxriot/archive_snapshot/8?time_ms=1700000000000"
+        )
+        self.assertEqual(denied_archive_snapshot.status_code, 403)
 
         self.assertTrue(
             any(
@@ -518,6 +569,22 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertTrue(
             any(
                 event.action == "http.luxriot_snapshot.access"
+                and event.result == "denied"
+                and event.channel_id == 8
+                for event in self.audit.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.action == "http.luxriot_media.access"
+                and event.result == "denied"
+                and event.channel_id == 8
+                for event in self.audit.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.action == "http.luxriot_archive_snapshot.access"
                 and event.result == "denied"
                 and event.channel_id == 8
                 for event in self.audit.events
@@ -1028,6 +1095,156 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(forbidden_scope.status_code, 403)
         self.assertEqual(allowed_scope.status_code, 200)
 
+    def test_multi_channel_detection_scope_checks_every_selected_channel(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset({Permission.DETECTIONS_VIEW.value}),
+            allowed_channel_ids=frozenset({7, 9}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        with patch(
+            "oldapp.detections_store.list_detections",
+            return_value=([], 0),
+        ) as list_detections:
+            allowed = self.client.get(
+                "/detections/list?channel_id=7&channel_id=9"
+            )
+            forbidden = self.client.get(
+                "/detections/list?channel_id=7&channel_id=8"
+            )
+
+        self.assertEqual(allowed.status_code, 200, allowed.get_json())
+        self.assertEqual(allowed.get_json()["filters"]["channel_ids"], [7, 9])
+        self.assertEqual(
+            list_detections.call_args.kwargs["channel_ids"],
+            [7, 9],
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_alert_false_positive_feedback_report_and_export_are_scoped(self) -> None:
+        self.repository.identity = _Identity(
+            roles=frozenset({Role.OPERATOR.value}),
+            permissions=frozenset(
+                {
+                    Permission.DETECTIONS_VIEW.value,
+                    Permission.REPORTS_VIEW.value,
+                    Permission.BOOKMARKS_CREATE.value,
+                    Permission.DATA_EXPORT.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+        saved_feedback = {
+            "id": 91,
+            "detection_id": 501,
+            "channel_id": 7,
+            "alert_timestamp_ms": 150_000,
+            "actor_id": USER_ID,
+            "reason_code": "benign_activity",
+            "reason_label": "Benign activity",
+            "note": "Maintenance worker.",
+            "alert_title": "Person near door",
+            "alert_snapshot": {"source": "vlm_alert"},
+            "submitted_at_ms": 160_000,
+            "updated_at_ms": 160_000,
+        }
+        report = {
+            "report_type": "false_positives",
+            "period": {"since_ms": 100_000, "until_ms": 200_000},
+            "coverage": {
+                "status": "covered",
+                "annotation_count": 1,
+                "returned_count": 1,
+                "truncated": False,
+                "ground_truth_status": "operator_annotation_only",
+            },
+            "summary": {
+                "annotation_count": 1,
+                "distinct_alert_count": 1,
+                "reviewer_count": 1,
+                "channel_count": 1,
+            },
+            "reason_counts": [
+                {
+                    "reason_code": "benign_activity",
+                    "reason_label": "Benign activity",
+                    "count": 1,
+                }
+            ],
+            "channel_counts": [{"channel_id": 7, "count": 1}],
+            "feedback": [saved_feedback],
+            "report": "# False-positive operator feedback report",
+        }
+
+        with (
+            patch(
+                "oldapp.detections_store.fetch_detections_by_ids",
+                return_value=[
+                    {
+                        "id": 501,
+                        "channel_id": 7,
+                        "source": "vlm_alert",
+                    }
+                ],
+            ),
+            patch(
+                "oldapp.detections_store.upsert_alert_feedback",
+                return_value=saved_feedback,
+            ) as upsert_feedback,
+            patch(
+                "oldapp.detections_store.generate_false_positive_report",
+                return_value=report,
+            ) as generate_report,
+        ):
+            missing_csrf = self.client.post(
+                "/detections/501/feedback",
+                json={"reason_code": "benign_activity"},
+            )
+            saved = self.client.post(
+                "/detections/501/feedback",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "reason_code": "benign_activity",
+                    "note": "Maintenance worker.",
+                },
+            )
+            scoped_report = self.client.get(
+                "/reports/false-positives?since_ms=100000&until_ms=200000"
+            )
+            xml_export = self.client.get(
+                "/reports/false-positives/export"
+                "?format=xml&since_ms=100000&until_ms=200000"
+            )
+
+        self.assertEqual(missing_csrf.status_code, 403)
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        self.assertEqual(saved.get_json()["feedback"]["detection_id"], 501)
+        self.assertEqual(
+            upsert_feedback.call_args.kwargs["actor_id"],
+            USER_ID,
+        )
+        self.assertEqual(scoped_report.status_code, 200, scoped_report.get_json())
+        self.assertEqual(
+            generate_report.call_args_list[0].kwargs["channel_ids"],
+            [7],
+        )
+        self.assertEqual(xml_export.status_code, 200)
+        self.assertTrue(xml_export.data.startswith(b"<?xml"))
+        self.assertIn(
+            "eva-false-positive-report-",
+            xml_export.headers["Content-Disposition"],
+        )
+        self.assertTrue(
+            any(
+                event.action == "archive.alert_feedback.upsert"
+                and event.channel_id == 7
+                for event in self.audit.events
+            )
+        )
+
     def test_archive_not_ready_response_is_sanitized(self) -> None:
         self._login()
 
@@ -1044,6 +1261,32 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(payload["not_ready"], "archive_store")
         self.assertEqual(payload["required_revision"], "20260612_0005")
         self.assertNotIn("archive.detections", payload["error"])
+
+    def test_prompt_editor_cannot_mutate_process_global_skills(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.AGENT_USE.value,
+                    Permission.PROMPTS_MANAGE.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch("oldapp._save_skill_record") as save_skill:
+            response = self.client.post(
+                "/agent/skills/create",
+                headers={"X-CSRF-Token": csrf_token},
+                json={
+                    "name": "Global mutation",
+                    "content": "# changed",
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+        save_skill.assert_not_called()
 
     def test_luxriot_prompt_bookmark_settings_require_bookmark_permission(self) -> None:
         self.repository.identity = _Identity(
@@ -1089,6 +1332,7 @@ class HttpAuthRouteTests(unittest.TestCase):
                     "channel_id": 7,
                     "stream_system_prompt": "plain prompt",
                     "alert_policy_prompt": "watch for visible falls near stairs",
+                    "capture_selector_enabled": False,
                 },
             )
 
@@ -1099,6 +1343,51 @@ class HttpAuthRouteTests(unittest.TestCase):
         )
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_enabled"])
         self.assertIsNone(update_settings.call_args.kwargs["bookmark_cooldown_sec"])
+        self.assertFalse(update_settings.call_args.kwargs["capture_selector_enabled"])
+
+        with patch("oldapp.luxriot_manager.update_prompt_settings") as update_settings:
+            denied_bookmark_reset = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "clear_override_fields": ["bookmark_enabled"]},
+            )
+
+        self.assertEqual(denied_bookmark_reset.status_code, 403)
+        update_settings.assert_not_called()
+
+        with patch(
+            "oldapp.luxriot_manager.update_prompt_settings",
+            return_value={"stream_system_prompt": "inherited"},
+        ) as update_settings:
+            allowed_prompt_reset = self.client.post(
+                "/luxriot/prompt_settings",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "clear_override_fields": ["stream_system_prompt"]},
+            )
+
+        self.assertEqual(allowed_prompt_reset.status_code, 200, allowed_prompt_reset.get_json())
+        self.assertEqual(
+            update_settings.call_args.kwargs["clear_override_fields"],
+            ["stream_system_prompt"],
+        )
+
+    def test_luxriot_rollups_reject_invalid_target_level_as_bad_request(self) -> None:
+        self.repository.identity = replace(
+            self.repository.identity,
+            permissions=frozenset(
+                {
+                    Permission.REPORTS_VIEW.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+
+        response = self.client.get("/luxriot/rollups?channel_id=7&target_level=L9")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("target_level", response.get_json()["error"])
 
     def test_probe_bookmark_save_requires_bookmark_permission(self) -> None:
         self.repository.identity = _Identity(
@@ -1246,6 +1535,88 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         delete_probe.assert_not_called()
 
+    def test_probe_channel_groups_are_filtered_and_mixed_groups_are_read_only(
+        self,
+    ) -> None:
+        self.repository.identity = replace(
+            self.repository.identity,
+            permissions=frozenset(
+                {
+                    Permission.PROBES_MANAGE.value,
+                    Permission.REPORTS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ChannelGroupStore(Path(temp_dir) / "probe_channel_groups.json")
+            mixed_group = store.upsert_group(
+                name="Mixed scope",
+                channel_ids=[7, 8],
+            )
+            store.upsert_group(
+                name="Hidden scope",
+                channel_ids=[9],
+            )
+            with (
+                patch("oldapp.channel_group_store", store),
+                patch("oldapp.probes_store.list_probes", return_value=[]),
+            ):
+                listed = self.client.get("/probes/channel_groups")
+                board = self.client.get("/probes/list")
+                delete = self.client.post(
+                    "/probes/channel_groups/delete",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"id": mixed_group["id"]},
+                )
+                rename = self.client.post(
+                    "/probes/channel_groups/save",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"id": mixed_group["id"], "name": "Claimed"},
+                )
+                claim = self.client.post(
+                    "/probes/channel_groups/save",
+                    headers={"X-CSRF-Token": csrf_token},
+                    json={"name": "Claim channel", "channel_ids": [7]},
+                )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(board.status_code, 200)
+        expected_groups = [
+            {
+                "name": "Mixed scope",
+                "channel_ids": [7],
+                "read_only": True,
+            }
+        ]
+        for response in (listed, board):
+            self.assertEqual(
+                [
+                    {
+                        "name": group["name"],
+                        "channel_ids": group["channel_ids"],
+                        "read_only": group.get("read_only"),
+                    }
+                    for group in response.get_json()["groups"]
+                ]
+                if "groups" in response.get_json()
+                else [
+                    {
+                        "name": group["name"],
+                        "channel_ids": group["channel_ids"],
+                        "read_only": group.get("read_only"),
+                    }
+                    for group in response.get_json()["channel_groups"]
+                ],
+                expected_groups,
+            )
+        self.assertEqual(delete.status_code, 403)
+        self.assertEqual(rename.status_code, 403)
+        self.assertEqual(claim.status_code, 403)
+
     def test_legacy_folder_routes_require_all_channel_for_scoped_users(self) -> None:
         _, csrf_token = self._login()
 
@@ -1267,7 +1638,9 @@ class HttpAuthRouteTests(unittest.TestCase):
 
     def test_lm_models_requires_authenticated_diagnostics_permission(self) -> None:
         anonymous = self.client.get("/lm/models")
+        anonymous_admission = self.client.get("/lm/admission")
         self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous_admission.status_code, 401)
 
         self.repository.identity = _Identity(
             permissions=frozenset(
@@ -1291,9 +1664,13 @@ class HttpAuthRouteTests(unittest.TestCase):
                 "oldapp._get_agent_config_payload",
                 return_value={"model": "qwen35-9b"},
             ),
+            patch("oldapp._lm_admission_profiles", return_value=[]),
         ):
             scoped_engineer = self.client.get("/lm/models?force=1")
+            admission = self.client.get("/lm/admission")
         self.assertEqual(scoped_engineer.status_code, 200)
+        self.assertEqual(admission.status_code, 200)
+        self.assertTrue(admission.get_json()["enabled"])
         event = next(
             event for event in self.audit.events if event.action == "lm.models.completed"
         )
@@ -1301,6 +1678,87 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(event.details["profile_count"], 1)
         self.assertEqual(event.details["model_count"], 1)
         self.assertTrue(event.details["force"])
+
+    def test_lm_admission_reports_served_model_match_without_credentials(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset({Permission.DIAGNOSTICS_VIEW.value}),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        self._login()
+        profiles = {
+            "match": {
+                "id": "match",
+                "kind": "vlm",
+                "base_url": "https://user:password@lm-match.example/v1",
+                "model": "model-a",
+                "api_key": "bearer-secret",
+                "timeout": 30,
+            },
+            "mismatch": {
+                "id": "mismatch",
+                "kind": "agent",
+                "base_url": "https://lm-mismatch.example/v1",
+                "model": "model-b",
+                "api_key": "",
+                "timeout": 30,
+            },
+            "unreachable": {
+                "id": "unreachable",
+                "kind": "vlm",
+                "base_url": "https://lm-down.example/v1",
+                "model": "model-c",
+                "api_key": "down-secret",
+                "timeout": 30,
+            },
+        }
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        def get_models(url, **_kwargs):
+            if "lm-match.example" in url:
+                return Response({"data": [{"id": "model-a", "max_model_len": 32768}]})
+            if "lm-mismatch.example" in url:
+                return Response({
+                    "data": [{"id": "actually-served", "meta": {"n_ctx": 16384}}]
+                })
+            raise oldapp.requests.Timeout("credential-bearing endpoint unavailable")
+
+        with oldapp._lm_served_models_cache_lock:
+            oldapp._lm_served_models_cache.clear()
+        with (
+            patch("oldapp._configured_lm_profiles", return_value=profiles),
+            patch("oldapp.requests.get", side_effect=get_models) as get,
+        ):
+            response = self.client.get("/lm/admission")
+            cached_response = self.client.get("/lm/admission")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(cached_response.status_code, 200, cached_response.get_json())
+        self.assertEqual(get.call_count, 3)
+        rows = {row["id"]: row for row in response.get_json()["profiles"]}
+        self.assertIs(rows["match"]["model_match"], True)
+        self.assertEqual(rows["match"]["served_models"], ["model-a"])
+        self.assertEqual(rows["match"]["served_context_length"], 32768)
+        self.assertIs(rows["mismatch"]["model_match"], False)
+        self.assertEqual(rows["mismatch"]["served_models"], ["actually-served"])
+        self.assertEqual(rows["mismatch"]["served_context_length"], 16384)
+        self.assertEqual(rows["unreachable"]["model_match"], "unknown")
+        self.assertEqual(rows["unreachable"]["served_models"], [])
+        serialized = str(response.get_json())
+        for secret in ("user", "password", "bearer-secret", "down-secret"):
+            self.assertNotIn(secret, serialized)
+        match_call = next(call for call in get.call_args_list if "lm-match.example" in call.args[0])
+        self.assertEqual(match_call.kwargs["headers"]["Authorization"], "Bearer bearer-secret")
+        self.assertEqual(match_call.kwargs["timeout"], 3.0)
 
     def test_settings_env_write_audits_keys_without_secret_values(self) -> None:
         self.repository.identity = _Identity(

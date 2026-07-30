@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -5,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CSS = (ROOT / "static/css/app.css").read_text(encoding="utf-8")
 JS = (ROOT / "static/js/app.js").read_text(encoding="utf-8")
 TEMPLATE = (ROOT / "templates/index.html").read_text(encoding="utf-8")
+OLDAPP = (ROOT / "oldapp.py").read_text(encoding="utf-8")
 
 
 def _cef_safe_section() -> str:
@@ -30,6 +32,39 @@ def test_cef_safe_section_removes_card_backdrop_filters():
     assert ".action-icon" in section
     assert ".probe-action-btn" in section
     assert "backdrop-filter: none;" in section
+
+
+def test_ui_has_no_runtime_google_font_dependency():
+    assert "fonts.googleapis.com" not in CSS
+    assert "fonts.gstatic.com" not in CSS
+
+
+def test_probe_editor_uses_backend_injected_threshold_defaults():
+    assert "const PROBE_POS_FLOOR_DEFAULT = {probe_pos_floor_default};" in JS
+    assert "const PROBE_MARGIN_DEFAULT = {probe_margin_default};" in JS
+    assert "value=\"0.28\"" in TEMPLATE
+    assert "value=\"0.08\"" in TEMPLATE
+
+
+def test_login_form_is_password_manager_friendly_and_keeps_typing_focus():
+    assert 'autocomplete="username"' in TEMPLATE
+    assert 'autocomplete="current-password"' in TEMPLATE
+    assert 'id="authPasswordToggle"' in TEMPLATE
+    assert "active === authUsernameInput" in JS
+    assert "active === authPasswordInput" in JS
+    assert "? authPasswordInput" in JS
+
+
+def test_global_skill_editing_requires_settings_management_in_ui():
+    assert "const canManageSkills = userHasPermission('settings:manage');" in JS
+    assert "setElementHidden(agentCreateSkillBtn, !canManageSkills);" in JS
+    assert "${canManageSkills ? `<button" in JS
+
+
+def test_channel_reload_marks_unavailable_inventory_and_skips_selection():
+    assert "ch.enabled === false" in JS
+    assert "['disabled', 'offline', 'unavailable'].includes(availability)" in JS
+    assert "stopped unavailable:" in JS
 
 
 def test_studio_scroll_contract_has_stable_gutters():
@@ -105,10 +140,15 @@ def test_repeated_grid_consistency_contract_prevents_card_overlap():
     assert "grid-auto-rows: max-content;" in section
     assert "overflow-x: hidden;" in section
     assert "overflow-y: auto;" in section
-    assert "repeat(auto-fit, minmax(min(100%, 120px), 1fr))" in section
     assert "repeat(auto-fit, minmax(min(100%, 88px), 1fr))" in section
     assert ".archive-inspector-body .result-item" in section
     assert "contain: none;" in section
+
+
+def test_probe_card_grid_uses_auto_fit_template():
+    """Probe cards must reflow instead of overlapping at any board width."""
+    section = CSS.split(".probe-channel-card-grid {", 1)[1].split("}", 1)[0]
+    assert "grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));" in section
 
 
 def test_modal_consistency_contract_has_bounded_scroll_bodies():
@@ -119,12 +159,30 @@ def test_modal_consistency_contract_has_bounded_scroll_bodies():
     assert ".archive-review-shell" in section
     assert "max-block-size: calc(100dvh - 32px);" in section
     assert ".prompt-modal-scrollarea" in section
-    assert "grid-template-rows: auto minmax(0, 1fr) auto auto auto minmax(0, 0.55fr);" in section
+    assert "grid-template-rows: auto minmax(240px, 1fr) auto auto auto auto minmax(180px, 0.55fr);" in section
     assert "position: relative;" in section
     assert "inset: auto;" in section
     assert "width: min(96vw, 1120px);" in section
     assert "height: min(calc(100dvh - 32px), 960px);" in section
     assert "border-radius: 22px;" in section
+
+
+def test_archive_review_modal_pins_hidden_feedback_and_summary_to_distinct_grid_rows():
+    section = CSS.split("Unified modal behavior", 1)[1].split("Unified scrollbar contract", 1)[0]
+    for area in ('"head"', '"frame"', '"meta"', '"filmstrip"', '"actions"', '"feedback"', '"summary"'):
+        assert area in section
+    for selector, area in (
+        (".archive-review-head", "head"),
+        (".archive-review-frame", "frame"),
+        (".archive-review-meta-row", "meta"),
+        (".archive-review-filmstrip", "filmstrip"),
+        (".archive-review-actions", "actions"),
+        (".archive-review-feedback", "feedback"),
+        (".archive-review-summary-panel", "summary"),
+    ):
+        assert f"{selector} {{\n    grid-area: {area};" in CSS
+    assert "minmax(240px, 1fr)" in section
+    assert "minmax(180px, 0.55fr)" in section
 
 
 def test_archive_review_modal_uses_shared_surface_not_hud_chrome():
@@ -137,6 +195,39 @@ def test_archive_review_modal_uses_shared_surface_not_hud_chrome():
     assert "border-radius: 22px;" in shell_section
     assert "border: 1px dashed" not in shell_section
     assert "background-size:" not in section
+
+
+def test_video_feed_cover_is_a_first_class_archive_review_image():
+    helper = JS.split("function archiveResultDirectImageSrc", 1)[1].split(
+        "function archiveResultHasImage", 1
+    )[0]
+    assert "result.image_url || result.thumbnail_url" in helper
+    assert r"^\/detections\/thumbnail\/\d+" in helper
+    assert "archiveResultDirectImageSrc(result)" in JS.split(
+        "function archiveResultHasImage", 1
+    )[1].split("function archiveResultImageSrc", 1)[0]
+    assert "const direct = archiveResultDirectImageSrc(result);" in JS.split(
+        "function archiveResultImageSrc", 1
+    )[1].split("function abortUiRequest", 1)[0]
+    assert "image_url: `/detections/thumbnail/${Math.trunc(detectionId)}`" in JS
+    assert "Frame preview unavailable" in JS
+
+
+def test_archive_review_batch_lookup_is_bounded_and_keeps_selected_evidence():
+    section = JS.split("async function archiveReviewLoadBatchFrames", 1)[1].split(
+        "function closeArchiveReviewModal", 1
+    )[0]
+    freshness = JS.split("function isCurrentArchiveReviewRequest", 1)[1].split(
+        "function clearArchiveMediaVideo", 1
+    )[0]
+    assert "ARCHIVE_REVIEW_BATCH_TIMEOUT_MS = 12000" in JS
+    assert "requestContext.controller.abort()" in section
+    assert "window.clearTimeout(timeoutId)" in section
+    assert "context.frames = archiveReviewLocalBatchFrames(context.baseResult)" in section
+    assert "Neighboring batch frames timed out; showing the selected evidence frame." in section
+    assert "context.framesLoading = false" in section
+    assert "currentMode === 'archive'" not in freshness
+    assert "currentMode === 'archive'" not in section
 
 
 def test_unified_scrollbar_contract_covers_modals_and_panels():
@@ -165,6 +256,71 @@ def test_unified_scrollbar_contract_covers_modals_and_panels():
 def test_modal_markup_has_no_obvious_duplicate_wrappers_or_options():
     assert TEMPLATE.count('class="probe-editor-modal-body"') == 1
     assert TEMPLATE.count('<option value="skip" selected>Skip matching</option>') == 1
+
+
+def test_video_workspace_keeps_preview_and_feed_controls_in_their_compact_panes():
+    channel = TEMPLATE.index('id="luxriotChannelSelect"')
+    preview = TEMPLATE.index('id="luxriotViewport"')
+    cadence = TEMPLATE.index('id="luxriotBatchSize"')
+    feed = TEMPLATE.index('class="luxriot-card luxriot-summaries-card')
+    feed_filters = TEMPLATE.index('id="luxriotSummaryChannelSelect"')
+    runtime = TEMPLATE.index('class="luxriot-selected-runtime"')
+    streams = TEMPLATE.index('id="luxriotStreams"')
+
+    assert channel < preview < cadence < feed < feed_filters < runtime < streams
+    assert TEMPLATE.count('id="luxriotViewport"') == 1
+    assert TEMPLATE.count('id="luxriotSummaryChannelSelect"') == 1
+    assert 'data-road-scene-grounding' not in TEMPLATE
+    assert '.luxriot-sidebar-preview .luxriot-viewport' in CSS
+    assert '.luxriot-summaries-card .video-feed-head' in CSS
+    assert '.luxriot-selected-runtime-facts' in CSS
+
+
+def test_video_workspace_compacts_controls_without_hiding_mobile_panes():
+    assert 'class="luxriot-row video-channel-row"' in TEMPLATE
+    assert 'class="luxriot-row video-model-row"' in TEMPLATE
+    assert TEMPLATE.count('class="runtime-fact-secondary"') == 2
+    assert '.video-command-panel #luxriotBatchInfo' in CSS
+    assert '.luxriot-stream-card > .studio-panel-head' in CSS
+    assert 'Narrow Video workspace: stack complete panes' in CSS
+
+    narrow = CSS.split('Narrow Video workspace: stack complete panes', 1)[1]
+    assert '.search-panel,' in narrow
+    assert '.video-box,' in narrow
+    assert '.video-rail,' in narrow
+    assert '.video-workspace' in narrow
+    assert 'overflow: visible;' in narrow
+    assert 'grid-auto-rows: max-content;' in narrow
+
+
+def test_remaining_studio_tabs_keep_inspectors_until_tablet_and_stack_on_mobile():
+    assert 'Compact density for the non-video workspaces' in CSS
+    compact = CSS.split('Compact density for the non-video workspaces', 1)[1]
+    for selector in (
+        '.archive-search-shell .archive-section',
+        '.probes-selection-panel',
+        '.agent-chat-topbar',
+        '.agent-messages',
+    ):
+        assert selector in compact
+
+    tablet = CSS.split('@media (max-width: 1440px)', 1)[1].split(
+        '@media (max-width: 1260px)', 1
+    )[0]
+    assert '.probes-box {' in tablet
+    assert '.agent-box {' in tablet
+    assert '.probes-inspector' not in tablet
+    assert '.agent-inspector' not in tablet
+
+    assert 'Narrow Archive/Monitoring/Agent workspaces' in CSS
+    narrow = CSS.split('Narrow Archive/Monitoring/Agent workspaces', 1)[1]
+    assert '.archive-search-shell' in narrow
+    assert '.probes-board-panel' in narrow
+    assert '.agent-chat-area' in narrow
+    assert 'grid-auto-rows: max-content;' in narrow
+    assert '.results-grid,' in narrow
+    assert '#probeCards,' in narrow
+    assert '.agent-messages' in narrow
 
 
 def test_escape_closes_all_primary_modals():
@@ -205,6 +361,7 @@ def test_agent_probe_approval_is_standalone_not_research_trace():
     assert "function isLegacyProbeApprovalCard" in JS
     assert "card.dataset.agentStandaloneApproval = 'true'" in JS
     assert "card.dataset && card.dataset.agentStandaloneApproval === 'true'" in JS
+    assert "card.querySelector('.agent-approval-footer')" in JS
     assert "const card = isStandaloneProbeApprovalResult(name, result)" in JS
     assert "bubble.bodyEl.insertBefore(card, before)" in JS
     assert "bubble.actionsEl.appendChild(card)" in JS
@@ -227,8 +384,62 @@ def test_agent_probe_approval_is_standalone_not_research_trace():
     assert ".agent-approval-card-legacy" in CSS
 
 
+def test_agent_research_trace_stays_collapsed_and_keeps_current_tool_visible():
+    streaming = JS.split("function startStreamingBubble", 1)[1].split(
+        "function appendTokenToBubble", 1
+    )[0]
+    finish = JS.split("function finishStreamingBubble", 1)[1].split(
+        "function appendAgentNotice", 1
+    )[0]
+    events = JS.split("function handleAgentEvent", 1)[1].split(
+        "function finishStreamingBubble", 1
+    )[0]
+    persisted = JS.split("function appendAssistantBubble", 1)[1].split(
+        "function isAgentNearBottom", 1
+    )[0]
+    trace_factory = JS.split("function createAgentToolTrace", 1)[1].split(
+        "function bindAgentTracePreference", 1
+    )[0]
+    assert "traceEl.open = false" in trace_factory
+    assert "if (!bubble.traceUserToggled)" in finish
+    assert "bubble.traceEl.open = false" in finish
+    assert "bindAgentTracePreference(bubble, traceSummary)" in streaming
+    assert "bindAgentTracePreference(bubble, traceSummary)" in persisted
+    assert "bodyEl.appendChild(traceEl)" in persisted
+    assert "bubble.currentToolName = String(evt.name)" in events
+    assert "`Running ${bubble.currentToolName}...`" in events
+
+
+def test_archive_channel_picker_is_full_width_searchable_and_collapsible():
+    assert 'class="input-group archive-streams-group"' in TEMPLATE
+    assert 'id="archiveChannelPickerToggle"' in TEMPLATE
+    assert 'id="archiveChannelPickerSummary"' in TEMPLATE
+    assert 'id="archiveChannelPopover"' in TEMPLATE
+    assert 'id="archiveChannelSearch"' in TEMPLATE
+    assert 'id="archiveChannelReset"' in TEMPLATE
+    assert 'id="archiveChannelDone"' in TEMPLATE
+    assert ".archive-streams-group" in CSS
+    assert "grid-column: 1 / -1" in CSS
+    assert ".archive-channel-picker-toggle" in CSS
+    assert ".archive-channel-popover[hidden]" in CSS
+    assert "function updateArchiveChannelPickerSummary" in JS
+    assert "function setArchiveChannelPickerOpen" in JS
+    assert "function filterArchiveChannelOptions" in JS
+    assert "archiveChannelSelectionChanged()" in JS
+
+
+def test_video_rollups_label_imported_legacy_semantics_as_ready():
+    assert "['llm', 'llm_cached', 'legacy_cached'].includes(summaryKind)" in JS
+    assert "semantic · legacy" in JS
+    assert "Imported from the pre-0.8.4 semantic history" in JS
+    assert "'llm', 'llm_cached', 'legacy_cached', 'pending_context'" in JS
+
+
 def test_vlm_machine_json_label_is_semantic_not_generic_only():
     assert "function summarizeMachineJson" in JS
+    assert r"BATCH[\s_-]*STATE[\s_-]*JSON" in JS
+    assert "label: isBatchState ? 'Batch state' : 'System message'" in JS
+    assert "Object.prototype.hasOwnProperty.call(parsed, 'observed_states')" in JS
     assert "System message" in JS
     assert "Memory/homeostasis" in JS
     assert "kind: 'alert'" in JS
@@ -254,3 +465,495 @@ def test_agent_thumbnail_grid_has_missing_image_fallback():
     assert "img.addEventListener('error', showMissingImage, { once: true })" in JS
     assert "agent-thumb-missing-image" in JS
     assert ".agent-thumb-missing-image" in CSS
+
+
+def test_shared_channel_surfaces_abort_and_reject_stale_responses():
+    for token in (
+        "luxriotPromptFormChannelId",
+        "luxriotPromptRequestGeneration",
+        "luxriotSummaryRequestGeneration",
+        "luxriotSummaryActiveRequest",
+        "archiveEvidenceRequestGeneration",
+        "archiveFilterRequestGeneration",
+        "archiveReviewRequestGeneration",
+        "new AbortController()",
+        "signal: requestContext.controller.signal",
+    ):
+        assert token in JS
+    assert "The selected channel changed. Its prompt settings were reloaded" in JS
+    assert "getSelectedSummaryChannel() === requestContext.channelId" in JS
+    assert "archiveReviewContext === requestContext.context" in JS
+    assert "function invalidateArchiveResultContext" in JS
+    summary_poll = JS.split("function startLuxriotSummaryPoll()", 1)[1].split(
+        "async function startLuxriotCapture", 1
+    )[0]
+    assert "stopLuxriotSummaryPoll()" not in summary_poll
+
+
+def test_agent_cards_surface_coverage_and_incomplete_scope():
+    assert "function appendAgentCompleteness" in JS
+    assert "toolName === 'list_video_summary_channels'" in JS
+    for label in (
+        "Coverage: not reported by the backend",
+        "Backend truncated:",
+        "Result truncation:",
+        "Unchecked:",
+        "Deferred:",
+        "Errors:",
+    ):
+        assert label in JS
+    search_card = JS.split("if (toolName === 'search_archive')", 1)[1].split("toolName === 'get_detections'", 1)[0]
+    assert "alwaysCoverage: true" in search_card
+    assert "alwaysTruncation: true" in search_card
+    assert "source windows retained; semantic summaries are being generated" in JS
+    assert "source windows retained; no completed semantic narrative yet" in JS
+    assert "No video-description data in this time range" in JS
+
+
+def test_agent_sidebar_polls_analytics_runtime_and_lm_admission_only_when_active():
+    assert "Analytics Streams" in JS
+    assert "not the full camera inventory" in JS
+    assert "agentLoadAnalyticsStreams" in JS
+    assert "agentSetContextActive" in JS
+    assert "window._agentSetActive = agentSetContextActive" in JS
+    assert "fetch(`/luxriot/streams?t=${Date.now()}`" in JS
+    assert "fetch(`/lm/admission?t=${Date.now()}`" in JS
+    assert "oldest_queue_age_sec" in JS
+    assert "LM model mismatch: configured" in JS
+    assert "model check unavailable" in JS
+    assert "profile.model_match === false" in JS
+    assert ".agent-lm-model-badge.mismatch" in CSS
+    assert "currentMode !== 'agent'" in JS
+
+
+def test_operator_media_uses_same_origin_broker_and_explicit_player_states():
+    assert "fetch(normalizedUrl" in JS
+    assert "normalizedUrl.startsWith('/luxriot/media/')" in JS
+    assert "normalizedUrl.startsWith('/luxriot/attention_stream/')" in JS
+    assert "`/luxriot/archive_snapshot/${encodeURIComponent(String(channelId))}" in JS
+    assert "method: 'HEAD'" in JS
+    assert "Media broker URL must be same-origin" in JS
+    for state in ("'loading'", "'playing'", "'degraded'", "'error'"):
+        assert state in JS
+    assert "Static frame fallback — not video" in JS
+    assert "this is not video or a snapshot slideshow" in JS
+    assert "function startLuxriotLegacySnapshotPreview" not in JS
+    assert "{luxriot_base_url_json}" not in JS
+    assert "luxriotDefaults.baseUrl" not in JS.split("function luxriotMediaBrokerUrl", 1)[1].split(
+        "function setRoadSceneGroundingConfidence", 1
+    )[0]
+
+
+def test_operator_media_rejects_late_channel_and_archive_player_responses():
+    assert "requestSeq === luxriotPreviewRequestSeq" in JS
+    assert "generation === probePreviewGeneration" in JS
+    assert "requestContext.generation === archiveMediaRequestGeneration" in JS
+    assert "archiveReviewFrameIdentity(requestContext.result) === requestContext.identity" in JS
+    assert "abortUiRequest(archiveMediaAbortController)" in JS
+    assert "abortUiRequest(probePreviewAbortController)" in JS
+
+
+def test_bounded_live_media_is_renewed_before_freeze_and_stalls_have_watchdogs():
+    assert "numericHeader('X-EVA-Media-Renew-After-Ms')" in JS
+    for token in (
+        "function scheduleLuxriotPreviewRenewal",
+        "function armLuxriotPreviewStallWatchdog",
+        "function scheduleProbePreviewRenewal",
+        "function armProbePreviewStallWatchdog",
+        "startProbePreview(channelId, true)",
+        "video.onprogress = clearLuxriotPreviewStallWatchdog",
+        "video.ontimeupdate = clearLuxriotPreviewStallWatchdog",
+        "video.onprogress = clearProbePreviewStallWatchdog",
+        "video.ontimeupdate = clearProbePreviewStallWatchdog",
+    ):
+        assert token in JS
+
+    live_preview = JS.split("function startLuxriotPreview(", 1)[1].split(
+        "function setRoadSceneGroundingConfidence", 1
+    )[0]
+    assert "negotiated.renewAfterMs" in live_preview
+    assert "Renewing the bounded MJPEG connection" in live_preview
+    assert "Renewing the bounded video connection" in live_preview
+    assert "options.reuseNegotiation" in live_preview
+    assert "Promise.resolve(cachedNegotiation)" in live_preview
+    assert "startLuxriotPreview({ reuseNegotiation: true })" in JS
+
+    stop_preview = JS.split("function stopLuxriotPreview", 1)[1].split(
+        "function setLuxriotPreviewSignalLost", 1
+    )[0]
+    assert "clearTimeout(luxriotPreviewRenewTimer)" in stop_preview
+    assert "clearTimeout(luxriotPreviewStallTimer)" in stop_preview
+
+    probe_preview = JS.split("function startProbePreview", 1)[1].split(
+        "function syncProbePreview", 1
+    )[0]
+    assert "!force" in probe_preview
+    assert "negotiated.renewAfterMs" in probe_preview
+    assert "probePreviewNegotiation" in probe_preview
+    assert "Promise.resolve(cachedNegotiation)" in probe_preview
+
+
+def test_running_analytics_uses_shared_attention_preview_unless_operator_requests_full_live():
+    for token in (
+        "/luxriot/attention_stream/",
+        "X-EVA-Attention-Preview",
+        "attentionPreview",
+        "useAttentionPreview",
+        "luxriotPreferFullOperatorMedia",
+        "maybeSwitchLuxriotPreviewToAttention",
+        "Full live",
+        "Model view",
+        "no second recorder stream competes with analytics",
+        "replaceLuxriotPreviewImageElement",
+        "replaceProbePreviewImageElement",
+    ):
+        assert token in JS
+    assert "Boolean(videoStream?.running) && !luxriotPreferFullOperatorMedia" in JS
+    assert "Boolean(sharedVideoStream?.running)" in JS
+    assert "currentSource.includes('/luxriot/attention_stream/')" in JS
+
+
+def test_live_runtime_surfaces_completed_and_inflight_attention_throughput():
+    for token in (
+        "last_live_segment_target_seconds",
+        "last_live_segment_summary_target_seconds",
+        "last_live_segment_represented_seconds",
+        "live_segment_inflight_target_seconds",
+        "live_segment_inflight_raw_frame_budget",
+        "live_segment_inflight_frames",
+        "live_segment_inflight_represented_seconds",
+        "attentionRealtimeRatio",
+        "attentionUnderfilled",
+        "attentionBehindRealtime",
+        "label: 'apex-lag'",
+        "dense frames",
+        "descriptions every",
+        "Dense capture progress",
+        "x realtime",
+    ):
+        assert token in JS
+    assert "activeCaptureSource !== 'live_segment'" in JS
+    assert "currentSnapshotSlow = source !== 'live_segment'" in JS
+
+
+def test_expected_summary_backpressure_is_not_rendered_as_a_capture_failure():
+    for token in (
+        "function classifyLuxriotStreamIssue",
+        "summary queue overflow",
+        "label: 'backpressure'",
+        "label: 'aggregating'",
+        "Aggregation backpressure: capture continues",
+        "aggregation backpressure",
+        "Boolean(streamIssue.hardError)",
+        "detailParts.push('backpressure')",
+    ):
+        assert token in JS
+    health = JS.split("function getLuxriotStreamHealth", 1)[1].split(
+        "function renderLuxriotHealthBadge", 1
+    )[0]
+    assert "if (issue.hardError)" in health
+    assert "if (issue.backpressure || droppedBatches > 0)" in health
+    assert health.index("if (issue.hardError)") < health.index("if (issue.backpressure || droppedBatches > 0)")
+
+
+def test_archive_media_loops_the_complete_description_batch():
+    assert "numericHeader('X-Stream-Last-Sample-Timestamp')" in JS
+    assert "numericHeader('X-EVA-Archive-Resolved-Time-Ms')" in JS
+    assert "numericHeader('X-EVA-Archive-Duration-Seconds')" in JS
+    assert "X-EVA-Archive-Frame-Alignment" in JS
+    assert "X-EVA-HTML5-Compatible" in JS
+    assert "function archivePlaybackWindow" in JS
+    assert "Math.ceil(batchSpanMs / 1000) + 1" in JS
+    assert "Math.min(15, Math.ceil(batchSpanMs / 1000) + 1)" in JS
+    assert "params.set('duration_sec'" in JS
+    assert "Math.min(120000, durationSec * 4000 + 30000)" in JS
+    assert "function fetchLuxriotMediaBlob" in JS
+    assert "URL.createObjectURL(negotiated.blob)" in JS
+    assert "URL.revokeObjectURL(archiveMediaObjectUrl)" in JS
+    assert ".archive-review-frame .feature-btn[hidden]" in CSS
+    assert "video.loop = true" in JS
+    assert "video.currentTime = 0" in JS
+    assert "isCurrentArchiveMediaRequest(requestContext)" in JS
+    assert "Loading the next recorded archive segment" not in JS
+
+
+def test_burst_attention_is_visible_in_summary_and_archive_ui():
+    for token in (
+        "function summaryBurstAttention",
+        "function renderSummaryBurstAttentionChip",
+        "capture_attention",
+        "⚡ burst ×",
+        "Motion far above this channel's measured norm; snapshot numbers:",
+        "function archiveFrameRoleLabel",
+        "burst apex",
+        "sharper companion (burst)",
+        "archive-review-strip-attention",
+        "Burst attention frame",
+    ):
+        assert token in JS
+    assert ".summary-attention-chip" in CSS
+    assert ".result-badge.attention" in CSS
+    assert ".archive-review-strip-frame .archive-review-strip-attention" in CSS
+
+
+def test_rollup_aggregation_progress_is_targeted_generation_safe_and_cleared():
+    rollups = JS.split("async function refreshLuxriotRollups", 1)[1].split(
+        "async function refreshLuxriotSummaryView", 1
+    )[0]
+    assert "params.set('target_level', targetLevel)" in rollups
+    assert "`Aggregating ${targetLevel}…`" in rollups
+    assert "renderAggregationProgress" in rollups
+    assert "isCurrentLuxriotSummaryRequest(requestContext)" in rollups
+    assert "shared LM queue" in rollups
+    assert "clearInterval(progressTimer)" in rollups
+
+
+def test_prompt_and_environment_setting_sources_are_operator_visible():
+    assert "luxriotPromptSettingSources" in JS
+    assert "persisted runtime default" in JS
+    assert "persistence error:" in JS
+    assert "saved revision" in JS
+    assert "different_process_and_file_keys" in JS
+    assert "declared_file_matches_project" in JS
+    assert ".settings-status.warning" in CSS
+
+
+def test_prompt_apply_only_posts_fields_changed_from_loaded_channel_settings():
+    collect = JS.split("function collectLuxriotPromptSettings", 1)[1].split(
+        "function applyLuxriotPromptSettingsFromPayload", 1
+    )[0]
+    assert "luxriotPromptLoadedSettings" in collect
+    assert "const payload = {}" in collect
+    assert "const changedRollups = {}" in collect
+    assert "payload.rollup_prompts = changedRollups" in collect
+    assert "current.bookmark_enabled" in collect
+    assert "baseline.bookmark_enabled" in collect
+
+
+def test_prompt_modal_preserves_unsaved_alert_criteria_until_explicit_save_or_discard():
+    assert "function syncLuxriotPromptModalEditorToDraft" in JS
+    assert "function hasLuxriotPromptDraftChanges" in JS
+    assert "Apply or close the modal and discard the draft before reloading saved settings." in JS
+    assert "Discard unsaved prompt changes?" in JS
+    assert "Discard unsaved prompt changes and switch channels?" in JS
+    assert "window.addEventListener('beforeunload'" in JS
+    assert "luxriotPromptModalInput.disabled = busy || !canManage || !ready" in JS
+    assert "luxriotPromptApplyBtn.textContent = saving" in JS
+
+    apply_listener = JS.split(
+        "luxriotPromptApplyBtn.addEventListener('click'", 1
+    )[1].split("if (luxriotPromptModalInput)", 1)[0]
+    assert "await applyLuxriotPromptModal()" in apply_listener
+    assert "closeLuxriotPromptModal()" not in apply_listener
+
+
+def test_prompt_modal_can_explicitly_reset_channel_overrides_to_inherited_defaults():
+    assert 'id="luxriotPromptResetBtn"' in TEMPLATE
+    assert "function getClearableLuxriotPromptOverrideFields" in JS
+    assert "function resetLuxriotPromptOverrides" in JS
+    assert "clear_override_fields: clearOverrideFields" in JS
+    assert "use inherited defaults" in JS.lower()
+
+
+def test_live_summary_controls_preserve_edits_and_disclose_pending_restart():
+    for token in (
+        "function markLuxriotLiveIntervalDirty",
+        "function clearLuxriotLiveIntervalDirty",
+        "function isLuxriotLiveIntervalDirty",
+        "function updateLuxriotRuntimeConfigHint",
+        "applies on summaries restart",
+        "running: batch",
+        'id="luxriotRuntimeConfigState"',
+    ):
+        assert token in JS or token in TEMPLATE
+    assert "batch_size: batchSize" in JS
+    assert "interval_sec: intervalSec" in JS
+    assert ".luxriot-runtime-config-pending" in CSS
+
+
+def test_l0_feed_requests_compact_operator_rows():
+    assert "params.set('view', 'feed')" in JS
+
+
+def test_rollup_ui_reads_precomputed_windows_without_triggering_llm():
+    route = OLDAPP.split("def luxriot_summary_rollups():", 1)[1].split("def luxriot_streams_status", 1)[0]
+    assert "request.args.get('synthesize')" in route
+    assert "synthesize=synthesize" in route
+    assert "rollups['levels']" in route
+
+
+def test_video_history_controls_separate_period_resolution_and_live_following():
+    for token in (
+        'value="live" selected>Live',
+        'value="day_before_yesterday">Day before yesterday',
+        'value="custom">Custom range…',
+        'value="AUTO" selected>Auto',
+        '>Observations<',
+        '>15 minute summaries<',
+        'id="luxriotSummaryPreviousPeriod"',
+        'id="luxriotSummaryNextPeriod"',
+        'id="luxriotSummaryLoadEarlierBtn"',
+    ):
+        assert token in TEMPLATE
+    for token in (
+        "function resolveAutoSummaryLevel",
+        "function shiftSelectedSummaryPeriod",
+        "function summaryLocalToEpoch",
+        "rangePreset === 'live' ? 'live'",
+        "fetch(`/luxriot/history?${params.toString()}`",
+        "function refreshLuxriotArchivedSummaries",
+        "all runs",
+        "Loading archived descriptions…",
+        "No precomputed rollup covers this period · loading archived observations…",
+    ):
+        assert token in JS
+    assert ".luxriot-feed-loading" in CSS
+    assert ".luxriot-feed-loading-spinner" in CSS
+    assert 'grid-template-areas:\n        "filters"\n        "period"\n        "custom"\n        "actions"' in CSS
+    assert ".video-feed-head .luxriot-summary-actions-row" in CSS
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in JS
+    assert "All retained history ·" not in JS
+    assert "site_timezone_json" not in JS
+
+
+def test_rollup_ui_distinguishes_semantic_pending_and_degraded_rows():
+    for token in (
+        "semantic · cached",
+        "semantic · refreshing",
+        "semantic_refresh_pending",
+        "aggregation pending",
+        "semantic queued",
+        "semantic retry available",
+        "Background semantic aggregation is queued behind live descriptions.",
+        "generation_status",
+        "summary_kind",
+        "function generateLuxriotSemanticRollup",
+        "Generate now",
+        "Retry semantic",
+        "Semantic pass remains queued behind live descriptions and will appear automatically.",
+        "window.setTimeout(() => controller.abort(), 60000)",
+        "synthesize: '1'",
+    ):
+        assert token in JS
+    assert ".luxriot-rollup-status.ready" in CSS
+    assert ".luxriot-rollup-status.pending" in CSS
+    assert ".luxriot-rollup-status.queued" in CSS
+    assert ".luxriot-rollup-status.degraded" in CSS
+
+
+def test_archive_channel_filter_is_an_explicit_multi_select():
+    for token in (
+        'id="archiveChannelFilter"',
+        'data-archive-channel-all',
+        'id="archiveChannelOptions"',
+    ):
+        assert token in TEMPLATE
+    for token in (
+        "function selectedArchiveChannelIds",
+        "function appendArchiveChannelParams",
+        "payload.channel_ids = channelIds",
+        "formData.append(key, String(item))",
+    ):
+        assert token in JS
+    assert ".archive-channel-picker" in CSS
+    assert ".archive-channel-option" in CSS
+
+
+def test_probe_board_groups_cards_by_group_then_channel():
+    """The board nests operator-defined group -> channel -> probes."""
+    for token in (
+        "function probeBoardTree(",
+        'class="probe-channel-group"',
+        'class="probe-channel-card-grid"',
+        "probe-channel-group-count",
+        "Ungrouped channels",
+    ):
+        assert token in JS
+    for selector in (".probe-channel-group", ".probe-channel-card-grid", ".probes-group-body"):
+        assert selector in CSS
+
+
+def test_probe_board_offers_grid_and_list_views():
+    assert 'class="probes-view-toggle"' in TEMPLATE
+    assert 'data-view="grid"' in TEMPLATE
+    assert 'data-view="list"' in TEMPLATE
+    assert "function probeRowHtml(" in JS
+    assert "function probeCardHtml(" in JS
+    assert "probeBoardView === 'list'" in JS
+    for selector in (".probes-view-btn", ".probes-row", ".probes-row-list"):
+        assert selector in CSS
+
+
+def test_probe_cards_show_authorship_and_replace_empty_preview_with_sparkline():
+    """Origin is rendered from data, and an empty preview shows signal history."""
+    assert "function probeOriginKey(" in JS
+    assert "function probeOriginBadgeHtml(" in JS
+    for origin in ("operator", "agent", "auto"):
+        assert f"is-{origin}" in CSS
+    assert "function probeSparklineHtml(" in JS
+    # The old dead-space placeholder must not come back.
+    assert "NO PREVIEW" not in TEMPLATE.upper()
+    assert ".probes-spark" in CSS
+    assert ".probes-origin-badge" in CSS
+
+
+def test_probe_board_filters_are_present_and_resettable():
+    assert 'id="probeSearchInput"' in TEMPLATE
+    assert 'id="probeOriginFilters"' in TEMPLATE
+    assert 'id="probeStateFilters"' in TEMPLATE
+    assert 'id="probeFilterResetBtn"' in TEMPLATE
+    assert "function probeMatchesBoardFilters(" in JS
+    assert "function resetProbeBoardFilters(" in JS
+    assert ".probes-chip" in CSS
+
+
+def test_probe_board_toggled_buttons_use_the_class_the_toggler_sets():
+    """setElementHidden toggles .is-hidden, so a bare `hidden` attribute here
+    would leave the button permanently invisible."""
+    assert "element.classList.toggle('is-hidden'" in JS
+    for button_id in ("probeFilterResetBtn", "probeGroupDeleteBtn"):
+        start = TEMPLATE.index(f'id="{button_id}"')
+        tag = TEMPLATE[start:TEMPLATE.index(">", start)]
+        assert "is-hidden" in tag, f"{button_id} must start hidden via the class"
+        assert not re.search(r"\bhidden\b(?!-)", tag.replace("is-hidden", "")), (
+            f"{button_id} must not mix the hidden attribute with .is-hidden"
+        )
+
+
+def test_probe_channel_group_editor_is_wired():
+    assert 'id="probeGroupModal"' in TEMPLATE
+    assert 'id="probeGroupChannelList"' in TEMPLATE
+    for token in (
+        "/probes/channel_groups/save",
+        "/probes/channel_groups/delete",
+        "function openProbeGroupModal(",
+    ):
+        assert token in JS
+    assert ".probes-group-chip" in CSS
+
+
+def test_probe_group_mutations_follow_probes_manage_permission():
+    for element in (
+        "probeGroupNewBtn",
+        "probeGroupSaveBtn",
+        "probeGroupDeleteBtn",
+    ):
+        assert element in JS
+    assert "group.read_only || !userHasPermission('probes:manage')" in JS
+    assert "if (!userHasPermission('probes:manage')) return;" in JS
+
+
+def test_probe_lineage_jump_uses_exact_parent_alert_id_with_legacy_fallback():
+    assert "parent_alert_id: parentAlertId" in JS
+    assert "Opened exact parent VLM alert." in JS
+    assert "Parent VLM alert time window" in JS
+
+
+def test_probes_tab_is_not_labelled_monitoring():
+    """The tab, its mode key, and its CSS shell all say 'probes'."""
+    assert 'id="probesModeBtn"' in TEMPLATE
+    assert ">Probes</button>" in TEMPLATE
+    assert "setMode('probes')" in JS
+    assert "'monitor'" not in JS
+    assert "monitor-box" not in CSS
+    assert "monitor-detections-panel" not in CSS

@@ -1,0 +1,254 @@
+# tuktuk scenario grammar — blocks, gates, devalidations, compositions.
+# THE primary artifact: the corpus is generated from this file; the model is a
+# function of the corpus. Prose spec and coverage tables: grammar.md.
+# Rules are data (knocknock style). Seeded generation reads this file only.
+version: 0.1.0
+date: 2026-07-19
+decisions:
+  - "CONFIRM is a gate on TERM claim level, not a chain block (Sasha 2026-07-19)"
+  - "mechanical continuation is harness-owned; corpus contains no trivial continue examples (Sasha 2026-07-19)"
+  - "deployment scenarios in scope; UI-show terminals in scope (Sasha 2026-07-19)"
+
+# ── harness ────────────────────────────────────────────────────────────────
+# Deterministic, outside the model. Tuktuk emits symbolic values; the harness
+# resolves them. These are NOT corpus decision points.
+harness_owned:
+  - id: window_resolution
+    what: "symbolic Window -> epoch bounds (normalize_time_window as library)"
+  - id: channel_resolution
+    what: "channel refs/titles -> channel ids; unknown ref -> devalidation d05"
+  - id: mechanical_continuation
+    what: "requires_continue / deferred_channel_ids / job_id resume loops"
+  - id: chunking
+    what: "channel batches within per_turn_channel_limit; checked/unchecked ledger bookkeeping"
+  - id: result_envelope
+    what: "compaction + uniform envelope {window, coverage, continuation, errors}"
+  - id: alias_normalization
+    what: "source aliases, query-alias params, sort_by vocabulary"
+  - id: homeostatic_context_selection
+    what: "which channels' state docs enter the encoder (deterministic, keyed off query) — spec in Task 3"
+
+# ── blocks ─────────────────────────────────────────────────────────────────
+# A chain is a sequence of block instances. Params marked extract are copied
+# from operator text; scratchpad params are copied from prior results; enum
+# params are chosen. Nothing is computed by the model.
+blocks:
+  W:
+    name: window
+    intent: "establish the time scope of the question"
+    params:
+      window: {type: Window, source: extract, default: "relative_range: last 24h"}
+    tools: []            # resolution is harness; block exists as a chain decision
+    emits: [resolved_window]
+  C:
+    name: channels
+    intent: "establish the channel scope"
+    params:
+      channels: {type: "ref[]", source: extract, default: unscoped}
+      cardinality: {type: enum, values: [one, set, group, unscoped]}
+    tools: [list_channels, list_video_summary_channels]
+    emits: [resolved_channels, per_turn_channel_limit, active/inactive/deferred]
+  MAP:
+    name: coarse_read
+    intent: "cheap aggregate state before drilling"
+    params:
+      domain: {type: enum, values: [rollups, detections, probes, prompts, runtime, live_survey]}
+      depth: {type: enum, values: [L3, L2, L1], applies_to: rollups}
+    tools: [get_video_summaries, get_detection_summary, list_probes,
+            get_prompt_settings, list_video_summary_channels, survey_channels]
+    emits: [coverage, source_counts, candidate_windows]
+  RANK:
+    name: attention_rank
+    intent: "rank windows/frames/channels for a semantic phrase"
+    params:
+      positive_query: {type: text, source: extract-or-rephrase}
+      contrast_query: {type: text, source: extract-or-rephrase, optional: true}
+      via: {type: enum, values: [pnm_signals, attention_bursts, semantic_search]}
+    tools: [get_visual_window_signals, list_attention_bursts, search_archive]
+    emits: [pnm, candidate_frames, count, total_in_window]
+    invariant: "P/N/M is attention, never proof"
+  DRILL:
+    name: evidence
+    intent: "exact-time evidence for candidate windows"
+    params:
+      depth: {type: enum, values: [L1, L0_live, frames, describe]}
+      source: {type: enum, values: [vlm_summary, vlm_alert, probe], default: vlm_summary+vlm_alert}
+    tools: [get_video_summaries, get_detections, describe_frame]
+    emits: [evidence_frames, image_urls, descriptions, total_in_window, count]
+    note: "describe_frame is DRILL at depth=describe; gate g1 reads its presence"
+  AGG:
+    name: quantify
+    intent: "counting, transitions, stratified sampling"
+    params:
+      kind: {type: enum, values: [count_events, state_transitions, research_batch]}
+      entity_query: {type: text, source: extract, applies_to: count_events}
+      states: {type: text, source: extract, applies_to: state_transitions}
+    tools: [count_video_summary_events, track_visual_state_transitions, build_research_batch]
+    emits: [counts, timeline, transitions, bands]
+    invariant: "thresholds use defaults unless copied from operator text or prior result"
+  CAL:
+    name: calibrate
+    intent: "P/N/M calibration for a probe hypothesis"
+    params:
+      positive_query: {type: text, source: extract-or-scratchpad}
+      contrast_query: {type: text, source: extract-or-scratchpad}
+      scope: {type: "ref[]", source: scratchpad}
+    tools: [calibrate_probe_from_archive, prepare_probe_calibration_batch]
+    emits: [safe_to_apply, suggested_thresholds, separation_quality, recommended_probe_args]
+    decision: "per-item accept/reject/rephrase; continuation itself is harness"
+  MUT:
+    name: mutate
+    intent: "propose a configuration change"
+    params:
+      target: {type: enum, values: [probe_create, probe_update, probe_delete,
+                                    prompt_settings, summary_restore, bookmark]}
+      args: {type: object, source: scratchpad-or-extract}
+    tools: [create_probe, update_probe, delete_probes, update_prompt_settings,
+            restore_video_summary_history, create_bookmark]
+    emits: [preview_diff, plan_id]
+    invariant: "preview=true always; apply happens in UI; only a trusted receipt proves change"
+  TERM:
+    name: terminal
+    intent: "close the signal"
+    params:
+      kind: {type: enum, values: [answer_text, answer_show, clarify, escalate_agent,
+                                  bookmark, deploy_card, receipt_wait, noop]}
+      claim_level: {type: enum, values: [no_coverage, candidate, likely, visually_confirmed]}
+    tools: []            # answer_show uses ui_* family (tool_inventory §4a) once it exists
+    note: "claim_level is capped by gates; noop is the junk-track expected behavior"
+
+# ── gates ──────────────────────────────────────────────────────────────────
+# Predicates over the chain history that cap TERM, independent of composition.
+gates:
+  g1_visual_confirmation:
+    rule: "claim_level=visually_confirmed requires DRILL[depth=describe] on the cited frame in this turn"
+    from: "6 runbooks, verbatim invariant"
+  g2_coverage_honesty:
+    rule: "TERM must state unchecked channels/windows; empty coverage -> 'no coverage', never 'no activity'"
+  g3_receipt:
+    rule: "claims that config changed require a trusted action receipt, not a preview"
+  g4_no_hidden_state:
+    rule: "sensitive/accusatory phrasing is rephrased to visible-evidence terms; identity/intent/legality never asserted"
+  g5_source_honesty:
+    rule: "VLM summary/alert frames are never called probe detections; sources labeled"
+  g6_escalation:
+    rule: "conflicting decision features or low confidence head -> TERM=escalate_agent, not a guess"
+
+# ── devalidations ──────────────────────────────────────────────────────────
+# symptom (observable in compacted result) -> implicated block -> correction.
+# owner: model = tuktuk must learn the correction; harness = deterministic.
+devalidations:
+  - {id: d01, symptom: "total_in_window == 0",                       implicates: W,
+     correction: "widen window; at max scope -> TERM claim_level=no_coverage", owner: model}
+  - {id: d02, symptom: "count == 0 && total_in_window > 0",         implicates: RANK/DRILL.filter,
+     correction: "relax or rephrase filter query; window is NOT the fault",    owner: model}
+  - {id: d03, symptom: "coverage empty / no summary rows for period", implicates: MAP,
+     correction: "switch source (rollups -> archive frames) or TERM no_coverage", owner: model}
+  - {id: d04, symptom: "truncated || backend_truncated",             implicates: W/AGG,
+     correction: "narrow window, or accept sample and report unchecked (g2)",  owner: model}
+  - {id: d05, symptom: "channel ref unresolved",                     implicates: C,
+     correction: "TERM=clarify with candidates, or C(domain=inventory)",       owner: model}
+  - {id: d06, symptom: "channel count > per_turn_channel_limit",     implicates: C,
+     correction: "present candidates, TERM=clarify chunk confirmation",        owner: model}
+  - {id: d07, symptom: "runtime_problem_channels nonempty",          implicates: MAP,
+     correction: "flag affected channels in coverage; optionally MAP(domain=runtime)", owner: model}
+  - {id: d08, symptom: "safe_to_apply == false || weak separation",  implicates: CAL,
+     correction: "rephrase positive/contrast or DRILL frames for review; never force thresholds", owner: model}
+  - {id: d09, symptom: "requires_continue / deferred_channel_ids",   implicates: continuation,
+     correction: "resume same job",                                            owner: harness}
+  - {id: d10, symptom: "semantic_pending_count > 0",                 implicates: DRILL,
+     correction: "fall back to time-sorted retrieval; report pending indexing", owner: model}
+  - {id: d11, symptom: "tool timeout",                               implicates: current block,
+     correction: "smaller chunk / fast_mode / switch source",                  owner: model}
+  - {id: d12, symptom: "restricted_matches (permission)",            implicates: TERM,
+     correction: "report admin/engineer-only; never invent steps",             owner: model}
+  - {id: d13, symptom: "describe_frame contradicts hypothesis",      implicates: TERM,
+     correction: "downgrade claim_level; report contradiction",                owner: model}
+  - {id: d14, symptom: "operator supplies new period mid-chain",     implicates: W,
+     correction: "re-resolve window; drop stale candidates",                   owner: model}
+  - {id: d15, symptom: "approval denied / plan expired",             implicates: MUT,
+     correction: "stop; report unapplied; do not retry silently",              owner: model}
+
+# ── scenarios ──────────────────────────────────────────────────────────────
+# composition: ordered blocks; [X] optional; ∀ch = per selected channel
+# (iteration itself harness-chunked). gates always-on: g2, g4, g5, g6;
+# listed gates are the scenario's characteristic ones.
+scenarios:
+  video_event_check:
+    from_runbook: video_event_check
+    question: "did E happen on channel N in window T?"
+    composition: [W, C(one), MAP(rollups), "[RANK]", DRILL, TERM(answer)]
+    gates: [g1]
+    devalidations_exercised: [d01, d02, d03, d05, d13, d14]
+  video_summary_review:
+    from_runbook: video_summary_review
+    question: "what happened / who was present in T?"
+    composition: [W, "C(named|unscoped)", MAP(rollups L2), DRILL(L1->L0), "[RANK]", TERM(report)]
+    gates: [g1]
+    devalidations_exercised: [d01, d03, d04, d06, d07, d10]
+  video_incident_timeline:
+    from_runbook: video_incident_timeline
+    question: "chronological incident report for T"
+    composition: [W, C, MAP(rollups L2), DRILL(L1 x2-3 windows), TERM(chronology)]
+    gates: [g1]
+    devalidations_exercised: [d01, d03, d04, d13]
+  multi_channel_event_sweep:
+    from_runbook: multi_channel_event_sweep
+    question: "which channels saw E in T?"
+    composition: [W, C(group), "∀ch[ MAP(rollups), RANK, DRILL ]", TERM(ledger)]
+    gates: [g1]
+    devalidations_exercised: [d01, d02, d06, d07, d09, d11]
+  cross_channel_correlation:
+    from_runbook: cross_channel_correlation
+    question: "is it the same entity across channels?"
+    composition: [W, C(set), "∀ch[ MAP(rollups), DRILL ]", RANK(weak), DRILL(describe both sides), TERM(correlation)]
+    gates: [g1, g4]
+    devalidations_exercised: [d01, d02, d13]
+  archive_research:
+    from_runbook: archive_research
+    question: "find X in the archive"
+    composition: [W, "[C]", RANK(semantic_search), "[AGG(research_batch)]", "[DRILL]", TERM(answer)]
+    gates: [g1, g5]
+    devalidations_exercised: [d01, d02, d10, d12]
+  probe_tuning:
+    from_runbook: probe_tuning
+    question: "tune/create/audit probes"
+    composition: [MAP(detections), CAL, "[DRILL(describe)]", "[AGG(research_batch, 3 horizons)]", MUT(probe), TERM(receipt_wait)]
+    gates: [g3]
+    devalidations_exercised: [d08, d09, d15]
+  prompt_tuning:
+    from_runbook: prompt_tuning
+    question: "fix descriptions/alert criteria"
+    composition: [C, MAP(prompts), MAP(rollups), MUT(prompt_settings), TERM(receipt_wait)]
+    gates: [g3]
+    decision_head:
+      fault_surface: [stream_prompt, alert_policy, rollup_L1, rollup_L2, rollup_L3,
+                      json_template, bookmark_gating]
+    devalidations_exercised: [d03, d05, d15]
+  protocol_deploy:
+    from_runbook: protocol_deploy
+    question: "first-time / demo deployment"
+    composition: [C(inventory), MAP(live_survey), TERM(propose), "[MUT(prompt_settings)]",
+                  "[CAL, MUT(probe)]", TERM(deploy_card)]
+    gates: [g3]
+    devalidations_exercised: [d06, d08, d09, d11, d15]
+    note: "reflex decides per-channel outcomes; survey chunking and job resume are harness (decision 2)"
+  status_glance:
+    from_runbook: null   # exists as intent 'runtime' only; no runbook today
+    question: "what needs attention / runtime health now?"
+    composition: [MAP(runtime), "[MAP(detections)]", TERM(answer_show)]
+    gates: []
+    devalidations_exercised: [d07]
+  bookmark_capture:
+    from_runbook: null   # intent group 'bookmark'; no runbook today
+    question: "bookmark this / mark the moment"
+    composition: [W, C(one), DRILL(frames), MUT(bookmark), TERM(answer)]
+    gates: [g3, g5]
+    devalidations_exercised: [d01, d05]
+  junk:
+    from_runbook: null
+    question: "noise: cat-on-keyboard, idle chatter, drift loops, test noise"
+    composition: [TERM(noop | escalate_agent low-confidence)]
+    gates: [g6]
+    devalidations_exercised: []
+    note: "validation track, not training track; labels {junk_type, expected_behavior}"

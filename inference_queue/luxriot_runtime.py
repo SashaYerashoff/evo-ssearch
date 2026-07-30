@@ -85,6 +85,7 @@ class LuxriotInferenceQueueRuntime:
         self._last_gc_at = 0.0
         self._completed_count = 0
         self._failed_count = 0
+        self._superseded_count = 0
 
     def start(self) -> None:
         with self._state_lock:
@@ -132,9 +133,14 @@ class LuxriotInferenceQueueRuntime:
         payload = {
             "kind": _SPOOL_KIND,
             "run_id": run_id,
+            "batch_id": str(batch.get("batch_id") or "").strip(),
             "frame_count": int(batch.get("frame_count") or 0),
             "batch_start_ms": batch_start_ms,
             "batch_end_ms": batch_end_ms,
+            # An L0 batch is evidence for a distinct interval, not a
+            # replaceable health gauge. Frame-aware coalescing has already
+            # happened in the capture session before this durable queue.
+            "coalesce_heartbeat": False,
         }
         with self._spool_lock:
             spool_name = self._write_spool(batch)
@@ -153,6 +159,16 @@ class LuxriotInferenceQueueRuntime:
                 self._delete_spool(spool_name)
                 raise
 
+            if result.replaced_payload is not None:
+                self._record_payload_coverage_gap(
+                    result.replaced_payload,
+                    "inference_queue_coalesced",
+                )
+            if result.evicted_payload is not None:
+                self._record_payload_coverage_gap(
+                    result.evicted_payload,
+                    "inference_queue_evicted",
+                )
             if result.status is EnqueueStatus.IDEMPOTENT or not result.accepted:
                 self._delete_spool(spool_name)
             self._delete_payload_spool(result.replaced_payload)
@@ -164,6 +180,7 @@ class LuxriotInferenceQueueRuntime:
             "status": result.status.value,
             "job_id": result.job.id,
             "evicted_job_id": result.evicted_job_id,
+            "coverage_gap_recorded": False,
         }
 
     def status(self) -> dict[str, Any]:
@@ -173,6 +190,7 @@ class LuxriotInferenceQueueRuntime:
             last_error = self._last_error
             completed = self._completed_count
             failed = self._failed_count
+            superseded = self._superseded_count
         return {
             "enabled": True,
             "started": started,
@@ -188,6 +206,7 @@ class LuxriotInferenceQueueRuntime:
             "dead_letter_count": metrics.dead_letter_count,
             "completed_count": completed,
             "failed_count": failed,
+            "superseded_count": superseded,
             "last_error": last_error,
         }
 
@@ -251,6 +270,9 @@ class LuxriotInferenceQueueRuntime:
         except Exception as exc:
             renew_stop.set()
             renew_thread.join(timeout=1.0)
+            if bool(getattr(exc, "superseded", False)):
+                self._complete_superseded_job(worker, job, exc)
+                return
             self._fail_job(worker, job, exc)
             return
         finally:
@@ -259,7 +281,12 @@ class LuxriotInferenceQueueRuntime:
 
         try:
             with self._apply_lock:
-                self.manager.accept_summary_entry(result.output)
+                accepted = self.manager.accept_summary_entry(result.output)
+                if not bool(accepted.get("accepted", True)):
+                    self._record_coverage_gap(
+                        entry,
+                        "inference_result_stale_session",
+                    )
                 self._delete_spool(str(job.payload.get("spool_file") or ""))
             with self._state_lock:
                 self._completed_count += 1
@@ -268,11 +295,45 @@ class LuxriotInferenceQueueRuntime:
             # The durable result remains in PostgreSQL and is retried by reconciliation.
             self._set_error(exc)
 
+    def _complete_superseded_job(self, worker: InferenceWorker, job: Any, exc: Exception) -> None:
+        reason = self._safe_error(exc)
+        try:
+            self._record_payload_coverage_gap(
+                job.payload,
+                "inference_job_superseded",
+            )
+            worker.complete(
+                job.id,
+                {
+                    "accepted": False,
+                    "superseded": True,
+                    "status": "superseded",
+                    "channel_id": job.channel_id,
+                    "run_id": str(job.payload.get("run_id") or ""),
+                    "stale_reason": reason,
+                },
+                metadata={"kind": _SPOOL_KIND, "status": "superseded"},
+            )
+            self._delete_spool(str(job.payload.get("spool_file") or ""))
+            with self._state_lock:
+                self._superseded_count += 1
+                self._last_error = None
+        except Exception as complete_exc:
+            self._fail_job(worker, job, complete_exc)
+
     def _fail_job(self, worker: InferenceWorker, job: Any, exc: Exception) -> None:
         error = self._safe_error(exc)
         try:
             failed = worker.fail(job.id, error)
             if failed.state in {JobState.DEAD_LETTER, JobState.DROPPED}:
+                self._record_payload_coverage_gap(
+                    job.payload,
+                    (
+                        "inference_queue_dead_letter"
+                        if failed.state is JobState.DEAD_LETTER
+                        else "inference_queue_dropped"
+                    ),
+                )
                 self._delete_spool(str(job.payload.get("spool_file") or ""))
         except InferenceQueueError:
             pass
@@ -307,7 +368,12 @@ class LuxriotInferenceQueueRuntime:
                 if result is None:
                     continue
                 with self._apply_lock:
-                    self.manager.accept_summary_entry(result.output)
+                    accepted = self.manager.accept_summary_entry(result.output)
+                    if not bool(accepted.get("accepted", True)):
+                        self._record_coverage_gap(
+                            result.output,
+                            "inference_result_stale_session",
+                        )
                     self._delete_spool(spool_name)
             except Exception as exc:
                 self._set_error(exc)
@@ -373,6 +439,34 @@ class LuxriotInferenceQueueRuntime:
         spool_name = str(payload.get("spool_file") or "")
         if spool_name:
             self._delete_spool(spool_name)
+
+    def _record_payload_coverage_gap(
+        self,
+        payload: Mapping[str, Any],
+        reason: str,
+    ) -> None:
+        spool_name = str(payload.get("spool_file") or "")
+        if spool_name:
+            try:
+                source = self._read_spool(spool_name)
+            except Exception:
+                source = dict(payload)
+        else:
+            source = dict(payload)
+        self._record_coverage_gap(source, reason)
+
+    def _record_coverage_gap(
+        self,
+        source: Mapping[str, Any],
+        reason: str,
+    ) -> None:
+        recorder = getattr(self.manager, "record_summary_coverage_gap", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(source, reason=reason)
+        except Exception as exc:
+            self._set_error(exc)
 
     def _spool_path(self, spool_name: str) -> Path:
         if not _SPOOL_NAME.fullmatch(str(spool_name or "")):

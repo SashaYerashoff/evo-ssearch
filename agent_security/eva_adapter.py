@@ -14,6 +14,7 @@ from .errors import (
     AuditUnavailableError,
     ChannelAccessDeniedError,
     InvalidToolArgumentsError,
+    PermissionDeniedError,
     ToolGatewayError,
 )
 from .gateway import ToolGateway
@@ -47,9 +48,21 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "delete_probes",
         "update_probe",
         "update_prompt_settings",
+        "restore_video_summary_history",
+        "apply_deployment_plan",
     }
 )
 _HIDDEN_UNTIL_APPROVALS = frozenset({"create_bookmark"})
+_STATE_WRITE_TOOLS = frozenset(
+    {
+        # These persist workflow checkpoints but do not alter live channels,
+        # prompts, probes, or model scheduling. They are audited as writes and
+        # intentionally do not create a UI approval plan.
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+    }
+)
 _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
     {
         "search_archive",
@@ -63,9 +76,11 @@ _SINGLE_CHANNEL_FOR_SCOPED_ACTORS = frozenset(
         "get_prompt_settings",
         "update_prompt_settings",
         "get_video_summaries",
+        "list_attention_bursts",
         "count_video_summary_events",
         "track_visual_state_transitions",
         "generate_report",
+        "query_counted_state_metric",
     }
 )
 
@@ -91,10 +106,19 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "get_prompt_settings": Permission.STREAMS_VIEW,
     "update_prompt_settings": Permission.PROMPTS_MANAGE,
     "get_video_summaries": Permission.STREAMS_VIEW,
+    "list_attention_bursts": Permission.STREAMS_VIEW,
     "count_video_summary_events": Permission.STREAMS_VIEW,
     "track_visual_state_transitions": Permission.DETECTIONS_VIEW,
     "create_bookmark": Permission.BOOKMARKS_CREATE,
     "generate_report": Permission.REPORTS_VIEW,
+    "restore_video_summary_history": Permission.CAPTURE_MANAGE,
+    "get_video_summary_restore_status": Permission.STREAMS_VIEW,
+    "start_deployment": Permission.STREAMS_VIEW,
+    "configure_deployment": Permission.STREAMS_VIEW,
+    "survey_deployment": Permission.STREAMS_VIEW,
+    "apply_deployment_plan": Permission.SETTINGS_MANAGE,
+    "get_deployment_status": Permission.REPORTS_VIEW,
+    "query_counted_state_metric": Permission.DETECTIONS_VIEW,
 }
 
 _WRITE_TOOLS = _PREVIEW_ONLY_TOOLS | _HIDDEN_UNTIL_APPROVALS
@@ -104,10 +128,14 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "delete_probes",
         "update_probe",
         "get_video_summaries",
+        "list_attention_bursts",
         "count_video_summary_events",
         "track_visual_state_transitions",
         "get_visual_window_signals",
         "create_bookmark",
+        "survey_deployment",
+        "apply_deployment_plan",
+        "query_counted_state_metric",
     }
 )
 
@@ -142,13 +170,28 @@ class EvaAgentToolAdapter:
             allowed_arguments = set(map(str, properties))
             if name in {"delete_probes", "update_probe"}:
                 allowed_arguments.update({"channel_id", "channel_ids"})
+            if name in {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+            }:
+                # Resolved server-side from the authenticated actor scope and
+                # durable deployment state. These are deliberately absent from
+                # the model-visible schemas unless channel_ids is a real
+                # configure_deployment input.
+                allowed_arguments.add("channel_ids")
+            if name == "query_counted_state_metric":
+                # Resolved server-side from the durable metric profile.
+                allowed_arguments.add("channel_id")
             policy = ToolPolicy(
                 required_permission=_TOOL_PERMISSIONS[name].value,
                 risk=(
                     ToolRisk.EXTERNAL_SIDE_EFFECT
                     if name == "create_bookmark"
                     else ToolRisk.WRITE
-                    if name in _WRITE_TOOLS
+                    if name in (_WRITE_TOOLS | _STATE_WRITE_TOOLS)
                     else ToolRisk.READ
                 ),
                 approval_required=name in _WRITE_TOOLS,
@@ -174,8 +217,8 @@ class EvaAgentToolAdapter:
                     "time_window_seconds",
                     "window_seconds",
                 ),
-                max_output_bytes=96_000,
-                max_output_items=500,
+                max_output_bytes=self._max_output_bytes(name),
+                max_output_items=self._max_output_items(name),
                 max_output_string_chars=24_000,
                 timeout_seconds=self._timeout_seconds(name),
                 rate_limit=RateLimit(
@@ -205,11 +248,73 @@ class EvaAgentToolAdapter:
             "get_detections": 100,
             "list_video_summary_channels": 100,
             "get_video_summaries": 100,
+            "list_attention_bursts": 100,
             "count_video_summary_events": 120,
             "track_visual_state_transitions": 120,
             "calibrate_probe_from_archive": 120,
             "prepare_probe_calibration_batch": 120,
         }.get(name)
+
+    @staticmethod
+    def _max_output_items(name: str) -> int:
+        # Video-summary responses contain bounded semantic entries, evidence
+        # rows, and nested coverage contracts. The generic 500-item ceiling can
+        # be exhausted by coverage metadata before it reaches entries/image_url,
+        # producing false empty summaries and blank UI previews. Bytes and row
+        # limits remain independently bounded.
+        #
+        # search_archive and get_detections have the identical shape: up to
+        # 48-100 uncompacted detection rows (each carrying its full
+        # vlm_summary/vlm_alert payload — state_observations/
+        # state_transition_events/vector_signal can be sizeable) followed by
+        # (for search_archive) a trailing `coverage` object. The sanitizer
+        # walks keys in order and stops counting once the budget is spent,
+        # so a full page of rows silently ate `coverage` before the
+        # sanitizer ever reached it — both the operator UI and the model
+        # then saw "coverage: not reported" and a spurious `_truncated`
+        # flag on searches that were not actually truncated. This is a
+        # coverage-honesty gate (docs/tuktuk/grammar_pin.md); see
+        # docs/tuktuk/grammar_review_questions.md (Resolved,
+        # "search_archive coverage truncation").
+        #
+        # Final search_archive/get_detections item counts, measured against live
+        # tbilisi-repro data at each tool's own max_rows ceiling
+        # (EvaAgentToolAdapter._max_rows): a full-size vlm_summary row with
+        # real (not placeholder) VLM-written text and state arrays consumes
+        # roughly 170-180 sanitizer "items" on its own -- 5x the ~35/row
+        # this budget was sized for from a synthetic test fixture at first.
+        # search_archive tops out at 48 rows (needs ~8,200 items; 20,000
+        # measured lossless). get_detections tops out at 100 rows (needs
+        # ~18,000 items; measured lossless only above 30,000). Both set to
+        # 50,000 for shared headroom against future payload growth.
+        return {
+            "get_video_summaries": 4_000,
+            "list_video_summary_channels": 2_000,
+            "search_archive": 50_000,
+            "get_detections": 50_000,
+        }.get(name, 500)
+
+    @staticmethod
+    def _max_output_bytes(name: str) -> int:
+        # Independent of _max_output_items: sanitize_output's final byte
+        # check (_bound_serialized) replaces the *entire* result with a
+        # useless {"_truncated": true, "preview": "<64KB of raw JSON>"}
+        # envelope once the serialized size exceeds this cap — wiping out
+        # coverage/count/scope alongside the rows, regardless of key order.
+        # Real archive rows run large (~9-11KB each with full vlm_summary
+        # payload/state arrays): search_archive at its default page (12
+        # rows) measured ~141KB, and get_detections at its own default
+        # (20 rows) measured ~221KB — both routinely exceeding the generic
+        # 96,000-byte default in normal operation, not just at max_rows.
+        # get_detections is one of the most frequently called tools, so
+        # this was silently returning an empty preview envelope on a large
+        # fraction of ordinary calls. See
+        # docs/tuktuk/grammar_review_questions.md (Resolved,
+        # "search_archive coverage truncation").
+        return {
+            "search_archive": 2_000_000,
+            "get_detections": 2_000_000,
+        }.get(name, 96_000)
 
     @staticmethod
     def _default_rows(name: str) -> int | None:
@@ -218,6 +323,7 @@ class EvaAgentToolAdapter:
             "get_detections": 20,
             "list_video_summary_channels": 16,
             "get_video_summaries": 20,
+            "list_attention_bursts": 24,
             "count_video_summary_events": 40,
             "track_visual_state_transitions": 40,
             "calibrate_probe_from_archive": 24,
@@ -228,6 +334,8 @@ class EvaAgentToolAdapter:
     def _timeout_seconds(name: str) -> float:
         return {
             "survey_channels": 300.0,
+            "survey_deployment": 300.0,
+            "apply_deployment_plan": 300.0,
             "describe_frame": 120.0,
             "search_archive": 90.0,
             "get_visual_window_signals": 90.0,
@@ -235,10 +343,12 @@ class EvaAgentToolAdapter:
             "prepare_probe_calibration_batch": 90.0,
             "build_research_batch": 90.0,
             "get_video_summaries": 90.0,
+            "list_attention_bursts": 90.0,
             "count_video_summary_events": 90.0,
             "track_visual_state_transitions": 90.0,
             "list_video_summary_channels": 90.0,
             "generate_report": 90.0,
+            "restore_video_summary_history": 180.0,
         }.get(name, 45.0)
 
     def close(self) -> None:
@@ -252,6 +362,12 @@ class EvaAgentToolAdapter:
             definition.name
             for definition in self.gateway.available_tools(context)
         } - _HIDDEN_UNTIL_APPROVALS
+        if "*" not in context.allowed_channel_ids:
+            # The durable backfill worker is deployment-global and its status
+            # contains channel IDs plus aggregate progress across the job. Do
+            # not expose a misleading partially-filtered global status to a
+            # channel-scoped actor.
+            allowed_names.discard("get_video_summary_restore_status")
         return [
             self._model_schema(name)
             for name in self._schemas
@@ -399,7 +515,7 @@ class EvaAgentToolAdapter:
             ToolRisk.EXTERNAL_SIDE_EFFECT
             if name == "create_bookmark"
             else ToolRisk.WRITE
-            if name in _WRITE_TOOLS
+            if name in (_WRITE_TOOLS | _STATE_WRITE_TOOLS)
             else ToolRisk.READ
         )
         try:
@@ -496,6 +612,8 @@ class EvaAgentToolAdapter:
                 "agent filesystem image paths are disabled"
             )
 
+        self._prepare_deployment_arguments(name, prepared, context)
+
         self._resolve_channel_reference(prepared)
         if name == "describe_frame":
             self._resolve_detection_channel(prepared)
@@ -504,6 +622,11 @@ class EvaAgentToolAdapter:
         if name == "delete_probes":
             self._resolve_delete_probe_channels(prepared, context)
         scoped_channels = self._scoped_channels(context)
+        if name == "get_video_summary_restore_status" and scoped_channels is not None:
+            raise ChannelAccessDeniedError(
+                "video-summary restoration status is deployment-wide; ask an all-channel administrator",
+                details={"scope": "deployment"},
+            )
         if name == "survey_channels" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif name == "list_video_summary_channels" and scoped_channels is not None:
@@ -513,6 +636,8 @@ class EvaAgentToolAdapter:
             if name == "prepare_probe_calibration_batch":
                 self._filter_probe_batch_items_for_scope(prepared, scoped_channels)
         elif name == "generate_report" and scoped_channels is not None:
+            prepared.setdefault("channel_ids", sorted(scoped_channels))
+        elif name == "restore_video_summary_history" and scoped_channels is not None:
             prepared.setdefault("channel_ids", sorted(scoped_channels))
         elif (
             name in _SINGLE_CHANNEL_FOR_SCOPED_ACTORS
@@ -529,6 +654,111 @@ class EvaAgentToolAdapter:
         if name in _PREVIEW_ONLY_TOOLS:
             prepared.setdefault("preview", True)
         return prepared
+
+    def _prepare_deployment_arguments(
+        self,
+        name: str,
+        prepared: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> None:
+        deployment_tools = {
+            "configure_deployment",
+            "survey_deployment",
+            "apply_deployment_plan",
+            "get_deployment_status",
+        }
+        scoped_channels = self._scoped_channels(context)
+        if name == "start_deployment":
+            if scoped_channels is not None:
+                # Always overwrite: authorization scope is server-created and
+                # must never be widened by a hidden caller argument.
+                prepared["channel_ids"] = sorted(scoped_channels)
+            else:
+                prepared.pop("channel_ids", None)
+            return
+
+        if name in deployment_tools:
+            deployment_id = str(prepared.get("deployment_id") or "").strip()
+            try:
+                state = self._legacy_tools._deployment_store.load(deployment_id)
+            except Exception as exc:
+                raise InvalidToolArgumentsError(
+                    "deployment does not exist"
+                ) from exc
+            selected = [
+                str(item)
+                for item in (state.get("selected_channel_ids") or [])
+                if str(item).strip()
+            ]
+            inventory_scope = [
+                str(item.get("id"))
+                for item in (state.get("available_channels") or [])
+                if isinstance(item, Mapping) and item.get("id") is not None
+            ]
+            requested = prepared.get("channel_ids")
+            if name == "configure_deployment" and requested is not None:
+                requested_ids = [
+                    str(item).strip()
+                    for item in requested
+                    if str(item).strip()
+                ]
+                selected = requested_ids
+            elif not selected:
+                selected = inventory_scope
+            # Hidden channel_ids makes the generic gateway enforce every
+            # selected channel against the authenticated actor grant.
+            prepared["channel_ids"] = selected
+
+            if name == "apply_deployment_plan":
+                required = {
+                    Permission.SETTINGS_MANAGE.value,
+                    Permission.PROMPTS_MANAGE.value,
+                    Permission.PROBES_MANAGE.value,
+                    Permission.CAPTURE_MANAGE.value,
+                }
+                missing = sorted(required - set(context.permissions))
+                if missing:
+                    raise PermissionDeniedError(
+                        "Protocol Deploy apply requires settings, prompts, probes, "
+                        "and capture management permissions",
+                        details={"missing_permissions": missing},
+                    )
+            return
+
+        if name != "query_counted_state_metric":
+            return
+        metric_id = str(prepared.get("metric_id") or "").strip()
+        metric_name = str(prepared.get("metric_name") or "").strip().casefold()
+        requested_channel = str(prepared.get("channel_id") or "").strip()
+        try:
+            profiles = self._legacy_tools._deployment_store.list_counted_profiles()
+        except Exception as exc:
+            raise InvalidToolArgumentsError(
+                "counted-state profiles are unavailable"
+            ) from exc
+        matches = [
+            item
+            for item in profiles
+            if isinstance(item, Mapping)
+            and (
+                not requested_channel
+                or str(item.get("channel_id") or "") == requested_channel
+            )
+            and (
+                (metric_id and str(item.get("id") or "") == metric_id)
+                or (
+                    not metric_id
+                    and metric_name
+                    and str(item.get("name") or "").strip().casefold()
+                    == metric_name
+                )
+            )
+        ]
+        if len(matches) != 1:
+            raise InvalidToolArgumentsError(
+                "counted-state metric must resolve to exactly one profile"
+            )
+        prepared["channel_id"] = str(matches[0].get("channel_id"))
 
     def _resolve_channel_reference(self, arguments: dict[str, Any]) -> None:
         if arguments.get("channel_id") is not None:
@@ -686,6 +916,34 @@ class EvaAgentToolAdapter:
                 if str(item.get("channel_id")) in scoped_channels
             ]
             return {**result, "count": len(probes), "probes": probes}
+        if name in {
+            "start_deployment",
+            "configure_deployment",
+            "survey_deployment",
+            "get_deployment_status",
+        }:
+            available = [
+                item
+                for item in (result.get("available_channels") or ())
+                if isinstance(item, Mapping)
+                and str(item.get("id")) in scoped_channels
+            ]
+            surveys = [
+                item
+                for item in (result.get("surveys") or ())
+                if isinstance(item, Mapping)
+                and str(item.get("channel_id")) in scoped_channels
+            ]
+            return {
+                **result,
+                "available_channels": available,
+                "selected_channel_ids": [
+                    item
+                    for item in (result.get("selected_channel_ids") or ())
+                    if str(item) in scoped_channels
+                ],
+                **({"surveys": surveys} if "surveys" in result else {}),
+            }
         return result
 
     def _model_schema(self, name: str) -> dict[str, Any]:

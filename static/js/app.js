@@ -16,10 +16,13 @@
     const folderInput = document.getElementById('folderPath');
     const AUTH_ENABLED = {auth_enabled_json};
     const AUTH_CSRF_COOKIE = {auth_csrf_cookie_json};
+    const PROBE_POS_FLOOR_DEFAULT = {probe_pos_floor_default};
+    const PROBE_MARGIN_DEFAULT = {probe_margin_default};
     const authGate = document.getElementById('authGate');
     const authLoginForm = document.getElementById('authLoginForm');
     const authUsernameInput = document.getElementById('authUsername');
     const authPasswordInput = document.getElementById('authPassword');
+    const authPasswordToggle = document.getElementById('authPasswordToggle');
     const authLoginBtn = document.getElementById('authLoginBtn');
     const authLoginStatus = document.getElementById('authLoginStatus');
     const authTokenBtn = document.getElementById('authTokenBtn');
@@ -51,8 +54,8 @@
     const videoOutput = document.getElementById('videoOutput');
     const videoFrames = document.getElementById('videoFrames');
     const saveSummaryBtn = document.getElementById('saveSummaryBtn');
-    const monitorModeBtn = document.getElementById('monitorModeBtn');
-    const monitorBox = document.getElementById('monitorBox');
+    const probesModeBtn = document.getElementById('probesModeBtn');
+    const probesBox = document.getElementById('probesBox');
     const agentModeBtn = document.getElementById('agentModeBtn');
     const agentBox = document.getElementById('agentBox');
     const agentModelInput = document.getElementById('agentModelInput');
@@ -74,8 +77,11 @@
     const luxriotBatchSizeSelect = document.getElementById('luxriotBatchSize');
     const luxriotLiveIntervalInput = document.getElementById('luxriotLiveIntervalSec');
     const luxriotBatchInfo = document.getElementById('luxriotBatchInfo');
+    const luxriotRuntimeConfigState = document.getElementById('luxriotRuntimeConfigState');
+    const luxriotRuntimeConfigRunning = document.getElementById('luxriotRuntimeConfigRunning');
+    const luxriotRuntimeConfigPending = document.getElementById('luxriotRuntimeConfigPending');
     const luxriotStatusLabel = document.getElementById('luxriotStatus');
-    const luxriotPreviewImg = document.getElementById('luxriotPreview');
+    let luxriotPreviewImg = document.getElementById('luxriotPreview');
     const luxriotViewport = document.getElementById('luxriotViewport');
     const luxriotOverlay = document.getElementById('luxriotOverlay');
     const luxriotStreamName = document.getElementById('luxriotStreamName');
@@ -85,6 +91,7 @@
     const luxriotStreamCadence = document.getElementById('luxriotStreamCadence');
     const luxriotStreamBatch = document.getElementById('luxriotStreamBatch');
     const luxriotStreamModel = document.getElementById('luxriotStreamModel');
+    const luxriotStreamSelector = document.getElementById('luxriotStreamSelector');
     const luxriotStreamQueue = document.getElementById('luxriotStreamQueue');
     const luxriotStreamProbesRow = document.getElementById('luxriotStreamProbesRow');
     const luxriotStreamProbes = document.getElementById('luxriotStreamProbes');
@@ -105,9 +112,15 @@
     const luxriotPromptModal = document.getElementById('luxriotPromptModal');
     const closeLuxriotPromptModalBtn = document.getElementById('closeLuxriotPromptModal');
     const luxriotPromptCloseBtn = document.getElementById('luxriotPromptCloseBtn');
+    const luxriotPromptResetBtn = document.getElementById('luxriotPromptResetBtn');
     const luxriotPromptApplyBtn = document.getElementById('luxriotPromptApplyBtn');
     const luxriotPromptModalInput = document.getElementById('luxriotPromptModalInput');
     const luxriotPromptModalMeta = document.getElementById('luxriotPromptModalMeta');
+    const luxriotMemoryMetabolism = document.getElementById('luxriotMemoryMetabolism');
+    const luxriotMemoryMetabolismSummary = document.getElementById('luxriotMemoryMetabolismSummary');
+    const luxriotMemoryMetabolismState = document.getElementById('luxriotMemoryMetabolismState');
+    const luxriotMemoryMetabolismStages = document.getElementById('luxriotMemoryMetabolismStages');
+    const luxriotMemoryMetabolismCurrent = document.getElementById('luxriotMemoryMetabolismCurrent');
     const luxriotPromptLayerDetails = document.getElementById('luxriotPromptLayerDetails');
     const luxriotPromptLayerContent = document.getElementById('luxriotPromptLayerContent');
     const luxriotPromptTabButtons = Array.from(document.querySelectorAll('[data-luxriot-prompt-tab]'));
@@ -120,6 +133,11 @@
     const luxriotSummaryFromInput = document.getElementById('luxriotSummaryFromInput');
     const luxriotSummaryToInput = document.getElementById('luxriotSummaryToInput');
     const luxriotSummaryApplyFiltersBtn = document.getElementById('luxriotSummaryApplyFiltersBtn');
+    const luxriotSummaryDateNav = document.getElementById('luxriotSummaryDateNav');
+    const luxriotSummaryDateLabel = document.getElementById('luxriotSummaryDateLabel');
+    const luxriotSummaryPreviousPeriodBtn = document.getElementById('luxriotSummaryPreviousPeriod');
+    const luxriotSummaryNextPeriodBtn = document.getElementById('luxriotSummaryNextPeriod');
+    const luxriotSummaryLoadEarlierBtn = document.getElementById('luxriotSummaryLoadEarlierBtn');
     const luxriotSummaryBackBtn = document.getElementById('luxriotSummaryBackBtn');
     const luxriotSummaryMeta = document.getElementById('luxriotSummaryMeta');
     const luxriotSummaryFollowBtn = document.getElementById('luxriotSummaryFollowBtn');
@@ -142,6 +160,8 @@
     const luxriotJsonAlertPromptInput = document.getElementById('luxriotJsonAlertPrompt');
     const luxriotBookmarkEnabledInput = document.getElementById('luxriotBookmarkEnabled');
     const luxriotBookmarkCooldownInput = document.getElementById('luxriotBookmarkCooldown');
+    const luxriotSelectorEnabledInput = document.getElementById('luxriotSelectorEnabled');
+    const luxriotSelectorBiasInput = document.getElementById('luxriotSelectorBias');
     const probeChannelSelect = document.getElementById('probeChannelSelect');
     const probeTopKInput = document.getElementById('probeTopK');
     const probePosFloorInput = document.getElementById('probePosFloor');
@@ -183,8 +203,25 @@
     const probeCards = document.getElementById('probeCards');
     const probeNewBtn = document.getElementById('probeNewBtn');
     const probeReloadBtn = document.getElementById('probeReloadBtn');
-    const probePreviewImg = document.getElementById('probePreviewImg');
-    const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.monitor-stream-preview') : null;
+    const probeSearchInput = document.getElementById('probeSearchInput');
+    const probeOriginFilters = document.getElementById('probeOriginFilters');
+    const probeStateFilters = document.getElementById('probeStateFilters');
+    const probeFilterResetBtn = document.getElementById('probeFilterResetBtn');
+    const probeBoardCount = document.getElementById('probeBoardCount');
+    const probeGroupListEl = document.getElementById('probeGroupList');
+    const probeGroupNewBtn = document.getElementById('probeGroupNewBtn');
+    const probeGroupModal = document.getElementById('probeGroupModal');
+    const probeGroupModalTitle = document.getElementById('probeGroupModalTitle');
+    const probeGroupNameInput = document.getElementById('probeGroupName');
+    const probeGroupChannelList = document.getElementById('probeGroupChannelList');
+    const probeGroupSelectedMeta = document.getElementById('probeGroupSelectedMeta');
+    const probeGroupStatus = document.getElementById('probeGroupStatus');
+    const probeGroupSaveBtn = document.getElementById('probeGroupSaveBtn');
+    const probeGroupDeleteBtn = document.getElementById('probeGroupDeleteBtn');
+    const probeGroupCancelBtn = document.getElementById('probeGroupCancelBtn');
+    const probeGroupCloseBtn = document.getElementById('closeProbeGroup');
+    let probePreviewImg = document.getElementById('probePreviewImg');
+    const probePreviewViewport = probePreviewImg ? probePreviewImg.closest('.probes-stream-preview') : null;
     const probePreviewOverlay = document.getElementById('probePreviewOverlay');
     const probeRoiLayer = document.getElementById('probeRoiLayer');
     const probeRoiBox = document.getElementById('probeRoiBox');
@@ -223,6 +260,14 @@
     const archiveInspectorBody = document.getElementById('archiveInspectorBody');
     const archiveInspectorEmpty = document.getElementById('archiveInspectorEmpty');
     const archiveChannelFilter = document.getElementById('archiveChannelFilter');
+    const archiveChannelPickerToggle = document.getElementById('archiveChannelPickerToggle');
+    const archiveChannelPickerSummary = document.getElementById('archiveChannelPickerSummary');
+    const archiveChannelPopover = document.getElementById('archiveChannelPopover');
+    const archiveChannelSearch = document.getElementById('archiveChannelSearch');
+    const archiveChannelReset = document.getElementById('archiveChannelReset');
+    const archiveChannelDone = document.getElementById('archiveChannelDone');
+    const archiveChannelEmpty = document.getElementById('archiveChannelEmpty');
+    const archiveChannelOptions = document.getElementById('archiveChannelOptions');
     const archiveProbeFilter = document.getElementById('archiveProbeFilter');
     const archiveProbeFilterGroup = archiveProbeFilter ? archiveProbeFilter.closest('.input-group') : null;
     const archiveSourceFilter = document.getElementById('archiveSourceFilter');
@@ -242,8 +287,8 @@
     const probeEnableToggle = document.getElementById('probeEnableToggle');
     const probeBenchBtn = document.getElementById('probeBenchBtn');
     const probeBenchOutput = document.getElementById('probeBenchOutput');
-    const monitorProbeSummary = document.getElementById('monitorProbeSummary');
-    const monitorSelectionStatus = document.getElementById('monitorSelectionStatus');
+    const probesSummary = document.getElementById('probesSummary');
+    const probesSelectionStatus = document.getElementById('probesSelectionStatus');
     const imageLightboxModal = document.getElementById('imageLightboxModal');
     const closeImageLightboxBtn = document.getElementById('closeImageLightbox');
     const imageLightboxImg = document.getElementById('imageLightboxImg');
@@ -254,6 +299,7 @@
     const archiveReviewQuery = document.getElementById('archiveReviewQuery');
     const archiveReviewMatch = document.getElementById('archiveReviewMatch');
     const archiveReviewImg = document.getElementById('archiveReviewImg');
+    const archiveReviewFrameContainer = archiveReviewImg ? archiveReviewImg.closest('.archive-review-frame') : null;
     const archiveReviewFrameEmpty = document.getElementById('archiveReviewFrameEmpty');
     const archiveReviewChannel = document.getElementById('archiveReviewChannel');
     const archiveReviewFrameRole = document.getElementById('archiveReviewFrameRole');
@@ -266,6 +312,15 @@
     const archiveReviewSimilarBtn = document.getElementById('archiveReviewSimilarBtn');
     const archiveReviewJumpBtn = document.getElementById('archiveReviewJumpBtn');
     const archiveReviewCopyBtn = document.getElementById('archiveReviewCopyBtn');
+    const archiveReviewFeedbackBtn = document.getElementById('archiveReviewFeedbackBtn');
+    const archiveReviewFeedbackPanel = document.getElementById('archiveReviewFeedbackPanel');
+    const archiveReviewFeedbackReasons = document.getElementById('archiveReviewFeedbackReasons');
+    const archiveReviewFeedbackNote = document.getElementById('archiveReviewFeedbackNote');
+    const archiveReviewFeedbackStatus = document.getElementById('archiveReviewFeedbackStatus');
+    const archiveReviewFeedbackSaveBtn = document.getElementById('archiveReviewFeedbackSaveBtn');
+    const archiveReviewFeedbackCancelBtn = document.getElementById('archiveReviewFeedbackCancelBtn');
+    const archiveReviewFeedbackExportMdBtn = document.getElementById('archiveReviewFeedbackExportMdBtn');
+    const archiveReviewFeedbackExportXmlBtn = document.getElementById('archiveReviewFeedbackExportXmlBtn');
     
     let currentFolder = '';
     let currentMode = 'archive';
@@ -284,11 +339,16 @@
     const luxriotSummarySeenKeys = {};
     let luxriotSummaryUnread = 0;
     let luxriotSummaryChannel = null;
-    let luxriotSummaryRunFilter = 'latest';
-    let luxriotSummaryRangePreset = '6h';
+    let luxriotSummaryRunFilter = 'live';
+    let luxriotSummaryRangePreset = 'live';
     let luxriotSummaryFromTs = null;
     let luxriotSummaryToTs = null;
     let luxriotSummaryLevel = 'L0';
+    let luxriotSummaryResolutionMode = 'AUTO';
+    let luxriotSummaryArchiveOffset = 0;
+    let luxriotSummaryArchiveHasMore = false;
+    let luxriotSummaryArchiveEvidenceTotal = 0;
+    let luxriotSummaryArchiveLoading = false;
     let luxriotSummaryRollupStack = [];
     let luxriotSummaryRollupRows = [];
     const luxriotSummaryRollupCache = {};
@@ -300,19 +360,35 @@
         channelId: {luxriot_default_channel},
         snapshotInterval: {luxriot_snapshot_interval},
         snapshotMaxEdge: {luxriot_snapshot_max_edge},
-        baseUrl: {luxriot_base_url_json},
         batchSize: {luxriot_batch_default}
     };
+    let luxriotDisplayTimezone = 'UTC';
+    try {
+        luxriotDisplayTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        new Intl.DateTimeFormat('en', { timeZone: luxriotDisplayTimezone }).format(new Date());
+    } catch (_) {
+        luxriotDisplayTimezone = 'UTC';
+    }
     let luxriotActiveChannel = luxriotDefaults.channelId;
     let luxriotPreviewTimer = null;
+    let luxriotPreviewRenewTimer = null;
+    let luxriotPreviewStallTimer = null;
     let luxriotPreviewLoading = false;
     let luxriotPreviewRequestSeq = 0;
-    let luxriotPreviewObjectUrl = '';
     let luxriotPreviewAbortController = null;
+    let luxriotPreviewVideo = null;
+    let luxriotPreviewRetryBtn = null;
+    let luxriotPreviewNegotiation = null;
+    let luxriotPreviewTransportBtn = null;
+    let luxriotPreferFullOperatorMedia = false;
+    let luxriotAttentionSwitchPending = false;
     let luxriotSummaryTimer = null;
     let luxriotSummaryRefreshInFlight = false;
     let luxriotSummaryRefreshQueued = null;
+    let luxriotSummaryRequestGeneration = 0;
+    let luxriotSummaryActiveRequest = null;
     let luxriotStreamsCache = [];
+    let luxriotLiveIntervalDirtyChannelId = null;
     const luxriotChannelNameById = {};
     const luxriotChannelMetaById = {};
     const luxriotCaptureRunningByChannel = {};
@@ -328,9 +404,22 @@
         failed: false,
         errorCode: '',
         errorText: '',
+        mediaState: 'idle',
+        mediaKind: '',
+        degraded: false,
     };
     let luxriotPromptModalTab = 'stream';
     let luxriotPromptLayers = null;
+    let luxriotPromptSettingSources = null;
+    let luxriotPromptOverrideFields = [];
+    let luxriotPromptPersistence = null;
+    let luxriotMemoryMetabolismData = null;
+    let luxriotPromptLoadedSettings = null;
+    let luxriotPromptFormChannelId = null;
+    let luxriotPromptRequestGeneration = 0;
+    let luxriotPromptLoadAbortController = null;
+    let luxriotPromptSaveAbortController = null;
+    let luxriotPromptModalNotice = '';
     let luxriotInitialized = false;
     let luxriotInitPromise = null;
     const probeHitsCacheByKey = {};
@@ -350,13 +439,32 @@
     let probeList = [];
     let probeCatalog = [];
     let activeProbeId = null;
+    const PROBE_ORIGINS = ['operator', 'agent', 'auto'];
+    const PROBE_BOARD_VIEW_KEY = 'eva.probes.boardView';
+    const PROBE_BOARD_COLLAPSED_KEY = 'eva.probes.collapsedGroups';
+    let probeChannelGroups = [];
+    let probeBoardView = 'grid';
+    let probeBoardQuery = '';
+    const probeBoardOriginFilter = new Set();
+    const probeBoardStateFilter = new Set();
+    const probeBoardCollapsed = new Set();
+    let probeGroupEditorId = null;
+    let probeGroupSelectedChannels = new Set();
     const probeCaptureState = {};
     const probeChannelRuntime = {};
     const probeCaptureManualStop = {};
     let probeRunTimer = null;
     let probeRunInFlight = false;
     let probePreviewTimer = null;
+    let probePreviewRenewTimer = null;
+    let probePreviewStallTimer = null;
     let probePreviewChannelId = null;
+    let probePreviewGeneration = 0;
+    let probePreviewAbortController = null;
+    let probePreviewVideo = null;
+    let probePreviewRetryBtn = null;
+    let probePreviewNegotiation = null;
+    let probePreviewMediaState = 'idle';
     let lastProbeRefresh = 0;
     let probeStatusTimer = null;
     let archiveDetectionsOffset = 0;
@@ -366,6 +474,22 @@
     let archiveScoreSliderPercent = 0;
     let archiveLastQueryText = '';
     let archiveReviewContext = null;
+    let archiveEvidenceRequestGeneration = 0;
+    let archiveEvidenceAbortController = null;
+    let archiveEvidenceBusyButton = null;
+    let archiveFilterRequestGeneration = 0;
+    let archiveFilterAbortController = null;
+    let archiveReviewRequestGeneration = 0;
+    let archiveReviewAbortController = null;
+    const ARCHIVE_REVIEW_BATCH_TIMEOUT_MS = 12000;
+    let archiveMediaRequestGeneration = 0;
+    let archiveMediaAbortController = null;
+    let archiveMediaLoadTimer = null;
+    let archiveMediaLoopTimer = null;
+    let archiveMediaObjectUrl = null;
+    let archiveMediaVideo = null;
+    let archiveMediaRetryBtn = null;
+    let archiveMediaStatus = null;
     let archiveScoreRange = {
         count: 0,
         min: null,
@@ -382,6 +506,7 @@
     const LM_AUTO_MODEL_LABEL = 'Auto balance';
     let lmModelCatalog = {
         models: [],
+        profiles: [],
         defaultModel: '',
         autoModelSelector: LM_AUTO_MODEL_SELECTOR,
         autoModelLabel: LM_AUTO_MODEL_LABEL,
@@ -408,32 +533,72 @@
         return out;
     }
 
+    function lmProfileForSelector(value) {
+        const normalized = normalizeModelId(value);
+        if (!normalized) return null;
+        const profiles = Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [];
+        return profiles.find((profile) => {
+            const selector = normalizeModelId(profile && (profile.selector || profile.id));
+            return selector && selector === normalized;
+        }) || null;
+    }
+
+    function lmModelOptionLabel(modelId) {
+        const profile = lmProfileForSelector(modelId);
+        if (!profile) return modelId;
+        const resolved = normalizeModelId(profile.model);
+        if (!resolved || resolved === modelId) return modelId;
+        return `${modelId} (${resolved})`;
+    }
+
     function setModelSelectOptions(selectEl, selectedValue = '', fallbackValue = '', optionsConfig = {}) {
         if (!(selectEl instanceof HTMLSelectElement)) return;
         const includeAuto = Boolean(optionsConfig.includeAuto);
+        const keepUnavailableSelection = Boolean(optionsConfig.keepUnavailableSelection);
         const autoSelector = normalizeModelId(lmModelCatalog.autoModelSelector || LM_AUTO_MODEL_SELECTOR);
         const autoLabel = normalizeModelId(lmModelCatalog.autoModelLabel || LM_AUTO_MODEL_LABEL);
         const selected = normalizeModelId(selectedValue);
         const fallback = normalizeModelId(fallbackValue || lmModelCatalog.defaultModel);
+        const profiles = Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [];
+        // Offer only what is actually reachable right now: selectors of live
+        // profiles plus the models their servers report. Configured-but-down
+        // entries and stale localStorage values never become options.
+        const availableProfileSelectors = profiles
+            .filter((profile) => profile && profile.available && profile.enabled !== false)
+            .map((profile) => normalizeModelId(profile.selector || profile.id))
+            .filter(Boolean);
+        const servedModels = uniqueModelIds(lmModelCatalog.models || []);
         const options = includeAuto
-            ? uniqueModelIds(autoSelector, lmModelCatalog.models || [], selected, fallback)
-            : uniqueModelIds(lmModelCatalog.models || [], selected, fallback);
-        const nextValue = selected || (includeAuto ? autoSelector : '') || fallback || options[0] || '';
-        if (!options.length) {
+            ? uniqueModelIds(autoSelector, availableProfileSelectors, servedModels)
+            : uniqueModelIds(availableProfileSelectors, servedModels);
+        const unavailableSelected = Boolean(selected)
+            && !options.includes(selected)
+            && keepUnavailableSelection;
+        if (!options.length && !unavailableSelected) {
             selectEl.innerHTML = '<option value="">No models available</option>';
             selectEl.value = '';
             return;
         }
-        selectEl.innerHTML = options
+        let html = options
             .map((modelId) => {
-                const label = includeAuto && modelId === autoSelector ? autoLabel : modelId;
+                const label = includeAuto && modelId === autoSelector
+                    ? autoLabel
+                    : lmModelOptionLabel(modelId);
                 return `<option value="${escapeHtml(modelId)}">${escapeHtml(label)}</option>`;
             })
             .join('');
-        if (options.includes(nextValue)) {
-            selectEl.value = nextValue;
+        if (unavailableSelected) {
+            html += `<option value="${escapeHtml(selected)}">${escapeHtml(`${lmModelOptionLabel(selected)} (unavailable)`)}</option>`;
+        }
+        selectEl.innerHTML = html;
+        if (selected && (options.includes(selected) || unavailableSelected)) {
+            selectEl.value = selected;
+        } else if (includeAuto && options.includes(autoSelector)) {
+            selectEl.value = autoSelector;
+        } else if (fallback && options.includes(fallback)) {
+            selectEl.value = fallback;
         } else {
-            selectEl.value = options[0];
+            selectEl.value = options[0] || '';
         }
     }
 
@@ -486,6 +651,9 @@
                 }
                 lmModelCatalog = {
                     models: uniqueModelIds(data.models || []),
+                    profiles: Array.isArray(data.profiles)
+                        ? data.profiles.filter((profile) => profile && typeof profile === 'object')
+                        : [],
                     defaultModel: normalizeModelId(data.default_model),
                     agentDefaultModel: normalizeModelId(data.agent_default_model),
                     offlineDefaultModel: normalizeModelId(data.offline_default_model),
@@ -505,6 +673,7 @@
                         luxriotLiveModelInput ? luxriotLiveModelInput.value : '',
                         videoModelInput ? videoModelInput.value : '',
                     ),
+                    profiles: Array.isArray(lmModelCatalog.profiles) ? lmModelCatalog.profiles : [],
                     defaultModel: normalizeModelId(lmModelCatalog.defaultModel || ''),
                     agentDefaultModel: normalizeModelId(lmModelCatalog.agentDefaultModel || ''),
                     offlineDefaultModel: normalizeModelId(lmModelCatalog.offlineDefaultModel || ''),
@@ -566,7 +735,22 @@
         authGate.classList.toggle('is-hidden', !visible);
         document.body.classList.toggle('auth-required', visible);
         if (authLoginStatus) authLoginStatus.textContent = message;
-        if (visible && authUsernameInput) authUsernameInput.focus();
+        if (visible) {
+            const active = document.activeElement;
+            const alreadyTyping = (
+                active === authUsernameInput
+                || active === authPasswordInput
+            );
+            if (!alreadyTyping) {
+                const focusTarget = (
+                    authUsernameInput
+                    && String(authUsernameInput.value || '').trim()
+                )
+                    ? authPasswordInput
+                    : authUsernameInput;
+                if (focusTarget) focusTarget.focus();
+            }
+        }
     }
 
     window.fetch = (input, init = {}) => {
@@ -612,6 +796,12 @@
             authCurrentUser = data.user || null;
             setAuthGateVisible(false);
             syncUiAccess();
+            void loadLmModelCatalog().then((catalog) => {
+                if (catalog && catalog.source === 'fallback') {
+                    return loadLmModelCatalog(true);
+                }
+                return catalog;
+            }).catch(() => {});
             if (authTokenBtn && authCurrentUser) {
                 authTokenBtn.title = `${authCurrentUser.displayName || authCurrentUser.username} · Sign out`;
                 authTokenBtn.style.opacity = '1';
@@ -624,6 +814,20 @@
     }
 
     if (AUTH_ENABLED && authLoginForm) {
+        if (authPasswordToggle && authPasswordInput) {
+            authPasswordToggle.addEventListener('click', () => {
+                const show = authPasswordInput.type === 'password';
+                authPasswordInput.type = show ? 'text' : 'password';
+                authPasswordToggle.textContent = show ? 'HIDE' : 'SHOW';
+                authPasswordToggle.setAttribute('aria-pressed', show ? 'true' : 'false');
+                authPasswordToggle.setAttribute(
+                    'aria-label',
+                    show ? 'Hide password' : 'Show password',
+                );
+                authPasswordToggle.title = show ? 'Hide password' : 'Show password';
+                authPasswordInput.focus();
+            });
+        }
         authLoginForm.addEventListener('submit', async (event) => {
             event.preventDefault();
             if (authLoginBtn) authLoginBtn.disabled = true;
@@ -922,13 +1126,19 @@
             return { main: mainText, json: jsonBlock, marker: 'fenced_json' };
         }
 
-        for (const marker of ['ALERTS_JSON:', 'MEMORY_UPDATE_JSON:']) {
-            const markerIndex = full.toUpperCase().indexOf(marker);
-            if (markerIndex >= 0) {
+        const markerPatterns = [
+            { marker: 'BATCH_STATE_JSON:', pattern: /\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:/i },
+            { marker: 'ALERTS_JSON:', pattern: /\bALERTS[\s_-]*JSON\s*:/i },
+            { marker: 'MEMORY_UPDATE_JSON:', pattern: /\bMEMORY[\s_-]*UPDATE[\s_-]*JSON\s*:/i },
+        ];
+        for (const candidate of markerPatterns) {
+            const match = candidate.pattern.exec(full);
+            if (match) {
+                const markerIndex = Number(match.index);
                 const mainText = full.slice(0, markerIndex).trim();
-                const jsonBlock = full.slice(markerIndex + marker.length).trim();
+                const jsonBlock = full.slice(markerIndex + match[0].length).trim();
                 if (jsonBlock) {
-                    return { main: mainText, json: jsonBlock, marker };
+                    return { main: mainText, json: jsonBlock, marker: candidate.marker };
                 }
             }
         }
@@ -937,8 +1147,14 @@
         const startIndex = trailingStart >= 0 ? trailingStart + 1 : (full.startsWith('{') ? 0 : -1);
         if (startIndex >= 0) {
             const jsonCandidate = full.slice(startIndex).trim();
-            const looksLikeAlerts = (jsonCandidate.includes('"alerts"') || jsonCandidate.includes("'alerts'"));
-            if (looksLikeAlerts && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+            const looksLikeMachineState = (
+                jsonCandidate.includes('"alerts"')
+                || jsonCandidate.includes("'alerts'")
+                || jsonCandidate.includes('"observed_states"')
+                || jsonCandidate.includes('"memory_pass"')
+                || jsonCandidate.includes('"routine_baseline"')
+            );
+            if (looksLikeMachineState && jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
                 const mainText = full.slice(0, startIndex).trim();
                 return { main: mainText, json: jsonCandidate, marker: 'trailing_json' };
             }
@@ -1049,19 +1265,41 @@
         const sizeLabel = `${lineCount} line${lineCount === 1 ? '' : 's'}`;
         const parsed = parseSummaryMachineJson(text);
         const markerText = String(marker || '').toUpperCase();
-        const haystack = `${markerText}\n${text}`.toLowerCase();
-
-        if (
+        const isBatchState = Boolean(
+            markerText.includes('BATCH_STATE_JSON')
+            || (
+                parsed
+                && typeof parsed === 'object'
+                && (
+                    Object.prototype.hasOwnProperty.call(parsed, 'cover')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'events')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'observed_states')
+                )
+            )
+        );
+        const isMemoryUpdate = Boolean(
             markerText.includes('MEMORY_UPDATE_JSON')
-            || /\b(homeostasis|memory_update|memory update|routine_baseline|baseline|prior)\b/i.test(haystack)
-        ) {
-            return { label: 'Memory/homeostasis', meta: sizeLabel, kind: 'memory' };
-        }
+            || (
+                parsed
+                && typeof parsed === 'object'
+                && !isBatchState
+                && (
+                    Object.prototype.hasOwnProperty.call(parsed, 'routine_baseline')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'active_watchlist')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'preserved_deviations')
+                    || Object.prototype.hasOwnProperty.call(parsed, 'alert_tuning_notes')
+                )
+            )
+        );
 
         const alerts = parsed && Array.isArray(parsed.alerts) ? parsed.alerts : null;
         if (alerts) {
             if (!alerts.length) {
-                return { label: 'System message', meta: `no alerts · ${sizeLabel}`, kind: 'system' };
+                return {
+                    label: isBatchState ? 'Batch state' : 'System message',
+                    meta: `no alerts · ${sizeLabel}`,
+                    kind: isBatchState ? 'machine' : 'system',
+                };
             }
             const first = alerts[0] || {};
             const title = shortMachineJsonTitle(
@@ -1077,6 +1315,12 @@
             return { label: `${title}${countLabel}`, meta, kind: 'alert' };
         }
 
+        if (isMemoryUpdate) {
+            return { label: 'Memory/homeostasis', meta: sizeLabel, kind: 'memory' };
+        }
+        if (isBatchState) {
+            return { label: 'Batch state', meta: sizeLabel, kind: 'machine' };
+        }
         if (lineCount <= 3) {
             return { label: 'System message', meta: sizeLabel, kind: 'system' };
         }
@@ -1106,7 +1350,7 @@
                 return userHasPermission('detections:view');
             case 'video':
                 return userHasPermission('streams:view');
-            case 'monitor':
+            case 'probes':
                 return canUseProbeDiagnostics();
             case 'agent':
                 return userHasPermission('agent:use');
@@ -1116,7 +1360,7 @@
     }
 
     function firstAllowedMode() {
-        return ['archive', 'video', 'monitor', 'agent'].find((mode) => canUseMode(mode)) || 'archive';
+        return ['archive', 'video', 'probes', 'agent'].find((mode) => canUseMode(mode)) || 'archive';
     }
 
     function setMode(mode) {
@@ -1126,13 +1370,13 @@
         currentMode = mode;
         archiveModeBtn.classList.toggle('active', mode === 'archive');
         videoModeBtn.classList.toggle('active', mode === 'video');
-        monitorModeBtn.classList.toggle('active', mode === 'monitor');
+        probesModeBtn.classList.toggle('active', mode === 'probes');
         if (agentModeBtn) agentModeBtn.classList.toggle('active', mode === 'agent');
         if (headerStatusText) {
             const statusByMode = {
                 archive: 'Archive Research Ready',
                 video: 'Live Video Ops',
-                monitor: 'CLIP Probe Diagnostics',
+                probes: 'CLIP Probe Board',
                 agent: 'Agent Session Active',
             };
             headerStatusText.textContent = statusByMode[mode] || 'Command Center Online';
@@ -1141,8 +1385,15 @@
             archiveBox.style.display = mode === 'archive' ? 'grid' : 'none';
         }
         videoBox.style.display = mode === 'video' ? 'grid' : 'none';
-        monitorBox.style.display = mode === 'monitor' ? 'grid' : 'none';
+        probesBox.style.display = mode === 'probes' ? 'grid' : 'none';
         if (agentBox) agentBox.style.display = mode === 'agent' ? 'grid' : 'none';
+        if (mode !== 'archive') {
+            invalidateArchiveResultContext();
+            cancelArchiveFilterRequest();
+        }
+        if (window._agentSetActive) {
+            window._agentSetActive(mode === 'agent');
+        }
         if (mode === 'video') {
             stopProbePreview();
             stopProbeRunLoop();
@@ -1163,12 +1414,12 @@
                 .catch((err) => {
                     setLuxriotStatus(`Luxriot init failed: ${err.message || err}`, true);
                 });
-        } else if (mode === 'monitor') {
+        } else if (mode === 'probes') {
             stopLuxriotPreview(true);
             stopLuxriotSummaryPoll();
             void ensureLuxriotInit()
                 .then(() => {
-                    if (currentMode !== 'monitor') return;
+                    if (currentMode !== 'probes') return;
                     syncProbeChannelSelect();
                     syncProbePreview(getSelectedProbeChannelId());
                     refreshProbeStatus();
@@ -1184,7 +1435,9 @@
             stopProbePreview();
             stopProbeRunLoop();
             stopProbeStatusPoll();
-            refreshArchiveFilters().catch(() => {});
+            if (mode === 'archive') {
+                refreshArchiveFilters().catch(() => {});
+            }
             if (probeEditorModal) {
                 setProbeEditorModalVisibility(false);
             }
@@ -1281,6 +1534,27 @@
             || 5;
     }
 
+    function markLuxriotLiveIntervalDirty() {
+        const channelId = getSelectedLuxriotChannel();
+        luxriotLiveIntervalDirtyChannelId = Number.isFinite(channelId) ? channelId : null;
+    }
+
+    function clearLuxriotLiveIntervalDirty(channelIdOverride = null) {
+        const channelId = Number.isFinite(channelIdOverride)
+            ? channelIdOverride
+            : getSelectedLuxriotChannel();
+        if (!Number.isFinite(channelId) || luxriotLiveIntervalDirtyChannelId === channelId) {
+            luxriotLiveIntervalDirtyChannelId = null;
+        }
+    }
+
+    function isLuxriotLiveIntervalDirty(channelIdOverride = null) {
+        const channelId = Number.isFinite(channelIdOverride)
+            ? channelIdOverride
+            : getSelectedLuxriotChannel();
+        return Number.isFinite(channelId) && luxriotLiveIntervalDirtyChannelId === channelId;
+    }
+
     function formatLuxriotDuration(intervalSec) {
         const seconds = Number(intervalSec);
         if (!Number.isFinite(seconds) || seconds <= 0) return 'n/a';
@@ -1301,7 +1575,10 @@
             ? channelIdOverride
             : getSelectedLuxriotChannel();
         if (!Number.isFinite(channelId)) return;
-        if (!options.force && document.activeElement === luxriotLiveIntervalInput) return;
+        if (!options.force && (
+            document.activeElement === luxriotLiveIntervalInput
+            || isLuxriotLiveIntervalDirty(channelId)
+        )) return;
         const videoStream = selectedLuxriotStream(channelId, 'video');
         const interval = normalizeLuxriotLiveInterval(videoStream?.interval_sec)
             || getStoredLuxriotLiveInterval(channelId)
@@ -1319,7 +1596,35 @@
         const fpsLabel = fps >= 1 ? fps.toFixed(1).replace(/[.]0$/, '') : fps.toFixed(2);
         const summaryLabel = batchSize > 0 ? ` · batch ~${formatLuxriotDuration(intervalSec * batchSize)}` : '';
         luxriotBatchInfo.textContent = `~${fpsLabel} fps${summaryLabel} · ${luxriotDefaults.snapshotMaxEdge}px`;
+        updateLuxriotRuntimeConfigHint();
         updateLuxriotStreamContext();
+    }
+
+    function updateLuxriotRuntimeConfigHint() {
+        if (!luxriotRuntimeConfigState || !luxriotRuntimeConfigRunning || !luxriotRuntimeConfigPending) return;
+        const channelId = getSelectedLuxriotChannel();
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        if (!videoStream?.running) {
+            luxriotRuntimeConfigState.hidden = true;
+            luxriotRuntimeConfigRunning.textContent = '';
+            luxriotRuntimeConfigPending.hidden = true;
+            return;
+        }
+        const runningBatch = Number(videoStream.batch_size);
+        const runningInterval = normalizeLuxriotLiveInterval(videoStream.interval_sec);
+        const selectedBatch = Number(luxriotBatchSizeSelect?.value);
+        const selectedInterval = getLuxriotLiveIntervalInputValue();
+        const batchLabel = Number.isFinite(runningBatch) && runningBatch > 0 ? String(runningBatch) : 'n/a';
+        const intervalLabel = runningInterval !== null ? formatLuxriotDuration(runningInterval) : 'n/a';
+        luxriotRuntimeConfigRunning.textContent = `running: batch ${batchLabel} · ${intervalLabel}`;
+        const batchChanged = Number.isFinite(runningBatch)
+            && runningBatch > 0
+            && Number.isFinite(selectedBatch)
+            && selectedBatch !== runningBatch;
+        const intervalChanged = runningInterval !== null
+            && Math.abs(selectedInterval - runningInterval) > 0.0005;
+        luxriotRuntimeConfigPending.hidden = !(batchChanged || intervalChanged);
+        luxriotRuntimeConfigState.hidden = false;
     }
 
     function setTextContentSafe(element, text) {
@@ -1345,6 +1650,33 @@
         return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
     }
 
+    function classifyLuxriotStreamIssue(stream) {
+        const captureError = String(stream?.capture_last_error || '').trim();
+        const probeError = String(stream?.probe_last_error || '').trim();
+        const summaryError = String(stream?.summary_last_error || '').trim();
+        const legacyError = String(stream?.last_error || '').trim();
+        const effectiveSummaryError = summaryError || (
+            /summary queue overflow|oldest pending batch dropped|lm admission queue timeout/i.test(legacyError)
+                ? legacyError
+                : ''
+        );
+        const backpressure = /summary queue overflow|oldest pending batch dropped|lm admission queue timeout/i.test(
+            effectiveSummaryError
+        );
+        const hardSummaryError = backpressure ? '' : effectiveSummaryError;
+        const classifiedSpecificError = captureError || probeError || hardSummaryError;
+        const hardError = classifiedSpecificError || (
+            legacyError && !backpressure && !summaryError && !captureError && !probeError
+                ? legacyError
+                : ''
+        );
+        return {
+            backpressure,
+            backpressureError: backpressure ? effectiveSummaryError : '',
+            hardError,
+        };
+    }
+
     function getLuxriotStreamHealth(stream) {
         if (!stream || typeof stream !== 'object') return null;
         const pending = luxriotHealthCount(stream.pending_frames);
@@ -1353,7 +1685,9 @@
         const droppedBatches = luxriotHealthCount(stream.queue_dropped_batches);
         const logsTotalRaw = stream.logs_total ?? (Array.isArray(stream.logs) ? stream.logs.length : null);
         const logsTotal = logsTotalRaw === null || logsTotalRaw === undefined ? null : luxriotHealthCount(logsTotalRaw);
-        const lastError = String(stream.last_error || '').trim();
+        const issue = classifyLuxriotStreamIssue(stream);
+        const summaryQueueDepth = luxriotHealthCount(stream.summary_queue_depth);
+        const summaryInflight = Boolean(stream.summary_inflight);
         const lastSnapshotLatency = Number(stream.last_snapshot_latency_sec);
         const avgSnapshotLatency = Number(stream.avg_snapshot_latency_sec);
         const snapshotSlowThreshold = Number(stream.snapshot_slow_threshold_sec);
@@ -1361,6 +1695,14 @@
         const activeCaptureSource = String(stream.active_capture_source || '').trim();
         const liveSegmentLatency = Number(stream.last_live_segment_latency_sec);
         const liveSegmentFrames = luxriotHealthCount(stream.last_live_segment_frames);
+        const liveSegmentTargetSeconds = Number(stream.last_live_segment_target_seconds);
+        const liveSegmentSummaryTargetSeconds = Number(stream.last_live_segment_summary_target_seconds);
+        const liveSegmentRepresentedSeconds = Number(stream.last_live_segment_represented_seconds);
+        const liveSegmentInflight = Boolean(stream.live_segment_inflight);
+        const liveSegmentInflightTargetSeconds = Number(stream.live_segment_inflight_target_seconds);
+        const liveSegmentInflightRawBudget = luxriotHealthCount(stream.live_segment_inflight_raw_frame_budget);
+        const liveSegmentInflightFrames = luxriotHealthCount(stream.live_segment_inflight_frames);
+        const liveSegmentInflightRepresentedSeconds = Number(stream.live_segment_inflight_represented_seconds);
         const frozenSignal = Boolean(stream.frozen_signal);
         const frozenAge = Number(stream.frozen_signal_age_sec);
         const frozenCount = luxriotHealthCount(stream.frozen_frame_count);
@@ -1382,6 +1724,38 @@
         if (Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0) {
             titleParts.push(`segment ${liveSegmentLatency.toFixed(1)}s/${formatCompactCount(liveSegmentFrames)} frames`);
         }
+        const completedAttentionWindow = (
+            activeCaptureSource === 'live_segment'
+            && Number.isFinite(liveSegmentTargetSeconds)
+            && liveSegmentTargetSeconds > 0
+            && Number.isFinite(liveSegmentRepresentedSeconds)
+            && liveSegmentRepresentedSeconds >= 0
+        );
+        const attentionRealtimeRatio = completedAttentionWindow
+            && Number.isFinite(liveSegmentLatency)
+            && liveSegmentLatency > 0
+            ? liveSegmentRepresentedSeconds / liveSegmentLatency
+            : null;
+        const attentionUnderfilled = completedAttentionWindow
+            && liveSegmentRepresentedSeconds + 0.25 < liveSegmentTargetSeconds * 0.8;
+        const attentionBehindRealtime = Number.isFinite(attentionRealtimeRatio)
+            && attentionRealtimeRatio < 0.8;
+        if (completedAttentionWindow) {
+            titleParts.push(
+                `attention ${liveSegmentRepresentedSeconds.toFixed(1)}/${liveSegmentTargetSeconds.toFixed(1)}s`
+                + (Number.isFinite(attentionRealtimeRatio) ? ` at ${attentionRealtimeRatio.toFixed(2)}x realtime` : '')
+            );
+        }
+        if (Number.isFinite(liveSegmentSummaryTargetSeconds) && liveSegmentSummaryTargetSeconds > 0) {
+            titleParts.push(`summary cadence ${liveSegmentSummaryTargetSeconds.toFixed(1)}s`);
+        }
+        if (liveSegmentInflight) {
+            titleParts.push(
+                `capturing ${Number.isFinite(liveSegmentInflightRepresentedSeconds) ? liveSegmentInflightRepresentedSeconds.toFixed(1) : '?'}s`
+                + (Number.isFinite(liveSegmentInflightTargetSeconds) ? `/${liveSegmentInflightTargetSeconds.toFixed(1)}s` : '')
+                + (liveSegmentInflightRawBudget > 0 ? ` · ${formatCompactCount(liveSegmentInflightFrames)}/${formatCompactCount(liveSegmentInflightRawBudget)} raw frames` : '')
+            );
+        }
         if (frozenSignal) {
             titleParts.unshift(`frozen ${Number.isFinite(frozenAge) && frozenAge > 0 ? formatLuxriotDuration(frozenAge) : ''}${frozenCount > 0 ? `/${formatCompactCount(frozenCount)} frames` : ''}`.trim());
             return { label: 'frozen', tone: 'error', title: titleParts.join(' | ') };
@@ -1389,27 +1763,38 @@
         if (droppedFrames > 0) titleParts.push(`dropped frames ${formatCompactCount(droppedFrames)}`);
         if (droppedBatches > 0) titleParts.push(`queue drops ${formatCompactCount(droppedBatches)}`);
         if (logsTotal !== null) titleParts.push(`logs ${formatCompactCount(logsTotal)}`);
-        if (lastError) {
-            titleParts.unshift(`error ${truncateLuxriotHealthText(lastError)}`);
+        if (issue.hardError) {
+            titleParts.unshift(`error ${truncateLuxriotHealthText(issue.hardError)}`);
             return { label: 'error', tone: 'error', title: titleParts.join(' | ') };
         }
+        if (attentionUnderfilled || attentionBehindRealtime) {
+            return { label: 'apex-lag', tone: 'warning', title: titleParts.join(' | ') };
+        }
+        if (issue.backpressure || droppedBatches > 0) {
+            if (issue.backpressureError) {
+                titleParts.unshift(`aggregation backpressure ${truncateLuxriotHealthText(issue.backpressureError)}`);
+            }
+            return { label: 'backpressure', tone: 'warning', title: titleParts.join(' | ') };
+        }
         if (
-            slowSnapshots > 0
-            || (
-                Number.isFinite(lastSnapshotLatency)
-                && Number.isFinite(snapshotSlowThreshold)
-                && snapshotSlowThreshold > 0
-                && lastSnapshotLatency >= snapshotSlowThreshold
-            )
+            activeCaptureSource !== 'live_segment'
+            && Number.isFinite(lastSnapshotLatency)
+            && Number.isFinite(snapshotSlowThreshold)
+            && snapshotSlowThreshold > 0
+            && lastSnapshotLatency >= snapshotSlowThreshold
         ) {
             return { label: 'slow', tone: 'warning', title: titleParts.join(' | ') };
         }
-        if (droppedFrames > 0 || droppedBatches > 0) {
+        if (droppedFrames > 0) {
             return { label: 'drops', tone: 'warning', title: titleParts.join(' | ') };
         }
         if (lagThreshold > 0 && pending >= lagThreshold) {
             titleParts.push(`lag threshold ${formatCompactCount(lagThreshold)}`);
             return { label: 'lag', tone: 'warning', title: titleParts.join(' | ') };
+        }
+        if (summaryInflight || summaryQueueDepth > 0) {
+            titleParts.push(`aggregation ${summaryInflight ? 'inference active' : 'queued'}${summaryQueueDepth > 0 ? ` · ${formatCompactCount(summaryQueueDepth)} batches waiting` : ''}`);
+            return { label: 'aggregating', tone: 'ok', title: titleParts.join(' | ') };
         }
         return { label: 'ok', tone: 'ok', title: titleParts.join(' | ') };
     }
@@ -1526,6 +1911,7 @@
     }
 
     function updateLuxriotStreamContext() {
+        updateLuxriotRuntimeConfigHint();
         if (!luxriotStreamName && !luxriotStreamState) return;
         const channelId = getSelectedLuxriotChannel();
         const selectedRaw = luxriotChannelSelect ? String(luxriotChannelSelect.value || '').trim() : String(channelId || '');
@@ -1538,10 +1924,13 @@
         const probeState = hasChannel ? String(probeChannelRuntime[String(channelId)] || '').trim() : '';
         const probeRunning = Boolean(analyticsStream?.running) || probeState === 'running';
         const probePaused = probeState === 'paused' || Boolean(analyticsStream?.paused);
-        const stateClass = luxriotPreviewMeta.failed
+        const mediaState = String(luxriotPreviewMeta.mediaState || 'idle');
+        const stateClass = mediaState === 'error' || luxriotPreviewMeta.failed
             ? 'error'
-            : luxriotPreviewMeta.stale
+            : mediaState === 'degraded' || luxriotPreviewMeta.stale
                 ? 'slow'
+            : mediaState === 'playing'
+                ? 'running'
             : running
                 ? 'running'
                 : showProbeDiagnostics && probeRunning
@@ -1549,7 +1938,19 @@
                     : showProbeDiagnostics && probePaused
                         ? 'paused'
                         : 'idle';
-        const stateText = luxriotPreviewMeta.failed
+        const stateText = mediaState === 'loading'
+            ? 'video loading'
+            : mediaState === 'playing'
+                ? (
+                    luxriotPreviewMeta.mediaKind === 'attention'
+                        ? 'attention playing'
+                        : luxriotPreviewMeta.mediaKind === 'mjpeg'
+                            ? 'mjpeg playing'
+                            : 'video playing'
+                )
+            : mediaState === 'degraded'
+                ? 'static fallback'
+            : luxriotPreviewMeta.failed
             ? luxriotPreviewMeta.errorCode === 'signal_lost'
                 ? 'signal lost'
                 : luxriotPreviewMeta.errorCode === 'signal_frozen'
@@ -1568,6 +1969,8 @@
         const previewHeight = Number(luxriotPreviewMeta.height);
         const resolution = previewWidth > 0 && previewHeight > 0
             ? `${previewWidth}x${previewHeight}`
+            : mediaState === 'loading'
+                ? 'loading video'
             : luxriotPreviewMeta.failed
                 ? luxriotPreviewMeta.errorCode === 'signal_lost'
                     ? 'signal lost'
@@ -1594,9 +1997,38 @@
         const activeCaptureSource = String(videoStream?.active_capture_source || '').trim();
         const liveSegmentLatency = Number(videoStream?.last_live_segment_latency_sec);
         const liveSegmentFrames = Number(videoStream?.last_live_segment_frames) || 0;
+        const liveSegmentTargetSeconds = Number(videoStream?.last_live_segment_target_seconds);
+        const liveSegmentSummaryTargetSeconds = Number(videoStream?.last_live_segment_summary_target_seconds);
+        const liveSegmentRepresentedSeconds = Number(videoStream?.last_live_segment_represented_seconds);
+        const liveSegmentInflight = Boolean(videoStream?.live_segment_inflight);
+        const liveSegmentInflightTargetSeconds = Number(videoStream?.live_segment_inflight_target_seconds);
+        const liveSegmentInflightRawBudget = Number(videoStream?.live_segment_inflight_raw_frame_budget) || 0;
+        const liveSegmentInflightFrames = Number(videoStream?.live_segment_inflight_frames) || 0;
+        const liveSegmentInflightRepresentedSeconds = Number(videoStream?.live_segment_inflight_represented_seconds);
         const summaryQueueDepth = Number(videoStream?.summary_queue_depth) || 0;
         const summaryQueueFrames = Number(videoStream?.summary_queue_frame_count) || 0;
         const summaryInflight = Boolean(videoStream?.summary_inflight);
+        const selectorEnabled = typeof videoStream?.capture_selector_enabled === 'boolean'
+            ? Boolean(videoStream.capture_selector_enabled)
+            : (luxriotSelectorEnabledInput ? Boolean(luxriotSelectorEnabledInput.checked) : true);
+        const selectorBias = String(
+            videoStream?.capture_selector_bias
+            || (luxriotSelectorBiasInput ? luxriotSelectorBiasInput.value : 'auto')
+            || 'auto'
+        ).toLowerCase();
+        const selectorLast = videoStream?.capture_apex_last_selection
+            && typeof videoStream.capture_apex_last_selection === 'object'
+            ? videoStream.capture_apex_last_selection
+            : {};
+        const selectorSource = String(selectorLast.selection_source || '').trim();
+        const selectorBaseline = videoStream?.capture_activity_baseline
+            && typeof videoStream.capture_activity_baseline === 'object'
+            ? videoStream.capture_activity_baseline
+            : {};
+        const selectorBaselineLevel = Number(selectorBaseline.level);
+        const selectorLabel = selectorEnabled
+            ? `${selectorBias}${selectorSource ? ` · ${selectorSource.replaceAll('_', ' ')}` : ''}`
+            : 'off · temporal midpoint';
         const queueLabel = running
             ? `${formatCompactCount(queued)}/${formatCompactCount(batchSize)} frames · ${formatCompactCount(flushes)} flushes${dropped > 0 ? ` · ${formatCompactCount(dropped)} dropped` : ''}`
             : 'idle';
@@ -1612,6 +2044,21 @@
                         ? 'configured, disabled'
                         : 'not configured';
         const detailParts = [];
+        if (mediaState === 'loading') {
+            detailParts.push(luxriotPreviewMeta.errorText || 'Negotiating browser-playable media through the same-origin broker.');
+        }
+        if (mediaState === 'playing') {
+            detailParts.push(
+                luxriotPreviewMeta.mediaKind === 'attention'
+                    ? 'Model view: exact per-second EVA apex frames; no second recorder stream competes with analytics.'
+                    : luxriotPreviewMeta.mediaKind === 'mjpeg'
+                        ? 'Full operator media is a continuous MJPEG stream from Luxriot and may compete with analytics.'
+                        : 'Full operator video is playing on a second recorder stream and may compete with analytics.'
+            );
+        }
+        if (mediaState === 'degraded') {
+            detailParts.push(luxriotPreviewMeta.errorText || 'Only one static fallback frame is shown; this is not video or a snapshot slideshow.');
+        }
         if (luxriotPreviewMeta.failed && luxriotPreviewMeta.errorText) {
             detailParts.push(luxriotPreviewMeta.errorText);
         }
@@ -1626,7 +2073,12 @@
             const age = Number(videoStream.frozen_signal_age_sec);
             detailParts.push(`Frozen source: repeated identical EVA frames${Number.isFinite(age) && age > 0 ? ` for ${formatLuxriotDuration(age)}` : ''}.`);
         }
-        if (videoStream?.last_error) detailParts.push(`Summary error: ${videoStream.last_error}`);
+        const videoIssue = classifyLuxriotStreamIssue(videoStream);
+        if (videoIssue.backpressure) {
+            detailParts.push('Aggregation backpressure: capture continues and the newest bounded batches are retained while older pending descriptions may be skipped.');
+        } else if (videoIssue.hardError) {
+            detailParts.push(`Summary error: ${videoIssue.hardError}`);
+        }
         if (showProbeDiagnostics && analyticsStream?.last_error) detailParts.push(`Diagnostic probe error: ${analyticsStream.last_error}`);
         if (Number.isFinite(lastSnapshotLatency) && lastSnapshotLatency > 0) {
             detailParts.push(
@@ -1634,7 +2086,36 @@
             );
         }
         if (activeCaptureSource === 'live_segment' && Number.isFinite(liveSegmentLatency) && liveSegmentLatency > 0) {
-            detailParts.push(`Live segment source ${liveSegmentLatency.toFixed(1)}s · ${formatCompactCount(liveSegmentFrames)} frames`);
+            const representedLabel = (
+                Number.isFinite(liveSegmentRepresentedSeconds)
+                && Number.isFinite(liveSegmentTargetSeconds)
+                && liveSegmentTargetSeconds > 0
+            )
+                ? ` · attention ${liveSegmentRepresentedSeconds.toFixed(1)}/${liveSegmentTargetSeconds.toFixed(1)}s`
+                : '';
+            const realtimeRatio = Number.isFinite(liveSegmentRepresentedSeconds) && liveSegmentLatency > 0
+                ? liveSegmentRepresentedSeconds / liveSegmentLatency
+                : null;
+            detailParts.push(
+                `Analytics segment ${liveSegmentLatency.toFixed(1)}s · ${formatCompactCount(liveSegmentFrames)} dense frames${representedLabel}`
+                + (Number.isFinite(realtimeRatio) ? ` · ${realtimeRatio.toFixed(2)}x realtime` : '')
+                + (Number.isFinite(liveSegmentSummaryTargetSeconds) && liveSegmentSummaryTargetSeconds > 0 ? ` · descriptions every ${liveSegmentSummaryTargetSeconds.toFixed(1)}s` : '')
+            );
+        }
+        if (activeCaptureSource === 'live_segment' && liveSegmentInflight) {
+            detailParts.push(
+                `Dense capture progress ${Number.isFinite(liveSegmentInflightRepresentedSeconds) ? liveSegmentInflightRepresentedSeconds.toFixed(1) : '?'}s`
+                + (Number.isFinite(liveSegmentInflightTargetSeconds) ? ` / ${liveSegmentInflightTargetSeconds.toFixed(1)}s` : '')
+                + (liveSegmentInflightRawBudget > 0 ? ` · ${formatCompactCount(liveSegmentInflightFrames)} / ${formatCompactCount(liveSegmentInflightRawBudget)} raw frames` : '')
+                + '.'
+            );
+        }
+        if (running) {
+            detailParts.push(
+                selectorEnabled
+                    ? `Frame selector ${selectorBias}${selectorSource ? ` · last ${selectorSource.replaceAll('_', ' ')}` : ''}${Number.isFinite(selectorBaselineLevel) ? ` · motion baseline ${selectorBaselineLevel.toFixed(4)}` : ' · baseline warming up'}.`
+                    : 'Adaptive CV frame selection is off for this channel; EVA uses the deterministic temporal midpoint for VLM, archive, and probe dispatch.'
+            );
         }
         if (summaryInflight || summaryQueueDepth > 0) {
             detailParts.push(`VLM processing${summaryInflight ? ' active' : ''}${summaryQueueDepth > 0 ? ` · ${formatCompactCount(summaryQueueDepth)} queued batch${summaryQueueDepth === 1 ? '' : 'es'} / ${formatCompactCount(summaryQueueFrames)} frames` : ''}.`);
@@ -1653,6 +2134,7 @@
         setTextContentSafe(luxriotStreamCadence, formatLuxriotCadence(intervalSec));
         setTextContentSafe(luxriotStreamBatch, batchSize > 0 ? formatCompactCount(batchSize) : '-');
         setTextContentSafe(luxriotStreamModel, selectedLuxriotModelLabel(videoStream));
+        setTextContentSafe(luxriotStreamSelector, selectorLabel);
         setTextContentSafe(luxriotStreamQueue, queueLabel);
         setElementHidden(luxriotStreamProbesRow, !showProbeDiagnostics);
         if (showProbeDiagnostics) {
@@ -1685,18 +2167,308 @@
         luxriotPreviewAbortController = null;
     }
 
+    function luxriotMediaBrokerUrl(mediaKind, channelId, options = {}) {
+        if (mediaKind === 'attention') {
+            // Dense capture fills bounded (default 60 s) incremental windows;
+            // sparse sources legitimately go tens of seconds between apex
+            // frames. A 15 s freshness bound turned that cadence into a
+            // permanent 409/static fallback on underfilled channels.
+            return `/luxriot/attention_stream/${encodeURIComponent(String(channelId))}?max_age_sec=60`;
+        }
+        const params = new URLSearchParams();
+        params.set('stream', String(options.stream || 'mainStream'));
+        if (mediaKind === 'archive' && Number.isFinite(Number(options.timeMs))) {
+            params.set('time_ms', String(Math.trunc(Number(options.timeMs))));
+            if (Number.isFinite(Number(options.durationSec))) {
+                params.set('duration_sec', String(Math.max(1, Math.trunc(Number(options.durationSec)))));
+            }
+        }
+        return `/luxriot/media/${encodeURIComponent(mediaKind)}/${encodeURIComponent(String(channelId))}?${params.toString()}`;
+    }
+
+    function parseLuxriotMediaResponse(response) {
+        const mediaKind = String(response.headers.get('X-EVA-Media-Kind') || '').trim().toLowerCase();
+        const errorCode = String(response.headers.get('X-EVA-Media-Error') || '').trim();
+        if (!response.ok || !['video', 'mjpeg'].includes(mediaKind)) {
+            const error = new Error(errorCode === 'snapshot_only'
+                ? 'Luxriot returned a static image instead of video.'
+                : `Browser-playable media is unavailable${errorCode ? ` (${errorCode})` : ''}.`);
+            error.code = errorCode || 'media_unavailable';
+            error.fallbackUrl = String(response.headers.get('X-EVA-Media-Fallback') || '').trim();
+            throw error;
+        }
+        const numericHeader = (name) => {
+            const rawValue = String(response.headers.get(name) || '').trim();
+            if (!/^\d+$/.test(rawValue)) return null;
+            const parsed = Number(rawValue);
+            return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+        };
+        return {
+            mediaKind,
+            contentType: String(response.headers.get('Content-Type') || ''),
+            bounded: response.headers.get('X-EVA-Media-Bounded') === '1',
+            attentionPreview: response.headers.get('X-EVA-Attention-Preview') === '1',
+            renewAfterMs: numericHeader('X-EVA-Media-Renew-After-Ms'),
+            streamStartTimeMs: numericHeader('X-Stream-Start-Time'),
+            streamEndTimeMs: numericHeader('X-Stream-End-Time'),
+            lastSampleTimestampMs: numericHeader('X-Stream-Last-Sample-Timestamp'),
+            requestedTimeMs: numericHeader('X-EVA-Archive-Requested-Time-Ms'),
+            resolvedTimeMs: numericHeader('X-EVA-Archive-Resolved-Time-Ms'),
+            durationSec: numericHeader('X-EVA-Archive-Duration-Seconds'),
+            frameAlignment: String(response.headers.get('X-EVA-Archive-Frame-Alignment') || '').trim(),
+            html5Compatibility: String(response.headers.get('X-EVA-HTML5-Compatible') || '').trim(),
+        };
+    }
+
+    function assertSameOriginMediaUrl(mediaUrl) {
+        const normalizedUrl = String(mediaUrl || '');
+        if (
+            !normalizedUrl.startsWith('/luxriot/media/')
+            && !normalizedUrl.startsWith('/luxriot/attention_stream/')
+        ) {
+            throw new Error('Media broker URL must be same-origin.');
+        }
+        return normalizedUrl;
+    }
+
+    async function negotiateLuxriotMedia(mediaUrl, controller, timeoutMs = 6000) {
+        const normalizedUrl = assertSameOriginMediaUrl(mediaUrl);
+        const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(normalizedUrl, {
+                method: 'HEAD',
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            return parseLuxriotMediaResponse(response);
+        } finally {
+            window.clearTimeout(timeoutId);
+        }
+    }
+
+    async function fetchLuxriotMediaBlob(mediaUrl, controller, timeoutMs) {
+        const normalizedUrl = assertSameOriginMediaUrl(mediaUrl);
+        const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(normalizedUrl, {
+                method: 'GET',
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            const metadata = parseLuxriotMediaResponse(response);
+            const blob = await response.blob();
+            if (!blob.size) throw new Error('The archive media response was empty.');
+            return { ...metadata, blob };
+        } finally {
+            window.clearTimeout(timeoutId);
+        }
+    }
+
+    function ensureLuxriotPreviewVideo() {
+        if (luxriotPreviewVideo && luxriotPreviewVideo.isConnected) return luxriotPreviewVideo;
+        if (!luxriotViewport) return null;
+        const video = document.createElement('video');
+        video.className = 'luxriot-operator-video';
+        video.autoplay = true;
+        video.muted = true;
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+        video.setAttribute('aria-label', 'Luxriot operator live video');
+        Object.assign(video.style, {
+            width: '100%',
+            height: '100%',
+            maxHeight: 'none',
+            objectFit: 'contain',
+            background: '#000',
+            display: 'none',
+        });
+        luxriotViewport.insertBefore(video, luxriotOverlay || null);
+        luxriotPreviewVideo = video;
+        return video;
+    }
+
+    function ensureLuxriotPreviewRetryButton() {
+        if (luxriotPreviewRetryBtn && luxriotPreviewRetryBtn.isConnected) return luxriotPreviewRetryBtn;
+        if (!luxriotViewport) return null;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'feature-btn';
+        button.textContent = 'Retry video';
+        button.hidden = true;
+        button.addEventListener('click', () => startLuxriotPreview());
+        Object.assign(button.style, {
+            position: 'absolute',
+            right: '12px',
+            bottom: '12px',
+            zIndex: '5',
+        });
+        luxriotViewport.appendChild(button);
+        luxriotPreviewRetryBtn = button;
+        return button;
+    }
+
+    function ensureLuxriotPreviewTransportButton() {
+        if (luxriotPreviewTransportBtn && luxriotPreviewTransportBtn.isConnected) return luxriotPreviewTransportBtn;
+        if (!luxriotViewport) return null;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'feature-btn';
+        button.addEventListener('click', () => {
+            luxriotPreferFullOperatorMedia = !luxriotPreferFullOperatorMedia;
+            luxriotPreviewNegotiation = null;
+            startLuxriotPreview();
+        });
+        Object.assign(button.style, {
+            position: 'absolute',
+            right: '12px',
+            top: '12px',
+            zIndex: '5',
+        });
+        luxriotViewport.appendChild(button);
+        luxriotPreviewTransportBtn = button;
+        return button;
+    }
+
+    function syncLuxriotPreviewTransportButton(channelId = getSelectedLuxriotChannel()) {
+        const button = ensureLuxriotPreviewTransportButton();
+        if (!button) return;
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        const attentionAvailable = Boolean(videoStream?.running);
+        button.hidden = !attentionAvailable;
+        button.textContent = luxriotPreferFullOperatorMedia ? 'Model view' : 'Full live';
+        button.title = luxriotPreferFullOperatorMedia
+            ? 'Return to the exact per-second EVA attention frames without opening another recorder stream.'
+            : 'Open a second smooth recorder stream. This may reduce dense analytics throughput on constrained sources.';
+    }
+
+    function maybeSwitchLuxriotPreviewToAttention() {
+        if (luxriotAttentionSwitchPending || luxriotPreferFullOperatorMedia || currentMode !== 'video') return;
+        const channelId = getSelectedLuxriotChannel();
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        if (!Number.isFinite(channelId) || !videoStream?.running) return;
+        const currentSource = String(
+            luxriotPreviewVideo?.currentSrc
+            || luxriotPreviewVideo?.getAttribute('src')
+            || luxriotPreviewImg?.getAttribute('src')
+            || ''
+        );
+        if (currentSource.includes('/luxriot/attention_stream/')) return;
+        luxriotAttentionSwitchPending = true;
+        queueMicrotask(() => {
+            luxriotAttentionSwitchPending = false;
+            if (luxriotPreferFullOperatorMedia || currentMode !== 'video') return;
+            const selectedChannelId = getSelectedLuxriotChannel();
+            if (selectedChannelId !== channelId || !selectedLuxriotStream(channelId, 'video')?.running) return;
+            luxriotPreviewNegotiation = null;
+            startLuxriotPreview();
+        });
+    }
+
+    function setLuxriotOperatorMediaState(state, options = {}) {
+        const normalized = ['idle', 'loading', 'playing', 'degraded', 'error'].includes(state) ? state : 'error';
+        const failed = normalized === 'error';
+        const degraded = normalized === 'degraded';
+        luxriotPreviewMeta = {
+            ...luxriotPreviewMeta,
+            width: Number(options.width ?? luxriotPreviewMeta.width) || 0,
+            height: Number(options.height ?? luxriotPreviewMeta.height) || 0,
+            loadedAt: Number(options.loadedAt ?? luxriotPreviewMeta.loadedAt) || 0,
+            frameAgeSec: null,
+            stale: false,
+            failed,
+            errorCode: String(options.errorCode || (failed ? 'media_error' : '')),
+            errorText: String(options.detail || ''),
+            mediaState: normalized,
+            mediaKind: Object.prototype.hasOwnProperty.call(options, 'mediaKind')
+                ? String(options.mediaKind || '')
+                : String(luxriotPreviewMeta.mediaKind || ''),
+            degraded,
+        };
+        if (luxriotViewport) {
+            luxriotViewport.dataset.mediaState = normalized;
+            luxriotViewport.classList.toggle('is-signal-lost', failed);
+            luxriotViewport.classList.toggle('is-signal-stale', degraded);
+        }
+        if (luxriotOverlay) {
+            const defaultText = {
+                idle: '',
+                loading: 'Loading live video…',
+                playing: '',
+                degraded: 'Static frame fallback — not video',
+                error: 'Video unavailable',
+            };
+            luxriotOverlay.textContent = String(options.overlay || defaultText[normalized] || '');
+        }
+        const retry = ensureLuxriotPreviewRetryButton();
+        if (retry) retry.hidden = !(degraded || failed);
+        syncLuxriotPreviewTransportButton();
+        updateLuxriotStreamContext();
+    }
+
+    function clearLuxriotPreviewVideo() {
+        if (!luxriotPreviewVideo) return;
+        luxriotPreviewVideo.onloadedmetadata = null;
+        luxriotPreviewVideo.oncanplay = null;
+        luxriotPreviewVideo.onplaying = null;
+        luxriotPreviewVideo.onwaiting = null;
+        luxriotPreviewVideo.onstalled = null;
+        luxriotPreviewVideo.onprogress = null;
+        luxriotPreviewVideo.ontimeupdate = null;
+        luxriotPreviewVideo.onended = null;
+        luxriotPreviewVideo.onerror = null;
+        try {
+            luxriotPreviewVideo.pause();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        luxriotPreviewVideo.removeAttribute('src');
+        try {
+            luxriotPreviewVideo.load();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        luxriotPreviewVideo.style.display = 'none';
+    }
+
+    function replaceLuxriotPreviewImageElement() {
+        if (!luxriotPreviewImg || !luxriotPreviewImg.parentNode) return;
+        const previous = luxriotPreviewImg;
+        previous.onload = null;
+        previous.onerror = null;
+        const replacement = previous.cloneNode(false);
+        replacement.removeAttribute('src');
+        replacement.style.display = 'none';
+        previous.replaceWith(replacement);
+        luxriotPreviewImg = replacement;
+    }
+
     function stopLuxriotPreview(clearImage = false) {
         if (luxriotPreviewTimer) {
-            clearInterval(luxriotPreviewTimer);
+            clearTimeout(luxriotPreviewTimer);
             luxriotPreviewTimer = null;
+        }
+        if (luxriotPreviewRenewTimer) {
+            clearTimeout(luxriotPreviewRenewTimer);
+            luxriotPreviewRenewTimer = null;
+        }
+        if (luxriotPreviewStallTimer) {
+            clearTimeout(luxriotPreviewStallTimer);
+            luxriotPreviewStallTimer = null;
         }
         luxriotPreviewRequestSeq += 1;
         abortLuxriotPreviewRequest();
         luxriotPreviewLoading = false;
+        clearLuxriotPreviewVideo();
+        if (luxriotPreviewImg) {
+            luxriotPreviewImg.onload = null;
+            luxriotPreviewImg.onerror = null;
+        }
+        if (luxriotPreviewRetryBtn) luxriotPreviewRetryBtn.hidden = true;
         if (clearImage) {
-            releaseLuxriotPreviewObjectUrl();
             if (luxriotPreviewImg) {
                 luxriotPreviewImg.removeAttribute('src');
+                luxriotPreviewImg.style.display = 'none';
             }
             if (luxriotOverlay) {
                 luxriotOverlay.textContent = '';
@@ -1704,50 +2476,25 @@
             if (luxriotViewport) {
                 luxriotViewport.classList.remove('is-signal-lost', 'is-signal-stale');
             }
-            luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, frameAgeSec: null, stale: false, staleAfterSec: 0, lostAfterSec: 0, failed: false, errorCode: '', errorText: '' };
+            luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, frameAgeSec: null, stale: false, staleAfterSec: 0, lostAfterSec: 0, failed: false, errorCode: '', errorText: '', mediaState: 'idle', mediaKind: '', degraded: false };
+            if (luxriotViewport) delete luxriotViewport.dataset.mediaState;
             updateLuxriotStreamContext();
         }
     }
 
-    function releaseLuxriotPreviewObjectUrl() {
-        if (!luxriotPreviewObjectUrl) return;
-        try {
-            URL.revokeObjectURL(luxriotPreviewObjectUrl);
-        } catch (err) {
-            // Best-effort cleanup only.
-        }
-        luxriotPreviewObjectUrl = '';
-    }
-
     function setLuxriotPreviewSignalLost(errorCode, errorText) {
-        releaseLuxriotPreviewObjectUrl();
+        clearLuxriotPreviewVideo();
         if (luxriotPreviewImg) {
             luxriotPreviewImg.removeAttribute('src');
+            luxriotPreviewImg.style.display = 'none';
         }
-        if (luxriotViewport) {
-            luxriotViewport.classList.add('is-signal-lost');
-            luxriotViewport.classList.remove('is-signal-stale');
-        }
-        luxriotPreviewMeta = {
-            width: 0,
-            height: 0,
-            loadedAt: 0,
-            frameAgeSec: null,
-            stale: false,
-            staleAfterSec: 0,
-            lostAfterSec: 0,
-            failed: true,
+        setLuxriotOperatorMediaState('error', {
             errorCode: errorCode || 'preview_error',
-            errorText: errorText || 'Live preview is unavailable.',
-        };
-        if (luxriotOverlay) {
-            luxriotOverlay.textContent = errorCode === 'signal_lost'
+            detail: errorText || 'Live video is unavailable.',
+            overlay: errorCode === 'signal_lost'
                 ? 'Signal lost'
-                : errorCode === 'signal_frozen'
-                    ? 'Signal frozen'
-                    : 'Preview unavailable';
-        }
-        updateLuxriotStreamContext();
+                : 'Video unavailable',
+        });
     }
 
     function stopLuxriotSummaryPoll() {
@@ -1756,6 +2503,47 @@
             luxriotSummaryTimer = null;
         }
         luxriotSummaryRefreshQueued = null;
+        cancelLuxriotSummaryRequest();
+    }
+
+    function luxriotSummaryRequestKey(channelId) {
+        const context = getCurrentSummaryRollupContext();
+        const range = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        return JSON.stringify({
+            channelId: Number(channelId),
+            view: isRollupViewActive() ? 'rollup' : 'summary',
+            level: normalizeSummaryLevel(context?.level || luxriotSummaryLevel),
+            sourceIds: Array.isArray(context?.sourceIds) ? context.sourceIds.map(String) : [],
+            run: normalizeSummaryRun(luxriotSummaryRunFilter),
+            range,
+            fromTs: range === 'custom' && Number.isFinite(luxriotSummaryFromTs) ? luxriotSummaryFromTs : null,
+            toTs: range === 'custom' && Number.isFinite(luxriotSummaryToTs) ? luxriotSummaryToTs : null,
+        });
+    }
+
+    function cancelLuxriotSummaryRequest() {
+        luxriotSummaryRequestGeneration += 1;
+        const active = luxriotSummaryActiveRequest;
+        if (active && active.controller) {
+            try {
+                active.controller.abort();
+            } catch (_) {
+                // Generation invalidation still prevents a stale render.
+            }
+        }
+        luxriotSummaryActiveRequest = null;
+    }
+
+    function isCurrentLuxriotSummaryRequest(requestContext) {
+        return Boolean(
+            requestContext
+            && requestContext.generation === luxriotSummaryRequestGeneration
+            && luxriotSummaryActiveRequest === requestContext
+            && !requestContext.controller.signal.aborted
+            && currentMode === 'video'
+            && getSelectedSummaryChannel() === requestContext.channelId
+            && luxriotSummaryRequestKey(requestContext.channelId) === requestContext.requestKey
+        );
     }
 
     function getSelectedLuxriotChannel() {
@@ -1791,16 +2579,116 @@
 
     function normalizeSummaryRangePreset(value) {
         const text = String(value || '').trim().toLowerCase();
-        if (text === '6h' || text === '24h' || text === '3d' || text === '7d' || text === '30d' || text === 'all' || text === 'custom') {
+        if (
+            text === 'live'
+            || text === 'today'
+            || text === 'yesterday'
+            || text === 'day_before_yesterday'
+            || text === '6h'
+            || text === '24h'
+            || text === '3d'
+            || text === '7d'
+            || text === '30d'
+            || text === 'all'
+            || text === 'custom'
+        ) {
             return text;
         }
-        return '24h';
+        return 'live';
+    }
+
+    function summaryLocalDateParts(epochSec = null) {
+        const hasEpoch = epochSec !== null && epochSec !== '' && Number.isFinite(Number(epochSec));
+        const date = hasEpoch
+            ? new Date(Number(epochSec) * 1000)
+            : new Date();
+        const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotDisplayTimezone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        }).formatToParts(date);
+        const values = {};
+        parts.forEach((part) => {
+            if (part.type !== 'literal') values[part.type] = Number(part.value);
+        });
+        return { year: values.year, month: values.month, day: values.day };
+    }
+
+    function shiftSummaryLocalDate(parts, dayDelta) {
+        const shifted = new Date(Date.UTC(
+            Number(parts.year),
+            Number(parts.month) - 1,
+            Number(parts.day) + Number(dayDelta || 0),
+        ));
+        return {
+            year: shifted.getUTCFullYear(),
+            month: shifted.getUTCMonth() + 1,
+            day: shifted.getUTCDate(),
+        };
+    }
+
+    function summaryLocalToEpoch(parts) {
+        const desiredMs = Date.UTC(
+            Number(parts.year),
+            Number(parts.month) - 1,
+            Number(parts.day),
+            Number(parts.hour || 0),
+            Number(parts.minute || 0),
+            Number(parts.second || 0),
+        );
+        let guessMs = desiredMs;
+        const formatter = new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotDisplayTimezone,
+            hourCycle: 'h23',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const observed = {};
+            formatter.formatToParts(new Date(guessMs)).forEach((part) => {
+                if (part.type !== 'literal') observed[part.type] = Number(part.value);
+            });
+            const observedMs = Date.UTC(
+                observed.year,
+                observed.month - 1,
+                observed.day,
+                observed.hour || 0,
+                observed.minute || 0,
+                observed.second || 0,
+            );
+            const correction = desiredMs - observedMs;
+            guessMs += correction;
+            if (Math.abs(correction) < 1000) break;
+        }
+        return guessMs / 1000;
+    }
+
+    function summaryLocalDayBounds(dayDelta = 0) {
+        const today = summaryLocalDateParts();
+        const startParts = shiftSummaryLocalDate(today, dayDelta);
+        const endParts = shiftSummaryLocalDate(startParts, 1);
+        return {
+            fromTs: summaryLocalToEpoch(startParts),
+            toTs: summaryLocalToEpoch(endParts) - 0.001,
+        };
     }
 
     function getSummaryRangeBounds(rangePreset, nowSec = null) {
         const normalized = normalizeSummaryRangePreset(rangePreset);
         const now = Number.isFinite(nowSec) ? Number(nowSec) : Math.floor(Date.now() / 1000);
         const toTs = now;
+        if (normalized === 'live' || normalized === 'all') return { fromTs: null, toTs: null };
+        if (normalized === 'today') {
+            const bounds = summaryLocalDayBounds(0);
+            return { fromTs: bounds.fromTs, toTs: now };
+        }
+        if (normalized === 'yesterday') return summaryLocalDayBounds(-1);
+        if (normalized === 'day_before_yesterday') return summaryLocalDayBounds(-2);
         if (normalized === '6h') return { fromTs: toTs - 6 * 3600, toTs };
         if (normalized === '24h') return { fromTs: toTs - 24 * 3600, toTs };
         if (normalized === '3d') return { fromTs: toTs - 3 * 24 * 3600, toTs };
@@ -1811,6 +2699,10 @@
 
     function getSummaryRangeLabel() {
         const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'live') return 'live';
+        if (preset === 'today') return 'today';
+        if (preset === 'yesterday') return 'yesterday';
+        if (preset === 'day_before_yesterday') return 'day before yesterday';
         if (preset === '6h') return '6h';
         if (preset === '24h') return '1d';
         if (preset === '3d') return '3d';
@@ -1823,6 +2715,40 @@
         return 'custom';
     }
 
+    function formatSummaryLocalTimestamp(ts, options = {}) {
+        if (ts === null || ts === '' || typeof ts === 'undefined') return 'n/a';
+        const sec = Number(ts);
+        if (!Number.isFinite(sec)) return 'n/a';
+        return new Intl.DateTimeFormat(undefined, {
+            timeZone: luxriotDisplayTimezone,
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: options.dateOnly ? undefined : '2-digit',
+            minute: options.dateOnly ? undefined : '2-digit',
+        }).format(new Date(sec * 1000));
+    }
+
+    function getSummaryEffectiveBounds() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'custom') {
+            return { fromTs: luxriotSummaryFromTs, toTs: luxriotSummaryToTs };
+        }
+        return getSummaryRangeBounds(preset);
+    }
+
+    function summaryPeriodLabel() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        const bounds = getSummaryEffectiveBounds();
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
+            return formatSummaryLocalTimestamp(bounds.fromTs, { dateOnly: true });
+        }
+        if (Number.isFinite(bounds.fromTs) && Number.isFinite(bounds.toTs)) {
+            return `${formatSummaryLocalTimestamp(bounds.fromTs)} – ${formatSummaryLocalTimestamp(bounds.toTs)}`;
+        }
+        return 'All retained history';
+    }
+
     function syncSummaryRangeUI() {
         const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
         if (luxriotSummaryRangeSelect) {
@@ -1831,31 +2757,61 @@
         if (luxriotSummaryCustomTime) {
             luxriotSummaryCustomTime.classList.toggle('is-hidden', preset !== 'custom');
         }
+        if (luxriotSummaryDateNav) {
+            luxriotSummaryDateNav.classList.toggle('is-hidden', preset === 'live');
+        }
+        if (luxriotSummaryDateLabel && preset !== 'live') {
+            luxriotSummaryDateLabel.textContent = summaryPeriodLabel();
+        }
+        if (luxriotSummaryNextPeriodBtn) {
+            const bounds = getSummaryEffectiveBounds();
+            luxriotSummaryNextPeriodBtn.disabled = !Number.isFinite(bounds.toTs) || bounds.toTs >= (Date.now() / 1000) - 1;
+        }
     }
 
     function parseSummaryDatetimeInput(value) {
         const text = String(value || '').trim();
         if (!text) return null;
-        const ms = Date.parse(text);
-        if (!Number.isFinite(ms)) return null;
-        return ms / 1000;
+        const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+        if (!match) return null;
+        return summaryLocalToEpoch({
+            year: Number(match[1]),
+            month: Number(match[2]),
+            day: Number(match[3]),
+            hour: Number(match[4]),
+            minute: Number(match[5]),
+        });
     }
 
     function formatSummaryDatetimeInput(ts) {
+        if (ts === null || ts === '' || typeof ts === 'undefined') return '';
         const sec = Number(ts);
         if (!Number.isFinite(sec)) return '';
-        const d = new Date(sec * 1000);
-        const yyyy = d.getFullYear();
-        const mm = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        const hh = String(d.getHours()).padStart(2, '0');
-        const mi = String(d.getMinutes()).padStart(2, '0');
+        const values = {};
+        new Intl.DateTimeFormat('en-CA', {
+            timeZone: luxriotDisplayTimezone,
+            hourCycle: 'h23',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+        }).formatToParts(new Date(sec * 1000)).forEach((part) => {
+            if (part.type !== 'literal') values[part.type] = part.value;
+        });
+        const yyyy = values.year;
+        const mm = values.month;
+        const dd = values.day;
+        const hh = values.hour;
+        const mi = values.minute;
         return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
     }
 
     function readSummaryFiltersFromInputs() {
-        const run = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
         const rangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect ? luxriotSummaryRangeSelect.value : luxriotSummaryRangePreset);
+        const currentRun = normalizeSummaryRun(luxriotSummaryRunSelect ? luxriotSummaryRunSelect.value : luxriotSummaryRunFilter);
+        const isExplicitRun = !['latest', 'live', 'all'].includes(String(currentRun).toLowerCase());
+        const run = rangePreset === 'live' ? 'live' : (isExplicitRun ? currentRun : 'all');
         let fromTs = null;
         let toTs = null;
         if (rangePreset === 'custom') {
@@ -1890,18 +2846,23 @@
         if (luxriotSummaryToInput) {
             luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
         }
+        const livePeriod = luxriotSummaryRangePreset === 'live';
+        luxriotSummaryFollowLive = livePeriod;
+        if (livePeriod) luxriotSummaryAutoRefresh = true;
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
     }
 
     function clearSummaryFilters() {
-        luxriotSummaryRunFilter = 'latest';
-        luxriotSummaryRangePreset = '6h';
+        luxriotSummaryRunFilter = 'live';
+        luxriotSummaryRangePreset = 'live';
         luxriotSummaryFromTs = null;
         luxriotSummaryToTs = null;
         if (luxriotSummaryRunSelect) {
-            luxriotSummaryRunSelect.value = 'latest';
+            luxriotSummaryRunSelect.value = 'live';
         }
         if (luxriotSummaryRangeSelect) {
-            luxriotSummaryRangeSelect.value = '6h';
+            luxriotSummaryRangeSelect.value = 'live';
         }
         if (luxriotSummaryFromInput) {
             luxriotSummaryFromInput.value = '';
@@ -1910,6 +2871,49 @@
             luxriotSummaryToInput.value = '';
         }
         syncSummaryRangeUI();
+        luxriotSummaryFollowLive = true;
+        luxriotSummaryAutoRefresh = true;
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
+    }
+
+    function shiftSelectedSummaryPeriod(direction) {
+        const delta = Number(direction) < 0 ? -1 : 1;
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        const bounds = getSummaryEffectiveBounds();
+        if (!Number.isFinite(bounds.fromTs) || !Number.isFinite(bounds.toTs)) return false;
+        let fromTs;
+        let toTs;
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday') {
+            const currentDate = summaryLocalDateParts(bounds.fromTs + 1);
+            const nextDate = shiftSummaryLocalDate(currentDate, delta);
+            const afterNext = shiftSummaryLocalDate(nextDate, 1);
+            fromTs = summaryLocalToEpoch(nextDate);
+            toTs = summaryLocalToEpoch(afterNext) - 0.001;
+        } else {
+            const durationSec = Math.max(60, bounds.toTs - bounds.fromTs);
+            fromTs = bounds.fromTs + delta * durationSec;
+            toTs = bounds.toTs + delta * durationSec;
+        }
+        const now = Date.now() / 1000;
+        if (toTs > now) {
+            const durationSec = toTs - fromTs;
+            toTs = now;
+            fromTs = Math.max(0, toTs - durationSec);
+        }
+        luxriotSummaryRangePreset = 'custom';
+        luxriotSummaryRunFilter = 'all';
+        luxriotSummaryFromTs = fromTs;
+        luxriotSummaryToTs = toTs;
+        luxriotSummaryFollowLive = false;
+        if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'custom';
+        if (luxriotSummaryFromInput) luxriotSummaryFromInput.value = formatSummaryDatetimeInput(fromTs);
+        if (luxriotSummaryToInput) luxriotSummaryToInput.value = formatSummaryDatetimeInput(toTs);
+        resetSummaryArchivePaging();
+        applySummaryResolutionMode();
+        syncSummaryRangeUI();
+        setSummaryUnread(0);
+        return true;
     }
 
     function buildSummaryQueryParams(channelId) {
@@ -2021,12 +3025,50 @@
         return 'L0';
     }
 
-    function setSummaryBaseLevel(level) {
+    function normalizeSummaryResolutionMode(value) {
+        const text = String(value || '').trim().toUpperCase();
+        if (text === 'AUTO') return 'AUTO';
+        return normalizeSummaryLevel(text);
+    }
+
+    function resolveAutoSummaryLevel() {
+        const preset = normalizeSummaryRangePreset(luxriotSummaryRangePreset);
+        if (preset === 'live') return 'L0';
+        if (preset === 'today' || preset === 'yesterday' || preset === 'day_before_yesterday' || preset === '24h') {
+            return 'L1';
+        }
+        if (preset === '3d' || preset === '7d') return 'L2';
+        if (preset === '30d' || preset === 'all') return 'L3';
+        const bounds = getSummaryEffectiveBounds();
+        const durationSec = Number(bounds.toTs) - Number(bounds.fromTs);
+        if (!Number.isFinite(durationSec) || durationSec <= 0) return 'L3';
+        if (durationSec <= 8 * 3600) return 'L0';
+        if (durationSec <= 36 * 3600) return 'L1';
+        if (durationSec <= 8 * 24 * 3600) return 'L2';
+        return 'L3';
+    }
+
+    function applySummaryResolutionMode() {
+        const mode = normalizeSummaryResolutionMode(luxriotSummaryResolutionMode);
+        const level = mode === 'AUTO' ? resolveAutoSummaryLevel() : normalizeSummaryLevel(mode);
+        luxriotSummaryLevel = level;
+        luxriotSummaryRollupStack = [{ level, sourceIds: null, label: level }];
+        if (luxriotSummaryLevelSelect) {
+            luxriotSummaryLevelSelect.value = mode;
+        }
+        updateSummaryControlsUI();
+        return level;
+    }
+
+    function setSummaryBaseLevel(level, preserveResolutionMode = false) {
         const normalized = normalizeSummaryLevel(level);
         luxriotSummaryLevel = normalized;
+        if (!preserveResolutionMode) luxriotSummaryResolutionMode = normalized;
         luxriotSummaryRollupStack = [{ level: normalized, sourceIds: null, label: normalized }];
         if (luxriotSummaryLevelSelect) {
-            luxriotSummaryLevelSelect.value = normalized;
+            luxriotSummaryLevelSelect.value = preserveResolutionMode
+                ? normalizeSummaryResolutionMode(luxriotSummaryResolutionMode)
+                : normalized;
         }
     }
 
@@ -2192,13 +3234,16 @@
 
     function updateSummaryControlsUI() {
         const rollupMode = isRollupViewActive();
+        const historicalMode = !isLiveSummaryPeriod();
         if (luxriotSummaryFollowBtn) {
-            const liveOn = !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
+            const liveOn = !historicalMode && !rollupMode && luxriotSummaryAutoRefresh && luxriotSummaryFollowLive;
             luxriotSummaryFollowBtn.classList.toggle('primary', liveOn);
-            luxriotSummaryFollowBtn.textContent = rollupMode
-                ? '▶ Live n/a'
-                : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
-            luxriotSummaryFollowBtn.disabled = rollupMode;
+            luxriotSummaryFollowBtn.textContent = historicalMode
+                ? '▶ Go live'
+                : rollupMode
+                    ? '▶ Live observations'
+                    : (liveOn ? '⏸ Live ON' : '▶ Live OFF');
+            luxriotSummaryFollowBtn.disabled = false;
         }
         if (luxriotSummaryPauseBtn) {
             luxriotSummaryPauseBtn.classList.toggle('primary', !luxriotSummaryAutoRefresh);
@@ -2229,6 +3274,7 @@
         if (luxriotSummaryApplyFiltersBtn) {
             luxriotSummaryApplyFiltersBtn.disabled = normalizeSummaryRangePreset(luxriotSummaryRangePreset) !== 'custom';
         }
+        updateSummaryArchivePagingUI();
     }
 
     function syncLuxriotSummaryChannelSelect() {
@@ -2281,6 +3327,9 @@
                 throw new Error(data.error);
             }
             const channels = data.channels || [];
+            const inventory = data.inventory && typeof data.inventory === 'object'
+                ? data.inventory
+                : {};
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
             Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
             if (!channels.length) {
@@ -2298,14 +3347,26 @@
                     const id = parseInt(String(rawId || ''), 10);
                     if (!Number.isFinite(id)) return '';
                     const label = normalizeLuxriotChannelName(ch, id);
+                    const availability = String(ch.availability || '').trim().toLowerCase();
+                    const unavailable = ch.enabled === false
+                        || ['disabled', 'offline', 'unavailable'].includes(availability);
+                    const optionLabel = unavailable
+                        ? `${label} [${availability || 'disabled'}]`
+                        : label;
                     luxriotChannelNameById[String(id)] = label;
                     luxriotChannelMetaById[String(id)] = ch;
                     const selected = String(id) === String(luxriotActiveChannel) ? 'selected' : '';
-                    return `<option value="${id}" ${selected}>${escapeHtml(label)}</option>`;
+                    const disabled = unavailable ? 'disabled' : '';
+                    return `<option value="${id}" ${selected} ${disabled}>${escapeHtml(optionLabel)}</option>`;
                 })
                 .filter((item) => Boolean(item));
             luxriotChannelSelect.innerHTML = options.join('');
             const channelIds = channels
+                .filter((ch) => {
+                    const availability = String(ch.availability || '').trim().toLowerCase();
+                    return ch.enabled !== false
+                        && !['disabled', 'offline', 'unavailable'].includes(availability);
+                })
                 .map((ch) => parseInt(String(ch.id ?? ch.channel_id ?? ''), 10))
                 .filter((id) => Number.isFinite(id));
             if (!channelIds.some((id) => String(id) === String(luxriotActiveChannel))) {
@@ -2322,7 +3383,12 @@
             syncLuxriotLiveIntervalInput(luxriotActiveChannel);
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
-            setLuxriotStatus(`Loaded ${channels.length} channels`);
+            const staleSuffix = inventory.stale ? ' · stale inventory' : '';
+            const stopped = inventory?.stream?.reconciliation?.stopped_channel_ids || [];
+            const stoppedSuffix = stopped.length
+                ? ` · stopped unavailable: ${stopped.join(', ')}`
+                : '';
+            setLuxriotStatus(`Loaded ${channels.length} channels${staleSuffix}${stoppedSuffix}`, Boolean(inventory.stale));
         } catch (err) {
             Object.keys(luxriotChannelNameById).forEach((key) => delete luxriotChannelNameById[key]);
             Object.keys(luxriotChannelMetaById).forEach((key) => delete luxriotChannelMetaById[key]);
@@ -2418,7 +3484,7 @@
             return 'Editing L3 rollup prompt (stored for rollup workflow tuning).';
         }
         if (normalized === 'json') {
-            return 'Advanced: editing the machine-readable ALERTS_JSON contract. Do this only when changing parser/schema behavior.';
+            return 'Advanced: editing the unified machine-readable BATCH_STATE_JSON contract for cover, continuity, memory, observations, and alerts.';
         }
         return 'Editing system prompt.';
     }
@@ -2439,6 +3505,97 @@
         const rollups = layers.rollups && typeof layers.rollups === 'object' ? layers.rollups : {};
         const level = normalized.toUpperCase();
         return rollups[level] && typeof rollups[level] === 'object' ? rollups[level] : null;
+    }
+
+    function updateLuxriotMemoryMetabolism() {
+        if (
+            !luxriotMemoryMetabolism
+            || !luxriotMemoryMetabolismSummary
+            || !luxriotMemoryMetabolismState
+            || !luxriotMemoryMetabolismStages
+            || !luxriotMemoryMetabolismCurrent
+        ) return;
+        const metabolism = luxriotMemoryMetabolismData && typeof luxriotMemoryMetabolismData === 'object'
+            ? luxriotMemoryMetabolismData
+            : null;
+        if (!metabolism) {
+            luxriotMemoryMetabolism.classList.add('is-hidden');
+            luxriotMemoryMetabolismStages.innerHTML = '';
+            luxriotMemoryMetabolismCurrent.textContent = '';
+            return;
+        }
+
+        const state = metabolism.current_state && typeof metabolism.current_state === 'object'
+            ? metabolism.current_state
+            : {};
+        const stages = Array.isArray(metabolism.stages) ? metabolism.stages : [];
+        const selectedTab = String(luxriotPromptModalTab || 'stream').toUpperCase();
+        const selectedLevel = ['L1', 'L2', 'L3'].includes(selectedTab) ? selectedTab : 'L0';
+        const scheduler = metabolism.scheduler && typeof metabolism.scheduler === 'object'
+            ? metabolism.scheduler
+            : {};
+        const sourceLevel = String(state.source_level || '').trim().toUpperCase();
+        const statusText = state.present
+            ? `Active${sourceLevel ? ` · ${sourceLevel}` : ''}`
+            : 'Awaiting consolidation';
+
+        luxriotMemoryMetabolismSummary.textContent = String(
+            metabolism.semantics
+            || 'Grounded L0 state is consolidated by L1/L2 and returned to later batches as prior context.'
+        );
+        luxriotMemoryMetabolismState.textContent = statusText;
+        luxriotMemoryMetabolismStages.innerHTML = stages.map((rawStage) => {
+            const stage = rawStage && typeof rawStage === 'object' ? rawStage : {};
+            const level = String(stage.level || '?').toUpperCase();
+            const applies = Boolean(stage.applies_to_live_memory);
+            const nextDueSeconds = Number(stage.next_due_at);
+            const nextDue = Number.isFinite(nextDueSeconds) && nextDueSeconds > 0
+                ? new Date(nextDueSeconds * 1000).toLocaleString()
+                : '';
+            const route = level === 'L3'
+                ? 'proposal only'
+                : applies
+                    ? 'returns to live L0'
+                    : 'feeds consolidation';
+            const title = [
+                String(stage.reads || '').trim(),
+                nextDue ? `Next scheduled run: ${nextDue}` : '',
+            ].filter(Boolean).join('\n');
+            return `
+                <div class="memory-metabolism-stage ${level === selectedLevel ? 'is-selected' : ''}" title="${escapeHtml(title)}">
+                    <div class="memory-metabolism-stage-level">${escapeHtml(level)}</div>
+                    <div class="memory-metabolism-stage-cadence">${escapeHtml(stage.cadence || 'configured cadence')}</div>
+                    <div class="memory-metabolism-stage-write">${escapeHtml(stage.writes || '')}</div>
+                    <div class="memory-metabolism-stage-route">${escapeHtml(route)}</div>
+                </div>
+            `;
+        }).join('');
+
+        const counts = [
+            ['watchlist', state.active_watchlist_count],
+            ['deviations', state.preserved_deviations_count],
+            ['held tuning proposals', state.held_tuning_proposals_count],
+            ['held suppression proposals', state.held_routine_suppression_proposals_count],
+        ].map(([label, value]) => `${label}: ${Math.max(0, Number(value) || 0)}`);
+        const baseline = String(state.routine_baseline || '').trim();
+        const updatedSeconds = Number(state.updated_at);
+        const updated = Number.isFinite(updatedSeconds) && updatedSeconds > 0
+            ? new Date(updatedSeconds * 1000).toLocaleString()
+            : '';
+        const schedulerText = scheduler.last_error
+            ? `Scheduler error: ${String(scheduler.last_error).slice(0, 160)}`
+            : scheduler.enabled
+                ? (scheduler.running ? `Scheduler running ${scheduler.active_level || ''}`.trim() : 'Scheduler enabled')
+                : 'Scheduler disabled';
+        luxriotMemoryMetabolismCurrent.textContent = state.present
+            ? [
+                baseline ? `Current routine candidate: ${baseline}` : 'No durable routine candidate.',
+                counts.join(' · '),
+                updated ? `Memory refreshed ${updated}.` : '',
+                schedulerText,
+            ].filter(Boolean).join(' ')
+            : `No consolidated channel memory yet. ${schedulerText}. Current snapshots still override all prior context.`;
+        luxriotMemoryMetabolism.classList.remove('is-hidden');
     }
 
     function updateLuxriotPromptLayerDetails() {
@@ -2465,18 +3622,19 @@
         if (backendInstructions) {
             lines.push(`Backend instructions appended by EVA AI:\n${backendInstructions}`);
         }
-        const backendMemory = String(layer.backend_memory || layer.active_memory || '').trim();
-        if (backendMemory) {
-            lines.push(`Active channel memory appended by EVA AI:\n${backendMemory}`);
-        } else {
-            lines.push('Active channel memory: none for the selected channel yet.');
-        }
+        const memoryContext = layer.memory_context && typeof layer.memory_context === 'object'
+            ? layer.memory_context
+            : {};
+        const memorySource = String(memoryContext.source_level || '').trim().toUpperCase();
+        lines.push(memoryContext.present
+            ? `Channel memory: appended internally as prior context${memorySource ? ` from ${memorySource}` : ''}; current snapshots override it.`
+            : 'Channel memory: none for the selected channel yet.');
         luxriotPromptLayerContent.textContent = lines.join('\n\n');
         luxriotPromptLayerDetails.classList.remove('is-hidden');
     }
 
     function collectLuxriotPromptSettings() {
-        const payload = {
+        const current = {
             stream_system_prompt: luxriotSystemPromptInput ? String(luxriotSystemPromptInput.value || '') : '',
             alert_policy_prompt: luxriotAlertPolicyPromptInput ? String(luxriotAlertPolicyPromptInput.value || '') : '',
             rollup_prompts: {
@@ -2486,13 +3644,74 @@
             },
         };
         if (userHasPermission('bookmarks:create')) {
-            payload.json_alert_prompt = luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '';
-            payload.bookmark_enabled = luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false;
-            payload.bookmark_cooldown_sec = luxriotBookmarkCooldownInput
+            current.json_alert_prompt = luxriotJsonAlertPromptInput ? String(luxriotJsonAlertPromptInput.value || '') : '';
+            current.bookmark_enabled = luxriotBookmarkEnabledInput ? Boolean(luxriotBookmarkEnabledInput.checked) : false;
+            current.bookmark_cooldown_sec = luxriotBookmarkCooldownInput
                 ? Math.max(0, Number.parseFloat(String(luxriotBookmarkCooldownInput.value || '0')) || 0)
                 : 0;
         }
+        current.capture_selector_enabled = luxriotSelectorEnabledInput
+            ? Boolean(luxriotSelectorEnabledInput.checked)
+            : true;
+        current.capture_selector_bias = luxriotSelectorBiasInput
+            ? String(luxriotSelectorBiasInput.value || 'auto')
+            : 'auto';
+        const baseline = luxriotPromptLoadedSettings && typeof luxriotPromptLoadedSettings === 'object'
+            ? luxriotPromptLoadedSettings
+            : {};
+        const payload = {};
+        for (const field of ['stream_system_prompt', 'alert_policy_prompt']) {
+            if (String(current[field] || '') !== String(baseline[field] || '')) {
+                payload[field] = current[field];
+            }
+        }
+        const changedRollups = {};
+        for (const level of ['L1', 'L2', 'L3']) {
+            const currentValue = String(current.rollup_prompts?.[level] || '');
+            const baselineValue = String(baseline.rollup_prompts?.[level] || '');
+            if (currentValue !== baselineValue) {
+                changedRollups[level] = currentValue;
+            }
+        }
+        if (Object.keys(changedRollups).length) {
+            payload.rollup_prompts = changedRollups;
+        }
+        if (userHasPermission('bookmarks:create')) {
+            if (String(current.json_alert_prompt || '') !== String(baseline.json_alert_prompt || '')) {
+                payload.json_alert_prompt = current.json_alert_prompt;
+            }
+            if (Boolean(current.bookmark_enabled) !== Boolean(baseline.bookmark_enabled)) {
+                payload.bookmark_enabled = current.bookmark_enabled;
+            }
+            if (Number(current.bookmark_cooldown_sec || 0) !== Number(baseline.bookmark_cooldown_sec || 0)) {
+                payload.bookmark_cooldown_sec = current.bookmark_cooldown_sec;
+            }
+        }
+        if (String(current.capture_selector_bias || 'auto') !== String(baseline.capture_selector_bias || 'auto')) {
+            payload.capture_selector_bias = current.capture_selector_bias;
+        }
+        if (Boolean(current.capture_selector_enabled) !== Boolean(baseline.capture_selector_enabled ?? true)) {
+            payload.capture_selector_enabled = current.capture_selector_enabled;
+        }
         return payload;
+    }
+
+    function isLuxriotPromptModalOpen() {
+        return Boolean(luxriotPromptModal && luxriotPromptModal.style.display === 'block');
+    }
+
+    function syncLuxriotPromptModalEditorToDraft() {
+        const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
+        if (targetInput && luxriotPromptModalInput) {
+            targetInput.value = String(luxriotPromptModalInput.value || '');
+        }
+    }
+
+    function hasLuxriotPromptDraftChanges() {
+        if (!luxriotPromptLoadedSettings || !Number.isFinite(luxriotPromptFormChannelId)) {
+            return false;
+        }
+        return Object.keys(collectLuxriotPromptSettings()).length > 0;
     }
 
     function applyLuxriotPromptSettingsFromPayload(payload) {
@@ -2520,11 +3739,14 @@
             const selectedChannel = getSelectedLuxriotChannel();
             const interval = normalizeLuxriotLiveInterval(settings.capture_interval_sec);
             if (interval !== null && (!Number.isFinite(payloadChannel) || payloadChannel === selectedChannel)) {
-                if (document.activeElement !== luxriotLiveIntervalInput) {
+                if (
+                    document.activeElement !== luxriotLiveIntervalInput
+                    && !isLuxriotLiveIntervalDirty(selectedChannel)
+                ) {
                     luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(interval);
+                    storeLuxriotLiveInterval(selectedChannel, interval);
+                    updateLuxriotBatchInfo();
                 }
-                storeLuxriotLiveInterval(selectedChannel, interval);
-                updateLuxriotBatchInfo();
             }
         }
         if (luxriotJsonAlertPromptInput && Object.prototype.hasOwnProperty.call(settings, 'json_alert_prompt')) {
@@ -2537,14 +3759,187 @@
             const cooldown = Number.parseFloat(String(settings.bookmark_cooldown_sec || '0'));
             luxriotBookmarkCooldownInput.value = Number.isFinite(cooldown) ? String(Math.max(0, cooldown)) : '0';
         }
+        if (luxriotSelectorBiasInput && Object.prototype.hasOwnProperty.call(settings, 'capture_selector_bias')) {
+            const bias = String(settings.capture_selector_bias || 'auto').toLowerCase();
+            luxriotSelectorBiasInput.value = ['auto', 'action', 'clarity'].includes(bias) ? bias : 'auto';
+        }
+        if (luxriotSelectorEnabledInput && Object.prototype.hasOwnProperty.call(settings, 'capture_selector_enabled')) {
+            luxriotSelectorEnabledInput.checked = Boolean(settings.capture_selector_enabled);
+        }
         luxriotPromptLayers = settings.prompt_layers && typeof settings.prompt_layers === 'object'
             ? settings.prompt_layers
             : null;
+        luxriotPromptSettingSources = settings.setting_sources && typeof settings.setting_sources === 'object'
+            ? settings.setting_sources
+            : null;
+        luxriotPromptOverrideFields = Array.isArray(settings.override_fields)
+            ? settings.override_fields.map((item) => String(item || ''))
+            : [];
+        luxriotPromptPersistence = settings.persistence && typeof settings.persistence === 'object'
+            ? settings.persistence
+            : null;
+        luxriotMemoryMetabolismData = settings.memory_metabolism && typeof settings.memory_metabolism === 'object'
+            ? settings.memory_metabolism
+            : null;
+        luxriotPromptLoadedSettings = {
+            stream_system_prompt: String(settings.stream_system_prompt || ''),
+            alert_policy_prompt: String(settings.alert_policy_prompt || ''),
+            rollup_prompts: {
+                L1: String(rollupPrompts.L1 || ''),
+                L2: String(rollupPrompts.L2 || ''),
+                L3: String(rollupPrompts.L3 || ''),
+            },
+            json_alert_prompt: String(settings.json_alert_prompt || ''),
+            bookmark_enabled: Boolean(settings.bookmark_enabled),
+            bookmark_cooldown_sec: Math.max(0, Number(settings.bookmark_cooldown_sec || 0)),
+            capture_selector_enabled: Boolean(settings.capture_selector_enabled ?? true),
+            capture_selector_bias: String(settings.capture_selector_bias || 'auto').toLowerCase(),
+        };
         const activeInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
         if (luxriotPromptModalInput && activeInput) {
             luxriotPromptModalInput.value = String(activeInput.value || '');
         }
+        updateLuxriotMemoryMetabolism();
         updateLuxriotPromptLayerDetails();
+    }
+
+    function getClearableLuxriotPromptOverrideFields() {
+        const bookmarkFields = new Set([
+            'bookmark_enabled',
+            'bookmark_cooldown_sec',
+            'json_alert_prompt',
+        ]);
+        return luxriotPromptOverrideFields.filter((field) => (
+            !bookmarkFields.has(field) || userHasPermission('bookmarks:create')
+        ));
+    }
+
+    function updateLuxriotPromptModalMeta() {
+        if (!luxriotPromptModalMeta) return;
+        const tabValue = luxriotPromptModalTab;
+        const channelId = Number.isFinite(luxriotPromptFormChannelId)
+            ? luxriotPromptFormChannelId
+            : getSelectedLuxriotChannel();
+        const channelLabel = getLuxriotChannelLabel(channelId);
+        const sourceKey = tabValue === 'stream'
+            ? 'stream_system_prompt'
+            : tabValue === 'alerts'
+                ? 'alert_policy_prompt'
+                : tabValue === 'json'
+                    ? 'json_alert_prompt'
+                    : null;
+        const source = sourceKey
+            ? String(luxriotPromptSettingSources?.[sourceKey] || '')
+            : String(luxriotPromptSettingSources?.rollup_prompts?.[tabValue] || '');
+        const sourceLabels = {
+            channel_override: 'channel override',
+            persisted_runtime_default: 'persisted runtime default',
+            config_default: 'configuration default',
+        };
+        const sourceLabel = sourceLabels[source] || 'source unknown';
+        const persistence = luxriotPromptPersistence;
+        const persistenceLabel = persistence?.last_error
+            ? `persistence error: ${String(persistence.last_error).slice(0, 160)}`
+            : persistence?.persisted
+                ? `saved revision ${Number(persistence.revision || 0)}`
+                : 'not persisted yet';
+        const operationLabel = luxriotPromptSaveAbortController
+            ? 'Saving changes…'
+            : luxriotPromptLoadAbortController
+                ? 'Loading saved settings…'
+                : hasLuxriotPromptDraftChanges()
+                    ? 'Unsaved changes.'
+                    : luxriotPromptModalNotice;
+        luxriotPromptModalMeta.textContent = [
+            `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`,
+            `Source: ${sourceLabel}; ${persistenceLabel}.`,
+            operationLabel,
+        ].filter(Boolean).join(' ');
+    }
+
+    function setLuxriotPromptApplyAvailability() {
+        const canManage = userHasPermission('prompts:manage');
+        const selectedChannelId = getSelectedLuxriotChannel();
+        const formMatchesChannel = Number.isFinite(luxriotPromptFormChannelId)
+            && selectedChannelId === luxriotPromptFormChannelId;
+        const loading = Boolean(luxriotPromptLoadAbortController);
+        const saving = Boolean(luxriotPromptSaveAbortController);
+        const busy = loading || saving;
+        const ready = Boolean(luxriotPromptLoadedSettings) && formMatchesChannel;
+        const dirty = ready && hasLuxriotPromptDraftChanges();
+        if (luxriotPromptApplyBtn) {
+            luxriotPromptApplyBtn.disabled = busy || !canManage || !dirty;
+            luxriotPromptApplyBtn.textContent = saving
+                ? 'Saving…'
+                : loading
+                    ? 'Loading…'
+                    : dirty
+                        ? 'Apply changes'
+                        : 'No changes';
+        }
+        if (luxriotPromptResetBtn) {
+            luxriotPromptResetBtn.disabled = busy
+                || !canManage
+                || !ready
+                || getClearableLuxriotPromptOverrideFields().length === 0;
+        }
+        if (luxriotPromptModalInput) {
+            luxriotPromptModalInput.disabled = busy || !canManage || !ready;
+        }
+        luxriotPromptTabButtons.forEach((button) => {
+            button.disabled = busy || !ready;
+        });
+        if (luxriotBookmarkEnabledInput) {
+            luxriotBookmarkEnabledInput.disabled = busy
+                || !canManage
+                || !ready
+                || !userHasPermission('bookmarks:create');
+        }
+        if (luxriotBookmarkCooldownInput) {
+            luxriotBookmarkCooldownInput.disabled = busy
+                || !canManage
+                || !ready
+                || !userHasPermission('bookmarks:create');
+        }
+        if (luxriotSelectorBiasInput) {
+            luxriotSelectorBiasInput.disabled = busy || !canManage || !ready;
+        }
+        updateLuxriotPromptModalMeta();
+    }
+
+    function abortLuxriotPromptController(controller) {
+        if (!controller) return;
+        try {
+            controller.abort();
+        } catch (_) {
+            // Abort is best-effort; generation checks remain authoritative.
+        }
+    }
+
+    function invalidateLuxriotPromptRequests({ clearFormIdentity = false } = {}) {
+        luxriotPromptRequestGeneration += 1;
+        abortLuxriotPromptController(luxriotPromptLoadAbortController);
+        abortLuxriotPromptController(luxriotPromptSaveAbortController);
+        luxriotPromptLoadAbortController = null;
+        luxriotPromptSaveAbortController = null;
+        if (clearFormIdentity) {
+            luxriotPromptFormChannelId = null;
+            luxriotPromptLoadedSettings = null;
+            luxriotPromptModalNotice = '';
+            luxriotMemoryMetabolismData = null;
+            updateLuxriotMemoryMetabolism();
+            if (luxriotPromptModalInput) {
+                luxriotPromptModalInput.value = '';
+            }
+        }
+        setLuxriotPromptApplyAvailability();
+    }
+
+    function isCurrentLuxriotPromptRequest(generation, controller, channelId) {
+        return generation === luxriotPromptRequestGeneration
+            && controller
+            && !controller.signal.aborted
+            && getSelectedLuxriotChannel() === channelId;
     }
 
     async function refreshLuxriotPromptSettings(showError = false, channelIdOverride = null) {
@@ -2552,45 +3947,144 @@
             ? channelIdOverride
             : getSelectedLuxriotChannel();
         if (!Number.isFinite(channelId)) {
-            return;
+            return false;
         }
+        if (isLuxriotPromptModalOpen() && hasLuxriotPromptDraftChanges()) {
+            const sameChannel = luxriotPromptFormChannelId === channelId;
+            luxriotPromptModalNotice = 'Apply or close the modal and discard the draft before reloading saved settings.';
+            setLuxriotPromptApplyAvailability();
+            if (showError || sameChannel) {
+                setLuxriotStatus(luxriotPromptModalNotice, true);
+            }
+            return false;
+        }
+        invalidateLuxriotPromptRequests({ clearFormIdentity: luxriotPromptFormChannelId !== channelId });
+        const generation = luxriotPromptRequestGeneration;
+        const controller = new AbortController();
+        luxriotPromptLoadAbortController = controller;
+        luxriotPromptModalNotice = '';
+        setLuxriotPromptApplyAvailability();
         try {
             const params = new URLSearchParams();
             params.set('channel_id', String(channelId));
-            const response = await fetch(`/luxriot/prompt_settings?${params.toString()}`);
+            const response = await fetch(`/luxriot/prompt_settings?${params.toString()}`, {
+                signal: controller.signal,
+            });
             const data = await parseApiJson(response, 'Failed to load prompt settings');
+            if (!isCurrentLuxriotPromptRequest(generation, controller, channelId)) {
+                return false;
+            }
+            const responseChannel = parseInt(String(data.channel_id ?? channelId), 10);
+            if (Number.isFinite(responseChannel) && responseChannel !== channelId) {
+                throw new Error(`Prompt settings response channel ${responseChannel} did not match requested channel ${channelId}`);
+            }
             applyLuxriotPromptSettingsFromPayload(data);
+            luxriotPromptFormChannelId = channelId;
+            luxriotPromptModalNotice = 'Saved settings loaded.';
+            setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+            return true;
         } catch (err) {
-            if (showError) {
+            if (err && err.name === 'AbortError') {
+                return false;
+            }
+            if (showError && generation === luxriotPromptRequestGeneration) {
                 setLuxriotStatus(err.message || 'Failed to load prompt settings', true);
+            }
+            if (generation === luxriotPromptRequestGeneration) {
+                luxriotPromptModalNotice = 'Could not load saved settings.';
+            }
+            return false;
+        } finally {
+            if (luxriotPromptLoadAbortController === controller) {
+                luxriotPromptLoadAbortController = null;
+            }
+            if (generation === luxriotPromptRequestGeneration) {
+                setLuxriotPromptApplyAvailability();
             }
         }
     }
 
-    async function persistLuxriotPromptSettings(channelIdOverride = null) {
+    async function persistLuxriotPromptSettings(channelIdOverride = null, payloadOverride = null) {
         const channelId = Number.isFinite(channelIdOverride)
             ? channelIdOverride
             : getSelectedLuxriotChannel();
         if (!Number.isFinite(channelId)) {
             throw new Error('Select a channel first');
         }
-        const payload = collectLuxriotPromptSettings();
+        abortLuxriotPromptController(luxriotPromptLoadAbortController);
+        abortLuxriotPromptController(luxriotPromptSaveAbortController);
+        luxriotPromptLoadAbortController = null;
+        const generation = ++luxriotPromptRequestGeneration;
+        const controller = new AbortController();
+        luxriotPromptSaveAbortController = controller;
+        luxriotPromptModalNotice = '';
+        setLuxriotPromptApplyAvailability();
+        const payload = payloadOverride && typeof payloadOverride === 'object'
+            ? { ...payloadOverride }
+            : collectLuxriotPromptSettings();
         payload.channel_id = channelId;
-        const response = await fetch('/luxriot/prompt_settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+        try {
+            const response = await fetch('/luxriot/prompt_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            });
+            const data = await parseApiJson(response, 'Failed to save prompt settings');
+            if (!isCurrentLuxriotPromptRequest(generation, controller, channelId)) {
+                throw new Error(`Prompt settings were saved for channel ${channelId}, but the selected channel changed; reload before editing again.`);
+            }
+            const responseChannel = parseInt(String(data.channel_id ?? channelId), 10);
+            if (Number.isFinite(responseChannel) && responseChannel !== channelId) {
+                throw new Error(`Prompt settings response channel ${responseChannel} did not match saved channel ${channelId}`);
+            }
+            applyLuxriotPromptSettingsFromPayload(data);
+            clearLuxriotLiveIntervalDirty(channelId);
+            luxriotPromptFormChannelId = channelId;
+            luxriotPromptModalNotice = 'Saved.';
+            return data;
+        } catch (err) {
+            if (!err || err.name !== 'AbortError') {
+                luxriotPromptModalNotice = 'Save failed; your changes are still in the editor.';
+            }
+            throw err;
+        } finally {
+            if (luxriotPromptSaveAbortController === controller) {
+                luxriotPromptSaveAbortController = null;
+            }
+            if (generation === luxriotPromptRequestGeneration) {
+                setLuxriotPromptApplyAvailability();
+            }
+        }
+    }
+
+    async function resetLuxriotPromptOverrides() {
+        const selectedChannelId = getSelectedLuxriotChannel();
+        const formChannelId = luxriotPromptFormChannelId;
+        if (!Number.isFinite(formChannelId) || formChannelId !== selectedChannelId) {
+            await refreshLuxriotPromptSettings(true, selectedChannelId);
+            throw new Error('The selected channel changed. Its settings were reloaded; review them before resetting overrides.');
+        }
+        const clearOverrideFields = getClearableLuxriotPromptOverrideFields();
+        if (!clearOverrideFields.length) {
+            throw new Error('This channel has no prompt or bookmark overrides you can reset.');
+        }
+        const confirmed = window.confirm(
+            `${hasLuxriotPromptDraftChanges() ? 'Discard the unsaved prompt changes and ' : ''}`
+            + `remove ${clearOverrideFields.length} channel-specific override(s) for ${getLuxriotChannelLabel(formChannelId)} and use inherited defaults?`
+        );
+        if (!confirmed) return null;
+        const result = await persistLuxriotPromptSettings(formChannelId, {
+            clear_override_fields: clearOverrideFields,
         });
-        const data = await parseApiJson(response, 'Failed to save prompt settings');
-        applyLuxriotPromptSettingsFromPayload(data);
+        setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+        setLuxriotStatus(`Inherited defaults restored for ${getLuxriotChannelLabel(formChannelId)}`);
+        return result;
     }
 
     function setLuxriotPromptModalTab(tab) {
         const normalized = String(tab || '').trim().toLowerCase();
-        const previousInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-        if (luxriotPromptModalInput && previousInput) {
-            previousInput.value = luxriotPromptModalInput.value || '';
-        }
+        syncLuxriotPromptModalEditorToDraft();
         const tabValue = (normalized === 'stream' || normalized === 'alerts' || normalized === 'json')
             ? normalized
             : normalized.toUpperCase();
@@ -2603,186 +4097,335 @@
             const sourceInput = getLuxriotPromptInputByTab(tabValue);
             luxriotPromptModalInput.value = sourceInput ? String(sourceInput.value || '') : '';
         }
-        if (luxriotPromptModalMeta) {
-            const channelLabel = getLuxriotChannelLabel(getSelectedLuxriotChannel());
-            luxriotPromptModalMeta.textContent = `${getLuxriotPromptTabMeta(tabValue)} Channel: ${channelLabel}.`;
-        }
+        updateLuxriotPromptModalMeta();
+        updateLuxriotMemoryMetabolism();
         updateLuxriotPromptLayerDetails();
+        setLuxriotPromptApplyAvailability();
     }
 
     function openLuxriotPromptModal() {
         if (!luxriotPromptModal) return;
+        invalidateLuxriotPromptRequests({ clearFormIdentity: true });
+        const channelId = getSelectedLuxriotChannel();
         luxriotPromptModal.style.display = 'block';
-        void refreshLuxriotPromptSettings(true);
         setLuxriotPromptModalTab(luxriotPromptModalTab || 'stream');
+        setLuxriotPromptApplyAvailability();
+        void refreshLuxriotPromptSettings(true, channelId);
     }
 
-    function closeLuxriotPromptModal() {
-        if (!luxriotPromptModal) return;
+    function closeLuxriotPromptModal({ force = false } = {}) {
+        if (!luxriotPromptModal) return false;
+        syncLuxriotPromptModalEditorToDraft();
+        if (
+            !force
+            && hasLuxriotPromptDraftChanges()
+            && !window.confirm('Discard unsaved prompt changes?')
+        ) {
+            return false;
+        }
+        invalidateLuxriotPromptRequests({ clearFormIdentity: true });
         luxriotPromptModal.style.display = 'none';
+        return true;
     }
 
     async function applyLuxriotPromptModal() {
-        const targetInput = getLuxriotPromptInputByTab(luxriotPromptModalTab);
-        if (targetInput && luxriotPromptModalInput) {
-            targetInput.value = luxriotPromptModalInput.value || '';
+        const selectedChannelId = getSelectedLuxriotChannel();
+        const formChannelId = luxriotPromptFormChannelId;
+        if (!Number.isFinite(formChannelId) || formChannelId !== selectedChannelId) {
+            await refreshLuxriotPromptSettings(true, selectedChannelId);
+            throw new Error('The selected channel changed. Its prompt settings were reloaded; review them and Apply again.');
         }
-        const channelId = getSelectedLuxriotChannel();
-        await persistLuxriotPromptSettings(channelId);
-        setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(channelId)}`);
+        syncLuxriotPromptModalEditorToDraft();
+        if (!hasLuxriotPromptDraftChanges()) {
+            luxriotPromptModalNotice = 'No changes to save.';
+            setLuxriotPromptApplyAvailability();
+            return null;
+        }
+        const result = await persistLuxriotPromptSettings(formChannelId);
+        setLuxriotStatus(`${getLuxriotPromptTabLabel(luxriotPromptModalTab)} updated for ${getLuxriotChannelLabel(formChannelId)}`);
+        return result;
     }
 
-    function startLuxriotPreview() {
-        if (!luxriotPreviewImg) return;
+    function isCurrentLuxriotMediaRequest(requestSeq, channelId) {
+        return requestSeq === luxriotPreviewRequestSeq
+            && currentMode === 'video'
+            && getSelectedLuxriotChannel() === channelId;
+    }
+
+    function scheduleLuxriotPreviewRenewal(requestSeq, channelId, delayMs, detail) {
+        if (luxriotPreviewRenewTimer) clearTimeout(luxriotPreviewRenewTimer);
+        const parsedDelay = Number(delayMs);
+        const safeDelay = delayMs !== null && delayMs !== undefined && Number.isFinite(parsedDelay) && parsedDelay > 0
+            ? Math.max(750, Math.min(120000, Math.trunc(parsedDelay)))
+            : 20000;
+        luxriotPreviewRenewTimer = window.setTimeout(() => {
+            luxriotPreviewRenewTimer = null;
+            if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+            setLuxriotOperatorMediaState('loading', {
+                mediaKind: luxriotPreviewMeta.mediaKind,
+                detail: detail || 'Renewing the bounded live media connection.',
+                overlay: 'Reconnecting video…',
+            });
+            startLuxriotPreview({ reuseNegotiation: true });
+        }, safeDelay);
+    }
+
+    function clearLuxriotPreviewStallWatchdog() {
+        if (!luxriotPreviewStallTimer) return;
+        clearTimeout(luxriotPreviewStallTimer);
+        luxriotPreviewStallTimer = null;
+    }
+
+    function armLuxriotPreviewStallWatchdog(requestSeq, channelId) {
+        clearLuxriotPreviewStallWatchdog();
+        luxriotPreviewStallTimer = window.setTimeout(() => {
+            luxriotPreviewStallTimer = null;
+            if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+            scheduleLuxriotPreviewRenewal(
+                requestSeq,
+                channelId,
+                750,
+                'The browser media clock stopped advancing; reconnecting without touching analytics.',
+            );
+        }, 5000);
+    }
+
+    function scheduleLuxriotAttentionRecovery(requestSeq, channelId) {
+        if (luxriotPreferFullOperatorMedia) return;
+        if (!selectedLuxriotStream(channelId, 'video')?.running) return;
+        // Analytics keeps selecting apex frames while the preview sits in a
+        // static fallback; retry the shared attention preview instead of
+        // waiting for a manual Retry click.
+        scheduleLuxriotPreviewRenewal(
+            requestSeq,
+            channelId,
+            12000,
+            'Retrying the shared EVA attention preview.',
+        );
+    }
+
+    function showLuxriotStaticFrameFallback(requestSeq, channelId, reason, fallbackUrl = '') {
+        if (!isCurrentLuxriotMediaRequest(requestSeq, channelId) || !luxriotPreviewImg) return;
+        clearLuxriotPreviewVideo();
+        luxriotPreviewLoading = true;
+        const staticUrl = fallbackUrl && fallbackUrl.startsWith('/')
+            ? fallbackUrl
+            : `/luxriot/snapshot/${encodeURIComponent(String(channelId))}?stream=mainStream`;
+        const separator = staticUrl.includes('?') ? '&' : '?';
+        luxriotPreviewImg.onload = () => {
+            if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+            luxriotPreviewLoading = false;
+            luxriotPreviewImg.style.display = 'block';
+            setLuxriotOperatorMediaState('degraded', {
+                width: Number(luxriotPreviewImg.naturalWidth) || 0,
+                height: Number(luxriotPreviewImg.naturalHeight) || 0,
+                loadedAt: Date.now(),
+                mediaKind: 'static_frame',
+                detail: `${reason || 'Browser-playable video is unavailable.'} One static fallback frame is shown; this is not video or a snapshot slideshow.`,
+            });
+            setLuxriotStatus('Static frame fallback shown; live video is unavailable.', true);
+            scheduleLuxriotAttentionRecovery(requestSeq, channelId);
+        };
+        luxriotPreviewImg.onerror = () => {
+            if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+            luxriotPreviewLoading = false;
+            setLuxriotPreviewSignalLost('media_error', reason || 'Live video and static fallback are unavailable.');
+            scheduleLuxriotAttentionRecovery(requestSeq, channelId);
+        };
+        luxriotPreviewImg.style.display = 'block';
+        luxriotPreviewImg.src = `${staticUrl}${separator}t=${Date.now()}`;
+    }
+
+    function startLuxriotPreview(options = {}) {
+        if (!luxriotPreviewImg || !luxriotViewport) return;
         const channelId = getSelectedLuxriotChannel();
-        if (!channelId) {
-            setLuxriotStatus('Select a channel to preview', true);
+        if (!Number.isFinite(channelId) || channelId <= 0) {
+            setLuxriotStatus('Select a channel to play video', true);
             return;
         }
-        stopLuxriotPreview();
-        releaseLuxriotPreviewObjectUrl();
-        if (luxriotViewport) luxriotViewport.classList.remove('is-signal-lost', 'is-signal-stale');
-        luxriotPreviewMeta = { width: 0, height: 0, loadedAt: 0, frameAgeSec: null, stale: false, staleAfterSec: 0, lostAfterSec: 0, failed: false, errorCode: '', errorText: '' };
-        updateLuxriotStreamContext();
-        const refresh = async () => {
-            if (currentMode !== 'video') return;
-            if (luxriotPreviewLoading) return;
-            luxriotPreviewLoading = true;
-            const requestSeq = ++luxriotPreviewRequestSeq;
-            const requestedChannelId = channelId;
-            if (luxriotOverlay) {
-                luxriotOverlay.textContent = 'Loading...';
-            }
-            abortLuxriotPreviewRequest();
-            const controller = new AbortController();
-            luxriotPreviewAbortController = controller;
-            const timeoutId = window.setTimeout(() => controller.abort(), 5000);
-            const clearActiveRequest = () => {
-                window.clearTimeout(timeoutId);
+        stopLuxriotPreview(false);
+        clearLuxriotPreviewVideo();
+        replaceLuxriotPreviewImageElement();
+        const requestSeq = ++luxriotPreviewRequestSeq;
+        const controller = new AbortController();
+        const cachedNegotiation = options.reuseNegotiation
+            && Number(luxriotPreviewNegotiation?.channelId) === channelId
+            ? luxriotPreviewNegotiation.value
+            : null;
+        luxriotPreviewAbortController = cachedNegotiation ? null : controller;
+        luxriotPreviewLoading = true;
+        const videoStream = selectedLuxriotStream(channelId, 'video');
+        const useAttentionPreview = Boolean(videoStream?.running) && !luxriotPreferFullOperatorMedia;
+        const mediaUrl = luxriotMediaBrokerUrl(
+            useAttentionPreview ? 'attention' : 'live',
+            channelId,
+            { stream: 'mainStream' },
+        );
+        syncLuxriotPreviewTransportButton(channelId);
+        setLuxriotOperatorMediaState('loading', {
+            width: 0,
+            height: 0,
+            loadedAt: 0,
+            mediaKind: '',
+            detail: useAttentionPreview
+                ? 'Opening the shared EVA attention preview without another recorder stream.'
+                : 'Negotiating full operator video through the same-origin broker.',
+        });
+
+        const negotiationRequest = cachedNegotiation
+            ? Promise.resolve(cachedNegotiation)
+            : negotiateLuxriotMedia(mediaUrl, controller);
+        void negotiationRequest
+            .then((negotiated) => {
                 if (luxriotPreviewAbortController === controller) {
                     luxriotPreviewAbortController = null;
                 }
-            };
-            const freshness = luxriotPreviewFreshnessLimits(requestedChannelId);
-            const maxAgeSec = freshness.lostAfterSec;
-            const previewUrl = `/luxriot/recent_frame/${requestedChannelId}?mode=latest&fallback=0&max_age_sec=${encodeURIComponent(String(maxAgeSec))}&t=${Date.now()}`;
-            try {
-                const response = await fetch(previewUrl, { cache: 'no-store', signal: controller.signal });
-                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
-                    clearActiveRequest();
-                    return;
-                }
-                if (!response.ok) {
-                    let body = {};
-                    try {
-                        body = await response.json();
-                    } catch (err) {
-                        body = {};
+                if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                luxriotPreviewNegotiation = { channelId, value: negotiated };
+                const failToStatic = (detail) => {
+                    if (luxriotPreviewTimer) {
+                        clearTimeout(luxriotPreviewTimer);
+                        luxriotPreviewTimer = null;
                     }
-                    clearActiveRequest();
-                    luxriotPreviewLoading = false;
-                    const code = String(body.error_code || (response.status === 503 ? 'signal_lost' : 'preview_error'));
-                    const detail = String(body.error || body.message || (code === 'signal_lost'
-                        ? 'Live signal is not currently reaching the EVA model.'
-                        : `Preview request failed with HTTP ${response.status}.`));
-                    setLuxriotPreviewSignalLost(code, detail);
-                    setLuxriotStatus(detail, true);
-                    return;
-                }
-                const contentType = String(response.headers.get('Content-Type') || '');
-                if (!contentType.toLowerCase().startsWith('image/')) {
-                    throw new Error('Preview endpoint did not return an image.');
-                }
-                const frameTimestampMs = Number(response.headers.get('X-EVA-Frame-Timestamp-Ms'));
-                const frameAgeSec = Number(response.headers.get('X-EVA-Frame-Age-Sec'));
-                const previewLoadedAt = Number.isFinite(frameTimestampMs) && frameTimestampMs > 0
-                    ? frameTimestampMs
-                    : Number.isFinite(frameAgeSec) && frameAgeSec >= 0
-                        ? Date.now() - (frameAgeSec * 1000)
-                        : Date.now();
-                const blob = await response.blob();
-                clearActiveRequest();
-                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
-                    return;
-                }
-                const objectUrl = URL.createObjectURL(blob);
-                const loader = new Image();
-                loader.decoding = 'async';
-                let imageSettled = false;
-                const imageTimeoutId = window.setTimeout(() => {
-                    if (imageSettled) return;
-                    imageSettled = true;
-                    URL.revokeObjectURL(objectUrl);
-                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
-                        return;
+                    if (luxriotPreviewRenewTimer) {
+                        clearTimeout(luxriotPreviewRenewTimer);
+                        luxriotPreviewRenewTimer = null;
                     }
-                    luxriotPreviewLoading = false;
-                    setLuxriotPreviewSignalLost('preview_error', 'Preview image decode timed out.');
-                    setLuxriotStatus('Preview image decode timed out.', true);
-                }, 5000);
-                loader.onload = () => {
-                    if (imageSettled) return;
-                    imageSettled = true;
-                    window.clearTimeout(imageTimeoutId);
-                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
-                        URL.revokeObjectURL(objectUrl);
-                        return;
-                    }
-                    releaseLuxriotPreviewObjectUrl();
-                    luxriotPreviewObjectUrl = objectUrl;
-                    luxriotPreviewLoading = false;
-                    luxriotPreviewImg.src = objectUrl;
-                    const stale = Number.isFinite(frameAgeSec) && frameAgeSec > freshness.staleAfterSec;
-                    if (luxriotViewport) {
-                        luxriotViewport.classList.remove('is-signal-lost');
-                        luxriotViewport.classList.toggle('is-signal-stale', stale);
-                    }
-                    luxriotPreviewMeta = {
-                        width: Number(loader.naturalWidth) || 0,
-                        height: Number(loader.naturalHeight) || 0,
-                        loadedAt: previewLoadedAt,
-                        frameAgeSec: Number.isFinite(frameAgeSec) ? frameAgeSec : null,
-                        stale,
-                        staleAfterSec: freshness.staleAfterSec,
-                        lostAfterSec: freshness.lostAfterSec,
-                        failed: false,
-                        errorCode: '',
-                        errorText: '',
+                    clearLuxriotPreviewStallWatchdog();
+                    showLuxriotStaticFrameFallback(requestSeq, channelId, detail);
+                };
+                luxriotPreviewTimer = window.setTimeout(() => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    failToStatic('Live media load timed out.');
+                }, 12000);
+                if (negotiated.mediaKind === 'mjpeg') {
+                    luxriotPreviewImg.onload = () => {
+                        if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                        if (luxriotPreviewTimer) {
+                            clearTimeout(luxriotPreviewTimer);
+                            luxriotPreviewTimer = null;
+                        }
+                        luxriotPreviewLoading = false;
+                        luxriotPreviewImg.style.display = 'block';
+                        setLuxriotOperatorMediaState('playing', {
+                            width: Number(luxriotPreviewImg.naturalWidth) || 0,
+                            height: Number(luxriotPreviewImg.naturalHeight) || 0,
+                            loadedAt: Date.now(),
+                            mediaKind: negotiated.attentionPreview ? 'attention' : 'mjpeg',
+                            detail: negotiated.attentionPreview
+                                ? 'The exact selected per-second EVA attention frames are playing without a second Evo stream.'
+                                : 'Continuous MJPEG operator media is playing.',
+                        });
+                        setLuxriotStatus(
+                            negotiated.attentionPreview
+                                ? `Playing EVA attention preview for channel ${channelId}`
+                                : `Playing MJPEG video for channel ${channelId}`
+                        );
                     };
-                    if (luxriotOverlay) luxriotOverlay.textContent = stale ? 'Processing delay' : '';
-                    updateLuxriotStreamContext();
-                    setLuxriotStatus(stale
-                        ? `Previewing delayed EVA frame for channel ${requestedChannelId}`
-                        : `Previewing channel ${requestedChannelId}`);
-                };
-                loader.onerror = () => {
-                    if (imageSettled) return;
-                    imageSettled = true;
-                    window.clearTimeout(imageTimeoutId);
-                    URL.revokeObjectURL(objectUrl);
-                    if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
-                        return;
-                    }
-                    luxriotPreviewLoading = false;
-                    setLuxriotPreviewSignalLost('preview_error', 'Preview image could not be decoded.');
-                    setLuxriotStatus('Preview image could not be decoded.', true);
-                };
-                loader.src = objectUrl;
-            } catch (err) {
-                clearActiveRequest();
-                if (requestSeq !== luxriotPreviewRequestSeq || getSelectedLuxriotChannel() !== requestedChannelId) {
+                    luxriotPreviewImg.onerror = () => failToStatic('The MJPEG media stream could not be decoded.');
+                    luxriotPreviewImg.style.display = 'block';
+                    scheduleLuxriotPreviewRenewal(
+                        requestSeq,
+                        channelId,
+                        negotiated.renewAfterMs,
+                        negotiated.attentionPreview
+                            ? 'Renewing the bounded EVA attention preview.'
+                            : 'Renewing the bounded MJPEG connection before its server lease expires.',
+                    );
+                    luxriotPreviewImg.src = `${mediaUrl}&request=${Date.now()}`;
                     return;
                 }
-                luxriotPreviewLoading = false;
-                const aborted = err && err.name === 'AbortError';
-                const message = aborted ? 'Preview request timed out.' : (err && err.message ? err.message : 'Preview request failed.');
-                setLuxriotPreviewSignalLost('preview_error', message);
-                setLuxriotStatus(message, true);
-            }
-        };
-        refresh();
-        const intervalMs = Math.max(1000, Math.min(2000, (luxriotDefaults.snapshotInterval || 5) * 1000));
-        luxriotPreviewTimer = setInterval(refresh, intervalMs);
+
+                const video = ensureLuxriotPreviewVideo();
+                if (!video) {
+                    failToStatic('The browser video element could not be initialized.');
+                    return;
+                }
+                video.style.display = 'block';
+                const markPlayable = (detail) => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    if (luxriotPreviewTimer) {
+                        clearTimeout(luxriotPreviewTimer);
+                        luxriotPreviewTimer = null;
+                    }
+                    clearLuxriotPreviewStallWatchdog();
+                    luxriotPreviewLoading = false;
+                    setLuxriotOperatorMediaState('playing', {
+                        width: Number(video.videoWidth) || 0,
+                        height: Number(video.videoHeight) || 0,
+                        loadedAt: Date.now(),
+                        mediaKind: 'video',
+                        detail,
+                    });
+                };
+                video.onloadedmetadata = () => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    luxriotPreviewMeta.width = Number(video.videoWidth) || 0;
+                    luxriotPreviewMeta.height = Number(video.videoHeight) || 0;
+                    updateLuxriotStreamContext();
+                };
+                video.oncanplay = () => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    markPlayable('Browser-playable operator video is ready.');
+                    const playPromise = video.play();
+                    if (playPromise && typeof playPromise.catch === 'function') {
+                        playPromise.catch(() => {
+                            if (isCurrentLuxriotMediaRequest(requestSeq, channelId)) {
+                                markPlayable('Video is ready; press Play if browser autoplay is blocked.');
+                            }
+                        });
+                    }
+                };
+                video.onplaying = () => {
+                    markPlayable('Operator video is playing independently of EVA analytics.');
+                    setLuxriotStatus(`Playing live video for channel ${channelId}`);
+                };
+                const markBuffering = () => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    setLuxriotOperatorMediaState('loading', {
+                        mediaKind: 'video',
+                        detail: 'Live video transport is buffering.',
+                        overlay: 'Buffering video…',
+                    });
+                    armLuxriotPreviewStallWatchdog(requestSeq, channelId);
+                };
+                video.onwaiting = markBuffering;
+                video.onstalled = markBuffering;
+                video.onprogress = clearLuxriotPreviewStallWatchdog;
+                video.ontimeupdate = clearLuxriotPreviewStallWatchdog;
+                video.onerror = () => failToStatic('The browser rejected the Luxriot video container or codec.');
+                video.onended = () => {
+                    if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                    clearLuxriotPreviewStallWatchdog();
+                    setLuxriotOperatorMediaState('loading', {
+                        mediaKind: 'video',
+                        detail: 'The bounded media segment ended; reconnecting.',
+                        overlay: 'Reconnecting video…',
+                    });
+                    scheduleLuxriotPreviewRenewal(requestSeq, channelId, 750, 'The bounded media segment ended; reconnecting.');
+                };
+                scheduleLuxriotPreviewRenewal(
+                    requestSeq,
+                    channelId,
+                    negotiated.renewAfterMs,
+                    'Renewing the bounded video connection before its server lease expires.',
+                );
+                video.src = `${mediaUrl}&request=${Date.now()}`;
+                video.load();
+            })
+            .catch((error) => {
+                if (luxriotPreviewAbortController === controller) {
+                    luxriotPreviewAbortController = null;
+                }
+                if (!isCurrentLuxriotMediaRequest(requestSeq, channelId)) return;
+                const timedOut = controller.signal.aborted;
+                showLuxriotStaticFrameFallback(
+                    requestSeq,
+                    channelId,
+                    timedOut ? 'Live media negotiation timed out.' : (error.message || 'Live video is unavailable.'),
+                    error && error.fallbackUrl,
+                );
+            });
     }
 
     function setRoadSceneGroundingConfidence(value) {
@@ -2936,6 +4579,125 @@
         luxriotSummaryMeta.classList.toggle('error', Boolean(isError));
     }
 
+    function isLiveSummaryPeriod() {
+        return normalizeSummaryRangePreset(luxriotSummaryRangePreset) === 'live';
+    }
+
+    function resetSummaryArchivePaging() {
+        luxriotSummaryArchiveOffset = 0;
+        luxriotSummaryArchiveHasMore = false;
+        luxriotSummaryArchiveEvidenceTotal = 0;
+        luxriotSummaryArchiveLoading = false;
+        if (luxriotSummaryLoadEarlierBtn) {
+            luxriotSummaryLoadEarlierBtn.classList.add('is-hidden');
+            luxriotSummaryLoadEarlierBtn.disabled = false;
+            luxriotSummaryLoadEarlierBtn.textContent = '← Load earlier';
+        }
+    }
+
+    function updateSummaryArchivePagingUI() {
+        if (!luxriotSummaryLoadEarlierBtn) return;
+        const show = !isLiveSummaryPeriod()
+            && !isRollupViewActive()
+            && (luxriotSummaryArchiveHasMore || luxriotSummaryArchiveLoading);
+        luxriotSummaryLoadEarlierBtn.classList.toggle('is-hidden', !show);
+        luxriotSummaryLoadEarlierBtn.disabled = luxriotSummaryArchiveLoading;
+        luxriotSummaryLoadEarlierBtn.textContent = luxriotSummaryArchiveLoading
+            ? '← Loading earlier…'
+            : '← Load earlier';
+    }
+
+    function showLuxriotSummaryLoading(label = 'Loading descriptions…', preserveRows = false) {
+        if (!luxriotSummaries) return;
+        luxriotSummaries.setAttribute('aria-busy', 'true');
+        luxriotSummaries.classList.add('is-loading-history');
+        setLuxriotSummaryMeta(`${label} · ${summaryPeriodLabel()}`);
+        if (!preserveRows) {
+            luxriotSummaries.innerHTML = `
+                <div class="luxriot-feed-loading" role="status" aria-live="polite">
+                    <span class="luxriot-feed-loading-spinner" aria-hidden="true"></span>
+                    <strong>${escapeHtml(label)}</strong>
+                    <span>${escapeHtml(summaryPeriodLabel())}</span>
+                </div>
+            `;
+        }
+    }
+
+    function finishLuxriotSummaryLoading() {
+        if (!luxriotSummaries) return;
+        luxriotSummaries.removeAttribute('aria-busy');
+        luxriotSummaries.classList.remove('is-loading-history');
+    }
+
+    function archiveSummaryBatchKey(log) {
+        return [
+            String(log?.run_id || ''),
+            Number(log?.batch_start_ms || 0),
+            Number(log?.batch_end_ms || 0),
+        ].join('|');
+    }
+
+    async function refreshLuxriotArchivedSummaries(channelId, requestContext = null, append = false) {
+        if (!channelId || luxriotSummaryArchiveLoading) return false;
+        const requestKey = luxriotSummaryRequestKey(channelId);
+        const offset = append ? luxriotSummaryArchiveOffset : 0;
+        const pageLimit = 120;
+        const bounds = getSummaryEffectiveBounds();
+        const params = new URLSearchParams({
+            channel_id: String(channelId),
+            limit: String(pageLimit),
+            offset: String(offset),
+        });
+        if (Number.isFinite(bounds.fromTs)) params.set('from_ts', String(bounds.fromTs));
+        if (Number.isFinite(bounds.toTs)) params.set('to_ts', String(bounds.toTs));
+        luxriotSummaryArchiveLoading = true;
+        updateSummaryArchivePagingUI();
+        showLuxriotSummaryLoading(append ? 'Loading earlier descriptions…' : 'Loading archived descriptions…', append);
+        try {
+            const response = await fetch(`/luxriot/history?${params.toString()}`, {
+                signal: requestContext?.controller?.signal,
+            });
+            const data = await parseApiJson(response, 'Failed to load archived descriptions');
+            const stillCurrent = requestContext
+                ? isCurrentLuxriotSummaryRequest(requestContext)
+                : (
+                    currentMode === 'video'
+                    && Number(getSelectedSummaryChannel()) === Number(channelId)
+                    && luxriotSummaryRequestKey(channelId) === requestKey
+                );
+            if (!stillCurrent) return false;
+            const pageLogs = Array.isArray(data.logs) ? data.logs : [];
+            const combined = new Map();
+            if (append) {
+                (Array.isArray(luxriotSummaryLogCache) ? luxriotSummaryLogCache : []).forEach((log) => {
+                    combined.set(archiveSummaryBatchKey(log), log);
+                });
+            }
+            pageLogs.forEach((log) => combined.set(archiveSummaryBatchKey(log), log));
+            luxriotSummaryArchiveOffset = offset + pageLogs.length;
+            luxriotSummaryArchiveEvidenceTotal = Math.max(0, Number(data.total || 0));
+            luxriotSummaryArchiveHasMore = Boolean(data.has_more);
+            renderLuxriotSummaries(Array.from(combined.values()), channelId);
+            const channelLabel = getLuxriotChannelLabel(channelId);
+            const batchCount = combined.size;
+            const pageLabel = luxriotSummaryArchiveHasMore ? ' · more available' : ' · complete period';
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(
+                `${channelLabel} · Observations · ${batchCount} loaded of ${luxriotSummaryArchiveEvidenceTotal} archived batches${pageLabel} · all runs · ${getSummaryRangeLabel()}`
+            ));
+            setLuxriotStatus(`Loaded ${batchCount} archived description batches`);
+            return true;
+        } catch (error) {
+            if (error && error.name === 'AbortError') return false;
+            setLuxriotSummaryMeta(`Failed to load archived descriptions: ${error.message || 'Unknown error'}`, true);
+            setLuxriotStatus(error.message || 'Failed to load archived descriptions', true);
+            return false;
+        } finally {
+            luxriotSummaryArchiveLoading = false;
+            finishLuxriotSummaryLoading();
+            updateSummaryArchivePagingUI();
+        }
+    }
+
     const SUMMARY_ALERT_SEVERITIES = ['critical', 'high', 'normal', 'low', 'info'];
 
     function normalizeSummaryAlertCounts(row) {
@@ -2975,6 +4737,38 @@
         const level = String(levelLabel || row?.level || 'L0').trim().toUpperCase();
         const title = `${level || 'Summary'} alerts`;
         return `<span class="summary-alert-badges" title="${escapeHtml(title)}"><span class="summary-alert-level">${escapeHtml(level || 'L0')}</span>${parts.join('')}</span>`;
+    }
+
+    function summaryBurstAttention(row) {
+        const attention = row?.vector_signal?.capture_attention;
+        const seconds = attention && typeof attention === 'object' && Array.isArray(attention.seconds)
+            ? attention.seconds
+            : [];
+        const bursts = seconds.filter((item) => (
+            item && typeof item === 'object' && String(item.mode || '').trim().toLowerCase() === 'burst'
+        ));
+        if (!bursts.length) return null;
+        const activityValues = bursts
+            .map((item) => Number(item.activity_x))
+            .filter((value) => Number.isFinite(value) && value >= 0);
+        const snapshots = bursts
+            .map((item) => String(item.snapshot ?? '').trim())
+            .filter(Boolean);
+        return {
+            count: bursts.length,
+            maxActivity: activityValues.length ? Math.max(...activityValues) : null,
+            snapshots,
+        };
+    }
+
+    function renderSummaryBurstAttentionChip(row) {
+        const burst = summaryBurstAttention(row);
+        if (!burst) return '';
+        const maxLabel = Number.isFinite(burst.maxActivity) ? ` (max ${burst.maxActivity.toFixed(1)}×)` : '';
+        const label = `⚡ burst ×${burst.count}${maxLabel}`;
+        const snapshotLabel = burst.snapshots.length ? burst.snapshots.join(', ') : 'n/a';
+        const title = `Motion far above this channel's measured norm; snapshot numbers: ${snapshotLabel}`;
+        return `<span class="summary-attention-chip" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
     }
 
     function withSummaryUpdatedMeta(text) {
@@ -3043,8 +4837,7 @@
                 const createdMs = Number.isFinite(createdAtSec) && createdAtSec > 0 ? Math.round(createdAtSec * 1000) : 0;
                 const batchStartMs = Number(log.batch_start_ms || log.window_start_ms || 0);
                 const batchEndMs = Number(log.batch_end_ms || log.window_end_ms || 0);
-                const ts = createdMs ? new Date(createdMs) : null;
-                const tsLabel = ts ? ts.toLocaleString() : 'n/a';
+                const tsLabel = createdMs ? formatSummaryLocalTimestamp(createdAtSec) : 'n/a';
                 const frameLabel = log.frame_count ? `${log.frame_count} frames` : '';
                 const modelLabel = String(log.model || '').trim();
                 const rowChannelId = parseInt(String(log?.channel_id ?? channelId), 10);
@@ -3052,6 +4845,21 @@
                 const channelLabel = Number.isFinite(rowChannelId)
                     ? getLuxriotChannelLabel(rowChannelId)
                     : 'Unknown channel';
+                if (log.coverage_gap) {
+                    const gapWindow = Number.isFinite(batchStartMs) && batchStartMs > 0 && Number.isFinite(batchEndMs) && batchEndMs > batchStartMs
+                        ? `${formatSummaryLocalTimestamp(batchStartMs / 1000)}–${formatSummaryLocalTimestamp(batchEndMs / 1000)}`
+                        : tsLabel;
+                    const gapReason = String(log.gap_reason || 'dropped batch').replace(/_/g, ' ');
+                    return `
+                        <div class="luxriot-summary luxriot-summary-gap" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(gapWindow)} · <strong>coverage gap</strong> — no description exists for this window (${escapeHtml(gapReason)})</div>
+                        </div>
+                    `;
+                }
+                const coalescedBatches = Number(log.coalesced?.batches || 0);
+                const coalescedLabel = coalescedBatches > 1
+                    ? ` · coalesced ×${coalescedBatches}`
+                    : '';
                 const summary = String(log.summary || '').trim();
                 const summaryParts = splitSummaryAndJson(summary);
                 const summaryMain = summaryParts.main || summary;
@@ -3060,13 +4868,30 @@
                 const canBookmark = userHasPermission('bookmarks:create');
                 const collapsed = isSummaryCollapsed(channelId, logKey);
                 const alertBadges = renderSummaryAlertBadges(log, 'L0');
+                const attentionBadge = renderSummaryBurstAttentionChip(log);
+                const thumbnailDetectionId = Number(log.thumbnail_detection_id);
+                const thumbnailRole = String(log.thumbnail_role || 'sample').replace(/_/g, ' ');
+                const thumbnailSelectionSource = String(log.thumbnail_selection_source || '').replace(/_/g, ' ');
+                const thumbnailIsCover = Boolean(log.thumbnail_is_cover);
+                const coverReason = String(log.cover_reason || '').trim();
+                const thumbnailTitle = coverReason
+                    ? `Open the archived VLM input batch · cover: ${coverReason}`
+                    : 'Open the archived VLM input batch';
+                const thumbnailMarkup = Number.isFinite(thumbnailDetectionId) && thumbnailDetectionId > 0
+                    ? `
+                        <button class="luxriot-summary-thumbnail" type="button" data-luxriot-summary-thumbnail="${idx}" title="${escapeHtml(thumbnailTitle)}">
+                            <img src="/detections/thumbnail/${Math.trunc(thumbnailDetectionId)}" alt="Representative frame submitted to the VLM" loading="lazy">
+                            <span>VLM input${thumbnailIsCover ? ' · cover' : ''} · ${escapeHtml(thumbnailRole)}${thumbnailSelectionSource ? ` · ${escapeHtml(thumbnailSelectionSource)}` : ''}</span>
+                        </button>
+                    `
+                    : '';
                 const bookmarkButton = canBookmark
                     ? `<button class="feature-btn luxriot-bookmark-btn" data-luxriot-bookmark="${idx}" ${hasSummaryText ? '' : 'disabled'}>Bookmark</button>`
                     : '';
                 return `
                     <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(logKey)}" data-summary-index="${idx}" data-summary-created-ms="${createdMs || ''}" data-summary-batch-start-ms="${Number.isFinite(batchStartMs) && batchStartMs > 0 ? batchStartMs : ''}" data-summary-batch-end-ms="${Number.isFinite(batchEndMs) && batchEndMs > 0 ? batchEndMs : ''}">
                         <div class="luxriot-summary-head">
-                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}</div>
+                            <div class="timestamp"><span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${tsLabel}${frameLabel ? ` · ${frameLabel}` : ''}${coalescedLabel}${modelLabel ? ` · ${escapeHtml(modelLabel)}` : ''}${alertBadges}${attentionBadge}</div>
                             <div class="luxriot-summary-actions">
                                 <button class="feature-btn luxriot-summary-action-btn" data-luxriot-collapse="${idx}">
                                     ${collapsed ? 'Expand' : 'Collapse'}
@@ -3080,7 +4905,10 @@
                                 ${bookmarkButton}
                             </div>
                         </div>
-                        <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson, 'Machine JSON', summaryParts.marker)}</div>
+                        <div class="luxriot-summary-content ${thumbnailMarkup ? 'has-thumbnail' : ''}">
+                            ${thumbnailMarkup}
+                            <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson, 'Machine JSON', summaryParts.marker)}</div>
+                        </div>
                     </div>
                 `;
             })
@@ -3105,8 +4933,8 @@
     function formatRollupRange(windowStart, windowEnd) {
         const start = Number(windowStart);
         const end = Number(windowEnd);
-        const startLabel = Number.isFinite(start) ? new Date(start * 1000).toLocaleString() : 'n/a';
-        const endLabel = Number.isFinite(end) ? new Date(end * 1000).toLocaleString() : 'n/a';
+        const startLabel = Number.isFinite(start) ? formatSummaryLocalTimestamp(start) : 'n/a';
+        const endLabel = Number.isFinite(end) ? formatSummaryLocalTimestamp(end) : 'n/a';
         return `${startLabel} -> ${endLabel}`;
     }
 
@@ -3173,6 +5001,62 @@
         setLuxriotStatus(`Exported ${filename}`);
     }
 
+    async function generateLuxriotSemanticRollup(rowIndex, triggerBtn = null) {
+        const idx = Number.isFinite(rowIndex) ? rowIndex : parseInt(String(rowIndex || ''), 10);
+        if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryRollupRows.length) return;
+        const row = luxriotSummaryRollupRows[idx] || {};
+        const channelId = Number(row?.channel_id) || getSelectedSummaryChannel();
+        const level = normalizeSummaryLevel(row?.level || luxriotSummaryLevel);
+        const windowStart = Number(row?.window_start);
+        const windowEnd = Number(row?.window_end);
+        if (!Number.isFinite(channelId) || !Number.isFinite(windowStart) || !Number.isFinite(windowEnd)) return;
+        const params = new URLSearchParams({
+            channel_id: String(channelId),
+            run: 'all',
+            from_ts: String(windowStart),
+            to_ts: String(Math.max(windowStart, windowEnd - 0.001)),
+            level_limit: '1',
+            target_level: level,
+            synthesize: '1',
+        });
+        const originalLabel = triggerBtn ? triggerBtn.textContent : '';
+        if (triggerBtn) {
+            triggerBtn.disabled = true;
+            triggerBtn.textContent = 'Generating…';
+        }
+        setLuxriotStatus(`Generating ${level} semantic summary for ${getLuxriotChannelLabel(channelId)}…`);
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 60000);
+        try {
+            const response = await fetch(`/luxriot/rollups?${params.toString()}`, {
+                cache: 'no-store',
+                signal: controller.signal,
+            });
+            const data = await parseApiJson(response, 'Semantic rollup generation failed');
+            const rows = Array.isArray(data?.levels?.[level]) ? data.levels[level] : [];
+            const generated = rows.find((candidate) => String(candidate?.rollup_id || '') === String(row?.rollup_id || '')) || rows[0];
+            const kind = String(generated?.summary_kind || '').trim().toLowerCase();
+            if (!['llm', 'llm_cached'].includes(kind)) {
+                const reason = String(generated?.generation_error || generated?.generation_status || 'LM unavailable');
+                throw new Error(`Semantic pass did not complete: ${reason}`);
+            }
+            setLuxriotStatus(`${level} semantic summary generated`);
+            await refreshLuxriotSummaryView(getSelectedSummaryChannel(), true, false);
+        } catch (error) {
+            if (error?.name === 'AbortError') {
+                setLuxriotStatus('Semantic pass remains queued behind live descriptions and will appear automatically.');
+            } else {
+                setLuxriotStatus(error.message || 'Semantic rollup generation failed', true);
+            }
+        } finally {
+            window.clearTimeout(timeoutId);
+            if (triggerBtn) {
+                triggerBtn.disabled = false;
+                triggerBtn.textContent = originalLabel || 'Retry semantic';
+            }
+        }
+    }
+
     function pushSummaryRollupContext(level, sourceIds = null, label = '') {
         const normalized = normalizeSummaryLevel(level);
         const ids = Array.isArray(sourceIds)
@@ -3184,6 +5068,7 @@
             label: String(label || normalized).trim() || normalized,
         });
         luxriotSummaryLevel = normalized;
+        luxriotSummaryResolutionMode = normalized;
         if (luxriotSummaryLevelSelect) {
             luxriotSummaryLevelSelect.value = normalized;
         }
@@ -3196,6 +5081,7 @@
         luxriotSummaryRollupStack.pop();
         const ctx = getCurrentSummaryRollupContext();
         luxriotSummaryLevel = normalizeSummaryLevel(ctx?.level || 'L0');
+        luxriotSummaryResolutionMode = luxriotSummaryLevel;
         if (luxriotSummaryLevelSelect) {
             luxriotSummaryLevelSelect.value = luxriotSummaryLevel;
         }
@@ -3250,6 +5136,8 @@
             const sourceLevel = String(row?.source_level || '').trim();
             const sourceIds = Array.isArray(row?.source_ids) ? row.source_ids : [];
             const summary = String(row?.summary || '').trim();
+            const summaryKind = String(row?.summary_kind || 'queued').trim().toLowerCase();
+            const generationStatus = String(row?.generation_status || summaryKind).trim().toLowerCase();
             const summaryParts = splitSummaryAndJson(summary);
             const summaryMain = summaryParts.main || summary;
             const summaryJson = summaryParts.json;
@@ -3257,18 +5145,48 @@
             const statsLabel = `${itemCount} items · ${frameCount} frames · ${runCount} runs${sourceTokens > 0 ? ` · ${sourceTokens} tok` : ''}`;
             const sourceLabel = canDrill ? `${sourceIds.length} from ${sourceLevel}` : 'source base';
             const alertBadges = renderSummaryAlertBadges(row, rowLevel);
+            const semanticReady = ['llm', 'llm_cached', 'legacy_cached'].includes(summaryKind);
+            const legacySemantic = summaryKind === 'legacy_cached';
+            const pending = summaryKind === 'pending_context' || generationStatus === 'pending';
+            const queued = summaryKind === 'queued' || generationStatus === 'queued' || generationStatus === 'deferred';
+            const semanticRefreshPending = generationStatus === 'refresh_pending' || row?.semantic_refresh_pending === true;
+            const statusLabel = semanticReady
+                ? (legacySemantic
+                    ? 'semantic · legacy'
+                    : semanticRefreshPending
+                    ? 'semantic · refreshing'
+                    : (summaryKind === 'llm_cached' ? 'semantic · cached' : 'semantic'))
+                : pending
+                    ? 'aggregation pending'
+                    : queued
+                        ? 'semantic queued'
+                        : 'semantic retry available';
+            const statusClass = semanticReady ? 'ready' : pending ? 'pending' : queued ? 'queued' : 'degraded';
+            const statusTitle = semanticRefreshPending
+                ? 'Showing the last completed semantic narrative while newly retained source observations are folded into this closed window.'
+                : legacySemantic
+                ? 'Imported from the pre-0.8.4 semantic history without regenerating the original operator narrative.'
+                : statusClass === 'degraded'
+                ? 'The semantic pass did not complete; source observations remain available and the window can be retried.'
+                : statusClass === 'queued'
+                    ? 'Background semantic aggregation is queued behind live descriptions.'
+                : statusLabel;
+            const generateButton = !semanticReady && !pending
+                ? `<button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-generate="${idx}">${queued ? 'Generate now' : 'Retry semantic'}</button>`
+                : '';
             return `
                 <div class="luxriot-summary ${collapsed ? 'is-collapsed' : ''}" data-log-key="${escapeHtml(rollupKey)}">
                     <div class="luxriot-summary-head">
-                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}${alertBadges}</div>
+                        <div class="timestamp"><span class="luxriot-summary-rollup-pill">${escapeHtml(rowLevel)}</span> <span class="luxriot-rollup-status ${escapeHtml(statusClass)}" title="${escapeHtml(statusTitle)}">${escapeHtml(statusLabel)}</span> <span class="luxriot-summary-channel-pill" title="${escapeHtml(channelLabel)}">${escapeHtml(channelTag)}</span> ${escapeHtml(rangeLabel)} · ${escapeHtml(statsLabel)} · ${escapeHtml(sourceLabel)}${alertBadges}</div>
                         <div class="luxriot-summary-actions">
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-collapse="${idx}">${collapsed ? 'Expand' : 'Collapse'}</button>
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-copy="${idx}">Copy</button>
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-export="${idx}">Export</button>
+                            ${generateButton}
                             <button class="feature-btn luxriot-summary-action-btn" data-luxriot-rollup-drill="${idx}" ${canDrill ? '' : 'disabled'}>${canDrill ? `Drill ${escapeHtml(sourceLevel)}` : 'No source'}</button>
                         </div>
                     </div>
-                    <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson)}</div>
+                    <div class="summary-body">${renderMarkdown(summaryMain)}${renderSummaryMachineJson(summaryJson, 'Machine JSON', summaryParts.marker)}</div>
                 </div>
             `;
         }).join('');
@@ -3285,18 +5203,56 @@
         return rows.length;
     }
 
-    async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+    async function refreshLuxriotRollups(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true, requestContext = null) {
         if (!channelId) return;
         if (!luxriotSummaryAutoRefresh && !force) return;
+        const progressStartedAt = Date.now();
+        let progressTimer = null;
+        let admissionHint = '';
+        const rollupContext = getCurrentSummaryRollupContext();
+        const targetLevel = normalizeSummaryLevel(rollupContext?.level || luxriotSummaryLevel);
+        const aggregationLabel = targetLevel === 'L0'
+            ? 'Loading L0 rollup source…'
+            : `Aggregating ${targetLevel}…`;
+        const renderAggregationProgress = () => {
+            if (!isCurrentLuxriotSummaryRequest(requestContext)) return;
+            const elapsedSec = Math.max(0, (Date.now() - progressStartedAt) / 1000);
+            const detail = `${aggregationLabel} ${elapsedSec.toFixed(1)}s${admissionHint ? ` · ${admissionHint}` : ''}`;
+            setLuxriotSummaryMeta(detail);
+            setLuxriotStatus(detail);
+        };
         try {
+            showLuxriotSummaryLoading(aggregationLabel);
             const params = buildSummaryQueryParams(channelId);
             params.set('level_limit', '240');
-            const resp = await fetch(`/luxriot/rollups?${params.toString()}`);
+            params.set('target_level', targetLevel);
+            renderAggregationProgress();
+            progressTimer = window.setInterval(renderAggregationProgress, 500);
+            void fetch(`/lm/admission?t=${Date.now()}`, {
+                cache: 'no-store',
+                signal: requestContext?.controller?.signal,
+            }).then(async (response) => {
+                const admission = await response.json().catch(() => ({}));
+                if (!response.ok || !isCurrentLuxriotSummaryRequest(requestContext)) return;
+                const active = Number(admission.active || 0);
+                const queued = Number(admission.queued || 0);
+                admissionHint = queued > 0
+                    ? `shared LM queue ${queued} queued · ${active} active`
+                    : active > 0
+                        ? `shared LM ${active} active`
+                        : '';
+                renderAggregationProgress();
+            }).catch(() => {
+                // Admission diagnostics are optional; the rollup request remains authoritative.
+            });
+            const resp = await fetch(`/luxriot/rollups?${params.toString()}`, {
+                signal: requestContext?.controller?.signal,
+            });
             const data = await resp.json();
+            if (!isCurrentLuxriotSummaryRequest(requestContext)) return false;
             if (data.error) {
                 throw new Error(data.error);
             }
-            if (currentMode !== 'video') return;
             syncSummaryRunSelectOptions(data.runs, data.selected_run);
             syncSummaryFiltersFromResponse(data);
             const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
@@ -3312,36 +5268,90 @@
                 if (currentMode === 'video') {
                     refreshLuxriotSummaryView(channelId, true, false);
                 }
-                return;
+                return false;
             }
             luxriotSummaryRollupCache[channelId] = data;
             const renderedCount = renderLuxriotRollups(data, channelId);
+            if (
+                renderedCount === 0
+                && normalizeSummaryResolutionMode(luxriotSummaryResolutionMode) === 'AUTO'
+                && !isLiveSummaryPeriod()
+                && !(Array.isArray(rollupContext?.sourceIds) && rollupContext.sourceIds.length)
+            ) {
+                luxriotSummaryLevel = 'L0';
+                luxriotSummaryRollupStack = [{ level: 'L0', sourceIds: null, label: 'L0' }];
+                if (luxriotSummaryLevelSelect) luxriotSummaryLevelSelect.value = 'AUTO';
+                setLuxriotSummaryMeta('No precomputed rollup covers this period · loading archived observations…');
+                window.setTimeout(() => {
+                    if (currentMode === 'video' && Number(getSelectedSummaryChannel()) === Number(channelId)) {
+                        void refreshLuxriotSummaryView(channelId, true, false);
+                    }
+                }, 0);
+                return true;
+            }
             const counts = data.source_counts && typeof data.source_counts === 'object' ? data.source_counts : {};
             const ctx = getCurrentSummaryRollupContext();
             const level = normalizeSummaryLevel(ctx?.level || luxriotSummaryLevel);
             const drillLabel = ctx?.sourceIds ? ` · drill ${ctx.sourceIds.length}` : '';
             const runLabel = luxriotSummaryRunFilter || 'latest';
-            const countsLabel = `L1 ${Number(counts.L1 || 0)} · L2 ${Number(counts.L2 || 0)} · L3 ${Number(counts.L3 || 0)}`;
+            const computedLevels = new Set(
+                Array.isArray(data.computed_levels)
+                    ? data.computed_levels.map((item) => String(item || '').toUpperCase())
+                    : ['L0', 'L1', 'L2', 'L3']
+            );
+            const countLabel = (rollupLevel) => computedLevels.has(rollupLevel)
+                ? String(Number(counts[rollupLevel] || 0))
+                : '—';
+            const countsLabel = `L1 ${countLabel('L1')} · L2 ${countLabel('L2')} · L3 ${countLabel('L3')}`;
             const pendingCount = luxriotSummaryRollupRows
                 .filter((row) => String(row?.summary_kind || '').trim() === 'pending_context')
+                .length;
+            const queuedCount = luxriotSummaryRollupRows
+                .filter((row) => {
+                    const kind = String(row?.summary_kind || '').trim().toLowerCase();
+                    const status = String(row?.generation_status || '').trim().toLowerCase();
+                    return kind === 'queued' || status === 'queued' || status === 'deferred';
+                })
+                .length;
+            const retryCount = luxriotSummaryRollupRows
+                .filter((row) => {
+                    const kind = String(row?.summary_kind || '').trim().toLowerCase();
+                    return kind && !['llm', 'llm_cached', 'legacy_cached', 'pending_context', 'queued'].includes(kind);
+                })
                 .length;
             const windowSecMap = data.window_sec && typeof data.window_sec === 'object' ? data.window_sec : {};
             const windowLabel = formatSummaryWindowLabel(windowSecMap[level]);
             const pendingLabel = pendingCount > 0 ? ` · pending ${pendingCount}` : '';
+            const queuedLabel = queuedCount > 0 ? ` · semantic queued ${queuedCount}` : '';
+            const retryLabel = retryCount > 0 ? ` · retry available ${retryCount}` : '';
             const waitLabel = renderedCount === 0 ? ` · waiting for ${level} window ${windowLabel}` : '';
+            const aggregationElapsed = Number(data.aggregation?.elapsed_sec);
+            const elapsedLabel = Number.isFinite(aggregationElapsed)
+                ? ` · aggregated ${aggregationElapsed.toFixed(1)}s`
+                : '';
             const channelLabel = getLuxriotChannelLabel(channelId);
-            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${waitLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(`${channelLabel} · ${level}${drillLabel} · ${renderedCount} items${pendingLabel}${queuedLabel}${retryLabel}${waitLabel}${elapsedLabel} · run ${runLabel} · ${getSummaryRangeLabel()} · ${countsLabel}`));
             setLuxriotStatus(`Rollup view ${level} · ${renderedCount} entries`);
+            return true;
         } catch (err) {
-            if (currentMode !== 'video') return;
+            if (err && err.name === 'AbortError') return false;
+            if (!isCurrentLuxriotSummaryRequest(requestContext)) return false;
             setLuxriotSummaryMeta('Failed to load rollups: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch rollups: ' + err.message, true);
+            return false;
+        } finally {
+            if (progressTimer) {
+                clearInterval(progressTimer);
+                progressTimer = null;
+            }
+            finishLuxriotSummaryLoading();
         }
     }
 
     async function refreshLuxriotSummaryView(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
         if (currentMode !== 'video') return false;
         if (!channelId) return;
+        const requestKey = luxriotSummaryRequestKey(channelId);
         if (luxriotSummaryRefreshInFlight) {
             const next = luxriotSummaryRefreshQueued || {};
             luxriotSummaryRefreshQueued = {
@@ -3349,20 +5359,34 @@
                 force: Boolean(force || next.force),
                 allowRunFallback: Boolean((allowRunFallback !== false) || (next.allowRunFallback !== false)),
             };
+            const active = luxriotSummaryActiveRequest;
+            if (active && (force || active.requestKey !== requestKey)) {
+                cancelLuxriotSummaryRequest();
+            }
             if (force) {
                 setLuxriotStatus('Refresh queued...');
             }
             return false;
         }
         luxriotSummaryRefreshInFlight = true;
+        const controller = new AbortController();
+        const requestContext = {
+            generation: ++luxriotSummaryRequestGeneration,
+            controller,
+            channelId: Number(channelId),
+            requestKey,
+        };
+        luxriotSummaryActiveRequest = requestContext;
         try {
             if (isRollupViewActive()) {
-                await refreshLuxriotRollups(channelId, force, allowRunFallback);
+                return await refreshLuxriotRollups(channelId, force, allowRunFallback, requestContext);
             } else {
-                await refreshLuxriotSummaries(channelId, force, allowRunFallback);
+                return await refreshLuxriotSummaries(channelId, force, allowRunFallback, requestContext);
             }
-            return true;
         } finally {
+            if (luxriotSummaryActiveRequest === requestContext) {
+                luxriotSummaryActiveRequest = null;
+            }
             luxriotSummaryRefreshInFlight = false;
             if (currentMode === 'video' && luxriotSummaryRefreshQueued) {
                 const next = luxriotSummaryRefreshQueued;
@@ -3453,6 +5477,7 @@
         updateProbeChannelRuntime(data, probeList.length > 0);
         luxriotStreamsCache = [...videoStreams, ...analyticsStreams];
         updateLuxriotStreamContext();
+        maybeSwitchLuxriotPreviewToAttention();
         const sortedVideo = videoStreams
             .slice()
             .sort((a, b) => (Number(a.channel_id) || 0) - (Number(b.channel_id) || 0));
@@ -3527,18 +5552,60 @@
                     const queued = Number(video?.pending_frames) || 0;
                     const flushes = Number(video?.flush_count) || 0;
                     const snapshotLatency = Number(video?.last_snapshot_latency_sec);
-                    const slowSnapshots = Number(video?.slow_snapshot_count) || 0;
                     const source = String(video?.active_capture_source || '').trim();
                     const segmentLatency = Number(video?.last_live_segment_latency_sec);
                     const segmentFrames = Number(video?.last_live_segment_frames) || 0;
+                    const segmentTargetSeconds = Number(video?.last_live_segment_target_seconds);
+                    const segmentSummaryTargetSeconds = Number(video?.last_live_segment_summary_target_seconds);
+                    const segmentRepresentedSeconds = Number(video?.last_live_segment_represented_seconds);
+                    const segmentInflight = Boolean(video?.live_segment_inflight);
+                    const segmentInflightTargetSeconds = Number(video?.live_segment_inflight_target_seconds);
+                    const segmentInflightRawBudget = Number(video?.live_segment_inflight_raw_frame_budget) || 0;
+                    const segmentInflightFrames = Number(video?.live_segment_inflight_frames) || 0;
+                    const segmentInflightRepresentedSeconds = Number(video?.live_segment_inflight_represented_seconds);
+                    const selectorEnabled = video?.capture_selector_enabled !== false;
+                    const selectorBias = String(video?.capture_selector_bias || 'auto').toLowerCase();
+                    const selectorSource = String(video?.capture_apex_last_selection?.selection_source || '').trim();
                     if (batch > 0) videoParts.push(`batch ${batch}`);
                     videoParts.push(`${queued} queued`);
+                    videoParts.push(
+                        selectorEnabled
+                            ? `selector ${selectorBias}${selectorSource ? `/${selectorSource.replaceAll('_', ' ')}` : ''}`
+                            : 'selector off/midpoint'
+                    );
                     if (source) videoParts.push(source);
                     if (Number.isFinite(snapshotLatency) && snapshotLatency > 0) videoParts.push(`snapshot ${snapshotLatency.toFixed(1)}s`);
-                    if (slowSnapshots > 0) videoParts.push('slow source');
+                    const currentSnapshotSlow = source !== 'live_segment'
+                        && Number.isFinite(snapshotLatency)
+                        && snapshotLatency >= Math.max(2, Number(video?.snapshot_slow_threshold_sec) || 0);
+                    if (currentSnapshotSlow) videoParts.push('slow snapshot');
                     if (Number.isFinite(segmentLatency) && segmentLatency > 0) videoParts.push(`segment ${segmentLatency.toFixed(1)}s/${segmentFrames}f`);
+                    if (
+                        Number.isFinite(segmentRepresentedSeconds)
+                        && Number.isFinite(segmentTargetSeconds)
+                        && segmentTargetSeconds > 0
+                    ) {
+                        const rate = segmentLatency > 0 ? segmentRepresentedSeconds / segmentLatency : null;
+                        videoParts.push(
+                            `attention ${segmentRepresentedSeconds.toFixed(1)}/${segmentTargetSeconds.toFixed(1)}s`
+                            + (Number.isFinite(rate) ? ` ${rate.toFixed(2)}x` : '')
+                        );
+                    }
+                    if (Number.isFinite(segmentSummaryTargetSeconds) && segmentSummaryTargetSeconds > 0) {
+                        videoParts.push(`describe every ${segmentSummaryTargetSeconds.toFixed(1)}s`);
+                    }
+                    if (segmentInflight) {
+                        videoParts.push(
+                            `capturing ${Number.isFinite(segmentInflightRepresentedSeconds) ? segmentInflightRepresentedSeconds.toFixed(1) : '?'}s`
+                            + (Number.isFinite(segmentInflightTargetSeconds) ? `/${segmentInflightTargetSeconds.toFixed(1)}s` : '')
+                            + (segmentInflightRawBudget > 0 ? ` · ${segmentInflightFrames}/${segmentInflightRawBudget} raw` : '')
+                        );
+                    }
                     if (flushes > 0) videoParts.push(`${flushes} flushes`);
-                    if (video?.last_error) videoParts.push('error');
+                    const issue = classifyLuxriotStreamIssue(video);
+                    if (issue.hardError) videoParts.push('error');
+                    else if (issue.backpressure) videoParts.push('aggregation backpressure');
+                    else if (Boolean(video?.summary_inflight) || Number(video?.summary_queue_depth) > 0) videoParts.push('aggregating');
                 }
                 const videoLine = isVideoRunning
                     ? `Video summaries: active${videoParts.length ? ` · ${videoParts.join(' · ')}` : ''}`
@@ -3932,18 +5999,29 @@
         renderLuxriotSummaries(luxriotSummaryLogCache, channelId);
     }
 
-    async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true) {
+    async function refreshLuxriotSummaries(channelId = getSelectedSummaryChannel(), force = false, allowRunFallback = true, requestContext = null) {
         if (!channelId) return;
+        if (!isLiveSummaryPeriod()) {
+            if (!force) return false;
+            return refreshLuxriotArchivedSummaries(channelId, requestContext, false);
+        }
         if (!luxriotSummaryAutoRefresh && !force) return;
         try {
+            showLuxriotSummaryLoading(
+                'Loading live descriptions…',
+                Array.isArray(luxriotSummaryLogCache) && luxriotSummaryLogCache.length > 0,
+            );
             const params = buildSummaryQueryParams(channelId);
             params.set('limit', '240');
-            const resp = await fetch(`/luxriot/session?${params.toString()}`);
+            params.set('view', 'feed');
+            const resp = await fetch(`/luxriot/session?${params.toString()}`, {
+                signal: requestContext?.controller?.signal,
+            });
             const data = await resp.json();
+            if (!isCurrentLuxriotSummaryRequest(requestContext)) return false;
             if (data.error) {
                 throw new Error(data.error);
             }
-            if (currentMode !== 'video') return;
             syncSummaryRunSelectOptions(data.runs, data.selected_run);
             syncSummaryFiltersFromResponse(data);
             const selectedRun = normalizeSummaryRun(luxriotSummaryRunFilter);
@@ -3959,7 +6037,7 @@
                 if (currentMode === 'video') {
                     refreshLuxriotSummaryView(channelId, true, false);
                 }
-                return;
+                return false;
             }
             renderLuxriotSummaries(data.logs || [], channelId);
             setLuxriotCaptureRunning(channelId, Boolean(data.running));
@@ -3973,30 +6051,43 @@
             const detailParts = [channelLabel, stateLabel, `${totalCount} entries`, `run ${luxriotSummaryRunFilter || 'latest'}`, getSummaryRangeLabel()];
             if (historyCount > 0) detailParts.push(`hist ${historyCount}`);
             if (typeof data.pending_frames === 'number' && data.pending_frames > 0) detailParts.push(`q ${data.pending_frames}`);
-            if (data.last_error) detailParts.push('err');
-            setLuxriotSummaryMeta(withSummaryUpdatedMeta(detailParts.join(' · ')), Boolean(data.last_error));
+            const streamIssue = classifyLuxriotStreamIssue(data);
+            if (streamIssue.hardError) detailParts.push('err');
+            else if (streamIssue.backpressure) detailParts.push('backpressure');
+            else if (Boolean(data.summary_inflight) || Number(data.summary_queue_depth) > 0) detailParts.push('aggregating');
+            setLuxriotSummaryMeta(withSummaryUpdatedMeta(detailParts.join(' · ')), Boolean(streamIssue.hardError));
             let baseStatus = data.running ? `Summaries running · batch ${data.batch_size || ''}` : 'Summaries stopped';
             if (typeof data.pending_frames === 'number' && data.pending_frames > 0) {
                 baseStatus += ` · ${data.pending_frames} frames queued`;
             }
-            setLuxriotStatus(baseStatus, Boolean(data.last_error));
-            if (data.last_error) {
-                luxriotStatusLabel.title = data.last_error;
+            if (streamIssue.backpressure) baseStatus += ' · aggregation backpressure';
+            else if (Boolean(data.summary_inflight) || Number(data.summary_queue_depth) > 0) baseStatus += ' · aggregating';
+            setLuxriotStatus(baseStatus, Boolean(streamIssue.hardError));
+            if (streamIssue.hardError || streamIssue.backpressureError) {
+                luxriotStatusLabel.title = streamIssue.hardError || streamIssue.backpressureError;
             }
             appendLuxriotStatusHealthBadge(data);
+            return true;
         } catch (err) {
-            if (currentMode !== 'video') return;
+            if (err && err.name === 'AbortError') return false;
+            if (!isCurrentLuxriotSummaryRequest(requestContext)) return false;
             setLuxriotSummaryMeta('Failed to load summaries: ' + (err.message || 'Unknown error'), true);
             setLuxriotStatus('Failed to fetch summaries: ' + err.message, true);
+            return false;
+        } finally {
+            finishLuxriotSummaryLoading();
         }
     }
 
     function startLuxriotSummaryPoll() {
-        stopLuxriotSummaryPoll();
+        if (luxriotSummaryTimer) {
+            clearInterval(luxriotSummaryTimer);
+            luxriotSummaryTimer = null;
+        }
         luxriotSummaryTimer = setInterval(() => {
             if (currentMode !== 'video') return;
             const channelId = getSelectedSummaryChannel();
-            refreshLuxriotSummaryView(channelId);
+            if (isLiveSummaryPeriod()) refreshLuxriotSummaryView(channelId);
             refreshLuxriotStreams();
         }, 8000);
     }
@@ -4007,7 +6098,15 @@
             setLuxriotStatus('Select a channel first', true);
             return;
         }
-        await refreshLuxriotPromptSettings(false, channelId);
+        const promptSettingsReady = await refreshLuxriotPromptSettings(false, channelId);
+        const selectedChannelId = getSelectedLuxriotChannel();
+        if (!promptSettingsReady || selectedChannelId !== channelId) {
+            const message = selectedChannelId !== channelId
+                ? 'Channel changed while prompt settings were loading; start summaries again for the selected channel.'
+                : 'Prompt settings could not be verified for this channel; summary start was cancelled.';
+            setLuxriotStatus(message, true);
+            return;
+        }
         const batchSize = luxriotBatchSizeSelect
             ? parseInt(luxriotBatchSizeSelect.value, 10)
             : luxriotDefaults.batchSize || 12;
@@ -4038,6 +6137,7 @@
             if (!resp.ok || data.error) {
                 throw new Error(data.error || 'Luxriot start failed');
             }
+            clearLuxriotLiveIntervalDirty(channelId);
             setLuxriotCaptureRunning(channelId, true);
             updateLuxriotCaptureToggleButton(channelId);
             const modelLabel = data?.session?.model || (luxriotLiveModelInput ? luxriotLiveModelInput.value.trim() : '') || '';
@@ -4172,7 +6272,7 @@
     syncProbeChannelSelect();
     syncSummaryRunSelectOptions([], luxriotSummaryRunFilter);
     applySummaryFiltersFromInputs();
-    setSummaryBaseLevel(luxriotSummaryLevel);
+    applySummaryResolutionMode();
 
     setMode(currentMode);
     
@@ -4444,11 +6544,11 @@
     function syncUiAccess() {
         const archiveAllowed = canUseMode('archive');
         const videoAllowed = canUseMode('video');
-        const monitorAllowed = canUseMode('monitor');
+        const probesAllowed = canUseMode('probes');
         const agentAllowed = canUseMode('agent');
         setElementHidden(archiveModeBtn, !archiveAllowed);
         setElementHidden(videoModeBtn, !videoAllowed);
-        setElementHidden(monitorModeBtn, !monitorAllowed);
+        setElementHidden(probesModeBtn, !probesAllowed);
         setElementHidden(agentModeBtn, !agentAllowed);
 
         if (AUTH_ENABLED && authCurrentUser && !canUseMode(currentMode)) {
@@ -4457,6 +6557,7 @@
 
         const canCapture = userHasPermission('capture:manage');
         const canPromptManage = userHasPermission('prompts:manage');
+        const canManageSkills = userHasPermission('settings:manage');
         const canProbeRun = userHasPermission('probes:run');
         const canProbeManage = userHasPermission('probes:manage');
         const canDiagnostics = userHasPermission('diagnostics:view');
@@ -4482,6 +6583,9 @@
         setElementHidden(luxriotPromptSettingsBtn, !canPromptManage);
         setControlDisabled(luxriotPromptSettingsBtn, !canPromptManage);
         setControlDisabled(luxriotPromptApplyBtn, !canPromptManage);
+        setControlDisabled(luxriotPromptResetBtn, !canPromptManage);
+        setControlDisabled(luxriotSelectorEnabledInput, !canPromptManage);
+        setControlDisabled(luxriotSelectorBiasInput, !canPromptManage);
         [luxriotBookmarkEnabledInput, luxriotBookmarkCooldownInput].forEach((element) => {
             setControlDisabled(element, !canBookmarks || !canPromptManage);
         });
@@ -4492,6 +6596,7 @@
         if (!canBookmarks && String(luxriotPromptModalTab || '').trim().toLowerCase() === 'json') {
             setLuxriotPromptModalTab('stream');
         }
+        setLuxriotPromptApplyAvailability();
         setPermissionHidden(saveSummaryBtn, !canBookmarks);
         setControlDisabled(saveSummaryBtn, !canBookmarks);
 
@@ -4508,6 +6613,9 @@
             probeSnapUseBtn,
             probeRoiToggleBtn,
             probeRoiClearBtn,
+            probeGroupNewBtn,
+            probeGroupSaveBtn,
+            probeGroupDeleteBtn,
         ].forEach((element) => {
             setElementHidden(element, !canProbeManage);
             setControlDisabled(element, !canProbeManage);
@@ -4527,9 +6635,9 @@
             setControlDisabled(element, !canBookmarks || !canProbeManage);
         });
 
-        setElementHidden(agentCreateSkillBtn, !canPromptManage);
-        setControlDisabled(agentCreateSkillBtn, !canPromptManage);
-        setControlDisabled(agentSkillSaveBtn, !canPromptManage);
+        setElementHidden(agentCreateSkillBtn, !canManageSkills);
+        setControlDisabled(agentCreateSkillBtn, !canManageSkills);
+        setControlDisabled(agentSkillSaveBtn, !canManageSkills);
         setControlDisabled(agentModelApplyBtn, !canModelsManage);
         if (agentModelInput) {
             agentModelInput.title = canModelsManage ? '' : 'Model changes require models:manage.';
@@ -5527,6 +7635,18 @@
         return lines.join('');
     }
 
+    function archiveFrameRoleLabel(roleValue) {
+        const role = String(roleValue || '').trim().toLowerCase();
+        if (role === 'burst_apex') return 'burst apex';
+        if (role === 'burst_companion') return 'sharper companion (burst)';
+        return role ? role.replace(/_/g, ' ') : '';
+    }
+
+    function isBurstArchiveFrameRole(roleValue) {
+        const role = String(roleValue || '').trim().toLowerCase();
+        return role === 'burst_apex' || role === 'burst_companion';
+    }
+
     function buildResultBadges(result) {
         if (!result || typeof result !== 'object') return '';
         const badges = [];
@@ -5536,6 +7656,8 @@
                 badges.push({ label: 'Video description', classes: 'mode-clip' });
             } else if (source === 'vlm_alert') {
                 badges.push({ label: 'VLM alert', classes: 'warning' });
+            } else if (source === 'semantic_snapshot') {
+                badges.push({ label: 'Continuous CLIP', classes: 'mode-clip' });
             } else if (source === 'probe') {
                 badges.push({
                     label: canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence',
@@ -5544,6 +7666,12 @@
             } else {
                 badges.push({ label: 'Archive frame', classes: '' });
             }
+        }
+
+        const payload = archiveResultPayload(result);
+        const anchorRole = String(payload.anchor_role || payload.anchor_source_role || '').trim();
+        if (isBurstArchiveFrameRole(anchorRole)) {
+            badges.push({ label: `⚡ ${archiveFrameRoleLabel(anchorRole)}`, classes: 'attention' });
         }
 
         const modeRaw = String(result.search_mode || '').trim().toLowerCase();
@@ -5609,6 +7737,7 @@
     function archiveLogicalSource(source) {
         const normalized = String(source || '').trim().toLowerCase();
         if (['probe', 'probes_run', 'probes_query', 'probe_daemon'].includes(normalized)) return 'probe';
+        if (['semantic_snapshot', 'semantic_snapshots', 'continuous_clip'].includes(normalized)) return 'semantic_snapshot';
         if (['vlm_summary', 'video_description', 'video_descriptions'].includes(normalized)) return 'vlm_summary';
         if (['vlm_alert', 'alert', 'alerts'].includes(normalized)) return 'vlm_alert';
         return normalized;
@@ -5617,6 +7746,7 @@
     function archiveSourceLabel(source, fallbackLabel = '') {
         const normalized = archiveLogicalSource(source);
         if (normalized === 'probe') return canUseProbeDiagnostics() ? 'Secondary CLIP probe' : 'Archive evidence';
+        if (normalized === 'semantic_snapshot') return 'Continuous CLIP snapshot';
         if (normalized === 'vlm_summary') return 'Video description';
         if (normalized === 'vlm_alert') return 'VLM alert';
         if (fallbackLabel) return String(fallbackLabel);
@@ -5626,6 +7756,7 @@
     function archiveSourcePluralLabel(source) {
         const normalized = archiveLogicalSource(source);
         if (normalized === 'probe') return canUseProbeDiagnostics() ? 'CLIP probe hits' : 'archive evidence';
+        if (normalized === 'semantic_snapshot') return 'continuous CLIP snapshots';
         if (normalized === 'vlm_summary') return 'video descriptions';
         if (normalized === 'vlm_alert') return 'VLM alerts';
         return 'archive items';
@@ -5673,8 +7804,24 @@
         return source === 'vlm_summary' || source === 'vlm_alert';
     }
 
+    function archiveResultDirectImageSrc(result) {
+        if (!result) return '';
+        const direct = String(result.image_url || result.thumbnail_url || '').trim();
+        if (/^\/detections\/thumbnail\/\d+(?:[?#].*)?$/.test(direct)) {
+            return direct;
+        }
+        if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(direct)) {
+            return direct;
+        }
+        return '';
+    }
+
     function archiveResultHasImage(result) {
-        return Boolean(result && (String(result.path || '').trim() || String(result.thumbnail || '').trim()));
+        return Boolean(result && (
+            String(result.path || '').trim()
+            || String(result.thumbnail || '').trim()
+            || archiveResultDirectImageSrc(result)
+        ));
     }
 
     function archiveResultImageSrc(result) {
@@ -5683,8 +7830,504 @@
         if (thumb) {
             return thumb.startsWith('data:') ? thumb : `data:image/jpeg;base64,${thumb}`;
         }
+        const direct = archiveResultDirectImageSrc(result);
+        if (direct) return direct;
         const path = String(result.path || '').trim();
         return path ? buildImageFetchUrl(path, result) : '';
+    }
+
+    function abortUiRequest(controller) {
+        if (!controller) return;
+        try {
+            controller.abort();
+        } catch (_) {
+            // Generation checks still prevent stale DOM writes.
+        }
+    }
+
+    function cancelArchiveEvidenceRequest() {
+        archiveEvidenceRequestGeneration += 1;
+        abortUiRequest(archiveEvidenceAbortController);
+        archiveEvidenceAbortController = null;
+        if (archiveEvidenceBusyButton) {
+            setButtonBusy(archiveEvidenceBusyButton, false);
+            archiveEvidenceBusyButton = null;
+        }
+    }
+
+    function beginArchiveEvidenceRequest(busyButton = null) {
+        cancelArchiveEvidenceRequest();
+        if (archiveReviewModal && archiveReviewModal.style.display === 'block') {
+            closeArchiveReviewModal();
+        } else {
+            cancelArchiveReviewRequest();
+        }
+        const controller = new AbortController();
+        archiveEvidenceAbortController = controller;
+        archiveEvidenceBusyButton = busyButton || null;
+        if (archiveEvidenceBusyButton) setButtonBusy(archiveEvidenceBusyButton, true);
+        return {
+            generation: archiveEvidenceRequestGeneration,
+            controller,
+        };
+    }
+
+    function isCurrentArchiveEvidenceRequest(requestContext) {
+        return Boolean(
+            requestContext
+            && requestContext.generation === archiveEvidenceRequestGeneration
+            && archiveEvidenceAbortController === requestContext.controller
+            && !requestContext.controller.signal.aborted
+            && currentMode === 'archive'
+        );
+    }
+
+    function finishArchiveEvidenceRequest(requestContext) {
+        if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
+        archiveEvidenceAbortController = null;
+        if (archiveEvidenceBusyButton) {
+            setButtonBusy(archiveEvidenceBusyButton, false);
+            archiveEvidenceBusyButton = null;
+        }
+    }
+
+    function cancelArchiveFilterRequest() {
+        archiveFilterRequestGeneration += 1;
+        abortUiRequest(archiveFilterAbortController);
+        archiveFilterAbortController = null;
+    }
+
+    function beginArchiveFilterRequest() {
+        cancelArchiveFilterRequest();
+        const controller = new AbortController();
+        archiveFilterAbortController = controller;
+        return {
+            generation: archiveFilterRequestGeneration,
+            controller,
+        };
+    }
+
+    function isCurrentArchiveFilterRequest(requestContext) {
+        return Boolean(
+            requestContext
+            && requestContext.generation === archiveFilterRequestGeneration
+            && archiveFilterAbortController === requestContext.controller
+            && !requestContext.controller.signal.aborted
+            && currentMode === 'archive'
+        );
+    }
+
+    function cancelArchiveReviewRequest() {
+        archiveReviewRequestGeneration += 1;
+        abortUiRequest(archiveReviewAbortController);
+        archiveReviewAbortController = null;
+    }
+
+    function beginArchiveReviewRequest(context) {
+        cancelArchiveReviewRequest();
+        const controller = new AbortController();
+        archiveReviewAbortController = controller;
+        return {
+            generation: archiveReviewRequestGeneration,
+            controller,
+            context,
+        };
+    }
+
+    function isCurrentArchiveReviewRequest(requestContext) {
+        return Boolean(
+            requestContext
+            && requestContext.generation === archiveReviewRequestGeneration
+            && archiveReviewAbortController === requestContext.controller
+            && !requestContext.controller.signal.aborted
+            && archiveReviewContext === requestContext.context
+        );
+    }
+
+    function clearArchiveMediaVideo() {
+        if (!archiveMediaVideo) return;
+        archiveMediaVideo.onloadedmetadata = null;
+        archiveMediaVideo.oncanplay = null;
+        archiveMediaVideo.onplaying = null;
+        archiveMediaVideo.onwaiting = null;
+        archiveMediaVideo.onstalled = null;
+        archiveMediaVideo.onended = null;
+        archiveMediaVideo.onerror = null;
+        try {
+            archiveMediaVideo.pause();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        archiveMediaVideo.removeAttribute('src');
+        try {
+            archiveMediaVideo.load();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        if (archiveMediaObjectUrl) {
+            URL.revokeObjectURL(archiveMediaObjectUrl);
+            archiveMediaObjectUrl = null;
+        }
+        archiveMediaVideo.style.display = 'none';
+    }
+
+    function cancelArchiveMediaRequest(clearUi = false) {
+        archiveMediaRequestGeneration += 1;
+        abortUiRequest(archiveMediaAbortController);
+        archiveMediaAbortController = null;
+        if (archiveMediaLoadTimer) {
+            clearTimeout(archiveMediaLoadTimer);
+            archiveMediaLoadTimer = null;
+        }
+        if (archiveMediaLoopTimer) {
+            clearTimeout(archiveMediaLoopTimer);
+            archiveMediaLoopTimer = null;
+        }
+        clearArchiveMediaVideo();
+        if (archiveReviewImg) {
+            archiveReviewImg.onload = null;
+            archiveReviewImg.onerror = null;
+        }
+        if (archiveMediaRetryBtn) archiveMediaRetryBtn.hidden = true;
+        if (clearUi) {
+            if (archiveMediaStatus) archiveMediaStatus.textContent = '';
+            if (archiveReviewFrameContainer) delete archiveReviewFrameContainer.dataset.mediaState;
+        }
+    }
+
+    function ensureArchiveMediaUi() {
+        if (!archiveReviewFrameContainer) return {};
+        if (!archiveMediaVideo || !archiveMediaVideo.isConnected) {
+            archiveMediaVideo = document.createElement('video');
+            archiveMediaVideo.autoplay = true;
+            archiveMediaVideo.muted = true;
+            archiveMediaVideo.controls = true;
+            archiveMediaVideo.playsInline = true;
+            archiveMediaVideo.preload = 'metadata';
+            archiveMediaVideo.setAttribute('aria-label', 'Luxriot archive video playback');
+            Object.assign(archiveMediaVideo.style, {
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                background: '#000',
+                display: 'none',
+            });
+            archiveReviewFrameContainer.insertBefore(archiveMediaVideo, archiveReviewFrameEmpty || null);
+        }
+        if (!archiveMediaStatus || !archiveMediaStatus.isConnected) {
+            archiveMediaStatus = document.createElement('div');
+            archiveMediaStatus.setAttribute('role', 'status');
+            Object.assign(archiveMediaStatus.style, {
+                position: 'absolute',
+                left: '12px',
+                bottom: '12px',
+                zIndex: '6',
+                padding: '6px 9px',
+                borderRadius: '6px',
+                background: 'rgba(7, 10, 14, 0.78)',
+                color: '#d5dee8',
+                fontSize: '12px',
+            });
+            archiveReviewFrameContainer.appendChild(archiveMediaStatus);
+        }
+        if (!archiveMediaRetryBtn || !archiveMediaRetryBtn.isConnected) {
+            archiveMediaRetryBtn = document.createElement('button');
+            archiveMediaRetryBtn.type = 'button';
+            archiveMediaRetryBtn.className = 'feature-btn';
+            archiveMediaRetryBtn.textContent = 'Retry playback';
+            archiveMediaRetryBtn.hidden = true;
+            archiveMediaRetryBtn.addEventListener('click', () => {
+                const context = archiveReviewContext;
+                if (context && context.result) startArchiveMediaPlayback(context.result, context, true);
+            });
+            Object.assign(archiveMediaRetryBtn.style, {
+                position: 'absolute',
+                right: '12px',
+                bottom: '12px',
+                zIndex: '7',
+            });
+            archiveReviewFrameContainer.appendChild(archiveMediaRetryBtn);
+        }
+        return { video: archiveMediaVideo, status: archiveMediaStatus, retry: archiveMediaRetryBtn };
+    }
+
+    function setArchiveMediaState(state, detail) {
+        const normalized = ['loading', 'playing', 'degraded', 'error'].includes(state) ? state : 'error';
+        const ui = ensureArchiveMediaUi();
+        if (archiveReviewFrameContainer) archiveReviewFrameContainer.dataset.mediaState = normalized;
+        if (ui.status) {
+            ui.status.hidden = false;
+            ui.status.textContent = detail || ({
+                loading: 'Loading archive video…',
+                playing: 'Archive video playing',
+                degraded: 'Static archive frame — not video',
+                error: 'Archive video unavailable',
+            }[normalized]);
+            ui.status.style.color = normalized === 'error'
+                ? '#ff8da1'
+                : normalized === 'degraded'
+                    ? '#ffd27a'
+                    : '#d5dee8';
+        }
+        if (ui.retry) {
+            ui.retry.textContent = 'Retry playback';
+            ui.retry.hidden = !['degraded', 'error'].includes(normalized);
+        }
+    }
+
+    function archiveStaticFallbackUrl(result, timeMsOverride = null) {
+        const channelId = Number(result && result.channel_id);
+        const requestedOverride = Number(timeMsOverride);
+        const timeMs = Number.isSafeInteger(requestedOverride) && requestedOverride > 0
+            ? requestedOverride
+            : Number(archiveFrameTimestampMs(result));
+        if (!Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(timeMs) || timeMs <= 0) return '';
+        const params = new URLSearchParams({
+            time_ms: String(Math.trunc(timeMs)),
+            stream: 'mainStream',
+        });
+        return `/luxriot/archive_snapshot/${encodeURIComponent(String(channelId))}?${params.toString()}`;
+    }
+
+    function isCurrentArchiveMediaRequest(requestContext) {
+        return Boolean(
+            requestContext
+            && requestContext.generation === archiveMediaRequestGeneration
+            && archiveMediaAbortController === requestContext.controller
+            && archiveReviewContext === requestContext.context
+            && archiveReviewContext?.result === requestContext.result
+            && archiveReviewFrameIdentity(requestContext.result) === requestContext.identity
+            && currentMode === 'archive'
+            && archiveReviewModal?.style.display === 'block'
+        );
+    }
+
+    function showArchiveStaticFallback(requestContext, reason) {
+        if (!isCurrentArchiveMediaRequest(requestContext) || !archiveReviewImg) return;
+        clearArchiveMediaVideo();
+        const storedImage = archiveResultImageSrc(requestContext.result);
+        const recorderSnapshotUrl = archiveStaticFallbackUrl(requestContext.result, requestContext.timeMs);
+        let triedRecorderSnapshot = false;
+        const markDegraded = (detail) => {
+            if (!isCurrentArchiveMediaRequest(requestContext)) return;
+            archiveReviewImg.classList.remove('is-hidden');
+            if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.add('is-hidden');
+            setArchiveMediaState('degraded', detail);
+        };
+        const markUnavailable = () => {
+            if (!isCurrentArchiveMediaRequest(requestContext)) return;
+            archiveReviewImg.classList.add('is-hidden');
+            if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.remove('is-hidden');
+            setArchiveMediaState('error', 'Archive video and fallback frames are unavailable.');
+        };
+        const storedEvidenceDetail = `${reason || 'Archive video is unavailable.'} Stored evidence frame shown — not video.`;
+        const showRecorderSnapshot = () => {
+            if (!isCurrentArchiveMediaRequest(requestContext)) return;
+            if (triedRecorderSnapshot || !recorderSnapshotUrl) {
+                markUnavailable();
+                return;
+            }
+            triedRecorderSnapshot = true;
+            archiveReviewImg.onload = () => markDegraded(
+                `${reason || 'Archive video is unavailable.'} Static recorder snapshot — not video.`
+            );
+            archiveReviewImg.onerror = markUnavailable;
+            archiveReviewImg.src = `${recorderSnapshotUrl}&request=${Date.now()}`;
+        };
+        // The stored frame is the exact evidence that fed VLM/CLIP/archive; a
+        // recorder snapshot resolved at a shifted time must never replace it.
+        if (storedImage) {
+            if (archiveReviewImg.getAttribute('src') === storedImage) {
+                markDegraded(storedEvidenceDetail);
+                return;
+            }
+            archiveReviewImg.onload = () => markDegraded(storedEvidenceDetail);
+            archiveReviewImg.onerror = showRecorderSnapshot;
+            archiveReviewImg.src = storedImage;
+            return;
+        }
+        showRecorderSnapshot();
+    }
+
+    function archivePlaybackWindow(result) {
+        const payload = archiveResultPayload(result);
+        const frameTimeMs = Number(archiveFrameTimestampMs(result));
+        const rawStartMs = Number(payload.batch_start_ms ?? result?.batch_start_ms);
+        const rawEndMs = Number(payload.batch_end_ms ?? result?.batch_end_ms);
+        const hasBatchWindow = Number.isFinite(rawStartMs) && rawStartMs > 0
+            && Number.isFinite(rawEndMs) && rawEndMs > 0;
+        const startMs = hasBatchWindow
+            ? Math.trunc(Math.min(rawStartMs, rawEndMs))
+            : Math.trunc(frameTimeMs);
+        const batchSpanMs = hasBatchWindow ? Math.abs(rawEndMs - rawStartMs) : 0;
+        // Batch timestamps describe sampled instants, so include the final
+        // second instead of clipping the last evidence frame from playback.
+        const durationSec = hasBatchWindow
+            ? Math.max(1, Math.min(15, Math.ceil(batchSpanMs / 1000) + 1))
+            : 15;
+        return {
+            startMs,
+            endMs: startMs + durationSec * 1000,
+            durationSec,
+            hasBatchWindow,
+        };
+    }
+
+    function startArchiveMediaPlayback(result, context, force = false) {
+        if (!result || !context || archiveReviewContext !== context) return;
+        const identity = archiveReviewFrameIdentity(result);
+        if (!force && context.mediaIdentity === identity && ['loading', 'playing', 'degraded'].includes(context.mediaState || '')) return;
+        cancelArchiveMediaRequest(false);
+        context.mediaIdentity = identity;
+        context.mediaState = 'loading';
+        const channelId = Number(result.channel_id);
+        const playbackWindow = archivePlaybackWindow(result);
+        const timeMs = Number(playbackWindow.startMs);
+        const durationSec = Number(playbackWindow.durationSec);
+        if (!isVideoArchiveResult(result) || !Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(timeMs) || timeMs <= 0) {
+            context.mediaState = 'degraded';
+            setArchiveMediaState('degraded', 'This result has a static evidence frame, not playable archive video.');
+            return;
+        }
+        const controller = new AbortController();
+        archiveMediaAbortController = controller;
+        const requestContext = {
+            generation: archiveMediaRequestGeneration,
+            controller,
+            context,
+            result,
+            identity,
+            timeMs,
+            durationSec,
+        };
+        const mediaUrl = luxriotMediaBrokerUrl('archive', channelId, {
+            stream: 'mainStream',
+            timeMs,
+            durationSec,
+        });
+        setArchiveMediaState('loading', `Preparing ${durationSec}s batch loop…`);
+        // Evo can spend close to a minute assembling an otherwise healthy
+        // browser-compatible archive fragment before sending its first byte.
+        // Keep the UI deadline above the broker's default 90 s preparation
+        // allowance so a valid WebM/MP4 response is not aborted at the edge.
+        const negotiationTimeoutMs = Math.max(60000, Math.min(120000, durationSec * 4000 + 30000));
+        void fetchLuxriotMediaBlob(mediaUrl, controller, negotiationTimeoutMs)
+            .then((negotiated) => {
+                if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                context.mediaSegmentTimeMs = timeMs;
+                context.mediaLastSampleTimestampMs = negotiated.lastSampleTimestampMs;
+                context.mediaDurationSec = Number(negotiated.durationSec) || durationSec;
+                const capabilityDetail = [];
+                if (negotiated.resolvedTimeMs && negotiated.resolvedTimeMs !== timeMs) {
+                    capabilityDetail.push(`aligned to ${new Date(negotiated.resolvedTimeMs).toLocaleTimeString()}`);
+                } else if (negotiated.frameAlignment === 'next_frame_time_unavailable') {
+                    capabilityDetail.push('exact next-frame seek is unavailable on this Evo variant');
+                }
+                if (negotiated.html5Compatibility === 'unsupported_fallback') {
+                    capabilityDetail.push('Evo rejected html5compatible; using its legacy stream response');
+                }
+                capabilityDetail.unshift(`${context.mediaDurationSec}s batch loop`);
+                const capabilitySuffix = capabilityDetail.length ? ` (${capabilityDetail.join('; ')})` : '';
+                archiveMediaObjectUrl = URL.createObjectURL(negotiated.blob);
+                const failToStatic = (reason) => {
+                    if (archiveMediaLoadTimer) {
+                        clearTimeout(archiveMediaLoadTimer);
+                        archiveMediaLoadTimer = null;
+                    }
+                    context.mediaState = 'degraded';
+                    showArchiveStaticFallback(requestContext, reason);
+                };
+                archiveMediaLoadTimer = window.setTimeout(
+                    () => failToStatic('Archive playback load timed out.'),
+                    12000,
+                );
+                if (negotiated.mediaKind === 'mjpeg') {
+                    archiveReviewImg.onload = () => {
+                        if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                        clearTimeout(archiveMediaLoadTimer);
+                        archiveMediaLoadTimer = null;
+                        context.mediaState = 'playing';
+                        archiveReviewImg.classList.remove('is-hidden');
+                        if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.add('is-hidden');
+                        setArchiveMediaState('playing', `Archive MJPEG playing${capabilitySuffix}`);
+                        if (!archiveMediaLoopTimer) {
+                            archiveMediaLoopTimer = window.setTimeout(() => {
+                                archiveMediaLoopTimer = null;
+                                if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                                startArchiveMediaPlayback(result, context, true);
+                            }, Math.max(1000, context.mediaDurationSec * 1000 + 500));
+                        }
+                    };
+                    archiveReviewImg.onerror = () => failToStatic('The archive MJPEG stream could not be decoded.');
+                    archiveReviewImg.src = archiveMediaObjectUrl;
+                    return;
+                }
+                const ui = ensureArchiveMediaUi();
+                const video = ui.video;
+                if (!video) {
+                    failToStatic('The browser archive video element could not be initialized.');
+                    return;
+                }
+                archiveReviewImg.classList.add('is-hidden');
+                if (archiveReviewFrameEmpty) archiveReviewFrameEmpty.classList.add('is-hidden');
+                video.style.display = 'block';
+                video.loop = true;
+                const markPlayable = (detail) => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    clearTimeout(archiveMediaLoadTimer);
+                    archiveMediaLoadTimer = null;
+                    context.mediaState = 'playing';
+                    setArchiveMediaState('playing', detail);
+                };
+                video.onloadedmetadata = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    setArchiveMediaState('loading', `Archive video metadata loaded…${capabilitySuffix}`);
+                };
+                video.oncanplay = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    markPlayable(`Archive video ready${capabilitySuffix}`);
+                    const playPromise = video.play();
+                    if (playPromise && typeof playPromise.catch === 'function') playPromise.catch(() => {});
+                };
+                video.onplaying = () => markPlayable(`Archive video playing${capabilitySuffix}`);
+                video.onwaiting = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    setArchiveMediaState('loading', 'Archive video buffering…');
+                };
+                video.onstalled = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    setArchiveMediaState('loading', 'Archive video transport stalled…');
+                };
+                video.onerror = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    failToStatic('The browser rejected the archive video container or codec.');
+                };
+                video.onended = () => {
+                    if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                    video.currentTime = 0;
+                    const playPromise = video.play();
+                    if (playPromise && typeof playPromise.catch === 'function') playPromise.catch(() => {});
+                };
+                video.src = archiveMediaObjectUrl;
+                video.load();
+            })
+            .catch((error) => {
+                if (!isCurrentArchiveMediaRequest(requestContext)) return;
+                context.mediaState = 'degraded';
+                showArchiveStaticFallback(
+                    requestContext,
+                    controller.signal.aborted ? 'Archive batch preparation timed out.' : (error.message || 'Archive video is unavailable.'),
+                );
+            });
+    }
+
+    function invalidateArchiveResultContext() {
+        cancelArchiveEvidenceRequest();
+        if (archiveReviewModal && archiveReviewModal.style.display === 'block') {
+            closeArchiveReviewModal();
+        } else {
+            cancelArchiveReviewRequest();
+        }
     }
 
     function base64ToBlob(base64, mimeType = 'image/jpeg') {
@@ -5699,7 +8342,7 @@
         return new Blob([bytes], { type: mimeType });
     }
 
-    async function archiveResultImageBlob(result) {
+    async function archiveResultImageBlob(result, signal = null) {
         if (!result) throw new Error('No archive result selected.');
         const thumb = String(result.thumbnail || '').trim();
         if (thumb) {
@@ -5709,7 +8352,7 @@
         }
         const path = String(result.path || '').trim();
         if (!path) throw new Error('No image is available for this archive result.');
-        const imageResponse = await fetch(buildImageFetchUrl(path, result));
+        const imageResponse = await fetch(buildImageFetchUrl(path, result), { signal });
         if (!imageResponse.ok) throw new Error('Failed to load archived image.');
         return imageResponse.blob();
     }
@@ -5807,26 +8450,136 @@
         const role = String(payload.anchor_role || payload.anchor_source_role || '').trim();
         const frameIndex = Number(payload.frame_index ?? payload.anchor_frame_index);
         const parts = [];
-        if (role) parts.push(role.replace(/_/g, ' '));
+        const roleLabel = archiveFrameRoleLabel(role);
+        if (roleLabel) parts.push(roleLabel);
         if (Number.isFinite(frameIndex)) parts.push(`frame ${frameIndex}`);
         return parts.length ? parts.join(' · ') : 'Frame';
     }
 
     function applySelectOptions(selectEl, options, selected = '') {
         if (!selectEl) return;
+        const before = String(selectEl.value || '');
         const previous = selected || selectEl.value || '';
         selectEl.innerHTML = options.map((opt) => `<option value="${escapeHtml(String(opt.value))}">${escapeHtml(String(opt.label))}</option>`).join('');
         const hasPrevious = options.some((opt) => String(opt.value) === String(previous));
         selectEl.value = hasPrevious ? String(previous) : String(options[0]?.value || '');
+        if (String(selectEl.value || '') !== before) {
+            invalidateArchiveResultContext();
+        }
     }
 
-    async function refreshArchiveChannelFilter() {
+    function selectedArchiveChannelIds() {
+        if (!archiveChannelOptions) return [];
+        return Array.from(
+            archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]:checked')
+        )
+            .map((input) => String(input.value || '').trim())
+            .filter((value) => /^\d+$/.test(value));
+    }
+
+    function updateArchiveChannelPickerSummary() {
+        if (!archiveChannelPickerSummary) return;
+        const selectedInputs = archiveChannelOptions
+            ? Array.from(archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]:checked'))
+            : [];
+        const labels = selectedInputs.map((input) => {
+            const option = input.closest('.archive-channel-option');
+            return String(option?.dataset.archiveChannelName || input.value || '').trim();
+        }).filter(Boolean);
+        let summary = 'All streams';
+        if (labels.length === 1) {
+            summary = labels[0];
+        } else if (labels.length > 1) {
+            summary = `${labels.length} streams selected`;
+        }
+        archiveChannelPickerSummary.textContent = summary;
+        archiveChannelPickerSummary.title = labels.length > 1 ? labels.join(', ') : summary;
+    }
+
+    function setArchiveChannelPickerOpen(open, focusSearch = false) {
+        if (!archiveChannelPopover || !archiveChannelPickerToggle) return;
+        const shouldOpen = Boolean(open);
+        archiveChannelPopover.hidden = !shouldOpen;
+        archiveChannelPickerToggle.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+        archiveChannelFilter?.classList.toggle('is-open', shouldOpen);
+        if (shouldOpen && focusSearch && archiveChannelSearch) {
+            window.requestAnimationFrame(() => archiveChannelSearch.focus());
+        }
+    }
+
+    function filterArchiveChannelOptions() {
+        if (!archiveChannelOptions) return;
+        const query = String(archiveChannelSearch?.value || '').trim().toLocaleLowerCase();
+        let visible = 0;
+        archiveChannelOptions.querySelectorAll('.archive-channel-option[data-archive-channel-name]').forEach((option) => {
+            const haystack = String(option.dataset.archiveChannelSearch || option.dataset.archiveChannelName || '').toLocaleLowerCase();
+            const matches = !query || haystack.includes(query);
+            option.hidden = !matches;
+            if (matches) visible += 1;
+        });
+        if (archiveChannelEmpty) archiveChannelEmpty.hidden = visible > 0;
+    }
+
+    function archiveChannelSelectionChanged() {
+        syncArchiveChannelAllOption();
+        invalidateArchiveResultContext();
+        archiveDetectionsOffset = 0;
+        archiveDetectionsHasMore = false;
+        updateArchiveDetectionsNav();
+        refreshArchiveProbeFilter();
+    }
+
+    function syncArchiveChannelAllOption() {
         if (!archiveChannelFilter) return;
+        const allInput = archiveChannelFilter.querySelector('input[data-archive-channel-all]');
+        if (allInput) {
+            allInput.checked = selectedArchiveChannelIds().length === 0;
+        }
+        updateArchiveChannelPickerSummary();
+    }
+
+    function renderArchiveChannelOptions(options, selectedIds = []) {
+        if (!archiveChannelOptions) return;
+        const selected = new Set((selectedIds || []).map((value) => String(value)));
+        const before = selectedArchiveChannelIds().join(',');
+        archiveChannelOptions.innerHTML = options.map((option) => {
+            const value = String(option.value);
+            const label = String(option.label);
+            return `
+                <label class="archive-channel-option" data-archive-channel-name="${escapeHtml(label)}"
+                       data-archive-channel-search="${escapeHtml(`${label} #${value}`)}">
+                    <input type="checkbox" value="${escapeHtml(value)}" data-archive-channel-id ${selected.has(value) ? 'checked' : ''}>
+                    <span class="archive-channel-option-copy">
+                        <span class="archive-channel-option-name">${escapeHtml(label)}</span>
+                        <span class="archive-channel-option-id">#${escapeHtml(value)}</span>
+                    </span>
+                </label>
+            `;
+        }).join('');
+        syncArchiveChannelAllOption();
+        filterArchiveChannelOptions();
+        if (selectedArchiveChannelIds().join(',') !== before) {
+            invalidateArchiveResultContext();
+        }
+    }
+
+    function appendArchiveChannelParams(params, channelIds = selectedArchiveChannelIds()) {
+        channelIds.forEach((channelId) => params.append('channel_id', channelId));
+    }
+
+    async function refreshArchiveChannelFilter(requestContext = null) {
+        if (!archiveChannelFilter || !archiveChannelOptions) return;
+        const ownedRequest = !requestContext;
+        const context = requestContext || beginArchiveFilterRequest();
+        const selectedIds = selectedArchiveChannelIds();
         try {
-            const response = await fetch('/luxriot/channels');
+            const response = await fetch('/luxriot/channels', {
+                signal: context.controller.signal,
+            });
             const data = await parseApiJson(response, 'Failed to load channels');
+            if (!isCurrentArchiveFilterRequest(context)) return false;
             const channels = Array.isArray(data.channels) ? data.channels : [];
-            const options = [{ value: '', label: 'All streams' }];
+            const options = [];
             channels.forEach((channel) => {
                 const rawId = channel.channel_id ?? channel.id;
                 const id = parseInt(String(rawId || ''), 10);
@@ -5835,31 +8588,47 @@
                 luxriotChannelNameById[String(id)] = label;
                 options.push({ value: String(id), label });
             });
-            applySelectOptions(archiveChannelFilter, options, archiveChannelFilter.value);
-        } catch (_) {
-            applySelectOptions(archiveChannelFilter, [{ value: '', label: 'All streams' }], '');
+            const available = new Set(options.map((option) => String(option.value)));
+            renderArchiveChannelOptions(
+                options,
+                selectedIds.filter((channelId) => available.has(channelId)),
+            );
+            return true;
+        } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveFilterRequest(context)) return false;
+            renderArchiveChannelOptions([], []);
+            return false;
+        } finally {
+            if (ownedRequest && archiveFilterAbortController === context.controller) {
+                archiveFilterAbortController = null;
+            }
         }
     }
 
-    async function refreshArchiveProbeFilter() {
+    async function refreshArchiveProbeFilter(requestContext = null) {
         if (!archiveProbeFilter) return;
+        const ownedRequest = !requestContext;
+        const context = requestContext || beginArchiveFilterRequest();
         if (!syncArchiveProbeFilterVisibility()) {
             applySelectOptions(archiveProbeFilter, [{ value: '', label: 'Probe filter available for CLIP probe hits' }], '');
-            return;
+            if (ownedRequest && archiveFilterAbortController === context.controller) {
+                archiveFilterAbortController = null;
+            }
+            return true;
         }
         try {
             const params = new URLSearchParams({ hours: '168', limit: '300' });
             applyArchiveTimeFilters(params);
-            const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
             const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
-            if (channelId) {
-                params.set('channel_id', channelId);
-            }
+            appendArchiveChannelParams(params);
             if (source) {
                 params.set('source', source);
             }
-            const response = await fetch(`/detections/summary?${params.toString()}`);
+            const response = await fetch(`/detections/summary?${params.toString()}`, {
+                signal: context.controller.signal,
+            });
             const data = await parseApiJson(response, 'Failed to load archive items');
+            if (!isCurrentArchiveFilterRequest(context)) return false;
             const summary = Array.isArray(data.summary) ? data.summary : [];
             const options = [{ value: '', label: `All ${archiveSourcePluralLabel(source)}` }];
             summary.forEach((item) => {
@@ -5870,16 +8639,33 @@
                 options.push({ value: id, label });
             });
             applySelectOptions(archiveProbeFilter, options, archiveProbeFilter.value);
-        } catch (_) {
+            return true;
+        } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveFilterRequest(context)) return false;
             applySelectOptions(archiveProbeFilter, [{ value: '', label: 'All CLIP probes' }], '');
+            return false;
+        } finally {
+            if (ownedRequest && archiveFilterAbortController === context.controller) {
+                archiveFilterAbortController = null;
+            }
         }
     }
 
     async function refreshArchiveFilters() {
+        const context = beginArchiveFilterRequest();
         archiveDetectionsOffset = 0;
         archiveDetectionsHasMore = false;
         updateArchiveDetectionsNav();
-        await Promise.all([refreshArchiveChannelFilter(), refreshArchiveProbeFilter()]);
+        try {
+            await refreshArchiveChannelFilter(context);
+            if (!isCurrentArchiveFilterRequest(context)) return false;
+            await refreshArchiveProbeFilter(context);
+            return isCurrentArchiveFilterRequest(context);
+        } finally {
+            if (archiveFilterAbortController === context.controller) {
+                archiveFilterAbortController = null;
+            }
+        }
     }
 
     function normalizeDetectionResults(detections) {
@@ -5939,12 +8725,13 @@
         }
         archiveDetectionsHasMore = false;
         updateArchiveDetectionsNav();
-        const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+        const channelIds = selectedArchiveChannelIds();
         const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
         const probeId = archiveProbeFilterActive() && archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
         const limitRaw = archiveDetectionsLimit ? archiveDetectionsLimit.value : '24';
         const params = new URLSearchParams();
         archiveLastQueryText = 'Loaded archive frames';
+        cancelArchiveEvidenceRequest();
         let timeWindow;
         try {
             timeWindow = applyArchiveTimeFilters(params);
@@ -5955,19 +8742,24 @@
             updateArchiveDetectionsNav();
             return;
         }
-        if (channelId) params.set('channel_id', channelId);
+        appendArchiveChannelParams(params, channelIds);
         if (probeId) params.set('probe_id', probeId);
         if (source) params.set('source', source);
         const limit = Number.parseInt(limitRaw, 10);
         params.set('limit', String(Number.isFinite(limit) ? limit : 24));
-        params.set('offset', String(Math.max(0, archiveDetectionsOffset)));
+        const requestedOffset = Math.max(0, archiveDetectionsOffset);
+        params.set('offset', String(requestedOffset));
 
+        const requestContext = beginArchiveEvidenceRequest(loadDetectionsBtn);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading frame archive...</div>';
         setArchiveDetectionsMeta('Loading archive frames...');
         renderArchiveInspectorEmpty('Loading frame archive...');
         try {
-            const response = await fetch(`/detections/list?${params.toString()}`);
+            const response = await fetch(`/detections/list?${params.toString()}`, {
+                signal: requestContext.controller.signal,
+            });
             const data = await parseApiJson(response, 'Failed to load frame archive');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return false;
             const detections = Array.isArray(data.detections) ? data.detections : [];
             archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : detections.length;
             archiveDetectionsHasMore = Boolean(data.has_more);
@@ -5983,12 +8775,13 @@
                 return;
             }
             displayResults(mapped);
-            const shownFrom = archiveDetectionsOffset + 1;
-            const shownTo = archiveDetectionsOffset + mapped.length;
+            const shownFrom = requestedOffset + 1;
+            const shownTo = requestedOffset + mapped.length;
             const windowNote = timeWindow.absolute ? ' in selected time window' : '';
             setArchiveDetectionsMeta(`Showing archive frames ${shownFrom}-${shownTo} of ${archiveDetectionsTotal}${windowNote}.`);
             updateArchiveDetectionsNav();
         } catch (err) {
+            if ((err && err.name === 'AbortError') || !isCurrentArchiveEvidenceRequest(requestContext)) return false;
             const payload = err && err.payload ? err.payload : {};
             const message = payload.not_ready === 'archive_store'
                 ? `Archive storage is not migrated yet. Apply database migration ${payload.required_revision || '20260612_0005'} and reload.`
@@ -5998,19 +8791,38 @@
             renderArchiveInspectorEmpty(`Frame archive error: ${message}`);
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
+            return false;
+        } finally {
+            finishArchiveEvidenceRequest(requestContext);
         }
     }
 
     function buildDetectionSearchFilters() {
         const payload = {};
-        const channelId = archiveChannelFilter ? archiveChannelFilter.value.trim() : '';
+        const channelIds = selectedArchiveChannelIds();
         const source = archiveSourceFilter ? archiveSourceFilter.value.trim() : '';
         const probeId = archiveProbeFilterActive() && archiveProbeFilter ? archiveProbeFilter.value.trim() : '';
-        if (channelId) payload.channel_id = channelId;
+        if (channelIds.length) payload.channel_ids = channelIds;
         if (probeId) payload.probe_id = probeId;
         if (source) payload.source = source;
         applyArchiveTimeFilters(payload);
         return payload;
+    }
+
+    function appendDetectionSearchFilters(formData, filters) {
+        Object.entries(filters || {}).forEach(([key, value]) => {
+            if (Array.isArray(value)) {
+                value.forEach((item) => {
+                    if (item !== undefined && item !== null && String(item).trim() !== '') {
+                        formData.append(key, String(item));
+                    }
+                });
+                return;
+            }
+            if (value !== undefined && value !== null && String(value).trim() !== '') {
+                formData.append(key, String(value));
+            }
+        });
     }
 
     function isDetectionsScope() {
@@ -6180,6 +8992,32 @@
             copyArchiveReviewSummary();
         });
     }
+    if (archiveReviewFeedbackBtn) {
+        archiveReviewFeedbackBtn.addEventListener('click', () => {
+            if (archiveReviewFeedbackPanel) archiveReviewFeedbackPanel.hidden = false;
+            if (archiveReviewFeedbackStatus) archiveReviewFeedbackStatus.textContent = '';
+        });
+    }
+    if (archiveReviewFeedbackCancelBtn) {
+        archiveReviewFeedbackCancelBtn.addEventListener('click', () => {
+            if (archiveReviewFeedbackPanel) archiveReviewFeedbackPanel.hidden = true;
+        });
+    }
+    if (archiveReviewFeedbackSaveBtn) {
+        archiveReviewFeedbackSaveBtn.addEventListener('click', () => {
+            void saveArchiveAlertFeedback();
+        });
+    }
+    if (archiveReviewFeedbackExportMdBtn) {
+        archiveReviewFeedbackExportMdBtn.addEventListener('click', () => {
+            exportArchiveFeedbackReport('md');
+        });
+    }
+    if (archiveReviewFeedbackExportXmlBtn) {
+        archiveReviewFeedbackExportXmlBtn.addEventListener('click', () => {
+            exportArchiveFeedbackReport('xml');
+        });
+    }
     
     // Close modal when clicking outside
     settingsModal.addEventListener('click', (e) => {
@@ -6202,6 +9040,11 @@
             }
         }
         if (e.key !== 'Escape') return;
+        if (archiveChannelPickerToggle?.getAttribute('aria-expanded') === 'true') {
+            setArchiveChannelPickerOpen(false);
+            archiveChannelPickerToggle.focus();
+            return;
+        }
         if (imageLightboxModal && imageLightboxModal.style.display === 'block') {
             closeImageLightbox();
             return;
@@ -6499,6 +9342,21 @@
             const data = await response.json();
             if (data.success) {
                 envEditorInput.value = String(data.envText || '');
+                const precedence = data.precedence && typeof data.precedence === 'object'
+                    ? data.precedence
+                    : null;
+                const different = precedence && Array.isArray(precedence.different_process_and_file_keys)
+                    ? precedence.different_process_and_file_keys
+                    : [];
+                if (different.length > 0) {
+                    const sourceKnown = Boolean(precedence?.declared_file_matches_project);
+                    showSettingsStatus(
+                        sourceKnown
+                            ? `${different.length} setting change(s) are pending restart: ${different.join(', ')}.`
+                            : `${different.length} .env value(s) differ from the running process: ${different.join(', ')}. Restart may apply them, or an external service override may win; check the service environment.`,
+                        'warning'
+                    );
+                }
             } else {
                 showSettingsStatus('Error loading environment variables: ' + (data.error || 'Unknown error'), 'error');
             }
@@ -6520,7 +9378,11 @@
             });
             const data = await response.json();
             if (data.success) {
-                showSettingsStatus(data.message || 'Environment variables saved.', 'success');
+                const pending = Array.isArray(data.pendingOrOverriddenKeys) ? data.pendingOrOverriddenKeys : [];
+                showSettingsStatus(
+                    data.message || 'Environment variables saved.',
+                    pending.length > 0 ? 'warning' : 'success'
+                );
                 await loadEnvEditor();
             } else {
                 showSettingsStatus('Error saving environment variables: ' + (data.error || 'Unknown error'), 'error');
@@ -6885,7 +9747,14 @@
             const data = await response.json();
             
             if (data.success) {
-                showSettingsStatus(data.message, 'success');
+                const pending = Array.isArray(data.pendingOrOverriddenKeys)
+                    ? data.pendingOrOverriddenKeys
+                    : [];
+                const sourceKnown = Boolean(data.precedence?.declared_file_matches_project);
+                showSettingsStatus(
+                    data.message,
+                    pending.length > 0 && !sourceKnown ? 'warning' : 'success'
+                );
                 scheduleArchiveCapacityEstimate();
             } else {
                 showSettingsStatus('Error saving settings: ' + data.error, 'error');
@@ -7105,7 +9974,14 @@
     applyEmbedderUI(embedderSelect.value);
     if (luxriotRefreshChannelsBtn) {
         luxriotRefreshChannelsBtn.addEventListener('click', () => {
-            fetchLuxriotChannels(true).then(syncProbeChannelSelect);
+            const channelId = getSelectedLuxriotChannel();
+            clearLuxriotLiveIntervalDirty(channelId);
+            fetchLuxriotChannels(true).then(() => {
+                syncProbeChannelSelect();
+                syncLuxriotLiveIntervalInput(channelId, { force: true });
+                void refreshLuxriotPromptSettings(false, channelId);
+                refreshLuxriotStreams();
+            });
         });
     }
     if (luxriotToggleCaptureBtn) {
@@ -7127,8 +10003,12 @@
         luxriotBatchSizeSelect.addEventListener('change', updateLuxriotBatchInfo);
     }
     if (luxriotLiveIntervalInput) {
-        luxriotLiveIntervalInput.addEventListener('input', updateLuxriotBatchInfo);
+        luxriotLiveIntervalInput.addEventListener('input', () => {
+            markLuxriotLiveIntervalDirty();
+            updateLuxriotBatchInfo();
+        });
         luxriotLiveIntervalInput.addEventListener('change', () => {
+            markLuxriotLiveIntervalDirty();
             const intervalSec = getLuxriotLiveIntervalInputValue();
             luxriotLiveIntervalInput.value = formatLuxriotLiveIntervalInput(intervalSec);
             storeLuxriotLiveInterval(getSelectedLuxriotChannel(), intervalSec);
@@ -7137,6 +10017,36 @@
     }
     if (luxriotLiveModelInput) {
         luxriotLiveModelInput.addEventListener('change', updateLuxriotStreamContext);
+    }
+    if (luxriotSelectorEnabledInput) {
+        luxriotSelectorEnabledInput.addEventListener('change', async () => {
+            const channelId = getSelectedLuxriotChannel();
+            const nextEnabled = Boolean(luxriotSelectorEnabledInput.checked);
+            const previousEnabled = Boolean(
+                luxriotPromptLoadedSettings?.capture_selector_enabled ?? !nextEnabled
+            );
+            if (!Number.isFinite(channelId) || !userHasPermission('prompts:manage')) {
+                luxriotSelectorEnabledInput.checked = previousEnabled;
+                return;
+            }
+            luxriotSelectorEnabledInput.disabled = true;
+            updateLuxriotStreamContext();
+            try {
+                await persistLuxriotPromptSettings(channelId, {
+                    capture_selector_enabled: nextEnabled,
+                });
+                setLuxriotStatus(
+                    `Adaptive frame selector ${nextEnabled ? 'enabled' : 'disabled'} for ${getLuxriotChannelLabel(channelId)}`
+                );
+                await refreshLuxriotStreams();
+            } catch (err) {
+                luxriotSelectorEnabledInput.checked = previousEnabled;
+                updateLuxriotStreamContext();
+                setLuxriotStatus(err.message || 'Failed to update frame selector', true);
+            } finally {
+                luxriotSelectorEnabledInput.disabled = !userHasPermission('prompts:manage');
+            }
+        });
     }
     if (luxriotPromptSettingsBtn) {
         luxriotPromptSettingsBtn.addEventListener('click', openLuxriotPromptModal);
@@ -7147,29 +10057,52 @@
     if (luxriotPromptCloseBtn) {
         luxriotPromptCloseBtn.addEventListener('click', closeLuxriotPromptModal);
     }
+    if (luxriotPromptResetBtn) {
+        luxriotPromptResetBtn.addEventListener('click', async () => {
+            try {
+                await resetLuxriotPromptOverrides();
+            } catch (err) {
+                setLuxriotStatus(err.message || 'Failed to reset prompt settings', true);
+            }
+        });
+    }
     if (luxriotPromptApplyBtn) {
         luxriotPromptApplyBtn.addEventListener('click', async () => {
             try {
                 await applyLuxriotPromptModal();
-                closeLuxriotPromptModal();
             } catch (err) {
                 setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                setLuxriotPromptApplyAvailability();
             }
         });
     }
     if (luxriotPromptModalInput) {
+        luxriotPromptModalInput.addEventListener('input', () => {
+            syncLuxriotPromptModalEditorToDraft();
+            luxriotPromptModalNotice = '';
+            setLuxriotPromptApplyAvailability();
+        });
         luxriotPromptModalInput.addEventListener('keydown', async (event) => {
             if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'enter') {
                 event.preventDefault();
                 try {
                     await applyLuxriotPromptModal();
-                    closeLuxriotPromptModal();
                 } catch (err) {
                     setLuxriotStatus(err.message || 'Failed to save prompt settings', true);
+                    setLuxriotPromptApplyAvailability();
                 }
             }
         });
     }
+    [luxriotBookmarkEnabledInput, luxriotBookmarkCooldownInput, luxriotSelectorBiasInput]
+        .filter((element) => Boolean(element))
+        .forEach((element) => {
+            const eventName = element === luxriotBookmarkCooldownInput ? 'input' : 'change';
+            element.addEventListener(eventName, () => {
+                luxriotPromptModalNotice = '';
+                setLuxriotPromptApplyAvailability();
+            });
+        });
     luxriotPromptTabButtons.forEach((button) => {
         button.addEventListener('click', () => {
             const tab = button.dataset.luxriotPromptTab || 'stream';
@@ -7183,6 +10116,11 @@
             }
         });
     }
+    window.addEventListener('beforeunload', (event) => {
+        if (!isLuxriotPromptModalOpen() || !hasLuxriotPromptDraftChanges()) return;
+        event.preventDefault();
+        event.returnValue = '';
+    });
     if (luxriotRefreshSummariesBtn) {
         luxriotRefreshSummariesBtn.addEventListener('click', async () => {
             setSummaryRefreshButtonState('busy');
@@ -7206,7 +10144,8 @@
     if (luxriotSummaryChannelSelect) {
         luxriotSummaryChannelSelect.addEventListener('change', () => {
             luxriotSummaryChannel = getSelectedSummaryChannel();
-            setSummaryBaseLevel(luxriotSummaryLevel);
+            resetSummaryArchivePaging();
+            applySummaryResolutionMode();
             setSummaryUnread(0);
             refreshLuxriotSummaryView(luxriotSummaryChannel, true);
         });
@@ -7221,19 +10160,32 @@
     if (luxriotSummaryRangeSelect) {
         luxriotSummaryRangeSelect.addEventListener('change', () => {
             luxriotSummaryRangePreset = normalizeSummaryRangePreset(luxriotSummaryRangeSelect.value);
-            syncSummaryRangeUI();
             if (luxriotSummaryRangePreset === 'custom') {
+                if (!Number.isFinite(luxriotSummaryFromTs) || !Number.isFinite(luxriotSummaryToTs)) {
+                    const initial = summaryLocalDayBounds(-1);
+                    luxriotSummaryFromTs = initial.fromTs;
+                    luxriotSummaryToTs = initial.toTs;
+                    if (luxriotSummaryFromInput) luxriotSummaryFromInput.value = formatSummaryDatetimeInput(initial.fromTs);
+                    if (luxriotSummaryToInput) luxriotSummaryToInput.value = formatSummaryDatetimeInput(initial.toTs);
+                }
+                luxriotSummaryRunFilter = 'all';
+                luxriotSummaryFollowLive = false;
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
                 updateSummaryControlsUI();
                 return;
             }
             applySummaryFiltersFromInputs();
+            syncSummaryRangeUI();
             setSummaryUnread(0);
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
         });
     }
     if (luxriotSummaryLevelSelect) {
         luxriotSummaryLevelSelect.addEventListener('change', () => {
-            setSummaryBaseLevel(luxriotSummaryLevelSelect.value);
+            luxriotSummaryResolutionMode = normalizeSummaryResolutionMode(luxriotSummaryLevelSelect.value);
+            applySummaryResolutionMode();
             setSummaryUnread(0);
             updateSummaryControlsUI();
             refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
@@ -7283,6 +10235,20 @@
     }
     if (luxriotSummaryFollowBtn) {
         luxriotSummaryFollowBtn.addEventListener('click', () => {
+            if (!isLiveSummaryPeriod() || isRollupViewActive()) {
+                luxriotSummaryRangePreset = 'live';
+                luxriotSummaryRunFilter = 'live';
+                luxriotSummaryFollowLive = true;
+                luxriotSummaryAutoRefresh = true;
+                if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
+                setSummaryUnread(0);
+                updateSummaryControlsUI();
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+                return;
+            }
             const enableLive = !(luxriotSummaryAutoRefresh && luxriotSummaryFollowLive);
             luxriotSummaryAutoRefresh = enableLive;
             luxriotSummaryFollowLive = enableLive;
@@ -7335,11 +10301,38 @@
     }
     if (luxriotSummaryJumpBtn) {
         luxriotSummaryJumpBtn.addEventListener('click', () => {
-            if (isRollupViewActive()) return;
+            if (!isLiveSummaryPeriod() || isRollupViewActive()) {
+                luxriotSummaryRangePreset = 'live';
+                luxriotSummaryRunFilter = 'live';
+                luxriotSummaryAutoRefresh = true;
+                if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                resetSummaryArchivePaging();
+                applySummaryResolutionMode();
+                syncSummaryRangeUI();
+            }
             luxriotSummaryFollowLive = true;
             setSummaryUnread(0);
             updateSummaryControlsUI();
-            scrollSummaryToLatest();
+            refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+        });
+    }
+    if (luxriotSummaryPreviousPeriodBtn) {
+        luxriotSummaryPreviousPeriodBtn.addEventListener('click', () => {
+            if (shiftSelectedSummaryPeriod(-1)) {
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            }
+        });
+    }
+    if (luxriotSummaryNextPeriodBtn) {
+        luxriotSummaryNextPeriodBtn.addEventListener('click', () => {
+            if (shiftSelectedSummaryPeriod(1)) {
+                refreshLuxriotSummaryView(getSelectedSummaryChannel(), true);
+            }
+        });
+    }
+    if (luxriotSummaryLoadEarlierBtn) {
+        luxriotSummaryLoadEarlierBtn.addEventListener('click', () => {
+            void refreshLuxriotArchivedSummaries(getSelectedSummaryChannel(), null, true);
         });
     }
     if (luxriotSummaries) {
@@ -7397,6 +10390,14 @@
                 exportLuxriotRollupFromRow(idx);
                 return;
             }
+            const rollupGenerateBtn = target.closest('[data-luxriot-rollup-generate]');
+            if (rollupGenerateBtn instanceof HTMLButtonElement) {
+                const idx = parseInt(rollupGenerateBtn.dataset.luxriotRollupGenerate || '', 10);
+                if (!Number.isFinite(idx)) return;
+                event.preventDefault();
+                void generateLuxriotSemanticRollup(idx, rollupGenerateBtn);
+                return;
+            }
             const rollupDrillBtn = target.closest('[data-luxriot-rollup-drill]');
             if (rollupDrillBtn instanceof HTMLButtonElement) {
                 const idx = parseInt(rollupDrillBtn.dataset.luxriotRollupDrill || '', 10);
@@ -7423,6 +10424,42 @@
                 if (!Number.isFinite(idx)) return;
                 event.preventDefault();
                 toggleLuxriotSummaryCollapse(idx);
+                return;
+            }
+            const thumbnailBtn = target.closest('[data-luxriot-summary-thumbnail]');
+            if (thumbnailBtn instanceof HTMLButtonElement) {
+                const idx = parseInt(thumbnailBtn.dataset.luxriotSummaryThumbnail || '', 10);
+                if (!Number.isFinite(idx) || idx < 0 || idx >= luxriotSummaryLogCache.length) return;
+                const row = luxriotSummaryLogCache[idx] || {};
+                const detectionId = Number(row.thumbnail_detection_id);
+                if (!Number.isFinite(detectionId) || detectionId <= 0) return;
+                event.preventDefault();
+                openArchiveReviewModal(idx, {
+                    id: Math.trunc(detectionId),
+                    detection_id: Math.trunc(detectionId),
+                    source: 'vlm_summary',
+                    logical_source: 'vlm_summary',
+                    channel_id: Number(row.channel_id) || getSelectedSummaryChannel(),
+                    timestamp_ms: Number(row.batch_end_ms || 0),
+                    summary: String(row.summary || ''),
+                    image_url: `/detections/thumbnail/${Math.trunc(detectionId)}`,
+                    payload: {
+                        source: 'vlm_summary',
+                        batch_id: String(row.batch_id || ''),
+                        run_id: String(row.run_id || ''),
+                        batch_start_ms: Number(row.batch_start_ms || 0),
+                        batch_end_ms: Number(row.batch_end_ms || 0),
+                        summary: String(row.summary || ''),
+                        anchor_role: String(row.thumbnail_role || 'sample'),
+                        frame_index: Number(row.thumbnail_frame_index || 0),
+                        snapshot_index: Number(row.thumbnail_snapshot_index || 0),
+                        is_cover: Boolean(row.thumbnail_is_cover),
+                        cover_kind: String(row.cover_kind || ''),
+                        cover_reason: String(row.cover_reason || ''),
+                        cover_confidence: String(row.cover_confidence || ''),
+                        selection_source: String(row.thumbnail_selection_source || ''),
+                    },
+                });
                 return;
             }
             const copyBtn = target.closest('[data-luxriot-copy]');
@@ -7459,9 +10496,15 @@
                 if (Number.isFinite(summaryChannelId)) {
                     luxriotSummaryChannel = summaryChannelId;
                     syncLuxriotSummaryChannelSelect();
-                    setSummaryBaseLevel(luxriotSummaryLevel);
+                    luxriotSummaryRangePreset = 'live';
+                    luxriotSummaryRunFilter = 'live';
+                    if (luxriotSummaryRangeSelect) luxriotSummaryRangeSelect.value = 'live';
+                    resetSummaryArchivePaging();
+                    applySummaryResolutionMode();
+                    syncSummaryRangeUI();
                     setSummaryUnread(0);
                     luxriotSummaryFollowLive = true;
+                    luxriotSummaryAutoRefresh = true;
                     updateSummaryControlsUI();
                     refreshLuxriotSummaryView(summaryChannelId, true);
                     if (!isRollupViewActive()) {
@@ -7487,11 +10530,23 @@
     }
     if (luxriotChannelSelect) {
         luxriotChannelSelect.addEventListener('change', () => {
+            const draftChannelId = luxriotPromptFormChannelId;
+            if (isLuxriotPromptModalOpen() && hasLuxriotPromptDraftChanges()) {
+                if (!window.confirm('Discard unsaved prompt changes and switch channels?')) {
+                    if (Number.isFinite(draftChannelId)) {
+                        luxriotChannelSelect.value = String(draftChannelId);
+                    }
+                    return;
+                }
+                invalidateLuxriotPromptRequests({ clearFormIdentity: true });
+            }
+            clearLuxriotLiveIntervalDirty();
             luxriotActiveChannel = getSelectedLuxriotChannel();
             syncProbeChannelSelect();
             syncLuxriotSummaryChannelSelect();
-            setSummaryBaseLevel(luxriotSummaryLevel);
-            syncLuxriotLiveIntervalInput(luxriotActiveChannel);
+            resetSummaryArchivePaging();
+            applySummaryResolutionMode();
+            syncLuxriotLiveIntervalInput(luxriotActiveChannel, { force: true });
             updateLuxriotCaptureToggleButton(luxriotActiveChannel);
             updateLuxriotStreamContext();
             void refreshLuxriotPromptSettings(false, luxriotActiveChannel);
@@ -7504,7 +10559,7 @@
         });
     }
     
-    // -------- Monitoring / Probes --------
+    // -------- Probes board --------
     function setProbeStatus(message, isError = false) {
         if (!probeStatus) return;
         probeStatus.textContent = message;
@@ -7732,8 +10787,11 @@
         const viewportWidth = viewportRect.width;
         const viewportHeight = viewportRect.height;
         if (!(viewportWidth > 1) || !(viewportHeight > 1)) return null;
-        const naturalWidth = probePreviewImg.naturalWidth || 0;
-        const naturalHeight = probePreviewImg.naturalHeight || 0;
+        const videoActive = probePreviewVideo
+            && probePreviewVideo.style.display !== 'none'
+            && Number(probePreviewVideo.videoWidth) > 0;
+        const naturalWidth = videoActive ? Number(probePreviewVideo.videoWidth) : (probePreviewImg.naturalWidth || 0);
+        const naturalHeight = videoActive ? Number(probePreviewVideo.videoHeight) : (probePreviewImg.naturalHeight || 0);
         if (!(naturalWidth > 1) || !(naturalHeight > 1)) {
             return {
                 viewportRect,
@@ -7928,40 +10986,337 @@
         renderProbeRoiBox();
     }
 
-    function stopProbePreview() {
-        if (probePreviewTimer) {
-            clearInterval(probePreviewTimer);
-            probePreviewTimer = null;
-        }
-        probePreviewChannelId = null;
+    function ensureProbePreviewVideo() {
+        if (probePreviewVideo && probePreviewVideo.isConnected) return probePreviewVideo;
+        if (!probePreviewViewport) return null;
+        const video = document.createElement('video');
+        video.className = 'probe-operator-video';
+        video.autoplay = true;
+        video.muted = true;
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+        video.setAttribute('aria-label', 'Luxriot operator video for probe monitoring');
+        Object.assign(video.style, {
+            position: 'absolute',
+            inset: '0',
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            background: '#000',
+            display: 'none',
+        });
+        probePreviewViewport.insertBefore(video, probePreviewOverlay || probeRoiLayer || null);
+        probePreviewVideo = video;
+        return video;
     }
 
-    function startProbePreview(channelId) {
-        if (!probePreviewImg) return;
-        if (currentMode !== 'monitor') return;
-        if (probePreviewTimer && probePreviewChannelId === channelId) return;
+    function ensureProbePreviewRetryButton() {
+        if (probePreviewRetryBtn && probePreviewRetryBtn.isConnected) return probePreviewRetryBtn;
+        if (!probePreviewViewport) return null;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'feature-btn';
+        button.textContent = 'Retry video';
+        button.hidden = true;
+        button.addEventListener('click', () => startProbePreview(getSelectedProbeChannelId()));
+        Object.assign(button.style, {
+            position: 'absolute',
+            right: '10px',
+            bottom: '10px',
+            zIndex: '8',
+        });
+        probePreviewViewport.appendChild(button);
+        probePreviewRetryBtn = button;
+        return button;
+    }
+
+    function clearProbePreviewVideo() {
+        if (!probePreviewVideo) return;
+        probePreviewVideo.onloadedmetadata = null;
+        probePreviewVideo.oncanplay = null;
+        probePreviewVideo.onplaying = null;
+        probePreviewVideo.onwaiting = null;
+        probePreviewVideo.onstalled = null;
+        probePreviewVideo.onprogress = null;
+        probePreviewVideo.ontimeupdate = null;
+        probePreviewVideo.onended = null;
+        probePreviewVideo.onerror = null;
+        try {
+            probePreviewVideo.pause();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        probePreviewVideo.removeAttribute('src');
+        try {
+            probePreviewVideo.load();
+        } catch (_) {
+            // Best-effort media cleanup.
+        }
+        probePreviewVideo.style.display = 'none';
+    }
+
+    function replaceProbePreviewImageElement() {
+        if (!probePreviewImg || !probePreviewImg.parentNode) return;
+        const previous = probePreviewImg;
+        previous.onload = null;
+        previous.onerror = null;
+        const replacement = previous.cloneNode(false);
+        replacement.removeAttribute('src');
+        replacement.style.display = 'none';
+        previous.replaceWith(replacement);
+        probePreviewImg = replacement;
+    }
+
+    function setProbeMediaState(state, detail = '') {
+        probePreviewMediaState = ['idle', 'loading', 'playing', 'degraded', 'error'].includes(state) ? state : 'error';
+        const overlayText = {
+            idle: '',
+            loading: detail || 'Loading live video…',
+            playing: '',
+            degraded: 'Static frame fallback — not video',
+            error: detail || 'Video unavailable',
+        }[probePreviewMediaState];
+        if (probePreviewViewport) probePreviewViewport.dataset.mediaState = probePreviewMediaState;
+        setPreviewState(overlayText);
+        const retry = ensureProbePreviewRetryButton();
+        if (retry) retry.hidden = !['degraded', 'error'].includes(probePreviewMediaState);
+    }
+
+    function isCurrentProbeMediaRequest(generation, channelId) {
+        return generation === probePreviewGeneration
+            && probePreviewChannelId === channelId
+            && currentMode === 'probes'
+            && probeEditorModal
+            && probeEditorModal.style.display === 'block'
+            && getSelectedProbeChannelId() === channelId;
+    }
+
+    function scheduleProbePreviewRenewal(generation, channelId, delayMs, detail) {
+        if (probePreviewRenewTimer) clearTimeout(probePreviewRenewTimer);
+        const parsedDelay = Number(delayMs);
+        const safeDelay = delayMs !== null && delayMs !== undefined && Number.isFinite(parsedDelay) && parsedDelay > 0
+            ? Math.max(750, Math.min(120000, Math.trunc(parsedDelay)))
+            : 20000;
+        probePreviewRenewTimer = window.setTimeout(() => {
+            probePreviewRenewTimer = null;
+            if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+            setProbeMediaState('loading', detail || 'Renewing bounded operator video…');
+            startProbePreview(channelId, true);
+        }, safeDelay);
+    }
+
+    function clearProbePreviewStallWatchdog() {
+        if (!probePreviewStallTimer) return;
+        clearTimeout(probePreviewStallTimer);
+        probePreviewStallTimer = null;
+    }
+
+    function armProbePreviewStallWatchdog(generation, channelId) {
+        clearProbePreviewStallWatchdog();
+        probePreviewStallTimer = window.setTimeout(() => {
+            probePreviewStallTimer = null;
+            if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+            scheduleProbePreviewRenewal(
+                generation,
+                channelId,
+                750,
+                'Operator video stalled; reconnecting without touching probe capture…',
+            );
+        }, 5000);
+    }
+
+    function showProbeStaticFallback(generation, channelId, reason) {
+        if (!isCurrentProbeMediaRequest(generation, channelId) || !probePreviewImg) return;
+        clearProbePreviewVideo();
+        probePreviewImg.onload = () => {
+            if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+            probePreviewImg.style.display = 'block';
+            setProbeMediaState('degraded', reason);
+            renderProbeRoiBox();
+        };
+        probePreviewImg.onerror = () => {
+            if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+            setProbeMediaState('error', 'Video and static fallback are unavailable.');
+        };
+        probePreviewImg.style.display = 'block';
+        probePreviewImg.src = `/luxriot/snapshot/${encodeURIComponent(String(channelId))}?stream=mainStream&t=${Date.now()}`;
+    }
+
+    function stopProbePreview() {
+        if (probePreviewTimer) {
+            clearTimeout(probePreviewTimer);
+            probePreviewTimer = null;
+        }
+        if (probePreviewRenewTimer) {
+            clearTimeout(probePreviewRenewTimer);
+            probePreviewRenewTimer = null;
+        }
+        clearProbePreviewStallWatchdog();
+        probePreviewGeneration += 1;
+        abortUiRequest(probePreviewAbortController);
+        probePreviewAbortController = null;
+        clearProbePreviewVideo();
+        if (probePreviewImg) {
+            probePreviewImg.onload = null;
+            probePreviewImg.onerror = null;
+            probePreviewImg.removeAttribute('src');
+            probePreviewImg.style.display = 'none';
+        }
+        if (probePreviewRetryBtn) probePreviewRetryBtn.hidden = true;
+        probePreviewChannelId = null;
+        probePreviewMediaState = 'idle';
+    }
+
+    function startProbePreview(channelId, force = false) {
+        if (!probePreviewImg || !probePreviewViewport) return;
+        if (currentMode !== 'probes') return;
+        if (
+            !force
+            && probePreviewChannelId === channelId
+            && ['loading', 'playing'].includes(probePreviewMediaState)
+        ) return;
         stopProbePreview();
+        replaceProbePreviewImageElement();
         if (!channelId && channelId !== 0) {
             setPreviewState('No channel', true);
             return;
         }
-        const refresh = () => {
-            if (probePreviewOverlay) probePreviewOverlay.textContent = 'Loading...';
-            probePreviewImg.src = `/luxriot/snapshot/${channelId}?t=${Date.now()}`;
-        };
-        probePreviewImg.onload = () => {
-            setPreviewState('');
-            renderProbeRoiBox();
-        };
-        probePreviewImg.onerror = () => setPreviewState('Preview failed');
         probePreviewChannelId = channelId;
-        refresh();
-        const intervalMs = Math.max(2000, (luxriotDefaults.snapshotInterval || 5) * 1000);
-        probePreviewTimer = setInterval(refresh, intervalMs);
+        const generation = ++probePreviewGeneration;
+        const controller = new AbortController();
+        const cachedNegotiation = force
+            && Number(probePreviewNegotiation?.channelId) === Number(channelId)
+            ? probePreviewNegotiation.value
+            : null;
+        probePreviewAbortController = cachedNegotiation ? null : controller;
+        const sharedVideoStream = selectedLuxriotStream(channelId, 'video');
+        const useAttentionPreview = Boolean(sharedVideoStream?.running);
+        const mediaUrl = luxriotMediaBrokerUrl(
+            useAttentionPreview ? 'attention' : 'live',
+            channelId,
+            { stream: 'mainStream' },
+        );
+        setProbeMediaState(
+            'loading',
+            useAttentionPreview ? 'Loading shared EVA attention frames…' : 'Loading operator video…',
+        );
+        const negotiationRequest = cachedNegotiation
+            ? Promise.resolve(cachedNegotiation)
+            : negotiateLuxriotMedia(mediaUrl, controller);
+        void negotiationRequest
+            .then((negotiated) => {
+                if (probePreviewAbortController === controller) probePreviewAbortController = null;
+                if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                probePreviewNegotiation = { channelId, value: negotiated };
+                const failToStatic = (reason) => {
+                    if (probePreviewTimer) {
+                        clearTimeout(probePreviewTimer);
+                        probePreviewTimer = null;
+                    }
+                    if (probePreviewRenewTimer) {
+                        clearTimeout(probePreviewRenewTimer);
+                        probePreviewRenewTimer = null;
+                    }
+                    clearProbePreviewStallWatchdog();
+                    showProbeStaticFallback(generation, channelId, reason);
+                };
+                probePreviewTimer = window.setTimeout(
+                    () => failToStatic('Operator video load timed out.'),
+                    12000,
+                );
+                if (negotiated.mediaKind === 'mjpeg') {
+                    probePreviewImg.onload = () => {
+                        if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                        clearTimeout(probePreviewTimer);
+                        probePreviewTimer = null;
+                        probePreviewImg.style.display = 'block';
+                        setProbeMediaState('playing');
+                        renderProbeRoiBox();
+                    };
+                    probePreviewImg.onerror = () => failToStatic('The MJPEG stream could not be decoded.');
+                    probePreviewImg.style.display = 'block';
+                    scheduleProbePreviewRenewal(
+                        generation,
+                        channelId,
+                        negotiated.renewAfterMs,
+                        negotiated.attentionPreview
+                            ? 'Renewing shared EVA attention frames…'
+                            : 'Renewing bounded MJPEG operator video…',
+                    );
+                    probePreviewImg.src = `${mediaUrl}&request=${Date.now()}`;
+                    return;
+                }
+                const video = ensureProbePreviewVideo();
+                if (!video) {
+                    failToStatic('The browser video element could not be initialized.');
+                    return;
+                }
+                video.style.display = 'block';
+                const markPlayable = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    clearTimeout(probePreviewTimer);
+                    probePreviewTimer = null;
+                    clearProbePreviewStallWatchdog();
+                    setProbeMediaState('playing');
+                    renderProbeRoiBox();
+                };
+                video.onloadedmetadata = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    renderProbeRoiBox();
+                };
+                video.oncanplay = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    markPlayable();
+                    const playPromise = video.play();
+                    if (playPromise && typeof playPromise.catch === 'function') playPromise.catch(() => {});
+                };
+                video.onplaying = markPlayable;
+                video.onwaiting = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    setProbeMediaState('loading', 'Buffering operator video…');
+                    armProbePreviewStallWatchdog(generation, channelId);
+                };
+                video.onstalled = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    setProbeMediaState('loading', 'Operator video transport stalled…');
+                    armProbePreviewStallWatchdog(generation, channelId);
+                };
+                video.onprogress = clearProbePreviewStallWatchdog;
+                video.ontimeupdate = clearProbePreviewStallWatchdog;
+                video.onerror = () => failToStatic('The browser rejected the Luxriot video container or codec.');
+                video.onended = () => {
+                    if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                    setProbeMediaState('loading', 'Reconnecting operator video…');
+                    scheduleProbePreviewRenewal(
+                        generation,
+                        channelId,
+                        750,
+                        'The bounded operator video segment ended; reconnecting…',
+                    );
+                };
+                scheduleProbePreviewRenewal(
+                    generation,
+                    channelId,
+                    negotiated.renewAfterMs,
+                    'Renewing bounded operator video before its server lease expires…',
+                );
+                video.src = `${mediaUrl}&request=${Date.now()}`;
+                video.load();
+            })
+            .catch((error) => {
+                if (probePreviewAbortController === controller) probePreviewAbortController = null;
+                if (!isCurrentProbeMediaRequest(generation, channelId)) return;
+                showProbeStaticFallback(
+                    generation,
+                    channelId,
+                    controller.signal.aborted ? 'Operator media negotiation timed out.' : (error.message || 'Operator video is unavailable.'),
+                );
+            });
     }
 
     function syncProbePreview(channelIdOverride = null) {
-        if (currentMode !== 'monitor') {
+        if (currentMode !== 'probes') {
             stopProbePreview();
             return;
         }
@@ -7975,23 +11330,8 @@
             setPreviewState('No channel', true);
             return;
         }
-        const runtimeState = getProbeRuntimeState(channelId);
-        const enabled = probeEnableToggle ? probeEnableToggle.checked !== false : true;
-        if (enabled && runtimeState === 'running') {
-            startProbePreview(channelId);
-            setPreviewState('');
-            return;
-        }
-        stopProbePreview();
-        if (!enabled) {
-            setPreviewState('Probe disabled');
-            return;
-        }
-        if (runtimeState === 'paused') {
-            setPreviewState('Paused');
-            return;
-        }
-        setPreviewState('No stream');
+        // Operator media is independent from probe/VLM capture lifecycle.
+        startProbePreview(channelId);
     }
 
     function updateProbeSnapScaleMode() {
@@ -8329,8 +11669,15 @@
             pairs: serializeProbePairsForStorage(editorPairs),
             positives,
             negatives,
-            pos_floor: parseFloat(probePosFloorInput?.value) || 0.2,
-            margin: Math.max(0, parseFloat(probeMarginInput?.value) || 0.05),
+            pos_floor: Number.isFinite(parseFloat(probePosFloorInput?.value))
+                ? parseFloat(probePosFloorInput.value)
+                : PROBE_POS_FLOOR_DEFAULT,
+            margin: Math.max(
+                0,
+                Number.isFinite(parseFloat(probeMarginInput?.value))
+                    ? parseFloat(probeMarginInput.value)
+                    : PROBE_MARGIN_DEFAULT,
+            ),
             top_k: parseInt(probeTopKInput?.value || '6', 10) || 6,
             window_sec: parseFloat(probeWindowSecInput?.value) || 300,
             fps: parseFloat(probeFpsInput?.value) || 0,
@@ -8491,13 +11838,137 @@
         };
     }
 
-    function renderMonitorProbeInspector() {
-        if (!monitorProbeSummary) return;
+    /**
+     * Authorship block for the inspector.
+     *
+     * For a background VLM probe this is the only place an operator can see
+     * which alert produced it, so the parent alert is offered as a jump into
+     * the archive rather than as an opaque id.
+     */
+    function probesLineageHtml(probe, originView) {
+        const rows = [`
+            <div class="probes-summary-stat">
+                <span class="probes-summary-stat-label">Created by</span>
+                <span class="probes-summary-stat-value" title="${escapeHtml(originView.title)}">${escapeHtml(originView.label)}</span>
+            </div>`];
+        if (originView.key === 'agent') {
+            const planId = probe.origin_meta?.plan_id;
+            if (planId) {
+                rows.push(`
+                    <div class="probes-summary-stat">
+                        <span class="probes-summary-stat-label">Approval plan</span>
+                        <span class="probes-summary-stat-value">${escapeHtml(String(planId))}</span>
+                    </div>`);
+            }
+        }
+        if (originView.key === 'auto') {
+            const alertTitle = String(probe.parent_alert_title || '').trim();
+            const alertTs = Number(probe.parent_alert_timestamp_ms);
+            rows.push(`
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Parent alert</span>
+                    <span class="probes-summary-stat-value" title="${escapeHtml(String(probe.parent_alert_description || alertTitle || ''))}">${escapeHtml(alertTitle || String(probe.parent_alert_id || 'unknown'))}</span>
+                </div>`);
+            if (Number.isFinite(alertTs)) {
+                rows.push(`
+                    <div class="probes-summary-stat">
+                        <span class="probes-summary-stat-label">Alert time</span>
+                        <span class="probes-summary-stat-value">${escapeHtml(new Date(alertTs).toLocaleString())}</span>
+                    </div>`);
+            }
+        }
+        const jump = originView.key === 'auto'
+            && String(probe.parent_alert_id || '').trim()
+            && Number.isFinite(Number(probe.parent_alert_timestamp_ms))
+            ? `<button type="button" class="feature-btn probes-lineage-jump" id="probeLineageJumpBtn">Open parent alert in archive</button>`
+            : '';
+        return `<div class="probes-summary-lineage">
+            <div class="probes-summary-stats">${rows.join('')}</div>
+            ${jump}
+        </div>`;
+    }
+
+    /**
+     * Point the archive at the alert that spawned a background probe: same
+     * channel, VLM-alert source, and a window bracketing the alert timestamp.
+     */
+    async function jumpToProbeParentAlert(probe) {
+        const alertTs = Number(probe?.parent_alert_timestamp_ms);
+        const parentAlertId = String(probe?.parent_alert_id || '').trim();
+        if (!Number.isFinite(alertTs) || !parentAlertId) return;
+        const channelId = parseInt(String(probe.channel_id || ''), 10);
+        if (archiveSourceFilter) {
+            archiveSourceFilter.value = 'vlm_alert';
+        }
+        if (archiveChannelOptions && Number.isFinite(channelId)) {
+            archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]').forEach((input) => {
+                input.checked = String(input.value) === String(channelId);
+            });
+            syncArchiveChannelAllOption();
+            invalidateArchiveResultContext();
+        }
+        // An absolute From/To window overrides the relative "Last Nh" select, so
+        // the hours dropdown is deliberately left alone.
+        const pad = 15 * 60 * 1000;
+        if (archiveFromTimeInput) archiveFromTimeInput.value = toArchiveLocalDateTimeInput(alertTs - pad);
+        if (archiveToTimeInput) archiveToTimeInput.value = toArchiveLocalDateTimeInput(alertTs + pad);
+        setMode('archive');
+        const params = new URLSearchParams({
+            source: 'vlm_alert',
+            parent_alert_id: parentAlertId,
+            limit: '1',
+            offset: '0',
+        });
+        if (Number.isFinite(channelId)) {
+            params.set('channel_id', String(channelId));
+        }
+        const requestContext = beginArchiveEvidenceRequest(loadDetectionsBtn);
+        if (resultsContainer) {
+            resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Opening parent VLM alert...</div>';
+        }
+        setArchiveDetectionsMeta('Opening parent VLM alert...');
+        try {
+            const response = await fetch(`/detections/list?${params.toString()}`, {
+                signal: requestContext.controller.signal,
+            });
+            const data = await parseApiJson(response, 'Failed to open parent VLM alert');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
+            const mapped = normalizeDetectionResults(
+                Array.isArray(data.detections) ? data.detections : []
+            );
+            if (mapped.length) {
+                archiveLastQueryText = `Parent VLM alert ${parentAlertId}`;
+                archiveDetectionsOffset = 0;
+                archiveDetectionsTotal = Number.isFinite(data.total) ? data.total : mapped.length;
+                archiveDetectionsHasMore = false;
+                displayResults(mapped);
+                setArchiveDetectionsMeta('Opened exact parent VLM alert.');
+                updateArchiveDetectionsNav();
+                openArchiveReviewModal(0, mapped[0]);
+                return;
+            }
+        } catch (error) {
+            if (error?.name === 'AbortError') return;
+        }
+        // Alerts archived before stable lineage ids existed cannot be addressed
+        // exactly; retain the bounded channel/time fallback for those rows.
+        archiveLastQueryText = 'Parent VLM alert time window';
+        await loadDetectionsArchive(true);
+    }
+
+    /** Inverse of parseArchiveLocalDateTimeMs: epoch ms -> local datetime-local value. */
+    function toArchiveLocalDateTimeInput(ms) {
+        const localMs = ms - new Date(ms).getTimezoneOffset() * 60000;
+        return new Date(localMs).toISOString().slice(0, 16);
+    }
+
+    function renderProbesInspector() {
+        if (!probesSummary) return;
         const probe = activeProbeId ? probeList.find((p) => String(p.id) === String(activeProbeId)) : null;
         if (!probe) {
-            monitorProbeSummary.innerHTML = '<div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>';
-            if (monitorSelectionStatus) {
-                monitorSelectionStatus.textContent = 'No probe selected';
+            probesSummary.innerHTML = '<div class="studio-empty-state">Select a probe card to inspect its live state and operate it from here.</div>';
+            if (probesSelectionStatus) {
+                probesSelectionStatus.textContent = 'No probe selected';
             }
             return;
         }
@@ -8522,121 +11993,704 @@
         const negativeCount = Array.isArray(probe.pairs) ? probe.pairs.filter((pair) => String(pair?.negative || '').trim()).length : 0;
         const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
 
-        if (monitorSelectionStatus) {
-            monitorSelectionStatus.textContent = `${status.toUpperCase()} · Ch ${probe.channel_id || luxriotActiveChannel}`;
+        const originView = probeOriginView(probe);
+        const ttl = probeTemporaryTtl(probe);
+
+        if (probesSelectionStatus) {
+            probesSelectionStatus.textContent = `${status.toUpperCase()} · Ch ${probe.channel_id || luxriotActiveChannel}`;
         }
 
-        monitorProbeSummary.innerHTML = `
-            <div class="monitor-probe-hero">
-                <div class="monitor-probe-thumb ${thumbSrc ? '' : 'is-empty'}">
+        probesSummary.innerHTML = `
+            <div class="probes-summary-hero">
+                <div class="probes-summary-thumb ${thumbSrc ? '' : 'is-empty'}">
                     ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(probe.name || 'probe preview')}" />` : '<span>No preview</span>'}
                 </div>
-                <div class="monitor-probe-copy">
-                    <div class="probe-status-pill ${pillClass}">${status}</div>
-                    <div class="monitor-probe-name">${escapeHtml(probe.name || 'unnamed probe')}</div>
-                    <div class="monitor-probe-meta">Channel ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || 'n/a'))}</div>
-                    <div class="monitor-probe-meta">Last event: ${escapeHtml(ts)}</div>
+                <div class="probes-summary-copy">
+                    <div class="probes-summary-tags">
+                        <div class="probe-status-pill ${pillClass}">${status}</div>
+                        ${probeOriginBadgeHtml(probe)}
+                        ${ttl ? `<span class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</span>` : ''}
+                    </div>
+                    <div class="probes-summary-name">${escapeHtml(probe.name || 'unnamed probe')}</div>
+                    <div class="probes-summary-meta">Channel ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || 'n/a'))}</div>
+                    <div class="probes-summary-meta">Last event: ${escapeHtml(ts)}</div>
                 </div>
             </div>
-            <div class="monitor-probe-stats">
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Scores</span>
-                    <span class="monitor-probe-stat-value">${escapeHtml(scores)}</span>
+            <div class="probes-summary-signal">
+                <div class="probes-summary-stat-label">Recent positive score</div>
+                ${probeSparklineHtml(probe, { width: 260, height: 48 })}
+            </div>
+            ${probesLineageHtml(probe, originView)}
+            <div class="probes-summary-stats">
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Scores</span>
+                    <span class="probes-summary-stat-value">${escapeHtml(scores)}</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Bookmark gate</span>
-                    <span class="monitor-probe-stat-value" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Bookmark gate</span>
+                    <span class="probes-summary-stat-value" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Text pairs</span>
-                    <span class="monitor-probe-stat-value">${positiveCount} positive · ${negativeCount} negative</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Text pairs</span>
+                    <span class="probes-summary-stat-value">${positiveCount} positive · ${negativeCount} negative</span>
                 </div>
-                <div class="monitor-probe-stat">
-                    <span class="monitor-probe-stat-label">Image probe</span>
-                    <span class="monitor-probe-stat-value">${probe.image_probe?.enabled !== false && probe.image_probe?.data ? 'enabled' : 'off'}</span>
+                <div class="probes-summary-stat">
+                    <span class="probes-summary-stat-label">Image probe</span>
+                    <span class="probes-summary-stat-value">${probe.image_probe?.enabled !== false && probe.image_probe?.data ? 'enabled' : 'off'}</span>
                 </div>
             </div>
         `;
     }
 
-    function renderProbeCards() {
-        if (!probeCards) return;
-        if (!probeList.length) {
-            const emptyCardsHtml = `
-                <div class="probe-mini-card new-probe-card">
-                    <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
-                        ${probeActionIcon('new')}
-                        <span>New Probe</span>
-                    </button>
-                </div>`;
-            if (probeCardsRenderKey !== emptyCardsHtml) {
-                probeCards.innerHTML = emptyCardsHtml;
-                probeCardsRenderKey = emptyCardsHtml;
-            }
-            renderMonitorProbeInspector();
-            return;
+    const PROBE_ORIGIN_VIEWS = {
+        operator: { label: 'Operator', short: 'OP', title: 'Created by an operator' },
+        agent: { label: 'Agent', short: 'AI', title: 'Created by the agent and applied after operator approval' },
+        auto: { label: 'Background VLM', short: 'VLM', title: 'Temporary follow-up raised automatically from a VLM alert' },
+    };
+
+    function probeOriginKey(probe) {
+        const raw = String(probe?.origin || '').trim().toLowerCase();
+        if (PROBE_ORIGINS.includes(raw)) return raw;
+        // Mirror the server-side backfill so a stale cached probe still renders
+        // with a truthful badge instead of silently claiming operator authorship.
+        if (probe?.temporary || probe?.parent_alert_id) return 'auto';
+        return 'operator';
+    }
+
+    function probeOriginView(probe) {
+        const key = probeOriginKey(probe);
+        return { key, ...PROBE_ORIGIN_VIEWS[key] };
+    }
+
+    function probeOriginBadgeHtml(probe) {
+        const view = probeOriginView(probe);
+        return `<span class="probes-origin-badge is-${view.key}" title="${escapeHtml(view.title)}">`
+            + `<span class="probes-origin-dot is-${view.key}" aria-hidden="true"></span>`
+            + `<span class="probes-origin-text">${escapeHtml(view.short)}</span></span>`;
+    }
+
+    function probeStatusView(probe) {
+        const channelId = parseInt(String(probe?.channel_id || luxriotActiveChannel), 10);
+        const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
+        const status = probe?.enabled === false
+            ? 'disabled'
+            : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
+        const pillClass = status === 'disabled'
+            ? 'pill-disabled'
+            : status === 'running'
+                ? 'pill-running'
+                : status === 'paused'
+                    ? 'pill-paused'
+                    : 'pill-idle';
+        return { status, pillClass, channelId };
+    }
+
+    function probeHitSeries(probe) {
+        const hits = Array.isArray(probe?.recent_hits) && probe.recent_hits.length
+            ? probe.recent_hits
+            : (probe?.last_hit ? [probe.last_hit] : []);
+        return hits
+            .filter((hit) => hit && Number.isFinite(Number(hit.pos_score)))
+            .map((hit) => ({
+                score: Number(hit.pos_score),
+                margin: Number(hit.margin),
+                timestampMs: Number(hit.timestamp_ms),
+            }))
+            .sort((left, right) => (left.timestampMs || 0) - (right.timestampMs || 0))
+            .slice(-24);
+    }
+
+    /**
+     * Activity sparkline over the probe's retained hits.
+     *
+     * This replaces the empty "NO PREVIEW" placeholder: a probe with no stored
+     * thumbnail still has a signal history worth seeing, and a flat baseline is
+     * an honest "no hits yet" rather than dead space.
+     */
+    function probeSparklineHtml(probe, { width = 160, height = 34 } = {}) {
+        const series = probeHitSeries(probe);
+        if (!series.length) {
+            return `<div class="probes-spark is-empty" title="No probe hits recorded yet">
+                <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+                    <line x1="0" y1="${height - 1}" x2="${width}" y2="${height - 1}" />
+                </svg>
+                <span class="probes-spark-label">no hits yet</span>
+            </div>`;
         }
-        const cards = probeList.map((p) => {
-            const last = p.last_hit;
-            const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
-            const channelId = parseInt(String(p.channel_id || luxriotActiveChannel), 10);
-            const runtimeState = Number.isFinite(channelId) ? probeChannelRuntime[channelId] : undefined;
-            const status = p.enabled === false
-                ? 'disabled'
-                : (runtimeState === 'running' ? 'running' : runtimeState === 'paused' ? 'paused' : 'idle');
-            const pillClass = status === 'disabled'
-                ? 'pill-disabled'
-                : status === 'running'
-                    ? 'pill-running'
-                    : status === 'paused'
-                        ? 'pill-paused'
-                        : 'pill-idle';
-            const thumbSrc = last?.thumbnail || p.image_probe?.data || '';
-            const toggleAction = status === 'disabled' ? 'enable' : 'disable';
-            const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
-            const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
-            const gateView = describeProbeBookmarkGate(p.bookmark_gate, p.bookmark !== false);
-            return `
-                <div class="probe-mini-card ${activeProbeId === p.id ? 'active' : ''}" data-probe-id="${p.id}">
-                    <div class="probe-mini-card-head">
+        const floor = Number.isFinite(Number(probe?.pos_floor)) ? Number(probe.pos_floor) : null;
+        const values = series.map((point) => point.score);
+        const scaleCandidates = values.concat(floor === null ? [] : [floor]);
+        const min = Math.min(...scaleCandidates);
+        const max = Math.max(...scaleCandidates);
+        const span = max - min > 1e-6 ? max - min : 1;
+        const stepX = series.length > 1 ? width / (series.length - 1) : width;
+        const toY = (value) => height - 2 - ((value - min) / span) * (height - 4);
+        const points = series
+            .map((point, index) => `${(index * stepX).toFixed(1)},${toY(point.score).toFixed(1)}`)
+            .join(' ');
+        const floorLine = floor === null
+            ? ''
+            : `<line class="probes-spark-floor" x1="0" y1="${toY(floor).toFixed(1)}" x2="${width}" y2="${toY(floor).toFixed(1)}" />`;
+        const lastPoint = series[series.length - 1];
+        const overFloor = floor !== null && lastPoint.score >= floor;
+        const title = `${series.length} hit${series.length === 1 ? '' : 's'} · last P ${lastPoint.score.toFixed(3)}`
+            + (floor === null ? '' : ` · floor ${floor.toFixed(3)}`);
+        return `<div class="probes-spark ${overFloor ? 'is-over' : ''}" title="${escapeHtml(title)}">
+            <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+                ${floorLine}
+                <polyline class="probes-spark-line" points="${points}" />
+                <circle class="probes-spark-head" cx="${((series.length - 1) * stepX).toFixed(1)}" cy="${toY(lastPoint.score).toFixed(1)}" r="2" />
+            </svg>
+        </div>`;
+    }
+
+    function probeTemporaryTtl(probe) {
+        if (!probe?.temporary) return null;
+        const expiresAt = Number(probe.expires_at_ms);
+        if (!Number.isFinite(expiresAt)) return { text: 'temporary', title: 'Temporary probe without a stored expiry' };
+        const remainingMs = expiresAt - Date.now();
+        if (remainingMs <= 0) return { text: 'expiring', title: 'Past its expiry; the next lifecycle sweep retires it' };
+        const minutes = Math.floor(remainingMs / 60000);
+        const text = minutes >= 60
+            ? `${Math.floor(minutes / 60)}h ${minutes % 60}m left`
+            : minutes >= 1
+                ? `${minutes}m left`
+                : `${Math.max(1, Math.round(remainingMs / 1000))}s left`;
+        return { text, title: `Retires at ${new Date(expiresAt).toLocaleString()}` };
+    }
+
+    function probeChannelLabel(channelId) {
+        if (!Number.isFinite(channelId)) return 'Unassigned channel';
+        return luxriotChannelNameById[String(channelId)] || getLuxriotChannelLabel(channelId);
+    }
+
+    function probeMatchesBoardFilters(probe) {
+        if (probeBoardOriginFilter.size && !probeBoardOriginFilter.has(probeOriginKey(probe))) {
+            return false;
+        }
+        if (probeBoardStateFilter.size && !probeBoardStateFilter.has(probeStatusView(probe).status)) {
+            return false;
+        }
+        if (!probeBoardQuery) return true;
+        const channelId = parseInt(String(probe?.channel_id || ''), 10);
+        const haystack = [
+            probe?.name || '',
+            Number.isFinite(channelId) ? String(channelId) : '',
+            Number.isFinite(channelId) ? probeChannelLabel(channelId) : '',
+            probe?.parent_alert_title || '',
+        ].join(' ').toLowerCase();
+        return haystack.includes(probeBoardQuery);
+    }
+
+    /**
+     * Assemble the board tree: operator-defined group -> channel -> probes.
+     *
+     * Channels the operator has not placed in a group fall into a synthetic
+     * "Ungrouped" bucket rendered last, so a fresh install still shows every
+     * probe without requiring any grouping setup first.
+     */
+    function probeBoardTree(probes) {
+        const groupIdByChannel = new Map();
+        probeChannelGroups.forEach((group) => {
+            (group.channel_ids || []).forEach((channelId) => {
+                const parsed = parseInt(String(channelId), 10);
+                if (Number.isFinite(parsed)) groupIdByChannel.set(parsed, String(group.id));
+            });
+        });
+
+        const byChannel = new Map();
+        probes.forEach((probe) => {
+            const parsed = parseInt(String(probe.channel_id || ''), 10);
+            const key = Number.isFinite(parsed) ? parsed : null;
+            if (!byChannel.has(key)) byChannel.set(key, []);
+            byChannel.get(key).push(probe);
+        });
+
+        const groupsById = new Map();
+        probeChannelGroups.forEach((group) => {
+            groupsById.set(String(group.id), {
+                id: String(group.id),
+                name: String(group.name || 'Group'),
+                synthetic: false,
+                channels: [],
+            });
+        });
+        const ungrouped = { id: '__ungrouped__', name: 'Ungrouped channels', synthetic: true, channels: [] };
+
+        Array.from(byChannel.entries())
+            .sort(([left], [right]) => {
+                if (left === null) return 1;
+                if (right === null) return -1;
+                return left - right;
+            })
+            .forEach(([channelId, channelProbes]) => {
+                const entry = {
+                    channelId,
+                    label: probeChannelLabel(channelId),
+                    probes: channelProbes,
+                    runningCount: channelProbes.filter((probe) => probeStatusView(probe).status === 'running').length,
+                };
+                const groupId = channelId === null ? null : groupIdByChannel.get(channelId);
+                const target = (groupId && groupsById.get(groupId)) || ungrouped;
+                target.channels.push(entry);
+            });
+
+        const ordered = probeChannelGroups
+            .map((group) => groupsById.get(String(group.id)))
+            .filter((group) => group && group.channels.length);
+        if (ungrouped.channels.length) ordered.push(ungrouped);
+        return ordered;
+    }
+
+    function probeCardHtml(probe) {
+        const { status, pillClass } = probeStatusView(probe);
+        const last = probe.last_hit;
+        const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : 'n/a';
+        const thumbSrc = last?.thumbnail || probe.image_probe?.data || '';
+        const toggleAction = status === 'disabled' ? 'enable' : 'disable';
+        const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
+        const scores = `P: ${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(3) : '—'} · N: ${Number.isFinite(last?.neg_score) ? last.neg_score.toFixed(3) : '—'} · M: ${Number.isFinite(last?.margin) ? last.margin.toFixed(3) : '—'}`;
+        const gateView = describeProbeBookmarkGate(probe.bookmark_gate, probe.bookmark !== false);
+        const ttl = probeTemporaryTtl(probe);
+        return `
+            <div class="probe-mini-card ${activeProbeId === probe.id ? 'active' : ''}" data-probe-id="${probe.id}">
+                <div class="probe-mini-card-head">
+                    <div class="probe-mini-head-tags">
                         <div class="probe-status-pill ${pillClass}">${status}</div>
-                        <div class="probe-mini-actions probe-mini-primary-actions">
-                            <button class="probe-action-btn" data-action="${toggleAction}" data-id="${p.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
-                            <button class="probe-action-btn" data-action="expand" data-id="${p.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
-                        </div>
+                        ${probeOriginBadgeHtml(probe)}
                     </div>
-                    <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
-                        ${thumbSrc ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(p.name || 'probe preview')}" />` : ''}
+                    <div class="probe-mini-actions probe-mini-primary-actions">
+                        <button class="probe-action-btn" data-action="${toggleAction}" data-id="${probe.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                        <button class="probe-action-btn" data-action="expand" data-id="${probe.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
                     </div>
-                    <div class="probe-mini-content">
-                        <div class="probe-mini-name" title="${escapeHtml(p.name || 'unnamed')}">${escapeHtml(p.name || 'unnamed')}</div>
-                        <div class="probe-mini-meta">Ch ${p.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
-                        <div class="probe-mini-score">${scores}</div>
-                        <div class="probe-mini-card-foot">
-                            <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
-                            <div class="probe-mini-actions probe-mini-danger-actions">
-                                <button class="probe-action-btn delete" data-action="delete" data-id="${p.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
-                            </div>
+                </div>
+                <div class="probe-mini-thumb ${thumbSrc ? '' : 'is-empty'}">
+                    ${thumbSrc
+                        ? `<img src="data:image/jpeg;base64,${thumbSrc}" alt="${escapeHtml(probe.name || 'probe preview')}" />`
+                        : probeSparklineHtml(probe)}
+                </div>
+                <div class="probe-mini-content">
+                    <div class="probe-mini-name" title="${escapeHtml(probe.name || 'unnamed')}">${escapeHtml(probe.name || 'unnamed')}</div>
+                    <div class="probe-mini-meta">Ch ${probe.channel_id || luxriotActiveChannel} · Last ${last ? ts : 'n/a'}</div>
+                    <div class="probe-mini-score">${scores}</div>
+                    <div class="probe-mini-card-foot">
+                        <div class="probe-mini-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</div>
+                        ${ttl ? `<div class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</div>` : ''}
+                        <div class="probe-mini-actions probe-mini-danger-actions">
+                            <button class="probe-action-btn delete" data-action="delete" data-id="${probe.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
                         </div>
                     </div>
                 </div>
-            `;
-        });
-        cards.push(`
-            <div class="probe-mini-card new-probe-card">
-                <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
-                    ${probeActionIcon('new')}
-                    <span>New Probe</span>
-                </button>
             </div>
-        `);
-        const cardsHtml = cards.join('');
+        `;
+    }
+
+    function probeRowHtml(probe) {
+        const { status, pillClass } = probeStatusView(probe);
+        const last = probe.last_hit;
+        const ts = last?.timestamp_ms ? new Date(last.timestamp_ms).toLocaleTimeString() : '—';
+        const toggleAction = status === 'disabled' ? 'enable' : 'disable';
+        const toggleTitle = status === 'disabled' ? 'Start probe' : 'Stop probe';
+        const gateView = describeProbeBookmarkGate(probe.bookmark_gate, probe.bookmark !== false);
+        const ttl = probeTemporaryTtl(probe);
+        const pm = `${Number.isFinite(last?.pos_score) ? last.pos_score.toFixed(2) : '—'} / ${Number.isFinite(last?.margin) ? last.margin.toFixed(2) : '—'}`;
+        return `
+            <div class="probes-row ${activeProbeId === probe.id ? 'active' : ''}" data-probe-id="${probe.id}">
+                <span class="probes-row-state"><span class="probe-status-pill ${pillClass}" title="${status}">${status}</span></span>
+                <span class="probes-row-origin">${probeOriginBadgeHtml(probe)}</span>
+                <span class="probes-row-name" title="${escapeHtml(probe.name || 'unnamed')}">${escapeHtml(probe.name || 'unnamed')}</span>
+                <span class="probes-row-channel">Ch ${escapeHtml(String(probe.channel_id || luxriotActiveChannel || '—'))}</span>
+                <span class="probes-row-spark">${probeSparklineHtml(probe, { width: 96, height: 20 })}</span>
+                <span class="probes-row-last">${escapeHtml(ts)}</span>
+                <span class="probes-row-score" title="last positive / margin">${escapeHtml(pm)}</span>
+                <span class="probes-row-gate" title="${escapeHtml(gateView.title)}">${escapeHtml(gateView.text)}</span>
+                <span class="probes-row-ttl">${ttl ? `<span class="probes-ttl" title="${escapeHtml(ttl.title)}">${escapeHtml(ttl.text)}</span>` : ''}</span>
+                <span class="probes-row-actions probe-mini-actions">
+                    <button class="probe-action-btn" data-action="${toggleAction}" data-id="${probe.id}" title="${toggleTitle}" aria-label="${toggleTitle}">${probeActionIcon(toggleAction)}</button>
+                    <button class="probe-action-btn" data-action="expand" data-id="${probe.id}" title="Edit probe" aria-label="Edit probe">${probeActionIcon('expand')}</button>
+                    <button class="probe-action-btn delete" data-action="delete" data-id="${probe.id}" title="Delete probe" aria-label="Delete probe">${probeActionIcon('delete')}</button>
+                </span>
+            </div>
+        `;
+    }
+
+    function probeChannelSectionHtml(channel) {
+        const body = probeBoardView === 'list'
+            ? `<div class="probes-row-list" role="table">
+                ${channel.probes.map(probeRowHtml).join('')}
+            </div>`
+            : `<div class="probe-channel-card-grid">
+                ${channel.probes.map(probeCardHtml).join('')}
+            </div>`;
+        return `
+            <section class="probe-channel-group" data-probe-channel="${escapeHtml(channel.channelId === null ? 'unassigned' : String(channel.channelId))}">
+                <div class="probe-channel-group-head">
+                    <div>
+                        <div class="probe-channel-group-kicker">Channel ${channel.channelId === null ? '—' : escapeHtml(String(channel.channelId))}</div>
+                        <div class="probe-channel-group-name">${escapeHtml(channel.label)}</div>
+                    </div>
+                    <div class="probe-channel-group-count">${channel.probes.length} probe${channel.probes.length === 1 ? '' : 's'} · ${channel.runningCount} running</div>
+                </div>
+                ${body}
+            </section>
+        `;
+    }
+
+    function probeGroupSectionHtml(group) {
+        const probeCount = group.channels.reduce((total, channel) => total + channel.probes.length, 0);
+        const runningCount = group.channels.reduce((total, channel) => total + channel.runningCount, 0);
+        const collapsed = probeBoardCollapsed.has(group.id);
+        return `
+            <section class="probes-group ${collapsed ? 'is-collapsed' : ''} ${group.synthetic ? 'is-synthetic' : ''}" data-group-id="${escapeHtml(group.id)}">
+                <div class="probes-group-head">
+                    <button type="button" class="probes-group-toggle" data-action="toggle-group" data-group-id="${escapeHtml(group.id)}"
+                            aria-expanded="${collapsed ? 'false' : 'true'}" title="${collapsed ? 'Expand group' : 'Collapse group'}">
+                        <span class="probes-group-chevron" aria-hidden="true"></span>
+                        <span class="probes-group-name">${escapeHtml(group.name)}</span>
+                    </button>
+                    <div class="probes-group-meta">${group.channels.length} channel${group.channels.length === 1 ? '' : 's'} · ${probeCount} probe${probeCount === 1 ? '' : 's'} · ${runningCount} running</div>
+                    ${group.synthetic || group.read_only || !userHasPermission('probes:manage') ? '' : `<button type="button" class="probe-action-btn probes-group-edit" data-action="edit-group" data-group-id="${escapeHtml(group.id)}" title="Edit group" aria-label="Edit group">${probeActionIcon('expand')}</button>`}
+                </div>
+                <div class="probes-group-body">
+                    ${group.channels.map(probeChannelSectionHtml).join('')}
+                </div>
+            </section>
+        `;
+    }
+
+    function renderProbeCards() {
+        if (!probeCards) return;
+        probeCards.classList.toggle('is-list-view', probeBoardView === 'list');
+        const visible = probeList.filter(probeMatchesBoardFilters);
+        const filtersActive = Boolean(probeBoardQuery) || probeBoardOriginFilter.size > 0 || probeBoardStateFilter.size > 0;
+
+        let cardsHtml;
+        if (!probeList.length) {
+            cardsHtml = `
+                <div class="probe-channel-card-grid">
+                    <div class="probe-mini-card new-probe-card">
+                        <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
+                            ${probeActionIcon('new')}
+                            <span>New Probe</span>
+                        </button>
+                    </div>
+                </div>`;
+        } else if (!visible.length) {
+            cardsHtml = `<div class="studio-empty-state probes-empty-filtered">
+                No probe matches the current filters.
+                <button type="button" class="feature-btn" data-action="reset-filters">Reset filters</button>
+            </div>`;
+        } else {
+            cardsHtml = `
+                ${probeBoardTree(visible).map(probeGroupSectionHtml).join('')}
+                ${filtersActive ? '' : `
+                <section class="probes-group probes-group-new">
+                    <div class="probe-channel-card-grid">
+                        <div class="probe-mini-card new-probe-card">
+                            <button class="probe-new-btn" data-action="new" aria-label="Create probe" title="Create probe">
+                                ${probeActionIcon('new')}
+                                <span>New Probe</span>
+                            </button>
+                        </div>
+                    </div>
+                </section>`}
+            `;
+        }
+
         if (probeCardsRenderKey !== cardsHtml) {
             probeCards.innerHTML = cardsHtml;
             probeCardsRenderKey = cardsHtml;
         }
-        renderMonitorProbeInspector();
+        renderProbeBoardMeta(visible);
+        renderProbesInspector();
     }
+
+    function renderProbeBoardMeta(visible) {
+        const counts = { operator: 0, agent: 0, auto: 0 };
+        probeList.forEach((probe) => { counts[probeOriginKey(probe)] += 1; });
+        if (probeOriginFilters) {
+            probeOriginFilters.querySelectorAll('[data-count]').forEach((node) => {
+                node.textContent = String(counts[node.dataset.count] ?? 0);
+            });
+        }
+        const filtersActive = Boolean(probeBoardQuery) || probeBoardOriginFilter.size > 0 || probeBoardStateFilter.size > 0;
+        setElementHidden(probeFilterResetBtn, !filtersActive);
+        if (probeBoardCount) {
+            const total = probeList.length;
+            probeBoardCount.textContent = !total
+                ? 'No probes'
+                : filtersActive
+                    ? `${visible.length} of ${total} probes`
+                    : `${total} probe${total === 1 ? '' : 's'}`;
+        }
+        [probeOriginFilters, probeStateFilters].forEach((container) => {
+            if (!container) return;
+            const set = container === probeOriginFilters ? probeBoardOriginFilter : probeBoardStateFilter;
+            container.querySelectorAll('.probes-chip').forEach((chip) => {
+                const active = set.has(chip.dataset.value);
+                chip.classList.toggle('is-active', active);
+                chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+        });
+        document.querySelectorAll('.probes-view-btn').forEach((button) => {
+            const active = button.dataset.view === probeBoardView;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    // ── Probe board preferences, filters, and channel groups ───────────────
+
+    function loadProbeBoardPrefs() {
+        try {
+            const view = localStorage.getItem(PROBE_BOARD_VIEW_KEY);
+            if (view === 'grid' || view === 'list') probeBoardView = view;
+            const collapsed = JSON.parse(localStorage.getItem(PROBE_BOARD_COLLAPSED_KEY) || '[]');
+            if (Array.isArray(collapsed)) collapsed.forEach((id) => probeBoardCollapsed.add(String(id)));
+        } catch (_) {
+            // A corrupt or unavailable localStorage must not block the board.
+        }
+    }
+
+    function persistProbeBoardPrefs() {
+        try {
+            localStorage.setItem(PROBE_BOARD_VIEW_KEY, probeBoardView);
+            localStorage.setItem(PROBE_BOARD_COLLAPSED_KEY, JSON.stringify(Array.from(probeBoardCollapsed)));
+        } catch (_) {
+            // Preferences are a convenience; failing to persist is not an error.
+        }
+    }
+
+    function setProbeBoardView(view) {
+        const next = view === 'list' ? 'list' : 'grid';
+        if (next === probeBoardView) return;
+        probeBoardView = next;
+        persistProbeBoardPrefs();
+        renderProbeCards();
+    }
+
+    function resetProbeBoardFilters() {
+        probeBoardOriginFilter.clear();
+        probeBoardStateFilter.clear();
+        probeBoardQuery = '';
+        if (probeSearchInput) probeSearchInput.value = '';
+        renderProbeCards();
+    }
+
+    function handleProbeFilterChipClick(event) {
+        const chip = event.target.closest('.probes-chip[data-filter]');
+        if (!chip) return;
+        const set = chip.dataset.filter === 'origin' ? probeBoardOriginFilter : probeBoardStateFilter;
+        const value = chip.dataset.value || '';
+        if (set.has(value)) set.delete(value); else set.add(value);
+        renderProbeCards();
+    }
+
+    function renderProbeGroupList() {
+        if (!probeGroupListEl) return;
+        if (!probeChannelGroups.length) {
+            probeGroupListEl.innerHTML = '<div class="probes-group-empty">No groups yet. Channels are listed under "Ungrouped".</div>';
+            return;
+        }
+        const canManageGroups = userHasPermission('probes:manage');
+        probeGroupListEl.innerHTML = probeChannelGroups.map((group) => {
+            const channelCount = (group.channel_ids || []).length;
+            const editable = canManageGroups && group.read_only !== true;
+            const title = editable
+                ? `Edit ${String(group.name || 'group')}`
+                : `${String(group.name || 'group')} · view only`;
+            return `
+                <button type="button" class="probes-group-chip" data-group-id="${escapeHtml(String(group.id))}" title="${escapeHtml(title)}" ${editable ? '' : 'disabled'}>
+                    <span class="probes-group-chip-name">${escapeHtml(String(group.name || 'group'))}</span>
+                    <span class="probes-group-chip-count">${channelCount} ch</span>
+                </button>
+            `;
+        }).join('');
+    }
+
+    async function loadProbeChannelGroups() {
+        try {
+            const resp = await fetch(`/probes/channel_groups?t=${Date.now()}`, { cache: 'no-store' });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : [];
+            renderProbeGroupList();
+            renderProbeCards();
+        } catch (_) {
+            // Grouping is presentation only: on failure the board still renders
+            // every channel under "Ungrouped".
+        }
+    }
+
+    function setProbeGroupModalVisibility(visible) {
+        if (!probeGroupModal) return;
+        probeGroupModal.style.display = visible ? 'flex' : 'none';
+    }
+
+    function renderProbeGroupChannelList() {
+        if (!probeGroupChannelList) return;
+        const catalog = getProbeCastChannelCatalog();
+        if (!catalog.length) {
+            probeGroupChannelList.innerHTML = '<div class="admin-empty">Channel list is not loaded yet.</div>';
+            if (probeGroupSelectedMeta) probeGroupSelectedMeta.textContent = '0 selected';
+            return;
+        }
+        const claimedElsewhere = new Map();
+        probeChannelGroups.forEach((group) => {
+            if (String(group.id) === String(probeGroupEditorId)) return;
+            (group.channel_ids || []).forEach((channelId) => {
+                claimedElsewhere.set(Number(channelId), String(group.name || 'another group'));
+            });
+        });
+        probeGroupChannelList.innerHTML = catalog.map((channel) => {
+            const channelId = Number(channel.id);
+            const checked = probeGroupSelectedChannels.has(channelId);
+            const owner = claimedElsewhere.get(channelId);
+            return `
+                <label class="admin-channel-row">
+                    <input type="checkbox" data-channel-id="${channelId}" ${checked ? 'checked' : ''} />
+                    <span class="admin-channel-label">Ch ${channelId} · ${escapeHtml(String(channel.label || ''))}</span>
+                    ${owner ? `<span class="probes-group-owner" title="Selecting this channel moves it out of ${escapeHtml(owner)}">in ${escapeHtml(owner)}</span>` : ''}
+                </label>
+            `;
+        }).join('');
+        if (probeGroupSelectedMeta) {
+            probeGroupSelectedMeta.textContent = `${probeGroupSelectedChannels.size} selected`;
+        }
+    }
+
+    function openProbeGroupModal(groupId = '') {
+        if (!userHasPermission('probes:manage')) return;
+        const group = groupId ? probeChannelGroups.find((item) => String(item.id) === String(groupId)) : null;
+        if (group?.read_only === true) return;
+        probeGroupEditorId = group ? String(group.id) : null;
+        probeGroupSelectedChannels = new Set(
+            ((group && group.channel_ids) || []).map((channelId) => Number(channelId)).filter(Number.isFinite)
+        );
+        if (probeGroupModalTitle) probeGroupModalTitle.textContent = group ? 'Edit channel group' : 'New channel group';
+        if (probeGroupNameInput) probeGroupNameInput.value = group ? String(group.name || '') : '';
+        if (probeGroupStatus) {
+            probeGroupStatus.textContent = 'A channel picked here is removed from whichever group held it before.';
+        }
+        setElementHidden(probeGroupDeleteBtn, !group || group.read_only === true);
+        renderProbeGroupChannelList();
+        setProbeGroupModalVisibility(true);
+        if (probeGroupNameInput) probeGroupNameInput.focus();
+    }
+
+    async function saveProbeGroup() {
+        if (!userHasPermission('probes:manage')) return;
+        const name = String(probeGroupNameInput?.value || '').trim();
+        if (!name) {
+            if (probeGroupStatus) probeGroupStatus.textContent = 'Provide a group name.';
+            return;
+        }
+        try {
+            const resp = await fetch('/probes/channel_groups/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: probeGroupEditorId || undefined,
+                    name,
+                    channel_ids: Array.from(probeGroupSelectedChannels),
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                if (probeGroupStatus) probeGroupStatus.textContent = data.error || 'Failed to save group.';
+                return;
+            }
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : probeChannelGroups;
+            renderProbeGroupList();
+            renderProbeCards();
+            setProbeGroupModalVisibility(false);
+        } catch (err) {
+            if (probeGroupStatus) probeGroupStatus.textContent = `Failed to save group: ${err.message}`;
+        }
+    }
+
+    async function deleteProbeGroup() {
+        if (!userHasPermission('probes:manage')) return;
+        if (!probeGroupEditorId) return;
+        const group = probeChannelGroups.find((item) => String(item.id) === String(probeGroupEditorId));
+        const label = group ? String(group.name || 'this group') : 'this group';
+        if (!window.confirm(`Delete group "${label}"? Its channels move to Ungrouped. Probes are not deleted.`)) {
+            return;
+        }
+        try {
+            const resp = await fetch('/probes/channel_groups/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: probeGroupEditorId }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                if (probeGroupStatus) probeGroupStatus.textContent = data.error || 'Failed to delete group.';
+                return;
+            }
+            probeChannelGroups = Array.isArray(data.groups) ? data.groups : [];
+            probeBoardCollapsed.delete(String(probeGroupEditorId));
+            persistProbeBoardPrefs();
+            renderProbeGroupList();
+            renderProbeCards();
+            setProbeGroupModalVisibility(false);
+        } catch (err) {
+            if (probeGroupStatus) probeGroupStatus.textContent = `Failed to delete group: ${err.message}`;
+        }
+    }
+
+    function bindProbeBoardControls() {
+        loadProbeBoardPrefs();
+        if (probeSearchInput) {
+            probeSearchInput.addEventListener('input', () => {
+                probeBoardQuery = String(probeSearchInput.value || '').trim().toLowerCase();
+                renderProbeCards();
+            });
+        }
+        if (probeOriginFilters) probeOriginFilters.addEventListener('click', handleProbeFilterChipClick);
+        if (probeStateFilters) probeStateFilters.addEventListener('click', handleProbeFilterChipClick);
+        if (probeFilterResetBtn) probeFilterResetBtn.addEventListener('click', resetProbeBoardFilters);
+        document.querySelectorAll('.probes-view-btn').forEach((button) => {
+            button.addEventListener('click', () => setProbeBoardView(button.dataset.view));
+        });
+        if (probeGroupNewBtn) probeGroupNewBtn.addEventListener('click', () => openProbeGroupModal(''));
+        if (probeGroupListEl) {
+            probeGroupListEl.addEventListener('click', (event) => {
+                const chip = event.target.closest('.probes-group-chip[data-group-id]');
+                if (chip) openProbeGroupModal(chip.dataset.groupId);
+            });
+        }
+        if (probeGroupChannelList) {
+            probeGroupChannelList.addEventListener('change', (event) => {
+                const input = event.target.closest('input[data-channel-id]');
+                if (!input) return;
+                const channelId = Number(input.dataset.channelId);
+                if (!Number.isFinite(channelId)) return;
+                if (input.checked) probeGroupSelectedChannels.add(channelId);
+                else probeGroupSelectedChannels.delete(channelId);
+                if (probeGroupSelectedMeta) {
+                    probeGroupSelectedMeta.textContent = `${probeGroupSelectedChannels.size} selected`;
+                }
+            });
+        }
+        if (probesSummary) {
+            // The inspector re-renders on every board refresh, so the lineage
+            // jump is bound by delegation rather than to the button itself.
+            probesSummary.addEventListener('click', (event) => {
+                if (!event.target.closest('#probeLineageJumpBtn')) return;
+                const probe = activeProbeId
+                    ? probeList.find((item) => String(item.id) === String(activeProbeId))
+                    : null;
+                if (probe) jumpToProbeParentAlert(probe);
+            });
+        }
+        if (probeGroupSaveBtn) probeGroupSaveBtn.addEventListener('click', saveProbeGroup);
+        if (probeGroupDeleteBtn) probeGroupDeleteBtn.addEventListener('click', deleteProbeGroup);
+        [probeGroupCancelBtn, probeGroupCloseBtn].forEach((button) => {
+            if (button) button.addEventListener('click', () => setProbeGroupModalVisibility(false));
+        });
+    }
+
 
     function setActiveProbe(probe) {
         activeProbeId = probe && probe.id ? probe.id : null;
@@ -8645,8 +12699,8 @@
             probeChannelSelect.value = probe.channel_id;
             syncProbePreview(probe.channel_id);
         }
-        if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? 0.2;
-        if (probeMarginInput) probeMarginInput.value = probe?.margin ?? 0.05;
+        if (probePosFloorInput) probePosFloorInput.value = probe?.pos_floor ?? PROBE_POS_FLOOR_DEFAULT;
+        if (probeMarginInput) probeMarginInput.value = probe?.margin ?? PROBE_MARGIN_DEFAULT;
         if (probeFpsInput) probeFpsInput.value = probe?.fps ?? 0;
         if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
@@ -8731,14 +12785,26 @@
             const data = await resp.json();
             probeList = data.probes || [];
             probeCatalog = Array.isArray(probeList) ? [...probeList] : [];
+            if (Array.isArray(data.channel_groups)) {
+                probeChannelGroups = data.channel_groups;
+                renderProbeGroupList();
+            }
             await refreshProbeRuntimeState(false);
-            if (showStatus) setProbeStatus(`Loaded ${probeList.length} probes`);
+            if (showStatus) {
+                const counts = data.counts || {};
+                setProbeStatus(
+                    `Loaded ${counts.persistent ?? probeList.length} saved probes`
+                    + `${counts.temporary_active ? ` · ${counts.temporary_active} temporary active` : ''}`
+                );
+            }
             const match = activeProbeId ? probeList.find(p => p.id === activeProbeId) : null;
             if (match) {
                 setActiveProbe(match);
-            } else if (!activeProbeId && probeList.length) {
-                setActiveProbe(probeList[0]);
+            } else if (probeList.length) {
+                const persistentFallback = probeList.find((probe) => probe.temporary !== true);
+                setActiveProbe(persistentFallback || probeList[0]);
             } else {
+                activeProbeId = null;
                 renderProbeHits([], 0, null, { key: probeHitsKey(activeProbeId), replace: true, resetOffset: true });
                 renderProbeCards();
             }
@@ -9009,18 +13075,18 @@
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = 'info';
         if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = '8';
         if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = '20';
-        if (probePosFloorInput) probePosFloorInput.value = '0.2';
-        if (probeMarginInput) probeMarginInput.value = '0.05';
+        if (probePosFloorInput) probePosFloorInput.value = String(PROBE_POS_FLOOR_DEFAULT);
+        if (probeMarginInput) probeMarginInput.value = String(PROBE_MARGIN_DEFAULT);
         if (probeFpsInput) probeFpsInput.value = '0';
         if (probeWindowSecInput) probeWindowSecInput.value = '300';
         updateProbeCaptureMeta(getSelectedProbeChannelId());
-        renderMonitorProbeInspector();
+        renderProbesInspector();
     }
 
     function handleProbeCardClick(event) {
         const btn = event.target.closest('button[data-action]');
         if (!btn) {
-            const card = event.target.closest('.probe-mini-card[data-probe-id]');
+            const card = event.target.closest('.probe-mini-card[data-probe-id], .probes-row[data-probe-id]');
             if (!card) return;
             const probe = probeList.find((p) => String(p.id) === String(card.dataset.probeId || ''));
             if (probe) {
@@ -9032,6 +13098,25 @@
         const action = btn.getAttribute('data-action');
         const probe = probeList.find(p => String(p.id) === String(id));
         if (!action) return;
+        if (action === 'toggle-group') {
+            const groupId = btn.getAttribute('data-group-id') || '';
+            if (probeBoardCollapsed.has(groupId)) {
+                probeBoardCollapsed.delete(groupId);
+            } else {
+                probeBoardCollapsed.add(groupId);
+            }
+            persistProbeBoardPrefs();
+            renderProbeCards();
+            return;
+        }
+        if (action === 'edit-group') {
+            openProbeGroupModal(btn.getAttribute('data-group-id') || '');
+            return;
+        }
+        if (action === 'reset-filters') {
+            resetProbeBoardFilters();
+            return;
+        }
         if (action === 'expand' && probe) {
             setActiveProbe(probe);
             if (probeEditorModal) {
@@ -9183,6 +13268,7 @@
     if (probeCards) {
         probeCards.addEventListener('click', handleProbeCardClick);
     }
+    bindProbeBoardControls();
     if (probeNewBtn) {
         probeNewBtn.addEventListener('click', () => {
             resetProbeDraftEditor();
@@ -9319,7 +13405,7 @@
     // Mode switching
     if (archiveModeBtn) archiveModeBtn.addEventListener('click', () => setMode('archive'));
     if (videoModeBtn) videoModeBtn.addEventListener('click', () => setMode('video'));
-    if (monitorModeBtn) monitorModeBtn.addEventListener('click', () => setMode('monitor'));
+    if (probesModeBtn) probesModeBtn.addEventListener('click', () => setMode('probes'));
     if (agentModeBtn) agentModeBtn.addEventListener('click', () => { setMode('agent'); agentInit(); });
     if (loadDetectionsBtn) {
         loadDetectionsBtn.addEventListener('click', () => {
@@ -9348,15 +13434,59 @@
         });
     }
     if (archiveChannelFilter) {
-        archiveChannelFilter.addEventListener('change', () => {
-            archiveDetectionsOffset = 0;
-            archiveDetectionsHasMore = false;
-            updateArchiveDetectionsNav();
-            refreshArchiveProbeFilter();
+        archiveChannelFilter.addEventListener('change', (event) => {
+            const target = event.target;
+            if (target?.matches('input[data-archive-channel-all]')) {
+                if (target.checked && archiveChannelOptions) {
+                    archiveChannelOptions.querySelectorAll('input[data-archive-channel-id]').forEach((input) => {
+                        input.checked = false;
+                    });
+                } else if (selectedArchiveChannelIds().length === 0) {
+                    target.checked = true;
+                }
+            } else if (target?.matches('input[data-archive-channel-id]')) {
+                syncArchiveChannelAllOption();
+            }
+            archiveChannelSelectionChanged();
         });
     }
+    if (archiveChannelPickerToggle) {
+        archiveChannelPickerToggle.addEventListener('click', () => {
+            const open = archiveChannelPickerToggle.getAttribute('aria-expanded') === 'true';
+            setArchiveChannelPickerOpen(!open, !open);
+        });
+    }
+    if (archiveChannelSearch) {
+        archiveChannelSearch.addEventListener('input', filterArchiveChannelOptions);
+    }
+    if (archiveChannelReset) {
+        archiveChannelReset.addEventListener('click', () => {
+            archiveChannelOptions?.querySelectorAll('input[data-archive-channel-id]').forEach((input) => {
+                input.checked = false;
+            });
+            if (archiveChannelSearch) archiveChannelSearch.value = '';
+            filterArchiveChannelOptions();
+            archiveChannelSelectionChanged();
+        });
+    }
+    if (archiveChannelDone) {
+        archiveChannelDone.addEventListener('click', () => {
+            setArchiveChannelPickerOpen(false);
+            archiveChannelPickerToggle?.focus();
+        });
+    }
+    document.addEventListener('click', (event) => {
+        if (
+            archiveChannelFilter
+            && archiveChannelPickerToggle?.getAttribute('aria-expanded') === 'true'
+            && !archiveChannelFilter.contains(event.target)
+        ) {
+            setArchiveChannelPickerOpen(false);
+        }
+    });
     if (archiveSourceFilter) {
         archiveSourceFilter.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
             syncArchiveDiagnosticSourceVisibility();
@@ -9367,6 +13497,7 @@
     }
     if (archiveProbeFilter) {
         archiveProbeFilter.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
@@ -9374,6 +13505,7 @@
     }
     if (archiveTimeFilter) {
         archiveTimeFilter.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
@@ -9382,6 +13514,7 @@
     [archiveFromTimeInput, archiveToTimeInput].forEach((input) => {
         if (!input) return;
         input.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
@@ -9389,6 +13522,7 @@
     });
     if (archiveDetectionsLimit) {
         archiveDetectionsLimit.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             archiveDetectionsOffset = 0;
             archiveDetectionsHasMore = false;
             updateArchiveDetectionsNav();
@@ -9405,6 +13539,7 @@
     if (searchScopeSelect) {
         searchScopeSelect.value = 'detections';
         searchScopeSelect.addEventListener('change', () => {
+            invalidateArchiveResultContext();
             updateSearchScopeUI();
         });
     }
@@ -9498,7 +13633,7 @@
         if (!query || (!detectionsScope && !folder)) return;
         archiveLastQueryText = query;
         
-        setButtonBusy(searchBtn, true);
+        const requestContext = beginArchiveEvidenceRequest(searchBtn);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching...</div>';
         renderArchiveInspectorEmpty('Searching archive...');
         
@@ -9516,16 +13651,19 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
+                    signal: requestContext.controller.signal,
                 });
             } else {
                 response = await fetch('/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder, query, limit, sort_by: sortBy })
+                    body: JSON.stringify({ folder, query, limit, sort_by: sortBy }),
+                    signal: requestContext.controller.signal,
                 });
             }
             
             const data = await parseApiJson(response, 'Text search failed');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
             
             if (data.results && data.results.length > 0) {
                 const renderedResults = detectionsScope
@@ -9544,10 +13682,11 @@
                 renderArchiveInspectorEmpty('No results found for this query.');
             }
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveEvidenceRequest(requestContext)) return;
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
             renderArchiveInspectorEmpty(`Search error: ${error.message}`);
         } finally {
-            setButtonBusy(searchBtn, false);
+            finishArchiveEvidenceRequest(requestContext);
         }
     });
     
@@ -9570,7 +13709,7 @@
         }
         archiveLastQueryText = `Image query: ${file.name || 'uploaded reference image'}`;
         
-        setButtonBusy(imageSearchBtn, true);
+        const requestContext = beginArchiveEvidenceRequest(imageSearchBtn);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Searching by image...</div>';
         renderArchiveInspectorEmpty('Searching by image...');
         
@@ -9582,21 +13721,19 @@
             if (detectionsScope) {
                 formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
                 const filters = buildDetectionSearchFilters();
-                Object.entries(filters).forEach(([key, value]) => {
-                    if (value !== undefined && value !== null && String(value).length > 0) {
-                        formData.append(key, String(value));
-                    }
-                });
+                appendDetectionSearchFilters(formData, filters);
             } else {
                 formData.append('folder', folder);
             }
             
             const response = await fetch(detectionsScope ? '/detections/search_image' : '/search_by_image', {
                 method: 'POST',
-                body: formData
+                body: formData,
+                signal: requestContext.controller.signal,
             });
             
             const data = await parseApiJson(response, 'Image search failed');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
             
             if (data.results && data.results.length > 0) {
                 const renderedResults = detectionsScope
@@ -9611,10 +13748,11 @@
                 renderArchiveInspectorEmpty('No visual matches found for this reference image.');
             }
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveEvidenceRequest(requestContext)) return;
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
             renderArchiveInspectorEmpty(`Image search error: ${error.message}`);
         } finally {
-            setButtonBusy(imageSearchBtn, false);
+            finishArchiveEvidenceRequest(requestContext);
         }
     });
 
@@ -9869,6 +14007,7 @@
         }
         setMode('archive');
         
+        const requestContext = beginArchiveEvidenceRequest(showCommentedBtn);
         resultsContainer.innerHTML = '<div class="loading"><div class="spinner"></div> Loading commented images...</div>';
         renderArchiveInspectorEmpty('Loading commented images...');
         
@@ -9876,10 +14015,12 @@
             const response = await fetch('/commented_images', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ folder })
+                body: JSON.stringify({ folder }),
+                signal: requestContext.controller.signal,
             });
             
             const data = await parseApiJson(response, 'Loading commented images failed');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
             
             if (data.results && data.results.length > 0) {
                 displayCommentedResults(data.results);
@@ -9891,8 +14032,11 @@
                 renderArchiveInspectorEmpty('No commented images found for the current archive.');
             }
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveEvidenceRequest(requestContext)) return;
             resultsContainer.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
             renderArchiveInspectorEmpty(`Commented image load failed: ${error.message}`);
+        } finally {
+            finishArchiveEvidenceRequest(requestContext);
         }
     });
     
@@ -9966,7 +14110,13 @@
 
     function archiveReviewFrameNumber(result) {
         const payload = archiveResultPayload(result);
-        const value = Number(payload.frame_index ?? payload.anchor_frame_index);
+        const value = Number(
+            payload.snapshot_index
+            ?? payload.anchor_snapshot_index
+            ?? payload.batch_position
+            ?? payload.frame_index
+            ?? payload.anchor_frame_index
+        );
         return Number.isFinite(value) ? value : null;
     }
 
@@ -9974,6 +14124,10 @@
         if (!result || !isVideoArchiveResult(result)) return '';
         const payload = archiveResultPayload(result);
         const channelId = Number(result.channel_id);
+        const batchId = String(payload.batch_id || result.batch_id || '').trim();
+        if (Number.isFinite(channelId) && channelId > 0 && batchId) {
+            return `${Math.trunc(channelId)}:${batchId}`;
+        }
         const startMs = Number(payload.batch_start_ms ?? result.batch_start_ms);
         const endMs = Number(payload.batch_end_ms ?? result.batch_end_ms);
         const runId = String(payload.run_id || '').trim();
@@ -10024,8 +14178,28 @@
         (frames || []).forEach((frame) => {
             if (!frame || !archiveResultHasImage(frame)) return;
             const key = archiveReviewFrameIdentity(frame);
-            if (!key || unique.has(key)) return;
-            unique.set(key, frame);
+            if (!key) return;
+            const existing = unique.get(key);
+            if (!existing) {
+                unique.set(key, frame);
+                return;
+            }
+            const existingPayload = archiveResultPayload(existing);
+            const incomingPayload = archiveResultPayload(frame);
+            const mergedPayload = {
+                ...incomingPayload,
+                ...existingPayload,
+                is_cover: Boolean(existingPayload.is_cover || incomingPayload.is_cover),
+                cover_kind: existingPayload.cover_kind || incomingPayload.cover_kind || '',
+                cover_reason: existingPayload.cover_reason || incomingPayload.cover_reason || '',
+                cover_confidence: existingPayload.cover_confidence || incomingPayload.cover_confidence || '',
+                cover_source: existingPayload.cover_source || incomingPayload.cover_source || '',
+            };
+            unique.set(key, {
+                ...frame,
+                ...existing,
+                payload: mergedPayload,
+            });
         });
         return archiveReviewSortFrames(Array.from(unique.values()));
     }
@@ -10124,10 +14298,29 @@
             const frameNo = archiveReviewFrameNumber(frame);
             const label = frameNo !== null ? `Frame ${frameNo}` : `Frame ${idx + 1}`;
             const roleText = archiveFrameRoleText(frame).replace(/\s+/g, ' ');
+            const framePayload = archiveResultPayload(frame);
+            const coverReason = String(framePayload.cover_reason || '').trim();
+            const frameTitle = coverReason
+                ? `${roleText} · cover: ${coverReason}`
+                : roleText;
+            const frameRole = String(framePayload.anchor_role || framePayload.anchor_source_role || '').trim();
+            const attentionMarker = isBurstArchiveFrameRole(frameRole)
+                ? '<span class="archive-review-strip-attention" aria-label="Burst attention frame">⚡</span>'
+                : '';
+            const markerLabels = [
+                framePayload.is_cover ? 'COVER' : '',
+                String(frame.logical_source || frame.source || '').toLowerCase() === 'vlm_alert' ? 'ALERT' : '',
+                archiveReviewFrameIdentity(frame) === archiveReviewFrameIdentity(context?.baseResult) ? 'MATCH' : '',
+            ].filter(Boolean);
+            const markerBadges = markerLabels.length
+                ? `<span class="archive-review-strip-marker">${escapeHtml(markerLabels.join(' · '))}</span>`
+                : '';
             const activeClass = idx === activeIndex ? ' is-active' : '';
             return `
-                <button class="archive-review-strip-frame${activeClass}" type="button" data-archive-review-frame-index="${idx}" title="${escapeHtml(roleText)}">
+                <button class="archive-review-strip-frame${activeClass}" type="button" data-archive-review-frame-index="${idx}" title="${escapeHtml(frameTitle)}">
                     <img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(label)}" loading="lazy">
+                    ${attentionMarker}
+                    ${markerBadges}
                     <span>${escapeHtml(label)}</span>
                 </button>
             `;
@@ -10147,12 +14340,50 @@
         context.frames = frames;
         context.activeFrameIndex = activeIndex;
         context.result = activeResult;
+        const identity = archiveReviewFrameIdentity(activeResult);
+        if (context.mediaIdentity && context.mediaIdentity !== identity) {
+            // Stepping to another frame returns to the stored evidence view;
+            // archive playback stays operator-initiated per frame.
+            cancelArchiveMediaRequest(true);
+            context.mediaIdentity = '';
+            context.mediaState = 'idle';
+        }
+        // While media for this exact frame is negotiating or playing, a
+        // re-render (for example the batch filmstrip finishing its load) must
+        // not clobber the live element with the static thumbnail.
+        const mediaActive = ['loading', 'playing'].includes(context.mediaState || '');
         const imageSrc = archiveResultImageSrc(activeResult);
-        if (archiveReviewImg) {
+        if (archiveReviewImg && !mediaActive) {
+            const expectedIdentity = identity;
+            archiveReviewImg.onload = () => {
+                if (
+                    context !== archiveReviewContext
+                    || archiveReviewFrameIdentity(context.result) !== expectedIdentity
+                    || ['loading', 'playing'].includes(context.mediaState || '')
+                ) return;
+                archiveReviewImg.classList.remove('is-hidden');
+                if (archiveReviewFrameEmpty) {
+                    archiveReviewFrameEmpty.textContent = 'No frame';
+                    archiveReviewFrameEmpty.classList.add('is-hidden');
+                }
+            };
+            archiveReviewImg.onerror = () => {
+                if (
+                    context !== archiveReviewContext
+                    || archiveReviewFrameIdentity(context.result) !== expectedIdentity
+                    || ['loading', 'playing'].includes(context.mediaState || '')
+                ) return;
+                archiveReviewImg.classList.add('is-hidden');
+                if (archiveReviewFrameEmpty) {
+                    archiveReviewFrameEmpty.textContent = 'Frame preview unavailable';
+                    archiveReviewFrameEmpty.classList.remove('is-hidden');
+                }
+            };
             archiveReviewImg.src = imageSrc || '';
             archiveReviewImg.classList.toggle('is-hidden', !imageSrc);
         }
-        if (archiveReviewFrameEmpty) {
+        if (archiveReviewFrameEmpty && !mediaActive) {
+            if (!imageSrc) archiveReviewFrameEmpty.textContent = 'No frame';
             archiveReviewFrameEmpty.classList.toggle('is-hidden', Boolean(imageSrc));
         }
         archiveReviewRenderFrameNav();
@@ -10165,6 +14396,23 @@
         }
         if (archiveReviewSimilarBtn) {
             archiveReviewSimilarBtn.disabled = !archiveResultHasImage(activeResult);
+        }
+        syncArchiveReviewPlayButton(context);
+    }
+
+    function archiveResultCanPlayArchiveVideo(result) {
+        return isVideoArchiveResult(result) && archiveResultCanOpenVlmFeed(result);
+    }
+
+    function syncArchiveReviewPlayButton(context) {
+        const ui = ensureArchiveMediaUi();
+        if (!ui.retry || !context) return;
+        if ((context.mediaState || 'idle') === 'idle') {
+            // Archive playback is opt-in: the modal reviews the exact stored
+            // evidence frames; recorder video never starts on its own.
+            if (ui.status) ui.status.hidden = true;
+            ui.retry.textContent = 'Play archive video';
+            ui.retry.hidden = !archiveResultCanPlayArchiveVideo(context.result);
         }
     }
 
@@ -10190,19 +14438,37 @@
         const batchStart = Number(payload.batch_start_ms ?? context.baseResult.batch_start_ms);
         const batchEnd = Number(payload.batch_end_ms ?? context.baseResult.batch_end_ms);
         if (!Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(batchStart) || !Number.isFinite(batchEnd)) return;
+        const requestContext = beginArchiveReviewRequest(context);
+        requestContext.timedOut = false;
         context.framesLoading = true;
         archiveReviewRenderFilmstrip();
         const params = new URLSearchParams();
         params.set('channel_id', String(Math.trunc(channelId)));
         params.set('source', 'vlm_summary');
-        params.set('since_ms', String(Math.trunc(Math.min(batchStart, batchEnd))));
-        params.set('until_ms', String(Math.trunc(Math.max(batchStart, batchEnd))));
+        const batchId = String(payload.batch_id || context.baseResult.batch_id || '').trim();
+        if (batchId) {
+            params.set('batch_id', batchId);
+        } else {
+            params.set('since_ms', String(Math.trunc(Math.min(batchStart, batchEnd))));
+            params.set('until_ms', String(Math.trunc(Math.max(batchStart, batchEnd))));
+        }
         params.set('limit', '120');
         params.set('offset', '0');
+        const timeoutId = window.setTimeout(() => {
+            requestContext.timedOut = true;
+            requestContext.controller.abort();
+        }, ARCHIVE_REVIEW_BATCH_TIMEOUT_MS);
+        const stillOwnsRequest = () => Boolean(
+            requestContext.generation === archiveReviewRequestGeneration
+            && archiveReviewAbortController === requestContext.controller
+            && archiveReviewContext === context
+        );
         try {
-            const response = await fetch(`/detections/list?${params.toString()}`);
+            const response = await fetch(`/detections/list?${params.toString()}`, {
+                signal: requestContext.controller.signal,
+            });
             const data = await parseApiJson(response, 'Failed to load batch frames');
-            if (archiveReviewContext !== context) return;
+            if (!isCurrentArchiveReviewRequest(requestContext)) return;
             const loaded = normalizeDetectionResults(Array.isArray(data.detections) ? data.detections : [])
                 .filter((item) => isVideoArchiveResult(item) && archiveResultHasImage(item))
                 .filter((item) => {
@@ -10217,28 +14483,249 @@
             context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
             context.framesError = '';
         } catch (error) {
-            if (archiveReviewContext !== context) return;
+            if (!stillOwnsRequest()) return;
+            if ((error && error.name === 'AbortError') && !requestContext.timedOut) return;
             context.frames = archiveReviewLocalBatchFrames(context.baseResult);
             context.activeFrameIndex = archiveReviewActiveFrameIndex(context.frames, context.baseResult);
-            context.framesError = error.message || 'Batch frames unavailable.';
+            context.framesError = requestContext.timedOut
+                ? 'Neighboring batch frames timed out; showing the selected evidence frame.'
+                : (error.message || 'Batch frames unavailable.');
         } finally {
-            if (archiveReviewContext === context) {
+            window.clearTimeout(timeoutId);
+            if (stillOwnsRequest()) {
                 context.framesLoading = false;
                 archiveReviewRenderActiveFrame();
+                archiveReviewAbortController = null;
             }
         }
     }
 
     function closeArchiveReviewModal() {
         if (!archiveReviewModal) return;
+        cancelArchiveReviewRequest();
+        cancelArchiveMediaRequest(true);
         archiveReviewModal.style.display = 'none';
         archiveReviewContext = null;
         if (archiveReviewImg) archiveReviewImg.src = '';
         if (archiveReviewFilmstrip) archiveReviewFilmstrip.innerHTML = '';
+        if (archiveReviewFeedbackPanel) archiveReviewFeedbackPanel.hidden = true;
+        if (archiveReviewFeedbackStatus) archiveReviewFeedbackStatus.textContent = '';
+    }
+
+    const ARCHIVE_FEEDBACK_REASON_OPTIONS = [
+        { code: 'no_relevant_event', label: 'No relevant event' },
+        { code: 'benign_activity', label: 'Benign activity' },
+        { code: 'wrong_object_or_actor', label: 'Wrong object or actor' },
+        { code: 'duplicate_or_stale', label: 'Duplicate or stale alert' },
+        { code: 'poor_visual_quality', label: 'Poor visual quality' },
+    ];
+
+    function archiveReviewAlertResult(context = archiveReviewContext) {
+        const result = context?.baseResult || context?.result || null;
+        const source = String(result?.logical_source || result?.source || '').trim().toLowerCase();
+        return source === 'vlm_alert' ? result : null;
+    }
+
+    function archiveReviewAlertDetectionId(context = archiveReviewContext) {
+        const result = archiveReviewAlertResult(context);
+        const detectionId = Number(result?.detection_id ?? result?.id);
+        return Number.isFinite(detectionId) && detectionId > 0 ? Math.trunc(detectionId) : null;
+    }
+
+    function renderArchiveFeedbackReasons(options, selectedCode = '') {
+        if (!archiveReviewFeedbackReasons) return;
+        const normalized = Array.isArray(options) && options.length
+            ? options
+            : ARCHIVE_FEEDBACK_REASON_OPTIONS;
+        archiveReviewFeedbackReasons.innerHTML = normalized.map((option) => {
+            const code = String(option?.code || '').trim();
+            const label = String(option?.label || code).trim();
+            if (!code) return '';
+            const checked = code === selectedCode ? ' checked' : '';
+            return `
+                <label class="archive-review-feedback-reason">
+                    <input type="radio" name="archiveFeedbackReason" value="${escapeHtml(code)}"${checked}>
+                    <span>${escapeHtml(label)}</span>
+                </label>
+            `;
+        }).join('');
+    }
+
+    function selectedArchiveFeedbackReason() {
+        const selected = archiveReviewFeedbackReasons?.querySelector(
+            'input[name="archiveFeedbackReason"]:checked'
+        );
+        return String(selected?.value || '').trim();
+    }
+
+    function resetArchiveFeedbackUi(context = archiveReviewContext) {
+        const eligible = Boolean(archiveReviewAlertDetectionId(context));
+        if (archiveReviewFeedbackBtn) {
+            archiveReviewFeedbackBtn.hidden = !eligible;
+            archiveReviewFeedbackBtn.textContent = 'Report false positive';
+        }
+        if (archiveReviewFeedbackPanel) archiveReviewFeedbackPanel.hidden = true;
+        if (archiveReviewFeedbackNote) archiveReviewFeedbackNote.value = '';
+        if (archiveReviewFeedbackStatus) archiveReviewFeedbackStatus.textContent = '';
+        if (archiveReviewFeedbackSaveBtn) {
+            archiveReviewFeedbackSaveBtn.disabled = false;
+            archiveReviewFeedbackSaveBtn.textContent = 'Save feedback';
+        }
+        renderArchiveFeedbackReasons(ARCHIVE_FEEDBACK_REASON_OPTIONS);
+        const canExport = eligible && userHasPermission('data:export');
+        if (archiveReviewFeedbackExportMdBtn) archiveReviewFeedbackExportMdBtn.hidden = !canExport;
+        if (archiveReviewFeedbackExportXmlBtn) archiveReviewFeedbackExportXmlBtn.hidden = !canExport;
+    }
+
+    async function loadArchiveAlertFeedback(context) {
+        const detectionId = archiveReviewAlertDetectionId(context);
+        if (!detectionId) return;
+        try {
+            const response = await fetch(`/detections/${detectionId}/feedback`, {
+                cache: 'no-store',
+            });
+            const data = await parseApiJson(response, 'Failed to load operator feedback');
+            if (context !== archiveReviewContext) return;
+            const feedback = data?.feedback || null;
+            renderArchiveFeedbackReasons(
+                Array.isArray(data?.reason_options) ? data.reason_options : ARCHIVE_FEEDBACK_REASON_OPTIONS,
+                String(feedback?.reason_code || '')
+            );
+            if (archiveReviewFeedbackNote) {
+                archiveReviewFeedbackNote.value = String(feedback?.note || '');
+            }
+            if (feedback) {
+                context.feedback = feedback;
+                if (archiveReviewFeedbackBtn) archiveReviewFeedbackBtn.textContent = 'Edit false-positive report';
+                if (archiveReviewFeedbackSaveBtn) archiveReviewFeedbackSaveBtn.textContent = 'Update feedback';
+                if (archiveReviewFeedbackStatus) {
+                    archiveReviewFeedbackStatus.textContent = 'Saved operator annotation';
+                }
+            }
+        } catch (error) {
+            if (context !== archiveReviewContext) return;
+            if (archiveReviewFeedbackStatus) {
+                archiveReviewFeedbackStatus.textContent = error.message || 'Feedback is unavailable.';
+            }
+        }
+    }
+
+    async function saveArchiveAlertFeedback() {
+        const context = archiveReviewContext;
+        const detectionId = archiveReviewAlertDetectionId(context);
+        if (!context || !detectionId) return;
+        const reasonCode = selectedArchiveFeedbackReason();
+        if (!reasonCode) {
+            if (archiveReviewFeedbackStatus) {
+                archiveReviewFeedbackStatus.textContent = 'Choose one reason before saving.';
+            }
+            return;
+        }
+        if (archiveReviewFeedbackSaveBtn) archiveReviewFeedbackSaveBtn.disabled = true;
+        if (archiveReviewFeedbackStatus) archiveReviewFeedbackStatus.textContent = 'Saving...';
+        try {
+            const response = await fetch(`/detections/${detectionId}/feedback`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    reason_code: reasonCode,
+                    note: String(archiveReviewFeedbackNote?.value || '').trim(),
+                }),
+            });
+            const data = await parseApiJson(response, 'Failed to save operator feedback');
+            if (context !== archiveReviewContext) return;
+            context.feedback = data.feedback || null;
+            if (archiveReviewFeedbackBtn) archiveReviewFeedbackBtn.textContent = 'Edit false-positive report';
+            if (archiveReviewFeedbackSaveBtn) archiveReviewFeedbackSaveBtn.textContent = 'Update feedback';
+            if (archiveReviewFeedbackStatus) {
+                archiveReviewFeedbackStatus.textContent = 'Saved. Agent reports and L3 can use this annotation.';
+            }
+        } catch (error) {
+            if (context !== archiveReviewContext) return;
+            if (archiveReviewFeedbackStatus) {
+                archiveReviewFeedbackStatus.textContent = error.message || 'Feedback save failed.';
+            }
+        } finally {
+            if (context === archiveReviewContext && archiveReviewFeedbackSaveBtn) {
+                archiveReviewFeedbackSaveBtn.disabled = false;
+            }
+        }
+    }
+
+    function exportArchiveFeedbackReport(format) {
+        const result = archiveReviewAlertResult();
+        if (!result) return;
+        const params = new URLSearchParams({
+            format: format === 'xml' ? 'xml' : 'md',
+            hours: '24',
+        });
+        const channelId = Number(result.channel_id);
+        if (Number.isFinite(channelId) && channelId > 0) {
+            params.set('channel_id', String(Math.trunc(channelId)));
+        }
+        const link = document.createElement('a');
+        link.href = `/reports/false-positives/export?${params.toString()}`;
+        link.download = '';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    }
+
+    async function archiveReviewHydrateBaseResult(context) {
+        // Rows rebuilt from a stored agent session carry only the compact
+        // model envelope (no payload.summary / batch bounds). Re-fetch the
+        // full detection so the summary and filmstrip work after reload.
+        const result = context && context.baseResult;
+        if (!result || !isVideoArchiveResult(result)) return;
+        const payload = archiveResultPayload(result);
+        if (payload.summary || Number.isFinite(Number(payload.batch_start_ms))) return;
+        const detectionId = result.detection_id ?? result.id;
+        const channelId = Number(result.channel_id);
+        const timestampMs = Number(result.timestamp_ms ?? payload.frame_timestamp_ms);
+        if (detectionId == null || !Number.isFinite(channelId) || !Number.isFinite(timestampMs)) return;
+        const params = new URLSearchParams({
+            channel_id: String(Math.trunc(channelId)),
+            since_ms: String(Math.trunc(timestampMs) - 1500),
+            until_ms: String(Math.trunc(timestampMs) + 1500),
+            limit: '50',
+            offset: '0',
+        });
+        const source = String(result.source || '').trim();
+        if (source) params.set('source', source);
+        try {
+            const response = await fetch(`/detections/list?${params.toString()}`);
+            const data = await parseApiJson(response, 'Failed to load archive detection');
+            const rows = normalizeDetectionResults(Array.isArray(data.detections) ? data.detections : []);
+            const match = rows.find((row) => String(row.detection_id ?? row.id ?? '') === String(detectionId));
+            if (!match) return;
+            const fullPayload = archiveResultPayload(match);
+            if (fullPayload && Object.keys(fullPayload).length) {
+                result.payload = fullPayload;
+                if (!result.summary && fullPayload.summary) result.summary = fullPayload.summary;
+            }
+            for (const key of ('thumbnail' in match ? ['thumbnail'] : [])) {
+                if (!result[key]) result[key] = match[key];
+            }
+            if (context === archiveReviewContext && archiveReviewSummary) {
+                const summary = archiveSummaryText(result);
+                const truncated = archiveResultPayload(result).summary_truncated;
+                archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
+            }
+        } catch (_) {
+            // Hydration is best-effort; the modal still shows the compact row.
+        }
+    }
+
+    async function archiveReviewPrepare(context) {
+        await archiveReviewHydrateBaseResult(context);
+        if (context !== archiveReviewContext) return;
+        await archiveReviewLoadBatchFrames(context);
     }
 
     function openArchiveReviewModal(index, result) {
         if (!archiveReviewModal || !result) return;
+        cancelArchiveReviewRequest();
+        cancelArchiveMediaRequest(true);
         const frames = archiveReviewLocalBatchFrames(result);
         archiveReviewContext = {
             index,
@@ -10248,6 +14735,8 @@
             activeFrameIndex: archiveReviewActiveFrameIndex(frames, result),
             framesLoading: false,
             framesError: '',
+            mediaIdentity: '',
+            mediaState: 'idle',
         };
         if (archiveReviewTitle) {
             archiveReviewTitle.textContent = 'Archive research review for video description streams';
@@ -10266,9 +14755,11 @@
             const truncated = archiveResultPayload(result).summary_truncated;
             archiveReviewSummary.innerHTML = `${renderMarkdown(summary)}${truncated ? '<div class="archive-review-note">Summary was truncated for archive storage.</div>' : ''}`;
         }
+        resetArchiveFeedbackUi(archiveReviewContext);
         archiveReviewRenderActiveFrame();
         archiveReviewModal.style.display = 'block';
-        void archiveReviewLoadBatchFrames(archiveReviewContext);
+        void loadArchiveAlertFeedback(archiveReviewContext);
+        void archiveReviewPrepare(archiveReviewContext);
     }
 
     async function copyArchiveReviewSummary() {
@@ -10337,6 +14828,7 @@
         if (luxriotSummaryToInput) {
             luxriotSummaryToInput.value = formatSummaryDatetimeInput(luxriotSummaryToTs);
         }
+        resetSummaryArchivePaging();
         syncSummaryRangeUI();
         setSummaryUnread(0);
         setLuxriotStatus(`Opening VLM feed around ${formatArchiveTimestamp(summaryWindow.targetMs)}...`);
@@ -11405,16 +15897,19 @@
         
         indexStatus.textContent = 'Finding similar images...';
         indexStatus.className = 'status';
+        const requestContext = beginArchiveEvidenceRequest();
         
         try {
             const shouldUseStoredBlob = hasArchiveImage && (!imagePath || isVideoArchiveResult(result));
             const imageBlob = shouldUseStoredBlob
-                ? await archiveResultImageBlob(result)
+                ? await archiveResultImageBlob(result, requestContext.controller.signal)
                 : await (async () => {
-                    const imageResponse = await fetch(buildImageFetchUrl(imagePath, result));
+                    const imageResponse = await fetch(buildImageFetchUrl(imagePath, result), {
+                        signal: requestContext.controller.signal,
+                    });
                     if (!imageResponse.ok) {
                         if (hasArchiveImage) {
-                            return archiveResultImageBlob(result);
+                            return archiveResultImageBlob(result, requestContext.controller.signal);
                         }
                         throw new Error('Failed to load image file');
                     }
@@ -11427,18 +15922,16 @@
 
             if (detectionResult || isDetectionsScope()) {
                 const filters = buildDetectionSearchFilters();
-                Object.entries(filters).forEach(([key, value]) => {
-                    if (value !== undefined && value !== null && String(value).trim() !== '') {
-                        formData.append(key, String(value));
-                    }
-                });
+                appendDetectionSearchFilters(formData, filters);
                 formData.append('embedder', embedderSelect ? embedderSelect.value : 'clip');
 
                 const response = await fetch('/detections/search_image', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    signal: requestContext.controller.signal,
                 });
                 const data = await parseApiJson(response, 'Detection image search failed');
+                if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
                 const rendered = decorateDetectionSearchResults(data.results, data.mode_used, data.mode_requested);
                 if (!rendered.length) {
                     indexStatus.textContent = 'No similar detections found';
@@ -11454,9 +15947,11 @@
             formData.append('folder', folder);
             const response = await fetch('/search_by_image', {
                 method: 'POST',
-                body: formData
+                body: formData,
+                signal: requestContext.controller.signal,
             });
             const data = await parseApiJson(response, 'Image search failed');
+            if (!isCurrentArchiveEvidenceRequest(requestContext)) return;
             const results = Array.isArray(data.results) ? data.results : [];
             if (!results.length) {
                 indexStatus.textContent = 'No similar images found';
@@ -11467,9 +15962,12 @@
             indexStatus.className = 'status success';
             displayResults(results);
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isCurrentArchiveEvidenceRequest(requestContext)) return;
             console.error('Find similar error:', error);
             indexStatus.textContent = 'Error finding similar images: ' + error.message;
             indexStatus.className = 'status error';
+        } finally {
+            finishArchiveEvidenceRequest(requestContext);
         }
     }
 
@@ -11596,6 +16094,10 @@
         let _agentStreaming = false;
         let _agentPendingBubble = null;     // { el, bodyEl } for the current streaming bubble
         let _agentPendingImageB64 = null;   // base64 string of attached image
+        let _agentContextActive = false;
+        let _agentContextTimer = null;
+        let _agentContextRequestGeneration = 0;
+        let _agentContextAbortController = null;
 
         // ---- DOM refs (safe — these are inside the IIFE scope) ----
         function q(id) { return document.getElementById(id); }
@@ -11627,19 +16129,41 @@
             } catch(_) { return ''; }
         }
 
+        function agentModelDescription(data, fallbackModel = '') {
+            const resolved = normalizeModelId(data && data.resolved_model);
+            const selector = normalizeModelId(data && data.model) || normalizeModelId(fallbackModel);
+            const profileId = normalizeModelId(data && data.profile_id);
+            const model = resolved || selector || 'default';
+            if (profileId && selector === profileId && resolved && resolved !== profileId) {
+                return `${model} (profile ${profileId})`;
+            }
+            return model;
+        }
+
+        function agentApplyConfigToInput(data) {
+            const input = elAgentModelInput();
+            if (!input) return;
+            setModelSelectOptions(input, data.model || data.default_model || '', '', {
+                keepUnavailableSelection: true,
+            });
+            const defaultDescription = normalizeModelId(data.default_resolved_model)
+                || normalizeModelId(data.default_model)
+                || 'n/a';
+            input.title = data.source === 'runtime_override'
+                ? `Runtime override active. Default: ${defaultDescription}`
+                : `Using default model: ${defaultDescription}`;
+        }
+
         async function agentLoadConfig() {
             try {
-                await loadLmModelCatalog();
+                const catalog = await loadLmModelCatalog();
+                if (catalog && catalog.source === 'fallback') {
+                    await loadLmModelCatalog(true);
+                }
                 const r = await fetch('/agent/config');
                 if (!r.ok) return;
                 const data = await r.json();
-                const input = elAgentModelInput();
-                if (input) {
-                    setModelSelectOptions(input, data.model || data.default_model || '');
-                    input.title = data.source === 'runtime_override'
-                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
-                        : `Using default model: ${data.default_model || 'n/a'}`;
-                }
+                agentApplyConfigToInput(data);
             } catch(e) {
                 console.warn('agent: failed to load config', e);
             }
@@ -11662,13 +16186,8 @@
                 if (!r.ok || data.error) {
                     throw new Error(data.error || 'Failed to save agent model');
                 }
-                if (input) {
-                    setModelSelectOptions(input, data.model || model || data.default_model || '');
-                    input.title = data.source === 'runtime_override'
-                        ? `Runtime override active. Default: ${data.default_model || 'n/a'}`
-                        : `Using default model: ${data.default_model || 'n/a'}`;
-                }
-                appendAgentNotice(`Agent model set to ${data.model || model || 'default'}`, 'success');
+                agentApplyConfigToInput(data);
+                appendAgentNotice(`Agent model set to ${agentModelDescription(data, model)}`, 'success');
             } catch (e) {
                 appendErrorToMessages(`Failed to set agent model: ${e.message}`);
             } finally {
@@ -11774,11 +16293,33 @@
             const el = elMessages();
             if (!el) return;
             el.innerHTML = '';
+            let bubble = null;
             for (const msg of messages) {
                 if (msg.role === 'user') {
+                    bubble = null;
                     appendUserBubble(msg.content, msg.created_at);
                 } else if (msg.role === 'assistant') {
-                    appendAssistantBubble(msg.content, msg.created_at);
+                    // Tool-call turns are stored as empty assistant messages;
+                    // reuse the open bubble so trace cards and the final answer
+                    // land in one bubble, matching the live stream layout.
+                    const text = String(msg.content || '').trim();
+                    if (!bubble) {
+                        bubble = appendAssistantBubble(msg.content, msg.created_at);
+                    } else if (text && !bubble.text) {
+                        bubble.textEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+                        bubble.text = text;
+                        syncAgentEvidenceIdCard(bubble);
+                    } else if (text) {
+                        bubble = appendAssistantBubble(msg.content, msg.created_at);
+                    }
+                } else if (msg.role === 'tool') {
+                    let result = msg.tool_result;
+                    if (typeof result === 'string') {
+                        try { result = JSON.parse(result); } catch (_) { result = null; }
+                    }
+                    if (result == null || typeof result !== 'object') continue;
+                    if (!bubble) bubble = appendAssistantBubble('', msg.created_at);
+                    appendActionCard(bubble, msg.tool_name || 'tool', result);
                 }
             }
             scrollToBottom(true);
@@ -11810,11 +16351,23 @@
             const textEl = document.createElement('div');
             textEl.className = 'agent-msg-text';
             if (text) textEl.innerHTML = renderMarkdown ? renderMarkdown(text) : escapeHtml(text);
+            const { traceEl, traceSummary, actionsEl } = createAgentToolTrace();
             bodyEl.appendChild(textEl);
+            bodyEl.appendChild(traceEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(ts || new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            const bubble = { el: div, bodyEl, textEl, traceEl: null, actionsEl: null, actionCount: 0, text: text || '' };
+            const bubble = {
+                el: div,
+                bodyEl,
+                textEl,
+                traceEl,
+                actionsEl,
+                actionCount: 0,
+                text: text || '',
+                traceUserToggled: false,
+            };
+            bindAgentTracePreference(bubble, traceSummary);
             syncAgentEvidenceIdCard(bubble);
             scrollToBottom(true);
             return bubble;
@@ -11832,6 +16385,28 @@
             bubble.textEl.innerHTML = `<span class="agent-typing-indicator agent-typing-indicator-${mode}"><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-dot"></span><span class="agent-typing-label">${safeMessage}</span></span>`;
         }
 
+        function createAgentToolTrace() {
+            const traceEl = document.createElement('details');
+            traceEl.className = 'agent-tool-trace';
+            traceEl.open = false;
+            traceEl.hidden = true;
+            const traceSummary = document.createElement('summary');
+            traceSummary.className = 'agent-tool-trace-summary';
+            traceSummary.textContent = 'Research trace';
+            const actionsEl = document.createElement('div');
+            actionsEl.className = 'agent-msg-actions';
+            traceEl.appendChild(traceSummary);
+            traceEl.appendChild(actionsEl);
+            return { traceEl, traceSummary, actionsEl };
+        }
+
+        function bindAgentTracePreference(bubble, traceSummary) {
+            if (!bubble || !traceSummary) return;
+            traceSummary.addEventListener('click', () => {
+                bubble.traceUserToggled = true;
+            });
+        }
+
         function startStreamingBubble() {
             const el = elMessages();
             if (!el) return null;
@@ -11845,23 +16420,24 @@
             bodyEl.className = 'agent-msg-body';
             const textEl = document.createElement('div');
             textEl.className = 'agent-msg-text';
-            const traceEl = document.createElement('details');
-            traceEl.className = 'agent-tool-trace';
-            traceEl.open = true;
-            traceEl.hidden = true;
-            const traceSummary = document.createElement('summary');
-            traceSummary.className = 'agent-tool-trace-summary';
-            traceSummary.textContent = 'Research trace';
-            const actionsEl = document.createElement('div');
-            actionsEl.className = 'agent-msg-actions';
-            traceEl.appendChild(traceSummary);
-            traceEl.appendChild(actionsEl);
+            const { traceEl, traceSummary, actionsEl } = createAgentToolTrace();
             bodyEl.appendChild(textEl);
             bodyEl.appendChild(traceEl);
             div.innerHTML = `<div class="agent-msg-header">EVA Agent <span class="agent-msg-ts">${fmtTime(new Date().toISOString())}</span></div>`;
             div.appendChild(bodyEl);
             el.appendChild(div);
-            const bubble = { el: div, bodyEl, textEl, traceEl, actionsEl, actionCount: 0, text: '' };
+            const bubble = {
+                el: div,
+                bodyEl,
+                textEl,
+                traceEl,
+                actionsEl,
+                actionCount: 0,
+                text: '',
+                currentToolName: '',
+                traceUserToggled: false,
+            };
+            bindAgentTracePreference(bubble, traceSummary);
             setStreamingStatus(bubble, 'Thinking through the request...', 'thinking');
             scrollToBottom(true);
             return bubble;
@@ -11886,8 +16462,15 @@
                 ? buildAgentProbeApprovalCard(name, result)
                 : buildActionCard(name, result);
             if (!card) return;
-            const standaloneApproval = card.dataset && card.dataset.agentStandaloneApproval === 'true';
+            const standaloneApproval = Boolean(
+                (card.dataset && card.dataset.agentStandaloneApproval === 'true')
+                || card.querySelector('.agent-approval-footer')
+            );
             if (standaloneApproval && bubble.bodyEl) {
+                card.dataset.agentStandaloneApproval = 'true';
+                if (card.classList.contains('agent-action-card')) {
+                    card.classList.add('agent-approval-card', 'agent-approval-card-legacy');
+                }
                 const before = bubble.traceEl && bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
                 bubble.bodyEl.insertBefore(card, before);
             } else if (bubble.actionsEl) {
@@ -11940,13 +16523,17 @@
                 if (!(node instanceof HTMLElement)) return false;
                 return node.dataset.agentStandaloneApproval === 'true'
                     || node.classList.contains('agent-approval-card')
+                    || Boolean(node.querySelector('.agent-approval-footer'))
                     || isLegacyProbeApprovalCard(node);
             });
             if (!candidates.length) return;
             const before = bubble.traceEl.parentNode === bubble.bodyEl ? bubble.traceEl : null;
             candidates.forEach((node) => {
                 node.dataset.agentStandaloneApproval = 'true';
-                if (isLegacyProbeApprovalCard(node)) {
+                if (
+                    isLegacyProbeApprovalCard(node)
+                    || (node.classList.contains('agent-action-card') && node.querySelector('.agent-approval-footer'))
+                ) {
                     node.classList.add('agent-approval-card', 'agent-approval-card-legacy');
                 }
                 bubble.bodyEl.insertBefore(node, before);
@@ -12434,7 +17021,10 @@
             if (!coverage) return '';
             if (typeof coverage === 'string') return coverage;
             if (typeof coverage !== 'object') return String(coverage);
-            if (coverage.note) return String(coverage.note);
+            if (coverage.note) {
+                const status = String(coverage.status || '').trim();
+                return `${status ? `Coverage ${status}: ` : 'Coverage: '}${String(coverage.note)}`;
+            }
             const parts = ['status', 'start_time', 'end_time', 'covered_entries', 'total_entries', 'sampled_frames']
                 .filter((key) => coverage[key] !== undefined && coverage[key] !== null && String(coverage[key]).trim() !== '')
                 .map((key) => `${agentHumanizeKey(key)}: ${agentCompactValue(coverage[key])}`);
@@ -12444,6 +17034,138 @@
         function agentCoverageClass(coverage) {
             const status = coverage && typeof coverage === 'object' ? String(coverage.status || 'unknown') : 'unknown';
             return status.toLowerCase().replace(/[^a-z0-9_-]+/g, '_') || 'unknown';
+        }
+
+        function agentCompletenessSources(result) {
+            const root = result && typeof result === 'object' ? result : {};
+            const scope = root.scope && typeof root.scope === 'object' ? root.scope : null;
+            const inventory = root.inventory && typeof root.inventory === 'object' ? root.inventory : null;
+            return [
+                root,
+                root.coverage && typeof root.coverage === 'object' ? root.coverage : null,
+                scope,
+                inventory,
+                inventory && inventory.coverage && typeof inventory.coverage === 'object' ? inventory.coverage : null,
+            ].filter(Boolean);
+        }
+
+        function agentFirstCompletenessValue(sources, key) {
+            for (const source of sources) {
+                if (Object.prototype.hasOwnProperty.call(source, key) && source[key] !== undefined && source[key] !== null) {
+                    return source[key];
+                }
+            }
+            return undefined;
+        }
+
+        function agentCompletenessIds(sources, key) {
+            const ids = [];
+            const seen = new Set();
+            sources.forEach((source) => {
+                const values = Array.isArray(source[key]) ? source[key] : [];
+                values.forEach((value) => {
+                    const normalized = String(value ?? '').trim();
+                    if (!normalized || seen.has(normalized)) return;
+                    seen.add(normalized);
+                    ids.push(normalized);
+                });
+            });
+            return ids;
+        }
+
+        function agentCompletenessErrors(sources) {
+            const errors = [];
+            const seen = new Set();
+            const add = (value) => {
+                const text = typeof value === 'object' && value !== null
+                    ? String(value.error || value.message || value.channel_id || JSON.stringify(value))
+                    : String(value ?? '');
+                const clean = text.trim();
+                if (!clean || seen.has(clean)) return;
+                seen.add(clean);
+                errors.push(clean);
+            };
+            sources.forEach((source) => {
+                if (Array.isArray(source.errors)) source.errors.forEach(add);
+                if (source.channel_inventory_error) add(source.channel_inventory_error);
+            });
+            return errors;
+        }
+
+        function appendAgentCompleteness(body, result, options = {}) {
+            if (!body) return;
+            const sources = agentCompletenessSources(result);
+            const root = result && typeof result === 'object' ? result : {};
+            const inventory = root.inventory && typeof root.inventory === 'object' ? root.inventory : null;
+            const explicitCoverage = root.coverage ?? (inventory ? inventory.coverage : null);
+            const coverage = (explicitCoverage ?? sources.find((source) => (
+                Object.prototype.hasOwnProperty.call(source, 'coverage_status')
+                || Object.prototype.hasOwnProperty.call(source, 'coverage_note')
+                || Object.prototype.hasOwnProperty.call(source, 'scanned_candidates')
+                || Object.prototype.hasOwnProperty.call(source, 'channel_inventory_status')
+            ))) || null;
+            let coverageText = agentCoverageText(coverage);
+            if (!coverageText && coverage && coverage.channel_inventory_status) {
+                coverageText = `Coverage inventory: ${coverage.channel_inventory_status}${coverage.full_research_note ? ` · ${coverage.full_research_note}` : ''}`;
+            }
+            if (coverage && (coverage.scanned_candidates !== undefined || coverage.total_candidates !== undefined)) {
+                const scanned = coverage.scanned_candidates ?? '?';
+                const total = coverage.total_candidates ?? '?';
+                coverageText = `${coverageText || 'Coverage'} · scanned ${scanned} of ${total} candidates`;
+            }
+            if (coverageText || options.alwaysCoverage) {
+                const note = document.createElement('div');
+                note.className = `agent-coverage-note agent-coverage-${agentCoverageClass(coverage)}`;
+                note.textContent = coverageText || 'Coverage: not reported by the backend for this result.';
+                body.appendChild(note);
+            }
+
+            const hasBackendTruncated = sources.some((source) => Object.prototype.hasOwnProperty.call(source, 'backend_truncated'));
+            const backendTruncated = sources.some((source) => Boolean(source.backend_truncated));
+            if (hasBackendTruncated || options.alwaysBackendTruncation) {
+                const note = document.createElement('div');
+                note.className = `agent-coverage-note agent-coverage-${backendTruncated ? 'partial' : 'covered'}`;
+                note.textContent = `Backend truncated: ${hasBackendTruncated ? (backendTruncated ? 'yes — older or additional backend rows may be unchecked' : 'no') : 'not reported'}.`;
+                body.appendChild(note);
+            }
+
+            const hasTruncated = sources.some((source) => (
+                Object.prototype.hasOwnProperty.call(source, 'truncated')
+                || Object.prototype.hasOwnProperty.call(source, '_truncated')
+                || Object.prototype.hasOwnProperty.call(source, 'id_lists_truncated')
+            ));
+            const truncated = sources.some((source) => Boolean(source.truncated || source._truncated || source.id_lists_truncated));
+            if (hasTruncated || options.alwaysTruncation) {
+                const note = document.createElement('div');
+                note.className = `agent-coverage-note agent-coverage-${truncated ? 'partial' : 'covered'}`;
+                note.textContent = `Result truncation: ${hasTruncated ? (truncated ? 'yes — displayed evidence is incomplete' : 'no') : 'not reported'}.`;
+                body.appendChild(note);
+            }
+
+            const uncheckedIds = agentCompletenessIds(sources, 'unchecked_channel_ids');
+            const deferredIds = agentCompletenessIds(sources, 'deferred_channel_ids');
+            const uncheckedRaw = agentFirstCompletenessValue(sources, 'unchecked_count');
+            const deferredRaw = agentFirstCompletenessValue(sources, 'deferred_count');
+            const errorsRaw = agentFirstCompletenessValue(sources, 'error_count');
+            const errors = agentCompletenessErrors(sources);
+            const uncheckedCount = Number.isFinite(Number(uncheckedRaw)) ? Number(uncheckedRaw) : uncheckedIds.length;
+            const deferredCount = Number.isFinite(Number(deferredRaw)) ? Number(deferredRaw) : deferredIds.length;
+            const errorCount = Number.isFinite(Number(errorsRaw)) ? Number(errorsRaw) : errors.length;
+            const hasScopeSignals = options.alwaysScope
+                || uncheckedRaw !== undefined || deferredRaw !== undefined || errorsRaw !== undefined
+                || uncheckedIds.length || deferredIds.length || errors.length;
+            if (hasScopeSignals) {
+                const scope = document.createElement('div');
+                const incomplete = uncheckedCount > 0 || deferredCount > 0 || errorCount > 0 || errors.length > 0;
+                scope.className = `agent-coverage-note agent-coverage-${incomplete ? 'partial' : 'covered'}`;
+                const parts = [
+                    `Unchecked: ${uncheckedCount}${uncheckedIds.length ? ` (${uncheckedIds.join(', ')})` : ''}`,
+                    `Deferred: ${deferredCount}${deferredIds.length ? ` (${deferredIds.join(', ')})` : ''}`,
+                    `Errors: ${Math.max(errorCount, errors.length)}${errors.length ? ` (${errors.slice(0, 3).join(' · ')})` : ''}`,
+                ];
+                scope.textContent = parts.join(' · ');
+                body.appendChild(scope);
+            }
         }
 
         function agentTransitionCountEntries(counts) {
@@ -12531,6 +17253,10 @@
                 } else {
                     body.innerHTML = '<div style="font-size:13px;color:var(--muted)">No results found.</div>';
                 }
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysTruncation: true,
+                });
                 card.appendChild(body);
 
             } else if (toolName === 'get_detections') {
@@ -12583,6 +17309,38 @@
                     : '<div style="font-size:13px;color:var(--muted)">No channels found.</div>';
                 card.appendChild(body);
 
+            } else if (toolName === 'list_video_summary_channels') {
+                const channels = (result && result.candidate_channels) || [];
+                const returned = result && result.returned != null ? Number(result.returned) : channels.length;
+                const checked = result && result.total_channels_checked != null ? Number(result.total_channels_checked) : channels.length;
+                const label = `VIDEO SUMMARY INVENTORY — ${returned} returned · ${checked} checked`;
+                card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
+                const body = document.createElement('div');
+                body.className = 'agent-action-card-body';
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysBackendTruncation: true,
+                    alwaysTruncation: true,
+                    alwaysScope: true,
+                });
+                if (channels.length) {
+                    const rows = document.createElement('div');
+                    rows.innerHTML = channels.slice(0, 12).map((channel) => {
+                        const channelId = channel.channel_id ?? channel.id ?? '?';
+                        const title = channel.title || channel.name || `Channel ${channelId}`;
+                        const status = channel.coverage_status || (channel.quiet ? 'quiet' : 'summary data');
+                        const count = channel.summary_count != null ? ` · ${channel.summary_count} summaries` : '';
+                        return `<div class="agent-summary-entry"><span class="agent-summary-ts">CH ${escapeHtml(String(channelId))}</span><span class="agent-summary-text">${escapeHtml(String(title))} · ${escapeHtml(String(status))}${escapeHtml(count)}</span></div>`;
+                    }).join('');
+                    body.appendChild(rows);
+                } else {
+                    const empty = document.createElement('div');
+                    empty.className = 'agent-card-muted-note';
+                    empty.textContent = 'No video-summary channels were returned for this window.';
+                    body.appendChild(empty);
+                }
+                card.appendChild(body);
+
             } else if (toolName === 'list_probes') {
                 const probes = (result && result.probes) || [];
                 const label = `PROBES — ${probes.length} configured`;
@@ -12608,6 +17366,7 @@
                         return `<div class="agent-summary-entry"><span class="agent-summary-ts">${escapeHtml(head)}</span><span class="agent-summary-text">${escapeHtml(text)}</span></div>`;
                     }).join('')
                     : '<div style="font-size:13px;color:var(--muted)">No survey data.</div>';
+                appendAgentCompleteness(body, result, { alwaysScope: true });
                 card.appendChild(body);
 
             } else if (toolName === 'create_probe') {
@@ -12735,12 +17494,12 @@
                 card.innerHTML = `<div class="agent-action-card-head">&#9670; ${escapeHtml(label)}</div>`;
                 const body = document.createElement('div');
                 body.className = 'agent-action-card-body';
-                if (coverage && coverage.note) {
-                    const cov = document.createElement('div');
-                    cov.className = `agent-coverage-note agent-coverage-${escapeHtml(String(coverage.status || 'unknown'))}`;
-                    cov.textContent = coverage.note;
-                    body.appendChild(cov);
-                }
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysBackendTruncation: true,
+                    alwaysTruncation: true,
+                    alwaysScope: true,
+                });
                 if (evidenceFrames.length) {
                     const head = document.createElement('div');
                     head.className = 'agent-evidence-title';
@@ -12763,7 +17522,16 @@
                 } else {
                     const empty = document.createElement('div');
                     empty.className = 'agent-card-muted-note';
-                    empty.textContent = 'No summaries in this time range.';
+                    const sourceWindows = Number(result && result.total_in_window) || 0;
+                    const semanticStatus = String((result && result.semantic_status) || '').toLowerCase();
+                    const semanticPending = Number(result && result.semantic_pending_count) || 0;
+                    if (sourceWindows > 0 && (semanticStatus === 'pending' || semanticPending > 0)) {
+                        empty.textContent = `${sourceWindows} source windows retained; semantic summaries are being generated.`;
+                    } else if (sourceWindows > 0) {
+                        empty.textContent = `${sourceWindows} source windows retained; no completed semantic narrative yet. Drill into L0 observations.`;
+                    } else {
+                        empty.textContent = 'No video-description data in this time range.';
+                    }
                     body.appendChild(empty);
                 }
                 card.appendChild(body);
@@ -12787,12 +17555,12 @@
                 body.innerHTML = `<div class="agent-probe-update-row">${
                     countRows.map(([key, value]) => `<div class="agent-probe-update-field"><span class="agent-probe-update-key">${escapeHtml(key)}:</span><span class="agent-probe-update-val">${escapeHtml(String(value ?? 0))}</span></div>`).join('')
                 }</div>`;
-                if (coverage && coverage.note) {
-                    const cov = document.createElement('div');
-                    cov.className = `agent-coverage-note agent-coverage-${escapeHtml(String(coverage.status || 'unknown'))}`;
-                    cov.textContent = coverage.note;
-                    body.appendChild(cov);
-                }
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysBackendTruncation: true,
+                    alwaysTruncation: true,
+                    alwaysScope: true,
+                });
                 if (events.length) {
                     const wrap = document.createElement('div');
                     wrap.innerHTML = events.slice(0, 8).map((event) => {
@@ -12869,13 +17637,12 @@
                     body.appendChild(emptyCounts);
                 }
 
-                const coverageText = agentCoverageText(coverage);
-                if (coverageText) {
-                    const cov = document.createElement('div');
-                    cov.className = `agent-coverage-note agent-coverage-${agentCoverageClass(coverage)}`;
-                    cov.textContent = coverageText;
-                    body.appendChild(cov);
-                }
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysBackendTruncation: true,
+                    alwaysTruncation: true,
+                    alwaysScope: true,
+                });
 
                 if (boundaryFrames.length) {
                     addTitle(`Boundary frames · ${boundaryFrames.length}`);
@@ -12999,6 +17766,12 @@
                 body.className = 'agent-action-card-body';
                 const text = (result && (result.report || result.text || result.content)) || JSON.stringify(result, null, 2);
                 body.innerHTML = `<div class="agent-report-block">${escapeHtml(text)}</div>`;
+                appendAgentCompleteness(body, result, {
+                    alwaysCoverage: true,
+                    alwaysBackendTruncation: true,
+                    alwaysTruncation: true,
+                    alwaysScope: true,
+                });
                 card.appendChild(body);
 
             } else {
@@ -13127,10 +17900,14 @@
                     if (evt.content) appendTokenToBubble(bubble, evt.content);
                     break;
                 case 'tool_call':
-                    if (evt.name) setStreamingStatus(bubble, `Running ${evt.name}...`, 'working');
+                    if (evt.name) {
+                        bubble.currentToolName = String(evt.name);
+                        setStreamingStatus(bubble, `Running ${evt.name}...`, 'working');
+                    }
                     break;
                 case 'tool_result':
                     appendActionCard(bubble, evt.name, evt.result);
+                    if (bubble.currentToolName === String(evt.name || '')) bubble.currentToolName = '';
                     if (
                         ((evt.name === 'update_probe') || (evt.name === 'create_probe') || (evt.name === 'delete_probes'))
                         && evt.result && evt.result.status === 'applied'
@@ -13145,7 +17922,27 @@
                     appendErrorToMessages(evt.message || 'Unknown error');
                     break;
                 case 'heartbeat':
-                    setStreamingStatus(bubble, 'Still working...', 'thinking');
+                    setStreamingStatus(
+                        bubble,
+                        bubble.currentToolName ? `Running ${bubble.currentToolName}...` : 'Still working...',
+                        bubble.currentToolName ? 'working' : 'thinking'
+                    );
+                    break;
+                case 'research_plan_complete':
+                    bubble.currentToolName = '';
+                    setStreamingStatus(
+                        bubble,
+                        evt.message || 'Research complete; writing response...',
+                        'writing'
+                    );
+                    break;
+                case 'tool_loop_guard':
+                    bubble.currentToolName = '';
+                    setStreamingStatus(
+                        bubble,
+                        'Repeated tool call stopped; writing response...',
+                        'writing'
+                    );
                     break;
                 case 'tool_start':
                 case 'done':
@@ -13163,7 +17960,9 @@
                 const hasText = String(bubble.text || '').trim().length > 0;
                 const hasActions = Number(bubble.actionCount || 0) > 0;
                 bubble.traceEl.hidden = !hasActions;
-                bubble.traceEl.open = hasActions && !hasText;
+                if (!bubble.traceUserToggled) {
+                    bubble.traceEl.open = false;
+                }
             }
             promoteStandaloneAgentApprovalCards(bubble);
             syncAgentEvidenceIdCard(bubble);
@@ -13184,56 +17983,177 @@
             appendAgentNotice(msg, 'error');
         }
 
-        // ---- Video stream list (context sidebar) ----
-        async function agentLoadVideoStreams() {
+        // ---- Analytics runtime list (context sidebar; not the camera inventory) ----
+        function agentLabelAnalyticsStreams() {
+            const el = elProbeList();
+            const title = el && el.closest('.agent-ctx-section')
+                ? el.closest('.agent-ctx-section').querySelector('.agent-ctx-title')
+                : null;
+            if (title) {
+                title.textContent = 'Analytics Streams';
+                title.title = 'Runtime VLM/probe analytics streams; this is not the full Luxriot camera inventory.';
+            }
+        }
+
+        function agentAdmissionRow(admission) {
+            if (!admission || typeof admission !== 'object') {
+                return `<div class="agent-probe-mini">
+                    <div class="agent-probe-dot warn"></div>
+                    <span class="agent-probe-name">LM admission</span>
+                    <span class="agent-probe-score">unavailable</span>
+                </div>`;
+            }
+            const active = Number(admission.active || 0);
+            const queued = Number(admission.queued || 0);
+            const resources = Array.isArray(admission.resources) ? admission.resources : [];
+            const oldest = resources.reduce((maxAge, row) => {
+                const age = Number(row && row.oldest_queue_age_sec);
+                return Number.isFinite(age) ? Math.max(maxAge, age) : maxAge;
+            }, 0);
+            const dotCls = queued > 0 ? 'warn' : (active > 0 ? 'on' : 'off');
+            const score = `${active} active · ${queued} queued · oldest ${oldest.toFixed(1)}s`;
+            const profiles = Array.isArray(admission.profiles) ? admission.profiles : [];
+            const modelChecks = profiles.map((profile) => {
+                if (profile && profile.model_match === false) {
+                    const configured = String(profile.configured_model || 'unknown');
+                    const servedModels = Array.isArray(profile.served_models)
+                        ? profile.served_models.map((model) => String(model || '')).filter(Boolean)
+                        : [];
+                    const served = servedModels.length ? servedModels.join(', ') : 'none';
+                    const message = `LM model mismatch: configured ${configured}, serving ${served}`;
+                    return `<div class="agent-lm-model-badge mismatch" title="${escapeHtml(message)}">${escapeHtml(message)}</div>`;
+                }
+                if (profile && profile.model_match === 'unknown') {
+                    return '<div class="agent-lm-model-badge unknown">model check unavailable</div>';
+                }
+                return '';
+            }).filter(Boolean).join('');
+            return `<div class="agent-probe-mini">
+                <div class="agent-probe-dot ${dotCls}"></div>
+                <span class="agent-probe-name">LM admission</span>
+                <span class="agent-probe-score" title="Shared model admission queue">${escapeHtml(score)}</span>
+            </div>${modelChecks}`;
+        }
+
+        function renderAgentAnalyticsStreams(data, admission) {
             const el = elProbeList();
             if (!el) return;
-            try {
-                const r = await fetch(`/luxriot/streams?t=${Date.now()}`, { cache: 'no-store' });
-                const data = await r.json().catch(() => ({}));
-                if (!r.ok || data.error) {
-                    throw new Error(data.error || 'Failed to load video streams');
-                }
-                const streams = Array.isArray(data.video_streams) ? data.video_streams : [];
-                const missing = Array.isArray(data.desired_video_missing) ? data.desired_video_missing : [];
-                if (!streams.length && !missing.length) {
-                    el.innerHTML = '<div class="agent-probe-empty">No video-description streams running</div>';
-                    return;
-                }
-                const streamRows = streams.map(stream => {
-                    const running = Boolean(stream.running);
-                    const lastError = String(stream.last_error || stream.last_restore_error || '').trim();
-                    const dotCls = lastError ? 'warn' : (running ? 'on' : 'off');
-                    const channel = stream.channel_id ?? '?';
-                    const model = String(stream.model || 'default');
-                    const pending = Number(stream.pending_frames || 0);
-                    const dropped = Number(stream.dropped_frames || 0) + Number(stream.queue_dropped_batches || 0);
-                    const logs = Number(stream.log_count || 0);
-                    const alertCounts = stream.last_alert_counts && typeof stream.last_alert_counts === 'object'
-                        ? Object.entries(stream.last_alert_counts).map(([key, val]) => `${key}:${val}`).join(',')
-                        : '';
-                    const score = lastError
-                        ? 'error'
-                        : `${pending}q · ${logs}s${dropped ? ` · ${dropped}d` : ''}${alertCounts ? ` · ${alertCounts}` : ''}`;
-                    return `<div class="agent-probe-mini">
-                        <div class="agent-probe-dot ${dotCls}"></div>
-                        <span class="agent-probe-name">CH ${escapeHtml(String(channel))} · ${escapeHtml(model)}</span>
-                        <span class="agent-probe-score" title="${escapeHtml(lastError || 'pending · summaries · dropped · alerts')}">${escapeHtml(score)}</span>
-                    </div>`;
-                });
-                const missingRows = missing.map(row => {
-                    const channel = row.channel_id ?? '?';
-                    const err = String(row.last_restore_error || '').trim();
-                    return `<div class="agent-probe-mini">
-                        <div class="agent-probe-dot warn"></div>
-                        <span class="agent-probe-name">CH ${escapeHtml(String(channel))} · desired</span>
-                        <span class="agent-probe-score" title="${escapeHtml(err || 'desired but not running')}">missing</span>
-                    </div>`;
-                });
-                el.innerHTML = [...streamRows, ...missingRows].join('');
-            } catch(e) {
-                el.innerHTML = '<div class="agent-probe-empty">Failed to load video streams</div>';
+            const videoStreams = Array.isArray(data.video_streams) ? data.video_streams : [];
+            const analyticsStreams = Array.isArray(data.analytics_streams) ? data.analytics_streams : [];
+            const missing = Array.isArray(data.desired_video_missing) ? data.desired_video_missing : [];
+            const intro = '<div class="agent-probe-empty">Runtime analytics only — not the full camera inventory.</div>';
+            const videoRows = videoStreams.map((stream) => {
+                const running = Boolean(stream.running);
+                const lastError = String(stream.last_error || stream.last_restore_error || '').trim();
+                const dotCls = lastError ? 'warn' : (running ? 'on' : 'off');
+                const channel = stream.channel_id ?? '?';
+                const model = String(stream.model || 'default');
+                const pending = Number(stream.pending_frames || 0);
+                const dropped = Number(stream.dropped_frames || 0) + Number(stream.queue_dropped_batches || 0);
+                const logs = Number(stream.log_count || 0);
+                const score = lastError ? 'error' : `${pending}q · ${logs}s${dropped ? ` · ${dropped}d` : ''}`;
+                return `<div class="agent-probe-mini">
+                    <div class="agent-probe-dot ${dotCls}"></div>
+                    <span class="agent-probe-name">VLM CH ${escapeHtml(String(channel))} · ${escapeHtml(model)}</span>
+                    <span class="agent-probe-score" title="${escapeHtml(lastError || 'pending · summaries · dropped')}">${escapeHtml(score)}</span>
+                </div>`;
+            });
+            const probeRows = analyticsStreams.map((stream) => {
+                const running = Boolean(stream.running);
+                const lastError = String(stream.last_error || '').trim();
+                const dotCls = lastError ? 'warn' : (running ? 'on' : 'off');
+                const channel = stream.channel_id ?? '?';
+                const buffered = Number(stream.pending_frames || 0);
+                const shared = Boolean(stream.shared_capture);
+                const score = lastError ? 'error' : `${buffered} buffered${shared ? ' · shared' : ''}`;
+                return `<div class="agent-probe-mini">
+                    <div class="agent-probe-dot ${dotCls}"></div>
+                    <span class="agent-probe-name">Probe analytics CH ${escapeHtml(String(channel))}</span>
+                    <span class="agent-probe-score" title="${escapeHtml(lastError || 'probe analytics capture runtime')}">${escapeHtml(score)}</span>
+                </div>`;
+            });
+            const missingRows = missing.map((row) => {
+                const channel = row.channel_id ?? '?';
+                const error = String(row.last_restore_error || '').trim();
+                return `<div class="agent-probe-mini">
+                    <div class="agent-probe-dot warn"></div>
+                    <span class="agent-probe-name">VLM CH ${escapeHtml(String(channel))} · desired</span>
+                    <span class="agent-probe-score" title="${escapeHtml(error || 'desired analytics stream is not running')}">missing</span>
+                </div>`;
+            });
+            const rows = [agentAdmissionRow(admission), ...videoRows, ...probeRows, ...missingRows];
+            if (rows.length === 1 && !videoStreams.length && !analyticsStreams.length && !missing.length) {
+                rows.push('<div class="agent-probe-empty">No VLM or probe analytics streams running.</div>');
             }
+            el.innerHTML = intro + rows.join('');
+        }
+
+        async function agentLoadAnalyticsStreams() {
+            const el = elProbeList();
+            if (!el || !_agentContextActive || currentMode !== 'agent') return false;
+            _agentContextRequestGeneration += 1;
+            abortUiRequest(_agentContextAbortController);
+            const generation = _agentContextRequestGeneration;
+            const controller = new AbortController();
+            _agentContextAbortController = controller;
+            try {
+                const [streamsResponse, admissionResponse] = await Promise.all([
+                    fetch(`/luxriot/streams?t=${Date.now()}`, {
+                        cache: 'no-store',
+                        signal: controller.signal,
+                    }),
+                    fetch(`/lm/admission?t=${Date.now()}`, {
+                        cache: 'no-store',
+                        signal: controller.signal,
+                    }),
+                ]);
+                const streamsData = await streamsResponse.json().catch(() => ({}));
+                const admissionData = await admissionResponse.json().catch(() => ({}));
+                if (!streamsResponse.ok || streamsData.error) {
+                    throw new Error(streamsData.error || 'Failed to load analytics streams');
+                }
+                if (
+                    generation !== _agentContextRequestGeneration
+                    || controller.signal.aborted
+                    || !_agentContextActive
+                    || currentMode !== 'agent'
+                ) return false;
+                renderAgentAnalyticsStreams(
+                    streamsData,
+                    admissionResponse.ok && !admissionData.error ? admissionData : null,
+                );
+                return true;
+            } catch (error) {
+                if (error && error.name === 'AbortError') return false;
+                if (generation !== _agentContextRequestGeneration || !_agentContextActive || currentMode !== 'agent') return false;
+                el.innerHTML = '<div class="agent-probe-empty">Analytics stream runtime unavailable</div>';
+                return false;
+            } finally {
+                if (_agentContextAbortController === controller) {
+                    _agentContextAbortController = null;
+                }
+            }
+        }
+
+        function agentSetContextActive(active) {
+            _agentContextActive = Boolean(active);
+            if (_agentContextTimer) {
+                clearInterval(_agentContextTimer);
+                _agentContextTimer = null;
+            }
+            if (!_agentContextActive) {
+                _agentContextRequestGeneration += 1;
+                abortUiRequest(_agentContextAbortController);
+                _agentContextAbortController = null;
+                return;
+            }
+            agentLabelAnalyticsStreams();
+            void agentLoadAnalyticsStreams();
+            _agentContextTimer = window.setInterval(() => {
+                if (_agentContextActive && currentMode === 'agent') {
+                    void agentLoadAnalyticsStreams();
+                }
+            }, 8000);
         }
 
         function closeAgentSkillModal() {
@@ -13273,6 +18193,7 @@
                     agentSkillList.innerHTML = '<div class="agent-probe-empty">No skills yet</div>';
                     return;
                 }
+                const canManageSkills = userHasPermission('settings:manage');
                 agentSkillList.innerHTML = skills.map((skill) => `
                     <div class="agent-skill-row" data-skill-slug="${escapeHtml(skill.slug || '')}">
                         <button
@@ -13282,12 +18203,12 @@
                             data-agent-skill-run="${escapeHtml(skill.slug || '')}">
                             <span class="agent-skill-run-title">${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}</span>
                         </button>
-                        <button
+                        ${canManageSkills ? `<button
                             class="feature-btn agent-skill-edit"
                             type="button"
                             title="Edit skill"
                             aria-label="Edit skill ${escapeHtml(skill.name || skill.slug || 'Unnamed skill')}"
-                            data-agent-skill-edit="${escapeHtml(skill.slug || '')}">&#9998;</button>
+                            data-agent-skill-edit="${escapeHtml(skill.slug || '')}">&#9998;</button>` : ''}
                     </div>
                 `).join('');
             } catch(e) {
@@ -13296,6 +18217,7 @@
         }
 
         async function agentOpenSkillEditor(slug) {
+            if (!userHasPermission('settings:manage')) return;
             try {
                 const r = await fetch(`/agent/skills/${encodeURIComponent(slug)}`);
                 const data = await r.json();
@@ -13307,7 +18229,7 @@
         }
 
         async function agentSaveSkill() {
-            if (!agentSkillDraft) return;
+            if (!agentSkillDraft || !userHasPermission('settings:manage')) return;
             const payload = {
                 name: (agentSkillNameInput?.value || '').trim(),
                 slug: (agentSkillSlugInput?.value || '').trim(),
@@ -13539,11 +18461,12 @@
                 }
             });
 
-            agentLoadVideoStreams();
+            agentSetContextActive(currentMode === 'agent');
         }
 
         // Expose agentInit to outer scope
         window._agentInit = agentInit;
+        window._agentSetActive = agentSetContextActive;
     })();
 
     function agentInit() {

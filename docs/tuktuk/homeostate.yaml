@@ -1,0 +1,116 @@
+# Homeostatic context document — typed schema + deterministic source selection.
+# Third encoder segment of tuktuk: query | tool signatures | state+homeostasis.
+# Law (project brief): homeostasis-as-CONTEXT goes into the model; homeostasis-
+# as-GAIN (escalation thresholds, decider policies) stays in the harness.
+# Everything here must be printable: any decision must be reconstructable as
+# "what the system felt at decision time".
+version: 0.1.0
+date: 2026-07-19
+
+# ── document schema ────────────────────────────────────────────────────────
+# Rendered as compact JSON (sorted keys, fixed key vocabulary) into the
+# encoder. All values are measured or copied — never model-computed.
+document:
+  meta:
+    generated_at: iso8601
+    site: {site_id: str, timezone: iana, profile: "enum[office, field, dev]"}
+    selection_rules_fired: "rule ids, in priority order"   # printability anchor
+  system:                       # always present, cheap, global
+    lm_load:
+      queued: int               # lm_admission stats
+      queued_by_workload: "map[workload -> int]"
+      oldest_wait_sec: float
+    runtime:
+      active_streams: int       # from composite channel inventory
+      problem_channels: "int[]" # runtime_problem_channels, capped
+    archive:
+      semantic_pending: int     # embedding backlog
+      semantic_failed: int
+      restore_job: "null | {status, remaining, eta_hours}"
+  channels:                     # ONLY channels chosen by selection rules; sorted by id
+    - channel: int
+      title: str
+      selected_because: "enum[query_mention, probe_alarm, topology_neighbor,
+                              recent_burst, runtime_problem, inventory_default]"
+      runtime:
+        stream: "enum[ok, degraded, down, not_started]"
+        last_error: "str | null"
+        vlm_profile: str
+      motion:                   # capture decider homeostasis (measured, trusted)
+        baseline_level: "float | null"
+        warmup: bool
+        recent_mode: "enum[quiet, normal, burst] | null"
+        recent_activity_x: "float | null"     # times above own baseline
+      bursts_24h:               # top-k by activity_x, k<=3
+        - {ts: iso8601, activity_x: float}
+      probes:                   # per configured probe on this channel
+        - {name: str, enabled: bool, hits_24h: int, latest_hit_age_sec: "int | null"}
+      alerts_24h:               # VLM alert classes seen, aggregated
+        - {class: str, count: int, latest_age_sec: int}
+      coverage:
+        l0_age_sec: "int | null"   # freshness of newest rollup per level
+        l1_age_sec: "int | null"
+        l2_age_sec: "int | null"
+        gaps_24h: int              # windows with no summaries
+      neighbors: "int[]"           # from site topology config (NEW artifact)
+  budget:                       # token discipline, enforced at render time
+    max_channels: 8
+    max_bursts_per_channel: 3
+    max_probes_per_channel: 6
+    max_alert_classes_per_channel: 4
+    target_chars: 2000
+    overflow: "drop lowest-priority channels first; record dropped ids in meta"
+
+# ── deterministic source selection ─────────────────────────────────────────
+# Keyed off the query + trigger context. First matching rules fill the channel
+# list up to budget.max_channels, in priority order; ties by channel id.
+# The fired rule ids are recorded in meta.selection_rules_fired.
+selection_rules:
+  - id: s1_query_mention
+    when: "query names channels (refs/titles resolved by harness)"
+    select: "the mentioned channels"
+  - id: s2_probe_alarm
+    when: "turn is triggered by a probe hit (reflex invocation, not operator)"
+    select: "probe's channel + its topology neighbors"
+  - id: s3_burst_escalation
+    when: "turn is triggered by a capture attention burst"
+    select: "burst channel + its topology neighbors"
+  - id: s4_runtime_focus
+    when: "query is runtime/health-shaped (status_glance scenario)"
+    select: "channels from runtime.problem_channels, worst first"
+  - id: s5_unscoped_research
+    when: "research query with no channel scope"
+    select: "NO per-channel docs; system section + inventory counts only
+             (the chain must go through C(inventory) anyway — do not pre-feed
+             a guessed channel subset)"
+  - id: s6_smalltalk_junk
+    when: "no operational intent detected"
+    select: "system section only"
+
+# ── site topology (new deployment artifact) ────────────────────────────────
+# Does not exist in EVA today (verified 2026-07-19). Static per-site config,
+# maintained by the deploying engineer; NOT learned, NOT inferred.
+topology_artifact:
+  file: "channel_topology.yaml (EVA repo, per deployment)"
+  schema:
+    channels: "map[channel_id -> {neighbors: int[], zone: str}]"
+  notes:
+    - "neighbors = spatial adjacency (shared FOV boundaries, same corridor/zone)"
+    - "office machine: Sasha sketches adjacency at update time (2026-07-20)"
+    - "absence of the file => neighbors: [] everywhere; rules s2/s3 degrade to single channel"
+
+# ── decision log (printability contract) ───────────────────────────────────
+# The harness writes one record per reflex/agent decision. This is both the
+# audit trail and the future shadow-mode label source.
+decision_log:
+  file: "decisions.jsonl (per site, daily rotation)"
+  record:
+    ts: iso8601
+    session: str
+    trigger: "enum[operator_query, probe_alarm, burst, schedule]"
+    query: "str | null"
+    homeostatic_doc: "the EXACT rendered document (verbatim)"
+    exposed_tools: "str[]"
+    chain: "[{tool, args, result_compact_digest}]"
+    terminal: "{kind, claim_level}"
+    operator_followup: "enum[none, accepted, corrected, escalated] | null"

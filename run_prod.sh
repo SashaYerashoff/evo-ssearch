@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_DIR="${APP_DIR}/.eva-runtime"
+if [[ -x "${RUNTIME_DIR}/bin/ffmpeg" ]]; then
+  export PATH="${RUNTIME_DIR}/bin:${PATH}"
+fi
+if [[ -d "${RUNTIME_DIR}/python" ]]; then
+  export PYTHONPATH="${RUNTIME_DIR}/python${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 HOST="${EVOSSEARCH_HOST:-0.0.0.0}"
 PORT="${EVOSSEARCH_PORT:-5000}"
 WORKERS="${EVOSSEARCH_GUNICORN_WORKERS:-1}"
-THREADS="${EVOSSEARCH_GUNICORN_THREADS:-4}"
+THREADS="${EVOSSEARCH_GUNICORN_THREADS:-8}"
 TIMEOUT="${EVOSSEARCH_GUNICORN_TIMEOUT:-180}"
 GUNICORN_BIN="${EVOSSEARCH_GUNICORN_BIN:-}"
 GUNICORN_CONFIG="${EVOSSEARCH_GUNICORN_CONFIG:-gunicorn_conf.py}"

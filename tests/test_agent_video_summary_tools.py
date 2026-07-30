@@ -1,11 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 from agent import (
     AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN,
     AgentTools,
+    _aggregate_vlm_alert_episodes,
     _apply_turn_tool_context,
     _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
+    _compact_vector_signal_for_model,
+    _format_epoch_minute,
     _format_turn_signal_ledger_message,
     _new_turn_signal_ledger,
     _record_turn_signal_ledger,
@@ -13,6 +17,7 @@ from agent import (
     _seed_turn_tool_context,
     _safe_detection,
     _strip_thumbnails,
+    _summary_node_alert_score,
     _tool_result_for_ui,
     build_system_prompt,
 )
@@ -20,6 +25,7 @@ from agent import (
 
 class _SummaryManager:
     def __init__(self):
+        self.summary_rollup_requests = []
         self.channels = [
             {"id": 7, "title": "Kitchen"},
             {"id": 8, "title": "Door"},
@@ -48,6 +54,10 @@ class _SummaryManager:
                     "running": True,
                     "model": "vlm-a1",
                     "pending_frames": 3,
+                    "summary_queue_depth": 2,
+                    "summary_queue_frame_count": 16,
+                    "summary_inflight": True,
+                    "summary_worker_alive": True,
                     "dropped_frames": 1,
                     "queue_dropped_batches": 0,
                     "recent_frame_count": 2,
@@ -121,7 +131,23 @@ class _SummaryManager:
             logs.append(dict(row))
         return {"running": False, "channel_id": channel_id, "logs": logs, "selected_run": None}
 
-    def summary_rollups(self, channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+    def summary_rollups(
+        self,
+        channel_id,
+        run_selector=None,
+        start_ts=None,
+        end_ts=None,
+        level_limit=None,
+        target_level=None,
+        synthesize=True,
+    ):
+        self.summary_rollup_requests.append(
+            {
+                "channel_id": channel_id,
+                "target_level": target_level,
+                "synthesize": synthesize,
+            }
+        )
         # Intentionally include out-of-window nodes to verify AgentTools performs strict post-filtering.
         nodes = [
             {
@@ -287,7 +313,15 @@ class _ChannelsMethodOnlyManager:
         return {"video_streams": [], "channel_status_digest": []}
 
 
-def _tools(manager=None, search_detections_fn=None, detections_store=None, call_lm_fn=None, embed_text_fn=None, probes_store=None):
+def _tools(
+    manager=None,
+    search_detections_fn=None,
+    detections_store=None,
+    call_lm_fn=None,
+    embed_text_fn=None,
+    probes_store=None,
+    embedding_metadata_fn=None,
+):
     return AgentTools(
         detections_store=detections_store or _DetectionStore(),
         probes_store=probes_store or _ProbeStore(),
@@ -298,6 +332,7 @@ def _tools(manager=None, search_detections_fn=None, detections_store=None, call_
         encode_jpeg_fn=lambda *_args, **_kwargs: "",
         search_indexed_folder_fn=lambda **_kwargs: [],
         search_detections_fn=search_detections_fn or (lambda **_kwargs: []),
+        embedding_metadata_fn=embedding_metadata_fn,
     )
 
 
@@ -367,6 +402,48 @@ class TurnSignalLedgerTests(unittest.TestCase):
 
 
 class AgentVideoSummaryToolTests(unittest.TestCase):
+    def test_repeated_vlm_alerts_are_grouped_as_candidate_episodes(self):
+        result = _aggregate_vlm_alert_episodes(
+            [
+                {
+                    "title": "Vehicle drifting with tire smoke",
+                    "severity": "high",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 1_000,
+                },
+                {
+                    "title": "Drifting vehicle creates tire smoke",
+                    "severity": "high",
+                    "delivery_status": "dedup_suppressed",
+                    "timestamp_ms": 31_000,
+                },
+                {
+                    "title": "Person entered the room",
+                    "severity": "low",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 40_000,
+                },
+                {
+                    "title": "Vehicle drifting again",
+                    "severity": "high",
+                    "delivery_status": "sent",
+                    "timestamp_ms": 901_000,
+                },
+            ],
+            raw_alert_count=7,
+            severity_counts={"high": 6, "low": 1},
+            delivery_breakdown={"sent": 3, "dedup_suppressed": 4},
+            episode_gap_sec=600,
+        )
+
+        self.assertEqual(result["raw_alert_count"], 7)
+        self.assertEqual(result["structured_alert_count"], 4)
+        self.assertEqual(result["candidate_episode_count"], 3)
+        self.assertEqual(result["repeated_structured_alert_count"], 1)
+        self.assertEqual(result["unclustered_alert_count"], 3)
+        self.assertEqual(result["severity_counts"]["high"], 6)
+        self.assertIn("not proof", result["semantics"])
+
     def test_ui_detection_rows_do_not_invent_image_url_without_thumbnail(self):
         missing = {
             "id": 117031,
@@ -417,6 +494,27 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                     "suggested_stream_system_prompt": "Describe public space activity.",
                     "suggested_alert_policy_prompt": "Flag people fighting.",
                 },
+                "memory_metabolism": {
+                    "status": "active",
+                    "semantics": "L1/L2 memory returns to later L0 as prior context.",
+                    "current_state": {
+                        "present": True,
+                        "source_level": "L2",
+                        "active_watchlist_count": 2,
+                    },
+                    "stages": [
+                        {
+                            "level": "L1",
+                            "cadence": "15 minutes",
+                            "applies_to_live_memory": True,
+                        },
+                        {
+                            "level": "L3",
+                            "cadence": "8 hours",
+                            "applies_to_live_memory": False,
+                        },
+                    ],
+                },
             }
         )
 
@@ -424,8 +522,12 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["prompt_health"]["suggested_alert_policy_prompt"], "Flag people fighting.")
         self.assertIn("L0 live-description role/style", compact["prompt_layers"]["stream"]["semantics"])
         self.assertIn("Operator watch/alert criteria", compact["prompt_layers"]["alerts"]["semantics"])
-        self.assertIn("Machine-readable ALERTS_JSON", compact["prompt_layers"]["json"]["semantics"])
+        self.assertIn("BATCH_STATE_JSON", compact["prompt_layers"]["json"]["semantics"])
         self.assertIn("compressed memory maps", compact["prompt_layers"]["rollups"]["semantics"])
+        self.assertEqual(compact["memory_metabolism"]["status"], "active")
+        self.assertEqual(compact["memory_metabolism"]["current_state"]["source_level"], "L2")
+        self.assertTrue(compact["memory_metabolism"]["stages"][0]["applies_to_live_memory"])
+        self.assertFalse(compact["memory_metabolism"]["stages"][1]["applies_to_live_memory"])
 
     def test_system_prompt_reframes_sensitive_visible_evidence_instead_of_refusing(self):
         class _ProbeStore:
@@ -440,7 +542,11 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
         self.assertIn("Video-description runtime:", prompt)
         self.assertIn("CH 7: running, video_lm=vlm-a1", prompt)
-        self.assertIn("recent_alerts=Doorway activity", prompt)
+        self.assertIn(
+            "volatile period counters omitted; call list_video_summary_channels",
+            prompt,
+        )
+        self.assertNotIn("recent_alerts=Doorway activity", prompt)
         self.assertIn("CH 8: desired but not running", prompt)
         self.assertIn("Configured semantic probes (1 total; secondary/internal", prompt)
         self.assertLess(prompt.index("Video-description runtime:"), prompt.index("Configured semantic probes"))
@@ -618,6 +724,76 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(detection_args["until_ms"], 200_000)
         self.assertEqual(detection_args["source"], "vlm_summary")
 
+    def test_operator_relative_period_overrides_model_invented_calendar_dates(self):
+        context = _seed_turn_tool_context(
+            "Show channel 112 L1 and L2 summaries for the last 3 days."
+        )
+
+        normalize_args = _apply_turn_tool_context(
+            "normalize_time_window",
+            {
+                "date": "2026-03-15",
+                "start_time": "05:20",
+                "end_time": "08:00",
+            },
+            context,
+        )
+        summary_args = _apply_turn_tool_context(
+            "get_video_summaries",
+            {
+                "channel_id": 112,
+                "depth": "L1",
+                "from_ts": 1_773_550_800,
+                "to_ts": 1_773_733_200,
+            },
+            context,
+        )
+        report_args = _apply_turn_tool_context(
+            "generate_report",
+            {
+                "channel_id": 112,
+                "from_ts": 1,
+                "to_ts": 2,
+            },
+            context,
+        )
+
+        self.assertNotIn("date", normalize_args)
+        self.assertNotIn("start_time", normalize_args)
+        self.assertIn("last 3 days", normalize_args["relative_range"])
+        self.assertIn("last 3 days", summary_args["relative_range"])
+        self.assertIn("last 3 days", report_args["relative_range"])
+
+        ru_context = _seed_turn_tool_context(
+            "Сделай отчёт по каналу 112 за последние 3 дня."
+        )
+        ru_report_args = _apply_turn_tool_context(
+            "generate_report",
+            {"channel_id": 112, "from_ts": 1, "to_ts": 2},
+            ru_context,
+        )
+        self.assertIn("последние 3 дня", ru_report_args["relative_range"])
+
+    def test_operator_explicit_calendar_range_is_not_replaced_by_relative_words(self):
+        context = _seed_turn_tool_context(
+            "Compare 2026-03-15 through 2026-03-17 with the last 3 days."
+        )
+
+        self.assertNotIn("operator_relative_range", context)
+
+    def test_russian_runtime_status_uses_current_runtime_fast_path(self):
+        context = _seed_turn_tool_context(
+            "Покажи активные стримы, модели, очереди, потери и последние ошибки."
+        )
+
+        self.assertTrue(context["runtime_status_only"])
+        prepared = _apply_turn_tool_context(
+            "list_video_summary_channels",
+            {"since_hours": 6},
+            context,
+        )
+        self.assertTrue(prepared["runtime_only"])
+
     def test_turn_context_does_not_override_explicit_source_or_time(self):
         context = _seed_turn_tool_context("Check video descriptions and confirm with images.")
         context["channel_id"] = 7
@@ -642,6 +818,36 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(args["source"], "probe")
         self.assertEqual(args["since_hours"], 24)
         self.assertNotIn("since_ms", args)
+
+    def test_turn_context_fills_only_missing_exact_window_bound(self):
+        context = _seed_turn_tool_context("continue the same period")
+        context["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+
+        summary_args = _apply_turn_tool_context(
+            "get_video_summaries",
+            {"from_ts": 125.0},
+            context,
+        )
+        archive_args = _apply_turn_tool_context(
+            "search_archive",
+            {"until_ms": 175_000},
+            context,
+        )
+        report_args = _apply_turn_tool_context(
+            "generate_report",
+            {"to_ts": 180.0},
+            context,
+        )
+
+        self.assertEqual(summary_args, {"from_ts": 125.0, "to_ts": 200.0})
+        self.assertEqual(archive_args["since_ms"], 100_000)
+        self.assertEqual(archive_args["until_ms"], 175_000)
+        self.assertEqual(report_args, {"from_ts": 100.0, "to_ts": 180.0})
 
     def test_turn_context_does_not_convert_detection_describe_frame_to_live_snapshot(self):
         context = _seed_turn_tool_context("Confirm this frame with images.")
@@ -686,6 +892,45 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["source"], "vlm_summary")
         self.assertEqual(result["source_label"], "Video-description frame")
         self.assertEqual(result["results"][0]["archive_item_type"], "video_description_frame")
+
+    def test_archive_search_compaction_preserves_coverage_and_similarity_alias(self):
+        def search_detections(**kwargs):
+            return {
+                "coverage": {
+                    "status": "partial",
+                    "candidate_count": 20_000,
+                    "truncated": True,
+                },
+                "results": [
+                    {
+                        "detection_id": 101,
+                        "timestamp_ms": 1781389900000,
+                        "source": "vlm_summary",
+                        "channel_id": 7,
+                        "similarity": 0.81,
+                    }
+                ],
+            }
+
+        result = _tools(search_detections_fn=search_detections).execute(
+            "search_archive",
+            {
+                "query": "vehicle drift",
+                "scope": "detections",
+                "source": "vlm_summary",
+                "channel_id": 7,
+            },
+        )
+        compact = _compact_tool_result_for_model("search_archive", result)
+
+        self.assertEqual(compact["coverage"]["status"], "partial")
+        self.assertTrue(compact["coverage"]["truncated"])
+        self.assertAlmostEqual(compact["results"][0]["score"], 0.81)
+        self.assertAlmostEqual(compact["results"][0]["similarity"], 0.81)
+        ledger = _new_turn_signal_ledger("find drift")
+        _record_turn_signal_ledger(ledger, "search_archive", compact)
+        self.assertEqual(ledger["evidence"][0]["coverage"]["status"], "partial")
+        self.assertAlmostEqual(ledger["evidence"][0]["best_similarity"], 0.81)
 
     def test_visual_window_signals_returns_pnm_attention_signal(self):
         calls = []
@@ -789,6 +1034,22 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["since_ms"], 1781389800000)
         self.assertEqual(result["until_ms"], 1781415000000)
 
+    def test_configured_timezone_is_default_and_formats_operator_timestamps_consistently(self):
+        with patch("agent.AGENT_SITE_TIMEZONE", "Etc/GMT-4"):
+            result = _tools().execute(
+                "normalize_time_window",
+                {
+                    "date": "2026-06-14",
+                    "start_time": "01:30",
+                    "end_time": "08:30",
+                },
+            )
+
+            self.assertEqual(result["timezone"], "Etc/GMT-4")
+            self.assertEqual(result["from_local"], "2026-06-14T01:30:00+04:00")
+            self.assertEqual(_format_epoch_minute(result["from_ts"]), "2026-06-14 01:30")
+            self.assertEqual(_format_epoch_minute(result["to_ts"]), "2026-06-14 08:30")
+
     def test_normalize_time_window_accepts_relative_last_two_hours(self):
         tools = _tools()
         result = tools.execute(
@@ -835,6 +1096,93 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["relative_range"], "last week")
         self.assertEqual(result["to_ts"] - result["from_ts"], 604_800)
         self.assertEqual(result["until_ms"] - result["since_ms"], 604_800_000)
+
+    def test_get_video_summaries_resolves_last_three_days_on_server_clock(self):
+        tools = _tools()
+        fixed_now = 1_783_900_000.0
+
+        with patch("agent.time.time", return_value=fixed_now):
+            result = tools.execute(
+                "get_video_summaries",
+                {
+                    "channel_id": 7,
+                    "depth": "L1",
+                    "relative_range": "last 3 days",
+                },
+            )
+
+        self.assertEqual(result["time_window"]["to_ts"], fixed_now)
+        self.assertEqual(result["time_window"]["from_ts"], fixed_now - 259_200)
+        self.assertEqual(result["time_window"]["duration_sec"], 259_200)
+        self.assertEqual(
+            result["time_window"]["window_source"],
+            "operator_relative_range",
+        )
+        self.assertEqual(
+            result["coverage"]["available"]["requested_span_sec"],
+            259_200,
+        )
+
+    def test_summary_restore_defaults_to_durable_l2_l3_preview_for_two_weeks(self):
+        manager = _SummaryManager()
+        captured = {}
+
+        def plan_rollup_backfill(**kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "preview",
+                "channel_ids": [7, 8],
+                "channel_count": 2,
+                "levels": list(kwargs["levels"]),
+                "totals": {
+                    "source_windows": 30,
+                    "already_ready": 4,
+                    "missing_semantic": 26,
+                },
+                "estimated_hours": 1.25,
+                "estimated_hours_range": [0.75, 2.25],
+                "load_policy": "single background worker",
+            }
+
+        manager.plan_rollup_backfill = plan_rollup_backfill
+        fixed_now = 1_783_900_000.0
+        with patch("agent.time.time", return_value=fixed_now):
+            result = _tools(manager).execute(
+                "restore_video_summary_history",
+                {
+                    "channel_ids": [7, 8],
+                    "relative_range": "last two weeks",
+                    "preview": True,
+                },
+            )
+
+        self.assertEqual(captured["levels"], ["L2", "L3"])
+        self.assertEqual(captured["start_ts"], fixed_now - 14 * 86400)
+        self.assertEqual(captured["end_ts"], fixed_now)
+        self.assertEqual(result["time_window"]["duration_sec"], 14 * 86400)
+        self.assertTrue(result["preview"])
+        self.assertIn("without another command", result["operator_action"])
+
+        compact = _compact_tool_result_for_model("restore_video_summary_history", result)
+        self.assertEqual(compact["restoration_scope"]["queueable_windows"], 26)
+        self.assertIn("not queued work", compact["restoration_scope"]["queue_contract"])
+
+    def test_summary_restore_status_reads_durable_worker_state(self):
+        manager = _SummaryManager()
+        manager.rollup_backfill_status = lambda: {
+            "status": "running",
+            "job_id": "rollup-backfill-1",
+            "progress_percent": 42.5,
+            "eta_hours": 3.2,
+            "durable": True,
+        }
+
+        result = _tools(manager).execute("get_video_summary_restore_status", {})
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["job_id"], "rollup-backfill-1")
+        self.assertEqual(result["eta_hours"], 3.2)
+        self.assertTrue(result["durable"])
 
     def test_normalize_time_window_accepts_date_without_clock_as_calendar_day(self):
         tools = _tools()
@@ -932,6 +1280,34 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["returned"]["first_ts"], 1781389900.0)
         self.assertTrue(result["coverage"]["must_state_coverage"])
 
+    def test_summary_tools_request_only_the_selected_rollup_depth(self):
+        manager = _SummaryManager()
+        tools = _tools(manager)
+
+        tools.execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+        tools.execute(
+            "count_video_summary_events",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "entity_query": "person",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+
+        self.assertEqual(len(manager.summary_rollup_requests), 2)
+        self.assertTrue(all(row["target_level"] == "L1" for row in manager.summary_rollup_requests))
+        self.assertTrue(all(row["synthesize"] is False for row in manager.summary_rollup_requests))
+
     def test_get_video_summaries_samples_across_period_when_truncated(self):
         manager = _SummaryManager()
 
@@ -978,6 +1354,60 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         )
         self.assertEqual(result["coverage"]["returned"]["first_ts"], 100.0)
         self.assertEqual(result["coverage"]["returned"]["last_ts"], 670.0)
+
+    def test_get_video_summaries_keeps_completed_semantics_in_period_sample(self):
+        manager = _SummaryManager()
+
+        def rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            nodes = [
+                {
+                    "level": "L1",
+                    "window_start": 100.0 + index * 60.0,
+                    "window_end": 130.0 + index * 60.0,
+                    "summary": f"queued-{index}",
+                    "summary_kind": "queued",
+                    "generation_status": "queued",
+                    "frame_count": 12,
+                }
+                for index in range(10)
+            ]
+            nodes[4].update(
+                {
+                    "summary": "full semantic behavior narrative",
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                }
+            )
+            return {
+                "running": False,
+                "selected_run": None,
+                "run_filter_id": None,
+                "levels": {"L0": [], "L1": nodes, "L2": [], "L3": []},
+            }
+
+        manager.summary_rollups = rollups
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 700.0,
+                "limit": 3,
+            },
+        )
+
+        self.assertEqual(
+            result["selection_strategy"],
+            "period_sample_semantic_alert_priority",
+        )
+        semantic = [
+            row for row in result["entries"]
+            if row.get("summary_kind") == "llm"
+        ]
+        self.assertEqual(len(semantic), 1)
+        self.assertEqual(semantic[0]["summary"], "full semantic behavior narrative")
+        self.assertEqual(semantic[0]["generation_status"], "ready")
 
     def test_get_video_summaries_uses_high_bounded_scan_limit_by_default(self):
         manager = _SummaryManager()
@@ -1224,6 +1654,71 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["evidence_frames"][0]["detection_id"], 501)
         self.assertEqual(compact["evidence_frames"][0]["score_semantics"], "not_applicable")
         self.assertIn("image_url", compact["evidence_frames"][0])
+
+    def test_get_video_summaries_samples_period_anchors_and_alert_window(self):
+        manager = _SummaryManager()
+
+        def rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            return {
+                "running": False,
+                "levels": {
+                    "L0": [],
+                    "L1": [
+                        {"level": "L1", "window_start": 100.0, "window_end": 110.0, "summary": "routine traffic"},
+                        {
+                            "level": "L1",
+                            "window_start": 490.0,
+                            "window_end": 510.0,
+                            "summary": "deviation: vehicle drift",
+                            "alert_total": 1,
+                        },
+                        {"level": "L1", "window_start": 890.0, "window_end": 900.0, "summary": "routine traffic"},
+                    ],
+                    "L2": [],
+                    "L3": [],
+                },
+            }
+
+        manager.summary_rollups = rollups
+        rows = [
+            {
+                "id": index,
+                "detection_id": index,
+                "timestamp_ms": (100 + index * 100) * 1000,
+                "source": "vlm_summary",
+                "channel_id": 7,
+            }
+            for index in range(9)
+        ]
+        rows.append({
+            "id": 50,
+            "detection_id": 50,
+            "timestamp_ms": 500_000,
+            "source": "vlm_alert",
+            "channel_id": 7,
+        })
+
+        result = _tools(manager, detections_store=_DetectionStore(rows)).execute(
+            "get_video_summaries",
+            {
+                "channel_id": 7,
+                "depth": "L1",
+                "from_ts": 100.0,
+                "to_ts": 1_000.0,
+                "include_evidence_frames": True,
+                "evidence_frame_limit": 3,
+            },
+        )
+
+        self.assertEqual(result["evidence_selection_strategy"], "period_span_alert_priority")
+        self.assertEqual(result["evidence_priority_windows"][0]["since_ms"], 490_000)
+        self.assertEqual(
+            [row["detection_id"] for row in result["evidence_frames"]],
+            [0, 50, 8],
+        )
+        compact = _compact_tool_result_for_model("get_video_summaries", result)
+        self.assertEqual(compact["evidence_selection_strategy"], "period_span_alert_priority")
+        self.assertEqual(compact["evidence_priority_windows"][0]["until_ms"], 510_000)
 
     def test_count_video_summary_events_counts_presence_transitions_with_coverage(self):
         manager = _SummaryManager()
@@ -1525,6 +2020,73 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["deferred_channel_ids"], [9])
         self.assertEqual(compact["channels"][0]["suggested_thresholds"]["confidence"], channel7["suggested_thresholds"]["confidence"])
         self.assertTrue(compact["channels"][0]["representative_frames"]["top_margin"][0]["image_url"].startswith("/detections/thumbnail/"))
+
+    def test_siglip2_calibration_rejects_legacy_or_mismatched_archive_vectors(self):
+        siglip_space = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "dimension": 2,
+        }
+        rows = [
+            {
+                "id": 1,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 101_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {"embedding_space": siglip_space},
+            },
+            {
+                "id": 2,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 102_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {},
+            },
+            {
+                "id": 3,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 103_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {
+                    "embedding_space": {
+                        "backend": "openai_clip",
+                        "model": "ViT-B/32",
+                        "dimension": 2,
+                    }
+                },
+            },
+        ]
+
+        result = _tools(
+            detections_store=_DetectionStore(rows),
+            embed_text_fn=lambda text: (
+                [0.0, 1.0]
+                if "empty" in str(text).lower()
+                else [1.0, 0.0]
+            ),
+            embedding_metadata_fn=lambda: siglip_space,
+        ).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "person near window",
+                "contrast_query": "empty window",
+                "channel_id": 7,
+                "sources": ["semantic_snapshot"],
+                "from_ts": 100.0,
+                "to_ts": 110.0,
+                "min_frames": 1,
+            },
+        )
+
+        channel = result["channels"][0]
+        self.assertEqual(channel["frame_count"], 1)
+        self.assertEqual(channel["embedding_space_rejected"], 2)
+        self.assertTrue(
+            any("different embedding space" in item for item in channel["warnings"])
+        )
 
     def test_calibrate_probe_flags_over_firing_as_unsafe(self):
         rows = [
@@ -1996,6 +2558,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
         self.assertEqual(result["active_count"], 2)
         self.assertEqual(result["inactive_count"], 1)
+        self.assertEqual(result["inactive_channel_ids"], [9])
+        self.assertEqual(result["candidate_channel_ids"], [7, 8])
         self.assertFalse(result["requires_confirmation"])
         self.assertEqual(
             [row["channel_id"] for row in result["candidate_channels"]],
@@ -2015,10 +2579,90 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertTrue(stale_row["stale_signal"])
         compact = _compact_tool_result_for_model("list_video_summary_channels", result)
         self.assertEqual(compact["candidate_channels"][0]["recent_alerts"][0]["title"], "Doorway activity")
+        self.assertEqual(compact["inactive_channel_ids"], [9])
+        self.assertEqual(compact["candidate_channel_ids"], [7, 8])
         self.assertEqual(compact["candidate_channels"][0]["live_signal_status"], "frozen")
         self.assertTrue(compact["candidate_channels"][0]["frozen_signal"])
         self.assertEqual(compact["runtime_problem_channels"][0]["live_signal_status"], "frozen")
         self.assertTrue(any(row["live_signal_status"] == "stale" for row in compact["runtime_problem_channels"]))
+        active_runtime = compact["active_runtime_streams"][0]
+        self.assertEqual(active_runtime["channel_id"], 7)
+        self.assertEqual(active_runtime["buffered_frames"], 3)
+        self.assertEqual(active_runtime["summary_queue_depth"], 2)
+        self.assertEqual(active_runtime["summary_queue_frames"], 16)
+        runtime_only = _tools().execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "runtime_only": True},
+        )
+        self.assertTrue(runtime_only["runtime_only"])
+        self.assertEqual(runtime_only["active_count"], 1)
+        self.assertEqual(runtime_only["inactive_count"], 0)
+        self.assertEqual(runtime_only["candidate_channels"], [])
+
+        manager = _SummaryManager()
+        manager.session_status = lambda *args, **kwargs: self.fail(
+            "runtime-only status must not scan historical summaries"
+        )
+        scoped_runtime = _tools(manager).execute(
+            "list_video_summary_channels",
+            {
+                "channel_ids": [7],
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "runtime_only": True,
+            },
+        )
+        self.assertEqual(scoped_runtime["running_video_channels"], [7])
+        self.assertEqual(scoped_runtime["desired_video_channels"], [7])
+        self.assertEqual(
+            [row["channel_id"] for row in scoped_runtime["active_runtime_streams"]],
+            [7],
+        )
+        self.assertNotIn(8, scoped_runtime["scope"]["active_channel_ids"])
+
+        runtime_context = _seed_turn_tool_context(
+            "List active streams, models, queues, dropped frames, and last errors"
+        )
+        prepared = _apply_turn_tool_context(
+            "list_video_summary_channels", {"since_hours": 6}, runtime_context
+        )
+        self.assertTrue(prepared["runtime_only"])
+
+    def test_get_video_summaries_distinguishes_pending_semantics_from_no_source_data(self):
+        manager = _SummaryManager()
+
+        def pending_rollups(channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None):
+            return {
+                "running": True,
+                "levels": {
+                    "L0": [],
+                    "L1": [
+                        {
+                            "level": "L1",
+                            "window_start": 100.0,
+                            "window_end": 200.0,
+                            "summary": "Aggregation in progress.",
+                            "summary_kind": "pending_context",
+                            "generation_status": "pending",
+                        }
+                    ],
+                    "L2": [],
+                    "L3": [],
+                },
+            }
+
+        manager.summary_rollups = pending_rollups
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {"channel_id": 7, "depth": "L1", "from_ts": 100.0, "to_ts": 200.0},
+        )
+
+        self.assertEqual(result["total_in_window"], 1)
+        self.assertEqual(result["semantic_available_count"], 0)
+        self.assertEqual(result["semantic_pending_count"], 1)
+        self.assertEqual(result["semantic_status"], "pending")
+        self.assertEqual(result["source_coverage"]["status"], "covered")
+        self.assertEqual(result["count"], 1)
 
     def test_list_video_summary_channels_uses_batch_bounds_for_activity_window(self):
         manager = _SummaryManager()
@@ -2081,6 +2725,21 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["time_window"]["since_ms"], 100_000)
         self.assertEqual(result["time_window"]["until_ms"], 300_000)
 
+    def test_channel_title_resolution_is_unicode_safe(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 112, "title": "თბილისის ქუჩა №1"}]
+
+        result = _tools(manager).execute(
+            "get_video_summaries",
+            {
+                "channel_ref": "თბილისის ქუჩა",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+            },
+        )
+
+        self.assertEqual(result["channel_id"], 112)
+
     def test_list_video_summary_channels_falls_back_to_local_history_when_channel_inventory_fails(self):
         manager = _SummaryManager()
 
@@ -2120,6 +2779,79 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["total_channels_checked"], 2)
         self.assertEqual(compact["channel_inventory_status"], "archive_fallback")
 
+    def test_list_video_summary_channels_augments_partial_live_inventory_with_provenance(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 7, "title": "Live channel"}]
+        manager.logs_by_channel = {
+            8: [{"created_at": 150.0, "summary": "history", "frame_count": 1}],
+        }
+
+        def streams_status():
+            return {
+                "video_streams": [{"channel_id": 9, "running": True, "title": "Runtime channel"}],
+                "channel_status_digest": [{"channel_id": 10, "title": "Digest channel"}],
+                "desired_video_channels": [11],
+                "desired_video_missing": [],
+            }
+
+        def session_status(channel_id, run_selector=None, start_ts=None, end_ts=None, limit=None):
+            return {
+                "running": int(channel_id) == 9,
+                "logs": [{"created_at": 150.0, "summary": f"channel {channel_id}", "frame_count": 1}],
+            }
+
+        manager.streams_status = streams_status
+        manager.session_status = session_status
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {
+                "channel_ids": [7, 8, 9, 10, 11, 99],
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "limit": 10,
+            },
+        )
+
+        self.assertEqual(result["channel_inventory_status"], "live_augmented")
+        self.assertEqual(result["live_inventory_count"], 1)
+        self.assertEqual(result["checked_channel_ids"], [7, 8, 9, 10, 11])
+        self.assertEqual(result["unchecked_channel_ids"], [99])
+        provenance = {row["channel_id"]: row["sources"] for row in result["inventory_provenance"]}
+        self.assertIn("live_inventory", provenance[7])
+        self.assertIn("logs_by_channel", provenance[8])
+        self.assertIn("runtime", provenance[9])
+        self.assertIn("status_digest", provenance[10])
+        self.assertIn("desired", provenance[11])
+        self.assertEqual(provenance[99], ["requested"])
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+        self.assertEqual(compact["scope"]["checked_channel_ids"], [7, 8, 9, 10, 11])
+        self.assertEqual(compact["scope"]["unchecked_channel_ids"], [99])
+
+    def test_list_video_summary_channels_marks_stale_cached_inventory(self):
+        manager = _SummaryManager()
+        manager.channels = [{"id": 7, "title": "Cached channel"}]
+        manager.channel_inventory_status = lambda: {
+            "cached": True,
+            "count": 1,
+            "stale": True,
+            "cache_age_sec": 44.0,
+            "last_error": "temporary upstream timeout",
+            "stream": {"completion": "settled"},
+        }
+
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "limit": 10},
+        )
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+
+        self.assertEqual(result["channel_inventory_status"], "stale_cache_augmented")
+        self.assertIn("temporary upstream timeout", result["channel_inventory_error"])
+        self.assertTrue(result["channel_inventory_cache"]["stale"])
+        self.assertEqual(result["candidate_channels"][0]["channel_id"], 7)
+        self.assertEqual(compact["channel_inventory_status"], "stale_cache_augmented")
+        self.assertTrue(compact["channel_inventory_cache"]["stale"])
+
     def test_list_video_summary_channels_caps_candidates_when_confirmation_required(self):
         manager = _SummaryManager()
         manager.channels = [
@@ -2155,6 +2887,41 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(len(result["deferred_channel_ids"]), 3)
         self.assertEqual(compact["returned"], AGENT_VIDEO_SUMMARY_CHANNELS_PER_TURN)
         self.assertEqual(compact["deferred_count"], 3)
+        self.assertEqual(compact["scope"]["deferred_count"], 3)
+        self.assertEqual(compact["scope"]["deferred_channel_ids"], result["deferred_channel_ids"])
+
+    def test_list_video_summary_channel_scope_id_lists_are_bounded(self):
+        manager = _SummaryManager()
+        manager.channels = [
+            {"id": channel_id, "title": f"Channel {channel_id}"}
+            for channel_id in range(1, 131)
+        ]
+        manager.logs_by_channel = {
+            channel["id"]: [
+                {
+                    "created_at": 150.0,
+                    "summary": f"event on {channel['id']}",
+                    "frame_count": 1,
+                }
+            ]
+            for channel in manager.channels
+        }
+
+        result = _tools(manager).execute(
+            "list_video_summary_channels",
+            {"from_ts": 100.0, "to_ts": 300.0, "limit": 100},
+        )
+        compact = _compact_tool_result_for_model("list_video_summary_channels", result)
+
+        self.assertEqual(result["total_channels_checked"], 130)
+        self.assertEqual(result["scope"]["checked_count"], 130)
+        self.assertTrue(result["scope"]["id_lists_truncated"])
+        self.assertEqual(result["scope"]["id_list_limit"], 100)
+        self.assertEqual(len(result["checked_channel_ids"]), 100)
+        self.assertEqual(result["deferred_count"], 122)
+        self.assertEqual(len(result["deferred_channel_ids"]), 100)
+        self.assertEqual(result["candidate_channel_ids"], list(range(1, 9)))
+        self.assertEqual(compact["scope"], result["scope"])
 
     def test_compact_list_video_summary_channels_preserves_errors_and_unchecked_counts(self):
         manager = _SummaryManager()
@@ -2193,6 +2960,9 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["unchecked_count"], 1)
         self.assertEqual(compact["error_count"], 1)
         self.assertEqual(compact["errors"][0]["channel_id"], 8)
+        self.assertEqual(compact["scope"]["checked_channel_ids"], [7, 8])
+        self.assertEqual(compact["scope"]["unchecked_channel_ids"], [99])
+        self.assertEqual(compact["scope"]["error_channel_ids"], [8])
 
     def test_generate_report_defaults_to_video_descriptions_and_avoids_probe_summary(self):
         class VideoReportStore(_DetectionStore):
@@ -2372,6 +3142,76 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["probes"][0]["probe_name"], "door")
         self.assertEqual(store.summary_kwargs["source"], "probe")
 
+    def test_generate_report_false_positives_uses_operator_annotations(self):
+        class FeedbackReportStore(_DetectionStore):
+            def generate_false_positive_report(self, **kwargs):
+                self.feedback_kwargs = kwargs
+                return {
+                    "report_type": "false_positives",
+                    "period": {
+                        "since_ms": kwargs["since_ms"],
+                        "until_ms": kwargs["until_ms"],
+                    },
+                    "coverage": {
+                        "status": "covered",
+                        "annotation_count": 2,
+                        "ground_truth_status": "operator_annotation_only",
+                    },
+                    "summary": {
+                        "annotation_count": 2,
+                        "distinct_alert_count": 2,
+                        "reviewer_count": 1,
+                        "channel_count": 1,
+                    },
+                    "reason_counts": [
+                        {
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "count": 2,
+                        }
+                    ],
+                    "channel_counts": [{"channel_id": 7, "count": 2}],
+                    "feedback": [
+                        {
+                            "detection_id": 501,
+                            "channel_id": 7,
+                            "alert_timestamp_ms": 150_000,
+                            "actor_id": "private-reviewer-id",
+                            "reason_code": "benign_activity",
+                            "reason_label": "Benign activity",
+                            "alert_title": "Person near door",
+                            "note": "Maintenance worker.",
+                        }
+                    ],
+                    "report": "# False-positive operator feedback report",
+                }
+
+        store = FeedbackReportStore()
+        result = _tools(detections_store=store).execute(
+            "generate_report",
+            {
+                "report_type": "false_positives",
+                "from_ts": 100.0,
+                "to_ts": 300.0,
+                "channel_ids": [7],
+                "top_events": 5,
+            },
+        )
+        compact = _compact_tool_result_for_model("generate_report", result)
+
+        self.assertEqual(result["report_type"], "false_positives")
+        self.assertEqual(store.feedback_kwargs["since_ms"], 100_000)
+        self.assertEqual(store.feedback_kwargs["until_ms"], 300_000)
+        self.assertEqual(store.feedback_kwargs["channel_ids"], [7])
+        self.assertEqual(store.feedback_kwargs["item_limit"], 5)
+        self.assertEqual(
+            result["coverage"]["ground_truth_status"],
+            "operator_annotation_only",
+        )
+        self.assertEqual(compact["reason_counts"][0]["count"], 2)
+        self.assertEqual(compact["feedback"][0]["detection_id"], 501)
+        self.assertNotIn("actor_id", compact["feedback"][0])
+
     def test_generate_probe_report_exposes_representative_events_to_model(self):
         class ProbeReportStore(_DetectionStore):
             def summarize_by_probe(self, *args, **kwargs):
@@ -2419,6 +3259,158 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             [row["detection_id"] for row in compact["probes"][0]["representative_events"]],
             [0, 4, 8],
         )
+
+    def test_list_attention_bursts_ranks_windows_and_reports_gaps(self):
+        class _BurstSummaryManager(_SummaryManager):
+            def summary_rollups(self, channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None, target_level=None, synthesize=True):
+                nodes = [
+                    {
+                        "level": "L0",
+                        "window_start": 100.0,
+                        "window_end": 112.0,
+                        "batch_start_ms": 100_000,
+                        "batch_end_ms": 112_000,
+                        "summary": "car drifting across the lot with smoke",
+                        "vector_signal": {
+                            "capture_attention": {
+                                "baseline": {"level": 0.001, "warmup": False},
+                                "seconds": [
+                                    {"snapshot": 3, "mode": "burst", "activity_x": 11.1, "sharper_companion": True},
+                                    {"snapshot": 5, "mode": "normal", "activity_x": 3.0},
+                                ],
+                            }
+                        },
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 112.0,
+                        "window_end": 124.0,
+                        "batch_start_ms": 112_000,
+                        "batch_end_ms": 124_000,
+                        "summary": "quiet lot",
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 124.0,
+                        "window_end": 136.0,
+                        "batch_start_ms": 124_000,
+                        "batch_end_ms": 136_000,
+                        "summary": "[coverage gap] dropped",
+                        "coverage_gap": True,
+                        "gap_reason": "lm_backpressure_dropped_batch",
+                    },
+                    {
+                        "level": "L0",
+                        "window_start": 136.0,
+                        "window_end": 148.0,
+                        "batch_start_ms": 136_000,
+                        "batch_end_ms": 148_000,
+                        "summary": "person runs through",
+                        "vector_signal": {
+                            "capture_attention": {
+                                "seconds": [
+                                    {"snapshot": 1, "mode": "burst", "activity_x": 5.5},
+                                ]
+                            }
+                        },
+                    },
+                ]
+                return {"levels": {"L0": nodes}, "source_counts": {"L0": len(nodes)}}
+
+        tools = _tools(manager=_BurstSummaryManager())
+        result = tools.execute(
+            "list_attention_bursts",
+            {"channel_id": 7, "from_ts": 90.0, "to_ts": 200.0, "min_activity_x": 2.0},
+        )
+
+        self.assertEqual(result["burst_count"], 2)
+        self.assertEqual(result["bursts"][0]["activity_x"], 11.1)
+        self.assertEqual(result["bursts"][0]["snapshot"], 3)
+        self.assertTrue(result["bursts"][0]["sharper_companion"])
+        self.assertEqual(result["bursts"][0]["baseline_level"], 0.001)
+        self.assertIn("drifting", result["bursts"][0]["summary_excerpt"])
+        self.assertEqual(result["bursts"][1]["activity_x"], 5.5)
+        self.assertNotIn(5, [row["snapshot"] for row in result["bursts"]])
+        self.assertEqual(result["backpressure_gap_count"], 1)
+        self.assertIn("unknowable, not absent", result["backpressure_note"])
+        self.assertIn("not semantic proof", result["semantics"])
+
+        strict = tools.execute(
+            "list_attention_bursts",
+            {"channel_id": 7, "from_ts": 90.0, "to_ts": 200.0, "min_activity_x": 6.0},
+        )
+        self.assertEqual(strict["burst_count"], 1)
+        self.assertEqual(strict["bursts"][0]["activity_x"], 11.1)
+
+    def test_system_prompt_routes_spike_questions_to_the_burst_tool(self):
+        prompt = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+        )
+        self.assertIn("call list_attention_bursts FIRST", prompt)
+        self.assertIn("unknown intervals, never as calm", prompt)
+
+    def test_capture_attention_survives_model_compaction(self):
+        compact = _compact_vector_signal_for_model(
+            {
+                "capture_attention": {
+                    "policy": "capture_per_second_cv_apex_v2",
+                    "baseline": {"level": 0.0012, "warmup": False},
+                    "seconds": [
+                        {"snapshot": 3, "mode": "burst", "activity_x": 11.12, "sharper_companion": True},
+                        {"snapshot": 5, "mode": "normal", "activity_x": 3.4},
+                        {"snapshot": 6, "mode": "quiet"},
+                        {"snapshot": None, "mode": "burst"},
+                    ],
+                }
+            }
+        )
+
+        attention = compact["capture_attention"]
+        self.assertEqual(attention["baseline"], {"level": 0.0012, "warmup": False})
+        self.assertEqual(
+            attention["seconds"],
+            [
+                {"snapshot": 3, "mode": "burst", "activity_x": 11.12, "sharper_companion": True},
+                {"snapshot": 5, "mode": "normal", "activity_x": 3.4},
+            ],
+        )
+
+    def test_burst_windows_outrank_plain_summaries_for_evidence(self):
+        quiet_node = {"summary": "corridor is calm", "alert_total": 0}
+        burst_node = {
+            "summary": "corridor is calm",
+            "alert_total": 0,
+            "vector_signal": {
+                "capture_attention": {
+                    "seconds": [
+                        {"snapshot": 2, "mode": "burst", "activity_x": 9.5},
+                        {"snapshot": 4, "mode": "burst", "activity_x": 4.1},
+                    ]
+                }
+            },
+        }
+
+        self.assertEqual(_summary_node_alert_score(quiet_node), 0)
+        self.assertEqual(_summary_node_alert_score(burst_node), 4)
+        self.assertGreater(
+            _summary_node_alert_score(burst_node),
+            _summary_node_alert_score(quiet_node),
+        )
+
+    def test_system_prompt_explains_capture_attention_semantics(self):
+        prompt = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+        )
+
+        self.assertIn("vector_signal.capture_attention", prompt)
+        self.assertIn("mode=burst", prompt)
+        self.assertIn("Motion blur on burst frames is expected physics", prompt)
+        self.assertIn("anchor_role=burst_companion", prompt)
+        self.assertIn("statistical attention, not semantic proof", prompt)
 
     def test_turn_context_applies_normalized_time_window_to_generate_report(self):
         context = _seed_turn_tool_context("Generate a video report for the selected channel.")

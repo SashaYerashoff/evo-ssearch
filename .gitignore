@@ -55,8 +55,11 @@ Thumbs.db
 # Project specific
 *.log
 *.tmp
+.eva-bundle-commit
+.eva-runtime/
 .clip_index/
 probes_store.json
+probe_channel_groups.json
 luxriot_rollups_cache.json
 luxriot_summary_state.json
 inference_spool/
@@ -68,6 +71,8 @@ react-ui/.vite/
 react-ui/*.tsbuildinfo
 react-ui/vite.config.js
 react-ui/vite.config.d.ts
+react-ui/proxy-config.js
+react-ui/proxy-config.d.ts
 detections_archive/
 detections_store.sqlite3
 agent_sessions.sqlite3

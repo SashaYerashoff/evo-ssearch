@@ -8,7 +8,7 @@ It is intentionally live-gated and slow. Run only on the dev/demo machine that
 has the 10-second drift loop on emu-2/channel 120.
 
     EVA_LIVE_BASE_URL=https://127.0.0.1:5443 \
-    EVA_LIVE_USER=admin EVA_LIVE_PASSWORD='Luxriot2026!?' \
+    EVA_LIVE_USER=admin EVA_LIVE_PASSWORD='<dev-password>' \
     EVA_LIVE_INCLUDE=drift \
     .venv/bin/pytest -q tests/integration/test_live_vlm_drift_emu2.py -s
 """

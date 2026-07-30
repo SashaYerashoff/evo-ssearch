@@ -1,0 +1,2308 @@
+{
+ "generated_from": {
+  "repo": "evo-ssearch",
+  "branch": "feature/secure-50-channel-foundation",
+  "files": [
+   "agent.py::_TOOL_SCHEMAS",
+   "agent.py::AgentTools.execute",
+   "agent.py::_TOOL_INTENT_GROUPS",
+   "agent.py::_compact_tool_result_for_model",
+   "agent_security/eva_adapter.py"
+  ],
+  "date": "2026-07-19"
+ },
+ "intent_groups": {
+  "help": [
+   "lookup_help"
+  ],
+  "channel_inventory": [
+   "list_channels",
+   "list_video_summary_channels"
+  ],
+  "runtime": [
+   "list_video_summary_channels"
+  ],
+  "prompt_policy": [
+   "get_prompt_settings",
+   "update_prompt_settings"
+  ],
+  "video_research": [
+   "count_video_summary_events",
+   "describe_frame",
+   "generate_report",
+   "get_detections",
+   "get_video_summaries",
+   "list_attention_bursts",
+   "list_video_summary_channels",
+   "normalize_time_window",
+   "track_visual_state_transitions"
+  ],
+  "archive_research": [
+   "build_research_batch",
+   "describe_frame",
+   "get_detection_summary",
+   "get_detections",
+   "get_visual_window_signals",
+   "list_channels",
+   "normalize_time_window",
+   "search_archive"
+  ],
+  "probe_management": [
+   "calibrate_probe_from_archive",
+   "create_probe",
+   "delete_probes",
+   "describe_frame",
+   "get_detection_summary",
+   "get_detections",
+   "list_channels",
+   "list_probes",
+   "prepare_probe_calibration_batch",
+   "search_archive",
+   "update_probe"
+  ],
+  "bookmark": [
+   "create_bookmark",
+   "describe_frame",
+   "get_detections",
+   "search_archive"
+  ],
+  "summary_restore": [
+   "get_video_summary_restore_status",
+   "list_video_summary_channels",
+   "normalize_time_window",
+   "restore_video_summary_history"
+  ]
+ },
+ "tools": [
+  {
+   "name": "build_research_batch",
+   "description": "Assemble a representative batch of detections for agent research across multiple time windows and confidence bands. Use before probe tuning, archive investigations, or prompt refinement.",
+   "params": [
+    {
+     "name": "probe_id",
+     "type": "string",
+     "required": false,
+     "desc": "Optional probe ID to restrict the batch."
+    },
+    {
+     "name": "probe_name",
+     "type": "string",
+     "required": false,
+     "desc": "Optional human-readable probe name, resolved to probe_id internally."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional channel to restrict the batch."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Default window lower bound if periods are not provided. Default: 24."
+    },
+    {
+     "name": "until_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Optional relative upper bound if periods are not provided."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound if periods are not provided."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound if periods are not provided."
+    },
+    {
+     "name": "periods",
+     "type": "array<object>",
+     "required": false,
+     "desc": "Optional named time slices to sample independently."
+    },
+    {
+     "name": "bands",
+     "type": "array<object>",
+     "required": false,
+     "desc": "Optional confidence bands for stratified sampling."
+    },
+    {
+     "name": "sort_by",
+     "type": "string enum[newest,oldest,highest_pos,lowest_pos,highest_margin,lowest_margin]",
+     "required": false,
+     "desc": "How to rank candidates before sampling within each period/band."
+    },
+    {
+     "name": "per_period_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max detections to keep per period before the final merge. Default: 24."
+    },
+    {
+     "name": "per_band_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max detections to keep per band inside each period. Default: 6."
+    },
+    {
+     "name": "max_candidates",
+     "type": "integer",
+     "required": false,
+     "desc": "Max raw detections to scan per period before sampling. Default: 1000."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "probe_id",
+    "channel_id",
+    "source",
+    "source_label",
+    "sort_by",
+    "batch_size",
+    "periods",
+    "bands",
+    "detections"
+   ]
+  },
+  {
+   "name": "calibrate_probe_from_archive",
+   "description": "Read-only CLIP P/N/M calibration for a proposed probe over archived frames. Use before creating/updating probes from VLM alerts, archive searches, or cross-channel sweeps. It scans real archived frames, compares a positive event query against a visible contrast query, suggests initial pos_floor/margin thresholds, and returns representative frames. Processes only a bounded channel batch per call and returns deferred_channel_ids for continuation.",
+   "params": [
+    {
+     "name": "event_query",
+     "type": "string",
+     "required": false,
+     "desc": "Positive visible event/action/state, e.g. 'two people fighting' or 'person lying on ground'."
+    },
+    {
+     "name": "positive_query",
+     "type": "string",
+     "required": false,
+     "desc": "Alias for event_query."
+    },
+    {
+     "name": "contrast_query",
+     "type": "string",
+     "required": false,
+     "desc": "Visible background/contrast state, e.g. 'people walking normally' or 'clear roadway with normal traffic'. Do not use literal negation."
+    },
+    {
+     "name": "negative_query",
+     "type": "string",
+     "required": false,
+     "desc": "Alias for contrast_query."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional single Luxriot channel ID."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": "Optional channel IDs to calibrate. The tool processes only the first max_channels_per_call and defers the rest."
+    },
+    {
+     "name": "sources",
+     "type": "array<string enum[vlm_summary,vlm_alert,probe]>",
+     "required": false,
+     "desc": "Archive frame sources to scan. Default: ['vlm_alert','vlm_summary']."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Scan frames from the past N hours. Default: 24."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "candidate_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max archive frames to scan per channel across sources. Default: 20000, max: 100000."
+    },
+    {
+     "name": "max_channels_per_call",
+     "type": "integer",
+     "required": false,
+     "desc": "Max channels to process in this call. Default: 8, max: 8."
+    },
+    {
+     "name": "evidence_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Representative frames per channel. Default: 8, max: 24."
+    },
+    {
+     "name": "min_frames",
+     "type": "integer",
+     "required": false,
+     "desc": "Minimum archived frames before suggestions are considered reliable. Default: 8."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 24,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "event_query",
+    "contrast_query",
+    "contrast_query_effective",
+    "sources",
+    "time_window",
+    "score_semantics",
+    "processed_channel_ids",
+    "deferred_channel_ids",
+    "deferred_count",
+    "requires_continue",
+    "next_batch_hint",
+    "operator_note",
+    "channels"
+   ]
+  },
+  {
+   "name": "count_video_summary_events",
+   "description": "Count appearance/disappearance style events from VLM video-summary text for one channel/time window. Use for questions like 'how many times did X appear/disappear', 'count entries/exits', or 'how often did an object leave/return'. The result is a structured count from summaries, with coverage and transition evidence; it is not frame-level ground truth.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID to query."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "entity_query",
+     "type": "string",
+     "required": true,
+     "desc": "Entity/object to track, e.g. 'person', 'white BMW', 'delivery courier', or 'animal'."
+    },
+    {
+     "name": "anchor_query",
+     "type": "string",
+     "required": false,
+     "desc": "Optional place/object relation, e.g. 'front door', 'loading bay', 'gate', or 'central square'."
+    },
+    {
+     "name": "event_kind",
+     "type": "string enum[presence_transitions]",
+     "required": false,
+     "desc": "Currently supports presence/absence transitions. Default: presence_transitions."
+    },
+    {
+     "name": "depth",
+     "type": "string enum[live,L1,L2,L3]",
+     "required": false,
+     "desc": "Summary level to scan. Use L1 for day-scale counts, live/L0 only for short exact windows."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Return summaries from the past N hours. Default: 6."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "run",
+     "type": "string",
+     "required": false,
+     "desc": "Optional run selector: latest, running, all, or a concrete run id."
+    },
+    {
+     "name": "level_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max nodes per rollup level to scan. Default: high bounded scan."
+    },
+    {
+     "name": "timeline_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max classified timeline rows to return. Default: 40, max: 120."
+    },
+    {
+     "name": "event_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max transition events to return. Default: 40, max: 120."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 40,
+   "intent_groups": [
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "channel_id",
+    "depth",
+    "event_kind",
+    "entity_query",
+    "anchor_query",
+    "score_semantics",
+    "source_counts",
+    "coverage",
+    "total_in_window",
+    "backend_truncated",
+    "counts",
+    "notes",
+    "transition_events",
+    "timeline_samples",
+    "timeline_returned",
+    "timeline_total",
+    "event_returned",
+    "event_total"
+   ]
+  },
+  {
+   "name": "create_bookmark",
+   "description": "Create a bookmark in Luxriot EVA on a camera channel, visible in the Luxriot client. Use to flag significant events for operator review. Only call when there is a concrete reason — do not create bookmarks speculatively.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel (camera) ID to attach the bookmark to."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "title",
+     "type": "string",
+     "required": true,
+     "desc": "Short bookmark title (max 80 characters)."
+    },
+    {
+     "name": "description",
+     "type": "string",
+     "required": false,
+     "desc": "Detailed event description (max 240 characters)."
+    },
+    {
+     "name": "severity",
+     "type": "string enum[info,low,normal,high,critical]",
+     "required": false,
+     "desc": "Event severity level. Default: normal."
+    },
+    {
+     "name": "timestamp_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional event timestamp in milliseconds. Defaults to now."
+    }
+   ],
+   "permission": "BOOKMARKS_CREATE",
+   "write_tool": true,
+   "preview_gated": false,
+   "hidden_until_approval": true,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "bookmark"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "status",
+    "channel_id",
+    "title",
+    "severity"
+   ]
+  },
+  {
+   "name": "create_probe",
+   "description": "Create a new probe with text pairs and thresholds. Use CLIP-friendly generic visual descriptors, not private names or abstract logic. For VLM-alert follow-up, create one named probe per distinct visible event and use update_existing=true to avoid duplicates. IMPORTANT: model calls must use preview=true. The UI Apply button commits the returned action plan outside chat.",
+   "params": [
+    {
+     "name": "name",
+     "type": "string",
+     "required": true,
+     "desc": ""
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "positives",
+     "type": "array<string>",
+     "required": false,
+     "desc": "Positive CLIP text prompts. Use visible object/action/state language such as 'two people fighting', 'vehicle doing a burnout', or 'person lying on ground'. Avoid personal names and legal/intent claims."
+    },
+    {
+     "name": "negatives",
+     "type": "array<string>",
+     "required": false,
+     "desc": "Visible contrast/background states for P/N/M. Do not write literal negation such as 'no person', 'no vehicle', or 'without smoke'. Use positive alternatives such as 'clear sidewalk', 'parked vehicles on clear roadway', or 'people walking normally'."
+    },
+    {
+     "name": "pos_floor",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "margin_thr",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "top_k",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "window_sec",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "severity",
+     "type": "string enum[info,low,normal,high,critical]",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "bookmark_enabled",
+     "type": "boolean",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "bookmark_cooldown_sec",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "bookmark_dedupe_window_sec",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "enabled",
+     "type": "boolean",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "update_existing",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, reuse an existing probe with the same name on the same channel instead of creating a duplicate. Default: true."
+    },
+    {
+     "name": "preview",
+     "type": "boolean",
+     "required": false,
+     "desc": ""
+    }
+   ],
+   "permission": "PROBES_MANAGE",
+   "write_tool": true,
+   "preview_gated": true,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "status",
+    "action",
+    "exists",
+    "probe_id",
+    "probe_name",
+    "channel_id",
+    "conflicts",
+    "action_plan?"
+   ]
+  },
+  {
+   "name": "delete_probes",
+   "description": "Delete one or more probes, or all probes. IMPORTANT: model calls must use preview=true. The UI Apply button commits the returned action plan outside chat.",
+   "params": [
+    {
+     "name": "probe_ids",
+     "type": "array<string>",
+     "required": false,
+     "desc": "Optional explicit probe IDs to delete."
+    },
+    {
+     "name": "delete_all",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, delete all configured probes."
+    },
+    {
+     "name": "preview",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, return a deletion plan without applying. Default: true."
+    }
+   ],
+   "permission": "PROBES_MANAGE",
+   "write_tool": true,
+   "preview_gated": true,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "status",
+    "delete_all",
+    "deleted",
+    "count",
+    "targets",
+    "action_plan?"
+   ]
+  },
+  {
+   "name": "deploy_summary",
+   "description": "Record the final outcome of a deployment or survey-only pass as a structured summary card. Use at the end of Protocol Deploy.",
+   "params": [
+    {
+     "name": "mode",
+     "type": "string enum[standard,magic,survey_only]",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "wipe",
+     "type": "boolean",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "elapsed_sec",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "overview",
+     "type": "string",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "channels",
+     "type": "array<string>",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "probes",
+     "type": "array<string>",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "prompt_targets",
+     "type": "array<string>",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "notes",
+     "type": "array<string>",
+     "required": false,
+     "desc": ""
+    }
+   ],
+   "permission": "REPORTS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [],
+   "chat_reachable": false,
+   "compact_result_keys": [
+    "mode",
+    "wipe",
+    "elapsed_sec",
+    "overview",
+    "channels",
+    "probes",
+    "prompt_targets",
+    "notes"
+   ]
+  },
+  {
+   "name": "describe_frame",
+   "description": "Send an image frame to the vision language model for a detailed description. Accepts a live camera snapshot (channel_id), a detection record (detection_id), or a filesystem path (image_path). Use to understand what is happening on camera right now, or to analyze a past detection.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID. Captures a live snapshot from the camera right now and describes it. Use when the operator asks about the current scene."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "image_path",
+     "type": "string",
+     "required": false,
+     "desc": "Absolute filesystem path to an image file."
+    },
+    {
+     "name": "detection_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Detection record ID. The stored thumbnail will be used."
+    },
+    {
+     "name": "prompt",
+     "type": "string",
+     "required": false,
+     "desc": "Optional instruction to the VLM. Defaults to a general scene description."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 120.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research",
+    "bookmark",
+    "probe_management",
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "description",
+    "source",
+    "channel_id",
+    "image_path",
+    "note"
+   ]
+  },
+  {
+   "name": "generate_report",
+   "description": "Compile an operator report for a time period. Defaults to live video-description coverage, VLM alerts, stream health, quiet channels, and evidence frames. Use report_type='probes' only when the operator explicitly asks for probe statistics.",
+   "params": [
+    {
+     "name": "report_type",
+     "type": "string enum[video_descriptions,probes]",
+     "required": false,
+     "desc": "Default: video_descriptions. Use probes only for explicit probe reports."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Report covers data from the past N hours. Default: 24."
+    },
+    {
+     "name": "until_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Optional upper bound. Omit for up-to-now."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted and normalized."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds. Normalized to from_ts."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds. Normalized to to_ts."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional. Restrict report to one channel."
+    },
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": "Optional channel IDs for a multi-channel video-description report."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "include_probes",
+     "type": "array<string>",
+     "required": false,
+     "desc": "Probe names to include when report_type='probes'."
+    },
+    {
+     "name": "top_events",
+     "type": "integer",
+     "required": false,
+     "desc": "Include up to N representative evidence events. Default: 5."
+    }
+   ],
+   "permission": "REPORTS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": null,
+   "intent_groups": [
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "report_type",
+    "period",
+    "coverage",
+    "summary",
+    "pipeline_health",
+    "report",
+    "channels",
+    "desired_video_missing",
+    "vlm_alert_frames",
+    "total_detections",
+    "probe_count",
+    "activity_by_hour",
+    "probes"
+   ]
+  },
+  {
+   "name": "get_detection_summary",
+   "description": "Aggregate archive frame statistics grouped by archive item/probe. Returns counts, source labels, and latest activity timestamps. Use source=probe for actual probe detection summaries.",
+   "params": [
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Summarize detections from the past N hours. Default: 24."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional. Restrict summary to one channel."
+    },
+    {
+     "name": "source",
+     "type": "string enum[probe,vlm_summary,vlm_alert]",
+     "required": false,
+     "desc": "Optional archive source filter: probe, vlm_summary, or vlm_alert."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research",
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "since_ms",
+    "until_ms",
+    "source",
+    "source_label",
+    "probe_count",
+    "total_detections",
+    "total_archive_items",
+    "by_probe"
+   ]
+  },
+  {
+   "name": "get_detections",
+   "description": "Retrieve recent archive frame records. By default this includes probe hits, video-description frames, and VLM alert frames. Use source=probe when you need actual probe detections only. Returns timestamps, source labels, scores where present, and preview image URLs.",
+   "params": [
+    {
+     "name": "probe_id",
+     "type": "string",
+     "required": false,
+     "desc": "Archive item/probe ID to filter by. If omitted, returns records across all archive items."
+    },
+    {
+     "name": "probe_name",
+     "type": "string",
+     "required": false,
+     "desc": "Human-readable probe name. Resolved to probe_id internally."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional. Restrict to archive records from this channel."
+    },
+    {
+     "name": "source",
+     "type": "string enum[probe,vlm_summary,vlm_alert]",
+     "required": false,
+     "desc": "Optional archive source filter. Use source=probe for real probe detections, source=vlm_summary for regular video-description frames, and source=vlm_alert for VLM alert frames."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Fetch detections from the past N hours. Default: 24."
+    },
+    {
+     "name": "until_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Optional upper bound: detections older than N hours ago."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "offset",
+     "type": "integer",
+     "required": false,
+     "desc": "Pagination offset within the selected time window."
+    },
+    {
+     "name": "sort_by",
+     "type": "string enum[newest,oldest]",
+     "required": false,
+     "desc": "Order detections by event time. Default: newest."
+    },
+    {
+     "name": "limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max detections to return. Default: 20, max: 100."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 45.0,
+   "default_rows": 20,
+   "intent_groups": [
+    "archive_research",
+    "bookmark",
+    "probe_management",
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "probe_id",
+    "channel_id",
+    "source",
+    "source_label",
+    "since_ms",
+    "until_ms",
+    "total_in_window",
+    "returned",
+    "offset",
+    "sort_by",
+    "detections"
+   ]
+  },
+  {
+   "name": "get_prompt_settings",
+   "description": "Read the effective Luxriot VLM prompt settings. Without channel_id returns global defaults. With channel_id returns the effective per-channel view.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional Luxriot channel ID. Omit to read global defaults."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "prompt_policy"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "scope",
+    "channel_id",
+    "stream",
+    "alerts",
+    "json",
+    "rollups",
+    "prompt_health",
+    "prompt_layers",
+    "bookmark_enabled",
+    "bookmark_cooldown_sec",
+    "notes",
+    "warnings"
+   ]
+  },
+  {
+   "name": "get_video_summaries",
+   "description": "Retrieve VLM-generated video summaries for a Luxriot channel. Returns narrative text summaries at different depths: live (L0, per-batch captions), L1 (minute-level), L2 (hour-level), L3 (day-level). Use to answer 'what happened on camera X in the last hour?' without re-analyzing frames.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID to query."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "depth",
+     "type": "string enum[live,L1,L2,L3]",
+     "required": false,
+     "desc": "live: raw per-batch captions (most detail, most entries). L1: minute-window rollups. L2: hour rollups. L3: day rollups. Default: L1."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Return summaries from the past N hours. Default: 6."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds."
+    },
+    {
+     "name": "run",
+     "type": "string",
+     "required": false,
+     "desc": "Optional run selector: latest, running, or a concrete run id."
+    },
+    {
+     "name": "level_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max nodes per rollup level to scan before slicing the requested depth. Defaults to a high bounded scan independent of display limit."
+    },
+    {
+     "name": "include_evidence_frames",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, also return representative archive frame records from source=vlm_summary and source=vlm_alert for the requested channel/time window. Use when the operator asks to confirm video-summary findings with images/snaps."
+    },
+    {
+     "name": "evidence_frame_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max evidence frames to include when include_evidence_frames=true. Default: 8, max: 24."
+    },
+    {
+     "name": "limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max summary entries to return. Default: 20."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 20,
+   "intent_groups": [
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "channel_id",
+    "depth",
+    "display_limit",
+    "level_limit_applied",
+    "backend_truncated",
+    "source_counts",
+    "time_window",
+    "coverage",
+    "source_coverage",
+    "count",
+    "total_in_window",
+    "semantic_available_count",
+    "semantic_pending_count",
+    "semantic_failed_count",
+    "semantic_status",
+    "truncated",
+    "selection_strategy",
+    "running",
+    "evidence_frame_query",
+    "evidence_selection_strategy",
+    "evidence_priority_windows",
+    "attempted_sources",
+    "evidence_frame_totals",
+    "totals",
+    "provenance_totals",
+    "returned_provenance_totals",
+    "evidence_frames",
+    "entries"
+   ]
+  },
+  {
+   "name": "get_video_summary_restore_status",
+   "description": "Get durable progress, ETA, current window, completed/restored/failed counts, and final report for the post-upgrade video-summary restoration worker.",
+   "params": [],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "summary_restore"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "<dictcomp>"
+   ]
+  },
+  {
+   "name": "get_visual_window_signals",
+   "description": "Compare a positive and optional negative semantic phrase against CLIP-indexed video-description archive frames for one channel/time window. Returns P/N/M (positive score, negative score, margin) as an attention signal only, not proof. Use this to choose candidate windows/frames before calling describe_frame.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID to score."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title."
+    },
+    {
+     "name": "positive_query",
+     "type": "string",
+     "required": true,
+     "desc": "Visible-event phrase to look for, e.g. 'dog without visible ear tag'."
+    },
+    {
+     "name": "negative_query",
+     "type": "string",
+     "required": false,
+     "desc": "Optional contrast phrase, e.g. 'empty street with no dogs'."
+    },
+    {
+     "name": "sources",
+     "type": "array<string enum[vlm_summary,vlm_alert,probe]>",
+     "required": false,
+     "desc": "Archive sources to compare. Default: ['vlm_alert','vlm_summary']; probe should be used only when the operator explicitly asks for probe corroboration."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Score frames from the past N hours. Default: 6."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "limit_per_source",
+     "type": "integer",
+     "required": false,
+     "desc": "Top results to inspect per query/source. Default: 8, max: 24."
+    },
+    {
+     "name": "candidate_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Candidate pool before CLIP ranking. Default: 20000."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "channel_id",
+    "positive_query",
+    "negative_query",
+    "sources",
+    "since_ms",
+    "until_ms",
+    "score_semantics",
+    "pnm",
+    "operator_note",
+    "search_errors",
+    "by_source",
+    "candidate_frames"
+   ]
+  },
+  {
+   "name": "list_attention_bursts",
+   "description": "List seconds whose measured motion ran far above the channel's own learned norm (capture_attention mode=burst) inside a time window. This is the FIRST tool for operator questions about spikes, sudden motion, 'что резкого было', or attention homeostasis: it is bounded and compact, unlike scanning full summaries. Bursts are statistical attention, not semantic proof - verify visually before alerting.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID to scan."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115' or a title."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Scan the past N hours. Default: 6."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds."
+    },
+    {
+     "name": "min_activity_x",
+     "type": "number",
+     "required": false,
+     "desc": "Only bursts at least this many times above the channel norm. Default: 0 (all bursts)."
+    },
+    {
+     "name": "limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max burst rows to return, strongest first. Default: 24, max: 100."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 24,
+   "intent_groups": [
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "channel_id",
+    "time_window",
+    "burst_count",
+    "bursts",
+    "scanned_l0_windows",
+    "truncated",
+    "semantics",
+    "next_step_hint"
+   ]
+  },
+  {
+   "name": "list_channels",
+   "description": "List available Luxriot channels with IDs and titles. Use before deployment, survey, or prompt tuning.",
+   "params": [
+    {
+     "name": "force",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, refresh channel list from Luxriot instead of relying on cache."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research",
+    "channel_inventory",
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "count",
+    "channels"
+   ]
+  },
+  {
+   "name": "list_probes",
+   "description": "List configured probes with their IDs, channels, thresholds, and recent hit counts.",
+   "params": [
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Recent window used for hit counts. Default: 24."
+    }
+   ],
+   "permission": "REPORTS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "count",
+    "since_hours",
+    "probes"
+   ]
+  },
+  {
+   "name": "list_video_summary_channels",
+   "description": "Inventory which Luxriot channels have VLM video-summary coverage in a time window. Use this before broad video-description review when the operator did not name channels. Returns metadata, candidate channels, and runtime_problem_channels for stale/frozen/error/stopped live signal issues; not full summaries.",
+   "params": [
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": "Optional channel IDs to inspect. Omit to inspect all available authorized channels."
+    },
+    {
+     "name": "depth",
+     "type": "string enum[live,L1,L2,L3]",
+     "required": false,
+     "desc": "Summary level to count. Default: L1."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Return coverage from the past N hours. Default: 6."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Operator-relative range such as 'last 3 days'. The server resolves it against its current clock."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted and normalized."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted and normalized."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds. Normalized to from_ts."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds. Normalized to to_ts."
+    },
+    {
+     "name": "run",
+     "type": "string",
+     "required": false,
+     "desc": "Optional run selector: latest, running, all, or a concrete run id."
+    },
+    {
+     "name": "limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Maximum candidate channels to return. Default: 16, max: 100."
+    },
+    {
+     "name": "runtime_only",
+     "type": "boolean",
+     "required": false,
+     "desc": "Return authoritative current stream runtime only, without historical coverage candidates."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 90.0,
+   "default_rows": 16,
+   "intent_groups": [
+    "channel_inventory",
+    "runtime",
+    "summary_restore",
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "depth",
+    "time_window",
+    "channel_inventory_status",
+    "channel_inventory_error",
+    "channel_inventory_cache",
+    "live_inventory_count",
+    "inventory_augmented_count",
+    "inventory_augmented_channel_ids",
+    "requested_only_channel_ids",
+    "inventory_provenance",
+    "scope",
+    "requested_count",
+    "requested_channel_ids",
+    "checked_channel_ids",
+    "inactive_channel_ids",
+    "candidate_channel_ids",
+    "unchecked_count",
+    "unchecked_channel_ids",
+    "active_count",
+    "inactive_count",
+    "error_count",
+    "error_channel_ids",
+    "total_channels_checked",
+    "returned",
+    "deferred_count",
+    "deferred_channel_ids",
+    "per_turn_channel_limit",
+    "requires_confirmation",
+    "configured_vlm_profile",
+    "configured_vlm_model",
+    "active_runtime_streams",
+    "runtime_problem_count",
+    "runtime_problem_channels",
+    "errors",
+    "candidate_channels"
+   ]
+  },
+  {
+   "name": "lookup_help",
+   "description": "Look up how to use EVA AI from its own operator/admin documentation: UI steps, workflows, scenario meaning, and product capabilities/limits. Use this for 'how do I...', 'where is...', 'what does X mean', and product-status questions; use top_k=8 for broad guide summaries. This is the agent's access path to first-party operator/admin docs, not internet browsing. NOT for incident facts about a scene. Returns documentation passages with citations. Admin/engineer-only matches come back as restricted_matches (no steps) when the caller lacks the permission; in that case tell the operator it is an admin/engineer action, do not invent the steps.",
+   "params": [
+    {
+     "name": "query",
+     "type": "string",
+     "required": true,
+     "desc": "What the operator wants to do or understand."
+    },
+    {
+     "name": "top_k",
+     "type": "integer",
+     "required": false,
+     "desc": "Max passages to return (1-8, default 3)."
+    }
+   ],
+   "permission": "AGENT_USE",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "help"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "query",
+    "results",
+    "restricted_matches",
+    "best_match_restricted",
+    "best_required_permission",
+    "best_restricted_section",
+    "indexed_docs",
+    "note"
+   ]
+  },
+  {
+   "name": "normalize_time_window",
+   "description": "Convert an operator-facing time range into exact Unix seconds/milliseconds. Use before archive or video-summary tools when the user gives relative or local times such as 'last day', 'last night from 1:30am to 8:30am', or 'past 90 minutes'.",
+   "params": [
+    {
+     "name": "date",
+     "type": "string",
+     "required": false,
+     "desc": "Optional local date in YYYY-MM-DD. If omitted, day_hint is used."
+    },
+    {
+     "name": "day_hint",
+     "type": "string enum[today,yesterday,last_night,explicit]",
+     "required": false,
+     "desc": "How to choose the date when date is omitted. Default: today."
+    },
+    {
+     "name": "start_time",
+     "type": "string",
+     "required": false,
+     "desc": "Local start time, e.g. '01:30', '1:30am', or '23:00'."
+    },
+    {
+     "name": "end_time",
+     "type": "string",
+     "required": false,
+     "desc": "Local end time, e.g. '08:30', '8:30am', or '02:00'."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Optional relative range such as 'last week' (rolling 7 days), 'last day' (rolling 24h), 'last two hours', 'past 90 minutes', or 'last hour'. Prefer this for phrases like 'during the last two hours' or 'for the last week'."
+    },
+    {
+     "name": "timezone",
+     "type": "string",
+     "required": false,
+     "desc": "Optional IANA timezone supplied by the operator. Defaults to the neutral reference timezone ({AGENT_SITE_TIMEZONE})."
+    }
+   ],
+   "permission": "AGENT_USE",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "archive_research",
+    "summary_restore",
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "timezone",
+    "relative_range",
+    "from_local",
+    "to_local",
+    "from_ts",
+    "to_ts",
+    "since_ms",
+    "until_ms",
+    "duration_sec"
+   ]
+  },
+  {
+   "name": "prepare_probe_calibration_batch",
+   "description": "Stateful batch workflow for probe P/N/M calibration. Use instead of manually faning out calibrate_probe_from_archive when reviewing multiple probes, multiple VLM-alert classes, or multiple channels. The server holds the item list in a job and returns a compact decision ledger plus recommended create_probe/update_probe preview arguments. To continue, call again with job_id.",
+   "params": [
+    {
+     "name": "job_id",
+     "type": "string",
+     "required": false,
+     "desc": "Existing batch job id to continue."
+    },
+    {
+     "name": "items",
+     "type": "array<object>",
+     "required": false,
+     "desc": "Optional event/probe items. If omitted, configured probes are used. Each item can include event_query, contrast_query, name/probe_name, probe_id, channel_id or channel_ids, severity, bookmark_enabled."
+    },
+    {
+     "name": "probe_names",
+     "type": "array<string>",
+     "required": false,
+     "desc": "Optional configured probe names to calibrate when items are omitted."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "sources",
+     "type": "array<string enum[vlm_summary,vlm_alert,probe]>",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "candidate_limit",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "items_per_call",
+     "type": "integer",
+     "required": false,
+     "desc": "Max job items to process in this call. Default 4, max 8."
+    },
+    {
+     "name": "evidence_limit",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    },
+    {
+     "name": "min_frames",
+     "type": "integer",
+     "required": false,
+     "desc": ""
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 24,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "job_id",
+    "workflow_type",
+    "status",
+    "processed_this_call",
+    "processed_total",
+    "total_items",
+    "remaining_count",
+    "remaining_items",
+    "requires_continue",
+    "next_batch_hint",
+    "output_contract",
+    "errors",
+    "processed_items"
+   ]
+  },
+  {
+   "name": "restore_video_summary_history",
+   "description": "Preview a durable background job that restores missing semantic video-summary history from archived L0 batch text, then place it in the low-priority worker after UI approval. Use for post-upgrade requests such as 'restore missing summaries for all channels for two weeks'. Levels are fixed-duration semantic windows: L1=15 minutes, L2=60 minutes, L3=6 hours. Default recovery levels are L2 then L3, which rebuild the temporal lens quickly; include L1 only when the operator explicitly requests exhaustive 15-minute semantic backfill. The job is idempotent, survives restarts, yields to live VLM backlog, and reports ETA/progress/source gaps.",
+   "params": [
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": "Channels to restore. Omit for all authorized channels."
+    },
+    {
+     "name": "relative_range",
+     "type": "string",
+     "required": false,
+     "desc": "Relative period such as 'last two weeks' or 'last 14 days'."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower Unix timestamp in seconds."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper Unix timestamp in seconds."
+    },
+    {
+     "name": "levels",
+     "type": "array<string enum[L1,L2,L3]>",
+     "required": false,
+     "desc": "Levels to restore: L1=15 minutes, L2=60 minutes, L3=6 hours. Default: L2,L3. Add L1 only for exhaustive 15-minute history."
+    },
+    {
+     "name": "preview",
+     "type": "boolean",
+     "required": false,
+     "desc": "Must be true in chat. Returns an auditable UI Apply action."
+    }
+   ],
+   "permission": "CAPTURE_MANAGE",
+   "write_tool": true,
+   "preview_gated": true,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 180.0,
+   "default_rows": null,
+   "intent_groups": [
+    "summary_restore"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "<passthrough: durable restore worker envelope>"
+   ]
+  },
+  {
+   "name": "search_archive",
+   "description": "Semantic text search over either an indexed folder (CLIP/FAISS) or the frame archive (vector search over probe hits and video-description frames). Returns ranked results with image URLs/previews, similarity scores, source labels, and metadata. When source is vlm_summary or vlm_alert, the result is from video descriptions, not a probe detection. TODO v1.1: add image_path/detection_id params for image-similarity search.",
+   "params": [
+    {
+     "name": "query",
+     "type": "string",
+     "required": true,
+     "desc": "Natural-language search query, e.g. 'person in red jacket near door'."
+    },
+    {
+     "name": "scope",
+     "type": "string enum[indexed_folder,detections]",
+     "required": true,
+     "desc": "indexed_folder: searches a FAISS-indexed image directory. detections: searches the frame archive via stored CLIP vectors."
+    },
+    {
+     "name": "folder",
+     "type": "string",
+     "required": false,
+     "desc": "Required when scope=indexed_folder. Absolute path to an indexed folder."
+    },
+    {
+     "name": "probe_id",
+     "type": "string",
+     "required": false,
+     "desc": "Optional. When scope=detections, restrict to one archive item/probe id."
+    },
+    {
+     "name": "source",
+     "type": "string enum[probe,vlm_summary,vlm_alert]",
+     "required": false,
+     "desc": "Optional archive source filter. probe = probe hits/detections; vlm_summary = regular frames saved from video-description batches; vlm_alert = frames anchored to video-description alerts."
+    },
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional. Restrict archive search to this channel."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Only include results from the past N hours. Default: 24."
+    },
+    {
+     "name": "since_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "until_ms",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix milliseconds."
+    },
+    {
+     "name": "sort_by",
+     "type": "string enum[similarity,time]",
+     "required": false,
+     "desc": "similarity: semantic relevance. time: newest first."
+    },
+    {
+     "name": "mode",
+     "type": "string enum[clip,dino,fusion]",
+     "required": false,
+     "desc": "Frame archive search only. clip: fast/default. dino/fusion: richer visual matching when available."
+    },
+    {
+     "name": "candidate_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Frame archive search only. Candidate pool before final ranking. Default: 20000."
+    },
+    {
+     "name": "limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Maximum results to return. Default: 12, max: 48."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 12,
+   "intent_groups": [
+    "archive_research",
+    "bookmark",
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "scope",
+    "source",
+    "source_label",
+    "count",
+    "coverage",
+    "results"
+   ]
+  },
+  {
+   "name": "survey_channels",
+   "description": "Capture a short batch of snapshots from one or more channels over 10-15 seconds and summarize what each camera is looking at.",
+   "params": [
+    {
+     "name": "channel_ids",
+     "type": "array<integer>",
+     "required": false,
+     "desc": "Optional explicit list of channel IDs. Omit to survey all available channels."
+    },
+    {
+     "name": "fast_mode",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, use a shorter demo survey with fewer samples and less wait time."
+    },
+    {
+     "name": "duration_sec",
+     "type": "number",
+     "required": false,
+     "desc": "Approximate capture duration per channel. Default: 12 seconds."
+    },
+    {
+     "name": "sample_count",
+     "type": "integer",
+     "required": false,
+     "desc": "How many snapshots to collect per channel. Default: 4."
+    },
+    {
+     "name": "prompt",
+     "type": "string",
+     "required": false,
+     "desc": "Optional instruction for the VLM summarizer."
+    }
+   ],
+   "permission": "STREAMS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 300.0,
+   "default_rows": null,
+   "intent_groups": [],
+   "chat_reachable": false,
+   "compact_result_keys": [
+    "fast_mode",
+    "duration_sec",
+    "sample_count",
+    "channels"
+   ]
+  },
+  {
+   "name": "track_visual_state_transitions",
+   "description": "Track visual state changes over archived video-description frames using CLIP P/N/M signals. Use for unexpected/count questions such as 'how many times did X appear/disappear', 'when did a door open/close', or 'did an object leave/return'. Builds a timeline of stable visual state segments and returns boundary frame evidence. This is stronger than summary-text counts but still returns candidates, not legal/medical/intent conclusions.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Luxriot channel ID to query."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "subject_query",
+     "type": "string",
+     "required": false,
+     "desc": "Optional subject label for reporting, e.g. 'delivery courier', 'white van', or 'animal'."
+    },
+    {
+     "name": "positive_state_query",
+     "type": "string",
+     "required": true,
+     "desc": "Visual state to count as positive, e.g. 'vehicle parked at gate' or 'person standing near doorway'."
+    },
+    {
+     "name": "negative_state_query",
+     "type": "string",
+     "required": false,
+     "desc": "Visible contrast state for CLIP scoring, e.g. 'empty gate' or 'empty doorway'. Avoid phrases like 'no person'/'without vehicle' when possible; literal negation is unreliable for CLIP."
+    },
+    {
+     "name": "alternate_state_query",
+     "type": "string",
+     "required": false,
+     "desc": "Optional third state, e.g. 'vehicle visible elsewhere, not at gate'."
+    },
+    {
+     "name": "positive_label",
+     "type": "string",
+     "required": false,
+     "desc": "State label for positive_state_query. Default: positive."
+    },
+    {
+     "name": "negative_label",
+     "type": "string",
+     "required": false,
+     "desc": "State label for negative_state_query. Default: negative."
+    },
+    {
+     "name": "alternate_label",
+     "type": "string",
+     "required": false,
+     "desc": "State label for alternate_state_query. Default: alternate."
+    },
+    {
+     "name": "sources",
+     "type": "array<string enum[vlm_summary,vlm_alert,probe]>",
+     "required": false,
+     "desc": "Archive frame sources to scan. Default: ['vlm_summary','vlm_alert']."
+    },
+    {
+     "name": "since_hours",
+     "type": "number",
+     "required": false,
+     "desc": "Scan frames from the past N hours. Default: 6."
+    },
+    {
+     "name": "from_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute lower timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "to_ts",
+     "type": "number",
+     "required": false,
+     "desc": "Optional absolute upper timestamp bound in Unix seconds. Milliseconds are accepted."
+    },
+    {
+     "name": "candidate_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max archive frames to scan across sources. Default: 20000, max: 100000."
+    },
+    {
+     "name": "positive_floor",
+     "type": "number",
+     "required": false,
+     "desc": "Minimum positive CLIP score for the positive state. Default: 0.18."
+    },
+    {
+     "name": "negative_floor",
+     "type": "number",
+     "required": false,
+     "desc": "Minimum negative CLIP score for the negative state. Default: 0.18."
+    },
+    {
+     "name": "margin_threshold",
+     "type": "number",
+     "required": false,
+     "desc": "Minimum CLIP margin between winning state and runner-up. Default: 0.03."
+    },
+    {
+     "name": "min_state_samples",
+     "type": "integer",
+     "required": false,
+     "desc": "Minimum samples for a stable segment. Default: 2."
+    },
+    {
+     "name": "min_state_duration_sec",
+     "type": "number",
+     "required": false,
+     "desc": "Minimum duration for a stable segment when sample count is low. Default: 2."
+    },
+    {
+     "name": "merge_gap_sec",
+     "type": "number",
+     "required": false,
+     "desc": "Merge short unknown gaps between same states. Default: 3."
+    },
+    {
+     "name": "transition_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max transitions to return. Default: 40, max: 120."
+    },
+    {
+     "name": "segment_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max segments to return. Default: 80, max: 200."
+    },
+    {
+     "name": "evidence_limit",
+     "type": "integer",
+     "required": false,
+     "desc": "Max boundary evidence frames to return. Default: 24, max: 48."
+    }
+   ],
+   "permission": "DETECTIONS_VIEW",
+   "write_tool": false,
+   "preview_gated": false,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 90.0,
+   "default_rows": 40,
+   "intent_groups": [
+    "video_research"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "channel_id",
+    "subject_query",
+    "positive_state_query",
+    "negative_state_query",
+    "negative_state_query_effective",
+    "alternate_state_query",
+    "positive_label",
+    "negative_label",
+    "alternate_label",
+    "sources",
+    "time_window",
+    "coverage",
+    "score_semantics",
+    "thresholds",
+    "counts",
+    "frame_count",
+    "source_totals",
+    "source_returned",
+    "warnings",
+    "operator_note",
+    "transitions",
+    "segments",
+    "boundary_frames",
+    "candidate_frames"
+   ]
+  },
+  {
+   "name": "update_probe",
+   "description": "Modify a probe's configuration: text pairs (positives/negatives), detection thresholds, or enabled state. Use generic CLIP-visible wording; negatives are visible contrast states, not logical 'no X' clauses. IMPORTANT: model calls must use preview=true to show the user a diff. The UI Apply button commits the returned action plan outside chat.",
+   "params": [
+    {
+     "name": "probe_name",
+     "type": "string",
+     "required": false,
+     "desc": "Human-readable name of the probe to modify."
+    },
+    {
+     "name": "probe_id",
+     "type": "string",
+     "required": false,
+     "desc": "Probe ID. Use if probe_name is ambiguous."
+    },
+    {
+     "name": "changes",
+     "type": "object",
+     "required": true,
+     "desc": "Partial update — only the fields to change. All other probe settings are preserved."
+    },
+    {
+     "name": "preview",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, return a diff without applying. If false, apply the changes. Default: true."
+    }
+   ],
+   "permission": "PROBES_MANAGE",
+   "write_tool": true,
+   "preview_gated": true,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": true,
+   "single_channel_for_scoped_actors": false,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "probe_management"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "status",
+    "probe_id",
+    "probe_name",
+    "diff",
+    "action_plan?"
+   ]
+  },
+  {
+   "name": "update_prompt_settings",
+   "description": "Modify Luxriot VLM prompt settings for either global defaults or a single channel. IMPORTANT: model calls must use preview=true. The UI Apply button commits the returned action plan outside chat.",
+   "params": [
+    {
+     "name": "channel_id",
+     "type": "integer",
+     "required": false,
+     "desc": "Optional Luxriot channel ID. Omit to update global defaults."
+    },
+    {
+     "name": "channel_ref",
+     "type": "string",
+     "required": false,
+     "desc": "Optional channel reference such as '#115', '115', or a title like 'stream'."
+    },
+    {
+     "name": "changes",
+     "type": "object",
+     "required": true,
+     "desc": "Partial prompt/settings update. L0/live descriptions use stream_system_prompt. Channel-specific alert/watch criteria use alert_policy_prompt. L1/L2/L3 summaries use rollup_prompts. json_alert_prompt is only the structured alert-output template."
+    },
+    {
+     "name": "preview",
+     "type": "boolean",
+     "required": false,
+     "desc": "If true, return a diff without applying. If false, apply the changes. Default: true."
+    }
+   ],
+   "permission": "PROMPTS_MANAGE",
+   "write_tool": true,
+   "preview_gated": true,
+   "hidden_until_approval": false,
+   "channel_required_for_scoped_actors": false,
+   "single_channel_for_scoped_actors": true,
+   "timeout_sec": 45.0,
+   "default_rows": null,
+   "intent_groups": [
+    "prompt_policy"
+   ],
+   "chat_reachable": true,
+   "compact_result_keys": [
+    "status",
+    "diff",
+    "current",
+    "proposed",
+    "action_plan?"
+   ]
+  }
+ ]
+}

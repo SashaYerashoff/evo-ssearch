@@ -15,7 +15,9 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
   search queries (`ViT-B/32`).
 - **VLM inference** (vLLM, `qwen3-vl-4b`) — produces video-descriptions; runs on
   dedicated host(s).
-- **Agent LM** (`qwen3.5-9b` class) — the conversational agent; separate endpoint.
+- **Agent LM** — the conversational agent profile. The constrained eight-channel
+  port deployment shares `qwen3-vl-4b` with the VLM under protected admission;
+  larger installations may use a separate 9B-class endpoint.
 - **Luxriot Evo** — source of channels/snapshots and sink for bookmarks.
 
 ## Deployment topology (pilot)
@@ -29,8 +31,10 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
                               |                       |
         snapshots/bookmarks   | SQL (RLS, 3 roles)    | HTTP
                               v                       v
-                         [Luxriot Evo NVR]     [vLLM host(s): qwen3-vl-4b]
-                                               [Agent LM host: qwen3.5-9b]
+                         [Luxriot Evo NVR]     [vLLM host(s): qwen3-vl-4b
+                                               VLM + protected agent profile]
+                                                      |
+                                               [optional quiet L3: 9B]
 ```
 
 Client specifics (hosts/IPs/ports) live in `install/field_rollout_demo.md`
@@ -46,10 +50,12 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 1. Pull snapshot at `SNAPSHOT_INTERVAL`; CLIP-embed it (feeds the probe buffer).
 2. When the batch fills (default 12 frames), build a summary batch.
 3. Dispatch to the VLM (synchronous by default; durable queue available but off).
-4. VLM returns a description + optional `ALERTS_JSON`.
-5. Accept: parse alerts → optional Luxriot bookmark (gated, instrumented); sample
-   frames into the archive (CLIP-indexed); record into per-channel history
-   (frame-time anchored; debounced persist; merge does not re-parse full history).
+4. VLM returns a description plus one `BATCH_STATE_JSON` block containing the
+   cover, episode state, memory pass, observations, and zero or more alerts.
+5. Accept: validate the unified batch state and snapshot references → optional
+   Luxriot bookmarks (gated, instrumented); retain the cover and evidence frames
+   under one stable batch id in the CLIP-indexed archive; record compact state
+   into per-channel history (frame-time anchored; debounced persist).
 
 **Aggregation**
 - L0 history → L1/L2/L3 rollups (deterministic + optional LLM synthesis).
@@ -72,7 +78,7 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 |---|---|---|
 | Frame archive (vectors + thumbnails) | `archive.detections` (Postgres) | row + thumbnail retention (configurable) |
 | Probe definitions | `archive.probes` | persistent |
-| Summary history / rollup cache / prompt settings / desired sessions | `archive.runtime_state` (Postgres) | summary retention days |
+| Summary history / semantic L1–L3 rows / hot rollup cache / prompt settings / desired sessions | `archive.runtime_state` (Postgres) | summary retention days |
 | IAM / sessions / audit | dedicated schemas (RLS) | per policy |
 
 ## Runtime model & durability
@@ -84,8 +90,10 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 - **Hard kill (SIGKILL)** can lose up to the persist-debounce interval of summary
   history; durable settings/sessions use immediate writes.
 - **Inference queue** (`inference_queue/`) exists for durable, decoupled VLM
-  dispatch with a worker pool; disabled by default, enable only after load
-  validation.
+  dispatch with a worker pool. The clean appliance installer enables one
+  PostgreSQL-backed worker; the unconfigured development default remains off.
+  Evidence-bearing L0 windows are never heartbeat-coalesced, and terminal loss
+  is archived as an explicit coverage gap.
 
 ## Known scaling ceilings (pilot → 10k)
 

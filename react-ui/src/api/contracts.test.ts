@@ -29,7 +29,7 @@ import {
   buildAuditQuery,
 } from './settings'
 import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery } from './video'
-import { API_PREFIXES } from '../../vite.config'
+import { API_PREFIXES } from '../../proxy-config'
 
 describe('React/backend contract normalizers', () => {
   it('maps the camelCase audit response to the UI model', () => {

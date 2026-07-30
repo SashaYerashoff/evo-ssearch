@@ -1,0 +1,24 @@
+[Unit]
+Description=EVA AI control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=@ENV_FILE@
+Environment=EVOSSEARCH_CONFIG_ENV_FILE=@ENV_FILE@
+ExecStart=@APP_DIR@/run_prod.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=120
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

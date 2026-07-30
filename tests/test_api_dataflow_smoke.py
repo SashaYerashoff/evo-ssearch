@@ -1,19 +1,25 @@
 import base64
+import hashlib
 import inspect
 import re
+import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 from unittest.mock import patch
 
+import oldapp
 from PIL import Image
 
 from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
     _SENSITIVE_ENDPOINT_PERMISSIONS,
     _build_detection_search_result,
+    _env_precedence_report,
+    _expired_stored_probe_lineage_payload,
     _store_vlm_summary_archive_frames,
+    ProbesStore,
     app,
     config,
 )
@@ -65,7 +71,13 @@ def _collect_frontend_and_backend_paths() -> Tuple[Set[str], Set[str]]:
     fetch_paths.extend(re.findall(r"fetch\(\s*`(/[^`]*)`", source))
     src_paths = re.findall(r"\.src\s*=\s*['\"](/[^'\"]+)['\"]", source)
     src_paths.extend(re.findall(r"\.src\s*=\s*`(/[^`]*)`", source))
-    frontend_paths = {_normalize_frontend_path(path) for path in fetch_paths + src_paths}
+    # URL-builder helpers (media broker, attention stream, image fetch) hand
+    # root-relative template literals to fetch()/media elements indirectly.
+    builder_paths = re.findall(r"return\s+`(/[^`]*)`", source)
+    frontend_paths = {
+        _normalize_frontend_path(path)
+        for path in fetch_paths + src_paths + builder_paths
+    }
     backend_routes = {path for _, path in re.findall(r"@app\.route\(\s*([`'\"])(/[^`'\"]+)\1", source)}
     return frontend_paths, backend_routes
 
@@ -101,6 +113,186 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         )
         self.assertEqual(unmatched, [], f"Frontend endpoints missing backend routes: {unmatched}")
 
+    def test_probe_runtime_patch_preserves_operator_edits_and_never_resurrects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ProbesStore(Path(temp_dir) / "probes.json")
+            original = store.upsert_probe(
+                {
+                    "id": "probe-1",
+                    "name": "Door watch",
+                    "bookmark": True,
+                    "pos_floor": 0.2,
+                }
+            )
+            stale_daemon_copy = dict(original)
+            store.upsert_probe(
+                {
+                    **original,
+                    "bookmark": False,
+                    "pos_floor": 0.8,
+                }
+            )
+
+            patched = store.patch_probe_runtime(
+                "probe-1",
+                {
+                    "last_hit": {"timestamp_ms": 123},
+                    "recent_hits": [{"timestamp_ms": 123}],
+                    "bookmark": True,
+                },
+            )
+
+            self.assertIsNotNone(patched)
+            self.assertFalse(patched["bookmark"])
+            self.assertEqual(patched["pos_floor"], 0.8)
+            self.assertEqual(patched["last_hit"]["timestamp_ms"], 123)
+            self.assertTrue(store.delete_probe("probe-1"))
+            self.assertIsNone(
+                store.patch_probe_runtime(
+                    "probe-1",
+                    {"last_hit": stale_daemon_copy},
+                )
+            )
+            self.assertEqual(store.list_probes(), [])
+
+            store.upsert_probe({"id": "probe-2"})
+            store.upsert_probe({"id": "probe-3"})
+            self.assertEqual(
+                store.delete_probes(["probe-2", "probe-3", "probe-3"]),
+                2,
+            )
+            self.assertEqual(store.list_probes(), [])
+
+    def test_archive_disk_guard_reports_low_space_before_snapshot_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(config, "DETECTIONS_ARCHIVE_DIR", temp_dir),
+                patch.object(config, "DETECTIONS_ARCHIVE_ENABLED", True),
+                patch.object(config, "ARCHIVE_DISK_MIN_FREE_GB", 0.0),
+                patch.object(config, "ARCHIVE_DISK_MIN_FREE_PERCENT", 5.0),
+            ):
+                archive = oldapp._AdaptiveDetectionArchive()
+            with patch(
+                "oldapp.shutil.disk_usage",
+                return_value=type(
+                    "Usage",
+                    (),
+                    {"total": 1000, "used": 960, "free": 40},
+                )(),
+            ):
+                status = archive.disk_status(refresh=True)
+
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["status"], "low_space")
+        self.assertEqual(status["free_percent"], 4.0)
+
+    def test_probe_list_hides_expired_temporary_rows_but_keeps_disabled_saved_probes(self) -> None:
+        store = type(
+            "ProbeStore",
+            (),
+            {
+                "list_probes": staticmethod(
+                    lambda: [
+                        {
+                            "id": "saved-disabled",
+                            "channel_id": 7,
+                            "enabled": False,
+                            "temporary": False,
+                        },
+                        {
+                            "id": "temporary-active",
+                            "channel_id": 7,
+                            "enabled": True,
+                            "temporary": True,
+                            "expires_at_ms": 9_999_999_999_999,
+                        },
+                        {
+                            "id": "temporary-expired",
+                            "channel_id": 7,
+                            "enabled": False,
+                            "temporary": True,
+                            "expires_at_ms": 1,
+                        },
+                    ]
+                )
+            },
+        )()
+
+        with patch("oldapp.probes_store", store):
+            response = self.client.get("/probes/list")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            [probe["id"] for probe in payload["probes"]],
+            ["saved-disabled", "temporary-active"],
+        )
+        self.assertEqual(payload["counts"]["persistent"], 1)
+        self.assertEqual(payload["counts"]["temporary_active"], 1)
+        self.assertEqual(payload["counts"]["temporary_expired_hidden"], 1)
+
+    def test_expired_probe_lineage_omits_heavy_runtime_thumbnails(self) -> None:
+        payload = _expired_stored_probe_lineage_payload(
+            {
+                "id": "temporary-expired",
+                "channel_id": 7,
+                "temporary": True,
+                "created_at_ms": 1_000,
+                "expires_at_ms": 2_000,
+                "parent_alert_id": "alert-1",
+                "last_hit": {
+                    "timestamp_ms": 1_900,
+                    "pos_score": 0.8,
+                    "thumbnail": "x" * 300_000,
+                },
+                "recent_hits": [
+                    {
+                        "timestamp_ms": 1_900,
+                        "pos_score": 0.8,
+                        "thumbnail": "y" * 300_000,
+                    }
+                ],
+            },
+            now_ms=3_000,
+        )
+
+        record = payload["record"]
+        self.assertNotIn("last_hit", record)
+        self.assertNotIn("recent_hits", record)
+        self.assertEqual(record["runtime_evidence"]["recent_hit_count"], 1)
+        self.assertEqual(
+            record["runtime_evidence"]["last_hit"]["pos_score"],
+            0.8,
+        )
+        self.assertNotIn(
+            "thumbnail",
+            record["runtime_evidence"]["last_hit"],
+        )
+
+    def test_env_precedence_reports_process_difference_without_values(self) -> None:
+        file_secret_hash = hashlib.sha256(b"different-secret").hexdigest()
+        report = _env_precedence_report(
+            file_map={
+                "EVOSSEARCH_LUXRIOT_PASSWORD": "file-secret",
+                "EVOSSEARCH_PORT": "5443",
+            },
+            process_keys={
+                "EVOSSEARCH_LUXRIOT_PASSWORD",
+                "EVOSSEARCH_HOST",
+            },
+            process_value_hashes={
+                "EVOSSEARCH_LUXRIOT_PASSWORD": file_secret_hash,
+            },
+        )
+
+        self.assertEqual(
+            report["different_process_and_file_keys"],
+            ["EVOSSEARCH_LUXRIOT_PASSWORD"],
+        )
+        self.assertIn("EVOSSEARCH_HOST", report["process_environment_keys"])
+        serialized = str(report)
+        self.assertNotIn("file-secret", serialized)
+
     def test_backend_only_endpoints_are_known(self) -> None:
         frontend_paths, backend_routes = _collect_frontend_and_backend_paths()
         backend_only = {
@@ -114,6 +306,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/agent/skills/create",
             "/detections/image",
             "/detections/thumbnail/<int:detection_id>",
+            "/detections/<int:detection_id>/feedback",
             "/detections/diagnostics",
             "/favicon.ico",
             "/health",
@@ -130,9 +323,13 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/image",
             "/image/<path:filepath>",
             "/js/app.js",
+            "/lm/admission",
             "/lm/models",
             "/luxriot/recent_frame/<int:channel_id>",
+            "/luxriot/rollups/l3-schedule",
             "/ready",
+            "/reports/false-positives",
+            "/reports/false-positives/export",
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
@@ -198,6 +395,70 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertTrue(store.records[2]["bookmark_sent"])
         self.assertIn("run-7", store.records[0]["dedupe_key"])
 
+    def test_cv_apex_and_companion_receive_independent_clip_embeddings(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.records: List[Dict[str, Any]] = []
+
+            def add_detections(self, records: List[Dict[str, Any]]) -> int:
+                self.records.extend(records)
+                return len(records)
+
+        store = Store()
+        embedded: List[str] = []
+
+        def embed(thumbnail: Any, embedder: str) -> str:
+            self.assertEqual(embedder, "clip")
+            value = str(thumbnail)
+            embedded.append(value)
+            return f"vec:{value}"
+
+        entry = {
+            "channel_id": 7,
+            "run_id": "run-7",
+            "summary": "Fast movement with a sharper comparison frame.",
+            "frame_count": 1,
+            "created_at": 100.0,
+            "batch_start_ms": 100000,
+            "batch_end_ms": 100999,
+            "archive_frames": [
+                {
+                    "anchor_role": "burst_apex",
+                    "frame_index": 0,
+                    "timestamp_ms": 100300,
+                    "thumbnail": "cv-apex",
+                    "source_frame_index": 2,
+                    "selection_source": "capture_cv_frame_delta",
+                    "selector_enabled": True,
+                },
+                {
+                    "anchor_role": "burst_companion",
+                    "frame_index": 0,
+                    "timestamp_ms": 100600,
+                    "thumbnail": "sharp-companion",
+                    "source_frame_index": 3,
+                    "companion_of_timestamp_ms": 100300,
+                },
+            ],
+        }
+
+        with (
+            patch("oldapp.detections_store", store),
+            patch("oldapp._embed_thumbnail_b64", side_effect=embed),
+            patch("oldapp._apply_archive_retention", return_value={"ok": True}),
+        ):
+            result = _store_vlm_summary_archive_frames(entry)
+
+        self.assertEqual(result["summary_frames"], 2)
+        self.assertEqual(embedded, ["cv-apex", "sharp-companion"])
+        self.assertEqual(
+            [record["clip_vec"] for record in store.records],
+            ["vec:cv-apex", "vec:sharp-companion"],
+        )
+        self.assertTrue(store.records[0]["payload"]["selector_enabled"])
+        self.assertEqual(store.records[0]["payload"]["source_frame_index"], 2)
+        self.assertEqual(store.records[1]["payload"]["source_frame_index"], 3)
+
     def test_vlm_summary_archive_frames_write_one_record_per_alert_event(self) -> None:
         class Store:
             def __init__(self) -> None:
@@ -255,6 +516,18 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual([record["severity"] for record in alert_records], ["info", "low"])
         self.assertEqual(alert_records[0]["payload"]["alert_event"]["title"], "Thumbs up")
         self.assertEqual(alert_records[1]["payload"]["alert_event"]["title"], "Union Jack mug drink")
+        parent_ids = [
+            record["payload"]["parent_alert_id"]
+            for record in alert_records
+        ]
+        self.assertEqual(
+            parent_ids,
+            [
+                record["payload"]["alert_event"]["id"]
+                for record in alert_records
+            ],
+        )
+        self.assertEqual(len(set(parent_ids)), 2)
 
     def test_vlm_alert_archive_anchor_prefers_snapshot_reference(self) -> None:
         class Store:
@@ -355,6 +628,161 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
 
+    def test_detections_list_passes_exact_parent_alert_filter(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?source=vlm_alert&channel_id=7"
+                "&parent_alert_id=vlm-alert-exact"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["parent_alert_id"], "vlm-alert-exact")
+        self.assertEqual(
+            response.get_json()["filters"]["parent_alert_id"],
+            "vlm-alert-exact",
+        )
+
+    def test_local_probe_bookmark_is_suppressed_before_send(self) -> None:
+        with (
+            patch.object(
+                oldapp.luxriot_manager,
+                "is_local_channel",
+                return_value=True,
+            ),
+            patch.object(oldapp.luxriot_manager, "send_bookmark_event") as send,
+            patch("oldapp._embed_thumbnail_b64") as embed,
+        ):
+            sent, gate = oldapp._maybe_send_probe_bookmark(
+                {
+                    "id": "probe-local",
+                    "name": "Local camera watch",
+                    "channel_id": 900001,
+                    "bookmark": True,
+                },
+                {
+                    "timestamp_ms": 1_785_000_000_000,
+                    "pos_score": 0.8,
+                    "neg_score": 0.1,
+                    "margin": 0.7,
+                    "thumbnail": "jpeg",
+                },
+                source="probe_daemon",
+            )
+
+        self.assertFalse(sent)
+        self.assertEqual(gate["reason"], "local_source_no_recorder")
+        send.assert_not_called()
+        embed.assert_not_called()
+
+    def test_detections_list_passes_multiple_channel_filters(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?channel_id=7&channel_id=9&since_ms=1000"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["channel_ids"], [7, 9])
+        self.assertNotIn("channel_id", captured)
+        self.assertEqual(response.get_json()["filters"]["channel_ids"], [7, 9])
+
+    def test_detections_list_can_skip_thumbnail_payload_for_history_reader(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured.update(kwargs)
+                return [], 0
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/detections/list?source=vlm_summary&channel_id=7&since_ms=1000"
+                "&until_ms=2000&include_thumbnail=0&batch_id=vlm-test-batch"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertFalse(captured["include_thumbnail"])
+        self.assertEqual(captured["batch_id"], "vlm-test-batch")
+        self.assertFalse(response.get_json()["filters"]["include_thumbnail"])
+        self.assertEqual(response.get_json()["filters"]["batch_id"], "vlm-test-batch")
+
+    def test_luxriot_history_returns_compact_postgres_batch_page(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class Store:
+            def list_vlm_summary_batches(self, **kwargs):
+                captured.update(kwargs)
+                return [
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-a",
+                        "created_at": 2.0,
+                        "batch_start_ms": 1000,
+                        "batch_end_ms": 2000,
+                        "summary": "A person crossed the road.",
+                    }
+                ], 3
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/luxriot/history?channel_id=7&from_ts=1&to_ts=2&limit=1&offset=0"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["storage"], "postgres")
+        self.assertEqual(payload["run"], "all")
+        self.assertEqual(payload["total"], 3)
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["logs"][0]["summary"], "A person crossed the road.")
+        self.assertEqual(captured["since_ms"], 1000)
+        self.assertEqual(captured["until_ms"], 2000)
+
+    def test_luxriot_rollup_api_never_exposes_internal_memory_or_signal_digest(self) -> None:
+        rollup_payload = {
+            "channel_id": 7,
+            "routine_context": {"routine": "internal homeostasis"},
+            "levels": {
+                "L1": [
+                    {
+                        "rollup_id": "l1-7",
+                        "summary": "### Period Overview\nRoutine window.",
+                        "operator_summary": "### Period Overview\nRoutine window.",
+                        "memory_update": {"routine_baseline": "internal homeostasis"},
+                        "signal_digest": {"watchlist": ["internal item"]},
+                        "highlights": ["internal source excerpt"],
+                        "llm_input_stats": {"source_chars_selected": 100},
+                    }
+                ]
+            },
+        }
+        with patch("oldapp.luxriot_manager.summary_rollups", return_value=rollup_payload):
+            response = self.client.get("/luxriot/rollups?channel_id=7&target_level=L1")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertNotIn("routine_context", payload)
+        row = payload["levels"]["L1"][0]
+        self.assertEqual(row["summary"], "### Period Overview\nRoutine window.")
+        self.assertNotIn("operator_summary", row)
+        self.assertNotIn("memory_update", row)
+        self.assertNotIn("signal_digest", row)
+        self.assertNotIn("highlights", row)
+        self.assertNotIn("llm_input_stats", row)
+
     def test_detections_list_normalizes_probe_source_aliases(self) -> None:
         captured: Dict[str, Any] = {}
 
@@ -373,6 +801,54 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["since_ms"], 1000)
         self.assertEqual(captured["until_ms"], 2000)
         self.assertEqual(response.get_json()["filters"]["source"], "probe")
+
+    def test_detections_list_rejects_unknown_source_filter(self) -> None:
+        class Store:
+            def list_detections(self, **_kwargs):
+                raise AssertionError("invalid source must not reach the archive store")
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get("/detections/list?source=everything")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "source must be one of: semantic_snapshot, probe, vlm_summary, vlm_alert"},
+        )
+
+    def test_detections_summary_rejects_unknown_source_filter(self) -> None:
+        class Store:
+            def summarize_by_probe(self, **_kwargs):
+                raise AssertionError("invalid source must not reach the archive store")
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get("/detections/summary?source=everything")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "source must be one of: semantic_snapshot, probe, vlm_summary, vlm_alert"},
+        )
+
+    def test_detection_routes_keep_empty_source_as_no_filter(self) -> None:
+        captured_sources = []
+
+        class Store:
+            def list_detections(self, **kwargs):
+                captured_sources.append(kwargs.get("source"))
+                return [], 0
+
+            def summarize_by_probe(self, **kwargs):
+                captured_sources.append(kwargs.get("source"))
+                return []
+
+        with patch("oldapp.detections_store", Store()):
+            list_response = self.client.get("/detections/list?source=%20")
+            summary_response = self.client.get("/detections/summary?source=")
+
+        self.assertEqual(list_response.status_code, 200, list_response.get_json())
+        self.assertEqual(summary_response.status_code, 200, summary_response.get_json())
+        self.assertEqual(captured_sources, [None, None])
 
     def test_detection_text_search_passes_archive_source_filter(self) -> None:
         captured: Dict[str, Any] = {}
@@ -398,6 +874,159 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
+
+    def test_detection_text_search_accepts_continuous_clip_archive(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        def _search(**kwargs):
+            captured.update(kwargs)
+            return [], {"search_strategy": "hourly_sharded_exact"}
+
+        with (
+            patch("oldapp.get_clip_text_embedding", return_value=object()),
+            patch("oldapp._search_detections_archive", side_effect=_search),
+        ):
+            response = self.client.post(
+                "/detections/search_text",
+                json={
+                    "query": "person near entrance",
+                    "source": "semantic_snapshot",
+                    "channel_ids": [7, 8],
+                    "hours": 24,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured["source"], "semantic_snapshot")
+        self.assertEqual(captured["channel_ids"], [7, 8])
+        self.assertEqual(
+            response.get_json()["coverage"]["search_strategy"],
+            "hourly_sharded_exact",
+        )
+
+    def test_continuous_clip_search_ranks_every_matching_shard(self) -> None:
+        class Index:
+            def __init__(self, name):
+                self.name = name
+                self.d = 2
+
+        rows = {
+            1: {
+                "id": 1,
+                "timestamp_ms": 1_000,
+                "probe_id": "semantic-snapshot:ch7",
+                "probe_name": "Semantic snapshot",
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "shard_key": "semantic:ch7:1970010100",
+            },
+            2: {
+                "id": 2,
+                "timestamp_ms": 2_000,
+                "probe_id": "semantic-snapshot:ch7",
+                "probe_name": "Semantic snapshot",
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "shard_key": "semantic:ch7:1970010100",
+            },
+            3: {
+                "id": 3,
+                "timestamp_ms": 3_000,
+                "probe_id": "semantic-snapshot:ch8",
+                "probe_name": "Semantic snapshot",
+                "channel_id": 8,
+                "source": "semantic_snapshot",
+                "shard_key": "semantic:ch8:1970010100",
+            },
+            4: {
+                "id": 4,
+                "timestamp_ms": 4_000,
+                "probe_id": "semantic-snapshot:ch8",
+                "probe_name": "Semantic snapshot",
+                "channel_id": 8,
+                "source": "semantic_snapshot",
+                "shard_key": "semantic:ch8:1970010100",
+            },
+        }
+
+        class Store:
+            def summarize_shards(self, **_kwargs):
+                return [
+                    {
+                        "shard_key": "semantic:ch7:1970010100",
+                        "clip_count": 2,
+                    },
+                    {
+                        "shard_key": "semantic:ch8:1970010100",
+                        "clip_count": 2,
+                    },
+                ]
+
+            def fetch_detections_by_ids(
+                self,
+                ids,
+                *,
+                include_vectors=False,
+                include_thumbnail=False,
+            ):
+                return [dict(rows[item]) for item in ids if item in rows]
+
+        indexes = {
+            "semantic:ch7:1970010100": (
+                Index("ch7"),
+                oldapp.np.asarray([1, 2], dtype=oldapp.np.int64),
+            ),
+            "semantic:ch8:1970010100": (
+                Index("ch8"),
+                oldapp.np.asarray([3, 4], dtype=oldapp.np.int64),
+            ),
+        }
+
+        def search(index, _query, k):
+            if index.name == "ch7":
+                scores = [0.8, 0.7]
+            else:
+                scores = [0.95, 0.6]
+            return (
+                oldapp.np.asarray([scores[:k]], dtype=oldapp.np.float32),
+                oldapp.np.asarray(
+                    [list(range(min(k, len(scores))))],
+                    dtype=oldapp.np.int64,
+                ),
+            )
+
+        with (
+            patch("oldapp.detections_store", Store()),
+            patch.object(
+                oldapp.detection_clip_shard_cache,
+                "get",
+                side_effect=lambda key: indexes[key],
+            ),
+            patch("oldapp._faiss_search", side_effect=search),
+        ):
+            results, coverage = oldapp._search_semantic_snapshot_shards(
+                clip_query_vec=oldapp.np.asarray(
+                    [1.0, 0.0],
+                    dtype=oldapp.np.float32,
+                ),
+                dino_query_vec=None,
+                mode="clip",
+                probe_id=None,
+                channel_id=None,
+                channel_ids=[7, 8],
+                since_ms=0,
+                until_ms=5_000,
+                limit=2,
+                sort_by="similarity",
+            )
+
+        self.assertEqual(
+            [item["detection_id"] for item in results],
+            [3, 1],
+        )
+        self.assertEqual(coverage["scanned_candidates"], 4)
+        self.assertEqual(coverage["shards_searched"], 2)
+        self.assertFalse(coverage["truncated"])
 
     def test_detection_search_result_preserves_vlm_payload_for_review(self) -> None:
         result = _build_detection_search_result(

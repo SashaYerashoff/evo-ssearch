@@ -69,8 +69,9 @@ prompt settings, desired live sessions, and summary state (see
 - **Alert Criteria** (`alert_policy_prompt`) is the plain-language per-channel or
   default watch policy. Put "watch for / alert on" conditions here, not in the
   L0 stream prompt.
-- The structured `ALERTS_JSON` / `json_alert_prompt` template is only the
-  machine-readable alert-output contract, not the place for operator criteria.
+- The legacy-named `json_alert_prompt` setting stores the unified
+  `BATCH_STATE_JSON` contract for cover, continuity, memory, observations, and
+  alerts. It is not the place for operator criteria.
 - These fields are editable per-channel or as defaults (Settings, or agent
   `update_prompt_settings` — preview-only in secure mode). If `prompt_health`
   reports legacy alert/watch text in the stream prompt, preview

@@ -12,6 +12,7 @@ BACKUP_DIR=""
 RESTORE_DB=false
 RUN_VERIFY=true
 START_SERVICE=true
+MODE="system"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -42,6 +43,8 @@ Usage: sudo scripts/rollback.sh [options]
 
 Options:
   --backup-dir DIR    Backup directory. Default: value from /var/backups/eva-ai/LATEST.
+  --backup-root DIR   Backup root containing LATEST.
+  --user              Use the current user's systemd manager (rehearsal mode).
   --app-dir DIR       Target app directory. Default: /opt/eva-ai/evo-ssearch.
   --env-file FILE     Runtime env file. Default: /etc/eva-ai/eva-ai.env.
   --service NAME      systemd service name. Default: eva-ai.
@@ -59,6 +62,14 @@ while [[ $# -gt 0 ]]; do
     --backup-dir)
       BACKUP_DIR="$2"
       shift 2
+      ;;
+    --backup-root)
+      BACKUP_ROOT="$2"
+      shift 2
+      ;;
+    --user)
+      MODE="user"
+      shift
       ;;
     --app-dir)
       APP_DIR="$2"
@@ -102,8 +113,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${EUID}" -ne 0 ]]; then
+if [[ "${MODE}" == "system" && "${EUID}" -ne 0 ]]; then
   die "Run this script with sudo/root so it can restore /etc, /opt, and systemd state."
+fi
+
+if [[ "${MODE}" == "user" ]]; then
+  SYSTEMCTL=(systemctl --user)
+else
+  SYSTEMCTL=(systemctl)
 fi
 
 if [[ -z "${BACKUP_DIR}" ]]; then
@@ -134,8 +151,8 @@ read_env_var() {
 }
 
 service_exists() {
-  systemctl list-unit-files "${SERVICE_NAME}.service" --no-legend >/dev/null 2>&1 \
-    || systemctl status "${SERVICE_NAME}.service" >/dev/null 2>&1
+  "${SYSTEMCTL[@]}" list-unit-files "${SERVICE_NAME}.service" --no-legend >/dev/null 2>&1 \
+    || "${SYSTEMCTL[@]}" status "${SERVICE_NAME}.service" >/dev/null 2>&1
 }
 
 run_as_user() {
@@ -152,7 +169,7 @@ run_as_user() {
 
 if service_exists; then
   log "Stopping ${SERVICE_NAME}"
-  systemctl stop "${SERVICE_NAME}.service" || true
+  "${SYSTEMCTL[@]}" stop "${SERVICE_NAME}.service" || true
   ok "stopped ${SERVICE_NAME}"
 else
   warn "service ${SERVICE_NAME} not found"
@@ -185,10 +202,20 @@ APP_BASE="$(basename "${APP_DIR}")"
 REPLACED_ARCHIVE="${APP_PARENT}/${APP_BASE}.rollback-current-code-$(date +%Y%m%d-%H%M%S).tgz"
 if [[ -e "${APP_DIR}" ]]; then
   tar \
-    --exclude="${APP_BASE}/.venv" \
+    --exclude="${APP_BASE}/.git" \
+    --exclude="${APP_BASE}/*/.git" \
+    --exclude="${APP_BASE}/.local" \
+    --exclude="${APP_BASE}/*/.local" \
+    --exclude="${APP_BASE}/.venv*" \
+    --exclude="${APP_BASE}/*/.venv*" \
+    --exclude="${APP_BASE}/.env" \
+    --exclude="${APP_BASE}/.env.*" \
+    --exclude="${APP_BASE}/dist" \
+    --exclude="${APP_BASE}/*/dist" \
     --exclude="${APP_BASE}/__pycache__" \
     --exclude="${APP_BASE}/.pytest_cache" \
     --exclude="${APP_BASE}/node_modules" \
+    --exclude="${APP_BASE}/*/node_modules" \
     --exclude="${APP_BASE}/detections_archive" \
     --exclude="${APP_BASE}/video" \
     --exclude="${APP_BASE}/models" \
@@ -197,15 +224,28 @@ if [[ -e "${APP_DIR}" ]]; then
     --exclude="${APP_BASE}/*.mov" \
     --exclude="${APP_BASE}/*.mkv" \
     --exclude="${APP_BASE}/probes_store.json" \
+    --exclude="${APP_BASE}/probe_channel_groups.json" \
     --exclude="${APP_BASE}/luxriot_summary_state.json" \
     --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
+    --exclude="${APP_BASE}/*.sqlite3" \
+    --exclude="${APP_BASE}/*.db" \
+    --exclude="${APP_BASE}/*.log" \
     -czf "${REPLACED_ARCHIVE}" \
     -C "${APP_PARENT}" "${APP_BASE}"
   ok "captured current app code at ${REPLACED_ARCHIVE}"
 fi
 mkdir -p "${APP_PARENT}"
-tar -xzf "${BACKUP_DIR}/code.tgz" -C "${APP_PARENT}"
-ok "restored code from backup without moving runtime data directories"
+RESTORE_HELPER="${SCRIPT_DIR}/restore_code_snapshot.py"
+[[ -f "${RESTORE_HELPER}" ]] || die "restore helper not found: ${RESTORE_HELPER}"
+if [[ -x "${APP_DIR}/.venv/bin/python" ]]; then
+  RESTORE_PYTHON="${APP_DIR}/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  RESTORE_PYTHON="$(command -v python3)"
+else
+  die "Python is required for safe code rollback"
+fi
+"${RESTORE_PYTHON}" "${RESTORE_HELPER}" --archive "${BACKUP_DIR}/code.tgz" --app-dir "${APP_DIR}"
+ok "restored exact code snapshot while preserving runtime data"
 
 if [[ "${RESTORE_DB}" == true ]]; then
   [[ "${EVA_PATCH_CONFIRM_DB_RESTORE:-}" == "yes" ]] || die "Database restore requires EVA_PATCH_CONFIRM_DB_RESTORE=yes"
@@ -237,10 +277,10 @@ else
   warn "database restore not requested; PostgreSQL left unchanged"
 fi
 
-systemctl daemon-reload || true
+"${SYSTEMCTL[@]}" daemon-reload || true
 if [[ "${START_SERVICE}" == true ]]; then
   log "Starting ${SERVICE_NAME}"
-  systemctl start "${SERVICE_NAME}.service"
+  "${SYSTEMCTL[@]}" start "${SERVICE_NAME}.service"
   sleep "${EVA_PATCH_START_WAIT_SECONDS:-10}"
   ok "started ${SERVICE_NAME}"
 fi

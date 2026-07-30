@@ -6,9 +6,11 @@ from agent_security import (
     AuditUnavailableError,
     ChannelAccessDeniedError,
     InvalidToolArgumentsError,
+    PermissionDeniedError,
     ToolExecutionContext,
 )
 from agent_security.eva_adapter import EvaAgentToolAdapter
+from deployment_workflow import ProtocolDeploymentStore
 from security import Permission
 
 
@@ -35,6 +37,8 @@ class _LegacyTools:
         self._trusted = None
         self.seen_trusted = None
         self.fail_name = None
+        self.results = {}
+        self._deployment_store = ProtocolDeploymentStore()
 
     def _set_trusted_permissions(self, permissions):
         self._trusted = frozenset(str(item) for item in (permissions or ()))
@@ -47,6 +51,8 @@ class _LegacyTools:
         self.seen_trusted = self._trusted
         if name == self.fail_name:
             raise RuntimeError("boom")
+        if name in self.results:
+            return self.results[name]
         if name == "list_channels":
             return {
                 "count": 2,
@@ -115,6 +121,67 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             frozenset({Permission.AGENT_USE.value, Permission.DETECTIONS_VIEW.value}),
         )
         self.assertNotIn("users:manage", self.legacy.seen_trusted)
+
+    def test_video_summary_security_boundary_preserves_entries_and_image_urls(self):
+        self.legacy.results["get_video_summaries"] = {
+            "channel_id": 7,
+            "count": 25,
+            "coverage": {
+                "status": "truncated",
+                "windows": [
+                    {"index": index, "status": "covered", "metadata": {"source": "L0"}}
+                    for index in range(300)
+                ],
+            },
+            "entries": [
+                {"time": f"10:{index:02d}", "summary": f"summary {index}"}
+                for index in range(25)
+            ],
+            "evidence_frames": [
+                {
+                    "id": 501,
+                    "detection_id": 501,
+                    "channel_id": 7,
+                    "image_url": "/detections/thumbnail/501",
+                }
+            ],
+        }
+
+        result = self.adapter.execute(
+            "get_video_summaries",
+            {"channel_id": 7, "limit": 25, "include_evidence_frames": True},
+            self.context,
+        )
+
+        self.assertEqual(len(result["entries"]), 25)
+        self.assertEqual(result["evidence_frames"][0]["image_url"], "/detections/thumbnail/501")
+        self.assertNotIn("_truncated", result)
+
+    def test_summary_restore_is_preview_only_and_scoped_to_authorized_channels(self):
+        schemas = {
+            item["function"]["name"]: item
+            for item in self.adapter.available_tool_schemas(self.context)
+        }
+        preview = schemas["restore_video_summary_history"]["function"]["parameters"]["properties"]["preview"]
+        self.assertEqual(preview["enum"], [True])
+
+        result = self.adapter.execute(
+            "restore_video_summary_history",
+            {"relative_range": "last two weeks", "preview": True},
+            self.context,
+        )
+
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+        self.assertTrue(result["arguments"]["preview"])
+
+        self.assertNotIn("get_video_summary_restore_status", schemas)
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "get_video_summary_restore_status",
+                {},
+                self.context,
+            )
 
     def test_trusted_permissions_are_cleared_after_tool_exception(self):
         self.legacy.fail_name = "lookup_help"
@@ -217,6 +284,85 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             "properties"
         ]["preview"]
         self.assertEqual(preview["enum"], [True])
+        deployment_apply = schemas["apply_deployment_plan"]["function"][
+            "parameters"
+        ]["properties"]["preview"]
+        self.assertEqual(deployment_apply["enum"], [True])
+
+    def test_deployment_scope_is_resolved_before_dispatch(self):
+        result = self.adapter.execute(
+            "start_deployment",
+            {"target_channel_count": 8},
+            self.context,
+        )
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+
+        state = self.legacy._deployment_store.start(
+            [{"id": 7, "title": "Door"}, {"id": 8, "title": "Yard"}],
+            resume_latest=False,
+        )
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "configure_deployment",
+                {
+                    "deployment_id": state["deployment_id"],
+                    "channel_ids": [8],
+                },
+                self.context,
+            )
+
+    def test_counted_metric_profile_is_channel_scoped(self):
+        self.legacy._deployment_store.save_counted_profiles(
+            [
+                {
+                    "id": "metric-yard",
+                    "name": "Yard occupancy",
+                    "channel_id": 8,
+                }
+            ]
+        )
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "query_counted_state_metric",
+                {"metric_id": "metric-yard"},
+                self.context,
+            )
+
+    def test_deployment_apply_requires_all_composite_permissions(self):
+        state = self.legacy._deployment_store.start(
+            [{"id": 7, "title": "Door"}],
+            resume_latest=False,
+        )
+        self.legacy._deployment_store.configure(
+            state["deployment_id"],
+            channel_ids=[7],
+        )
+        missing_capture = ToolExecutionContext(
+            actor_id=self.context.actor_id,
+            tenant_id=self.context.tenant_id,
+            roles={"admin"},
+            permissions={
+                permission.value
+                for permission in Permission
+                if permission is not Permission.CAPTURE_MANAGE
+            },
+            allowed_channel_ids={"7"},
+        )
+
+        with self.assertRaises(PermissionDeniedError) as raised:
+            self.adapter.execute(
+                "apply_deployment_plan",
+                {
+                    "deployment_id": state["deployment_id"],
+                    "preview": True,
+                },
+                missing_capture,
+            )
+
+        self.assertIn(
+            Permission.CAPTURE_MANAGE.value,
+            raised.exception.details["missing_permissions"],
+        )
 
     def test_list_results_are_filtered_to_channel_grants(self):
         channels = self.adapter.execute("list_channels", {}, self.context)

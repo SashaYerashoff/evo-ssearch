@@ -1,5 +1,8 @@
 import json
+import time
 import unittest
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
 
 import agent
 from agent import (
@@ -8,14 +11,24 @@ from agent import (
     _LMResponse,
     _ToolCall,
     _compact_tool_result_for_model,
+    _compact_tool_messages_for_context_budget,
+    _coalesce_system_messages,
+    _context_budget_snapshot,
+    _filter_streamed_tool_markup,
+    _parse_text_tool_calls,
+    _select_relevant_tool_schemas,
+    _seed_turn_tool_context,
+    _apply_turn_tool_context,
+    _AgentLMClient,
 )
 from agent_security import ToolExecutionContext
 
 
 class _FakeStore:
-    def __init__(self, history=None) -> None:
+    def __init__(self, history=None, research_state=None) -> None:
         self.messages = []
         self.history = history
+        self.research_state = research_state
 
     def session_exists(self, _session_id, **_owner):
         return True
@@ -34,16 +47,29 @@ class _FakeStore:
             return list(self.history)
         return [{"role": "user", "content": "test"}]
 
+    def load_research_state(self, _session_id, **_owner):
+        return self.research_state
+
+    def save_research_state(self, _session_id, state, **_owner):
+        self.research_state = dict(state)
+
 
 class _FakeLMClient:
-    def __init__(self, tool_rounds: int, tool_name: str = "list_channels") -> None:
+    def __init__(
+        self,
+        tool_rounds: int,
+        tool_name: str = "list_channels",
+        *,
+        distinct_args: bool = False,
+    ) -> None:
         self.remaining = tool_rounds
         self.tool_name = tool_name
+        self.distinct_args = distinct_args
         self.tools = None
         self.final_messages = None
         self.tool_call_messages = []
 
-    def call_with_tools(self, _messages, tools=None):
+    def call_with_tools(self, _messages, tools=None, cancel_event=None):
         self.tools = tools
         self.tool_call_messages.append(list(_messages))
         if self.remaining > 0:
@@ -56,13 +82,13 @@ class _FakeLMClient:
                     _ToolCall(
                         id=f"call-{round_number}",
                         name=self.tool_name,
-                        args={},
+                        args={"round": round_number} if self.distinct_args else {},
                     )
                 ],
             )
         return _LMResponse(content="done", finish_reason="stop", tool_calls=[])
 
-    def stream_text(self, messages):
+    def stream_text(self, messages, cancel_event=None):
         self.final_messages = list(messages)
         yield "done"
 
@@ -70,10 +96,12 @@ class _FakeLMClient:
 class _FakeTools:
     def __init__(self, result=None) -> None:
         self.calls = 0
+        self.call_args = []
         self.result = result
 
     def execute(self, name, args, progress_cb=None):
         self.calls += 1
+        self.call_args.append((name, dict(args)))
         if self.result is not None:
             return self.result
         return {"name": name, "args": args, "count": self.calls}
@@ -125,6 +153,842 @@ class _FakeApprovalTools:
 
 
 class AgentToolLoopTests(unittest.TestCase):
+    def test_system_messages_are_coalesced_at_front_for_strict_chat_templates(self):
+        messages = [
+            {"role": "system", "content": "base rules"},
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "list_channels", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "list_channels",
+                "content": "{}",
+            },
+            {"role": "system", "content": "trusted turn ledger"},
+        ]
+
+        normalized = _coalesce_system_messages(messages)
+
+        self.assertEqual(normalized[0], {
+            "role": "system",
+            "content": "base rules\n\ntrusted turn ledger",
+        })
+        self.assertEqual([item["role"] for item in normalized], [
+            "system", "user", "assistant", "tool",
+        ])
+        self.assertEqual(messages[-1]["role"], "system")
+
+    def test_tool_schemas_are_routed_by_operator_intent(self):
+        def names(query, *, inventory_complete=False):
+            context = _seed_turn_tool_context(query)
+            if inventory_complete:
+                context["video_inventory_completed"] = True
+            return {
+                row["function"]["name"]
+                for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+            }
+
+        self.assertEqual(names("Hello, introduce yourself"), set())
+        self.assertEqual(
+            names("Show current active streams, models, queues and dropped frames"),
+            {"list_video_summary_channels"},
+        )
+        self.assertEqual(
+            names("Show recent VLM alerts and notable video-summary events for the last hour"),
+            {"normalize_time_window", "list_video_summary_channels"},
+        )
+        detailed = names(
+            "Show recent VLM alerts and notable video-summary events for the last hour",
+            inventory_complete=True,
+        )
+        self.assertIn("get_video_summaries", detailed)
+        self.assertIn("describe_frame", detailed)
+        self.assertNotIn("create_probe", detailed)
+        self.assertNotIn("update_prompt_settings", detailed)
+        self.assertEqual(
+            names("How do I open the archive review?"),
+            {"lookup_help"},
+        )
+        probe_tools = names("Create a CLIP probe on channel #112 for a visible lighter flame")
+        self.assertIn("create_probe", probe_tools)
+        self.assertIn("calibrate_probe_from_archive", probe_tools)
+        self.assertNotIn("get_video_summaries", probe_tools)
+        self.assertEqual(
+            names("Hi, Protocol: Deploy, target 8 channels"),
+            {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+                "query_counted_state_metric",
+            },
+        )
+        self.assertEqual(
+            names("How many times did the person leave the workstation?"),
+            {"normalize_time_window", "query_counted_state_metric"},
+        )
+
+    def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
+        initial = _seed_turn_tool_context(
+            "Hi! Tell me about what happend this night"
+        )
+        self.assertIn("video_research", initial["tool_intents"])
+
+        followup = _seed_turn_tool_context("2. the las 24 hours.")
+        agent._inherit_followup_tool_context(
+            followup,
+            "2. the las 24 hours.",
+            [
+                {
+                    "role": "user",
+                    "content": "Hi! Tell me about what happend this night",
+                },
+                {"role": "assistant", "content": "Which period?"},
+            ],
+        )
+        self.assertIn("video_research", followup["tool_intents"])
+        self.assertEqual(followup["operator_relative_range"], "last 24 hours")
+        self.assertTrue(followup["inherited_operator_intent"])
+
+        continued = _seed_turn_tool_context("continue")
+        agent._inherit_followup_tool_context(
+            continued,
+            "continue",
+            [
+                {
+                    "role": "user",
+                    "content": "Hi! Tell me about what happend this night",
+                },
+                {"role": "assistant", "content": "Which period?"},
+                {"role": "user", "content": "2. the las 24 hours."},
+                {"role": "assistant", "content": "I will normalize it."},
+            ],
+        )
+        self.assertIn("video_research", continued["tool_intents"])
+        self.assertEqual(continued["operator_relative_range"], "last 24 hours")
+
+    def test_video_period_research_executes_required_reads_before_model_narrative(self):
+        class ResearchTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                window = {
+                    "from_ts": 100.0,
+                    "to_ts": 86_500.0,
+                    "since_ms": 100_000,
+                    "until_ms": 86_500_000,
+                    "duration_sec": 86_400,
+                    "relative_range": "last 24 hours",
+                }
+                if name == "normalize_time_window":
+                    return dict(window)
+                if name == "list_video_summary_channels":
+                    return {
+                        "time_window": dict(window),
+                        "requested_channel_ids": [112, 118],
+                        "checked_channel_ids": [112, 118],
+                        "candidate_channels": [
+                            {"channel_id": 112, "summary_count": 10},
+                            {"channel_id": 118, "summary_count": 20},
+                        ],
+                        "inactive_channel_ids": [],
+                        "deferred_channel_ids": [],
+                        "unchecked_channel_ids": [],
+                        "errors": [],
+                        "active_count": 2,
+                        "inactive_count": 0,
+                        "error_count": 0,
+                    }
+                if name == "get_video_summaries":
+                    return {
+                        "channel_id": args["channel_id"],
+                        "depth": args["depth"],
+                        "time_window": dict(window),
+                        "count": 1,
+                        "total_in_window": 1,
+                        "coverage": {"status": "covered"},
+                        "entries": [{"summary": "observed activity"}],
+                    }
+                raise AssertionError(name)
+
+        history = [
+            {
+                "role": "user",
+                "content": "Hi! Tell me about what happend this night",
+            },
+            {"role": "assistant", "content": "Which period?"},
+            {"role": "user", "content": "2. the las 24 hours."},
+        ]
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(history=history)
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = ResearchTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "2. the las 24 hours.",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            [
+                "normalize_time_window",
+                "list_video_summary_channels",
+                "get_video_summaries",
+                "get_video_summaries",
+            ],
+        )
+        self.assertEqual(runner._tools.call_args[0][1]["relative_range"], "last 24 hours")
+        self.assertEqual(runner._tools.call_args[2][1]["depth"], "L2")
+        self.assertEqual(runner._tools.call_args[3][1]["channel_id"], 118)
+        self.assertEqual(
+            sum(event.get("type") == "tool_call" for event in events),
+            4,
+        )
+        self.assertTrue(
+            any(event.get("type") == "research_plan_complete" for event in events)
+        )
+        self.assertEqual(runner._lm_client.tool_call_messages, [])
+
+    def test_duplicate_video_read_is_suppressed_and_stops_tool_loop(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=10,
+            tool_name="get_video_summaries",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "channel_id": 112,
+                "depth": "L1",
+                "count": 1,
+                "total_in_window": 1,
+                "coverage": {"status": "covered"},
+                "entries": [{"summary": "stable result"}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Inspect video coverage for channel #112",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 1)
+        self.assertEqual(
+            sum(event.get("type") == "tool_call" for event in events),
+            2,
+        )
+        guard = next(
+            event for event in events if event.get("type") == "tool_loop_guard"
+        )
+        self.assertEqual(guard["reason"], "duplicate_read")
+        duplicate_result = [
+            event
+            for event in events
+            if event.get("type") == "tool_result"
+        ][-1]
+        self.assertTrue(duplicate_result["result"]["duplicate_suppressed"])
+
+    def test_activated_runbook_tools_pass_the_intent_gate(self):
+        query = "проверь канал 115, был ли почтальон вчера вечером?"
+        context = _seed_turn_tool_context(query)
+        # Without the runbook the RU phrasing matches no intent group.
+        bare = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        self.assertEqual(bare, [])
+
+        slugs = agent._extract_requested_skill_slugs(query)
+        self.assertIn("video_event_check", slugs)
+        skill_tools = agent._skill_tool_names(slugs)
+        self.assertIn("get_video_summaries", skill_tools)
+        self.assertIn("describe_frame", skill_tools)
+
+        context["skill_tool_names"] = sorted(skill_tools)
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        }
+        self.assertTrue(skill_tools.issubset(exposed))
+
+    def test_skill_tool_names_ignores_unknown_and_stays_in_schema_envelope(self):
+        self.assertEqual(agent._skill_tool_names([]), set())
+        self.assertEqual(agent._skill_tool_names(["no_such_runbook"]), set())
+        # Names never leave the provided (permission-filtered) schema list.
+        context = _seed_turn_tool_context("привет! как дела?")
+        context["skill_tool_names"] = ["get_video_summaries", "not_a_real_tool"]
+        permitted = [
+            row
+            for row in agent._TOOL_SCHEMAS
+            if row["function"]["name"] == "lookup_help"
+        ]
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(permitted, context)
+        }
+        self.assertEqual(exposed, set())
+
+    def test_protocol_deploy_trigger_activates_only_composite_workflow_tools(self):
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "Hi, Protocol: Deploy, target 8 channels"
+            ),
+            ["protocol_deploy"],
+        )
+        names = agent._skill_tool_names(["protocol_deploy"])
+        self.assertTrue(
+            {
+                "start_deployment",
+                "configure_deployment",
+                "survey_deployment",
+                "apply_deployment_plan",
+                "get_deployment_status",
+                "query_counted_state_metric",
+            }.issubset(names)
+        )
+        self.assertTrue(
+            {
+                "survey_channels",
+                "update_prompt_settings",
+                "create_probe",
+            }.isdisjoint(names)
+        )
+
+    def test_all_runbooks_have_bounded_explicit_tool_envelopes(self):
+        expected = {
+            "archive_research": {
+                "normalize_time_window", "search_archive", "get_detections",
+                "build_research_batch", "describe_frame",
+            },
+            "cross_channel_correlation": {
+                "normalize_time_window", "get_video_summaries", "get_detections",
+                "get_visual_window_signals", "describe_frame",
+            },
+            "multi_channel_event_sweep": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame",
+            },
+            "probe_tuning": {
+                "list_probes", "get_detection_summary",
+                "prepare_probe_calibration_batch", "calibrate_probe_from_archive",
+                "build_research_batch", "get_video_summaries", "describe_frame",
+                "create_probe", "update_probe",
+            },
+            "prompt_tuning": {
+                "normalize_time_window", "get_prompt_settings",
+                "get_video_summaries", "get_detections",
+                "update_prompt_settings",
+            },
+            "protocol_deploy": {
+                "start_deployment", "configure_deployment", "survey_deployment",
+                "apply_deployment_plan", "get_deployment_status",
+                "normalize_time_window", "query_counted_state_metric",
+            },
+            "video_event_check": {
+                "normalize_time_window", "get_video_summaries",
+                "get_visual_window_signals", "search_archive",
+                "get_detections", "describe_frame",
+            },
+            "video_incident_timeline": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame",
+            },
+            "video_summary_review": {
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_visual_window_signals",
+                "get_detections", "describe_frame", "search_archive",
+            },
+        }
+
+        for slug, tool_names in expected.items():
+            with self.subTest(slug=slug):
+                self.assertEqual(agent._skill_tool_names([slug]), tool_names)
+                context = _seed_turn_tool_context(f'use playbook "{slug}"')
+                context["active_skill_slugs"] = [slug]
+                context["skill_tool_names"] = sorted(tool_names)
+                context["video_inventory_completed"] = True
+                schemas = _select_relevant_tool_schemas(
+                    agent._TOOL_SCHEMAS,
+                    context,
+                )
+                exposed = {row["function"]["name"] for row in schemas}
+                self.assertEqual(exposed, tool_names)
+                budget = _context_budget_snapshot(
+                    [{"role": "user", "content": "audit"}],
+                    tool_schemas=schemas,
+                    context_policy=agent._context_budget_policy(32768),
+                )
+                self.assertLess(budget["tool_schema_estimated_tokens"], 8_000)
+                self.assertLessEqual(agent._turn_tool_call_limit(context), 16)
+
+    def test_runbook_trigger_matching_does_not_activate_singular_substring(self):
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "check channels for smoke during the last hour"
+            ),
+            ["multi_channel_event_sweep"],
+        )
+        self.assertEqual(
+            agent._extract_requested_skill_slugs(
+                "check channel #118 for smoke during the last hour"
+            ),
+            ["video_event_check"],
+        )
+
+    def test_evidence_playbooks_are_not_stopped_after_overview_map(self):
+        base = {
+            "video_overview_request": True,
+            "video_inventory_completed": True,
+            "video_inventory_requires_confirmation": False,
+            "video_candidate_channel_ids": [118],
+            "video_detail_completed_channel_ids": [118],
+        }
+        self.assertTrue(agent._video_overview_research_plan_completed(base))
+        for slug in (
+            "cross_channel_correlation",
+            "multi_channel_event_sweep",
+            "video_event_check",
+            "video_incident_timeline",
+        ):
+            with self.subTest(slug=slug):
+                self.assertFalse(
+                    agent._video_overview_research_plan_completed(
+                        {**base, "active_skill_slugs": [slug]}
+                    )
+                )
+
+    def test_write_tool_compaction_returns_stable_preview_envelope(self):
+        raw = {
+            "status": "preview",
+            "action": "create",
+            "exists": False,
+            "proposed": {"name": "visible fire or smoke", "channel_id": 7},
+            "conflicts": [{"id": f"p{i}", "name": f"probe {i}"} for i in range(12)],
+            "approval": {
+                "plan_id": "plan-123",
+                "action": "create_probe",
+                "expires_at": "2026-07-19T20:00:00+00:00",
+                "required_permission": "probes:manage",
+            },
+        }
+        compact = _compact_tool_result_for_model("create_probe", raw)
+        self.assertEqual(compact["status"], "preview")
+        self.assertEqual(compact["channel_id"], 7)
+        self.assertEqual(len(compact["conflicts"]), 8)
+        self.assertNotIn("approval", compact)
+        self.assertEqual(compact["action_plan"]["plan_id"], "plan-123")
+        self.assertEqual(compact["action_plan"]["status"], "awaiting_ui_apply")
+
+        deleted = _compact_tool_result_for_model(
+            "delete_probes",
+            {"status": "applied", "delete_all": False, "deleted": 2,
+             "targets": [{"id": "p1"}, {"id": "p2"}]},
+        )
+        self.assertEqual(deleted["deleted"], 2)
+        self.assertEqual(len(deleted["targets"]), 2)
+        self.assertNotIn("action_plan", deleted)
+
+        deployment = _compact_tool_result_for_model(
+            "apply_deployment_plan",
+            {
+                "status": "preview",
+                "deployment_id": "deploy-123456789abc",
+                "diff": {"channel_ids": [7], "probe_count": 2},
+                "approval": {
+                    "plan_id": "plan-deploy",
+                    "action": "apply_deployment_plan",
+                    "expires_at": "2026-07-28T20:00:00+00:00",
+                    "required_permission": "settings:manage",
+                },
+            },
+        )
+        self.assertNotIn("approval", deployment)
+        self.assertEqual(
+            deployment["action_plan"]["plan_id"],
+            "plan-deploy",
+        )
+        self.assertEqual(
+            deployment["action_plan"]["status"],
+            "awaiting_ui_apply",
+        )
+
+    def test_plain_chat_omits_empty_tools_payload(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+        client.admission_controller = Admission()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "hello"}}]
+        }
+        with patch.object(agent.requests, "post", return_value=response) as post:
+            client.call_with_tools([{"role": "user", "content": "hello"}], tools=[])
+        payload = post.call_args.kwargs["json"]
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_operator_mode_can_require_the_first_model_owned_tool_decision(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+        client.admission_controller = Admission()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}]
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_channels",
+                    "description": "List channels.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        with patch.object(agent.requests, "post", return_value=response) as post:
+            client.call_with_tools(
+                [{"role": "user", "content": "inspect the console"}],
+                tools=tools,
+                tool_choice="required",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(payload["tools"], tools)
+
+    def test_agent_disables_model_thinking_for_tool_and_final_calls(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3.5-9b-mtp", "", 120)
+
+        class Admission:
+            def admission(self, *_args, **_kwargs):
+                return nullcontext()
+
+            def status(self):
+                return {"resources": []}
+
+        client.admission_controller = Admission()
+        tool_response = Mock()
+        tool_response.raise_for_status.return_value = None
+        tool_response.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "done"}}]
+        }
+        with patch.object(agent.requests, "post", return_value=tool_response) as post:
+            client.call_with_tools([{"role": "user", "content": "inspect"}], tools=[])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_agent_uses_smaller_context_limit_reported_by_inference_server(self):
+        client = _AgentLMClient("http://agent.local/v1", "qwen3-vl-4b", "", 120)
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [
+                {
+                    "id": "qwen3-vl-4b",
+                    "max_model_len": 32768,
+                }
+            ]
+        }
+
+        with patch.object(agent.requests, "get", return_value=response) as get:
+            served_limit = client.context_limit_tokens()
+            cached_limit = client.context_limit_tokens()
+
+        self.assertEqual(served_limit, 32768)
+        self.assertEqual(cached_limit, 32768)
+        self.assertEqual(get.call_count, 1)
+        policy = agent._context_budget_policy(served_limit)
+        self.assertEqual(policy["context_limit_tokens"], 32768)
+        self.assertLess(policy["warning_tokens"], policy["hard_tokens"])
+        self.assertLess(
+            policy["hard_tokens"] + policy["output_reserve_tokens"],
+            served_limit,
+        )
+
+        class StreamResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self):
+                yield b'data: {"choices":[{"delta":{"content":"done"}}]}'
+                yield b'data: [DONE]'
+
+        with patch.object(agent.requests, "post", return_value=StreamResponse()) as post:
+            self.assertEqual("".join(client.stream_text([{"role": "user", "content": "finish"}])), "done")
+        self.assertEqual(
+            post.call_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_recovers_allowed_xml_tool_call_and_strips_protocol_markup(self):
+        content = """I will prepare the preview.\n<tool_call>
+<function=update_prompt_settings>
+<parameter=channel_id>112</parameter>
+<parameter=changes>{"alert_policy_prompt":"Alert when a visible lighter flame appears in a person's hand."}</parameter>
+<parameter=preview>True</parameter>
+</function>
+</tool_call>"""
+        cleaned, calls, saw_markup = _parse_text_tool_calls(
+            content,
+            allowed_names={"get_prompt_settings", "update_prompt_settings"},
+        )
+
+        self.assertTrue(saw_markup)
+        self.assertEqual(cleaned, "I will prepare the preview.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "update_prompt_settings")
+        self.assertEqual(calls[0].args["channel_id"], 112)
+        self.assertTrue(calls[0].args["preview"])
+
+        cleaned, calls, _ = _parse_text_tool_calls(
+            content.replace("update_prompt_settings", "create_probe"),
+            allowed_names={"get_prompt_settings", "update_prompt_settings"},
+        )
+        self.assertEqual(calls, [])
+        self.assertNotIn("<tool_call>", cleaned or "")
+
+    def test_stream_filter_removes_split_tool_protocol(self):
+        chunks = ["Answer before <tool_", "call><function=create_probe>", "secret", "</tool_call> after"]
+        self.assertEqual("".join(_filter_streamed_tool_markup(chunks)), "Answer before  after")
+
+    def test_vlm_alert_request_routes_to_prompt_policy_without_disabling_explicit_probes(self):
+        self.assertFalse(
+            _seed_turn_tool_context("Show the latest VLM alert for channel #112")["vlm_alert_policy_request"]
+        )
+        self.assertFalse(
+            _seed_turn_tool_context("Покажи последние VLM-алерты канала #112")["vlm_alert_policy_request"]
+        )
+        context = _seed_turn_tool_context(
+            "set a new alert for the vlm channel #112 - if person fires a lighter"
+        )
+        self.assertTrue(context["vlm_alert_policy_request"])
+        self.assertEqual(context["channel_id"], 112)
+        context["prompt_settings_current"] = {"alert_policy_prompt": "Existing criterion."}
+        prepared = _apply_turn_tool_context(
+            "update_prompt_settings",
+            {"changes": {
+                "alert_policy_prompt": "model wording",
+                "rollup_prompts": {"L1": "must not leak"},
+                "bookmark_enabled": True,
+                "migrate_legacy_alert_policy": True,
+            }},
+            context,
+        )
+        self.assertEqual(prepared["channel_id"], 112)
+        self.assertTrue(prepared["preview"])
+        self.assertEqual(
+            prepared["changes"]["alert_policy_prompt"],
+            "Existing criterion.\nAlert when a person ignites a lighter and a visible small flame appears in or near the person's hand.",
+        )
+        self.assertEqual(set(prepared["changes"]), {"alert_policy_prompt"})
+        explicit_probe = _seed_turn_tool_context(
+            "create a CLIP probe on VLM channel #112 for a visible lighter flame"
+        )
+        self.assertFalse(explicit_probe["vlm_alert_policy_request"])
+
+    def test_context_budget_counts_tool_schemas_and_emergency_compacts_results(self):
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "tool", "name": "get_video_summaries", "tool_call_id": "c1", "content": json.dumps({
+                "channel_id": 7,
+                "depth": "L1",
+                "count": 10,
+                "entries": [{"time": str(index), "summary": "x" * 3000} for index in range(10)],
+            })},
+        ]
+        schemas = [{"type": "function", "function": {"name": "wide", "description": "y" * 3000}}]
+        with_tools = _context_budget_snapshot(messages, tool_schemas=schemas)
+        without_tools = _context_budget_snapshot(messages)
+        compacted, status = _compact_tool_messages_for_context_budget(messages, token_budget=1000)
+
+        self.assertGreater(with_tools["estimated_tokens"], without_tools["estimated_tokens"])
+        self.assertGreater(with_tools["tool_schema_estimated_tokens"], 0)
+        self.assertEqual(status["compacted_tool_messages"], 1)
+        self.assertLess(len(compacted[1]["content"]), len(messages[1]["content"]))
+
+    def test_video_summary_model_compaction_keeps_signal_without_verbose_contract(self):
+        raw = {
+            "channel_id": 112,
+            "depth": "L0",
+            "count": 25,
+            "total_in_window": 154,
+            "semantic_available_count": 154,
+            "semantic_status": "ready",
+            "truncated": True,
+            "coverage": {
+                "status": "truncated",
+                "truncated": True,
+                "selection_strategy": "period_sample_alert_priority",
+                "note": "n" * 2000,
+                "available": {
+                    "entry_count": 154,
+                    "status": "covered",
+                    "first_time": "2026-07-13 09:27",
+                    "last_time": "2026-07-13 10:27",
+                    "large_internal_gaps": [{"detail": "x" * 2000}],
+                },
+                "returned": {"entry_count": 25, "status": "partial"},
+            },
+            "source_coverage": {"status": "covered", "available": {"entry_count": 154}},
+            "evidence_frames": [
+                {"id": 296781, "channel_id": 112, "source": "vlm_summary", "image_url": "/detections/thumbnail/296781"}
+            ],
+            "entries": [
+                {
+                    "time": f"10:{index:02d}",
+                    "summary": "semantic narrative " + ("x" * 1500),
+                    "alert_events": [{"title": "event"}] * 10,
+                }
+                for index in range(25)
+            ],
+        }
+
+        compact = _compact_tool_result_for_model("get_video_summaries", raw)
+
+        self.assertEqual(len(compact["entries"]), 5)
+        self.assertEqual(len(compact["entries"][0]["summary"]), 700)
+        self.assertEqual(len(compact["entries"][0]["alert_events"]), 4)
+        self.assertEqual(compact["evidence_frames"][0]["image_url"], "/detections/thumbnail/296781")
+        self.assertNotIn("large_internal_gaps", json.dumps(compact["coverage"]))
+        self.assertLess(len(json.dumps(compact)), 9_000)
+
+    def test_incomplete_final_response_uses_completed_tool_ledger(self):
+        class IncompleteLM(_FakeLMClient):
+            def stream_text(self, messages, cancel_event=None):
+                self.final_messages = list(messages)
+                yield "Let me fetch the remaining frames."
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = IncompleteLM(tool_rounds=1, tool_name="get_video_summaries")
+        runner._tools = _FakeTools(result={
+            "channel_id": 112,
+            "depth": "L0",
+            "count": 25,
+            "total_in_window": 154,
+            "semantic_status": "ready",
+            "coverage": {"status": "truncated", "truncated": True},
+            "evidence_frames": [{"id": 296781, "image_url": "/detections/thumbnail/296781"}],
+            "evidence_frame_totals": {"vlm_summary": 154},
+            "entries": [],
+        })
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat("session-1", "Show VLM alerts for channel #112")
+            if item.startswith("data: ")
+        ]
+
+        self.assertTrue(any(item.get("type") == "completion_recovery" for item in events))
+        final_text = "".join(item.get("content", "") for item in events if item.get("type") == "text")
+        self.assertIn("CH 112", final_text)
+        self.assertNotIn("Let me fetch", final_text)
+
+    def test_final_transport_failure_retries_then_returns_and_persists_tool_fallback(self):
+        class BrokenFinalLM(_FakeLMClient):
+            def __init__(self):
+                super().__init__(tool_rounds=1, tool_name="get_video_summaries")
+                self.stream_attempts = 0
+
+            def context_limit_tokens(self):
+                return 32768
+
+            def stream_text(self, messages, cancel_event=None):
+                self.stream_attempts += 1
+                self.final_messages = list(messages)
+                raise RuntimeError("synthetic final transport failure")
+                yield  # pragma: no cover
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = BrokenFinalLM()
+        runner._tools = _FakeTools(result={
+            "channel_id": 118,
+            "depth": "L2",
+            "count": 5,
+            "total_in_window": 18,
+            "semantic_status": "ready",
+            "coverage": {"status": "partial", "truncated": False},
+            "entries": [
+                {
+                    "time": "2026-07-28 01:00",
+                    "alert_total": 2,
+                    "summary": "A vehicle repeatedly drifts through the intersection.",
+                }
+            ],
+        })
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        payloads = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "test",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._lm_client.stream_attempts, 2)
+        self.assertTrue(
+            any(item.get("type") == "completion_recovery" for item in payloads)
+        )
+        self.assertFalse(any(item.get("type") == "error" for item in payloads))
+        final_text = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text"
+        )
+        self.assertIn("CH 118", final_text)
+        self.assertIn("repeatedly drifts", final_text)
+        persisted_roles = [row.get("role") for row in runner.store.messages]
+        self.assertIn("tool", persisted_roles)
+        self.assertEqual(persisted_roles[-1], "assistant")
+
     def test_archive_tool_compaction_preserves_source_semantics(self):
         compact = _compact_tool_result_for_model(
             "search_archive",
@@ -161,7 +1025,7 @@ class AgentToolLoopTests(unittest.TestCase):
     def test_tool_loop_can_exceed_eight_rounds(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
-        runner._lm_client = _FakeLMClient(tool_rounds=12)
+        runner._lm_client = _FakeLMClient(tool_rounds=12, distinct_args=True)
         runner._tools = _FakeTools()
         runner._ps = object()
         runner._ds = object()
@@ -197,7 +1061,7 @@ class AgentToolLoopTests(unittest.TestCase):
             request_id="request-1",
         )
 
-        list(runner.stream_chat("session-1", "test", tool_context=context))
+        list(runner.stream_chat("session-1", "list channels", tool_context=context))
 
         self.assertEqual(
             runner._lm_client.tools[0]["function"]["name"],
@@ -213,7 +1077,7 @@ class AgentToolLoopTests(unittest.TestCase):
     def test_tool_loop_has_high_but_finite_budget(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
-        runner._lm_client = _FakeLMClient(tool_rounds=100)
+        runner._lm_client = _FakeLMClient(tool_rounds=100, distinct_args=True)
         runner._tools = _FakeTools()
         runner._ps = object()
         runner._ds = object()
@@ -229,6 +1093,166 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(runner._tools.calls, 64)
         self.assertTrue(any(item.get("type") == "tool_budget" for item in payloads))
         self.assertEqual(payloads[-1]["type"], "done")
+
+    def test_video_research_has_a_smaller_distinct_tool_budget(self):
+        class DistinctVideoLM(_FakeLMClient):
+            def __init__(self):
+                super().__init__(tool_rounds=100, tool_name="get_video_summaries")
+                self.round_number = 0
+
+            def call_with_tools(self, _messages, tools=None, cancel_event=None):
+                self.tools = tools
+                self.tool_call_messages.append(list(_messages))
+                self.round_number += 1
+                return _LMResponse(
+                    content="",
+                    finish_reason="tool_calls",
+                    tool_calls=[
+                        _ToolCall(
+                            id=f"video-{self.round_number}",
+                            name="get_video_summaries",
+                            args={"limit": self.round_number},
+                        )
+                    ],
+                )
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = DistinctVideoLM()
+        runner._tools = _FakeTools(
+            result={
+                "channel_id": 112,
+                "depth": "L1",
+                "count": 1,
+                "total_in_window": 1,
+                "coverage": {"status": "covered"},
+                "entries": [{"summary": "result"}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Inspect video coverage for channel #112",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            runner._tools.calls,
+            agent.AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+        )
+        budget = next(item for item in events if item.get("type") == "tool_budget")
+        self.assertEqual(
+            budget["max_tool_calls"],
+            agent.AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+        )
+
+    def test_continue_uses_persisted_channel_ids_and_frozen_window(self):
+        research_state = {
+            "version": 1,
+            "kind": "video_summary_inventory",
+            "status": "pending",
+            "frozen_window": {"from_ts": 100.0, "to_ts": 200.0},
+            "requested_channel_ids": [1, 2, 3, 4],
+            "completed_channel_ids": [1, 2],
+            "remaining_channel_ids": [3, 4],
+            "updated_at": time.time(),
+        }
+        result = {
+            "time_window": {
+                "from_ts": 100.0,
+                "to_ts": 200.0,
+                "since_ms": 100_000,
+                "until_ms": 200_000,
+            },
+            "requested_channel_ids": [3, 4],
+            "checked_channel_ids": [3, 4],
+            "candidate_channels": [{"channel_id": 3}],
+            "deferred_channel_ids": [4],
+            "inactive_channel_ids": [],
+            "unchecked_channel_ids": [],
+            "errors": [],
+        }
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(research_state=research_state)
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="list_video_summary_channels",
+        )
+        runner._tools = _FakeTools(result=result)
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = list(runner.stream_chat("session-1", "Continue with the remaining channels"))
+        payloads = [
+            json.loads(event.removeprefix("data: ").strip())
+            for event in events
+            if event.startswith("data: ")
+        ]
+
+        tool_name, tool_args = runner._tools.call_args[0]
+        self.assertEqual(tool_name, "list_video_summary_channels")
+        self.assertEqual(tool_args["channel_ids"], [3, 4])
+        self.assertEqual(tool_args["from_ts"], 100.0)
+        self.assertEqual(tool_args["to_ts"], 200.0)
+        self.assertEqual(runner.store.research_state["completed_channel_ids"], [1, 2, 3])
+        self.assertEqual(runner.store.research_state["remaining_channel_ids"], [4])
+        state_event = next(item for item in payloads if item.get("type") == "research_state")
+        self.assertTrue(state_event["persisted"])
+        self.assertEqual(state_event["remaining_channel_ids"], [4])
+        first_lm_prompt = runner._lm_client.tool_call_messages[0]
+        self.assertTrue(
+            any(
+                "Trusted server research continuation ledger" in str(message.get("content") or "")
+                for message in first_lm_prompt
+            )
+        )
+
+    def test_unrelated_turn_does_not_apply_stale_research_defaults(self):
+        research_state = {
+            "version": 1,
+            "kind": "video_summary_inventory",
+            "status": "pending",
+            "frozen_window": {"from_ts": 100.0, "to_ts": 200.0},
+            "requested_channel_ids": [3, 4],
+            "completed_channel_ids": [3],
+            "remaining_channel_ids": [4],
+            "updated_at": time.time(),
+        }
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(research_state=research_state)
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="list_video_summary_channels",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "time_window": {"from_ts": 900.0, "to_ts": 1_000.0},
+                "requested_channel_ids": [],
+                "checked_channel_ids": [],
+                "candidate_channels": [],
+                "inactive_channel_ids": [],
+                "deferred_channel_ids": [],
+                "unchecked_channel_ids": [],
+                "errors": [],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        list(runner.stream_chat("session-1", "Show current stream status"))
+
+        _tool_name, tool_args = runner._tools.call_args[0]
+        self.assertNotIn("channel_ids", tool_args)
+        self.assertNotIn("from_ts", tool_args)
+        self.assertNotIn("to_ts", tool_args)
 
     def test_signal_ledger_is_final_prompt_only_and_uses_compacted_results(self):
         raw_result = {

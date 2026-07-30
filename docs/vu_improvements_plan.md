@@ -1,7 +1,23 @@
 # VU Improvements Plan (Working Notes)
 
-Last updated: 2026-02-18
-Branch: `vu-improvements`
+Last updated: 2026-07-12
+Active release branch: `stabilization/0.8.3-pre-react`
+
+## Post-pilot revision marker (recorded 2026-07-12)
+
+After the 0.8.4 pilot release, revisit the Video history reader as an
+investigation workspace rather than adding more controls to the release UI:
+
+- add an event/alert density timeline with brush-to-select;
+- use server cursors instead of offset paging for deep archive traversal;
+- expose archive/hot/rollup coverage as one honest coverage bar;
+- consider two-channel comparison and shareable investigation URLs;
+- measure the `Auto` resolution thresholds on real 50-channel operator queries
+  before changing the release defaults.
+
+This is deliberately deferred until after the pilot. The release reader keeps
+the smaller operator model: **Period / Resolution / Follow live**, indexed
+PostgreSQL history pages, and explicit loading/coverage feedback.
 
 ## Objective
 Improve Video Understanding usability for multi-channel operation (4-8 channels) and make summaries readable, persistent, and retrievable.

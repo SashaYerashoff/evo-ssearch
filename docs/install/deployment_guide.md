@@ -4,16 +4,51 @@ Third-party-shareable install guide for an EVA AI pilot on Ubuntu LTS. **Contain
 no client data** — all site specifics are placeholders. The filled, internal
 version lives in `install/field_rollout_demo.md` (not shared).
 
+For the reviewed β 0.8.5 source branch, release-specific migration and
+verification constraints are in the
+[β 0.8.5 release notes](../../readiness/RELEASE_NOTES_0.8.5.md). The older
+[0.8.4 Git guide](git_install_084.md) is historical and must not be reused as a
+0.8.5 upgrade recipe because 0.8.5 adds database migrations. Do not run
+`git pull` inside a live production checkout.
+
 Invariants: [facts](../00_CANON/facts.md). All variables:
 [config_reference](../00_CANON/config_reference.md). Production browser/internal
 URL rules: [production_settings](production_settings.md). Placeholders: `<...>`.
+
+## Offline single-node port appliance
+
+For the reviewed RTX 4070 Super / Intel i9 14th Gen / 64-GB target, use the
+generated `EVA-AI-0.8.5-PORT` directory on the writable partition of the Ubuntu
+Server 24.04 installer USB:
+
+```bash
+cd EVA-AI-0.8.5-PORT
+sha256sum -c SHA256SUMS
+./install.sh
+```
+
+The English wizard asks for Evo connectivity and credentials, installation
+paths, local versus external inference endpoints, the optional preemptible 9B
+quiet window, and the first EVA administrator. It checks free space, GPU and
+PostgreSQL/Alembic state before changing the host. A clean local install uses
+Qwen3-VL-4B AWQ/vLLM on the GPU, Qwen3.5-9B-MTP Q4/llama.cpp on CPU for deep
+review, and CPU/iGPU for dense CV plus continuous one-hertz CLIP indexing.
+
+The USB is self-contained: local APT repository, Python 3.12 wheels, NVIDIA
+driver/HWE kernel, PostgreSQL 16, Nginx/TLS support, both model payloads, CLIP
+weights, and llama.cpp source are included. The default paths are:
+`/opt/eva-ai`, `/var/lib/eva-ai`, `/etc/eva-ai`, and
+`/var/backups/eva-ai`.
 
 ## Prerequisites
 
 - Ubuntu LTS host for the app (also runs CLIP + the agent LM client + can co-host
   PostgreSQL for a single-node pilot).
-- One or more GPU hosts running vLLM for the VLM (`qwen3-vl-4b`), and an agent LM
-  endpoint (`qwen3.5-9b` class). See [inference_topology](inference_topology.md).
+- One or more GPU hosts running vLLM for `qwen3-vl-4b`. The constrained
+  eight-channel appliance may share it for VLM + agent profiles under protected
+  admission; scale-out deployments may add a separate agent endpoint and an
+  optional quiet-window 9B deep-L3 endpoint. See
+  [inference_topology](inference_topology.md).
 - PostgreSQL reachable, with the EVA roles/schemas (API/audit/worker/migration).
 - Luxriot Evo reachable on the closed network.
 - Closed network (the pilot security model assumes isolation).
@@ -33,7 +68,7 @@ pip install --upgrade pip && pip install -r requirements.txt
 # create roles/schemas, then migrate to head
 set -a; . /etc/eva-ai/eva-ai.env; set +a
 alembic upgrade head
-alembic current   # expect: 20260614_0006
+alembic current   # expect: 20260727_0010
 ```
 
 Use `scripts/bootstrap_db_roles.py` for the separated runtime roles `[VERIFY]`.
@@ -109,6 +144,8 @@ Single worker is **required** (in-process schedulers). See
 - **Code-only patch** (e.g. β 0.8.1 → 0.8.2): apply files, restart. No migration.
 - **DB-touching patch:** run `alembic upgrade head` explicitly; the installer must
   refuse unsafe startup if DB revision < code-expected revision.
+- **β 0.8.4 → β 0.8.5:** back up PostgreSQL and apply Alembic revisions
+  `20260725_0007` through `20260727_0010`; this is not a code-only update.
 - Always reversible via `scripts/rollback.sh`.
 - For closed-network field patches via USB, follow the offline patch SOP
   (internal field-rollout doc).

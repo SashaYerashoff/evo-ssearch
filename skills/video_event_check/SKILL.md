@@ -14,6 +14,14 @@ Trigger phrases:
 
 Goal: check one named channel for one requested event inside one time window without overclaiming.
 
+Tools:
+- `normalize_time_window`
+- `get_video_summaries`
+- `get_visual_window_signals`
+- `search_archive`
+- `get_detections`
+- `describe_frame`
+
 Default order:
 1. Normalize the time window with `normalize_time_window`.
 2. Resolve the named channel. If the channel is ambiguous, list likely candidates and ask one short clarification.

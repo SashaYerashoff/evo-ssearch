@@ -36,6 +36,22 @@ class EnqueueStatus(str, Enum):
     DROPPED = "dropped"
 
 
+def heartbeat_coalescing_enabled(job: "InferenceJob") -> bool:
+    """Whether a heartbeat may replace an older queued heartbeat.
+
+    Generic health heartbeats are safely replaceable with their newest value.
+    Evidence-bearing heartbeats, including L0 VLM windows, are not.  Those
+    producers set ``coalesce_heartbeat`` to ``False`` in the job payload.
+    """
+
+    if job.workload_class is not WorkloadClass.HEARTBEAT:
+        return False
+    value = job.payload.get("coalesce_heartbeat", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
 class FrozenMapping(Mapping[str, Any]):
     """Small immutable mapping used to keep frozen models deeply immutable."""
 

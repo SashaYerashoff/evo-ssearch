@@ -4,7 +4,24 @@ Contains all configurable settings with environment variable support
 """
 import os
 import re
+import hashlib
 from pathlib import Path
+
+from local_video_source import parse_local_video_sources
+
+# Keep only names, never values.  After python-dotenv runs, ``os.environ`` no
+# longer reveals whether a setting came from systemd/process environment or the
+# project file.  Settings diagnostics use this frozen set to explain precedence
+# without exposing secrets.
+ENV_KEYS_BEFORE_DOTENV = frozenset(os.environ.keys())
+ENV_VALUE_HASHES_BEFORE_DOTENV = {
+    key: hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+    for key, value in os.environ.items()
+    if key.startswith("EVOSSEARCH_")
+}
+CONFIG_ENV_FILE_BEFORE_DOTENV = str(
+    os.environ.get("EVOSSEARCH_CONFIG_ENV_FILE") or ""
+).strip()
 
 # Load .env file if it exists
 try:
@@ -123,7 +140,7 @@ def _get_lm_profiles(
     return profiles
 
 
-def _get_app_version(default: str = "β 0.8.1") -> str:
+def _get_app_version(default: str = "β 0.8.5") -> str:
     env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
     if env_value:
         return env_value
@@ -143,6 +160,19 @@ class Config:
     PORT = int(os.getenv('EVOSSEARCH_PORT', '5000'))
     DEBUG = _get_bool_env('EVOSSEARCH_DEBUG', 'False')
     APP_VERSION = _get_app_version()
+    OFFLINE_MODE = _get_bool_env('EVOSSEARCH_OFFLINE_MODE', 'True')
+    MODEL_CACHE_DIR = Path(
+        os.getenv(
+            'EVOSSEARCH_MODEL_CACHE_DIR',
+            str(Path.home() / '.cache' / 'eva-ai' / 'models'),
+        )
+    ).expanduser()
+    OPENAI_CLIP_CACHE_DIR = Path(
+        os.getenv(
+            'EVOSSEARCH_OPENAI_CLIP_CACHE_DIR',
+            str(Path.home() / '.cache' / 'clip'),
+        )
+    ).expanduser()
 
     # Embedder configuration
     EXPERIMENTAL_EMBEDDERS_ENABLED = _get_bool_env(
@@ -154,6 +184,21 @@ class Config:
         or 'ViT-B/32'
     )
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
+    EMBEDDER_EAGER_LOAD = _get_bool_env(
+        'EVOSSEARCH_EMBEDDER_EAGER_LOAD',
+        'false',
+    )
+    # A fallback changes the embedding space, invalidating archive vectors and
+    # calibrated probe thresholds. Keep it opt-in so production never silently
+    # swaps SigLIP2 for OpenAI CLIP after a load failure.
+    EMBEDDER_FALLBACK_ENABLED = _get_bool_env(
+        'EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED',
+        'False',
+    )
+    CLIP_DEVICE = (
+        os.getenv('EVOSSEARCH_CLIP_DEVICE', 'auto').strip().lower()
+        or 'auto'
+    )
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
     if not EXPERIMENTAL_EMBEDDERS_ENABLED:
         EMBEDDER = 'clip'
@@ -239,6 +284,13 @@ class Config:
     SETTINGS_LOCAL_ONLY = _get_bool_env('EVOSSEARCH_SETTINGS_LOCAL_ONLY', 'True')
     CORS_ALLOWED_ORIGINS = _get_list_env('EVOSSEARCH_CORS_ALLOWED_ORIGINS')
     ALLOWED_ROOTS = _get_path_list_env('EVOSSEARCH_ALLOWED_ROOTS')
+    try:
+        TRUSTED_PROXY_HOPS = int(
+            os.getenv('EVOSSEARCH_TRUSTED_PROXY_HOPS', '0')
+        )
+    except (TypeError, ValueError):
+        TRUSTED_PROXY_HOPS = 0
+    TRUSTED_PROXY_HOPS = min(4, max(0, TRUSTED_PROXY_HOPS))
     AUTH_ENABLED = _get_bool_env('EVOSSEARCH_AUTH_ENABLED', 'False')
     AUTH_TENANT_ID = os.getenv('EVOSSEARCH_AUTH_TENANT_ID', '').strip()
     AUTH_SESSION_COOKIE = (
@@ -379,6 +431,13 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = 2500000
     LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS = max(100000, LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS)
+    # Rough VLM context ceiling used only for llm_input_stats warnings
+    # (~4 chars/token + ~300 visual tokens per <=640px image).
+    try:
+        LM_VIDEO_CONTEXT_TOKENS_WARN = int(os.getenv('EVOSSEARCH_LM_VIDEO_CONTEXT_TOKENS_WARN', '7000'))
+    except (TypeError, ValueError):
+        LM_VIDEO_CONTEXT_TOKENS_WARN = 7000
+    LM_VIDEO_CONTEXT_TOKENS_WARN = max(1000, LM_VIDEO_CONTEXT_TOKENS_WARN)
     try:
         LM_VIDEO_TEMPERATURE = float(os.getenv('EVOSSEARCH_LM_VIDEO_TEMPERATURE', '0.2'))
     except (TypeError, ValueError):
@@ -454,6 +513,9 @@ class Config:
     LUXRIOT_BASE_URL = os.getenv('EVOSSEARCH_LUXRIOT_BASE_URL', 'http://luxriot-host:8080').strip().rstrip('/')
     LUXRIOT_USERNAME = os.getenv('EVOSSEARCH_LUXRIOT_USERNAME', '').strip()
     LUXRIOT_PASSWORD = os.getenv('EVOSSEARCH_LUXRIOT_PASSWORD', '').strip()
+    LOCAL_VIDEO_SOURCES = parse_local_video_sources(
+        os.getenv('EVOSSEARCH_LOCAL_VIDEO_SOURCES_JSON', '')
+    )
     try:
         LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
     except (TypeError, ValueError):
@@ -468,9 +530,9 @@ class Config:
     if LUXRIOT_CAPTURE_SOURCE not in {'auto', 'snapshot', 'live_segment'}:
         LUXRIOT_CAPTURE_SOURCE = 'auto'
     try:
-        LUXRIOT_LIVE_SEGMENT_SECONDS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS', '15.0'))
+        LUXRIOT_LIVE_SEGMENT_SECONDS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS', '60.0'))
     except (TypeError, ValueError):
-        LUXRIOT_LIVE_SEGMENT_SECONDS = 15.0
+        LUXRIOT_LIVE_SEGMENT_SECONDS = 60.0
     LUXRIOT_LIVE_SEGMENT_SECONDS = max(2.0, min(60.0, LUXRIOT_LIVE_SEGMENT_SECONDS))
     try:
         LUXRIOT_LIVE_SEGMENT_MB = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_MB', '8.0'))
@@ -488,6 +550,237 @@ class Config:
         LUXRIOT_LIVE_SEGMENT_FPS = 3.0
     LUXRIOT_LIVE_SEGMENT_FPS = max(0.2, min(10.0, LUXRIOT_LIVE_SEGMENT_FPS))
     try:
+        LUXRIOT_SUMMARY_MAX_BATCH_FRAMES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES', '16')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_MAX_BATCH_FRAMES = 16
+    LUXRIOT_SUMMARY_MAX_BATCH_FRAMES = max(
+        1,
+        min(16, LUXRIOT_SUMMARY_MAX_BATCH_FRAMES),
+    )
+    try:
+        LUXRIOT_SUMMARY_MAX_WINDOW_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_MAX_WINDOW_SEC', '60')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_MAX_WINDOW_SEC = 60.0
+    LUXRIOT_SUMMARY_MAX_WINDOW_SEC = max(
+        5.0,
+        min(300.0, LUXRIOT_SUMMARY_MAX_WINDOW_SEC),
+    )
+    try:
+        LUXRIOT_SUMMARY_QUIET_CADENCE_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_QUIET_CADENCE_SEC', '5')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_QUIET_CADENCE_SEC = 5.0
+    LUXRIOT_SUMMARY_QUIET_CADENCE_SEC = max(
+        1.0,
+        min(60.0, LUXRIOT_SUMMARY_QUIET_CADENCE_SEC),
+    )
+    try:
+        LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC', '2')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC = 2.0
+    LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC = max(
+        0.5,
+        min(LUXRIOT_SUMMARY_QUIET_CADENCE_SEC, LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC),
+    )
+    try:
+        LUXRIOT_SUMMARY_BURST_CADENCE_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_BURST_CADENCE_SEC', '1')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_BURST_CADENCE_SEC = 1.0
+    LUXRIOT_SUMMARY_BURST_CADENCE_SEC = max(
+        0.2,
+        min(LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC, LUXRIOT_SUMMARY_BURST_CADENCE_SEC),
+    )
+    LUXRIOT_ATTENTION_SCHEDULER_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED',
+        'False',
+    )
+    LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED',
+        'False',
+    )
+    LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS',
+        'False',
+    )
+    try:
+        LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS = int(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS',
+                '1000',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS = 1000
+    LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS = max(
+        200,
+        min(60000, LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS),
+    )
+    LUXRIOT_CLIP_ASYNC_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_CLIP_ASYNC_ENABLED',
+        'True',
+    )
+    try:
+        LUXRIOT_CLIP_ASYNC_WORKERS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_CLIP_ASYNC_WORKERS', '8')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_CLIP_ASYNC_WORKERS = 8
+    LUXRIOT_CLIP_ASYNC_WORKERS = max(
+        1,
+        min(16, LUXRIOT_CLIP_ASYNC_WORKERS),
+    )
+    try:
+        LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY = int(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY',
+                '64',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY = 64
+    LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY = max(
+        LUXRIOT_CLIP_ASYNC_WORKERS,
+        min(512, LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY),
+    )
+    LUXRIOT_ATTENTION_STORAGE_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED',
+        'False',
+    )
+    try:
+        LUXRIOT_ATTENTION_RING_SECONDS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ATTENTION_RING_SECONDS', '90')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_RING_SECONDS = 90.0
+    LUXRIOT_ATTENTION_RING_SECONDS = max(
+        30.0,
+        min(600.0, LUXRIOT_ATTENTION_RING_SECONDS),
+    )
+    try:
+        LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE', '6')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE = 6.0
+    LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE = max(
+        0.2,
+        min(120.0, LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE),
+    )
+    try:
+        LUXRIOT_ATTENTION_MAX_OUTSTANDING = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ATTENTION_MAX_OUTSTANDING', '1')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_MAX_OUTSTANDING = 1
+    LUXRIOT_ATTENTION_MAX_OUTSTANDING = max(
+        1,
+        min(16, LUXRIOT_ATTENTION_MAX_OUTSTANDING),
+    )
+    try:
+        LIVE_CLIP_BATCH_SIZE = int(
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_SIZE', '8')
+        )
+    except (TypeError, ValueError):
+        LIVE_CLIP_BATCH_SIZE = 8
+    LIVE_CLIP_BATCH_SIZE = max(1, min(32, LIVE_CLIP_BATCH_SIZE))
+    try:
+        LIVE_CLIP_BATCH_WAIT_MS = float(
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_WAIT_MS', '75')
+        )
+    except (TypeError, ValueError):
+        LIVE_CLIP_BATCH_WAIT_MS = 75.0
+    LIVE_CLIP_BATCH_WAIT_MS = max(0.0, min(500.0, LIVE_CLIP_BATCH_WAIT_MS))
+    try:
+        LIVE_CLIP_BATCH_QUEUE_CAPACITY = int(
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_QUEUE_CAPACITY', '128')
+        )
+    except (TypeError, ValueError):
+        LIVE_CLIP_BATCH_QUEUE_CAPACITY = 128
+    LIVE_CLIP_BATCH_QUEUE_CAPACITY = max(
+        LIVE_CLIP_BATCH_SIZE,
+        min(4096, LIVE_CLIP_BATCH_QUEUE_CAPACITY),
+    )
+    try:
+        LIVE_CLIP_BATCH_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_TIMEOUT_SEC', '15')
+        )
+    except (TypeError, ValueError):
+        LIVE_CLIP_BATCH_TIMEOUT_SEC = 15.0
+    LIVE_CLIP_BATCH_TIMEOUT_SEC = max(
+        1.0,
+        min(120.0, LIVE_CLIP_BATCH_TIMEOUT_SEC),
+    )
+    SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED = _get_bool_env(
+        'EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED',
+        'True',
+    )
+    try:
+        SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE = int(
+            os.getenv('EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE', '512')
+        )
+    except (TypeError, ValueError):
+        SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE = 512
+    SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE = max(
+        32,
+        min(16384, SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE),
+    )
+    try:
+        SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE = int(
+            os.getenv('EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE', '32')
+        )
+    except (TypeError, ValueError):
+        SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE = 32
+    SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE = max(
+        1,
+        min(
+            SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE,
+            SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE,
+        ),
+    )
+    try:
+        LUXRIOT_ATTENTION_POSTROLL_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC', '3')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_POSTROLL_SEC = 3.0
+    LUXRIOT_ATTENTION_POSTROLL_SEC = max(
+        0.0,
+        min(30.0, LUXRIOT_ATTENTION_POSTROLL_SEC),
+    )
+    try:
+        LUXRIOT_ATTENTION_MAX_VLM_FRAMES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES', '8')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_MAX_VLM_FRAMES = 8
+    LUXRIOT_ATTENTION_MAX_VLM_FRAMES = max(
+        2,
+        min(24, LUXRIOT_ATTENTION_MAX_VLM_FRAMES),
+    )
+    LUXRIOT_ALERT_DERIVED_PROBES_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED',
+        'False',
+    )
+    try:
+        LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC', '300')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC = 300.0
+    LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC = max(
+        30.0,
+        min(3600.0, LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC),
+    )
+    try:
         LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC = float(
             os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC', '5.0')
         )
@@ -501,6 +794,81 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = 5.0
     LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC))
+    try:
+        LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC', '3.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = 3.0
+    LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = max(0.25, min(30.0, LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC))
+    try:
+        LUXRIOT_MEDIA_READ_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_READ_TIMEOUT_SEC', '8.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_MEDIA_READ_TIMEOUT_SEC = 8.0
+    LUXRIOT_MEDIA_READ_TIMEOUT_SEC = max(0.5, min(60.0, LUXRIOT_MEDIA_READ_TIMEOUT_SEC))
+    try:
+        LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC', '90.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = 90.0
+    LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC = max(
+        15.0,
+        min(180.0, LUXRIOT_ARCHIVE_PREPARE_TIMEOUT_SEC),
+    )
+    try:
+        LUXRIOT_LIVE_MEDIA_MAX_SECONDS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS', '120.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_MEDIA_MAX_SECONDS = 120.0
+    LUXRIOT_LIVE_MEDIA_MAX_SECONDS = max(1.0, min(120.0, LUXRIOT_LIVE_MEDIA_MAX_SECONDS))
+    try:
+        LUXRIOT_LIVE_MEDIA_MAX_BYTES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_BYTES', str(256 * 1024 * 1024))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_LIVE_MEDIA_MAX_BYTES = 256 * 1024 * 1024
+    LUXRIOT_LIVE_MEDIA_MAX_BYTES = max(1024, min(256 * 1024 * 1024, LUXRIOT_LIVE_MEDIA_MAX_BYTES))
+    try:
+        LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS', '45.0')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = 45.0
+    LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS = max(1.0, min(300.0, LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS))
+    try:
+        LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES', str(128 * 1024 * 1024))
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+    LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES = max(
+        1024,
+        min(512 * 1024 * 1024, LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES),
+    )
+    # Per-second CV apex decider (capture_per_second_cv_apex_v2).
+    try:
+        LUXRIOT_CAPTURE_BURST_ZSCORE = float(os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_BURST_ZSCORE', '6.0'))
+    except (TypeError, ValueError):
+        LUXRIOT_CAPTURE_BURST_ZSCORE = 6.0
+    LUXRIOT_CAPTURE_BURST_ZSCORE = max(1.0, min(50.0, LUXRIOT_CAPTURE_BURST_ZSCORE))
+    try:
+        LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR', '0.004')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = 0.004
+    LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR = max(0.0, min(0.25, LUXRIOT_CAPTURE_ACTIVITY_NOISE_FLOOR))
+    LUXRIOT_CAPTURE_SELECTOR_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_ENABLED',
+        'True',
+    )
+    LUXRIOT_CAPTURE_SELECTOR_BIAS = os.getenv('EVOSSEARCH_LUXRIOT_CAPTURE_SELECTOR_BIAS', 'auto').strip().lower()
+    if LUXRIOT_CAPTURE_SELECTOR_BIAS not in {'auto', 'action', 'clarity'}:
+        LUXRIOT_CAPTURE_SELECTOR_BIAS = 'auto'
     LUXRIOT_VECTOR_SIGNALS_ENABLED = os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
     try:
         LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT = int(os.getenv('EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT', '6'))
@@ -530,7 +898,8 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES = 8
     LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES = max(4, min(64, LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES))
-    LUXRIOT_BATCH_SIZES = (12, 24, 36)
+    # One VLM request must never exceed the bounded L0 delivery contract.
+    LUXRIOT_BATCH_SIZES = (12, 16)
     try:
         LUXRIOT_SUMMARY_RETENTION_DAYS = float(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS', '7')
@@ -538,6 +907,16 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_SUMMARY_RETENTION_DAYS = 7.0
     LUXRIOT_SUMMARY_RETENTION_DAYS = max(0.0, LUXRIOT_SUMMARY_RETENTION_DAYS)
+    try:
+        LUXRIOT_ROLLUP_RETENTION_DAYS = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_RETENTION_DAYS',
+                str(ARCHIVE_ROW_RETENTION_DAYS),
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_RETENTION_DAYS = float(ARCHIVE_ROW_RETENTION_DAYS)
+    LUXRIOT_ROLLUP_RETENTION_DAYS = max(0.0, LUXRIOT_ROLLUP_RETENTION_DAYS)
     _SUMMARY_DEFAULT_BATCH = LUXRIOT_BATCH_SIZES[0] if LUXRIOT_BATCH_SIZES else 12
     _SUMMARY_DEFAULT_LIMIT = int(
         max(
@@ -556,6 +935,13 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_SUMMARY_HISTORY_LIMIT = _SUMMARY_DEFAULT_LIMIT
     LUXRIOT_SUMMARY_HISTORY_LIMIT = max(40, LUXRIOT_SUMMARY_HISTORY_LIMIT)
+    try:
+        LUXRIOT_SUMMARY_STATE_HOT_LIMIT = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_STATE_HOT_LIMIT', '2160')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_SUMMARY_STATE_HOT_LIMIT = 2160
+    LUXRIOT_SUMMARY_STATE_HOT_LIMIT = max(240, min(10000, LUXRIOT_SUMMARY_STATE_HOT_LIMIT))
     try:
         LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH = int(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH', '4')
@@ -662,6 +1048,13 @@ class Config:
         LUXRIOT_BOOKMARK_COOLDOWN_SEC = 60.0
     LUXRIOT_BOOKMARK_COOLDOWN_SEC = max(0.0, LUXRIOT_BOOKMARK_COOLDOWN_SEC)
     try:
+        LUXRIOT_ALERT_DEDUPE_WINDOW_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC', '600')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ALERT_DEDUPE_WINDOW_SEC = 600.0
+    LUXRIOT_ALERT_DEDUPE_WINDOW_SEC = max(0.0, min(86400.0, LUXRIOT_ALERT_DEDUPE_WINDOW_SEC))
+    try:
         LUXRIOT_ALERTS_MAX_PER_BATCH = int(os.getenv('EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH', '8'))
     except (TypeError, ValueError):
         LUXRIOT_ALERTS_MAX_PER_BATCH = 8
@@ -689,6 +1082,105 @@ class Config:
         'critical': os.getenv('EVOSSEARCH_LUXRIOT_SEV_CRITICAL', 'critical').lower(),
     }
     LUXRIOT_ROLLUP_L1_LLM_ENABLED = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_L1_LLM_ENABLED', 'True')
+    LUXRIOT_ROLLUP_SCHEDULER_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED',
+        'True',
+    )
+    try:
+        LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC', '30')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC = 30.0
+    LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC = max(
+        1.0,
+        min(600.0, LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC', '5')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC = 5.0
+    LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC = max(
+        1.0,
+        min(300.0, LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS', '2')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS = 2
+    LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS = max(
+        1,
+        min(12, LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS),
+    )
+    try:
+        LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS', '2')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS = 2.0
+    LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS = max(
+        0.0,
+        min(10.0, LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS),
+    )
+    try:
+        LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC', '180')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC = 180.0
+    LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC = max(
+        0.0,
+        min(3600.0, LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC', '10')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = 10.0
+    LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC = max(
+        1.0,
+        min(300.0, LUXRIOT_ROLLUP_BACKFILL_SPACING_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS', '3')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = 3
+    LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS = max(
+        1,
+        min(10, LUXRIOT_ROLLUP_BACKFILL_MAX_ATTEMPTS),
+    )
+    try:
+        LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC', '45')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = 45.0
+    LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC = max(
+        1.0,
+        min(900.0, LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L1_WINDOW_SEC = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_WINDOW_SEC', '900'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_WINDOW_SEC = 900
+    LUXRIOT_ROLLUP_L1_WINDOW_SEC = max(300, LUXRIOT_ROLLUP_L1_WINDOW_SEC)
+    try:
+        LUXRIOT_ROLLUP_L2_WINDOW_SEC = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L2_WINDOW_SEC', '3600'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L2_WINDOW_SEC = 3600
+    LUXRIOT_ROLLUP_L2_WINDOW_SEC = max(900, LUXRIOT_ROLLUP_L2_WINDOW_SEC)
+    try:
+        LUXRIOT_ROLLUP_L3_WINDOW_SEC = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_WINDOW_SEC', '28800'))
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_WINDOW_SEC = 28800
+    LUXRIOT_ROLLUP_L3_WINDOW_SEC = max(1800, LUXRIOT_ROLLUP_L3_WINDOW_SEC)
     try:
         LUXRIOT_ROLLUP_L1_CHAR_BUDGET = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_CHAR_BUDGET', '12000'))
     except (TypeError, ValueError):
@@ -715,59 +1207,51 @@ class Config:
         os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_STATE_FILE', 'luxriot_summary_state.json').strip()
         or 'luxriot_summary_state.json'
     )
+    # Operator-defined channel groups for the Probes board.  Luxriot exposes no
+    # group concept, so this is EVA-side organisation state.
+    PROBE_CHANNEL_GROUPS_FILE = (
+        os.getenv('EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE', 'probe_channel_groups.json').strip()
+        or 'probe_channel_groups.json'
+    )
     LUXRIOT_ROLLUP_TIME_ONLY = _get_bool_env('EVOSSEARCH_LUXRIOT_ROLLUP_TIME_ONLY', 'True')
     LUXRIOT_ROLLUP_L1_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_MODEL', '').strip()
     LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L0 batch notes for one short time window.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: keep factual language; preserve every grounded "
-            "alert/deviation even when the rest of the window is routine; do not classify behavior as illegal; "
-            "describe observable security/safety facts requiring operator review; avoid phrases like 'L1 rollup from L0'."
+            "You execute short-horizon episodic consolidation (L1) within EVA's visual-semantic intellectual core. "
+            "EVA may operate from a home installation to city-scale infrastructure; deployment rules and alert criteria "
+            "are supplied separately. Your output becomes short-lived system memory and may affect continuity and future "
+            "attention, so preserve evidence, uncertainty, provenance, rare deviations, and coverage gaps. Turn grounded "
+            "L0 observations into a readable 15-minute episode account: what persisted, changed, resolved, or remains "
+            "uncertain. Maintain unresolved episodes and a short-lived watchlist, but do not establish durable routine, "
+            "suppress alerts, or invent new visual facts. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L2_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L1 summaries into one hour-scale view.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: preserve meaningful deviations from routine; "
-            "never compress alerts or operator-review incidents into routine; avoid repeating unchanged background details; "
-            "keep concise, operator-facing language."
+            "You execute medium-horizon routine and recurrence consolidation (L2) within EVA's visual-semantic "
+            "intellectual core. Convert L1 episodes into a grounded hour-scale account of recurrence, routine shifts, "
+            "alerts and outcomes, unresolved exceptions, and coverage interruptions. Your output may regulate the future "
+            "channel baseline, so distinguish repeated observation from certainty, preserve isolated important events, "
+            "and express baseline changes as grounded candidates rather than visual facts. Do not concatenate lower-level "
+            "summaries, invent new observations, or let routine suppress visible hazards and operator criteria. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_L3_SYSTEM_PROMPT',
         (
-            "You are a CCTV operations analyst. Summarize multiple L2 summaries into a longer period narrative.\n"
-            "Return Markdown using exactly these sections:\n"
-            "### Window Snapshot\n"
-            "### Routine Baseline\n"
-            "### Preserved Deviations\n"
-            "### Alert Ledger\n"
-            "### Alert Tuning Notes\n"
-            "### Alerts/Signals\n"
-            "### Operator Notes\n"
-            "Append MEMORY_UPDATE_JSON with durable routine_baseline, active_watchlist, preserved_deviations, "
-            "alert_tuning_notes, and ignore_as_routine. Rules: emphasize trend shifts and durable signals; "
-            "preserve real security/safety deviations; remove duplicate wording; focus on actionable context."
+            "You execute slow-horizon audit and regulatory memory consolidation (L3) within EVA's visual-semantic "
+            "intellectual core. Build a grounded eight-hour account of durable routine, repeated or changing behavior, "
+            "unresolved incidents, alert meaning, exceptions, and coverage quality. Reconcile the hierarchy audit and "
+            "bounded L0 drills without treating samples as complete coverage. Operator false-positive annotations are "
+            "privileged review feedback: analyze recurring failure modes separately, while leaving unreviewed alerts "
+            "unclassified. Propose durable memory and alert tuning conservatively; never silently suppress general hazards "
+            "or operator criteria, and never invent new visual facts. This pass is review/proposal-only: it must not "
+            "change probes, thresholds, alert policy, or live sampling automatically. "
+            "Use the mandatory EVA operator rollup contract appended by the backend."
         ),
     ).strip()
     LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'
@@ -793,13 +1277,227 @@ class Config:
         LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL
     if LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL < 1:
         LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = 1
-    LUXRIOT_ROLLUP_LLM_MODEL = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL', LUXRIOT_ROLLUP_L1_MODEL).strip()
+    LUXRIOT_ROLLUP_LLM_MODEL = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL',
+        LUXRIOT_ROLLUP_L1_MODEL or LM_AGENT_PROFILE_ID,
+    ).strip()
     LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT = os.getenv(
         'EVOSSEARCH_LUXRIOT_ROLLUP_LLM_SYSTEM_PROMPT',
         LUXRIOT_ROLLUP_L1_SYSTEM_PROMPT,
     ).strip()
+    LUXRIOT_ROLLUP_L3_DEEP_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED',
+        'False',
+    )
+    LUXRIOT_ROLLUP_L3_DEEP_BASE_URL = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL',
+        '',
+    ).strip().rstrip('/')
+    LUXRIOT_ROLLUP_L3_DEEP_MODEL = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MODEL',
+        '',
+    ).strip()
+    LUXRIOT_ROLLUP_L3_DEEP_API_KEY = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_API_KEY',
+        '',
+    ).strip()
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC',
+                '5',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC = 5.0
+    LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC = min(
+        60.0,
+        max(0.25, LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC',
+                '600',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC = 600.0
+    LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC = min(
+        3600.0,
+        max(1.0, LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS', '3072')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS = 3072
+    LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS = min(
+        32768,
+        max(128, LUXRIOT_ROLLUP_L3_DEEP_MAX_TOKENS),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE', '0.1')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE = 0.1
+    LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE = min(
+        2.0,
+        max(0.0, LUXRIOT_ROLLUP_L3_DEEP_TEMPERATURE),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY', '64')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY = 64
+    LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY = min(
+        256,
+        max(1, LUXRIOT_ROLLUP_L3_DEEP_QUEUE_CAPACITY),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS', '3')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS = 3
+    LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS = min(
+        10,
+        max(1, LUXRIOT_ROLLUP_L3_DEEP_MAX_ATTEMPTS),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC',
+                '30',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC = 30.0
+    LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC = min(
+        3600.0,
+        max(1.0, LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC',
+                '900',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC = 900.0
+    LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC = max(
+        LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_INITIAL_SEC,
+        min(3600.0, LUXRIOT_ROLLUP_L3_DEEP_BACKOFF_MAX_SEC),
+    )
+    LUXRIOT_ROLLUP_L3_QUIET_WINDOW_ENABLED = _get_bool_env(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_ENABLED',
+        'False',
+    )
+    LUXRIOT_ROLLUP_L3_QUIET_WINDOW_TIMEZONE = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_TIMEZONE',
+        os.getenv('EVOSSEARCH_SITE_TIMEZONE', 'UTC'),
+    ).strip() or 'UTC'
+    LUXRIOT_ROLLUP_L3_QUIET_WINDOW_START = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_START',
+        '01:00',
+    ).strip() or '01:00'
+    LUXRIOT_ROLLUP_L3_QUIET_WINDOW_END = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_END',
+        '05:00',
+    ).strip() or '05:00'
+    LUXRIOT_ROLLUP_L3_QUIET_WINDOW_DAYS = os.getenv(
+        'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_DAYS',
+        'mon,tue,wed,thu,fri,sat,sun',
+    ).strip() or 'mon,tue,wed,thu,fri,sat,sun'
+    try:
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC',
+                '86400',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC = 86400.0
+    LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC = min(
+        604800.0,
+        max(60.0, LUXRIOT_ROLLUP_L3_QUIET_MAX_DEFERRAL_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC', '60')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC = 60.0
+    LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC = min(
+        3600.0,
+        max(5.0, LUXRIOT_ROLLUP_L3_QUIET_POLL_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X',
+                '1.5',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X = 1.5
+    LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X = min(
+        1000.0,
+        max(0.0, LUXRIOT_ROLLUP_L3_QUIET_MAX_ACTIVITY_X),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC',
+                '900',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC = 900.0
+    LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC = min(
+        86400.0,
+        max(0.0, LUXRIOT_ROLLUP_L3_QUIET_ALERT_LOOKBACK_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT',
+                '0.75',
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT = 0.75
+    LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT = min(
+        10.0,
+        max(0.0, LUXRIOT_ROLLUP_L3_QUIET_MAX_L0_DEBT),
+    )
 
     # Probe / CLIP monitoring
+    try:
+        PROBE_POS_FLOOR_DEFAULT = float(
+            os.getenv('EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT', '0.28')
+        )
+    except (TypeError, ValueError):
+        PROBE_POS_FLOOR_DEFAULT = 0.28
+    PROBE_POS_FLOOR_DEFAULT = min(1.0, max(-1.0, PROBE_POS_FLOOR_DEFAULT))
+    try:
+        PROBE_MARGIN_DEFAULT = float(
+            os.getenv('EVOSSEARCH_PROBE_MARGIN_DEFAULT', '0.08')
+        )
+    except (TypeError, ValueError):
+        PROBE_MARGIN_DEFAULT = 0.08
+    PROBE_MARGIN_DEFAULT = min(2.0, max(0.0, PROBE_MARGIN_DEFAULT))
+    try:
+        PROBE_CAPTURE_WARMUP_SEC = float(
+            os.getenv('EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC', '2.5')
+        )
+    except (TypeError, ValueError):
+        PROBE_CAPTURE_WARMUP_SEC = 2.5
+    PROBE_CAPTURE_WARMUP_SEC = min(10.0, max(0.0, PROBE_CAPTURE_WARMUP_SEC))
     try:
         PROBE_MAX_FRAMES = int(os.getenv('EVOSSEARCH_PROBE_MAX_FRAMES', '2000'))
     except (TypeError, ValueError):
@@ -847,6 +1545,23 @@ class Config:
     # Detection archive + adaptive retention
     DETECTIONS_ARCHIVE_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED', 'True')
     DETECTIONS_ARCHIVE_DIR = os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_DIR', 'detections_archive').strip() or 'detections_archive'
+    try:
+        ARCHIVE_DISK_MIN_FREE_GB = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB', '2.0')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_DISK_MIN_FREE_GB = 2.0
+    ARCHIVE_DISK_MIN_FREE_GB = max(0.0, ARCHIVE_DISK_MIN_FREE_GB)
+    try:
+        ARCHIVE_DISK_MIN_FREE_PERCENT = float(
+            os.getenv('EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT', '5.0')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_DISK_MIN_FREE_PERCENT = 5.0
+    ARCHIVE_DISK_MIN_FREE_PERCENT = min(
+        50.0,
+        max(0.0, ARCHIVE_DISK_MIN_FREE_PERCENT),
+    )
     try:
         DETECTIONS_ARCHIVE_JPEG_QUALITY = int(os.getenv('EVOSSEARCH_DETECTIONS_ARCHIVE_JPEG_QUALITY', '88'))
     except (TypeError, ValueError):
@@ -998,6 +1713,7 @@ class Config:
                 cls.LUXRIOT_ROLLUP_LLM_MODEL or cls.LM_MODEL,
             )
         )
+        print(f"Probe channel groups: {cls.PROBE_CHANNEL_GROUPS_FILE}")
         print(
             "Detections archive: {} ({}, adaptive retention {}, keep_all_rows {}, window {}s, force {}s)".format(
                 'enabled' if cls.DETECTIONS_ARCHIVE_ENABLED else 'disabled',

@@ -18,7 +18,15 @@ else:  # pragma: no cover - Pillow compatibility fallback
 class Mask2FormerHead:
     """Thin wrapper around Mask2Former for single-image region refinement."""
 
-    def __init__(self, model_name: str, device: str, max_size: int = 1024) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        max_size: int = 1024,
+        *,
+        local_files_only: bool = True,
+        cache_dir: str | None = None,
+    ) -> None:
         target_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         if target_device.startswith("cuda") and not torch.cuda.is_available():
             target_device = "cpu"
@@ -26,8 +34,16 @@ class Mask2FormerHead:
         self.model_name = model_name
         self.max_size = max(256, int(max_size)) if max_size else 0
 
-        self.processor = Mask2FormerImageProcessor.from_pretrained(model_name)
-        self.model = Mask2FormerForUniversalSegmentation.from_pretrained(model_name)
+        self.processor = Mask2FormerImageProcessor.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+            cache_dir=cache_dir,
+        )
+        self.model = Mask2FormerForUniversalSegmentation.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+            cache_dir=cache_dir,
+        )
         cast(torch.nn.Module, self.model).to(self.device)
         self.model.eval()
         self.use_autocast = self.device.type == "cuda"

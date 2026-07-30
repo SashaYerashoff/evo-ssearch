@@ -216,10 +216,20 @@ fi
 APP_PARENT="$(dirname "${APP_DIR}")"
 APP_BASE="$(basename "${APP_DIR}")"
 tar \
-  --exclude="${APP_BASE}/.venv" \
+  --exclude="${APP_BASE}/.git" \
+  --exclude="${APP_BASE}/*/.git" \
+  --exclude="${APP_BASE}/.local" \
+  --exclude="${APP_BASE}/*/.local" \
+  --exclude="${APP_BASE}/.venv*" \
+  --exclude="${APP_BASE}/*/.venv*" \
+  --exclude="${APP_BASE}/.env" \
+  --exclude="${APP_BASE}/.env.*" \
+  --exclude="${APP_BASE}/dist" \
+  --exclude="${APP_BASE}/*/dist" \
   --exclude="${APP_BASE}/__pycache__" \
   --exclude="${APP_BASE}/.pytest_cache" \
   --exclude="${APP_BASE}/node_modules" \
+  --exclude="${APP_BASE}/*/node_modules" \
   --exclude="${APP_BASE}/detections_archive" \
   --exclude="${APP_BASE}/video" \
   --exclude="${APP_BASE}/models" \
@@ -228,11 +238,20 @@ tar \
   --exclude="${APP_BASE}/*.mov" \
   --exclude="${APP_BASE}/*.mkv" \
   --exclude="${APP_BASE}/probes_store.json" \
+  --exclude="${APP_BASE}/probe_channel_groups.json" \
   --exclude="${APP_BASE}/luxriot_summary_state.json" \
   --exclude="${APP_BASE}/luxriot_rollups_cache.json" \
+  --exclude="${APP_BASE}/*.sqlite3" \
+  --exclude="${APP_BASE}/*.db" \
+  --exclude="${APP_BASE}/*.log" \
   -czf "${BACKUP_DIR}/code.tgz" \
   -C "${APP_PARENT}" "${APP_BASE}"
 ok "backed up current code"
+if [[ -f "${APP_DIR}/probe_channel_groups.json" ]]; then
+  install -m 0600 "${APP_DIR}/probe_channel_groups.json" \
+    "${BACKUP_DIR}/probe_channel_groups.json"
+  ok "backed up probe channel groups"
+fi
 
 if [[ "${SKIP_PG_DUMP}" != true ]]; then
   if command -v pg_dump >/dev/null 2>&1; then
@@ -304,6 +323,7 @@ RSYNC_EXCLUDES=(
   "--exclude=*.mov"
   "--exclude=*.mkv"
   "--exclude=probes_store.json"
+  "--exclude=probe_channel_groups.json"
   "--exclude=luxriot_summary_state.json"
   "--exclude=luxriot_rollups_cache.json"
   "--exclude=.env"

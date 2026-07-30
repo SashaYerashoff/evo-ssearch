@@ -12,14 +12,22 @@ Trigger phrases:
 
 Goal: search a channel group for one event without pretending to review more channels than the turn can handle.
 
+Tools:
+- `normalize_time_window`
+- `list_video_summary_channels`
+- `get_video_summaries`
+- `get_visual_window_signals`
+- `get_detections`
+- `describe_frame`
+
 Default order:
-1. Normalize the time window.
+1. Normalize the time window with `normalize_time_window`.
 2. Resolve explicit channel IDs/titles if provided.
 3. If no explicit group is provided, call `list_video_summary_channels` for the period.
 4. If active channels exceed `per_turn_channel_limit`, present candidate channels and ask the operator to choose or confirm full multi-turn research.
-5. For each selected channel, start with L2/L1 depending on period length, then use `get_visual_window_signals` for the event phrase if candidate windows are unclear.
+5. For each selected channel, start with `get_video_summaries` at L2/L1 depending on period length, then use `get_visual_window_signals` for the event phrase if candidate windows are unclear.
 6. Drill only candidate windows.
-7. If visual confirmation is needed, pull VLM summary/alert frames and call `describe_frame` on the relevant returned `detection_id` or frame image before calling anything visually confirmed.
+7. If visual confirmation is needed, pull VLM summary/alert frames with `get_detections` (`source="vlm_summary"`/`source="vlm_alert"`) and call `describe_frame` on the relevant returned `detection_id` or frame image before calling anything visually confirmed.
 8. Keep a per-channel ledger with checked, candidates found, no coverage, and unchecked.
 
 Output:

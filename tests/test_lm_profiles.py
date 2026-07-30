@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import oldapp
@@ -95,15 +96,22 @@ class LmProfileRuntimeTests(unittest.TestCase):
             captured["timeout"] = kwargs.get("timeout")
             return _Response({"choices": [{"message": {"content": "ok"}}]})
 
+        class AdmissionCapture:
+            def admission(self, _resource, *, workload, **_kwargs):
+                captured["workload"] = workload
+                return nullcontext()
+
         with (
             patch.object(oldapp.config, "LM_PROFILES", profiles),
             patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
             patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
         ):
             result = oldapp._call_lm_chat(
                 [{"role": "user", "content": "describe"}],
                 model_override="vlm-a",
                 profile_kind="vlm",
+                workload_class="rollup",
             )
 
         self.assertEqual(result, "ok")
@@ -111,6 +119,82 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["json"]["model"], "qwen3.5-vl-4b")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer vlm-secret")
         self.assertEqual(captured["timeout"], 321)
+        self.assertEqual(captured["workload"], "rollup")
+        self.assertEqual(
+            captured["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_interactive_agent_keeps_model_thinking_mode(self):
+        profile = {
+            "id": "agent",
+            "kind": "agent",
+            "base_url": "http://agent.local/v1",
+            "model": "qwen3.5-9b-mtp",
+            "api_key": "",
+            "timeout": 120,
+        }
+        captured = {}
+
+        def fake_post(_url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "research this"}],
+                profile_id="agent",
+                profile_kind="agent",
+                workload_class="agent",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertNotIn("chat_template_kwargs", captured["json"])
+
+    def test_interactive_vlm_requests_direct_answer(self):
+        profile = {
+            "id": "vlm",
+            "kind": "vlm",
+            "base_url": "http://vlm.local/v1",
+            "model": "qwen3.5-4b-mtp",
+            "api_key": "",
+            "timeout": 120,
+        }
+        captured = {}
+
+        def fake_post(_url, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _Response({"choices": [{"message": {"content": "ok"}}]})
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "describe this frame"}],
+                profile_id="vlm",
+                profile_kind="vlm",
+                workload_class="describe",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(
+            captured["json"]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
 
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {
@@ -159,10 +243,14 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["default_model"], "vlm-a")
         self.assertEqual(payload["offline_default_model"], "agent")
         self.assertEqual(payload["agent_default_model"], "agent")
-        self.assertIn("agent", payload["models"])
-        self.assertIn("vlm-a", payload["models"])
-        self.assertIn("qwen-agent", payload["models"])
-        self.assertIn("qwen-vlm", payload["models"])
+        self.assertEqual(sorted(payload["models"]), ["qwen-agent", "qwen-vlm"])
+        self.assertNotIn("agent", payload["models"])
+        self.assertNotIn("vlm-a", payload["models"])
+        self.assertIn("agent", payload["configured_models"])
+        self.assertIn("vlm-a", payload["configured_models"])
+        agent_profile = next(profile for profile in payload["profiles"] if profile["id"] == "agent")
+        self.assertTrue(agent_profile["available"])
+        self.assertEqual(agent_profile["available_models"], ["qwen-agent"])
         self.assertEqual(payload["auto_model_selector"], "__auto__")
         self.assertTrue(payload["vlm_balancer"]["enabled"])
         self.assertEqual(payload["vlm_balancer"]["profile_ids"], ["vlm-a"])
