@@ -542,6 +542,13 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                     "thumbnail_role": "burst_apex",
                     "thumbnail_frame_index": 2,
                     "thumbnail_selection_source": "capture_cv_frame_delta",
+                    "thumbnail_is_cover": True,
+                    "thumbnail_snapshot_index": 3,
+                    "cover_kind": "event",
+                    "cover_reason": "Burst apex represents the episode.",
+                    "cover_confidence": "high",
+                    "batch_id": "batch-7",
+                    "state_transition_total": 2,
                     "prompt": "large internal prompt",
                     "frame_selection": {
                         "groups": [
@@ -573,6 +580,13 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertEqual(feed_log["thumbnail_detection_id"], 44)
             self.assertEqual(feed_log["thumbnail_role"], "burst_apex")
             self.assertEqual(feed_log["thumbnail_frame_index"], 2)
+            self.assertTrue(feed_log["thumbnail_is_cover"])
+            self.assertEqual(feed_log["thumbnail_snapshot_index"], 3)
+            self.assertEqual(feed_log["cover_kind"], "event")
+            self.assertEqual(feed_log["cover_reason"], "Burst apex represents the episode.")
+            self.assertEqual(feed_log["cover_confidence"], "high")
+            self.assertEqual(feed_log["batch_id"], "batch-7")
+            self.assertEqual(feed_log["state_transition_total"], 2)
             self.assertEqual(
                 feed_log["thumbnail_selection_source"],
                 "capture_cv_frame_delta",

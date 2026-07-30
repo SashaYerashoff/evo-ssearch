@@ -46,6 +46,41 @@ export interface SummaryEntry {
   run_id?: string
   severity?: string
   alert_counts?: Record<string, number>
+  alert_total?: number
+  level?: string
+  rollup_id?: string
+  batch_id?: string
+  item_count?: number
+  source_tokens?: number
+  run_ids?: string[]
+  summary_kind?: string
+  generation_status?: string
+  generation_error?: string
+  semantic_refresh_pending?: boolean
+  state_transition_total?: number
+  coverage_gap?: boolean
+  gap_reason?: string
+  coalesced?: { batches?: number; omitted_frames?: number }
+  thumbnail_detection_id?: number
+  thumbnail_role?: string
+  thumbnail_snapshot_index?: number
+  thumbnail_selection_source?: string
+  thumbnail_is_cover?: boolean
+  cover_kind?: string
+  cover_reason?: string
+  cover_confidence?: string
+  vector_signal?: {
+    capture_attention?: {
+      seconds?: Array<{
+        snapshot?: number | string
+        mode?: string
+        activity_x?: number
+        [k: string]: any
+      }>
+      [k: string]: any
+    }
+    [k: string]: any
+  }
   [k: string]: any
 }
 
@@ -132,13 +167,20 @@ export function buildSessionQuery(
   }
 }
 
+export function buildSummaryFeedQuery(
+  channelId: number,
+  opts: { limit?: number; from_ts?: number; to_ts?: number } = {},
+): SessionQuery & { view: 'feed' } {
+  return { ...buildSessionQuery(channelId, opts), view: 'feed' }
+}
+
 export const videoApi = {
   streams: (): Promise<StreamsStatus> => api.get('/luxriot/streams'),
   lmModels: (): Promise<LmModelCatalog> => api.get('/lm/models'),
   rollups: (channelId: number, opts: { level_limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<RollupsResponse> =>
     api.get('/luxriot/rollups', { channel_id: String(channelId), level_limit: String(opts.level_limit ?? 60), from_ts: opts.from_ts, to_ts: opts.to_ts }),
   session: (channelId: number, opts: { limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
-    api.get('/luxriot/session', buildSessionQuery(channelId, opts)),
+    api.get('/luxriot/session', buildSummaryFeedQuery(channelId, opts)),
   startCapture: (b: CaptureInput): Promise<{ success: boolean; session?: any; error?: string }> => api.postJson('/luxriot/start_capture', b),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/luxriot/stop_capture', { channel_id: channelId }),
   flushCapture: (channelId: number): Promise<{ success: boolean; status?: { logs?: SummaryEntry[] }; items?: number }> =>

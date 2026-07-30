@@ -30,7 +30,7 @@ import {
   normalizeRevokedSessions,
   buildAuditQuery,
 } from './settings'
-import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery } from './video'
+import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery, buildSummaryFeedQuery } from './video'
 import { API_PREFIXES } from '../../proxy-config'
 
 describe('React/backend contract normalizers', () => {
@@ -115,6 +115,16 @@ describe('React/backend contract normalizers', () => {
       limit: '60',
       from_ts: 1234,
       to_ts: undefined,
+    })
+  })
+
+  it('requests the bounded video-summary feed instead of internal diagnostics', () => {
+    expect(buildSummaryFeedQuery(7, { limit: 240, from_ts: 1234 })).toEqual({
+      channel_id: '7',
+      limit: '240',
+      from_ts: 1234,
+      to_ts: undefined,
+      view: 'feed',
     })
   })
 

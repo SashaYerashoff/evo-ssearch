@@ -1,5 +1,13 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
-import { IconVideoOff, IconAlertTriangle, IconChevronRight } from '@tabler/icons-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  IconAlertTriangle,
+  IconChevronDown,
+  IconChevronRight,
+  IconCopy,
+  IconDownload,
+  IconVideoOff,
+  IconX,
+} from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import type { ConsoleDrive } from '../../App'
 import { buildCaptureInput, videoApi, recentFrameUrl, mergeRuntime, type StreamsStatus, type ChannelRuntime, type SummaryEntry } from '../../api/video'
@@ -7,12 +15,197 @@ import type { DropOption } from '../shell/Dropdown'
 import { renderMarkdown } from '../agent/markdown'
 import { StreamControl } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
+import {
+  SUMMARY_SEVERITIES,
+  splitSummaryMachineJson,
+  summaryAlertCounts,
+  summaryBurst,
+  summaryEntryKey,
+  summaryLevel,
+  summarySemanticStatus,
+} from './summaryView'
 
-const SEV_ORDER = ['critical', 'high', 'normal', 'low', 'info']
+function asTimestampMs(value: unknown): number | null {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return null
+  return number > 1e12 ? number : number * 1000
+}
 
-function fmtClock(sec?: number): string {
-  if (!sec) return '—'
-  return new Date(sec * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' })
+function fmtTimestamp(value: unknown): string {
+  const ms = asTimestampMs(value)
+  if (!ms) return '—'
+  return new Date(ms).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function summaryRange(entry: SummaryEntry): string {
+  const start = asTimestampMs(entry.batch_start_ms ?? entry.window_start)
+  const end = asTimestampMs(entry.batch_end_ms ?? entry.window_end)
+  if (!start || !end || end <= start) return fmtTimestamp(entry.created_at ?? entry.window_end)
+  const startDate = new Date(start)
+  const endDate = new Date(end)
+  const sameDay = startDate.toDateString() === endDate.toDateString()
+  const startLabel = startDate.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  const endLabel = endDate.toLocaleString([], sameDay
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return `${startLabel}–${endLabel}`
+}
+
+function copySummary(entry: SummaryEntry): void {
+  void navigator.clipboard.writeText(String(entry.summary || '')).catch(() => {})
+}
+
+function exportSummary(entry: SummaryEntry, level: string): void {
+  const text = String(entry.summary || '').trim()
+  if (!text) return
+  const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `eva-${level.toLowerCase()}-${entry.channel_id ?? 'channel'}-${Date.now()}.md`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+function SummaryCard({
+  entry,
+  selectedDepth,
+  collapsed,
+  canExport,
+  onToggle,
+  onImage,
+}: {
+  entry: SummaryEntry
+  selectedDepth: string
+  collapsed: boolean
+  canExport: boolean
+  onToggle: () => void
+  onImage: (src: string, title: string) => void
+}) {
+  const level = summaryLevel(entry, selectedDepth)
+  const alerts = summaryAlertCounts(entry)
+  const burst = summaryBurst(entry)
+  const semantic = summarySemanticStatus(entry)
+  const parts = splitSummaryMachineJson(entry.summary)
+  const thumbnailId = Number(entry.thumbnail_detection_id)
+  const thumbnailSrc = Number.isInteger(thumbnailId) && thumbnailId > 0
+    ? `/detections/thumbnail/${thumbnailId}`
+    : ''
+  const thumbnailRole = String(entry.thumbnail_role || 'sample').replace(/_/g, ' ')
+  const isCover = entry.thumbnail_is_cover === true
+  const coalesced = Number(entry.coalesced?.batches || 0)
+  const itemCount = Number(entry.item_count || 0)
+  const frameCount = Number(entry.frame_count || 0)
+  const runCount = Array.isArray(entry.run_ids) ? entry.run_ids.length : 0
+  const sourceTokens = Number(entry.source_tokens || 0)
+  const contentStats = level === 'L0'
+    ? [
+        frameCount > 0 ? `${frameCount} frames` : '',
+        entry.model ? String(entry.model) : '',
+      ].filter(Boolean)
+    : [
+        itemCount > 0 ? `${itemCount} items` : '',
+        frameCount > 0 ? `${frameCount} frames` : '',
+        runCount > 0 ? `${runCount} runs` : '',
+        sourceTokens > 0 ? `${sourceTokens} tok` : '',
+      ].filter(Boolean)
+
+  return (
+    <article className={`vid-sum ${collapsed ? 'collapsed' : ''} ${entry.coverage_gap ? 'coverage-gap' : ''}`}>
+      <div className="vid-sum-head">
+        <button className="vid-sum-toggle" onClick={onToggle} aria-expanded={!collapsed}>
+          {collapsed ? <IconChevronRight size={15} /> : <IconChevronDown size={15} />}
+          <span className="vid-level">{level}</span>
+          {semantic && (
+            <span className={`vid-semantic ${semantic.tone}`} title={semantic.title}>{semantic.label}</span>
+          )}
+          <span className="vid-channel-pill">#{entry.channel_id ?? '?'}</span>
+          <span className="vid-sum-ts">{summaryRange(entry)}</span>
+          {contentStats.length > 0 && <span className="vid-sum-stats">{contentStats.join(' · ')}</span>}
+          {coalesced > 1 && <span className="vid-meta-chip">coalesced ×{coalesced}</span>}
+          {isCover && <span className="vid-meta-chip cover" title={String(entry.cover_reason || 'Model-selected batch cover')}>cover</span>}
+          {burst && (
+            <span
+              className="vid-meta-chip burst"
+              title={`Motion above the measured channel norm${burst.snapshots.length ? ` · snapshots ${burst.snapshots.join(', ')}` : ''}`}
+            >
+              ⚡ burst ×{burst.count}{burst.maxActivity != null ? ` · ${burst.maxActivity.toFixed(1)}×` : ''}
+            </span>
+          )}
+          {Number(entry.state_transition_total || 0) > 0 && (
+            <span className="vid-meta-chip transition">{entry.state_transition_total} transitions</span>
+          )}
+          {entry.coverage_gap && <span className="vid-meta-chip gap">coverage gap</span>}
+          {SUMMARY_SEVERITIES.filter((severity) => Number(alerts[severity] || 0) > 0).map((severity) => (
+            <span key={severity} className={`vid-sev sev-${severity}`}>
+              {severity} <strong>{alerts[severity]}</strong>
+            </span>
+          ))}
+        </button>
+        <div className="vid-sum-actions">
+          <button className="btn compact" onClick={() => copySummary(entry)} disabled={!entry.summary}>
+            <IconCopy size={13} /> Copy
+          </button>
+          {canExport && (
+            <button className="btn compact" onClick={() => exportSummary(entry, level)} disabled={!entry.summary}>
+              <IconDownload size={13} /> Export
+            </button>
+          )}
+        </div>
+      </div>
+
+      {!collapsed && (
+        <div className={`vid-sum-content ${thumbnailSrc ? 'has-thumbnail' : ''}`}>
+          {thumbnailSrc && (
+            <button
+              className="vid-sum-thumbnail"
+              onClick={() => onImage(thumbnailSrc, `${level} · ${summaryRange(entry)}`)}
+              title={String(entry.cover_reason || 'Open the representative VLM input')}
+            >
+              <img src={thumbnailSrc} alt="Representative VLM input" loading="lazy" />
+              <span>
+                VLM input{isCover ? ' · cover' : ''} · {thumbnailRole}
+                {entry.thumbnail_snapshot_index != null ? ` · snapshot ${entry.thumbnail_snapshot_index}` : ''}
+              </span>
+            </button>
+          )}
+          <div className="vid-sum-copy">
+            {entry.coverage_gap ? (
+              <div className="vid-gap-copy">
+                <IconAlertTriangle size={15} />
+                No description exists for this window: {String(entry.gap_reason || 'dropped batch').replace(/_/g, ' ')}.
+              </div>
+            ) : (
+              <>
+                {parts.narrative
+                  ? <div className="vid-sum-body md" dangerouslySetInnerHTML={{ __html: renderMarkdown(parts.narrative) }} />
+                  : !parts.machineJson && <div className="vid-sum-body empty">No operator-facing narrative was returned.</div>}
+                {parts.machineJson && (
+                  <details className="vid-machine-state">
+                    <summary>{parts.marker || 'BATCH_STATE_JSON'} · machine state</summary>
+                    <pre>{parts.machineJson}</pre>
+                  </details>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </article>
+  )
 }
 
 export function VideoScreen({
@@ -22,6 +215,7 @@ export function VideoScreen({
   canCapture,
   canManagePrompts,
   canCreateBookmarks,
+  canExport,
 }: {
   channels: Channel[]
   drive?: ConsoleDrive | null
@@ -29,6 +223,7 @@ export function VideoScreen({
   canCapture: boolean
   canManagePrompts: boolean
   canCreateBookmarks: boolean
+  canExport: boolean
 }) {
   const [channelId, setChannelId] = useState<number | null>(channels[0]?.id ?? null)
   const [streams, setStreams] = useState<StreamsStatus>({})
@@ -47,6 +242,9 @@ export function VideoScreen({
   const [promptOpen, setPromptOpen] = useState(false)
   const [selOpen, setSelOpen] = useState(false)  // Selected stream details — collapsed by default
   const [modelOptions, setModelOptions] = useState<DropOption[]>([{ value: 'auto', label: 'Auto (balance)' }])
+  const [collapsedSummaries, setCollapsedSummaries] = useState<Set<string>>(new Set())
+  const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
+  const feedRef = useRef<HTMLDivElement>(null)
 
   const channelName = useCallback((id: number) => channels.find((c) => c.id === id)?.title, [channels])
   const runtime: ChannelRuntime[] = mergeRuntime(streams, channelName)
@@ -63,11 +261,19 @@ export function VideoScreen({
     const from_ts = history !== '0' ? Math.floor(Date.now() / 1000 - Number(history) * 3600) : undefined
     try {
       let entries: SummaryEntry[] = []
-      if (depth === 'L0') { const r = await videoApi.session(channelId, { limit: 60, from_ts }); entries = r.logs || [] }
-      else { const r = await videoApi.rollups(channelId, { from_ts }); entries = (r.levels as any)?.[depth] || [] }
-      setFeed(entries)
+      if (depth === 'L0') {
+        const response = await videoApi.session(channelId, { limit: 240, from_ts })
+        entries = response.logs || []
+      } else {
+        const response = await videoApi.rollups(channelId, { level_limit: 240, from_ts })
+        entries = (response.levels as any)?.[depth] || []
+      }
+      setFeed(entries.slice().sort((left, right) => (
+        Number(left.created_at ?? left.window_start ?? 0)
+        - Number(right.created_at ?? right.window_start ?? 0)
+      )))
     } catch (e: any) { setError(e?.message || 'Feed failed') }
-  }, [channelId, depth, history, channelName])
+  }, [channelId, depth, history])
 
   useEffect(() => { loadStreams() }, [loadStreams])
   useEffect(() => { loadFeed() }, [loadFeed])
@@ -116,6 +322,9 @@ export function VideoScreen({
     if (!live) return
     const t = window.setInterval(loadFeed, 3000); return () => window.clearInterval(t)
   }, [live, loadFeed])
+  useEffect(() => {
+    if (live) feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight, behavior: 'smooth' })
+  }, [feed, live])
   // refresh preview image on cadence
   useEffect(() => {
     setPreviewBust((b) => b + 1); setPreviewError(true)
@@ -144,6 +353,23 @@ export function VideoScreen({
   }
 
   const previewSrc = channelId != null ? recentFrameUrl(channelId, previewBust) : ''
+  const feedKeys = useMemo(
+    () => feed.map((entry, index) => summaryEntryKey(entry, index)),
+    [feed],
+  )
+  const collapseAll = useCallback(
+    () => setCollapsedSummaries(new Set(feedKeys)),
+    [feedKeys],
+  )
+  const expandAll = useCallback(() => setCollapsedSummaries(new Set()), [])
+  const toggleSummary = useCallback((key: string) => {
+    setCollapsedSummaries((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
 
   return (
     <div className="vid-cols">
@@ -156,6 +382,7 @@ export function VideoScreen({
         onPromptSettings={() => setPromptOpen(true)}
         history={history} onHistory={setHistory} depth={depth} onDepth={setDepth}
         onRefreshFeed={loadFeed} live={live} onToggleLive={() => setLive((v) => !v)}
+        summaryCount={feed.length} onCollapseAll={collapseAll} onExpandAll={expandAll}
       />
 
       <div className="vid-main">
@@ -196,27 +423,35 @@ export function VideoScreen({
         </aside>
 
         <div className="vid-feed-card">
-          <div className="mon-panel-title">VLM feed</div>
+          <div className="vid-feed-heading">
+            <div>
+              <div className="mon-panel-title">VLM feed</div>
+              <div className="vid-feed-meta">
+                {channelName(channelId ?? -1) || 'No channel'} · {depth} · {feed.length} summaries
+                {live ? ' · following live' : ' · fixed view'}
+              </div>
+            </div>
+          </div>
           {error && <div className="chat-error"><IconAlertTriangle size={14} /> {error}</div>}
-          <div className="vid-feed">
+          <div className="vid-feed" ref={feedRef}>
             {feed.length === 0 && (
               <div className="vid-feed-empty">
                 {noFrame && <div className="vid-feed-note"><IconAlertTriangle size={16} /> No fresh EVA frame is available for this channel yet.</div>}
                 <div className="empty-state">No summaries yet for this channel.</div>
               </div>
             )}
-            {feed.map((s, i) => {
-              const chips = SEV_ORDER.filter((k) => (s.alert_counts?.[k] ?? 0) > 0)
+            {feed.map((entry, index) => {
+              const key = feedKeys[index]
               return (
-                <div key={i} className="vid-sum">
-                  <div className="vid-sum-head">
-                    <span className="vid-sum-ts">{fmtClock(s.created_at ?? (s.window_end))}</span>
-                    {s.model && <span className="vid-sum-model">{s.model}</span>}
-                    {s.frame_count != null && <span className="vid-sum-frames">{s.frame_count} frames</span>}
-                    {chips.map((k) => <span key={k} className={`vid-sev sev-${k}`}>{s.alert_counts![k]} {k}</span>)}
-                  </div>
-                  {s.summary && <div className="vid-sum-body md" dangerouslySetInnerHTML={{ __html: renderMarkdown(String(s.summary)) }} />}
-                </div>
+                <SummaryCard
+                  key={key}
+                  entry={entry}
+                  selectedDepth={depth}
+                  collapsed={collapsedSummaries.has(key)}
+                  canExport={canExport}
+                  onToggle={() => toggleSummary(key)}
+                  onImage={(src, title) => setSummaryImage({ src, title })}
+                />
               )
             })}
           </div>
@@ -225,6 +460,15 @@ export function VideoScreen({
 
       {promptOpen && canManagePrompts && channelId != null && (
         <PromptSettingsModal channelId={channelId} canCreateBookmarks={canCreateBookmarks} onClose={() => setPromptOpen(false)} />
+      )}
+      {summaryImage && (
+        <div className="inspect-zoom" onClick={() => setSummaryImage(null)}>
+          <img src={summaryImage.src} alt={summaryImage.title} onClick={(event) => event.stopPropagation()} />
+          <div className="vid-summary-lightbox-title">{summaryImage.title}</div>
+          <button className="modal-close inspect-zoom-close" onClick={() => setSummaryImage(null)} aria-label="Close frame">
+            <IconX size={22} />
+          </button>
+        </div>
       )}
     </div>
   )

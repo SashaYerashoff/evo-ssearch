@@ -18672,6 +18672,7 @@ class LuxriotManager:
             "alert_counts",
             "alert_total",
             "alert_severities",
+            "state_transition_total",
             "bookmarks_sent",
             "bookmark_failed_count",
             "bookmark_last_error",
@@ -18685,6 +18686,12 @@ class LuxriotManager:
             "thumbnail_role",
             "thumbnail_frame_index",
             "thumbnail_selection_source",
+            "thumbnail_is_cover",
+            "thumbnail_snapshot_index",
+            "cover_kind",
+            "cover_reason",
+            "cover_confidence",
+            "batch_id",
         )
         out = {key: value[key] for key in fields if key in value}
         vector_signal = cls._compact_vector_signal(value.get("vector_signal"))

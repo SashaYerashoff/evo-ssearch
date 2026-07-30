@@ -1,5 +1,15 @@
 import { useState } from 'react'
-import { IconReload, IconPlayerPlay, IconPlayerStop, IconDroplet, IconSettings, IconVideo, IconEye } from '@tabler/icons-react'
+import {
+  IconChevronsDown,
+  IconChevronsUp,
+  IconDroplet,
+  IconFileDescription,
+  IconPlayerPlay,
+  IconPlayerStop,
+  IconReload,
+  IconSettings,
+  IconVideo,
+} from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import { Dropdown, type DropOption } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
@@ -31,6 +41,9 @@ export function StreamControl(p: {
   depth: string; onDepth: (v: string) => void
   onRefreshFeed: () => void
   live: boolean; onToggleLive: () => void
+  summaryCount: number
+  onCollapseAll: () => void
+  onExpandAll: () => void
 }) {
   const [tab, setTab] = useState<'stream' | 'lens'>('stream')
 
@@ -46,7 +59,7 @@ export function StreamControl(p: {
     <ToolTabs
       tabs={[
         { id: 'stream', icon: <IconVideo size={13} />, label: 'Live stream control', summary: streamSummary },
-        { id: 'lens', icon: <IconEye size={13} />, label: 'Summary lens', summary: lensSummary },
+        { id: 'lens', icon: <IconFileDescription size={13} />, label: 'Summary lens', summary: lensSummary },
       ]}
       active={tab}
       onSelect={(id) => setTab(id as 'stream' | 'lens')}
@@ -91,6 +104,12 @@ export function StreamControl(p: {
           <div className="vid-tb-actions">
             <button className="mon-btn" onClick={p.onRefreshFeed}><IconReload size={14} /> Refresh</button>
             <button className={`mon-btn ${p.live ? 'accent' : ''}`} onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? 'Live on' : 'Live off'}</button>
+            <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onCollapseAll}>
+              <IconChevronsUp size={14} /> Collapse all
+            </button>
+            <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onExpandAll}>
+              <IconChevronsDown size={14} /> Expand all
+            </button>
           </div>
         </div>
       )}

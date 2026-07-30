@@ -323,6 +323,7 @@ export default function App() {
               canCapture={hasPermission(user, PERMISSION.captureManage)}
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canExport={hasPermission(user, PERMISSION.dataExport)}
             />
           )}
           {section !== 'home' && section !== 'archive' && section !== 'monitoring' && section !== 'video' && (
