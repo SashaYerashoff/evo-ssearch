@@ -19,6 +19,7 @@ import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
+import { NeuralBackground } from './components/shell/NeuralBackground'
 
 export type AgentDrive = AgentAction & { seq: number }
 
@@ -43,6 +44,7 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
   }
   return (
     <div className="gate">
+      <NeuralBackground />
       <form className="gate-card" onSubmit={submit}>
         <h1>EVA AI</h1>
         <div className="brand-sub">Command console · sign in</div>
@@ -65,6 +67,8 @@ export default function App() {
   const [section, setSection] = useState<SectionId>('home')
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
+  const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
+  const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
   const [noAnim, setNoAnim] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
@@ -144,6 +148,12 @@ export default function App() {
     }
   }, [])
   useEffect(() => { apiMe().then((u) => { setUser(u); setReady(true) }) }, [])
+  // the "Animations" switch also turns off the ambient backdrop entirely — neural field,
+  // aurora and the starfield (#root::after) — for a clean, motionless background.
+  useEffect(() => {
+    document.documentElement.classList.toggle('anim-off', noAnim)
+    return () => document.documentElement.classList.remove('anim-off')
+  }, [noAnim])
   useEffect(() => {
     refreshHealth()
     const timer = window.setInterval(refreshHealth, 30_000)
@@ -178,9 +188,11 @@ export default function App() {
   if (!user) return <LoginGate onDone={setUser} />
 
   async function handleLogout() { await apiLogout(); setUser(null) }
+  const agentPresetGrid = agentOpen && !agentFull
 
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
+      <NeuralBackground noAnim={noAnim} />
       <TopBar
         user={user}
         status={status}
@@ -192,7 +204,15 @@ export default function App() {
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
-      <div className={`body-row ${agentOpen ? 'agent-open' : ''}`}>
+      <div
+        className={`body-row ${agentOpen ? 'agent-open' : ''} ${agentPresetGrid ? 'agent-preset-grid' : ''}`}
+        style={agentPresetGrid
+          ? ({
+              '--archive-grid-columns': agentArchiveColumns,
+              '--archive-results-columns': agentCommittedArchiveColumns,
+            } as React.CSSProperties)
+          : undefined}
+      >
         <LeftRail
           active={section}
           visibleSections={visibleSections}
@@ -256,6 +276,8 @@ export default function App() {
               archiveFilters={archiveFilters}
               onAction={handleAgentAction}
               onBusyChange={handleAgentBusy}
+              onLayoutPresetChange={setAgentArchiveColumns}
+              onLayoutPresetCommit={setAgentCommittedArchiveColumns}
               canManageModels={hasPermission(user, PERMISSION.modelsManage)}
               canManageSkills={hasPermission(user, PERMISSION.promptsManage)}
             />

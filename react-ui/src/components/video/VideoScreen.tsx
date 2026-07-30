@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { IconVideoOff, IconAlertTriangle } from '@tabler/icons-react'
+import { IconVideoOff, IconAlertTriangle, IconChevronRight } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import { buildCaptureInput, videoApi, recentFrameUrl, mergeRuntime, type StreamsStatus, type ChannelRuntime, type SummaryEntry } from '../../api/video'
 import type { DropOption } from '../shell/Dropdown'
@@ -39,10 +39,10 @@ export function VideoScreen({
   const [live, setLive] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [feedNote, setFeedNote] = useState('')
   const [previewBust, setPreviewBust] = useState(1)
   const [previewError, setPreviewError] = useState(true)
   const [promptOpen, setPromptOpen] = useState(false)
+  const [selOpen, setSelOpen] = useState(false)  // Selected stream details — collapsed by default
   const [modelOptions, setModelOptions] = useState<DropOption[]>([{ value: 'auto', label: 'Auto (balance)' }])
 
   const channelName = useCallback((id: number) => channels.find((c) => c.id === id)?.title, [channels])
@@ -63,7 +63,6 @@ export function VideoScreen({
       if (depth === 'L0') { const r = await videoApi.session(channelId, { limit: 60, from_ts }); entries = r.logs || [] }
       else { const r = await videoApi.rollups(channelId, { from_ts }); entries = (r.levels as any)?.[depth] || [] }
       setFeed(entries)
-      setFeedNote(`${entries.length} ${depth === 'L0' ? 'summaries' : 'rollups'} · ${channelName(channelId) || `ch ${channelId}`}`)
     } catch (e: any) { setError(e?.message || 'Feed failed') }
   }, [channelId, depth, history, channelName])
 
@@ -148,28 +147,34 @@ export function VideoScreen({
             </div>
           </div>
 
-          <div className="vid-selected-card">
-            <div className="mon-panel-title">Selected stream</div>
-            <div className="vid-sel-name">{channelName(channelId ?? -1) || 'No channel selected'}</div>
-            <div className="vid-sel-grid">
-              <div><span>Channel</span><b>#{channelId ?? '—'}</b></div>
-              <div><span>Preview</span><b className={previewError ? 'bad' : 'good'}>{previewError ? 'failed' : 'live'}</b></div>
-              <div><span>Cadence</span><b>{(1 / Number(every || 5)).toFixed(2)} fps · {every}s</b></div>
-              <div><span>Batch</span><b>{batch}</b></div>
-            </div>
-            <div className="vid-sel-list">
-              <div><span>Live model</span><b>{model || 'auto'}</b></div>
-              <div><span>Summary queue</span><b>{capturing ? 'running' : 'idle'}</b></div>
-              <div><span>Probe capture</span><b>{selRt?.probe?.running ? (selRt.probe.paused ? 'paused' : 'active') : 'idle'}</b></div>
-              <div><span>Last preview</span><b>{previewError ? 'never' : 'just now'}</b></div>
-            </div>
+          <div className={`vid-selected-card ${selOpen ? 'open' : ''}`}>
+            <button className="vid-sel-toggle" onClick={() => setSelOpen((v) => !v)} aria-expanded={selOpen}>
+              <IconChevronRight size={15} className="vid-sel-chev" />
+              <span className="mon-panel-title">Selected stream</span>
+              <span className="vid-sel-cur">{channelId != null ? `#${channelId}` : '—'}</span>
+            </button>
+            {selOpen && (
+              <div className="vid-sel-body">
+                <div className="vid-sel-name">{channelName(channelId ?? -1) || 'No channel selected'}</div>
+                <div className="vid-sel-grid">
+                  <div><span>Channel</span><b>#{channelId ?? '—'}</b></div>
+                  <div><span>Preview</span><b className={previewError ? 'bad' : 'good'}>{previewError ? 'failed' : 'live'}</b></div>
+                  <div><span>Cadence</span><b>{(1 / Number(every || 5)).toFixed(2)} fps · {every}s</b></div>
+                  <div><span>Batch</span><b>{batch}</b></div>
+                </div>
+                <div className="vid-sel-list">
+                  <div><span>Live model</span><b>{model || 'auto'}</b></div>
+                  <div><span>Summary queue</span><b>{capturing ? 'running' : 'idle'}</b></div>
+                  <div><span>Probe capture</span><b>{selRt?.probe?.running ? (selRt.probe.paused ? 'paused' : 'active') : 'idle'}</b></div>
+                  <div><span>Last preview</span><b>{previewError ? 'never' : 'just now'}</b></div>
+                </div>
+              </div>
+            )}
           </div>
         </aside>
 
         <div className="vid-feed-card">
           <div className="mon-panel-title">VLM feed</div>
-          <div className="mon-panel-sub">Live summaries and drilled rollups for the selected channel context.</div>
-          <div className="vid-feed-meta">{feedNote}</div>
           {error && <div className="chat-error"><IconAlertTriangle size={14} /> {error}</div>}
           <div className="vid-feed">
             {feed.length === 0 && (

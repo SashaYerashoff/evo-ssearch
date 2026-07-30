@@ -93,8 +93,11 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
 
   // pre-open a collapsed section when it already holds non-default settings (editing)
   const [openTuning] = useState(() => (probe?.pos_floor ?? 0.2) !== 0.2 || (probe?.margin ?? 0.05) !== 0.05)
-  const [openBookmarks] = useState(() => !!probe?.bookmark)
   const [openImage] = useState(() => !!probe?.image_probe?.data)
+  // the two bottom dropdowns are controlled: their toggle sits OUTSIDE the scroll area and
+  // never moves — the panel opens into the reserved space above it, so nothing jumps.
+  const [techOpen, setTechOpen] = useState(false)
+  const [advOpen, setAdvOpen] = useState(() => openTuning || openImage)
 
   // live preview + capture status of the selected channel
   const [bust, setBust] = useState(1)
@@ -228,17 +231,10 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             </div>
           )}
 
-          {/* 1 · where the probe watches */}
-          <div className="wgrid">
-            <div className="wfield"><label>Probe name</label>
-              <input value={d.name} onChange={(e) => set({ name: e.target.value })} placeholder="Descriptive name" autoFocus />
-            </div>
-            <div className="wfield"><label>Channel</label>
-              <Dropdown value={String(d.channel_id ?? '')} onChange={(v) => set({ channel_id: Number(v) })}
-                options={channels.map((c) => ({ value: String(c.id), label: c.title }))} />
-            </div>
-          </div>
-
+          {/* Concept A — hero preview on the left, the essence (name/channel/what-to-detect) on the right */}
+          <div className="probe-cols">
+          <div className="probe-col-left">
+          <div className="probe-col-scroll">
           <div className={`probe-preview ${pvErr ? 'err' : ''} ${d.roiOn ? 'roi-mode' : ''}`} ref={pvRef}
             onMouseDown={roiDown} onMouseMove={roiMove} onMouseUp={roiUp} onMouseLeave={roiUp}>
             {previewSrc && <img className={pvErr ? 'preview-pending' : undefined} src={previewSrc} alt="stream preview" draggable={false}
@@ -258,11 +254,8 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             {canControlCapture && <button className="mon-btn sm" onClick={stopStream}><IconPlayerStop size={14} /> Stop stream</button>}
           </div>
 
-          <details className="probe-acc probe-tech">
-            <summary>
-              <IconChevronRight size={15} className="acc-chev" /> Technical details
-            </summary>
-            <div className="acc-body">
+          {techOpen && (
+            <div className="probe-panel">
               <div className="probe-tech-grid">
                 <div><span>Stream</span><b className={pvErr ? 'is-bad' : 'is-good'}>{pvErr ? 'Failed' : 'Ready'}</b></div>
                 <div><span>Capture</span><b>{(st.frames ?? 0) > 0 ? 'Active' : 'Warming'}</b></div>
@@ -273,9 +266,24 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
               </div>
               <div className="probe-tech-note"><strong>Prompt pairs</strong> Positive describes what to spot; negative describes a similar scene to suppress.</div>
             </div>
-          </details>
+          )}
+          </div>{/* /probe-col-scroll */}
+          <button className={`probe-tab ${techOpen ? 'on' : ''}`} onClick={() => setTechOpen((v) => !v)}>
+            <IconChevronRight size={15} className="acc-chev" /> Technical details
+          </button>
+          </div>{/* /probe-col-left */}
 
-          {/* 2 · what to detect — the essence of the probe */}
+          {/* the essence: identity + what to detect */}
+          <div className="probe-col-right">
+          <div className="probe-col-scroll">
+          <div className="wfield"><label>Probe name</label>
+            <input value={d.name} onChange={(e) => set({ name: e.target.value })} placeholder="Descriptive name" autoFocus />
+          </div>
+          <div className="wfield"><label>Channel</label>
+            <Dropdown value={String(d.channel_id ?? '')} onChange={(v) => set({ channel_id: Number(v) })}
+              options={channels.map((c) => ({ value: String(c.id), label: c.title }))} />
+          </div>
+          <div className="probe-detect-card">
           <div className="mon-heading">What to detect</div>
           <div className="mon-pairs">
             <div className="probe-pair-head"><span>Positive scene</span><span>Negative look-alike</span><span /></div>
@@ -289,85 +297,83 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             ))}
             <button className="mon-btn" onClick={() => set({ pairs: [...d.pairs, { pos: '', neg: '' }] })}><IconPlus size={14} /> Add pair</button>
           </div>
+          </div>{/* /probe-detect-card */}
 
-          {/* 3 · optional settings, collapsed with live summaries */}
-          <details className="probe-acc" open={openTuning || undefined}>
-            <summary>
-              <IconChevronRight size={15} className="acc-chev" /> Detection tuning
-              <span className="acc-sub">floor {d.pos_floor} · margin {d.margin}</span>
-            </summary>
-            <div className="acc-body">
-              <div className="wgrid">
-                <div className="wfield"><label>Positive floor</label>
-                  <input type="number" step="0.01" value={d.pos_floor} onChange={(e) => set({ pos_floor: Number(e.target.value) })} />
-                  <div className="mon-help">Minimum similarity for a hit (0–1). Higher = stricter.</div>
-                </div>
-                <div className="wfield"><label>Margin</label>
-                  <input type="number" step="0.01" min="0" value={d.margin} onChange={(e) => set({ margin: Number(e.target.value) })} />
-                  <div className="mon-help">How far positive must beat negative.</div>
+          {advOpen && (
+            <div className="probe-panel">
+              <div className="probe-sub">
+                <div className="probe-block-head">Detection tuning</div>
+                <div className="wgrid">
+                  <div className="wfield"><label>Positive floor</label>
+                    <input type="number" step="0.01" value={d.pos_floor} onChange={(e) => set({ pos_floor: Number(e.target.value) })} />
+                    <div className="mon-help">Minimum similarity for a hit (0–1). Higher = stricter.</div>
+                  </div>
+                  <div className="wfield"><label>Margin</label>
+                    <input type="number" step="0.01" min="0" value={d.margin} onChange={(e) => set({ margin: Number(e.target.value) })} />
+                    <div className="mon-help">How far positive must beat negative.</div>
+                  </div>
                 </div>
               </div>
-            </div>
-          </details>
 
-          {canCreateBookmarks && <details className="probe-acc" open={openBookmarks || undefined}>
-            <summary>
-              <IconChevronRight size={15} className="acc-chev" /> Bookmarks
-              <span className="acc-sub">{d.bookmark ? `on · ${d.severity} · cooldown ${d.cooldown}s` : 'off'}</span>
-            </summary>
-            <div className="acc-body">
-              <label className="mon-check tile"><input type="checkbox" checked={d.bookmark} onChange={(e) => set({ bookmark: e.target.checked })} /> Make bookmarks in Luxriot on hits</label>
-              {d.bookmark && (
-                <>
-                  <div className="wfield"><label>Severity</label>
-                    <Dropdown value={d.severity} onChange={(v) => set({ severity: v })} options={SEVERITIES.map((s) => ({ value: s, label: s }))} />
-                  </div>
-                  <div className="wgrid">
-                    <div className="wfield"><label>Cooldown (s)</label>
-                      <input type="number" step="0.5" min="0" value={d.cooldown} onChange={(e) => set({ cooldown: Number(e.target.value) })} />
-                    </div>
-                    <div className="wfield"><label>Dedup window (s)</label>
-                      <input type="number" step="0.5" min="0.5" value={d.dedupe} onChange={(e) => set({ dedupe: Number(e.target.value) })} />
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          </details>}
-
-          <details className="probe-acc" open={openImage || undefined}>
-            <summary>
-              <IconChevronRight size={15} className="acc-chev" /> Image probe
-              <span className="acc-sub">{d.imgData ? (d.imgEnabled ? `${d.imgName || 'image'} · min ${d.imgFloor}` : 'set · disabled') : 'none'}</span>
-            </summary>
-            <div className="acc-body">
-              <div className="mon-help">Optional reference image — frames similar to it also count as hits.</div>
-              {!d.imgData ? (
-                <label className="mon-btn"><IconPhoto size={14} /> Choose image
-                  <input type="file" accept="image/*" style={{ display: 'none' }}
-                    onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
-                </label>
-              ) : (
-                <div className="probe-img-box">
-                  <img className="probe-img" src={`data:image/jpeg;base64,${d.imgData}`} alt="probe reference" />
-                  <div className="probe-img-side">
-                    <div className="probe-img-name" title={d.imgName}>{d.imgName || 'reference.jpg'}</div>
-                    <label className="mon-check"><input type="checkbox" checked={d.imgEnabled} onChange={(e) => set({ imgEnabled: e.target.checked })} /> Enabled</label>
-                    <div className="wfield"><label>Min match</label>
-                      <input type="number" step="0.01" min="0" max="1" value={d.imgFloor} onChange={(e) => set({ imgFloor: Number(e.target.value) })} />
-                    </div>
-                    <div className="probe-img-actions">
-                      <label className="mon-btn sm"><IconPhoto size={13} /> Replace
-                        <input type="file" accept="image/*" style={{ display: 'none' }}
-                          onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
-                      </label>
-                      <button className="mon-btn sm danger" onClick={() => set({ imgData: null, imgName: '', imgEnabled: false })}><IconTrash size={13} /> Clear</button>
-                    </div>
-                  </div>
+              {canCreateBookmarks && (
+                <div className="probe-sub">
+                  <div className="probe-block-head">Bookmarks</div>
+                  <label className="mon-check tile"><input type="checkbox" checked={d.bookmark} onChange={(e) => set({ bookmark: e.target.checked })} /> Make bookmarks in Luxriot on hits</label>
+                  {d.bookmark && (
+                    <>
+                      <div className="wfield"><label>Severity</label>
+                        <Dropdown value={d.severity} onChange={(v) => set({ severity: v })} options={SEVERITIES.map((s) => ({ value: s, label: s }))} />
+                      </div>
+                      <div className="wgrid">
+                        <div className="wfield"><label>Cooldown (s)</label>
+                          <input type="number" step="0.5" min="0" value={d.cooldown} onChange={(e) => set({ cooldown: Number(e.target.value) })} />
+                        </div>
+                        <div className="wfield"><label>Dedup window (s)</label>
+                          <input type="number" step="0.5" min="0.5" value={d.dedupe} onChange={(e) => set({ dedupe: Number(e.target.value) })} />
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
+
+              <div className="probe-sub">
+                <div className="probe-block-head">Image probe</div>
+                <div className="mon-help">Optional reference image — frames similar to it also count as hits.</div>
+                {!d.imgData ? (
+                  <label className="mon-btn"><IconPhoto size={14} /> Choose image
+                    <input type="file" accept="image/*" style={{ display: 'none' }}
+                      onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
+                  </label>
+                ) : (
+                  <div className="probe-img-box">
+                    <img className="probe-img" src={`data:image/jpeg;base64,${d.imgData}`} alt="probe reference" />
+                    <div className="probe-img-side">
+                      <div className="probe-img-name" title={d.imgName}>{d.imgName || 'reference.jpg'}</div>
+                      <label className="mon-check"><input type="checkbox" checked={d.imgEnabled} onChange={(e) => set({ imgEnabled: e.target.checked })} /> Enabled</label>
+                      <div className="wfield"><label>Min match</label>
+                        <input type="number" step="0.01" min="0" max="1" value={d.imgFloor} onChange={(e) => set({ imgFloor: Number(e.target.value) })} />
+                      </div>
+                      <div className="probe-img-actions">
+                        <label className="mon-btn sm"><IconPhoto size={13} /> Replace
+                          <input type="file" accept="image/*" style={{ display: 'none' }}
+                            onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
+                        </label>
+                        <button className="mon-btn sm danger" onClick={() => set({ imgData: null, imgName: '', imgEnabled: false })}><IconTrash size={13} /> Clear</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
-          </details>
+          )}
+          </div>{/* /probe-col-scroll */}
+          <button className={`probe-tab ${advOpen ? 'on' : ''}`} onClick={() => setAdvOpen((v) => !v)}>
+            <IconChevronRight size={15} className="acc-chev" /> Advanced settings
+            <span className="acc-sub">floor {d.pos_floor}{canCreateBookmarks && d.bookmark ? ' · bookmarks' : ''}{d.imgData ? ' · image' : ''}</span>
+          </button>
+          </div>{/* /probe-col-right */}
+          </div>{/* /probe-cols */}
         </div>
 
         <div className="probe-footer">

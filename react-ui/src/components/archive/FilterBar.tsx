@@ -98,8 +98,6 @@ export function FilterBar({
 
       <Dropdown variant="chip" icon={<IconArrowsSort size={15} />} value={filters.sortBy || 'similarity'} onChange={(v) => onChange({ sortBy: v })}
         options={[{ value: 'similarity', label: 'Similarity' }, { value: 'time', label: 'Newest' }]} />
-      <Dropdown variant="chip" value={filters.rows || '24'} onChange={(v) => onChange({ rows: v })}
-        options={['12', '24', '36', '48'].map((r) => ({ value: r, label: `${r} rows` }))} />
 
       <button className="btn" type="button" onClick={onRefresh} disabled={loading || probesLoading} title="Reload channel and archive probe filters">
         <IconRefresh size={15} /> Refresh filters

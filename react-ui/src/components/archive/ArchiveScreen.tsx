@@ -91,12 +91,13 @@ export function ArchiveScreen({
   const [probesLoading, setProbesLoading] = useState(false)
   const [filterRefresh, setFilterRefresh] = useState(0)
   // horizontal accordion: exactly one tool block is expanded, the rest collapse to summary chips
-  const [openTool, setOpenTool] = useState<'filters' | 'text' | 'match' | 'image'>('filters')
+  const [openTool, setOpenTool] = useState<'filters' | 'text' | 'image'>('filters')
   const typeToken = useRef(0)
   const requestSeq = useRef(0)
   const probeRequestSeq = useRef(0)
   const loadingRef = useRef(false)
   const loadMoreRef = useRef<HTMLDivElement>(null)
+  const nextOffsetRef = useRef(0)   // read by the observer without re-creating it each load
 
   const patch = useCallback((p: Partial<ArchiveFilters>) => {
     requestSeq.current++
@@ -291,17 +292,21 @@ export function ArchiveScreen({
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
 
+  // keep the offset in a ref so the observer reads the latest value WITHOUT being torn down
+  // and rebuilt on every load (which was re-firing instantly and loading the whole archive)
+  useEffect(() => { nextOffsetRef.current = nextOffset }, [nextOffset])
+
   useEffect(() => {
     const sentinel = loadMoreRef.current
-    if (!sentinel || loading || !hasMore || resultMode !== 'list' || filtersDirty) return
+    if (!sentinel || !hasMore || resultMode !== 'list' || filtersDirty) return
+    // one batch per genuine scroll-into-view — the observer is stable, so it never chains
+    // into a runaway that loads (and re-renders) the entire archive at once
     const observer = new IntersectionObserver((entries) => {
-      if (entries[0]?.isIntersecting && !loadingRef.current) {
-        void runLoad(nextOffset, true)
-      }
-    }, { rootMargin: '500px 0px' })
+      if (entries[0]?.isIntersecting && !loadingRef.current) void runLoad(nextOffsetRef.current, true)
+    }, { rootMargin: '400px 0px' })
     observer.observe(sentinel)
     return () => observer.disconnect()
-  }, [filtersDirty, hasMore, loading, nextOffset, resultMode, runLoad])
+  }, [filtersDirty, hasMore, resultMode, runLoad])
 
   // live summaries shown on collapsed chips
   const filtersSummary = [
@@ -310,16 +315,13 @@ export function ArchiveScreen({
       ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
       : null,
     (filters.sinceMs || filters.untilMs) ? 'custom range' : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h'),
-    `${filters.rows || '24'} rows`,
   ].filter(Boolean).join(' · ')
   const q = textValue.trim()
-  const textSummary = q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—'
-  const matchSummary = minMatch > 0 ? `≥ ${minMatch}%` : 'off'
+  const textSummary = (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (minMatch > 0 ? ` · ≥ ${minMatch}%` : '')
 
   const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
     filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
     text: { Icon: IconLetterT, label: 'Text query', summary: textSummary },
-    match: { Icon: IconAdjustmentsHorizontal, label: 'Match', summary: matchSummary },
     image: { Icon: IconPhoto, label: 'Image', summary: '—' },
   }
 
@@ -348,13 +350,9 @@ export function ArchiveScreen({
             onChange={(e) => setTextValue(e.target.value)} />
           <button className="btn primary" disabled={agentTyping || !textValue.trim()}><IconSearch size={15} /> Search</button>
         </form>
-      </div>
-    )
-    if (openTool === 'match') return (
-      <div className="atp-open atp-group" key="match">
-        <span className="atp-glabel"><IconAdjustmentsHorizontal size={13} /> Match threshold</span>
+        {/* similarity threshold for the text-query results — filters out weak matches */}
         <div className="atp-min">
-          <label>Min match · {minMatch}%</label>
+          <label><IconAdjustmentsHorizontal size={12} /> Min match · {minMatch}%</label>
           <input type="range" min={0} max={100} step={1} value={minMatch} onChange={(e) => setMinMatch(Number(e.target.value))} />
         </div>
       </div>
@@ -380,7 +378,7 @@ export function ArchiveScreen({
         </div>
       )}
       <ToolTabs
-        tabs={(['filters', 'text', 'match', 'image'] as const).map((t) => {
+        tabs={(['filters', 'text', 'image'] as const).map((t) => {
           const { Icon, label, summary } = TOOL_META[t]
           return { id: t, icon: <Icon size={13} />, label, summary }
         })}

@@ -13,6 +13,7 @@ export const API_PREFIXES = [
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: true,        // listen on 0.0.0.0 so the app is reachable from the LAN
     port: 5173,
     proxy: Object.fromEntries(
       API_PREFIXES.map((p) => [
