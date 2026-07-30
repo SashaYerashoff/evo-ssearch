@@ -1,91 +1,195 @@
-/* EVA AI — command-console theme. Deep-space / Stellaris flavour. */
+/* EVA AI design tokens. Runtime overrides are applied by AppearanceProvider. */
+
+@font-face {
+  font-family: "EVA Sans";
+  src: url("../assets/fonts/NotoSans-Regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EVA Sans";
+  src: url("../assets/fonts/NotoSans-Bold.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 700 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EVA Sans";
+  src: url("../assets/fonts/NotoSans-Italic.ttf") format("truetype");
+  font-style: italic;
+  font-weight: 400 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EVA Sans";
+  src: url("../assets/fonts/NotoSans-BoldItalic.ttf") format("truetype");
+  font-style: italic;
+  font-weight: 700 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EVA Mono";
+  src: url("../assets/fonts/NotoSansMono-Regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "EVA Mono";
+  src: url("../assets/fonts/NotoSansMono-Bold.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 700 900;
+  font-display: swap;
+}
 
 :root {
-  /* space surfaces (lifted — lighter navy, still cosmic) */
-  --space-0: #10162e;   /* deepest void */
-  --space-1: #18203c;   /* app base */
-  --panel:   rgba(31, 42, 76, 0.92);   /* working surfaces — denser so they lift off the live backdrop */
+  /* Default preset prevents a flash before React restores local preferences. */
+  --space-0: #10162e;
+  --space-1: #18203c;
+  --panel: rgba(31, 42, 76, 0.92);
   --panel-2: rgba(38, 51, 90, 0.9);
-  --panel-solid: #212a49;
+  --panel-solid: #26335a;
   --void-tile: #1d2743;
+  --surface: #1f2a4c;
+  --surface-raised: #26335a;
+  --control: #1d2743;
+  --control-hover: #2f3953;
 
-  /* lines — a touch stronger for crisper edges against the background */
-  --line:    rgba(150, 180, 245, 0.30);
-  --line-2:  rgba(150, 180, 245, 0.46);
+  --line: rgba(238, 242, 252, 0.18);
+  --line-2: rgba(238, 242, 252, 0.31);
+  --text: #eef2fc;
+  --text-2: #b7c3e2;
+  --text-mut: #8494b8;
 
-  /* elevation: soft drop shadow that separates panels from the ambient background */
-  --elev: 0 14px 34px -16px rgba(3, 7, 20, 0.75), 0 2px 8px -4px rgba(3, 7, 20, 0.5);
-
-  /* text */
-  --text:      #eef2fc;
-  --text-2:    #b7c3e2;
-  --text-mut:  #8494b8;
-
-  /* accent — plasma cyan/teal */
-  --accent:    #38e0d4;
-  --accent-2:  #23b7c9;
+  --accent: #38e0d4;
+  --accent-2: #51e4da;
   --accent-bg: rgba(56, 224, 212, 0.14);
-  --accent-line: rgba(56, 224, 212, 0.5);
-  --glow: 0 0 0 1px rgba(56,224,212,0.35), 0 0 18px -2px rgba(56,224,212,0.45);
+  --accent-line: rgba(56, 224, 212, 0.52);
+  --accent-soft: rgba(56, 224, 212, 0.08);
+  --primary-text: #07120f;
+  --glow: 0 0 0 1px rgba(56, 224, 212, 0.34), 0 0 18px -2px rgba(56, 224, 212, 0.42);
 
-  /* semantic */
-  --danger:  #ff5d73;  --danger-bg: rgba(255, 93, 115, 0.15);
-  --warning: #ffb454;  --warning-bg: rgba(255, 180, 84, 0.15);
-  --success: #3ee6a4;  --success-bg: rgba(62, 230, 164, 0.15);
-  --info:    #6aa8ff;  --info-bg: rgba(106, 168, 255, 0.14);
+  --danger: #ff5d73;
+  --danger-bg: rgba(255, 93, 115, 0.15);
+  --warning: #ffb454;
+  --warning-bg: rgba(255, 180, 84, 0.15);
+  --success: #3ee6a4;
+  --success-bg: rgba(62, 230, 164, 0.15);
+  --info: #6aa8ff;
+  --info-bg: rgba(106, 168, 255, 0.14);
 
   --radius: 10px;
   --radius-lg: 16px;
+  --control-radius: 10px;
+  --control-pad-y: 9px;
+  --control-pad-x: 12px;
+  --control-min-h: 38px;
+  --section-gap: 14px;
   --rail-w: 60px;
-  --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+
+  --backdrop-accent: rgba(56, 224, 212, 0.13);
+  --backdrop-info: rgba(106, 168, 255, 0.14);
+  --backdrop-mid: rgba(238, 242, 252, 0.06);
+  --topbar-start: rgba(16, 22, 46, 0.88);
+  --topbar-end: rgba(24, 32, 60, 0.74);
+  --scrim: rgba(16, 22, 46, 0.78);
+  --elev: 0 14px 34px -16px rgba(3, 7, 20, 0.75), 0 2px 8px -4px rgba(3, 7, 20, 0.5);
+
+  /* Typography is intentionally fixed, not an operator preference. */
+  --font: "EVA Sans", "Noto Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "EVA Mono", "Noto Sans Mono", "Cascadia Mono", ui-monospace, monospace;
+  --type-xs: 11px;
+  --type-sm: 12.5px;
+  --type-md: 13.5px;
+  --type-lg: 15px;
+  --type-xl: 18px;
 }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
 
+html {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
 body {
   font-family: var(--font);
+  font-size: var(--type-md);
+  line-height: 1.45;
   color: var(--text);
   background: var(--space-1);
+  font-variant-numeric: proportional-nums;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
 }
 
-/* cosmic backdrop: nebula glows + faint starfield */
+code, pre, kbd, samp, .mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ambient canvas is token-driven so custom themes remain coherent. */
 #root::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -2;
   background:
-    radial-gradient(1200px 700px at 82% -10%, rgba(56, 224, 212, 0.13), transparent 60%),
-    radial-gradient(1000px 800px at -8% 108%, rgba(135, 105, 255, 0.15), transparent 62%),
-    radial-gradient(1200px 800px at 50% 32%, rgba(74, 104, 170, 0.30), transparent 72%),
+    radial-gradient(1200px 700px at 82% -10%, var(--backdrop-accent), transparent 60%),
+    radial-gradient(1000px 800px at -8% 108%, var(--backdrop-info), transparent 62%),
+    radial-gradient(1200px 800px at 50% 32%, var(--backdrop-mid), transparent 72%),
     var(--space-0);
 }
+
 #root::after {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
   background-image:
-    radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,0.7), transparent),
-    radial-gradient(1px 1px at 70% 20%, rgba(255,255,255,0.5), transparent),
-    radial-gradient(1px 1px at 40% 70%, rgba(255,255,255,0.6), transparent),
-    radial-gradient(1px 1px at 85% 65%, rgba(180,220,255,0.6), transparent),
-    radial-gradient(1px 1px at 12% 82%, rgba(255,255,255,0.4), transparent),
-    radial-gradient(1.5px 1.5px at 60% 48%, rgba(160,240,240,0.5), transparent);
-  opacity: 0.5;
+    radial-gradient(1px 1px at 20% 30%, color-mix(in srgb, var(--text) 70%, transparent), transparent),
+    radial-gradient(1px 1px at 70% 20%, color-mix(in srgb, var(--text) 50%, transparent), transparent),
+    radial-gradient(1px 1px at 40% 70%, color-mix(in srgb, var(--text) 60%, transparent), transparent),
+    radial-gradient(1px 1px at 85% 65%, color-mix(in srgb, var(--info) 60%, transparent), transparent),
+    radial-gradient(1px 1px at 12% 82%, color-mix(in srgb, var(--text) 40%, transparent), transparent),
+    radial-gradient(1.5px 1.5px at 60% 48%, color-mix(in srgb, var(--accent) 50%, transparent), transparent);
+  opacity: 0.48;
 }
-/* the Animations switch hides the starfield too */
+
 .anim-off #root::after { display: none; }
 
-/* scrollbars */
 *::-webkit-scrollbar { width: 9px; height: 9px; }
-*::-webkit-scrollbar-thumb { background: rgba(120,160,240,0.18); border-radius: 999px; }
-*::-webkit-scrollbar-thumb:hover { background: rgba(120,160,240,0.3); }
+*::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--line-2); }
 *::-webkit-scrollbar-track { background: transparent; }
 
-button { font-family: inherit; cursor: pointer; }
-input, select { font-family: inherit; }
+button, input, select, textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled, input:disabled, select:disabled, textarea:disabled {
+  cursor: not-allowed;
+}
+
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+[data-color-scheme="light"] input[type="date"],
+[data-color-scheme="light"] input[type="datetime-local"],
+[data-color-scheme="light"] input[type="time"] {
+  color-scheme: light;
+}

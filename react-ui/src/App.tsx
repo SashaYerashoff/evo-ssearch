@@ -20,6 +20,8 @@ import { VideoScreen } from './components/video/VideoScreen'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
+import { AppearanceModal } from './components/appearance/AppearanceModal'
+import { useAppearance } from './appearance/AppearanceProvider'
 
 export type AgentDrive = AgentAction & { seq: number }
 
@@ -60,6 +62,11 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
 }
 
 export default function App() {
+  const {
+    savedPreferences,
+    isMotionReduced,
+    commitPreferences,
+  } = useAppearance()
   const [user, setUser] = useState<AuthUser | null>(null)
   const [ready, setReady] = useState(false)
   const [channels, setChannels] = useState<Channel[]>([])
@@ -69,8 +76,8 @@ export default function App() {
   const [agentFull, setAgentFull] = useState(false)
   const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
   const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
-  const [noAnim, setNoAnim] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
   const [forbiddenNotice, setForbiddenNotice] = useState('')
@@ -148,12 +155,6 @@ export default function App() {
     }
   }, [])
   useEffect(() => { apiMe().then((u) => { setUser(u); setReady(true) }) }, [])
-  // the "Animations" switch also turns off the ambient backdrop entirely — neural field,
-  // aurora and the starfield (#root::after) — for a clean, motionless background.
-  useEffect(() => {
-    document.documentElement.classList.toggle('anim-off', noAnim)
-    return () => document.documentElement.classList.remove('anim-off')
-  }, [noAnim])
   useEffect(() => {
     refreshHealth()
     const timer = window.setInterval(refreshHealth, 30_000)
@@ -189,6 +190,7 @@ export default function App() {
 
   async function handleLogout() { await apiLogout(); setUser(null) }
   const agentPresetGrid = agentOpen && !agentFull
+  const noAnim = isMotionReduced
 
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
@@ -200,7 +202,11 @@ export default function App() {
         section={SECTION_LABELS[section]}
         noAnim={noAnim}
         canBenchmark={hasPermission(user, PERMISSION.diagnosticsView)}
-        onToggleNoAnim={() => setNoAnim((v) => !v)}
+        onToggleNoAnim={() => commitPreferences({
+          ...savedPreferences,
+          motion: noAnim ? 'full' : 'reduced',
+        })}
+        onAppearance={() => setAppearanceOpen(true)}
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -264,6 +270,7 @@ export default function App() {
             onClose={() => setSettingsOpen(false)}
           />
         )}
+        {appearanceOpen && <AppearanceModal onClose={() => setAppearanceOpen(false)} />}
         {hasPermission(user, PERMISSION.agentUse) && (
           <>
             <AgentEar open={agentOpen} onToggle={() => setAgentOpen((v) => !v)} />
