@@ -188,6 +188,17 @@ class Config:
         'EVOSSEARCH_EMBEDDER_EAGER_LOAD',
         'false',
     )
+    # A fallback changes the embedding space, invalidating archive vectors and
+    # calibrated probe thresholds. Keep it opt-in so production never silently
+    # swaps SigLIP2 for OpenAI CLIP after a load failure.
+    EMBEDDER_FALLBACK_ENABLED = _get_bool_env(
+        'EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED',
+        'False',
+    )
+    CLIP_DEVICE = (
+        os.getenv('EVOSSEARCH_CLIP_DEVICE', 'auto').strip().lower()
+        or 'auto'
+    )
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
     if not EXPERIMENTAL_EMBEDDERS_ENABLED:
         EMBEDDER = 'clip'

@@ -72,10 +72,24 @@ def load_lm_alert_parser():
 
 
 def install_channel_memory(manager: LuxriotManager, channel_id: int = 7) -> None:
+    now = time.time()
+    manager._update_channel_routine_context(
+        channel_id=channel_id,
+        rollup_id="l1-memory",
+        window_end=now - 1.0,
+        level="L1",
+        memory_update={
+            "active_watchlist": ["watch the east gate"],
+            "preserved_deviations": [
+                "vehicle drifting was seen in a prior window"
+            ],
+        },
+        summary_text="",
+    )
     manager._update_channel_routine_context(
         channel_id=channel_id,
         rollup_id="l2-memory",
-        window_end=time.time(),
+        window_end=now,
         level="L2",
         summary_text=(
             "MEMORY_UPDATE_JSON:\n"
@@ -346,13 +360,13 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             self.assertEqual(metabolism["status"], "active")
             self.assertEqual(current["source_level"], "L2")
             self.assertEqual(current["active_watchlist_count"], 1)
-            self.assertEqual(current["preserved_deviations_count"], 1)
+            self.assertEqual(current["preserved_deviations_count"], 0)
             self.assertEqual(
                 [stage["level"] for stage in metabolism["stages"]],
                 ["L0", "L1", "L2", "L3"],
             )
             self.assertTrue(metabolism["stages"][1]["applies_to_live_memory"])
-            self.assertTrue(metabolism["stages"][2]["applies_to_live_memory"])
+            self.assertFalse(metabolism["stages"][2]["applies_to_live_memory"])
             self.assertFalse(metabolism["stages"][3]["applies_to_live_memory"])
             self.assertNotIn("backend_memory", settings["prompt_layers"]["stream"])
             self.assertNotIn("active_memory", settings["prompt_layers"]["rollups"]["L1"])
@@ -361,13 +375,15 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             )
             self.assertEqual(current["alert_tuning_notes_count"], 0)
             self.assertEqual(current["ignore_as_routine_count"], 0)
-            self.assertEqual(current["held_tuning_proposals_count"], 1)
+            self.assertEqual(current["held_tuning_proposals_count"], 0)
             self.assertEqual(
                 current["held_routine_suppression_proposals_count"],
-                1,
+                0,
             )
             live_prompt = manager._get_channel_routine_prompt(7)
-            self.assertIn("vehicle drifting", live_prompt)
+            self.assertIn("watch the east gate", live_prompt)
+            self.assertNotIn("vehicle drifting", live_prompt)
+            self.assertNotIn("parking lot is usually empty", live_prompt)
             self.assertNotIn("keep drifting visible", live_prompt)
             self.assertNotIn("parked maintenance vehicles", live_prompt)
 
@@ -375,6 +391,14 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             now = time.time()
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-watch",
+                window_end=now - 1.0,
+                level="L1",
+                memory_update={"active_watchlist": ["old unresolved item"]},
+                summary_text="",
+            )
             manager._update_channel_routine_context(
                 channel_id=7,
                 rollup_id="l1-watch-a",
@@ -422,7 +446,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             live_prompt = manager._get_channel_routine_prompt(7)
             self.assertNotIn("normal pattern for this channel", live_prompt)
             self.assertNotIn("old unresolved item", live_prompt)
-            self.assertIn("grounded prior deviation", live_prompt)
+            self.assertNotIn("grounded prior deviation", live_prompt)
 
     def test_channel_memory_text_marks_prior_context_not_current_observation(self):
         with tempfile.TemporaryDirectory() as temp:

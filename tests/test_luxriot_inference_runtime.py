@@ -1206,13 +1206,18 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertTrue(started.wait(timeout=1.0))
             self.assertLess(elapsed, 0.5)
-            self.assertEqual(len(session.frames), 0)
+            self.assertEqual(len(session.frames), 1)
+            self.assertEqual(session.frames[0]["embedding_status"], "pending")
             release.set()
             deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not session.frames:
+            while (
+                time.monotonic() < deadline
+                and not session.frames[0].get("embedding_ref")
+            ):
                 time.sleep(0.01)
             self.assertEqual(len(session.frames), 1)
             self.assertTrue(session.frames[0].get("embedding_ref"))
+            self.assertEqual(session.frames[0]["embedding_status"], "ready")
             status = manager.probe_embedding_dispatch_status()
             self.assertEqual(status["submitted_total"], 1)
             self.assertEqual(status["completed_total"], 1)
@@ -2774,6 +2779,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(probe_calls, [])
             self.assertEqual(session.status()["capture_apex_selected_count"], 1)
             self.assertEqual(session.status()["capture_apex_probe_skipped_count"], 1)
+            self.assertEqual(len(session.frames), 1)
+            self.assertEqual(session.frames[0]["embedding_status"], "unavailable")
 
     def test_capture_cv_buckets_are_channel_local_and_never_index_raw_non_apex_frames(self):
         probe_calls = []
@@ -4288,10 +4295,19 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
     def test_memory_update_json_feeds_next_l0_system_prompt(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
+            now = time.time()
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-memory",
+                window_end=now - 1.0,
+                level="L1",
+                memory_update={"active_watchlist": ["watch the east gate"]},
+                summary_text="",
+            )
             manager._update_channel_routine_context(
                 channel_id=7,
                 rollup_id="l2-memory",
-                window_end=1234.0,
+                window_end=now,
                 level="L2",
                 summary_text=(
                     "### Window Snapshot\n"
@@ -4321,8 +4337,9 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             system_prompt = batch["system_prompt"]
             self.assertIn("Active Channel Memory", system_prompt)
-            self.assertIn("parking lot is usually empty overnight", system_prompt)
-            self.assertIn("vehicle drifting", system_prompt)
+            self.assertIn("watch the east gate", system_prompt)
+            self.assertNotIn("parking lot is usually empty overnight", system_prompt)
+            self.assertNotIn("vehicle drifting", system_prompt)
             self.assertIn("Do not let routine baseline suppress", system_prompt)
 
     def test_memory_update_json_accepts_qwen_key_variants(self):
@@ -4348,11 +4365,202 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
 
             routine_text = manager.channel_routine_context[7]["routine"]
-            self.assertIn("quiet lot overnight", routine_text)
             self.assertIn("east gate", routine_text)
             self.assertIn("vehicle drifting", routine_text)
-            self.assertIn("keep drifting visible", routine_text)
-            self.assertIn("parked maintenance vehicles", routine_text)
+            self.assertNotIn("quiet lot overnight", routine_text)
+            self.assertNotIn("keep drifting visible", routine_text)
+            self.assertNotIn("parked maintenance vehicles", routine_text)
+
+    def test_auto_probe_scores_are_shadow_but_operator_scores_regulate_attention(self):
+        class ProbeStore:
+            def __init__(self, origin):
+                self.origin = origin
+
+            def list_probes(self):
+                return [
+                    {
+                        "id": f"{self.origin}-probe",
+                        "name": "person near window",
+                        "channel_id": 7,
+                        "positives": ["person near window"],
+                        "negatives": ["empty window"],
+                        "pos_floor": 0.2,
+                        "margin": 0.05,
+                        "enabled": True,
+                        "origin": self.origin,
+                        "temporary": self.origin == "auto",
+                        "attention_only": self.origin == "auto",
+                    }
+                ]
+
+        class ProbeManager:
+            @staticmethod
+            def score_frames(*_args, **_kwargs):
+                return {
+                    "results": [
+                        {
+                            "timestamp_ms": 1_000,
+                            "pos_score": 0.42,
+                            "neg_score": 0.18,
+                            "margin": 0.24,
+                        }
+                    ]
+                }
+
+            @staticmethod
+            def query(*_args, **_kwargs):
+                return {
+                    "frames_indexed": 1,
+                    "results": [
+                        {
+                            "timestamp_ms": 1_000,
+                            "pos_score": 0.42,
+                            "neg_score": 0.18,
+                            "margin": 0.24,
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.probe_manager = ProbeManager()
+            emitted = []
+            manager.set_attention_event_callback(
+                lambda event_type, payload: emitted.append(
+                    (event_type, payload)
+                )
+            )
+            frames = [
+                {
+                    "captured_at": 1.0,
+                    "attention_snapshot_id": "snapshot-1",
+                }
+            ]
+
+            manager.probes_store = ProbeStore("auto")
+            auto_signals, _health = manager._clip_probe_vector_signals(
+                7,
+                frames,
+                batch_start_ms=900,
+                batch_end_ms=1_100,
+            )
+            self.assertEqual(
+                auto_signals[0]["attention_authority"],
+                "shadow",
+            )
+            self.assertFalse(
+                any(event_type == "probe_scores" for event_type, _ in emitted)
+            )
+
+            emitted.clear()
+            frames[0].pop("attention_probe_scores", None)
+            manager.probes_store = ProbeStore("operator")
+            operator_signals, _health = manager._clip_probe_vector_signals(
+                7,
+                frames,
+                batch_start_ms=900,
+                batch_end_ms=1_100,
+            )
+            self.assertEqual(
+                operator_signals[0]["attention_authority"],
+                "regulatory",
+            )
+            self.assertTrue(
+                any(event_type == "probe_scores" for event_type, _ in emitted)
+            )
+
+    def test_siglip2_probe_stays_shadow_until_embedding_space_is_stamped(self):
+        class ProbeStore:
+            def __init__(self, embedding_space):
+                self.embedding_space = embedding_space
+
+            def list_probes(self):
+                return [
+                    {
+                        "id": "operator-probe",
+                        "name": "person near window",
+                        "channel_id": 7,
+                        "positives": ["person near window"],
+                        "negatives": ["empty window"],
+                        "pos_floor": 0.2,
+                        "margin": 0.05,
+                        "enabled": True,
+                        "origin": "operator",
+                        "embedding_space": self.embedding_space,
+                    }
+                ]
+
+        class ProbeManager:
+            @staticmethod
+            def score_frames(*_args, **_kwargs):
+                return {
+                    "results": [
+                        {
+                            "timestamp_ms": 1_000,
+                            "pos_score": 0.42,
+                            "neg_score": 0.18,
+                            "margin": 0.24,
+                        }
+                    ]
+                }
+
+            @staticmethod
+            def query(*_args, **_kwargs):
+                return {
+                    "frames_indexed": 1,
+                    "results": [
+                        {
+                            "timestamp_ms": 1_000,
+                            "pos_score": 0.42,
+                            "neg_score": 0.18,
+                            "margin": 0.24,
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.config.CLIP_MODEL = "google/siglip2-base-patch16-224"
+            manager.probe_manager = ProbeManager()
+            frames = [
+                {
+                    "captured_at": 1.0,
+                    "attention_snapshot_id": "snapshot-1",
+                }
+            ]
+
+            manager.probes_store = ProbeStore(None)
+            unverified, health = manager._clip_probe_vector_signals(
+                7,
+                frames,
+                batch_start_ms=900,
+                batch_end_ms=1_100,
+            )
+            self.assertEqual(unverified[0]["attention_authority"], "shadow")
+            self.assertEqual(
+                unverified[0]["authority_reason"],
+                "embedding_space_unverified",
+            )
+            self.assertEqual(
+                health["clip_probe_embedding_space_mismatch"],
+                1,
+            )
+
+            manager.probes_store = ProbeStore(
+                {
+                    "backend": "siglip2",
+                    "model": "google/siglip2-base-patch16-224",
+                    "dimension": 768,
+                }
+            )
+            verified, health = manager._clip_probe_vector_signals(
+                7,
+                frames,
+                batch_start_ms=900,
+                batch_end_ms=1_100,
+            )
+            self.assertEqual(verified[0]["attention_authority"], "regulatory")
+            self.assertEqual(health["clip_probe_regulatory"], 1)
 
     def test_current_observed_state_parser_extracts_present_absent_unknown(self):
         summary = (
@@ -5723,7 +5931,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("MEMORY_UPDATE_JSON", row["summary"])
             self.assertNotIn("active_watchlist", row["summary"])
             self.assertEqual(row["memory_update"]["routine_baseline"], "desk work")
-            self.assertIn("desk work", manager.channel_routine_context[7]["routine"])
+            self.assertNotIn("desk work", manager.channel_routine_context[7]["routine"])
+            self.assertIn("brief absence", manager.channel_routine_context[7]["routine"])
 
     def test_invalid_rollup_operator_contract_is_degraded_and_diagnostic(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -6053,11 +6262,133 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 interval_sec=5.0,
                 frames=sample_frames(),
             )
-            self.assertIn("vehicle drifting", batch["system_prompt"])
+            self.assertNotIn("Active Channel Memory", batch["system_prompt"])
+            self.assertNotIn("east gate vehicle", batch["system_prompt"])
+            self.assertNotIn("vehicle drifting", batch["system_prompt"])
+
+    def test_structured_events_and_watched_states_reach_l3_without_prose_loss(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            base_ms = 1_781_683_200_000
+            logs = []
+            for offset_ms, event_id, label in (
+                (0, "cat-race", "Two cats chase each other across the room"),
+                (
+                    30 * 60 * 1000,
+                    "window-crawl",
+                    "A person crawls past the exterior window",
+                ),
+            ):
+                timestamp_ms = base_ms + offset_ms
+                logs.append(
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        # Deliberately bland prose: the structured state must
+                        # survive even when the first summary sentence does not.
+                        "summary": "Static room with ordinary furniture.",
+                        "frame_count": 8,
+                        "created_at": timestamp_ms / 1000.0,
+                        "batch_start_ms": timestamp_ms,
+                        "batch_end_ms": timestamp_ms + 50_000,
+                        "batch_state": {
+                            "version": 1,
+                            "events": [
+                                {
+                                    "event_id": event_id,
+                                    "label": label,
+                                    "state": "new",
+                                    "snapshot_indices": [2, 4],
+                                    "summary": label,
+                                    "novelty": "novel",
+                                    "pass_up": True,
+                                }
+                            ],
+                            "observed_states": [
+                                {
+                                    "key": "mail_carrier_visit",
+                                    "label": "Mail carrier visit",
+                                    "state": "absent",
+                                    "snapshot_indices": [1, 8],
+                                    "evidence": (
+                                        "Entrance area is clear and visible in "
+                                        "the sampled snapshots"
+                                    ),
+                                }
+                            ],
+                            "alerts": [],
+                        },
+                    }
+                )
+
+            l0 = manager._l0_nodes_from_logs(7, logs)
+            l1 = manager._build_rollup_level(
+                7,
+                "L1",
+                "L0",
+                900,
+                l0,
+                synthesize=False,
+            )
+            l2 = manager._build_rollup_level(
+                7,
+                "L2",
+                "L1",
+                3600,
+                l1,
+                synthesize=False,
+            )
+            l3 = manager._build_rollup_level(
+                7,
+                "L3",
+                "L2",
+                28800,
+                l2,
+                synthesize=False,
+            )
+
+            self.assertEqual(len(l3), 1)
+            labels = [item["label"] for item in l3[0]["event_ledger"]]
+            self.assertIn("Two cats chase each other across the room", labels)
+            self.assertIn("A person crawls past the exterior window", labels)
+            watched = {
+                item["key"]: item for item in l3[0]["state_ledger"]
+            }["mail_carrier_visit"]
+            self.assertEqual(watched["present_count"], 0)
+            self.assertEqual(watched["absent_count"], 2)
+
+            prompt = manager._build_rollup_messages(
+                7,
+                "L3",
+                "L2",
+                l3[0],
+                l2,
+            )[1]["content"][0]["text"]
+            self.assertIn("Two cats chase each other", prompt)
+            self.assertIn("person crawls past the exterior window", prompt)
+            self.assertIn('"present_count":0', prompt)
+            self.assertIn(
+                "event_ledger_erased",
+                manager._rollup_grounding_guard_issues(
+                    operator_rollup_response(
+                        "Nothing happened during the period.",
+                        observations="No notable events occurred.",
+                    ),
+                    l3[0],
+                ),
+            )
 
     def test_older_memory_update_preserves_deviation_without_resurrecting_watchlist(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
+            manager._update_channel_routine_context(
+                channel_id=7,
+                rollup_id="l1-new",
+                window_end=200.0,
+                level="L1",
+                memory_update={"active_watchlist": ["north door"]},
+                summary_text="",
+            )
             manager._update_channel_routine_context(
                 channel_id=7,
                 rollup_id="l2-new",
@@ -6094,7 +6425,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("north door", routine_text)
             self.assertNotIn("east gate vehicle", routine_text)
             self.assertIn("vehicle drifting", routine_text)
-            self.assertIn("keep drifting visible", routine_text)
+            self.assertNotIn("keep drifting visible", routine_text)
             self.assertNotIn("old busy lobby baseline", routine_text)
 
     def test_rollup_llm_levels_none_and_off_disable_all_rollup_llm(self):

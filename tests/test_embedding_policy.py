@@ -28,6 +28,12 @@ class EmbeddingPolicyTests(unittest.TestCase):
             "EXPERIMENTAL_EMBEDDERS_ENABLED": getattr(config, "EXPERIMENTAL_EMBEDDERS_ENABLED", False),
             "PRODUCTION_CLIP_MODEL": getattr(config, "PRODUCTION_CLIP_MODEL", "ViT-B/32"),
             "EMBEDDER": config.EMBEDDER,
+            "EMBEDDER_FALLBACK_ENABLED": getattr(
+                config,
+                "EMBEDDER_FALLBACK_ENABLED",
+                False,
+            ),
+            "CLIP_DEVICE": getattr(config, "CLIP_DEVICE", "auto"),
             "CLIP_MODEL": config.CLIP_MODEL,
             "INDEX_MODE": config.INDEX_MODE,
             "FUSION_ENABLED": config.FUSION_ENABLED,
@@ -40,8 +46,11 @@ class EmbeddingPolicyTests(unittest.TestCase):
         }
         config.AUTH_ENABLED = False
         config.SETTINGS_LOCAL_ONLY = True
+        config.EMBEDDER_FALLBACK_ENABLED = False
+        config.CLIP_DEVICE = "auto"
 
     def tearDown(self) -> None:
+        oldapp.reset_embedder_runtime_state()
         for key, value in self._original.items():
             setattr(config, key, value)
 
@@ -174,6 +183,52 @@ class EmbeddingPolicyTests(unittest.TestCase):
             "/var/lib/eva-ai/models/huggingface",
         )
         self.assertTrue(load_processor.call_args.kwargs["local_files_only"])
+
+    def test_siglip_init_fails_closed_instead_of_changing_embedding_space(self) -> None:
+        config.EXPERIMENTAL_EMBEDDERS_ENABLED = True
+        config.CLIP_MODEL = "google/siglip2-base-patch16-224"
+        config.EMBEDDER_FALLBACK_ENABLED = False
+        oldapp.reset_embedder_runtime_state()
+
+        with (
+            patch(
+                "oldapp._load_siglip2_clip_model",
+                side_effect=RuntimeError("missing local artifact"),
+            ),
+            patch("oldapp._load_openai_clip_model") as load_clip,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "embedding fallback is disabled",
+            ):
+                oldapp.init_clip()
+
+        load_clip.assert_not_called()
+
+    def test_siglip_init_uses_clip_fallback_only_when_explicitly_enabled(self) -> None:
+        config.EXPERIMENTAL_EMBEDDERS_ENABLED = True
+        config.CLIP_MODEL = "google/siglip2-base-patch16-224"
+        config.EMBEDDER_FALLBACK_ENABLED = True
+        oldapp.reset_embedder_runtime_state()
+        fallback_model = Mock()
+        fallback_preprocess = Mock()
+
+        with (
+            patch(
+                "oldapp._load_siglip2_clip_model",
+                side_effect=RuntimeError("missing local artifact"),
+            ),
+            patch(
+                "oldapp._load_openai_clip_model",
+                return_value=(fallback_model, fallback_preprocess),
+            ) as load_clip,
+        ):
+            oldapp.init_clip()
+
+        load_clip.assert_called_once_with("ViT-B/32", oldapp.device)
+        self.assertIs(oldapp.clip_model, fallback_model)
+        self.assertEqual(oldapp.clip_backend_kind, "openai_clip")
+        self.assertEqual(oldapp.clip_runtime_model, "ViT-B/32")
 
 
 class ProbeVectorGuardTests(unittest.TestCase):

@@ -72,10 +72,17 @@ Tools:
 
 The first commissioning pass waits for at least 120 independent archived
 semantic snapshots per channel. It requests one bounded L1 synthesis on the
-agent profile, searches the continuous CLIP archive, checks P/N/M separation,
+agent profile, searches the continuous embedding archive, checks P/N/M separation,
 estimates episode cadence for cooldown/dedup, and stores proposal-only probe
 adjustments. It does not silently rewrite semantic meaning, severity, or alert
 policy. Report coverage failures as `waiting_coverage`, not as an empty scene.
+
+If the configured attention embedder is SigLIP2, treat commissioning as a new
+embedding epoch. Starter probes remain shadow until enough SigLIP2-tagged
+semantic snapshots exist and the operator approves the calibrated proposal.
+Never reuse CLIP thresholds or interpret rejected legacy vectors as evidence
+that an event did not occur. Continue live L0 from CV-selected frames while
+this calibration debt is open.
 
 ## Count and duration questions
 

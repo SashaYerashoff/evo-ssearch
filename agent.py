@@ -2501,6 +2501,9 @@ class AgentTools:
         search_detections_fn: Callable[..., List[Dict[str, Any]]],
         channel_group_store: Any | None = None,
         deployment_store: ProtocolDeploymentStore | None = None,
+        embedding_metadata_fn: Optional[
+            Callable[[], Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self._ds   = detections_store
         self._ps   = probes_store
@@ -2512,6 +2515,7 @@ class AgentTools:
         self._search_folder    = search_indexed_folder_fn
         self._search_det       = search_detections_fn
         self._channel_groups = channel_group_store
+        self._embedding_metadata_fn = embedding_metadata_fn
         self._deployment_store = deployment_store or ProtocolDeploymentStore(
             getattr(luxriot_manager, "runtime_state_store", None)
         )
@@ -2529,6 +2533,30 @@ class AgentTools:
                 self._schedule_deployment_commissioning(
                     str(deployment.get("deployment_id") or "")
                 )
+
+    def _current_embedding_space(self) -> Dict[str, Any]:
+        if not callable(self._embedding_metadata_fn):
+            return {}
+        try:
+            raw = self._embedding_metadata_fn()
+        except Exception:
+            return {}
+        if not isinstance(raw, Mapping):
+            return {}
+        result: Dict[str, Any] = {}
+        for key in ("backend", "model", "dimension"):
+            value = raw.get(key)
+            if value is None:
+                continue
+            if key == "dimension":
+                parsed = _opt_int(value)
+                if parsed is not None and parsed > 0:
+                    result[key] = int(parsed)
+            else:
+                text = str(value).strip()
+                if text:
+                    result[key] = text
+        return result
 
     def _set_trusted_permissions(self, permissions: Optional[Sequence[str]]) -> None:
         """Authz set by the secure adapter from the execution context only.
@@ -2948,6 +2976,8 @@ class AgentTools:
         positive_vec = _agent_normalized_vec(self._emb_text(event_query))
         if positive_vec is None:
             raise ToolError("CLIP text embedder did not return an event query vector.")
+        embedding_space = self._current_embedding_space()
+        embedding_space.setdefault("dimension", int(positive_vec.shape[0]))
         contrast_vec = _agent_normalized_vec(self._emb_text(contrast_effective)) if contrast_effective else None
 
         channel_results: List[Dict[str, Any]] = []
@@ -2960,7 +2990,64 @@ class AgentTools:
                 candidate_limit=candidate_limit,
             )
             samples: List[Dict[str, Any]] = []
+            rejected_embedding_space = 0
             for row in rows:
+                raw_payload = (
+                    row.get("payload")
+                    if isinstance(row.get("payload"), Mapping)
+                    else {}
+                )
+                archived_space = (
+                    raw_payload.get("embedding_space")
+                    if isinstance(raw_payload.get("embedding_space"), Mapping)
+                    else {}
+                )
+                expected_backend = str(
+                    embedding_space.get("backend") or ""
+                ).strip()
+                expected_model = str(
+                    embedding_space.get("model") or ""
+                ).strip()
+                expected_dimension = _opt_int(
+                    embedding_space.get("dimension")
+                )
+                archived_backend = str(
+                    archived_space.get("backend") or ""
+                ).strip()
+                archived_model = str(
+                    archived_space.get("model") or ""
+                ).strip()
+                archived_dimension = _opt_int(
+                    archived_space.get("dimension")
+                )
+                explicit_identity_required = (
+                    expected_backend not in {"", "openai_clip"}
+                    or "siglip" in expected_model.lower()
+                )
+                incompatible = (
+                    (
+                        bool(archived_backend)
+                        and bool(expected_backend)
+                        and archived_backend != expected_backend
+                    )
+                    or (
+                        bool(archived_model)
+                        and bool(expected_model)
+                        and archived_model != expected_model
+                    )
+                    or (
+                        archived_dimension is not None
+                        and expected_dimension is not None
+                        and archived_dimension != expected_dimension
+                    )
+                    or (
+                        explicit_identity_required
+                        and (not archived_backend or not archived_model)
+                    )
+                )
+                if incompatible:
+                    rejected_embedding_space += 1
+                    continue
                 pos_score = _agent_dot_score(positive_vec, row.get("clip_vec"))
                 if pos_score is None:
                     continue
@@ -3009,6 +3096,11 @@ class AgentTools:
                 )
             if truncated:
                 warnings.append("Frame candidate scan was truncated by candidate_limit; calibration applies only to scanned frames.")
+            if rejected_embedding_space:
+                warnings.append(
+                    f"Skipped {rejected_embedding_space} archived frame(s) "
+                    "from an unknown or different embedding space."
+                )
 
             distributions = {
                 "positive_score": _score_distribution([sample.get("positive_score") for sample in samples]),
@@ -3039,6 +3131,7 @@ class AgentTools:
                 "frame_count": len(samples),
                 "source_totals": source_totals,
                 "source_returned": source_returned,
+                "embedding_space_rejected": rejected_embedding_space,
                 "coverage": coverage,
                 "distributions": distributions,
                 "suggested_thresholds": suggested_thresholds,
@@ -3068,6 +3161,7 @@ class AgentTools:
                 if deferred_channel_ids else None
             ),
             "score_semantics": "clip_pnm_archive_calibration_not_ground_truth",
+            "embedding_space": embedding_space,
             "operator_note": (
                 "Calibration estimates initial probe thresholds from archived CLIP vectors. "
                 "It is a secondary attention signal, not proof; inspect representative frames "
@@ -5871,6 +5965,9 @@ class AgentTools:
             # the store.
             "origin": "agent",
         }
+        embedding_space = self._current_embedding_space()
+        if embedding_space:
+            probe["embedding_space"] = embedding_space
         errors = _validate_probe(probe)
         if errors:
             raise ToolError("Validation failed: " + "; ".join(errors))
@@ -5999,6 +6096,13 @@ class AgentTools:
 
         # Deep merge — only touch what changes specifies
         merged = _merge_probe(current, changes)
+        if any(
+            key in changes
+            for key in ("positives", "negatives", "pos_floor", "margin_thr")
+        ):
+            embedding_space = self._current_embedding_space()
+            if embedding_space:
+                merged["embedding_space"] = embedding_space
 
         # Validate merged object
         errors = _validate_probe(merged)
@@ -8120,6 +8224,7 @@ def _probe_summary(probe: Dict[str, Any]) -> Dict[str, Any]:
         "bookmark":    probe.get("bookmark"),
         "bookmark_cooldown_sec": probe.get("bookmark_cooldown_sec"),
         "bookmark_dedupe_window_sec": probe.get("bookmark_dedupe_window_sec"),
+        "embedding_space": probe.get("embedding_space"),
     }
 
 
@@ -10495,6 +10600,9 @@ class AgentRunner:
         tool_approval_store: Any | None = None,
         channel_group_store: Any | None = None,
         deployment_store: ProtocolDeploymentStore | None = None,
+        embedding_metadata_fn: Optional[
+            Callable[[], Mapping[str, Any]]
+        ] = None,
     ) -> None:
         self._ps  = probes_store
         self._ds  = detections_store
@@ -10520,6 +10628,7 @@ class AgentRunner:
             search_detections_fn=search_detections_fn,
             channel_group_store=channel_group_store,
             deployment_store=deployment_store,
+            embedding_metadata_fn=embedding_metadata_fn,
         )
         self._secure_tools = (
             EvaAgentToolAdapter(

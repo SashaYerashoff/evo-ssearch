@@ -302,6 +302,8 @@ links, P/N/M semantics, and the deployed office profile.
 |---|---|
 | `EVOSSEARCH_EMBEDDER` (`clip`) | Production embedder |
 | `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`ViT-B/32`) | CLIP model |
+| `EVOSSEARCH_CLIP_DEVICE` (`auto`) | Device for the CLIP-like attention embedder. Set `cpu` to reserve GPU VRAM for the VLM; benchmark semantic-snapshot queue lag before production |
+| `EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED` (`false`) | Allows an explicit fallback to a different embedding model after load failure. Keep `false` in production: model changes invalidate archive vectors and probe thresholds |
 | `EVOSSEARCH_OFFLINE_MODE` (`true`) | Blocks Hugging Face/Transformers and OpenAI CLIP downloads; missing artifacts fail closed |
 | `EVOSSEARCH_MODEL_CACHE_DIR` (`~/.cache/eva-ai/models`) | Local Hugging Face/Transformers model cache |
 | `EVOSSEARCH_OPENAI_CLIP_CACHE_DIR` (`~/.cache/clip`) | Local OpenAI CLIP weights cache |

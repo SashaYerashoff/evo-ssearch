@@ -127,6 +127,7 @@ class SemanticSnapshotArchiveWriter:
         dedupe_capacity: int = 100_000,
         max_thumbnail_chars: int = 8_000_000,
         max_provenance_chars: int = 32_000,
+        embedding_space_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
         autostart: bool = True,
@@ -162,6 +163,7 @@ class SemanticSnapshotArchiveWriter:
         self.dedupe_capacity = int(dedupe_capacity)
         self.max_thumbnail_chars = max(1, int(max_thumbnail_chars))
         self.max_provenance_chars = max(1, int(max_provenance_chars))
+        self.embedding_space_fn = embedding_space_fn
         self._clock = clock
         self._monotonic = monotonic
 
@@ -336,6 +338,22 @@ class SemanticSnapshotArchiveWriter:
             "%Y%m%d%H",
             time.localtime(float(timestamp) / 1000.0),
         )
+        embedding_space: Dict[str, Any] = {}
+        if callable(self.embedding_space_fn):
+            try:
+                raw_embedding_space = self.embedding_space_fn()
+                if isinstance(raw_embedding_space, Mapping):
+                    embedding_space = {
+                        str(key): _plain_json_value(value)
+                        for key, value in raw_embedding_space.items()
+                        if str(key) in {"backend", "model", "dimension"}
+                        and value is not None
+                    }
+            except Exception:
+                # The vector remains searchable. Calibration treats missing
+                # identity conservatively for non-legacy embedding spaces.
+                embedding_space = {}
+        embedding_space.setdefault("dimension", int(len(vector)))
         record = {
             "dedupe_key": dedupe_key,
             "timestamp_ms": timestamp,
@@ -360,6 +378,7 @@ class SemanticSnapshotArchiveWriter:
                 "cadence_slot": cadence_slot,
                 "independent_of_alert_or_probe_hit": True,
                 "selection_policy": "one_embedding_per_channel_cadence_slot",
+                "embedding_space": embedding_space,
                 "provenance": provenance_value,
             },
         }

@@ -1491,7 +1491,10 @@ def init_clip() -> None:
         if clip_backend_kind == "siglip2" and clip_processor is not None:
             return
 
-    preferred_device = device
+    configured_device = str(
+        getattr(config, "CLIP_DEVICE", "auto") or "auto"
+    ).strip().lower()
+    preferred_device = device if configured_device == "auto" else configured_device
     requested_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
     config.CLIP_MODEL = requested_model
     if _is_siglip2_clip_model(requested_model):
@@ -1505,10 +1508,19 @@ def init_clip() -> None:
             clip_runtime_device = preferred_device
             return
         except Exception as exc:
+            if not bool(getattr(config, "EMBEDDER_FALLBACK_ENABLED", False)):
+                raise RuntimeError(
+                    f"SigLIP2 model '{requested_model}' failed to load and "
+                    "embedding fallback is disabled. Keep the service unready "
+                    "until the configured model is available; silently changing "
+                    "the embedding space would invalidate archive vectors and "
+                    "probe thresholds."
+                ) from exc
             fallback_model = "ViT-B/32"
             print(
                 f"SigLIP2 model '{requested_model}' failed to load ({exc}). "
-                f"Falling back to CLIP '{fallback_model}'."
+                f"Explicit fallback is enabled; falling back to CLIP "
+                f"'{fallback_model}'."
             )
             fallback_error: Optional[Exception] = None
             fallback_device = preferred_device
@@ -1961,6 +1973,36 @@ def get_probe_image_embedding_from_pil(pil_image: Image.Image) -> np.ndarray:
 def get_probe_text_embedding(text: str) -> np.ndarray:
     """Probe text embeddings always use the CLIP-like backend so they remain available outside clip search mode."""
     return get_clip_text_embedding(text)
+
+
+def get_probe_embedding_space() -> Dict[str, Any]:
+    """Return the exact live vector space used by semantic search and probes."""
+
+    ensure_embedder_loaded("clip")
+    dimension: Optional[int] = None
+    if clip_backend_kind == "siglip2":
+        projection_dim = getattr(
+            getattr(clip_model, "config", None),
+            "projection_dim",
+            None,
+        )
+        if projection_dim:
+            dimension = int(projection_dim)
+    else:
+        output_dim = getattr(
+            getattr(clip_model, "visual", None),
+            "output_dim",
+            None,
+        )
+        if output_dim:
+            dimension = int(output_dim)
+    payload: Dict[str, Any] = {
+        "backend": str(clip_backend_kind or "unknown"),
+        "model": str(clip_runtime_model or config.CLIP_MODEL or "unknown"),
+    }
+    if dimension is not None:
+        payload["dimension"] = dimension
+    return payload
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4540,6 +4582,7 @@ if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
         batch_size=int(
             getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE", 32)
         ),
+        embedding_space_fn=get_probe_embedding_space,
     )
 luxriot_manager.semantic_snapshot_writer = semantic_snapshot_writer
 channel_group_store = ChannelGroupStore(
@@ -6587,8 +6630,9 @@ def _get_agent_runner() -> Any:
             kind="agent",
         )
         _agent_runner = AgentRunner(
-            embed_text_fn=lambda text: get_text_embedding(text),
+            embed_text_fn=get_probe_text_embedding,
             embed_image_fn=lambda img: get_image_embedding_from_pil(img, embedder='clip'),
+            embedding_metadata_fn=get_probe_embedding_space,
             call_lm_fn=_agent_tool_lm_chat,
             encode_jpeg_fn=_encode_jpeg,
             probes_store=probes_store,

@@ -313,7 +313,15 @@ class _ChannelsMethodOnlyManager:
         return {"video_streams": [], "channel_status_digest": []}
 
 
-def _tools(manager=None, search_detections_fn=None, detections_store=None, call_lm_fn=None, embed_text_fn=None, probes_store=None):
+def _tools(
+    manager=None,
+    search_detections_fn=None,
+    detections_store=None,
+    call_lm_fn=None,
+    embed_text_fn=None,
+    probes_store=None,
+    embedding_metadata_fn=None,
+):
     return AgentTools(
         detections_store=detections_store or _DetectionStore(),
         probes_store=probes_store or _ProbeStore(),
@@ -324,6 +332,7 @@ def _tools(manager=None, search_detections_fn=None, detections_store=None, call_
         encode_jpeg_fn=lambda *_args, **_kwargs: "",
         search_indexed_folder_fn=lambda **_kwargs: [],
         search_detections_fn=search_detections_fn or (lambda **_kwargs: []),
+        embedding_metadata_fn=embedding_metadata_fn,
     )
 
 
@@ -2011,6 +2020,73 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["deferred_channel_ids"], [9])
         self.assertEqual(compact["channels"][0]["suggested_thresholds"]["confidence"], channel7["suggested_thresholds"]["confidence"])
         self.assertTrue(compact["channels"][0]["representative_frames"]["top_margin"][0]["image_url"].startswith("/detections/thumbnail/"))
+
+    def test_siglip2_calibration_rejects_legacy_or_mismatched_archive_vectors(self):
+        siglip_space = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "dimension": 2,
+        }
+        rows = [
+            {
+                "id": 1,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 101_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {"embedding_space": siglip_space},
+            },
+            {
+                "id": 2,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 102_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {},
+            },
+            {
+                "id": 3,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 103_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {
+                    "embedding_space": {
+                        "backend": "openai_clip",
+                        "model": "ViT-B/32",
+                        "dimension": 2,
+                    }
+                },
+            },
+        ]
+
+        result = _tools(
+            detections_store=_DetectionStore(rows),
+            embed_text_fn=lambda text: (
+                [0.0, 1.0]
+                if "empty" in str(text).lower()
+                else [1.0, 0.0]
+            ),
+            embedding_metadata_fn=lambda: siglip_space,
+        ).execute(
+            "calibrate_probe_from_archive",
+            {
+                "event_query": "person near window",
+                "contrast_query": "empty window",
+                "channel_id": 7,
+                "sources": ["semantic_snapshot"],
+                "from_ts": 100.0,
+                "to_ts": 110.0,
+                "min_frames": 1,
+            },
+        )
+
+        channel = result["channels"][0]
+        self.assertEqual(channel["frame_count"], 1)
+        self.assertEqual(channel["embedding_space_rejected"], 2)
+        self.assertTrue(
+            any("different embedding space" in item for item in channel["warnings"])
+        )
 
     def test_calibrate_probe_flags_over_firing_as_unsafe(self):
         rows = [

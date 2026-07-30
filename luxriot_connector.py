@@ -253,6 +253,8 @@ LIVE_OBSERVATION_STATE_PROMPT = (
 VECTOR_SIGNAL_PROMPT_PREFIX = (
     "Current vector/homeostasis signal contract:\n"
     "- VECTOR_SIGNALS_JSON is a secondary attention/arousal signal from CLIP probes and lightweight CV, not visual proof.\n"
+    "- A CLIP signal with attention_authority=shadow is an unconfirmed follow-up cue. It may direct visual scrutiny, "
+    "but it must not change the current state, create an alert, or confirm another cue without direct snapshot evidence.\n"
     "- Use it to decide which current snapshots deserve extra scrutiny; verify any candidate directly in the current images.\n"
     "- capture_attention marks snapshots whose motion is far above this channel's measured norm (activity_x = times above "
     "typical). Motion blur on burst snapshots is expected physics of fast events - describe the action itself; use sharper "
@@ -2777,7 +2779,14 @@ class LuxriotCaptureSession:
                         "channel_id": int(self.channel_id),
                         "captured_at_ms": selected_timestamp,
                         "embedding_ref": embedding_ref,
-                        "embedding_model": "clip",
+                        "embedding_model": str(
+                            getattr(
+                                self.manager.config,
+                                "CLIP_MODEL",
+                                "clip",
+                            )
+                            or "clip"
+                        )[:160],
                         "frame_ref": embedding_ref,
                         "cadence_ms": max(
                             200,
@@ -2824,27 +2833,41 @@ class LuxriotCaptureSession:
         allow_stopped: bool = False,
         trigger_summary: bool = False,
     ) -> None:
-        """Admit only completed embedding-backed frames to adaptive L0."""
+        """Admit a selected CV apex to L0 without making CLIP a hard gate.
+
+        ``embedding`` is optional by design.  The per-second semantic archive
+        and probe scores are a parallel evidence/attention branch; a missing,
+        slow, or disabled embedder must never turn a healthy camera into a
+        silent L0 stream.
+        """
 
         buffer_gap_frames: List[Dict[str, Any]] = []
         with self.lock:
             if self.stop_event.is_set() and not allow_stopped:
                 return
-            if (
-                not self.manager.attention_scheduler_enabled
-                or embedding is not None
-            ):
-                admitted_to_summary = self._admit_summary_frame_locked(frame)
-                selection = frame.get("capture_selection")
-                if isinstance(selection, dict):
-                    selection["summary_admitted"] = bool(
-                        admitted_to_summary
-                    )
-                    selection["summary_cadence_sec"] = round(
-                        float(self._summary_cadence_for_frame(frame)),
-                        3,
-                    )
-                self.recent_frames.append(frame)
+            admitted_to_summary = self._admit_summary_frame_locked(frame)
+            selection = frame.get("capture_selection")
+            existing_embedding_status = str(
+                frame.get("embedding_status") or ""
+            ).strip().lower()
+            embedding_status = (
+                "ready"
+                if embedding is not None or frame.get("embedding_ref")
+                else existing_embedding_status
+                if existing_embedding_status in {"pending", "ready", "unavailable"}
+                else "unavailable"
+            )
+            if isinstance(selection, dict):
+                selection["summary_admitted"] = bool(
+                    admitted_to_summary
+                )
+                selection["summary_cadence_sec"] = round(
+                    float(self._summary_cadence_for_frame(frame)),
+                    3,
+                )
+                selection["embedding_status"] = embedding_status
+            frame["embedding_status"] = embedding_status
+            self.recent_frames.append(frame)
             buffer_gap_frames = self._enforce_buffer_locked()
         if buffer_gap_frames:
             self._note_summary_coverage_gap(
@@ -3165,17 +3188,36 @@ class LuxriotCaptureSession:
                 motion_aggregate=motion_aggregate,
                 apex_available=apex_available,
             )
-            self._admit_embedding_completed_frame(
-                frame,
-                result,
-                trigger_summary=True,
+            selection = frame.get("capture_selection")
+            if isinstance(selection, dict):
+                selection["embedding_status"] = (
+                    "ready" if result is not None else "unavailable"
+                )
+            frame["embedding_status"] = (
+                "ready" if result is not None else "unavailable"
             )
+            self._summarize_if_ready()
 
         if embedding_async:
             embedding_async = self.manager.submit_probe_embedding(
                 embedding_work,
                 embedding_complete,
             )
+            if embedding_async:
+                if not frame.get("embedding_ref") and not frame.get(
+                    "embedding_status"
+                ):
+                    frame["embedding_status"] = "pending"
+                selection = frame.get("capture_selection")
+                if isinstance(selection, dict):
+                    selection["embedding_status"] = frame.get(
+                        "embedding_status"
+                    ) or "pending"
+                self._admit_embedding_completed_frame(
+                    frame,
+                    None,
+                    allow_stopped=True,
+                )
         if not embedding_async:
             embedding = embedding_work()
             self._link_completed_probe_embedding(
@@ -5781,6 +5823,8 @@ class LuxriotManager:
                 alert_total=node.get("alert_total"),
                 alert_severities=node.get("alert_severities"),
                 signal_digest=node.get("signal_digest"),
+                event_ledger=node.get("event_ledger"),
+                state_ledger=node.get("state_ledger"),
                 alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
                 alert_events=node.get("alert_events"),
                 alert_parser_breakdown=node.get("alert_parser_breakdown"),
@@ -6982,7 +7026,7 @@ class LuxriotManager:
             )
             and summary
             and not self._is_legacy_fallback_rollup(summary)
-            and not self._rollup_operator_semantic_guard_issues(summary)
+            and not self._rollup_grounding_guard_issues(summary, row)
         )
 
     def _backfill_ready_ids(
@@ -7715,6 +7759,10 @@ class LuxriotManager:
             "- Source entries may be model-generated summaries from a lower level; avoid compounding uncertainty.",
             "- Window signal digest and channel memory are internal routing context, not operator prose and not independent evidence.",
             "- Preserve rare but important events even if they appear once.",
+            "- The deterministic event ledger is extracted from lower-level BATCH_STATE_JSON, transitions, and structured alerts. "
+            "Do not erase a ledger entry merely because lower-level prose calls the period routine.",
+            "- The watched-state ledger counts sampled present/absent/unknown observations once per batch. "
+            "Zero present observations means no confirmed occurrence in available samples, not proof that an entity never appeared.",
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
             "- Never compress alerts, deviations, coverage gaps, or operator-review incidents into routine.",
             "- Do not classify behavior as illegal/unlawful; describe observable security/safety facts.",
@@ -7743,6 +7791,7 @@ class LuxriotManager:
             "- Distinguish 'no interruption recorded in metadata' from a claim that visual coverage was complete.",
             "- Recommend operator follow-up only for a grounded unresolved safety/security issue, not routine presence changes or low-confidence cues.",
             "- If the period is routine, say so plainly and keep the report short.",
+            "- Never say that nothing happened, no notable event occurred, or no activity occurred while the event ledger is non-empty.",
             "- Do not invent entities, times, or counts.",
             "",
             "Operator output format (Markdown, use exactly these sections):",
@@ -8390,6 +8439,8 @@ class LuxriotManager:
             "backend_instruction_chars",
             "routine_context_chars",
             "signal_digest_chars",
+            "event_ledger_chars",
+            "state_ledger_chars",
             "vector_signal_chars",
             "warning_text_chars",
             "warning_image_payload_chars",
@@ -8633,6 +8684,436 @@ class LuxriotManager:
                     event[field] = int(parsed)
             out.append(event)
         return out
+
+    @classmethod
+    def _compact_event_ledger(
+        cls,
+        value: object,
+        *,
+        max_items: int = 96,
+    ) -> List[Dict[str, Any]]:
+        """Normalize the bounded event chronology propagated through rollups."""
+
+        if not isinstance(value, Sequence) or isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            return []
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, int, str]] = set()
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                continue
+            kind = str(raw.get("kind") or "event").strip().lower()[:32]
+            if kind not in {"event", "state_transition", "alert"}:
+                kind = "event"
+            label = cls._truncate_text(
+                raw.get("label") or raw.get("title") or raw.get("event_id"),
+                160,
+            )
+            if not label:
+                continue
+            timestamp_ms = _parse_optional_int(raw.get("timestamp_ms"))
+            if timestamp_ms is None:
+                timestamp_ms = 0
+            state = str(raw.get("state") or "").strip().lower()[:32]
+            event_id = cls._truncate_text(
+                raw.get("id") or raw.get("event_id"),
+                120,
+            )
+            dedupe_key = (
+                kind,
+                event_id.casefold() or label.casefold(),
+                int(timestamp_ms),
+                state,
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            item: Dict[str, Any] = {
+                "id": event_id or cls._stable_id(
+                    [
+                        kind,
+                        label.casefold(),
+                        str(int(timestamp_ms)),
+                        state,
+                    ],
+                    length=16,
+                ),
+                "kind": kind,
+                "timestamp_ms": int(timestamp_ms),
+                "label": label,
+            }
+            end_timestamp_ms = _parse_optional_int(raw.get("end_timestamp_ms"))
+            if end_timestamp_ms is not None:
+                item["end_timestamp_ms"] = int(end_timestamp_ms)
+            for key, limit in (
+                ("state", 32),
+                ("novelty", 32),
+                ("severity", 20),
+                ("source_id", 120),
+            ):
+                text = str(raw.get(key) or "").strip()
+                if text:
+                    item[key] = text[:limit]
+            for key, limit in (("summary", 320), ("evidence", 300)):
+                text = cls._truncate_text(raw.get(key), limit)
+                if text:
+                    item[key] = text
+            if raw.get("pass_up") is not None:
+                item["pass_up"] = bool(raw.get("pass_up"))
+            out.append(item)
+        out.sort(
+            key=lambda item: (
+                int(_parse_optional_int(item.get("timestamp_ms")) or 0),
+                str(item.get("kind") or ""),
+                str(item.get("id") or ""),
+            )
+        )
+        if len(out) <= max(1, int(max_items)):
+            return out
+
+        def salience(item: Mapping[str, Any]) -> int:
+            score = 0
+            if item.get("pass_up"):
+                score += 80
+            if str(item.get("kind") or "") == "alert":
+                score += 100
+            elif str(item.get("kind") or "") == "state_transition":
+                score += 70
+            severity = str(item.get("severity") or "").lower()
+            score += {
+                "critical": 80,
+                "high": 60,
+                "normal": 35,
+                "low": 20,
+                "info": 10,
+            }.get(severity, 0)
+            if str(item.get("novelty") or "").lower() in {
+                "novel",
+                "deviation",
+                "unexpected",
+            }:
+                score += 30
+            return score
+
+        limit = max(1, int(max_items))
+        selected: Set[int] = {0, len(out) - 1}
+        for index, _item in sorted(
+            enumerate(out),
+            key=lambda pair: (
+                -salience(pair[1]),
+                int(_parse_optional_int(pair[1].get("timestamp_ms")) or 0),
+            ),
+        ):
+            selected.add(index)
+            if len(selected) >= limit:
+                break
+        return [out[index] for index in sorted(selected)[:limit]]
+
+    @classmethod
+    def _compact_state_ledger(
+        cls,
+        value: object,
+        *,
+        max_items: int = 64,
+    ) -> List[Dict[str, Any]]:
+        """Normalize watched-state coverage without treating absence as proof."""
+
+        if not isinstance(value, Sequence) or isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            return []
+        out: List[Dict[str, Any]] = []
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                continue
+            key = str(raw.get("key") or "").strip().lower()[:80]
+            label = cls._truncate_text(raw.get("label") or key, 140)
+            if not key or not label:
+                continue
+            item: Dict[str, Any] = {
+                "key": key,
+                "label": label,
+                "present_count": max(
+                    0,
+                    int(_parse_optional_int(raw.get("present_count")) or 0),
+                ),
+                "absent_count": max(
+                    0,
+                    int(_parse_optional_int(raw.get("absent_count")) or 0),
+                ),
+                "unknown_count": max(
+                    0,
+                    int(_parse_optional_int(raw.get("unknown_count")) or 0),
+                ),
+            }
+            for timestamp_key in (
+                "first_observed_ms",
+                "last_observed_ms",
+                "first_present_ms",
+                "last_present_ms",
+            ):
+                parsed = _parse_optional_int(raw.get(timestamp_key))
+                if parsed is not None and parsed > 0:
+                    item[timestamp_key] = int(parsed)
+            evidence = cls._coerce_memory_items(
+                raw.get("evidence_samples"),
+                max_items=3,
+                max_len=180,
+            )
+            if evidence:
+                item["evidence_samples"] = evidence
+            out.append(item)
+            if len(out) >= max(1, int(max_items)):
+                break
+        out.sort(key=lambda item: str(item.get("key") or ""))
+        return out
+
+    @classmethod
+    def _l0_event_ledger(
+        cls,
+        *,
+        rollup_id: str,
+        batch_state: Mapping[str, Any],
+        alert_events: Sequence[Mapping[str, Any]],
+        transition_events: Sequence[Mapping[str, Any]],
+        default_timestamp_ms: int,
+    ) -> List[Dict[str, Any]]:
+        ledger: List[Dict[str, Any]] = []
+        raw_events = batch_state.get("events")
+        if isinstance(raw_events, Sequence) and not isinstance(
+            raw_events,
+            (str, bytes, bytearray),
+        ):
+            for ordinal, raw in enumerate(raw_events[:24]):
+                if not isinstance(raw, Mapping):
+                    continue
+                novelty = str(raw.get("novelty") or "").strip().lower()
+                state = str(raw.get("state") or "uncertain").strip().lower()
+                pass_up = bool(raw.get("pass_up"))
+                if (
+                    not pass_up
+                    and novelty in {"routine", "known", "unchanged"}
+                    and state == "continuing"
+                ):
+                    continue
+                label = cls._truncate_text(
+                    raw.get("label") or raw.get("event_id"),
+                    160,
+                )
+                if not label:
+                    continue
+                ledger.append(
+                    {
+                        "id": f"{rollup_id}:event:{ordinal}",
+                        "event_id": cls._truncate_text(
+                            raw.get("event_id"),
+                            80,
+                        ),
+                        "kind": "event",
+                        "timestamp_ms": int(default_timestamp_ms),
+                        "label": label,
+                        "state": state,
+                        "summary": cls._truncate_text(
+                            raw.get("summary"),
+                            320,
+                        ),
+                        "novelty": novelty,
+                        "pass_up": pass_up,
+                        "source_id": rollup_id,
+                    }
+                )
+        for ordinal, raw in enumerate(transition_events[:32]):
+            if not isinstance(raw, Mapping):
+                continue
+            timestamp_ms = (
+                _parse_optional_int(raw.get("timestamp_ms"))
+                or int(default_timestamp_ms)
+            )
+            event_type = str(raw.get("event_type") or "state_change").strip()
+            label = cls._truncate_text(
+                raw.get("label") or raw.get("key"),
+                140,
+            )
+            if not label:
+                continue
+            ledger.append(
+                {
+                    "id": f"{rollup_id}:transition:{ordinal}",
+                    "kind": "state_transition",
+                    "timestamp_ms": int(timestamp_ms),
+                    "label": f"{label}: {event_type}",
+                    "state": str(raw.get("to_state") or "unknown"),
+                    "summary": cls._truncate_text(
+                        raw.get("evidence"),
+                        300,
+                    ),
+                    "pass_up": True,
+                    "source_id": rollup_id,
+                }
+            )
+        for ordinal, raw in enumerate(alert_events[:16]):
+            if not isinstance(raw, Mapping):
+                continue
+            label = cls._truncate_text(
+                raw.get("title") or raw.get("description"),
+                160,
+            )
+            if not label:
+                continue
+            timestamp_ms = (
+                _parse_optional_int(raw.get("timestamp_ms"))
+                or int(default_timestamp_ms)
+            )
+            ledger.append(
+                {
+                    "id": f"{rollup_id}:alert:{ordinal}",
+                    "kind": "alert",
+                    "timestamp_ms": int(timestamp_ms),
+                    "label": label,
+                    "summary": cls._truncate_text(
+                        raw.get("description"),
+                        300,
+                    ),
+                    "severity": str(raw.get("severity") or "normal"),
+                    "pass_up": True,
+                    "source_id": rollup_id,
+                }
+            )
+        return cls._compact_event_ledger(ledger, max_items=72)
+
+    @classmethod
+    def _l0_state_ledger(
+        cls,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        timestamp_ms: int,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for raw in observations[:64]:
+            if not isinstance(raw, Mapping):
+                continue
+            key = str(raw.get("key") or "").strip().lower()[:80]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            state = str(raw.get("state") or "unknown").strip().lower()
+            if state not in {"present", "absent", "unknown"}:
+                state = "unknown"
+            row: Dict[str, Any] = {
+                "key": key,
+                "label": cls._truncate_text(raw.get("label") or key, 140),
+                "present_count": 1 if state == "present" else 0,
+                "absent_count": 1 if state == "absent" else 0,
+                "unknown_count": 1 if state == "unknown" else 0,
+                "first_observed_ms": int(timestamp_ms),
+                "last_observed_ms": int(timestamp_ms),
+            }
+            if state == "present":
+                row["first_present_ms"] = int(timestamp_ms)
+                row["last_present_ms"] = int(timestamp_ms)
+            evidence = cls._truncate_text(raw.get("evidence"), 180)
+            if evidence:
+                row["evidence_samples"] = [evidence]
+            rows.append(row)
+        return cls._compact_state_ledger(rows)
+
+    @classmethod
+    def _aggregate_event_ledger(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        *,
+        max_items: int = 96,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Mapping[str, Any]] = []
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            raw = child.get("event_ledger")
+            if isinstance(raw, Sequence) and not isinstance(
+                raw,
+                (str, bytes, bytearray),
+            ):
+                rows.extend(
+                    item for item in raw if isinstance(item, Mapping)
+                )
+        return cls._compact_event_ledger(rows, max_items=max_items)
+
+    @classmethod
+    def _aggregate_state_ledger(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        *,
+        max_items: int = 64,
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for child in children:
+            if not isinstance(child, Mapping):
+                continue
+            for raw in cls._compact_state_ledger(
+                child.get("state_ledger"),
+                max_items=max_items,
+            ):
+                key = str(raw.get("key") or "")
+                target = grouped.setdefault(
+                    key,
+                    {
+                        "key": key,
+                        "label": raw.get("label") or key,
+                        "present_count": 0,
+                        "absent_count": 0,
+                        "unknown_count": 0,
+                        "evidence_samples": [],
+                    },
+                )
+                for count_key in (
+                    "present_count",
+                    "absent_count",
+                    "unknown_count",
+                ):
+                    target[count_key] = int(target.get(count_key) or 0) + int(
+                        raw.get(count_key) or 0
+                    )
+                for timestamp_key in (
+                    "first_observed_ms",
+                    "first_present_ms",
+                ):
+                    parsed = _parse_optional_int(raw.get(timestamp_key))
+                    current = _parse_optional_int(target.get(timestamp_key))
+                    if parsed is not None and (
+                        current is None or parsed < current
+                    ):
+                        target[timestamp_key] = int(parsed)
+                for timestamp_key in (
+                    "last_observed_ms",
+                    "last_present_ms",
+                ):
+                    parsed = _parse_optional_int(raw.get(timestamp_key))
+                    current = _parse_optional_int(target.get(timestamp_key))
+                    if parsed is not None and (
+                        current is None or parsed > current
+                    ):
+                        target[timestamp_key] = int(parsed)
+                target["evidence_samples"] = cls._dedupe_memory_items(
+                    cls._coerce_memory_items(
+                        target.get("evidence_samples"),
+                        max_items=3,
+                        max_len=180,
+                    ),
+                    cls._coerce_memory_items(
+                        raw.get("evidence_samples"),
+                        max_items=3,
+                        max_len=180,
+                    ),
+                    max_items=3,
+                )
+        return cls._compact_state_ledger(
+            list(grouped.values()),
+            max_items=max_items,
+        )
 
     @staticmethod
     def _finite_float(value: object) -> Optional[float]:
@@ -9106,6 +9587,8 @@ class LuxriotManager:
                 for text_key in (
                     "probe_id",
                     "severity",
+                    "origin",
+                    "attention_authority",
                     "capture_selection_source",
                     "capture_frame_hash",
                     "capture_fallback_reason",
@@ -9134,6 +9617,8 @@ class LuxriotManager:
                     parsed = _parse_optional_int(raw.get(int_key))
                     if parsed is not None:
                         item[int_key] = int(parsed)
+                if raw.get("temporary") is not None:
+                    item["temporary"] = bool(raw.get("temporary"))
                 clip_items.append(item)
         if clip_items:
             out["clip_probe_signals"] = clip_items[:8]
@@ -9589,12 +10074,76 @@ class LuxriotManager:
             return [], health
         active = active[: self.vector_signal_probe_limit]
         health["clip_probe_scanned"] = len(active)
+        health["clip_probe_shadow"] = 0
+        health["clip_probe_regulatory"] = 0
+        health["clip_probe_embedding_space_mismatch"] = 0
 
         duration_sec = 30.0
         if batch_start_ms is not None and batch_end_ms is not None and batch_end_ms >= batch_start_ms:
             duration_sec = max(10.0, min(180.0, (batch_end_ms - batch_start_ms) / 1000.0 + 15.0))
         signals: List[Dict[str, Any]] = []
         for probe in active:
+            probe_origin = str(probe.get("origin") or "").strip().lower()
+            if probe_origin not in {"operator", "agent", "auto"}:
+                probe_origin = (
+                    "auto"
+                    if bool(probe.get("temporary"))
+                    or bool(probe.get("parent_alert_id"))
+                    else "operator"
+                )
+            expected_embedding_model = str(
+                getattr(self.config, "CLIP_MODEL", "") or ""
+            ).strip()
+            expected_siglip2 = "siglip2" in expected_embedding_model.lower()
+            probe_embedding_space = (
+                probe.get("embedding_space")
+                if isinstance(probe.get("embedding_space"), Mapping)
+                else {}
+            )
+            probe_embedding_model = str(
+                probe_embedding_space.get("model") or ""
+            ).strip()
+            probe_embedding_backend = str(
+                probe_embedding_space.get("backend") or ""
+            ).strip().lower()
+            embedding_space_compatible = (
+                not expected_siglip2
+                or (
+                    probe_embedding_backend == "siglip2"
+                    and probe_embedding_model == expected_embedding_model
+                )
+            )
+            attention_authority = (
+                "shadow"
+                if bool(probe.get("attention_only"))
+                or bool(probe.get("temporary"))
+                or probe_origin == "auto"
+                or not embedding_space_compatible
+                else "regulatory"
+            )
+            authority_reason = (
+                "attention_only"
+                if bool(probe.get("attention_only"))
+                else "temporary"
+                if bool(probe.get("temporary"))
+                else "auto_origin"
+                if probe_origin == "auto"
+                else "embedding_space_unverified"
+                if not embedding_space_compatible
+                else "calibrated_operator_or_agent_probe"
+            )
+            if attention_authority == "shadow":
+                health["clip_probe_shadow"] = int(
+                    health.get("clip_probe_shadow") or 0
+                ) + 1
+            else:
+                health["clip_probe_regulatory"] = int(
+                    health.get("clip_probe_regulatory") or 0
+                ) + 1
+            if not embedding_space_compatible:
+                health["clip_probe_embedding_space_mismatch"] = int(
+                    health.get("clip_probe_embedding_space_mismatch") or 0
+                ) + 1
             positives = [str(item).strip() for item in (probe.get("positives") or []) if str(item).strip()]
             negatives = [str(item).strip() for item in (probe.get("negatives") or []) if str(item).strip()]
             pos_floor = float(probe.get("pos_floor", 0.2))
@@ -9659,6 +10208,10 @@ class LuxriotManager:
                             "probe_id": probe_id,
                             "probe_name": str(probe.get("name") or probe_id).strip()[:120],
                             "probe_version": probe_version,
+                            "origin": probe_origin,
+                            "attention_authority": attention_authority,
+                            "authority_reason": authority_reason,
+                            "temporary": bool(probe.get("temporary")),
                             "timestamp_ms": int(timestamp_ms or 0),
                             "p": round(p_score, 6),
                             "n": round(n_score, 6),
@@ -9670,7 +10223,10 @@ class LuxriotManager:
                         }
                         frame.setdefault("attention_probe_scores", []).append(compact_score)
                         snapshot_id = str(frame.get("attention_snapshot_id") or "").strip()
-                        if snapshot_id:
+                        if (
+                            snapshot_id
+                            and attention_authority == "regulatory"
+                        ):
                             persisted_scores.append(
                                 {
                                     "id": str(
@@ -9750,6 +10306,10 @@ class LuxriotManager:
                 "severity": str(probe.get("severity") or "normal").strip().lower()[:20] or "normal",
                 "state": "positive_candidate",
                 "hit_count": len(mapped_hits),
+                "origin": probe_origin,
+                "attention_authority": attention_authority,
+                "authority_reason": authority_reason,
+                "temporary": bool(probe.get("temporary")),
                 "score_semantics": "clip_pnm_attention_signal_not_visual_proof",
             }
             for src_key, out_key in (("pos_score", "pos_score"), ("neg_score", "negative_score"), ("margin", "margin")):
@@ -9988,6 +10548,14 @@ class LuxriotManager:
             )
         for signal in clip_signals:
             if not isinstance(signal, Mapping):
+                continue
+            # Alert-derived probes are useful shadow checks, but feeding them
+            # into a second inferred road episode would let a VLM alert
+            # manufacture corroboration for itself.
+            if (
+                str(signal.get("attention_authority") or "").strip().lower()
+                == "shadow"
+            ):
                 continue
             cue_type = self._road_cue_type_from_clip_signal(signal)
             timestamp_ms = _parse_optional_int(signal.get("timestamp_ms"))
@@ -11755,6 +12323,14 @@ class LuxriotManager:
                     "summary_hash": self._text_hash(child.get("summary")),
                     "alert_counts": self._normalize_alert_counts(child.get("alert_counts")),
                     "signal_digest": signal_digest if isinstance(signal_digest, Mapping) else {},
+                    "event_ledger": self._compact_event_ledger(
+                        child.get("event_ledger"),
+                        max_items=96,
+                    ),
+                    "state_ledger": self._compact_state_ledger(
+                        child.get("state_ledger"),
+                        max_items=64,
+                    ),
                     "source_signature": str(child.get("source_signature") or "").strip(),
                 }
             )
@@ -12345,26 +12921,22 @@ class LuxriotManager:
         *,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Return only memory that is authorized to regulate a live L0 call.
+        """Return only short-lived continuity checks authorized for live L0.
 
-        L3 tuning/ignore output is proposal-only.  Legacy deployments may
-        still have those fields in the persisted channel context, so keeping
-        them in storage for audit must not silently feed them back into L0.
-        The L1 watchlist is ephemeral and expires when the scheduler cannot
-        refresh it for two L1 windows.
+        Durable routine baselines and preserved deviations remain available to
+        L1-L3 aggregation, reports, and operator review, but are deliberately
+        excluded from the visual system prompt.  Replaying descriptive memory
+        into the same VLM that produced it creates a self-confirming perception
+        loop (for example a hallucinated object becoming the channel routine).
+        L1's unresolved watchlist is the only live semantic bridge and expires
+        when the scheduler cannot refresh it for two L1 windows.
         """
 
         raw_memory = current.get("memory")
         memory = dict(raw_memory) if isinstance(raw_memory, Mapping) else {}
-        baseline = str(memory.get("routine_baseline") or "").strip()
-        if self._is_memory_schema_placeholder(baseline):
-            memory.pop("routine_baseline", None)
-
-        # These remain in durable state as review material, but they have no
-        # live regulatory authority until an explicit operator-approval path
-        # exists.
-        memory.pop("alert_tuning_notes", None)
-        memory.pop("ignore_as_routine", None)
+        memory = {
+            "active_watchlist": memory.get("active_watchlist"),
+        }
 
         field_times_raw = current.get("memory_field_updated_at")
         field_times = dict(field_times_raw) if isinstance(field_times_raw, Mapping) else {}
@@ -12615,6 +13187,29 @@ class LuxriotManager:
         return issues
 
     @classmethod
+    def _rollup_grounding_guard_issues(
+        cls,
+        value: object,
+        node: Optional[Mapping[str, Any]] = None,
+    ) -> List[str]:
+        """Add node-aware guards that cannot be decided from prose alone."""
+
+        issues = cls._rollup_operator_semantic_guard_issues(value)
+        event_ledger = cls._compact_event_ledger(
+            node.get("event_ledger") if isinstance(node, Mapping) else None,
+            max_items=96,
+        )
+        if event_ledger and re.search(
+            r"\b(?:nothing\s+happened|nothing\s+of\s+note|"
+            r"no\s+(?:notable|significant|meaningful)\s+events?|"
+            r"no\s+activity\s+(?:occurred|was\s+observed))\b",
+            " ".join(str(value or "").split()),
+            flags=re.IGNORECASE,
+        ):
+            issues.append("event_ledger_erased")
+        return list(dict.fromkeys(issues))
+
+    @classmethod
     def _sanitize_rollup_operator_overclaims(cls, value: object) -> str:
         """Replace a narrow set of unsafe sampled-evidence overclaims."""
 
@@ -12672,6 +13267,18 @@ class LuxriotManager:
             )
         else:
             extracted_memory = self._extract_memory_update(summary_text)
+        authorized_fields = {
+            "L1": {"active_watchlist", "preserved_deviations"},
+            "L2": {"routine_baseline", "preserved_deviations"},
+            # L3 is persisted on its rollup as proposal material and has no
+            # authority to mutate live channel memory.
+            "L3": set(),
+        }.get(source_level, set())
+        extracted_memory = {
+            key: value
+            for key, value in extracted_memory.items()
+            if key in authorized_fields
+        }
         # A valid empty L1 memory update still has meaning: it clears the
         # short-lived watchlist. Other empty/invalid updates are no-ops.
         if not extracted_memory and source_level != "L1":
@@ -13296,9 +13903,10 @@ class LuxriotManager:
         memory_metabolism = {
             "status": "active" if memory_state.get("present") else "awaiting_consolidation",
             "semantics": (
-                "L0 emits grounded continuity and salience; L1/L2 consolidate it into bounded "
-                "channel memory that returns to later L0 prompts as prior context. L3 audits "
-                "operator feedback and proposes durable tuning without mutating live regulation."
+                "L0 emits grounded continuity and salience; L1 may return only a short-lived "
+                "unresolved watchlist to later L0 prompts. L2 baselines/deviations remain "
+                "aggregation context, and L3 audits operator feedback and proposes tuning "
+                "without mutating live regulation."
             ),
             "current_state": memory_state,
             "scheduler": rollup_scheduler_state,
@@ -13309,7 +13917,7 @@ class LuxriotManager:
                         f"event-driven, at {int(l0_batch_max_frames)} snapshots "
                         f"or by {l0_batch_max_window_sec:g}s"
                     ),
-                    "reads": "current snapshots + P/N/M/CV/probes + prior channel memory",
+                    "reads": "current snapshots + P/N/M/CV/probes + short-lived L1 watchlist",
                     "writes": "BATCH_STATE_JSON continuity, routines, memory_pass, alerts",
                     "applies_to_live_memory": False,
                     "next_due_at": None,
@@ -13327,7 +13935,7 @@ class LuxriotManager:
                     "cadence": "1 hour",
                     "reads": "L1 episodes",
                     "writes": "routine/recurrence baseline and preserved deviations",
-                    "applies_to_live_memory": True,
+                    "applies_to_live_memory": False,
                     "next_due_at": rollup_due.get("L2"),
                 },
                 {
@@ -13838,6 +14446,22 @@ class LuxriotManager:
     @classmethod
     def _rollup_child_salience_score(cls, child: Mapping[str, Any]) -> int:
         score = 0
+        event_ledger = cls._compact_event_ledger(
+            child.get("event_ledger"),
+            max_items=24,
+        )
+        if event_ledger:
+            score += min(
+                160,
+                sum(
+                    35
+                    if item.get("pass_up")
+                    else 20
+                    if item.get("kind") == "state_transition"
+                    else 10
+                    for item in event_ledger
+                ),
+            )
         counts = cls._normalize_alert_counts(child.get("alert_counts"))
         score += counts.get("critical", 0) * 120
         score += counts.get("high", 0) * 100
@@ -14002,11 +14626,14 @@ class LuxriotManager:
             generation_status = "legacy_ready"
         elif not generation_status:
             generation_status = "cached" if summary_kind in {"llm", "llm_cached"} else "stale"
-        semantic_issues = self._rollup_operator_semantic_guard_issues(summary)
+        semantic_issues = self._rollup_grounding_guard_issues(summary, entry)
         legacy_sanitized = False
         if semantic_issues and summary_kind == "legacy_cached":
             sanitized = self._sanitize_rollup_operator_overclaims(summary)
-            if sanitized and not self._rollup_operator_semantic_guard_issues(sanitized):
+            if sanitized and not self._rollup_grounding_guard_issues(
+                sanitized,
+                entry,
+            ):
                 summary = sanitized
                 generation_status = "legacy_sanitized"
                 legacy_sanitized = True
@@ -14029,6 +14656,8 @@ class LuxriotManager:
         alert_delivery_breakdown = self._compact_count_breakdown(entry.get("alert_delivery_breakdown"))
         alert_parser_breakdown = self._compact_count_breakdown(entry.get("alert_parser_breakdown"))
         alert_events = self._compact_alert_events(entry.get("alert_events"))
+        event_ledger = self._compact_event_ledger(entry.get("event_ledger"))
+        state_ledger = self._compact_state_ledger(entry.get("state_ledger"))
         state_transition_total = int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0))
         vector_signal_total = int(max(0, _parse_optional_int(entry.get("vector_signal_total")) or 0))
         created_at = self._coerce_float(entry.get("created_at"))
@@ -14059,6 +14688,12 @@ class LuxriotManager:
             "signal_digest": dict(signal_digest),
             **alert_meta,
         }
+        if alert_events:
+            normalized["alert_events"] = alert_events
+        if event_ledger:
+            normalized["event_ledger"] = event_ledger
+        if state_ledger:
+            normalized["state_ledger"] = state_ledger
         generation_error = str(entry.get("generation_error") or "").strip()
         if generation_error:
             normalized["generation_error"] = generation_error[:240]
@@ -14774,6 +15409,34 @@ class LuxriotManager:
         )
         window_alert_counts = self._format_alert_counts(node.get("alert_counts"))
         window_signal_digest = self._render_signal_digest(node.get("signal_digest"), max_len=1000)
+        event_ledger = self._compact_event_ledger(
+            node.get("event_ledger"),
+            max_items=96,
+        )
+        state_ledger = self._compact_state_ledger(
+            node.get("state_ledger"),
+            max_items=64,
+        )
+        event_ledger_text = (
+            json.dumps(
+                event_ledger,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if event_ledger
+            else ""
+        )
+        state_ledger_text = (
+            json.dumps(
+                state_ledger,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if state_ledger
+            else ""
+        )
         alert_event_lines: List[str] = []
         for event in self._compact_alert_events(node.get("alert_events"))[:16]:
             timestamp_ms = _parse_optional_int(event.get("timestamp_ms"))
@@ -14849,6 +15512,12 @@ class LuxriotManager:
                 "Window signal digest (compact continuity map):",
                 window_signal_digest or "none",
                 "",
+                "Deterministic event ledger (chronological lower-level pass-up):",
+                event_ledger_text or "none",
+                "",
+                "Watched-state sample ledger (counts are batches, not continuous proof):",
+                state_ledger_text or "none",
+                "",
                 "Period Overview must begin with:",
                 f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
                 "",
@@ -14882,6 +15551,8 @@ class LuxriotManager:
                 "hierarchy_audit_chars": len(hierarchy_audit_text),
                 "l0_drill_chars": len(l0_drill_text),
                 "signal_digest_chars": len(window_signal_digest),
+                "event_ledger_chars": len(event_ledger_text),
+                "state_ledger_chars": len(state_ledger_text),
                 "warning_text_chars": self.lm_input_warning_chars,
             }
         )
@@ -14932,7 +15603,10 @@ class LuxriotManager:
                 operator_summary
                 and self._rollup_operator_contract_valid(operator_summary)
             )
-            semantic_issues = self._rollup_operator_semantic_guard_issues(operator_summary)
+            semantic_issues = self._rollup_grounding_guard_issues(
+                operator_summary,
+                node,
+            )
             if contract_valid and not semantic_issues:
                 return operator_summary, memory_update, None
 
@@ -14990,7 +15664,10 @@ class LuxriotManager:
                 retry_summary
                 and self._rollup_operator_contract_valid(retry_summary)
             )
-            retry_semantic_issues = self._rollup_operator_semantic_guard_issues(retry_summary)
+            retry_semantic_issues = self._rollup_grounding_guard_issues(
+                retry_summary,
+                node,
+            )
             if retry_contract_valid and not retry_semantic_issues:
                 self._increment_rollup_status_counter("corrective_retry_successes")
                 if semantic_issues:
@@ -15000,7 +15677,10 @@ class LuxriotManager:
                 sanitized_summary = self._sanitize_rollup_operator_overclaims(
                     retry_summary
                 )
-                if not self._rollup_operator_semantic_guard_issues(sanitized_summary):
+                if not self._rollup_grounding_guard_issues(
+                    sanitized_summary,
+                    node,
+                ):
                     self._increment_rollup_status_counter("corrective_retry_successes")
                     self._increment_rollup_status_counter("semantic_guard_sanitized")
                     return sanitized_summary, retry_memory, None
@@ -15092,6 +15772,8 @@ class LuxriotManager:
                     frame_count=_parse_optional_int(node.get("frame_count")) or 0,
                     alert_counts=node.get("alert_counts"),
                     signal_digest=node.get("signal_digest"),
+                    event_ledger=node.get("event_ledger"),
+                    state_ledger=node.get("state_ledger"),
                 )
                 node["operator_summary"] = node["summary"]
                 node["summary_kind"] = "pending_context"
@@ -15105,8 +15787,9 @@ class LuxriotManager:
                 cached_format_version = _parse_optional_int(cached.get("format_version")) or 1
                 cached_kind = str(cached.get("summary_kind") or "").strip().lower()
                 cached_legacy = cached_kind == "legacy_cached"
-                cached_semantic_issues = self._rollup_operator_semantic_guard_issues(
-                    cached_summary
+                cached_semantic_issues = self._rollup_grounding_guard_issues(
+                    cached_summary,
+                    node,
                 )
                 if cached_semantic_issues:
                     self._increment_rollup_status_counter(
@@ -15178,6 +15861,8 @@ class LuxriotManager:
                     alert_total=node.get("alert_total"),
                     alert_severities=node.get("alert_severities"),
                     signal_digest=node.get("signal_digest"),
+                    event_ledger=node.get("event_ledger"),
+                    state_ledger=node.get("state_ledger"),
                     alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
                     alert_events=node.get("alert_events"),
                     alert_parser_breakdown=node.get("alert_parser_breakdown"),
@@ -15260,6 +15945,8 @@ class LuxriotManager:
                         alert_total=node.get("alert_total"),
                         alert_severities=node.get("alert_severities"),
                         signal_digest=node.get("signal_digest"),
+                        event_ledger=node.get("event_ledger"),
+                        state_ledger=node.get("state_ledger"),
                         alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
                         alert_events=node.get("alert_events"),
                         alert_parser_breakdown=node.get("alert_parser_breakdown"),
@@ -15315,6 +16002,7 @@ class LuxriotManager:
             alert_events = self._compact_alert_events(log.get("alert_events"))
             state_observations = self._compact_state_observations(log.get("state_observations"))
             state_transition_events = self._compact_state_transition_events(log.get("state_transition_events"))
+            batch_state = self._compact_batch_state(log.get("batch_state"))
             vector_signal = self._compact_vector_signal(log.get("vector_signal"))
             state_transition_total = int(
                 max(
@@ -15330,6 +16018,35 @@ class LuxriotManager:
                 timestamp_ms=int(batch_end_ms),
                 alert_counts=alert_counts,
                 alert_total=alert_total,
+            )
+            event_ledger = self._l0_event_ledger(
+                rollup_id=rollup_id,
+                batch_state=batch_state,
+                alert_events=alert_events,
+                transition_events=state_transition_events,
+                default_timestamp_ms=int(batch_end_ms),
+            )
+            raw_watched_states = (
+                batch_state.get("observed_states")
+                if isinstance(batch_state, Mapping)
+                else None
+            )
+            watched_states = (
+                [
+                    item
+                    for item in raw_watched_states
+                    if isinstance(item, Mapping)
+                ]
+                if isinstance(raw_watched_states, Sequence)
+                and not isinstance(
+                    raw_watched_states,
+                    (str, bytes, bytearray),
+                )
+                else state_observations
+            )
+            state_ledger = self._l0_state_ledger(
+                watched_states,
+                timestamp_ms=int(batch_end_ms),
             )
             node = {
                 "rollup_id": rollup_id,
@@ -15353,6 +16070,12 @@ class LuxriotManager:
                 "alert_severities": self._coerce_str_list(log.get("alert_severities")),
                 "signal_digest": signal_digest,
             }
+            if batch_state:
+                node["batch_state"] = batch_state
+            if event_ledger:
+                node["event_ledger"] = event_ledger
+            if state_ledger:
+                node["state_ledger"] = state_ledger
             if frame_selection:
                 node["frame_selection"] = frame_selection
             if alert_events:
@@ -15549,6 +16272,8 @@ class LuxriotManager:
                             run_ids.add(run_text)
             highlights = self._collect_highlights(children, self.rollup_highlight_limit)
             alert_events = self._collect_rollup_alert_events(children)
+            event_ledger = self._aggregate_event_ledger(children)
+            state_ledger = self._aggregate_state_ledger(children)
             alert_meta = self._merge_alert_metadata(children)
             signal_digest = self._aggregate_signal_digest(
                 children,
@@ -15631,6 +16356,10 @@ class LuxriotManager:
             )
             if alert_events:
                 out[-1]["alert_events"] = alert_events
+            if event_ledger:
+                out[-1]["event_ledger"] = event_ledger
+            if state_ledger:
+                out[-1]["state_ledger"] = state_ledger
             if level == "L3":
                 hierarchy_audits = [
                     dict(child.get("hierarchy_audit") or {})

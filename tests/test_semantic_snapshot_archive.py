@@ -77,7 +77,14 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
 
     def test_exactly_one_durable_record_per_second_per_channel(self):
         store = RecordingDetectionsStore()
-        writer = self._writer(store)
+        writer = self._writer(
+            store,
+            embedding_space_fn=lambda: {
+                "backend": "siglip2",
+                "model": "google/siglip2-base-patch16-224",
+                "dimension": 2,
+            },
+        )
 
         first = writer.submit(
             channel_id=7,
@@ -131,6 +138,17 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
         )
         self.assertTrue(
             all(row["payload"]["independent_of_alert_or_probe_hit"] for row in store.records)
+        )
+        self.assertTrue(
+            all(
+                row["payload"]["embedding_space"]
+                == {
+                    "backend": "siglip2",
+                    "model": "google/siglip2-base-patch16-224",
+                    "dimension": 2,
+                }
+                for row in store.records
+            )
         )
         status = writer.status()
         self.assertEqual(status["counters"]["accepted_total"], 3)
