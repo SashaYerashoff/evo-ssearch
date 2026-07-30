@@ -64,11 +64,13 @@ function agentHoursFromArgs(args: any): string | null {
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
 export function ArchiveScreen({
-  channels, drive, noAnim, onFilters, onRefreshChannels,
+  channels, drive, noAnim, canReportFeedback, canExport, onFilters, onRefreshChannels,
 }: {
   channels: Channel[]
   drive?: AgentDrive | null
   noAnim?: boolean
+  canReportFeedback?: boolean
+  canExport?: boolean
   onFilters?: (f: ArchiveFilters) => void
   onRefreshChannels?: () => Promise<void> | void
 }) {
@@ -286,6 +288,11 @@ export function ArchiveScreen({
         setAppliedFilters({ ...filters })
         setNote(`Agent · ${found.length} frame${found.length === 1 ? '' : 's'} · ${prettyTool(name)}`)
         setError(found.length ? null : 'Agent returned no frames for this query.')
+        if (args?.open_detection_id != null) {
+          const requestedId = String(args.open_detection_id)
+          const requested = found.find((item) => String(item.id) === requestedId)
+          if (requested) setSelected(requested)
+        }
       }
     }
     setAgentStep(error ? `${prettyTool(name)} — failed` : prettyTool(name))
@@ -425,7 +432,16 @@ export function ArchiveScreen({
         </div>
       )}
 
-      {selected && <InspectorModal d={selected} onClose={() => setSelected(null)} onFindSimilar={runSimilar} />}
+      {selected && (
+        <InspectorModal
+          d={selected}
+          channels={channels}
+          canReportFeedback={!!canReportFeedback}
+          canExport={!!canExport}
+          onClose={() => setSelected(null)}
+          onFindSimilar={runSimilar}
+        />
+      )}
     </div>
   )
 }

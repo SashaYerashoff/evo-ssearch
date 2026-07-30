@@ -55,6 +55,38 @@ interface Msg {
   error?: string
 }
 
+function ResearchTrace({
+  message,
+  onThumb,
+  onApply,
+}: {
+  message: Msg
+  onThumb: (url: string, title: string) => void
+  onApply: (action: ToolAction) => void
+}) {
+  // The operator owns this disclosure state. Streaming updates must not force
+  // a trace open or closed after the user has touched it.
+  const [traceOpen, setTraceOpen] = useState(true)
+  const stepCount = (message.actions?.length ?? 0) + (message.notes?.length ?? 0)
+  return (
+    <details
+      className="ag-trace"
+      open={traceOpen}
+      onToggle={(event) => setTraceOpen(event.currentTarget.open)}
+    >
+      <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
+      <div className="ag-trace-body">
+        {message.notes?.map((note) => (
+          <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
+        ))}
+        {message.actions?.map((action) => (
+          <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+        ))}
+      </div>
+    </details>
+  )
+}
+
 const labelTool = (n: string) => (n || '').replace(/_/g, ' ')
 
 // format a session timestamp (backend may send seconds, ms, or ISO)
@@ -530,17 +562,11 @@ export function AgentPanel({
                   : m.streaming && <div className="chat-status"><span className="action-dots"><i /><i /><i /></span>{m.status || 'Thinking…'}</div>}
 
                 {((m.actions?.length ?? 0) > 0 || (m.notes?.length ?? 0) > 0) && (
-                  <details className="ag-trace" open>
-                    <summary>Research trace · {(m.actions?.length ?? 0) + (m.notes?.length ?? 0)} step{((m.actions?.length ?? 0) + (m.notes?.length ?? 0)) === 1 ? '' : 's'}</summary>
-                    <div className="ag-trace-body">
-                      {m.notes?.map((n) => (
-                        <div key={n.id} className="ag-note"><span className="ag-note-badge">In progress</span>{n.message}</div>
-                      ))}
-                      {m.actions?.map((a) => (
-                        <ActionCard key={a.id} action={a} onThumb={(url, title) => setLightbox({ url, title })} onApply={applyPlan} />
-                      ))}
-                    </div>
-                  </details>
+                  <ResearchTrace
+                    message={m}
+                    onThumb={(url, title) => setLightbox({ url, title })}
+                    onApply={applyPlan}
+                  />
                 )}
                 {m.error && <div className="chat-error"><IconAlertTriangle size={14} /> {m.error}</div>}
               </div>

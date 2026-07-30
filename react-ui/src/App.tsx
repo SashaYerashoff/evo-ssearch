@@ -8,7 +8,8 @@ import {
   hasPermission,
   PERMISSION,
 } from './api/access'
-import { getChannels } from './api/detections'
+import { findParentAlert, getChannels } from './api/detections'
+import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { LeftRail, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
@@ -126,6 +127,42 @@ export default function App() {
     const agent = busy ? 'working' : 'idle'
     setStatus((current) => current.agent === agent ? current : { ...current, agent })
   }, [])
+  const handleOpenParentAlert = useCallback(async (probe: Probe) => {
+    const parentAlertId = String(probe.parent_alert_id || '').trim()
+    const channelId = Number(probe.channel_id)
+    if (!parentAlertId || !Number.isInteger(channelId)) return
+    try {
+      const detection = await findParentAlert(
+        parentAlertId,
+        channelId,
+        channels,
+        probe.parent_alert_timestamp_ms,
+      )
+      if (!detection) {
+        setForbiddenNotice('The parent VLM alert is no longer available in the archive.')
+        window.setTimeout(() => setForbiddenNotice(''), 5_000)
+        return
+      }
+      const timestamp = Number(probe.parent_alert_timestamp_ms || detection.tsMs || Date.now())
+      setSection('archive')
+      setDrive({
+        name: 'get_detections',
+        args: {
+          channel_id: channelId,
+          source: 'vlm_alert',
+          since_ms: timestamp - 15 * 60_000,
+          until_ms: timestamp + 15 * 60_000,
+          open_detection_id: detection.id,
+        },
+        done: true,
+        result: { detections: [detection.raw] },
+        seq: ++seqRef.current,
+      })
+    } catch (exception: any) {
+      setForbiddenNotice(exception?.message || 'Could not open the parent VLM alert.')
+      window.setTimeout(() => setForbiddenNotice(''), 5_000)
+    }
+  }, [channels])
 
   const refreshChannels = useCallback(async () => {
     if (!user || !hasPermission(user, PERMISSION.streamsView)) {
@@ -262,6 +299,8 @@ export default function App() {
               channels={channels}
               drive={drive}
               noAnim={noAnim}
+              canReportFeedback={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canExport={hasPermission(user, PERMISSION.dataExport)}
               onFilters={setArchiveFilters}
               onRefreshChannels={refreshChannels}
             />
@@ -273,6 +312,7 @@ export default function App() {
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
               canManage={hasPermission(user, PERMISSION.probesManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
+              onOpenParentAlert={handleOpenParentAlert}
             />
           )}
           {section === 'video' && (

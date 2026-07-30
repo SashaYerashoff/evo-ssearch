@@ -18,6 +18,8 @@ import {
   buildArchiveFilterPayload,
   buildArchiveListQuery,
   buildArchiveSearchPayload,
+  batchFrameNumber,
+  falsePositiveExportUrl,
   fullDetectionImageSrc,
   normalizeDetection,
 } from './detections'
@@ -219,6 +221,16 @@ describe('React/backend contract normalizers', () => {
     })
     expect(fullDetectionImageSrc(detection)).toBe(
       '/detections/image?image_path=D%3A%5Carchive%5Ccamera%207%5Cframe.jpg',
+    )
+  })
+
+  it('orders batch frames by stored snapshot index and scopes feedback exports', () => {
+    expect(batchFrameNumber(normalizeDetection({
+      source: 'vlm_summary',
+      payload: { snapshot_index: 6 },
+    }))).toBe(6)
+    expect(falsePositiveExportUrl('xml', 112)).toBe(
+      '/reports/false-positives/export?format=xml&hours=24&channel_id=112',
     )
   })
 

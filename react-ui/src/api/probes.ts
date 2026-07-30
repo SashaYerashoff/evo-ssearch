@@ -48,12 +48,49 @@ export interface Probe {
   bookmark_cooldown_sec?: number
   bookmark_dedupe_window_sec?: number
   bookmark_gate?: BookmarkGate
+  origin?: ProbeOrigin
+  origin_meta?: { plan_id?: string; [k: string]: any }
+  temporary?: boolean
+  source?: string
+  parent_alert_id?: string
+  parent_alert_title?: string
+  parent_alert_description?: string
+  parent_alert_timestamp_ms?: number
+  created_at_ms?: number
+  expires_at_ms?: number
   image_probe?: ImageProbe | null
   roi_enabled?: boolean
   roi_norm?: RoiNorm | number[] | null
   recent_hits?: ProbeHit[]
   last_hit?: ProbeHit
   [k: string]: any
+}
+
+export type ProbeOrigin = 'operator' | 'agent' | 'auto'
+
+export interface ProbeChannelGroup {
+  id: string
+  name: string
+  channel_ids: number[]
+  position?: number
+  read_only?: boolean
+  created_at_ms?: number
+  updated_at_ms?: number
+}
+
+export interface ProbeListCounts {
+  visible?: number
+  persistent?: number
+  temporary_active?: number
+  temporary_expired_hidden?: number
+  stored?: number
+  by_origin?: Partial<Record<ProbeOrigin, number>>
+}
+
+export interface ProbeListResponse {
+  probes: Probe[]
+  channel_groups?: ProbeChannelGroup[]
+  counts?: ProbeListCounts
 }
 
 // Live capture status for a channel (GET /probes/status).
@@ -148,7 +185,7 @@ export interface CastResult {
 }
 
 export const probesApi = {
-  list: (): Promise<{ probes: Probe[] }> => api.get('/probes/list'),
+  list: (): Promise<ProbeListResponse> => api.get('/probes/list'),
   save: (p: ProbeInput): Promise<{ success: boolean; probe: Probe; error?: string }> => api.postJson('/probes/save', p),
   remove: (id: string): Promise<{ success: boolean; error?: string }> => api.postJson('/probes/delete', { id }),
   run: (id: string): Promise<ProbeRunResult> => api.postJson('/probes/run', { id }),
@@ -157,6 +194,16 @@ export const probesApi = {
   cast: (payload: CastInput): Promise<CastResult> => api.postJson('/probes/cast', payload),
   startCapture: (channelId: number, fps?: number): Promise<any> => api.postJson('/probes/start_capture', { channel_id: channelId, fps }),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/probes/stop_capture', { channel_id: channelId }),
+  groups: (): Promise<{ groups: ProbeChannelGroup[] }> => api.get('/probes/channel_groups'),
+  saveGroup: (group: {
+    id?: string
+    name: string
+    channel_ids: number[]
+    position?: number
+  }): Promise<{ success: boolean; group: ProbeChannelGroup; groups: ProbeChannelGroup[]; error?: string }> =>
+    api.postJson('/probes/channel_groups/save', group),
+  deleteGroup: (id: string): Promise<{ success: boolean; groups: ProbeChannelGroup[]; error?: string }> =>
+    api.postJson('/probes/channel_groups/delete', { id }),
 }
 
 // Best thumbnail source for a probe hit (mirrors detImageSrc).

@@ -137,6 +137,28 @@ export interface ArchiveProbeOption {
   hitCount: number
 }
 
+export interface AlertFeedbackReason {
+  code: string
+  label: string
+}
+
+export interface AlertFeedback {
+  id?: string | number
+  detection_id?: number
+  channel_id?: number
+  reason_code: string
+  reason_label?: string
+  note?: string
+  submitted_at_ms?: number
+  updated_at_ms?: number
+}
+
+export interface AlertFeedbackResponse {
+  feedback: AlertFeedback | null
+  reason_options: AlertFeedbackReason[]
+  success?: boolean
+}
+
 export async function getArchiveProbeOptions(f: ArchiveFilters): Promise<ArchiveProbeOption[]> {
   if (f.source !== 'probe') return []
   const res = await api.get('/detections/summary', {
@@ -152,6 +174,117 @@ export async function getArchiveProbeOptions(f: ArchiveFilters): Promise<Archive
       hitCount: Number(item?.hit_count || 0),
     }]
   })
+}
+
+export async function getAlertFeedback(detectionId: number): Promise<AlertFeedbackResponse> {
+  return api.get(`/detections/${detectionId}/feedback`)
+}
+
+export async function saveAlertFeedback(
+  detectionId: number,
+  reasonCode: string,
+  note: string,
+): Promise<AlertFeedbackResponse> {
+  return api.postJson(`/detections/${detectionId}/feedback`, {
+    reason_code: reasonCode,
+    note,
+  })
+}
+
+export function falsePositiveExportUrl(
+  format: 'md' | 'xml',
+  channelId?: number | null,
+): string {
+  const params = new URLSearchParams({ format, hours: '24' })
+  if (channelId != null && Number.isInteger(channelId) && channelId > 0) {
+    params.set('channel_id', String(channelId))
+  }
+  return `/reports/false-positives/export?${params.toString()}`
+}
+
+export async function findParentAlert(
+  parentAlertId: string,
+  channelId: number,
+  channels: Channel[],
+  timestampMs?: number,
+): Promise<Detection | null> {
+  const response = await api.get('/detections/list', {
+    channel_id: channelId,
+    source: 'vlm_alert',
+    parent_alert_id: parentAlertId,
+    limit: 1,
+    offset: 0,
+  })
+  const rows = response.detections || []
+  if (rows.length) return normalizeDetection(rows[0], channelMap(channels))
+  if (!Number.isFinite(Number(timestampMs))) return null
+  const pad = 15 * 60_000
+  const fallback = await api.get('/detections/list', {
+    channel_id: channelId,
+    source: 'vlm_alert',
+    since_ms: Number(timestampMs) - pad,
+    until_ms: Number(timestampMs) + pad,
+    limit: 24,
+    offset: 0,
+  })
+  return (fallback.detections || []).length
+    ? normalizeDetection(fallback.detections[0], channelMap(channels))
+    : null
+}
+
+export async function loadDetectionBatchFrames(
+  detection: Detection,
+  channels: Channel[],
+): Promise<Detection[]> {
+  if (!['vlm_summary', 'vlm_alert'].includes(detection.source)) return [detection]
+  const payload = detection.raw?.payload || {}
+  const batchId = String(payload.batch_id || detection.raw?.batch_id || '').trim()
+  const batchStart = num(payload.batch_start_ms ?? detection.raw?.batch_start_ms)
+  const batchEnd = num(payload.batch_end_ms ?? detection.raw?.batch_end_ms)
+  if (detection.channelId == null || (!batchId && (batchStart == null || batchEnd == null))) {
+    return [detection]
+  }
+  const response = await api.get('/detections/list', {
+    channel_id: detection.channelId,
+    source: 'vlm_summary',
+    batch_id: batchId || undefined,
+    since_ms: batchId ? undefined : Math.min(batchStart!, batchEnd!),
+    until_ms: batchId ? undefined : Math.max(batchStart!, batchEnd!),
+    limit: 120,
+    offset: 0,
+  })
+  const normalized = (response.detections || [])
+    .map((row: any) => normalizeDetection(row, channelMap(channels)))
+    .filter((row: Detection) => !!detImageSrc(row))
+  const unique = new Map<string, Detection>()
+  for (const row of [detection, ...normalized]) unique.set(batchFrameIdentity(row), row)
+  return [...unique.values()].sort((left, right) => (
+    batchFrameNumber(left) - batchFrameNumber(right)
+    || Number(left.tsMs || 0) - Number(right.tsMs || 0)
+  ))
+}
+
+export function batchFrameNumber(detection: Detection): number {
+  const payload = detection.raw?.payload || {}
+  const value = num(
+    payload.snapshot_index
+      ?? payload.anchor_snapshot_index
+      ?? payload.batch_position
+      ?? payload.frame_index
+      ?? payload.anchor_frame_index,
+  )
+  return value ?? Number.MAX_SAFE_INTEGER
+}
+
+function batchFrameIdentity(detection: Detection): string {
+  const payload = detection.raw?.payload || {}
+  return [
+    payload.batch_id,
+    payload.run_id,
+    payload.snapshot_index ?? payload.anchor_snapshot_index ?? payload.frame_index,
+    payload.frame_timestamp_ms ?? detection.tsMs,
+    detection.source,
+  ].map((value) => String(value ?? '')).join(':')
 }
 
 /** Describe a frame with the VLM. Returns the description text (`summary`). */
