@@ -15467,6 +15467,11 @@ def settings_archive_capacity():
     if guard is not None:
         return guard
     try:
+        include_current = _coerce_bool(
+            request.args.get("include_current", True),
+            True,
+        )
+
         def _optional_float(name: str) -> Optional[float]:
             raw = request.args.get(name)
             if raw is None or str(raw).strip() == "":
@@ -15496,7 +15501,15 @@ def settings_archive_capacity():
             {
                 "success": True,
                 "estimate": estimate,
-                "current": _archive_storage_summary(),
+                "current": (
+                    _archive_storage_summary()
+                    if include_current
+                    else {
+                        "available": False,
+                        "deferred": True,
+                        "backend": getattr(detections_store, "backend", "unknown"),
+                    }
+                ),
                 "retention": dict(_archive_retention_last_result),
             }
         )
@@ -15690,7 +15703,14 @@ def get_settings():
                 250.0,
             ),
             'archiveCapacityEstimate': _archive_capacity_estimate(),
-            'archiveStorageSummary': _archive_storage_summary(),
+            # Current archive row/storage statistics can require a full aggregate
+            # on large PostgreSQL stores. Keep the base settings read fast and
+            # let /settings/archive_capacity request that diagnostic explicitly.
+            'archiveStorageSummary': {
+                'available': False,
+                'deferred': True,
+                'backend': getattr(detections_store, "backend", "unknown"),
+            },
             'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})

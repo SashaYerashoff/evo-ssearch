@@ -1203,6 +1203,31 @@
   height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0;
 }
 
+.vid-lens-controls {
+  width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 10px;
+}
+.vid-lens-fields, .vid-lens-actions {
+  display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; min-width: 0;
+}
+.vid-lens-fields .wfield { gap: 5px; }
+.vid-lens-fields .wfield > label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+}
+.vid-lens-fields .wfield.hist { width: 168px; flex: 0 1 168px; min-width: 142px; }
+.vid-lens-fields .wfield.sm { width: 112px; flex: 0 1 112px; min-width: 96px; }
+.vid-lens-fields .dd-field .dd-btn, .vid-lens-actions .mon-btn {
+  height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0;
+}
+.vid-lens-count {
+  align-self: flex-end; min-height: 38px; display: inline-flex; align-items: center;
+  padding: 0 11px; border: 1px solid var(--line); border-radius: var(--control-radius);
+  background: var(--void-tile); color: var(--text-mut); font: 600 10.5px var(--mono);
+  white-space: nowrap;
+}
+.vid-lens-actions {
+  width: 100%; padding-top: 9px; border-top: 1px solid var(--line);
+}
+
 .vid-row { display: flex; gap: 8px; align-items: stretch; }
 .vid-row > select, .vid-row > .mon-btn, .vid-row > .dd { flex: 1; min-width: 0; }
 .vid-row > .mon-icobtn { width: 40px; height: auto; align-self: stretch; flex: 0 0 auto; }
@@ -1377,6 +1402,17 @@
 .set-navitem:hover { background: var(--void-tile); color: var(--text); }
 .set-navitem.on { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
 .set-content { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 22px; }
+.set-loading {
+  min-height: 120px; display: flex; align-items: center; justify-content: center; gap: 12px;
+  color: var(--text-2);
+}
+.set-loading > div:last-child { display: flex; flex-direction: column; gap: 3px; }
+.set-loading b { color: var(--text); font-size: 13px; }
+.set-loading span { color: var(--text-mut); font-size: 11.5px; }
+.set-load-error {
+  padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--danger) 48%, var(--line));
+  border-radius: 9px; background: var(--danger-bg); color: var(--danger); font-size: 12px;
+}
 .set-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--line); flex: 0 0 auto; }
 .set-status { font-size: 12.5px; color: var(--text-mut); }
 .set-status.ok { color: var(--success); } .set-status.err { color: var(--danger); }
@@ -1406,10 +1442,13 @@
 .set-sev { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; max-width: 780px; }
 .set-sev .set-label { text-transform: capitalize; }
 /* capacity stats as tiles */
+.set-capacity-wrap { display: flex; flex-direction: column; gap: 10px; }
 .set-capacity { display: flex; gap: 12px; flex-wrap: wrap; }
 .set-capacity > div { display: flex; flex-direction: column; gap: 4px; background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 10px; padding: 11px 16px; min-width: 170px; }
 .set-capacity span { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-mut); }
 .set-capacity b { font-family: var(--mono); font-size: 16px; color: var(--accent); }
+.set-capacity-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.set-capacity-actions span { max-width: 680px; color: var(--text-mut); font-size: 11.5px; line-height: 1.45; }
 .set-denied { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #f0b74f; }
 
 .set-env { width: 100%; min-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; resize: vertical; border-radius: 10px; background: var(--space-0); }

@@ -71,6 +71,10 @@ export function normalizeRevokedSessions(raw: any): { success: boolean; revoked_
   }
 }
 
+export function buildArchiveCapacityQuery(includeCurrent = false): Record<string, string> {
+  return { include_current: String(includeCurrent) }
+}
+
 export interface AuthUserRow {
   user_id: string
   username: string
@@ -110,7 +114,8 @@ export interface AuthSessionRow {
 export const settingsApi = {
   get: (): Promise<{ success: boolean; settings: Settings }> => api.get('/settings'),
   save: (patch: Settings): Promise<{ success: boolean; message?: string; error?: string }> => api.postJson('/settings', patch),
-  archiveCapacity: (): Promise<any> => api.get('/settings/archive_capacity'),
+  archiveCapacity: (includeCurrent = false): Promise<any> =>
+    api.get('/settings/archive_capacity', buildArchiveCapacityQuery(includeCurrent)),
   getEnv: (): Promise<{ envText?: string; envVariables?: Record<string, string>; count?: number }> => api.get('/settings/env'),
   saveEnv: (envText: string): Promise<{ success: boolean; message?: string; count?: number; error?: string }> => api.postJson('/settings/env', { envText }),
   audit: async (params: Record<string, unknown>): Promise<{ success: boolean; events?: AuditEvent[]; nextCursor?: string | null; error?: string }> => {

@@ -29,6 +29,7 @@ import {
   normalizeAuditEvent,
   normalizeRevokedSessions,
   buildAuditQuery,
+  buildArchiveCapacityQuery,
 } from './settings'
 import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery, buildSummaryFeedQuery } from './video'
 import { API_PREFIXES } from '../../proxy-config'
@@ -94,6 +95,11 @@ describe('React/backend contract normalizers', () => {
       totalBytes: null,
       currentRows: null,
     })
+  })
+
+  it('keeps expensive current archive statistics opt-in', () => {
+    expect(buildArchiveCapacityQuery()).toEqual({ include_current: 'false' })
+    expect(buildArchiveCapacityQuery(true)).toEqual({ include_current: 'true' })
   })
 
   it('maps revokedSessions to the UI count', () => {

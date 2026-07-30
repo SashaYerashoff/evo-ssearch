@@ -94,14 +94,17 @@ export function StreamControl(p: {
           </div>
         </div>
       ) : (
-        <div className="vid-tb-row">
-          <div className="wfield hist"><label>History</label>
-            <Dropdown value={p.history} onChange={p.onHistory} options={HISTORY.map((h) => ({ value: h.v, label: h.label }))} />
+        <div className="vid-lens-controls">
+          <div className="vid-lens-fields">
+            <div className="wfield hist"><label>History</label>
+              <Dropdown value={p.history} onChange={p.onHistory} options={HISTORY.map((h) => ({ value: h.v, label: h.label }))} />
+            </div>
+            <div className="wfield sm"><label>Depth</label>
+              <Dropdown value={p.depth} onChange={p.onDepth} options={DEPTH.map((d) => ({ value: d.v, label: d.label }))} />
+            </div>
+            <span className="vid-lens-count">{p.summaryCount} summaries</span>
           </div>
-          <div className="wfield sm"><label>Depth</label>
-            <Dropdown value={p.depth} onChange={p.onDepth} options={DEPTH.map((d) => ({ value: d.v, label: d.label }))} />
-          </div>
-          <div className="vid-tb-actions">
+          <div className="vid-lens-actions">
             <button className="mon-btn" onClick={p.onRefreshFeed}><IconReload size={14} /> Refresh</button>
             <button className={`mon-btn ${p.live ? 'accent' : ''}`} onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? 'Live on' : 'Live off'}</button>
             <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onCollapseAll}>
