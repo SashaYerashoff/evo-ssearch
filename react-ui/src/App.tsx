@@ -22,8 +22,14 @@ import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
 import { AppearanceModal } from './components/appearance/AppearanceModal'
 import { useAppearance } from './appearance/AppearanceProvider'
+import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
 
 export type AgentDrive = AgentAction & { seq: number }
+export interface ConsoleDrive {
+  effect: ConsoleUiEffect
+  result: unknown
+  seq: number
+}
 
 export interface StatusData {
   luxriot: boolean
@@ -79,20 +85,42 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
+  const [probeDrive, setProbeDrive] = useState<ConsoleDrive | null>(null)
+  const [videoDrive, setVideoDrive] = useState<ConsoleDrive | null>(null)
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
   const [forbiddenNotice, setForbiddenNotice] = useState('')
   const [appVersion, setAppVersion] = useState('')
   const [serverStartedAtMs, setServerStartedAtMs] = useState<number | null>(null)
   const seqRef = useRef(0)
+  const appliedEffectIds = useRef(new Set<string>())
   const visibleSections = (['home', 'archive', 'video', 'monitoring'] as SectionId[])
     .filter((candidate) => canViewSection(user, candidate))
   const settingsAllowed = canOpenSettings(user)
 
-  // agent → console mirroring: route each agent action to the working area
-  const handleAgentAction = useCallback((a: AgentAction) => {
-    if (!canViewSection(user, 'archive')) return
-    setSection('archive')
-    setDrive({ ...a, seq: ++seqRef.current })
+  // Trusted backend effects route completed domain reads/receipts into the console.
+  const handleAgentUiEffects = useCallback((effects: ConsoleUiEffect[], result: unknown) => {
+    for (const effect of effects) {
+      if (appliedEffectIds.current.has(effect.effectId)) continue
+      if (appliedEffectIds.current.size >= 512) appliedEffectIds.current.clear()
+      appliedEffectIds.current.add(effect.effectId)
+      const seq = ++seqRef.current
+      if (effect.target === 'archive' && canViewSection(user, 'archive')) {
+        setSection('archive')
+        setDrive({
+          name: effect.source.tool,
+          args: effect.payload,
+          done: true,
+          result,
+          seq,
+        })
+      } else if (effect.target === 'probes' && canViewSection(user, 'monitoring')) {
+        setSection('monitoring')
+        setProbeDrive({ effect, result, seq })
+      } else if (effect.target === 'video' && canViewSection(user, 'video')) {
+        setSection('video')
+        setVideoDrive({ effect, result, seq })
+      }
+    }
   }, [user])
   const handleAgentBusy = useCallback((busy: boolean) => {
     const agent = busy ? 'working' : 'idle'
@@ -241,6 +269,7 @@ export default function App() {
           {section === 'monitoring' && (
             <MonitoringScreen
               channels={channels}
+              drive={probeDrive}
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
               canManage={hasPermission(user, PERMISSION.probesManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
@@ -249,6 +278,7 @@ export default function App() {
           {section === 'video' && (
             <VideoScreen
               channels={channels}
+              drive={videoDrive}
               onReloadChannels={refreshChannels}
               canCapture={hasPermission(user, PERMISSION.captureManage)}
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
@@ -279,9 +309,10 @@ export default function App() {
               full={agentFull}
               onClose={() => setAgentOpen(false)}
               onToggleFull={() => setAgentFull((v) => !v)}
+              section={section}
               channels={channels}
               archiveFilters={archiveFilters}
-              onAction={handleAgentAction}
+              onUiEffects={handleAgentUiEffects}
               onBusyChange={handleAgentBusy}
               onLayoutPresetChange={setAgentArchiveColumns}
               onLayoutPresetCommit={setAgentCommittedArchiveColumns}

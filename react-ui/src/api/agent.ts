@@ -2,6 +2,7 @@
 // The chat endpoint needs a POST body, so EventSource can't be used — we read the
 // fetch stream manually and parse `data: {json}\n\n` frames.
 import { api } from './client'
+import type { AgentConsoleContext, ConsoleUiEffect } from '../ui-effects/consoleEffects'
 
 export interface AgentEvent {
   type: 'session' | 'text' | 'token' | 'tool_call' | 'tool_result' | 'tool_progress' | 'tool_start'
@@ -9,8 +10,10 @@ export interface AgentEvent {
   session_id?: string
   content?: string
   name?: string
+  call_id?: string
   args?: any
   result?: any
+  ui_effects?: unknown
   error?: string
   message?: string
   [k: string]: any
@@ -69,7 +72,13 @@ export class AgentSseParser {
 
 export async function streamAgent(
   message: string,
-  opts: { sessionId?: string | null; imageB64?: string | null; operatorMode?: boolean; signal?: AbortSignal },
+  opts: {
+    sessionId?: string | null
+    imageB64?: string | null
+    operatorMode?: boolean
+    consoleContext?: AgentConsoleContext
+    signal?: AbortSignal
+  },
   onEvent: (e: AgentEvent) => void,
 ): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -86,6 +95,7 @@ export async function streamAgent(
       session_id: opts.sessionId || undefined,
       image_b64: opts.imageB64 || undefined,
       operator_mode: opts.operatorMode || undefined,
+      console_context: opts.consoleContext,
     }),
   })
   if (!res.ok || !res.body) {
@@ -109,7 +119,15 @@ export async function streamAgent(
 // ---- REST ----------------------------------------------------------------
 
 export interface AgentSession { id: string; title?: string; updated_at?: string | number; message_count?: number }
-export interface AgentStoredMsg { role: 'user' | 'assistant'; content: string; created_at?: string | number }
+export interface AgentStoredMsg {
+  role: 'user' | 'assistant' | 'tool' | 'system'
+  content: string
+  created_at?: string | number
+  tool_calls?: any[]
+  tool_call_id?: string
+  tool_name?: string
+  tool_result?: string
+}
 export interface AgentSkill { slug: string; name?: string; summary?: string; content?: string; path?: string }
 export interface AgentConfig { model?: string; default_model?: string; source?: string }
 
@@ -125,7 +143,12 @@ export const agentApi = {
     api.postJson('/agent/skills/create', b),
   updateSkill: (slug: string, b: { name: string; slug: string; content: string }): Promise<{ skill?: AgentSkill; error?: string }> =>
     api.postJson(`/agent/skills/${slug}`, b),
-  executePlan: (planId: string, sessionId: string | null): Promise<{ success: boolean; result?: any; error?: string }> =>
+  executePlan: (planId: string, sessionId: string | null): Promise<{
+    success: boolean
+    result?: any
+    ui_effects?: ConsoleUiEffect[]
+    error?: string
+  }> =>
     api.postJson(`/agent/action-plans/${planId}/execute`, { session_id: sessionId || undefined }),
   streams: (): Promise<{ video_streams?: any[]; desired_video_missing?: any[]; error?: string }> =>
     api.get('/luxriot/streams'),

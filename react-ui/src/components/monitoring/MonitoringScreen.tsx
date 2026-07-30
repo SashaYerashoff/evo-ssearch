@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { IconPlus, IconX, IconRefresh, IconRadar2, IconSearch } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
+import type { ConsoleDrive } from '../../App'
 import { probeMutationRequiresBookmarkPermission, probesApi, type Probe, type ProbeInput } from '../../api/probes'
 import { videoApi } from '../../api/video'
 import { ToolTabs } from '../shell/ToolTabs'
@@ -17,8 +18,9 @@ function statusOf(p: Probe, runtime: Record<number, string>): ProbeStatus {
   return 'idle'
 }
 
-export function MonitoringScreen({ channels, canOperate, canManage, canCreateBookmarks }: {
+export function MonitoringScreen({ channels, drive, canOperate, canManage, canCreateBookmarks }: {
   channels: Channel[]
+  drive?: ConsoleDrive | null
   canOperate: boolean
   canManage: boolean
   canCreateBookmarks: boolean
@@ -44,6 +46,20 @@ export function MonitoringScreen({ channels, canOperate, canManage, canCreateBoo
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
+  useEffect(() => {
+    if (!drive || drive.effect.target !== 'probes') return
+    const payload = drive.effect.payload
+    const channelId = Number(payload.channel_id)
+    if (Number.isInteger(channelId) && channels.some((channel) => channel.id === channelId)) {
+      setChFilter(String(channelId))
+    }
+    if (drive.effect.action === 'refresh' || drive.effect.action === 'show_board') {
+      void refresh().then(() => {
+        const probeId = String(payload.probe_id || payload.id || '').trim()
+        if (probeId) setInspectId(probeId)
+      })
+    }
+  }, [drive?.seq, channels, refresh])
 
   // poll analytics-capture runtime for all channels (true probe running state)
   useEffect(() => {

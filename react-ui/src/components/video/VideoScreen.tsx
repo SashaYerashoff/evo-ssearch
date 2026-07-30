@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { IconVideoOff, IconAlertTriangle, IconChevronRight } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
+import type { ConsoleDrive } from '../../App'
 import { buildCaptureInput, videoApi, recentFrameUrl, mergeRuntime, type StreamsStatus, type ChannelRuntime, type SummaryEntry } from '../../api/video'
 import type { DropOption } from '../shell/Dropdown'
 import { renderMarkdown } from '../agent/markdown'
@@ -16,12 +17,14 @@ function fmtClock(sec?: number): string {
 
 export function VideoScreen({
   channels,
+  drive,
   onReloadChannels,
   canCapture,
   canManagePrompts,
   canCreateBookmarks,
 }: {
   channels: Channel[]
+  drive?: ConsoleDrive | null
   onReloadChannels?: () => Promise<void> | void
   canCapture: boolean
   canManagePrompts: boolean
@@ -68,6 +71,25 @@ export function VideoScreen({
 
   useEffect(() => { loadStreams() }, [loadStreams])
   useEffect(() => { loadFeed() }, [loadFeed])
+  useEffect(() => {
+    if (!drive || drive.effect.target !== 'video') return
+    const { action, payload } = drive.effect
+    const nextChannel = Number(payload.channel_id)
+    if (Number.isInteger(nextChannel) && channels.some((channel) => channel.id === nextChannel)) {
+      setChannelId(nextChannel)
+    }
+    const nextDepth = String(payload.depth || '').toUpperCase()
+    if (['L0', 'L1', 'L2', 'L3'].includes(nextDepth)) setDepth(nextDepth)
+    const sinceMs = Number(payload.since_ms)
+    const untilMs = Number(payload.until_ms)
+    if (Number.isFinite(sinceMs) && Number.isFinite(untilMs) && untilMs >= sinceMs) {
+      const hours = Math.max(1, Math.ceil((untilMs - sinceMs) / 3_600_000))
+      setHistory(String(hours))
+      setLive(false)
+    }
+    if (action === 'open_prompt_settings' && canManagePrompts) setPromptOpen(true)
+    if (action === 'show_channels' || action === 'show_restore_status') void loadStreams()
+  }, [drive?.seq, channels, canManagePrompts, loadStreams])
   useEffect(() => {
     setChannelId((current) => (
       current != null && channels.some((channel) => channel.id === current)

@@ -244,26 +244,31 @@ export function ArchiveScreen({
   useEffect(() => {
     if (!drive) return
     const { name, args, done, error, result } = drive
+    if (VIEW_TOOLS.has(name)) {
+      if (args?.channel_id != null) {
+        const ch = channels.find((c) => String(c.id) === String(args.channel_id))
+        if (ch) patch({ channelId: String(ch.id) })
+      }
+      if (args?.source) patch({ source: String(args.source) })
+      if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
+      const h = agentHoursFromArgs(args)
+      if (h != null) patch({ hours: h, sinceMs: undefined, untilMs: undefined })
+      if (args?.sort_by) patch({ sortBy: String(args.sort_by) === 'time' ? 'time' : 'similarity' })
+      if (args?.limit != null && isFinite(Number(args.limit))) {
+        const ps = [12, 24, 36, 48]; const n = Number(args.limit)
+        patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
+      }
+      if (done && (args?.channel_id != null || args?.source || h != null || args?.sort_by || args?.limit != null)) {
+        setOpenTool('filters')
+      }
+    }
     if (!done) {
       setAgentStep(prettyTool(name))
       if (VIEW_TOOLS.has(name)) {
         // agent drives the console controls: channel / source / time / sort / rows visibly change
-        if (args?.channel_id != null) {
-          const ch = channels.find((c) => String(c.id) === String(args.channel_id))
-          if (ch) patch({ channelId: String(ch.id) })
-        }
-        if (args?.source) patch({ source: String(args.source) })
-        if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
-        const h = agentHoursFromArgs(args)
-        if (h != null) patch({ hours: h, sinceMs: undefined, untilMs: undefined })
-        if (args?.sort_by) patch({ sortBy: String(args.sort_by) === 'time' ? 'time' : 'similarity' })
-        if (args?.limit != null && isFinite(Number(args.limit))) {
-          const ps = [12, 24, 36, 48]; const n = Number(args.limit)
-          patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
-        }
         const q = String(args?.query || args?.event_query || args?.positive_query || args?.text || '').trim()
         if (TYPING_TOOLS.has(name) && q) { setOpenTool('text'); animateTyping(q) }
-        else if (args?.channel_id != null || args?.source || h != null || args?.sort_by || args?.limit != null) setOpenTool('filters')
+        else if (args?.channel_id != null || args?.source || args?.sort_by || args?.limit != null) setOpenTool('filters')
       }
       return
     }

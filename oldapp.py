@@ -53,6 +53,8 @@ from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import config
+from agent_console_context import normalize_agent_console_context
+from agent_ui_effects import derive_agent_ui_effects
 from agent_postgres_store import PostgresAgentStore, record_agent_tool_run_audit
 from archive_store import (
     ALERT_FEEDBACK_REASON_LABELS,
@@ -16309,6 +16311,14 @@ def agent_chat():
     operator_mode = bool(data.get('operator_mode'))
     tool_context = None
     auth_context = _current_auth_context()
+    console_context = normalize_agent_console_context(
+        data.get('console_context'),
+        allowed_channel_ids=(
+            auth_context.allowed_channel_ids
+            if auth_context is not None
+            else None
+        ),
+    )
     if _auth_enabled() and auth_context is not None:
         tool_context = ToolExecutionContext(
             actor_id=auth_context.user_id,
@@ -16336,6 +16346,7 @@ def agent_chat():
             image_b64=image_b64,
             tool_context=tool_context,
             force_tools=operator_mode,
+            console_context=console_context,
         )
 
     response = Response(
@@ -16376,7 +16387,28 @@ def agent_action_plan_execute(plan_id: str):
     try:
         runner = _get_agent_runner()
         result = runner.approve_action_plan(plan_id, tool_context)
-        return jsonify({'success': True, 'result': result})
+        receipt = result.get('action_receipt') if isinstance(result, Mapping) else None
+        tool_name = (
+            str(receipt.get('tool') or '').strip()
+            if isinstance(receipt, Mapping)
+            else ''
+        )
+        ui_effects = (
+            derive_agent_ui_effects(
+                tool_name,
+                {},
+                result,
+                committed=True,
+                seed=plan_id,
+            )
+            if tool_name
+            else []
+        )
+        return jsonify({
+            'success': True,
+            'result': result,
+            'ui_effects': ui_effects,
+        })
     except ToolGatewayError as exc:
         status = 403 if getattr(exc, 'code', '') in {'permission_denied', 'channel_access_denied'} else 409
         return jsonify({'success': False, 'error': str(exc), 'code': getattr(exc, 'code', 'tool_error')}), status

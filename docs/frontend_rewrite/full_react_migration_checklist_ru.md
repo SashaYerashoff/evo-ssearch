@@ -157,28 +157,29 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
 
 ## 2. Production-интеграция React
 
-- [ ] **P0** Определить production-схему раздачи React:
-  - предпочтительно Flask/Gunicorn отдаёт `react-ui/dist/index.html` и assets;
-  - либо внешний web server отдаёт SPA, а Flask остаётся API.
-- [ ] **P0** Добавить воспроизводимый build-шаг `npm ci && npm run build`.
-- [ ] **P0** Включить React build в patch/release bundle и install-скрипты.
+- [x] Production-схема раздачи React определена: Flask отдаёт
+  `react-ui/dist/index.html` и fingerprinted assets из `/ui-assets/`.
+- [x] Воспроизводимый React build включён в USB bundle builder.
+- [x] React source и готовый `dist` включены в patch/release bundle; production
+  appliance не требует Node.js.
 - [ ] **P0** Добавить SPA fallback для клиентских маршрутов, если будет
   использоваться routing.
-- [ ] **P0** Не перехватывать SPA fallback-ом API, `/branding`, thumbnails и
+- [x] React-раздача не перехватывает API, `/branding`, thumbnails и
   другие backend routes.
-- [ ] **P0** Настроить корректные cache headers:
+- [x] Настроены корректные cache headers:
   - `index.html` — `no-cache`;
   - fingerprinted assets — долгий immutable cache.
-- [ ] **P0** Проверить работу React не только через Vite proxy на `:5173`, но и
-  через production endpoint/порт.
+- [x] Production entrypoint и asset route проверяются backend contract tests, не
+  только через Vite proxy на `:5173`.
 - [x] Текущий Vite proxy включает все используемые React API-prefixes, включая
   `/audit`.
 - [ ] **P2** При переносе legacy-функций добавить соответствующие proxy-prefixes:
   `/road`, `/video_understanding`, `/segment_from_point`, `/search_by_mask` и
   `/index_segments`.
-- [ ] **P0** Добавить runtime feature flag для контролируемого переключения
-  `legacy UI ↔ React UI` на период приёмки.
-- [ ] **P0** Определить безопасный rollback без пересборки базы данных.
+- [x] Добавлен runtime feature flag `EVOSSEARCH_UI_MODE=legacy|react` и
+  per-request pilot overrides `/?ui=react|legacy`.
+- [x] Rollback не требует пересборки базы: legacy остаётся default, а React при
+  отсутствии `dist` fail-safe возвращает legacy shell.
 - [ ] **P0** Добавить health/smoke-проверку доступности React entrypoint и assets.
 - [ ] **P1** Настроить source maps согласно политике production-сборки.
 - [ ] **P1** Добавить страницу/состояние для ошибки загрузки JS bundle.
@@ -199,6 +200,10 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
   следующая генерация и состояние игры сохраняются и восстанавливаются после
   reload. Снимок от предыдущего запуска сервера автоматически отбрасывается.
 - [x] Есть верхняя status bar, левое меню, Settings и Logout.
+- [x] Есть Appearance editor с четырьмя палитрами, семантическими color
+  overrides, live preview и contrast gate. Типографика намеренно фиксирована:
+  bundled Noto Sans + Noto Sans Mono; пользователь не меняет шрифты или
+  type scale.
 - [x] Есть отдельная боковая панель EVA Agent.
 - [x] Docked EVA Agent использует фиксированные width-пресеты: Full HD держит
   `4/3` и никогда не опускается ниже трёх карточек, а 2K — `5/4/3`.
@@ -500,8 +505,8 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
 - [ ] **P0** Обрабатывать все terminal SSE events и гарантированно снимать busy.
 - [x] Incremental SSE parser обрабатывает partial frames, LF/CRLF, malformed
   event и остаток buffer после EOF.
-- [ ] **P0** Не терять tool calls/results при повторном открытии сохранённой
-  session, если backend их возвращает.
+- [x] Persisted assistant/tool rows и trusted action receipts восстанавливаются
+  в Research trace при повторном открытии session.
 - [ ] **P0** Проверить CSRF, session expiry и reconnect во время stream.
 - [ ] **P1** Показывать tool/context budget events.
 - [ ] **P1** Добавить понятный статус stalled/heartbeat/timeout.
@@ -524,10 +529,14 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
 - [ ] **P0** Показывать approval preview и итоговый receipt без потери полей.
 - [ ] **P0** Проверить rendering evidence thumbnails, IDs, scores и coverage.
 - [ ] **P0** Санитизировать markdown и значения tool result.
-- [ ] **P1** Расширить mirroring Agent → UI на Video и Monitoring, если действие
-  относится к этим разделам.
-- [ ] **P1** После mutation обновлять затронутые probes, streams, settings и
-  Archive без полного reload.
+- [x] Agent → UI mirroring расширен на Archive, Video и Probes через закрытые
+  server-derived `ui_effects`; модель не генерирует DOM/UI-команды.
+- [x] Подтверждённые probe/prompt mutations обновляют или открывают
+  соответствующий React workspace без полного reload; preview не выдаётся за
+  применённое состояние.
+- [x] Current console scope передаётся отдельно как валидируемый
+  `console_context`, а не дописывается prose-префиксом в пользовательскую
+  реплику. Явный запрос оператора имеет приоритет над UI defaults.
 - [ ] **P1** Показывать operator context, который фактически отправляется Agent,
   в диагностическом режиме.
 
@@ -645,24 +654,25 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
 Состояние на снимке аудита:
 
 - [x] `npm run build`: TypeScript + Vite production build прошёл; bundle
-  `317.38 kB` JS / `72.93 kB` CSS до gzip.
-- [x] `npm test`: 22 React/backend contract regression tests прошли.
+  `362.42 kB` JS / `98.92 kB` CSS до gzip; локальные fixed-font assets
+  загружаются отдельными fingerprinted файлами.
+- [x] `npm test`: 40 React unit/contract tests прошли, включая appearance,
+  structured console context, closed UI effects и восстановление tool traces.
 - [x] Targeted Postgres identity/auth/security suite: 78 tests, `OK`
   (`3 skipped`) после добавления `sessionId` в login/me contract.
 - [x] 17 существующих UI CSS contract checks прошли.
 - [x] 85 из 85 запущенных API/auth/audit/security smoke tests вне Agent loop
   прошли.
 - [x] Повторно запущены 23 archive/API dataflow smoke tests — все прошли.
-- [ ] **P0** Исправить 5 текущих ошибок из 9 tests в
-  `tests.test_agent_tool_loop`: authorized tool dispatch, history trimming,
-  signal ledger и два tool-budget сценария.
+- [x] Targeted Agent loop/auth/context/UI-effect suite: 93 tests и 13 subtests
+  прошли; остаётся только локальное предупреждение CUDA 804 на несовместимом
+  driver/runtime стенде.
 - [x] В `react-ui/package.json` есть `vitest` и воспроизводимый `npm test`.
 - [ ] **P1** Запланировать совместимое обновление Vite: полный `npm audit`
   показывает 1 moderate и 1 high у dev toolchain; production dependencies
   (`npm audit --omit=dev`) уязвимостей не показывают.
-- [ ] **P0** Установить/зафиксировать `pytest` в test environment. Три
-  pytest-style проверки `test_luxriot_api_extensions.py` не запускаются через
-  `unittest`, а `pytest` в текущем `.venv` отсутствует.
+- [x] `pytest` доступен в текущем `.venv`; pytest-style suites запускаются
+  напрямую через `.venv/bin/python -m pytest`.
 
 ### 12.1 Unit
 

@@ -64,7 +64,7 @@ export function ActionCard({ action, onThumb, onApply }: {
 }) {
   const { name, result, error } = action
   const items = itemsOf(result)
-  const isApproval = !!action.planId || result?.status === 'preview'
+  const isApproval = !!action.applied || !!action.planId || result?.status === 'preview'
   const describeImg = name === 'describe_frame' ? agentImageUrl(result) : ''
   const text = result?.description || result?.summary || result?.note || result?.text || result?.message
 
