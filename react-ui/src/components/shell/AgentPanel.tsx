@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
 import {
   IconSparkles, IconX, IconArrowUp,
-  IconPlus, IconTrash, IconPhoto, IconAlertTriangle, IconPencil, IconChevronRight,
+  IconPlus, IconTrash, IconPaperclip, IconAlertTriangle, IconPencil, IconChevronRight,
   IconChevronDown, IconWand, IconCpu, IconVideo, IconDeviceGamepad2, IconArrowAutofitWidth, IconHistory,
   IconMaximize, IconMinimize, IconPlayerStop,
 } from '@tabler/icons-react'
@@ -9,20 +9,23 @@ import type { Channel, ArchiveFilters } from '../../api/types'
 import { agentSubmissionText, streamAgent, agentApi, type AgentEvent, type AgentSession, type AgentSkill } from '../../api/agent'
 import { renderMarkdown } from '../agent/markdown'
 import { ActionCard, type ToolAction } from '../agent/ActionCard'
+import { PromptAssist } from '../agent/PromptAssist'
+import {
+  AGENT_WIDTH_PRESET_STORAGE_KEY,
+  MIN_AGENT_WIDTH,
+  agentDragGeometry,
+  archiveColumnsForAgentWidth,
+  agentWidthPresets,
+  closestAgentWidthPresetIndex,
+  maxAgentPanelWidth,
+  nextAgentWidthPresetIndex,
+} from './agentWidthPresets'
 
 export interface AgentAction { name: string; args: any; done: boolean; error?: string; result?: any }
 
 const LS_SESSION = 'evs_agent_session_id'
 const LS_WIDTH = 'evs_agent_half_width'
-const MIN_W = 420          // agent panel never narrower than this
-// keep enough console behind the panel for the toolbar to stay one line
-// and a full 6-wide row of result cards (rail + padding + 6 × 172 + gaps)
-const MIN_CONSOLE = 1180
-const maxWidth = () => Math.max(MIN_W, window.innerWidth - MIN_CONSOLE)
-// effective half-width: use the saved value or a default a touch under half, always clamped
-const DEFAULT_FRAC = 0.42
-const effHalfWidth = (saved: number | null) =>
-  Math.round(Math.max(MIN_W, Math.min(saved ?? window.innerWidth * DEFAULT_FRAC, maxWidth())))
+const validPresetIndex = (index: number, count: number) => Math.max(0, Math.min(index, count - 1))
 const SUGGESTIONS = [
   'Search the archive for a man sitting on a chair',
   'Find people near the entrance in the last hour',
@@ -95,7 +98,7 @@ function buildAgentContext(f: ArchiveFilters | null | undefined, channels: Chann
 
 export function AgentPanel({
   open, full, onClose, onToggleFull, channels, archiveFilters, onAction, onBusyChange,
-  canManageModels, canManageSkills,
+  onLayoutPresetChange, onLayoutPresetCommit, canManageModels, canManageSkills,
 }: {
   open: boolean
   full: boolean
@@ -105,6 +108,8 @@ export function AgentPanel({
   archiveFilters?: ArchiveFilters | null
   onAction: (a: AgentAction) => void
   onBusyChange?: (busy: boolean) => void
+  onLayoutPresetChange?: (archiveColumns: number) => void
+  onLayoutPresetCommit?: (archiveColumns: number) => void
   canManageModels: boolean
   canManageSkills: boolean
 }) {
@@ -123,31 +128,58 @@ export function AgentPanel({
   const [skillModal, setSkillModal] = useState<{ mode: 'create' | 'edit'; name: string; slug: string; content: string } | null>(null)
   const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'model' | 'streams' | null>(null)
   const [operatorMode, setOperatorMode] = useState(true)
-  const [halfWidth, setHalfWidth] = useState<number | null>(() => {
-    const v = Number(localStorage.getItem(LS_WIDTH))
-    return isFinite(v) && v >= MIN_W ? v : null
+  const [widthPresetIndex, setWidthPresetIndex] = useState(() => {
+    const presets = agentWidthPresets(window.innerWidth)
+    const storedValue = localStorage.getItem(AGENT_WIDTH_PRESET_STORAGE_KEY)
+    const storedIndex = Number(storedValue)
+    if (storedValue != null && Number.isInteger(storedIndex) && storedIndex >= 0 && storedIndex < presets.length) return storedIndex
+    const legacyWidth = Number(localStorage.getItem(LS_WIDTH))
+    return isFinite(legacyWidth) && legacyWidth >= MIN_AGENT_WIDTH
+      ? closestAgentWidthPresetIndex(legacyWidth, presets)
+      : 0
   })
+  const [halfWidth, setHalfWidth] = useState(() => (
+    agentWidthPresets(window.innerWidth)[widthPresetIndex].width
+  ))
   const [resizing, setResizing] = useState(false)
 
   const sessionRef = useRef<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const dockRef = useRef<HTMLDivElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
   const idRef = useRef(1)
   const loadedRef = useRef(false)
-
-  const [, force] = useState(0)
 
   useEffect(() => { bodyRef.current?.scrollTo({ top: 1e9, behavior: 'smooth' }) }, [msgs, busy])
   useEffect(() => { onBusyChange?.(busy) }, [busy, onBusyChange])
   useEffect(() => () => abortRef.current?.abort(), [])
-
-  // keep the panel width valid when the browser window is resized
   useEffect(() => {
-    const onResize = () => { setHalfWidth((w) => (w == null ? w : Math.min(w, maxWidth()))); force((n) => n + 1) }
+    const presets = agentWidthPresets(window.innerWidth)
+    const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
+    const preset = presets[normalizedIndex]
+    if (normalizedIndex !== widthPresetIndex) setWidthPresetIndex(normalizedIndex)
+    onLayoutPresetChange?.(preset.archiveColumns)
+    onLayoutPresetCommit?.(preset.archiveColumns)
+  }, [widthPresetIndex, onLayoutPresetChange, onLayoutPresetCommit])
+
+  // Preserve the selected layout when moving between Full HD / 2K or changing OS scaling.
+  useEffect(() => {
+    const onResize = () => {
+      const presets = agentWidthPresets(window.innerWidth)
+      const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
+      const preset = presets[normalizedIndex]
+      if (normalizedIndex !== widthPresetIndex) {
+        setWidthPresetIndex(normalizedIndex)
+        localStorage.setItem(AGENT_WIDTH_PRESET_STORAGE_KEY, String(normalizedIndex))
+      }
+      setHalfWidth(preset.width)
+      onLayoutPresetChange?.(preset.archiveColumns)
+      onLayoutPresetCommit?.(preset.archiveColumns)
+    }
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
-  }, [])
+  }, [widthPresetIndex, onLayoutPresetChange, onLayoutPresetCommit])
 
   // close strip dropdowns on outside click
   useEffect(() => {
@@ -282,25 +314,50 @@ export function AgentPanel({
     try { const s = await agentApi.skill(slug); setSkillModal({ mode: 'edit', name: s.name || '', slug: s.slug, content: s.content || '' }) } catch { /* ignore */ }
   }
 
-  // drag the left edge to resize the half-screen panel; value is remembered
+  function applyWidthPreset(index: number) {
+    const presets = agentWidthPresets(window.innerWidth)
+    const normalizedIndex = validPresetIndex(index, presets.length)
+    const preset = presets[normalizedIndex]
+    setWidthPresetIndex(normalizedIndex)
+    setHalfWidth(preset.width)
+    localStorage.setItem(AGENT_WIDTH_PRESET_STORAGE_KEY, String(normalizedIndex))
+    localStorage.setItem(LS_WIDTH, String(preset.width))
+    onLayoutPresetChange?.(preset.archiveColumns)
+    onLayoutPresetCommit?.(preset.archiveColumns)
+  }
+
+  // Dragging is allowed, but release snaps to the nearest stable Full HD / 2K layout.
   function startResize(e: React.MouseEvent) {
     e.preventDefault()
     const startX = e.clientX
     const startW = dockRef.current?.getBoundingClientRect().width ?? window.innerWidth * 0.5
+    let latestWidth = startW
     setResizing(true)
     const onMove = (ev: MouseEvent) => {
-      setHalfWidth(Math.min(maxWidth(), Math.max(MIN_W, startW + (startX - ev.clientX))))
+      latestWidth = Math.min(
+        maxAgentPanelWidth(window.innerWidth),
+        Math.max(MIN_AGENT_WIDTH, startW + (startX - ev.clientX)),
+      )
+      const presets = agentWidthPresets(window.innerWidth)
+      const { layoutWidth } = agentDragGeometry(latestWidth, presets)
+      setHalfWidth(latestWidth)
+      onLayoutPresetChange?.(archiveColumnsForAgentWidth(layoutWidth, window.innerWidth))
     }
     const onUp = () => {
       setResizing(false)
       document.removeEventListener('mousemove', onMove)
       document.removeEventListener('mouseup', onUp)
-      setHalfWidth((w) => { if (w != null) localStorage.setItem(LS_WIDTH, String(Math.round(w))); return w })
+      const presets = agentWidthPresets(window.innerWidth)
+      applyWidthPreset(closestAgentWidthPresetIndex(latestWidth, presets))
     }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
   }
-  function resetWidth() { setHalfWidth(null); localStorage.removeItem(LS_WIDTH) }
+  function cycleWidthPreset() {
+    const presets = agentWidthPresets(window.innerWidth)
+    const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
+    applyWidthPreset(nextAgentWidthPresetIndex(normalizedIndex, presets.length))
+  }
 
   const empty = msgs.length === 0
 
@@ -313,7 +370,12 @@ export function AgentPanel({
         </div>
       )}
       <div className="agent-input">
-        <textarea rows={1} placeholder="Ask the agent…" value={input}
+        <label className="agent-clip" title="Attach an image">
+          <IconPaperclip size={17} />
+          <input type="file" accept="image/*" style={{ display: 'none' }}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
+        </label>
+        <textarea ref={composerRef} rows={1} placeholder="Ask the agent…" value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(input) } }}
           disabled={busy} />
@@ -327,12 +389,8 @@ export function AgentPanel({
           </button>
         )}
       </div>
-      <div className="agent-chips">
-        <label className="agent-chip agent-chip-file"><IconPhoto size={13} /> Image
-          <input type="file" accept="image/*" style={{ display: 'none' }}
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.currentTarget.value = '' }} />
-        </label>
-      </div>
+      {/* on a fresh session the prompt assist lives up in the centre instead (see empty state) */}
+      {!empty && <PromptAssist channels={channels} value={input} onChange={setInput} inputRef={composerRef} />}
     </div>
   )
 
@@ -467,6 +525,9 @@ export function AgentPanel({
             <div className="agent-suggest">
               {SUGGESTIONS.map((s) => <button key={s} className="agent-chip" onClick={() => send(s)}>{s}</button>)}
             </div>
+            <div className="agent-assist-center">
+              <PromptAssist channels={channels} value={input} onChange={setInput} inputRef={composerRef} />
+            </div>
           </>
         )}
 
@@ -508,23 +569,32 @@ export function AgentPanel({
     </section>
   )
 
+  const widthPresets = agentWidthPresets(window.innerWidth)
+  const activeWidthPresetIndex = validPresetIndex(widthPresetIndex, widthPresets.length)
+  const activeWidthPreset = widthPresets[activeWidthPresetIndex]
+  const nextWidthPreset = widthPresets[nextAgentWidthPresetIndex(activeWidthPresetIndex, widthPresets.length)]
+  const dragGeometry = agentDragGeometry(halfWidth, widthPresets)
+
   return (
     <div ref={dockRef} className={`agent-dock ${open ? 'open' : ''} ${full ? 'full' : ''} ${resizing ? 'resizing' : ''}`} data-agent
-      style={open && !full ? { width: effHalfWidth(halfWidth) } : undefined}>
-      {open && !full && <div className="agent-resize" onMouseDown={startResize} title="Drag to resize" />}
+      style={open && !full ? { width: halfWidth, marginLeft: -dragGeometry.overlayWidth } : undefined}>
+      {open && !full && (
+        <div className="agent-resize" onMouseDown={startResize}
+          title="Drag to resize; release snaps to the nearest fixed layout" />
+      )}
       <div className="agent-head">
         <div className="agent-head-title">
           <span className="agent-badge"><IconSparkles size={15} /></span>
           <div>
             <div className="agent-title">EVA Agent</div>
-            <div className="brand-sub">Watches {channels.length} channels · operates the console for you</div>
           </div>
         </div>
         <div className="agent-head-btns">
           <button className="modal-close" onClick={onToggleFull} title={full ? 'Exit full screen' : 'Open full screen'}>
             {full ? <IconMinimize size={17} /> : <IconMaximize size={17} />}
           </button>
-          <button className="modal-close" onClick={resetWidth} disabled={halfWidth == null} title="Reset to default width">
+          <button className="modal-close" onClick={cycleWidthPreset} disabled={full}
+            title={`Reset to default width · ${activeWidthPreset.label}; click for ${nextWidthPreset.label}`}>
             <IconArrowAutofitWidth size={17} />
           </button>
           <button className="modal-close" onClick={onClose} title="Close agent"><IconX size={18} /></button>

@@ -4,14 +4,17 @@
   /* space surfaces (lifted — lighter navy, still cosmic) */
   --space-0: #10162e;   /* deepest void */
   --space-1: #18203c;   /* app base */
-  --panel:   rgba(38, 50, 86, 0.78);   /* glassy panel */
-  --panel-2: rgba(46, 60, 100, 0.72);
+  --panel:   rgba(31, 42, 76, 0.92);   /* working surfaces — denser so they lift off the live backdrop */
+  --panel-2: rgba(38, 51, 90, 0.9);
   --panel-solid: #212a49;
   --void-tile: #1d2743;
 
-  /* lines */
-  --line:    rgba(150, 180, 245, 0.20);
-  --line-2:  rgba(150, 180, 245, 0.34);
+  /* lines — a touch stronger for crisper edges against the background */
+  --line:    rgba(150, 180, 245, 0.30);
+  --line-2:  rgba(150, 180, 245, 0.46);
+
+  /* elevation: soft drop shadow that separates panels from the ambient background */
+  --elev: 0 14px 34px -16px rgba(3, 7, 20, 0.75), 0 2px 8px -4px rgba(3, 7, 20, 0.5);
 
   /* text */
   --text:      #eef2fc;
@@ -75,6 +78,8 @@ body {
     radial-gradient(1.5px 1.5px at 60% 48%, rgba(160,240,240,0.5), transparent);
   opacity: 0.5;
 }
+/* the Animations switch hides the starfield too */
+.anim-off #root::after { display: none; }
 
 /* scrollbars */
 *::-webkit-scrollbar { width: 9px; height: 9px; }
