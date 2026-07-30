@@ -45,6 +45,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_PORT` (`5000`) | Internal Gunicorn HTTP port. TLS is provided by reverse proxy/TLS boundary, not by this variable |
 | `EVOSSEARCH_DEBUG` (`false`) | Keep false in prod |
 | `EVOSSEARCH_APP_VERSION` | Overrides `VERSION` only if set; keep in sync with release |
+| `EVOSSEARCH_UI_MODE` (`legacy`) | Browser shell: `legacy` or `react`. During parity soak, `/?ui=react` and `/?ui=legacy` provide a per-request override without restarting EVA. React production assets are prebuilt; Node.js is not required on the appliance |
 | `EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED` | Gate for secure-mode checks + single-worker enforcement |
 | `EVOSSEARCH_GUNICORN_WORKERS` (`1`) | Must stay `1` |
 | `EVOSSEARCH_GUNICORN_THREADS` (`8`) | HTTP request threads inside the single required worker. Eight leaves capacity for bounded live-media responses plus Agent/status traffic |

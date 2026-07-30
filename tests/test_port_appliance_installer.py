@@ -21,19 +21,25 @@ sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
 
 
-def test_usb_builder_excludes_the_unused_react_workspace():
+def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"
     )
 
-    assert "--exclude=react-ui/" in builder
+    assert 'npm --prefix "${REACT_UI_ROOT}" run build' in builder
+    assert 'dist/index.html' in builder
+    assert not any(
+        line.strip() == "--exclude=react-ui/ \\"
+        for line in builder.splitlines()
+    )
+    assert "--exclude=react-ui/node_modules/" in builder
     assert "--delete-excluded" in builder
     for local_only_pattern in (
         "--exclude='.env*'",
         "--exclude='.venv*'",
         "--exclude=.eva-runtime",
         "--exclude=node_modules/",
-        "--exclude=dist/",
+        "--exclude=/dist/",
         "--exclude=probes_store.json",
         "--exclude='*.sqlite3'",
     ):
@@ -47,6 +53,7 @@ def test_port_profile_keeps_gpu_for_vllm_and_clip_on_cpu():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
+    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "legacy"
 
 
 def test_port_profile_has_bounded_queue_and_context():

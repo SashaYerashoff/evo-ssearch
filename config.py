@@ -160,6 +160,9 @@ class Config:
     PORT = int(os.getenv('EVOSSEARCH_PORT', '5000'))
     DEBUG = _get_bool_env('EVOSSEARCH_DEBUG', 'False')
     APP_VERSION = _get_app_version()
+    UI_MODE = os.getenv('EVOSSEARCH_UI_MODE', 'legacy').strip().lower()
+    if UI_MODE not in {'legacy', 'react'}:
+        UI_MODE = 'legacy'
     OFFLINE_MODE = _get_bool_env('EVOSSEARCH_OFFLINE_MODE', 'True')
     MODEL_CACHE_DIR = Path(
         os.getenv(

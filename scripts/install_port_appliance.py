@@ -52,6 +52,9 @@ PORT_ENV = {
     "EVOSSEARCH_HOST": "127.0.0.1",
     "EVOSSEARCH_PORT": "5000",
     "EVOSSEARCH_DEBUG": "false",
+    # Keep the mature console as the appliance default until React parity is
+    # accepted. Operators can pilot React at /?ui=react without a restart.
+    "EVOSSEARCH_UI_MODE": "legacy",
     "EVOSSEARCH_GUNICORN_WORKERS": "1",
     "EVOSSEARCH_GUNICORN_THREADS": "8",
     "EVOSSEARCH_GUNICORN_TIMEOUT": "240",

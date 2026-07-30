@@ -330,6 +330,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/ready",
             "/reports/false-positives",
             "/reports/false-positives/export",
+            "/ui-assets/<path:filename>",
         }
         unexpected_backend_only = backend_only - allowed_backend_only
         self.assertEqual(unexpected_backend_only, set(), f"Unexpected backend-only endpoints: {sorted(unexpected_backend_only)}")
@@ -1127,6 +1128,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         public_endpoints = {
             "static",
             "home",
+            "react_ui_asset",
             "favicon",
             "branding_logo",
             "serve_app_js",

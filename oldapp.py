@@ -48,7 +48,7 @@ import torch
 import cv2
 from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
-from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
+from flask import Flask, g, request, jsonify, send_file, send_from_directory, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -127,6 +127,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
+_REACT_UI_DIST = Path(__file__).resolve().parent / "react-ui" / "dist"
 if int(getattr(config, "TRUSTED_PROXY_HOPS", 0) or 0) > 0:
     trusted_hops = int(config.TRUSTED_PROXY_HOPS)
     app.wsgi_app = ProxyFix(
@@ -2131,6 +2132,23 @@ def create_index(folder_path):
 @app.route('/')
 def home():
     """Serve the frontend."""
+    requested_ui = str(request.args.get("ui") or getattr(config, "UI_MODE", "legacy")).strip().lower()
+    if requested_ui not in {"legacy", "react"}:
+        requested_ui = str(getattr(config, "UI_MODE", "legacy")).strip().lower()
+    if requested_ui == "react":
+        react_index = _REACT_UI_DIST / "index.html"
+        if react_index.is_file():
+            response = make_response(send_file(react_index, mimetype="text/html", conditional=True))
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            response.headers["X-EVA-UI"] = "react"
+            return response
+        app.logger.warning(
+            "React UI requested but production build is missing: %s; serving legacy UI",
+            react_index,
+        )
+
     min_val, max_val, default_val = config.MIN_RESULTS, config.MAX_RESULTS, config.DEFAULT_RESULTS
     options: Set[int] = {min_val, default_val, max_val}
     if max_val <= 20:
@@ -2192,6 +2210,22 @@ def home():
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
+    response.headers['X-EVA-UI'] = 'legacy'
+    if requested_ui == "react":
+        response.headers['X-EVA-UI-Fallback'] = 'react-dist-missing'
+    return response
+
+
+@app.route('/ui-assets/<path:filename>')
+def react_ui_asset(filename: str):
+    """Serve immutable hashed React build assets without requiring Node in production."""
+    if not _REACT_UI_DIST.is_dir():
+        return ("React UI build not found", 404)
+    response = make_response(send_from_directory(_REACT_UI_DIST, filename, conditional=True))
+    if filename.startswith("assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
